@@ -397,6 +397,7 @@ dependencies = [
  "clap",
  "flexaudio",
  "flexaudio-mic",
+ "flexaudio-os-linux",
  "hound",
 ]
 
