@@ -16,3 +16,7 @@ flexaudio-mic = { path = "../flexaudio-mic" }
 hound = "3.5"
 # 引数解析（純 Rust・寛容ライセンス Apache-2.0/MIT）
 clap = { version = "4", features = ["derive"] }
+
+# システム音声（PipeWire）バックエンド。--source system 用（Linux のみ）
+[target.'cfg(target_os = "linux")'.dependencies]
+flexaudio-os-linux = { path = "../flexaudio-os-linux" }

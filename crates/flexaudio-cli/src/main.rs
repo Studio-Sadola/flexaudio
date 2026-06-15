@@ -23,6 +23,8 @@ use flexaudio::core::{
 };
 use flexaudio::Stream;
 use flexaudio_mic::CpalMicBackend;
+#[cfg(target_os = "linux")]
+use flexaudio_os_linux::PwSystemBackend;
 
 /// キャプチャするソース種別（CLI 引数用）。
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -67,36 +69,50 @@ fn main() -> ExitCode {
 
 /// 実処理本体。失敗は人間向けメッセージ（`String`）として返す。
 fn run(cli: &Cli) -> std::result::Result<(), String> {
-    // --- ソース種別の解決（当面 mic のみ） ---
-    match cli.source {
-        SourceArg::Mic => {}
-        SourceArg::System => {
-            return Err(
-                "--source system（システム出力ループバック）は未対応です。\
-                 対応バックエンドが配線され次第サポート予定です。"
-                    .into(),
-            );
-        }
-        SourceArg::Process => {
-            return Err(
-                "--source process（プロセス出力ループバック）は未対応です。\
-                 対応バックエンドが配線され次第サポート予定です。"
-                    .into(),
-            );
-        }
-    }
-
     if cli.seconds == 0 {
         return Err("--seconds は 1 以上を指定してください。".into());
     }
 
-    // --- backend 構築 & ネイティブフォーマット表示 ---
-    let backend = CpalMicBackend::new();
+    // --- ソース種別から backend / SourceKind / 表示ラベルを解決 ---
+    // Stream::open は Box<dyn CaptureBackend> を取る汎用設計なので、
+    // 以降のキャプチャ→WAV 本体は全ソース共通。
+    let (backend, kind, source_label): (Box<dyn CaptureBackend>, SourceKind, &str) =
+        match cli.source {
+            SourceArg::Mic => (
+                Box::new(CpalMicBackend::new()),
+                SourceKind::Mic,
+                "mic（既定入力デバイス）",
+            ),
+            SourceArg::System => {
+                #[cfg(target_os = "linux")]
+                {
+                    (
+                        Box::new(PwSystemBackend::new()),
+                        SourceKind::SystemLoopback,
+                        "system（既定出力の monitor / PipeWire）",
+                    )
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err(
+                        "--source system（システム出力ループバック）は現在 Linux のみ対応です。"
+                            .into(),
+                    );
+                }
+            }
+            SourceArg::Process => {
+                return Err(
+                    "--source process（プロセス出力ループバック）は未対応です。\
+                     対応バックエンドが配線され次第サポート予定です。"
+                        .into(),
+                );
+            }
+        };
+
+    // --- ネイティブフォーマット表示 ---
     let (native_rate, native_ch) = backend.native_format();
-    println!("ソース            : mic（既定入力デバイス）");
-    println!(
-        "ネイティブフォーマット: {native_rate} Hz / {native_ch} ch（cpal 報告値）"
-    );
+    println!("ソース            : {source_label}");
+    println!("ネイティブフォーマット: {native_rate} Hz / {native_ch} ch");
     println!(
         "出力フォーマット   : {SAMPLE_RATE} Hz / {CHANNELS} ch / 16-bit PCM（固定契約）"
     );
@@ -106,10 +122,10 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
 
     // --- ストリームを開いて開始 ---
     let config = StreamConfig {
-        kind: SourceKind::Mic,
+        kind,
         ..Default::default()
     };
-    let mut stream = Stream::open(config, Box::new(backend)).map_err(describe_error)?;
+    let mut stream = Stream::open(config, backend).map_err(describe_error)?;
     stream.start().map_err(describe_error)?;
 
     println!("キャプチャ中 ...");
