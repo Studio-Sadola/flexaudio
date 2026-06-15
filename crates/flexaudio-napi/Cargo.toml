@@ -1,0 +1,25 @@
+[package]
+name = "flexaudio-napi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Node.js (N-API) addon。WhisperApp(TS/Electron) が flexaudio をインプロセスで
+# 叩く第二経路（第一は CLI パイプ）。cdylib として .node にリネームして読み込む。
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+flexaudio = { path = "../flexaudio" }
+
+# napi-rs 2.x 系の安定最新（2.16.17）。
+# - napi6: BigInt を JS へ渡すのに必要（AudioChunk.seq:u64 を BigInt 化する）。
+# - tokio_rt: ThreadsafeFunction を使う最小構成として有効化（napi の TSFN 経路で必要）。
+# runtime にネットワークは無い（napi は N-API ブリッジのみ。通信なし）。
+napi = { version = "2.16", default-features = false, features = ["napi6", "tokio_rt"] }
+napi-derive = "2.16"
+
+[build-dependencies]
+# build.rs で napi_build::setup() を呼ぶ（cdylib のシンボル設定等）。ビルド時のみ。
+napi-build = "2"

@@ -9,6 +9,7 @@ members = [
     "crates/flexaudio",
     "crates/flexaudio-cli",
     "crates/flexaudio-ffi",
+    "crates/flexaudio-napi",
     "crates/flexaudio-vad",
     "bindings/pyflexaudio",
 ]
