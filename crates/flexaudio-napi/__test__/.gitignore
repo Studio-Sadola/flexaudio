@@ -1,0 +1,2 @@
+# ビルド成果物（cargo build した cdylib のコピー）。run-smoke.sh が生成する。
+flexaudio.node

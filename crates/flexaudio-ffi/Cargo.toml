@@ -1,0 +1,13 @@
+[package]
+name = "flexaudio-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "C FFI scaffold for flexaudio (placeholder; not yet implemented)."
+# スキャフォルドのみ。実装が固まるまで crates.io へ公開しない。
+publish = false
+
+[dependencies]

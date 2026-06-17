@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flexaudio-core",
+    "crates/flexaudio-os-windows",
+    "crates/flexaudio-os-macos",
+    "crates/flexaudio-os-linux",
+    "crates/flexaudio-mic",
+    "crates/flexaudio",
+    "crates/flexaudio-cli",
+    "crates/flexaudio-ffi",
+    "crates/flexaudio-napi",
+    "crates/flexaudio-vad",
+    "bindings/flexaudio-py",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+repository = "https://github.com/tsubome/flexaudio"
+authors = ["tsubome (Aratech)"]
+
+[workspace.dependencies]
+# flexaudio-core が要求する純 Rust 依存 (システムライブラリ不要・実行時ネットワーク禁止)
+bitflags = "2"
+ringbuf = "0.4"
+rtrb = "0.3"
+rubato = "3"
+thiserror = "2"
+# マイク入力バックエンド (flexaudio-mic)。rust 1.85 互換の安定版を採用。
+cpal = "0.16"
+# Linux システム出力キャプチャ (flexaudio-os-linux)。libpipewire-0.3 + libclang を要求し
+# target.'cfg(target_os = "linux")' でのみ引く（非 Linux はビルドに pipewire を一切引かない）。
+pipewire = "0.10"
+# 実装フェーズで追加 (ort, pyo3, numpy 等)

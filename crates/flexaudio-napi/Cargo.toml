@@ -1,0 +1,32 @@
+[package]
+name = "flexaudio-napi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# napi-build / napi-derive のツールチェインが rustc 1.88 を要求するので、workspace
+# の 1.85 をここだけ上書きする。
+rust-version = "1.88"
+authors.workspace = true
+repository.workspace = true
+description = "Node.js (N-API) addon for flexaudio. Distributed via npm, not crates.io."
+# cdylib は crates.io ではライブラリとして消費できない（npm 配布）。
+publish = false
+
+# Node.js (N-API) addon。TS/Electron アプリが flexaudio をインプロセスで叩く第二の
+# 経路（第一は CLI パイプ）。cdylib を .node にリネームして読み込む。
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+flexaudio = { path = "../flexaudio" }
+
+# napi-rs 2.x 系の安定最新（2.16.17）。
+# - napi6: BigInt を JS へ渡すのに必要（AudioChunk.seq:u64 を BigInt 化する）。
+# - tokio_rt: ThreadsafeFunction を使う最小構成として有効化（napi の TSFN 経路で必要）。
+# runtime にネットワークは無い（napi は N-API ブリッジのみ。通信なし）。
+napi = { version = "2.16", default-features = false, features = ["napi6", "tokio_rt"] }
+napi-derive = "2.16"
+
+[build-dependencies]
+# build.rs で napi_build::setup() を呼ぶ（cdylib のシンボル設定等）。ビルド時のみ。
+napi-build = "2"

@@ -1,0 +1,20 @@
+[package]
+name = "flexaudio-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Source-agnostic audio capture engine, types, and resampling/normalization core for flexaudio."
+readme = "README.md"
+keywords = ["audio", "capture", "resampling", "stream", "dsp"]
+categories = ["multimedia::audio"]
+documentation = "https://docs.rs/flexaudio-core"
+
+[dependencies]
+bitflags = { workspace = true }
+ringbuf = { workspace = true }
+rtrb = { workspace = true }
+rubato = { workspace = true }
+thiserror = { workspace = true }

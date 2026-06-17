@@ -1,0 +1,64 @@
+{
+  "name": "@aratech/flexaudio",
+  "version": "0.2.0",
+  "description": "Flexible cross-platform audio capture (microphone, system loopback, per-process) for Node.js, via native N-API bindings to the flexaudio Rust library.",
+  "author": "tsubome (Aratech)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tsubome/flexaudio.git",
+    "directory": "crates/flexaudio-napi"
+  },
+  "homepage": "https://github.com/tsubome/flexaudio#readme",
+  "keywords": [
+    "audio",
+    "capture",
+    "loopback",
+    "recording",
+    "napi-rs"
+  ],
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "napi": {
+    "binaryName": "flexaudio",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin"
+    ]
+  },
+  "engines": {
+    "node": ">= 16"
+  },
+  "optionalDependencies": {
+    "@aratech/flexaudio-linux-x64-gnu": "0.2.0",
+    "@aratech/flexaudio-linux-arm64-gnu": "0.2.0",
+    "@aratech/flexaudio-win32-x64-msvc": "0.2.0",
+    "@aratech/flexaudio-win32-arm64-msvc": "0.2.0",
+    "@aratech/flexaudio-darwin-x64": "0.2.0",
+    "@aratech/flexaudio-darwin-arm64": "0.2.0"
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "prepublishOnly": "napi prepublish -t npm",
+    "version": "napi version"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

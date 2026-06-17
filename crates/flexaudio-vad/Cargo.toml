@@ -1,0 +1,36 @@
+[package]
+name = "flexaudio-vad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# ort / ONNX Runtime のツールチェインが rustc 1.88 を要求するので、workspace の
+# 1.85 をここだけ上書きする。
+rust-version = "1.88"
+authors.workspace = true
+repository.workspace = true
+description = "Offline Voice Activity Detection (Silero VAD on ONNX Runtime, model embedded) for flexaudio."
+keywords = ["vad", "voice", "silero", "onnx", "audio"]
+categories = ["multimedia::audio", "science"]
+readme = "README.md"
+documentation = "https://docs.rs/flexaudio-vad"
+
+[dependencies]
+# silero-VAD を ONNX でオフライン実行する。`download-binaries` がビルド時に onnxruntime
+# を取得して静的リンクするので、実行時に .so/.dll を配る必要も実行時ネットワークも無い
+# （単一の自己完結バイナリ）。CUDA 等の追加 EP は不要。
+# TLS は default の `tls-native`（openssl-sys＝システム libssl 依存）でなく純 Rust の
+# `tls-rustls` を使う。libssl-dev 不要でポータブル。ビルド時のモデル取得 HTTP にのみ使う。
+# 他の default feature (std/ndarray/tracing/download-binaries/copy-dylibs/api-24) は維持。
+ort = { version = "2.0.0-rc.12", default-features = false, features = [
+    "std",
+    "ndarray",
+    "tracing",
+    "download-binaries",
+    "copy-dylibs",
+    "api-24",
+    "tls-rustls",
+] }
+
+[[example]]
+name = "probe"
+path = "examples/probe.rs"

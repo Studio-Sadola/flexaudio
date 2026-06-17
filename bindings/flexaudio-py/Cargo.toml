@@ -1,0 +1,13 @@
+[package]
+name = "flexaudio-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "PyO3 Python binding scaffold for flexaudio (placeholder; distributed via PyPI, not crates.io)."
+# PyO3 拡張のスキャフォルド。crates.io へは公開しない（PyPI 配布）。
+publish = false
+
+[dependencies]

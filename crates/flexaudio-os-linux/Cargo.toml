@@ -1,0 +1,19 @@
+[package]
+name = "flexaudio-os-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Linux system and per-process audio capture backend (PipeWire) for flexaudio."
+readme = "README.md"
+keywords = ["audio", "pipewire", "loopback", "capture", "linux"]
+categories = ["multimedia::audio", "os::unix-apis"]
+documentation = "https://docs.rs/flexaudio-os-linux"
+
+# Linux 専用。非 Linux では lib.rs が `#![cfg(target_os = "linux")]` で空になり、
+# pipewire 依存も下の target 限定セクションでしか引かれない。
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = { workspace = true }
+flexaudio-core = { path = "../flexaudio-core", version = "0.2.0" }
