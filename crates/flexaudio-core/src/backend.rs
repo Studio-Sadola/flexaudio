@@ -1,8 +1,8 @@
 //! OS バックエンドが実装する [`CaptureBackend`] トレイトと、バックエンドが
 //! 生フレームをコアへ渡すための [`RawSink`] ハンドル。
 //!
-//! 配線（backend → [`RawRing`](crate::raw_ring) → [`Normalizer`](crate::normalizer)
-//! → [`ChunkRing`](crate::chunk_ring)）は facade 層が後で行う。ここではバックエンド
+//! 配線（backend → [`RawRing`](mod@crate::raw_ring) → [`Normalizer`](crate::normalizer)
+//! → [`ChunkRing`](mod@crate::chunk_ring)）は facade 層が後で行う。ここではバックエンド
 //! 契約の型のみを定義する。
 
 use crate::raw_ring::RawProducer;

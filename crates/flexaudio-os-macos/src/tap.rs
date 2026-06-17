@@ -31,7 +31,7 @@ use objc2_core_audio::{
 };
 use objc2_core_audio_types::{AudioBufferList, AudioTimeStamp};
 use objc2_core_foundation::CFDictionary;
-use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSObject};
+use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSObject, NSString};
 
 use flexaudio_core::backend::RawSink;
 use flexaudio_core::types::Error;
@@ -148,7 +148,10 @@ pub(crate) unsafe fn build_tap_chain(
         }
         TapKind::ExcludeProcesses(ids) => {
             let arr = object_ids_to_nsarray(ids);
-            CATapDescription::initStereoGlobalTapButExcludeProcesses(CATapDescription::alloc(), &arr)
+            CATapDescription::initStereoGlobalTapButExcludeProcesses(
+                CATapDescription::alloc(),
+                &arr,
+            )
         }
     };
     desc.setName(&NSString::from_str(name));
@@ -293,14 +296,14 @@ pub(crate) unsafe fn build_tap_chain(
 /// `{ Name, UID(生成UUID), IsPrivate:true, IsStacked:false, TapAutoStart:true,
 ///    TapList:[{SubTapUID: tap UUID, SubTapDriftCompensation:true}] }`。
 /// NSDictionary で組み、toll-free bridge で `&CFDictionary` として渡す。
-fn create_aggregate_device(
-    name: &str,
-    sub_tap_uid: &NSString,
-) -> Result<AudioObjectID, Error> {
+fn create_aggregate_device(name: &str, sub_tap_uid: &NSString) -> Result<AudioObjectID, Error> {
     // sub-tap 辞書: { uid: <tap uuid>, drift: true }。
     let drift_true = NSNumber::numberWithBool(true);
     let sub_tap: Retained<NSDictionary<NSString, NSObject>> = NSDictionary::from_slices::<NSString>(
-        &[&cstr_key(kAudioSubTapUIDKey), &cstr_key(kAudioSubTapDriftCompensationKey)],
+        &[
+            &cstr_key(kAudioSubTapUIDKey),
+            &cstr_key(kAudioSubTapDriftCompensationKey),
+        ],
         &[sub_tap_uid.as_ref(), drift_true.as_ref()],
     );
     let tap_list: Retained<NSArray<NSObject>> =
@@ -335,15 +338,11 @@ fn create_aggregate_device(
     // NSDictionary は CFDictionary と toll-free bridge。ポインタを &CFDictionary に。
     // SAFETY: NSDictionary と CFDictionary は toll-free bridged（同一 ObjC オブジェクト）。
     // dict は本関数末尾まで生存し、ポインタはその間有効。
-    let cf: &CFDictionary = unsafe {
-        &*(Retained::as_ptr(&dict) as *const CFDictionary)
-    };
+    let cf: &CFDictionary = unsafe { &*(Retained::as_ptr(&dict) as *const CFDictionary) };
 
     let mut device_id: AudioObjectID = 0;
     // SAFETY: cf は有効な CFDictionary、device_id は有効なローカル。
-    let status = unsafe {
-        AudioHardwareCreateAggregateDevice(cf, NonNull::from(&mut device_id))
-    };
+    let status = unsafe { AudioHardwareCreateAggregateDevice(cf, NonNull::from(&mut device_id)) };
     if status != NO_ERR {
         return Err(map_os_status("AudioHardwareCreateAggregateDevice", status));
     }
@@ -374,7 +373,11 @@ fn new_uuid_string() -> String {
 ///
 /// # Safety
 /// `list` は有効な `AudioBufferList` を指すこと（CoreAudio が IOProc に供給）。
-unsafe fn push_buffer_list(sink: &mut RawSink, scratch: &mut Vec<f32>, list: *const AudioBufferList) {
+unsafe fn push_buffer_list(
+    sink: &mut RawSink,
+    scratch: &mut Vec<f32>,
+    list: *const AudioBufferList,
+) {
     if list.is_null() {
         return;
     }
@@ -442,8 +445,14 @@ fn log_buffer_shape_once(num_buffers: usize) {
     LOGGED_SHAPE.with(|c| {
         if !c.get() {
             c.set(true);
-            let kind = if num_buffers == 1 { "interleaved" } else { "planar" };
-            eprintln!("[flexaudio-os-macos] IOProc buffer shape: mNumberBuffers={num_buffers} ({kind})");
+            let kind = if num_buffers == 1 {
+                "interleaved"
+            } else {
+                "planar"
+            };
+            eprintln!(
+                "[flexaudio-os-macos] IOProc buffer shape: mNumberBuffers={num_buffers} ({kind})"
+            );
         }
     });
 }

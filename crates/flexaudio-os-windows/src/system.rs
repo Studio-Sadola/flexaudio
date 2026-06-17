@@ -25,9 +25,7 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
 
-use crate::common::{
-    capture_loop, init_loopback_capture, map_hr, parse_mix_format, ComThread,
-};
+use crate::common::{capture_loop, init_loopback_capture, map_hr, parse_mix_format, ComThread};
 
 /// 既定 render endpoint を取得できなかったときに [`native_format`] が返す
 /// 無難なフォールバック `(48000, 2)`（panic しない）。実際の `start` で
@@ -246,8 +244,9 @@ unsafe fn setup_system_loopback(
     windows::Win32::Foundation::HANDLE,
     u16,
 )> {
-    let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-        .map_err(|e| map_hr("CoCreateInstance(MMDeviceEnumerator)", e))?;
+    let enumerator: IMMDeviceEnumerator =
+        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            .map_err(|e| map_hr("CoCreateInstance(MMDeviceEnumerator)", e))?;
 
     // 既定の render endpoint（loopback は render を録る）。無ければ DeviceNotFound。
     let device: IMMDevice = enumerator
@@ -341,7 +340,8 @@ mod tests {
                 backend.stop();
                 backend.stop(); // 二重 stop も安全。
             }
-            Err(_e) => { /* 非対応 OS / プロセスループバック activation 失敗は許容 */ }
+            Err(_e) => { /* 非対応 OS / プロセスループバック activation 失敗は許容 */
+            }
         }
     }
 }

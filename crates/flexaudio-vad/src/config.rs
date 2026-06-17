@@ -122,9 +122,7 @@ impl VadConfig {
         }
         if let Some(nt) = self.neg_threshold {
             if !(0.0..=1.0).contains(&nt) {
-                return Err(format!(
-                    "neg_threshold must be within [0.0, 1.0], got {nt}"
-                ));
+                return Err(format!("neg_threshold must be within [0.0, 1.0], got {nt}"));
             }
         }
         Ok(())

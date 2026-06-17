@@ -2,12 +2,12 @@
 //!
 //! [`DeviceWatcher`] は OS のデバイス着脱・既定変更を [`DeviceEvent`] として
 //! **pull 型**（[`poll_event`](DeviceWatcher::poll_event)）で配信する。capture
-//! stream 単位の [`core::Event`] とは別系統で、デバイス単位の事象を扱う。
+//! stream 単位の [`Event`](crate::core::Event) とは別系統で、デバイス単位の事象を扱う。
 //!
-//! OS バックエンドの差異は private trait [`DeviceWatchBackend`] で吸収する:
+//! OS バックエンドの差異は private trait `DeviceWatchBackend` で吸収する:
 //! - **Linux**: PipeWire レジストリを永続監視する `PwDeviceWatcher`
 //!   （`flexaudio-os-linux`）。
-//! - **その他 OS / 縮退**: 常に `None` を返す [`NoopWatcher`]。
+//! - **その他 OS / 縮退**: 常に `None` を返す `NoopWatcher`。
 //!
 //! [`crate::watch_devices`] が cfg と縮退判断を行い、適切な実装を `Box` で包んで
 //! [`DeviceWatcher`] を返す。
@@ -101,7 +101,8 @@ impl DeviceWatchBackend for flexaudio_os_linux::PwDeviceWatcher {
 pub(crate) fn watch_devices() -> flexaudio_core::types::Result<DeviceWatcher> {
     #[cfg(target_os = "linux")]
     {
-        let inner: Box<dyn DeviceWatchBackend> = match flexaudio_os_linux::PwDeviceWatcher::start() {
+        let inner: Box<dyn DeviceWatchBackend> = match flexaudio_os_linux::PwDeviceWatcher::start()
+        {
             Ok(w) => Box::new(w),
             // PipeWire 不在/接続失敗は no-op 縮退（着脱が来ないだけ）。
             Err(_) => Box::new(NoopWatcher),

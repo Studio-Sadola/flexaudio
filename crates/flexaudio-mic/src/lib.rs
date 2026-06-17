@@ -1,12 +1,12 @@
 //! flexaudio-mic — マイク入力バックエンド (cpal, 全 OS)。
 //!
 //! [`CpalMicBackend`] は cpal を介して既定入力デバイスから生 interleaved `f32`
-//! フレームをキャプチャし、[`RawSink`](flexaudio_core::RawSink) へ非ブロッキングに
-//! push する [`CaptureBackend`](flexaudio_core::CaptureBackend) 実装である。主な検証
+//! フレームをキャプチャし、[`RawSink`] へ非ブロッキングに
+//! push する [`CaptureBackend`] 実装である。主な検証
 //! 対象は Linux/ALSA だが、cpal が対応する全 OS で動作する。
 //!
 //! # `cpal::Stream` は `!Send` という制約
-//! [`CaptureBackend`](flexaudio_core::CaptureBackend) は `Send` を要求するため、
+//! [`CaptureBackend`] は `Send` を要求するため、
 //! `!Send` な [`cpal::Stream`] を backend 構造体へ直接保持できない。これを避けるため、
 //! [`start`](CpalMicBackend::start) では **専用所有スレッド**を spawn し、その内部で
 //! input stream を build + `play()` してから停止シグナルまで `park` する。停止時に
@@ -28,6 +28,8 @@
 //! // ... _cons から生フレームを pop ...
 //! backend.stop();
 //! ```
+
+#![warn(missing_docs)]
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,7 +53,7 @@ const FALLBACK_FORMAT: (u32, u16) = (48_000, 1);
 ///
 /// 既定入力デバイス（`device_id = None`）または **安定 ID（= デバイス名）で選んだ
 /// 特定入力デバイス**（`device_id = Some(id)`）から生 interleaved `f32` フレームを
-/// キャプチャし [`RawSink`](flexaudio_core::RawSink) へ流す。詳細はモジュールドキュメント参照。
+/// キャプチャし [`RawSink`] へ流す。詳細はモジュールドキュメント参照。
 ///
 /// この型は `Send`（保持するのは停止フラグ・[`JoinHandle`]・キャッシュ済み
 /// フォーマット・選択 device_id のみ。`!Send` な [`cpal::Stream`] は所有スレッド内に
@@ -76,7 +78,7 @@ impl CpalMicBackend {
     ///   デバイスを選ぶ（id は [`list_devices`] が返す安定 ID = デバイス名）。
     ///
     /// 構築時に**選択したデバイス**のネイティブフォーマットを問い合わせてキャッシュする。
-    /// デバイスが無い／一致しない／問い合わせに失敗した場合は [`FALLBACK_FORMAT`]
+    /// デバイスが無い／一致しない／問い合わせに失敗した場合は `FALLBACK_FORMAT`
     /// （`(48000, 1)`）をキャッシュし、実際の [`start`](Self::start) で
     /// **device_id が一致しなければ [`Error::DeviceNotFound`]** を返す（new は panic
     /// もエラーもせず必ず成功し、解決の成否は start/native_format で一貫させる）。
@@ -153,9 +155,7 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
     let host = cpal::default_host();
 
     // 既定入力デバイス名（is_default 判定用）。取れなければ既定一致は付かない。
-    let default_name = host
-        .default_input_device()
-        .and_then(|d| d.name().ok());
+    let default_name = host.default_input_device().and_then(|d| d.name().ok());
 
     // input_devices() 自体が失敗する環境（ALSA 不在等）は空リスト扱い。
     let devices = match host.input_devices() {

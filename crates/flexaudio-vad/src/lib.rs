@@ -28,6 +28,8 @@
 //! }
 //! ```
 
+#![warn(missing_docs)]
+
 mod config;
 mod segmenter;
 
@@ -48,9 +50,15 @@ const STATE_LEN: usize = 2 * 128;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VadEvent {
     /// 発話開始 (パディング適用後の絶対サンプル位置)。
-    SpeechStart { at_sample: u64 },
+    SpeechStart {
+        /// 発話が始まった絶対サンプル位置 (パディング適用後・含む)。
+        at_sample: u64,
+    },
     /// 発話終了 (パディング適用後の絶対サンプル位置・排他的)。
-    SpeechEnd { at_sample: u64 },
+    SpeechEnd {
+        /// 発話が終わった絶対サンプル位置 (パディング適用後・排他的)。
+        at_sample: u64,
+    },
 }
 
 /// VAD のエラー型。
@@ -187,8 +195,9 @@ impl Vad {
         let state_tensor = Tensor::from_array(([2_i64, 1, 128], self.state.clone()))
             .map_err(|e| VadError::Inference(e.to_string()))?;
         // sr はランク0スカラー int64 (モデル入力 shape は [])。
-        let sr_tensor = Tensor::from_array((vec![] as Vec<i64>, vec![self.config.sample_rate as i64]))
-            .map_err(|e| VadError::Inference(e.to_string()))?;
+        let sr_tensor =
+            Tensor::from_array((vec![] as Vec<i64>, vec![self.config.sample_rate as i64]))
+                .map_err(|e| VadError::Inference(e.to_string()))?;
 
         let outputs = self
             .session
@@ -294,7 +303,7 @@ mod tests {
         VadConfig {
             threshold: 0.5,
             neg_threshold: Some(0.35),
-            min_speech_ms: 0,     // 破棄を切る (個別テストで上書き)
+            min_speech_ms: 0, // 破棄を切る (個別テストで上書き)
             min_silence_ms: 0,
             speech_pad_ms: 0,
             max_speech_ms: 0,
@@ -317,7 +326,7 @@ mod tests {
         // 512 サンプル/フレーム。min_silence=512 (=1フレーム), min_speech=0。
         let mut c = base_config();
         c.min_silence_ms = 32; // 32ms @16k = 512 samples = 1 frame
-        // 20 フレーム発話 → 30 フレーム無音
+                               // 20 フレーム発話 → 30 フレーム無音
         let mut probs = vec![0.9f32; 20];
         probs.extend(vec![0.1f32; 30]);
         let segs = run_probs(&c, &probs);
@@ -334,11 +343,14 @@ mod tests {
         let mut c = base_config();
         c.min_silence_ms = 32; // 1 frame
         c.min_speech_ms = 250; // 250ms @16k = 4000 samples ≈ 7.8 frames
-        // 5 フレーム発話 (5*512=2560 < 4000) → 破棄されるべき
+                               // 5 フレーム発話 (5*512=2560 < 4000) → 破棄されるべき
         let mut probs = vec![0.9f32; 5];
         probs.extend(vec![0.1f32; 10]);
         let segs = run_probs(&c, &probs);
-        assert!(segs.is_empty(), "short segment must be discarded, got {segs:?}");
+        assert!(
+            segs.is_empty(),
+            "short segment must be discarded, got {segs:?}"
+        );
 
         // 10 フレーム発話 (5120 >= 4000) → 採用
         let mut probs2 = vec![0.9f32; 10];
@@ -353,7 +365,7 @@ mod tests {
         // 短い無音 (< min_silence) はセグメントを切らない。
         let mut c = base_config();
         c.min_silence_ms = 192; // 192ms @16k = 3072 samples = 6 frames
-        // 10発話 → 3無音 (3*512=1536 < 3072 なので継続) → 10発話 → 長い無音
+                                // 10発話 → 3無音 (3*512=1536 < 3072 なので継続) → 10発話 → 長い無音
         let mut probs = vec![0.9f32; 10];
         probs.extend(vec![0.1f32; 3]);
         probs.extend(vec![0.9f32; 10]);
@@ -370,10 +382,10 @@ mod tests {
         // min_silence をちょうど超える無音は切る。
         let mut c = base_config();
         c.min_silence_ms = 64; // 64ms = 1024 samples = 2 frames
-        // 5発話 → 3無音 (3*512=1536) → 5発話 → 無音
-        // 無音3フレーム目で (frame_start - temp_end) を評価:
-        //   temp_end は無音1フレーム目先頭。無音Nフレーム目先頭 - temp_end = (N-1)*512。
-        //   >= 1024 となるのは N-1 >= 2 → N>=3 → 3フレーム目の feed で確定。
+                               // 5発話 → 3無音 (3*512=1536) → 5発話 → 無音
+                               // 無音3フレーム目で (frame_start - temp_end) を評価:
+                               //   temp_end は無音1フレーム目先頭。無音Nフレーム目先頭 - temp_end = (N-1)*512。
+                               //   >= 1024 となるのは N-1 >= 2 → N>=3 → 3フレーム目の feed で確定。
         let mut probs = vec![0.9f32; 5];
         probs.extend(vec![0.1f32; 3]);
         probs.extend(vec![0.9f32; 5]);
@@ -388,11 +400,11 @@ mod tests {
     fn speech_pad_extends_and_clamps() {
         let mut c = base_config();
         c.min_silence_ms = 32; // 1 frame
-        c.speech_pad_ms = 32;  // 32ms = 512 samples
-        // フレーム2..5 が発話 (先頭に無音2フレームを置き、開始 pad が 0 でクランプされない様に)
-        let mut probs = vec![0.1f32; 2];   // フレーム0,1 無音
-        probs.extend(vec![0.9f32; 4]);     // フレーム2..5 発話 (開始=2*512=1024)
-        probs.extend(vec![0.1f32; 5]);     // 無音
+        c.speech_pad_ms = 32; // 32ms = 512 samples
+                              // フレーム2..5 が発話 (先頭に無音2フレームを置き、開始 pad が 0 でクランプされない様に)
+        let mut probs = vec![0.1f32; 2]; // フレーム0,1 無音
+        probs.extend(vec![0.9f32; 4]); // フレーム2..5 発話 (開始=2*512=1024)
+        probs.extend(vec![0.1f32; 5]); // 無音
         let segs = run_probs(&c, &probs);
         assert_eq!(segs.len(), 1);
         // 開始 = 1024 - 512 = 512。
@@ -418,9 +430,9 @@ mod tests {
     fn pad_does_not_overlap_previous_segment() {
         // 2 セグメントで、後段の開始 pad が前段の終了 pad を侵さないようクランプ。
         let mut c = base_config();
-        c.min_silence_ms = 64;  // 2 frames
-        c.speech_pad_ms = 192;  // 3072 samples = 6 frames (大きめに)
-        // 5発話 → 3無音 (確定) → 5発話 → 無音
+        c.min_silence_ms = 64; // 2 frames
+        c.speech_pad_ms = 192; // 3072 samples = 6 frames (大きめに)
+                               // 5発話 → 3無音 (確定) → 5発話 → 無音
         let mut probs = vec![0.9f32; 5];
         probs.extend(vec![0.1f32; 3]);
         probs.extend(vec![0.9f32; 5]);
@@ -445,7 +457,10 @@ mod tests {
         // 連続発話 20 フレーム (無音なし)。max_speech=6フレームごとに分割。
         let probs = vec![0.9f32; 20];
         let segs = run_probs(&c, &probs);
-        assert!(segs.len() >= 2, "max_speech must force at least one split, got {segs:?}");
+        assert!(
+            segs.len() >= 2,
+            "max_speech must force at least one split, got {segs:?}"
+        );
         // 各セグメントが max_speech 程度で切られている。
         for s in &segs {
             assert!(
@@ -512,7 +527,11 @@ mod tests {
             total_probs += vad.last_frame_probabilities().len();
             fed += take;
         }
-        assert_eq!(total_probs, total / 512, "all complete frames must be inferred");
+        assert_eq!(
+            total_probs,
+            total / 512,
+            "all complete frames must be inferred"
+        );
     }
 
     #[test]

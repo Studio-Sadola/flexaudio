@@ -9,7 +9,7 @@
 //! これは consumer 側のインデックスにも触れるため SPSC のロックフリー前提を満たさない
 //! （ringbuf ドキュメント: overwrite を並行に行うにはロックが要る）。本リングの
 //! producer は **RT スレッドではなく取り込み/加工スレッド**（通常優先度・§0.7）なので、
-//! リング本体を短い [`Mutex`] で保護する。RT 経路（[`crate::raw_ring`]）はこのロックに
+//! リング本体を短い [`Mutex`] で保護する。RT 経路（[`mod@crate::raw_ring`]）はこのロックに
 //! 一切触れない。
 
 use std::sync::atomic::{AtomicU64, Ordering};

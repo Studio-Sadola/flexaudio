@@ -29,6 +29,7 @@
 //! セクションでのみ引かれる。
 
 #![cfg(target_os = "linux")]
+#![warn(missing_docs)]
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -285,7 +286,7 @@ impl Drop for PwSystemBackend {
 /// Client global props に**常在**する（デーモンがソケット資格情報から付与＝詐称不能。
 /// 実機 stock 検証で確定）。ノードは `client.id` で所有 Client を指すだけ。よって
 /// 「PID → `pipewire.sec.pid == target_pid` の Client の global id → その id を
-/// `client.id` に持つ `Stream/Output/Audio` ノード」の順に辿る（[`resolve_node_pid`]
+/// `client.id` に持つ `Stream/Output/Audio` ノード」の順に辿る（`resolve_node_pid`
 /// 参照）。
 ///
 /// 自前 stream は `stream.connect(Direction::Input, None, ...)` で接続するが
@@ -538,9 +539,7 @@ struct ProcessKeep {
     _listener: pw::stream::StreamListener<UserData>,
     _registry: pw::registry::RegistryRc,
     _registry_listener: pw::registry::Listener,
-    _links: std::rc::Rc<
-        std::cell::RefCell<std::collections::HashMap<u32, Vec<pw::link::Link>>>,
-    >,
+    _links: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, Vec<pw::link::Link>>>>,
     _core: pw::core::CoreRc,
 }
 
@@ -653,7 +652,10 @@ fn pair_ports(out_ports: &[(u32, String)], in_ports: &[(u32, String)]) -> Vec<(u
 ///
 /// Client が先に来ても Node が先に来ても、各 global 到着時にこの関数で再評価すれば
 /// 順序に依存せず正しく PID を解決できる（どちらも揃った時点で `Some(pid)` になる）。
-fn resolve_node_pid(entry: &NodeEntry, client_pid: &std::collections::HashMap<u32, u32>) -> Option<u32> {
+fn resolve_node_pid(
+    entry: &NodeEntry,
+    client_pid: &std::collections::HashMap<u32, u32>,
+) -> Option<u32> {
     if let Some(pid) = entry.app_pid {
         // ノードに直接 PID が載る将来構成。Client を介さず確定。
         return Some(pid);
@@ -1015,8 +1017,9 @@ fn setup_pw_process(
                             return;
                         }
                         // 所有 Client を指す client.id。
-                        let owning_client_id =
-                            props.get(*pw::keys::CLIENT_ID).and_then(|s| s.parse::<u32>().ok());
+                        let owning_client_id = props
+                            .get(*pw::keys::CLIENT_ID)
+                            .and_then(|s| s.parse::<u32>().ok());
                         // 将来互換: ノード自身に PID が載れば直接照合可。
                         let app_pid = props
                             .get(*pw::keys::SEC_PID)
@@ -1031,17 +1034,23 @@ fn setup_pw_process(
                     }
                     pw::types::ObjectType::Port => {
                         // ポートを蓄積する（対象出力ポート・自入力ポートの双方をここから引く）。
-                        let Some(node_id) =
-                            props.get(*pw::keys::NODE_ID).and_then(|s| s.parse::<u32>().ok())
+                        let Some(node_id) = props
+                            .get(*pw::keys::NODE_ID)
+                            .and_then(|s| s.parse::<u32>().ok())
                         else {
                             return;
                         };
-                        let direction =
-                            props.get(*pw::keys::PORT_DIRECTION).unwrap_or("").to_string();
+                        let direction = props
+                            .get(*pw::keys::PORT_DIRECTION)
+                            .unwrap_or("")
+                            .to_string();
                         if direction != "out" && direction != "in" {
                             return;
                         }
-                        let channel = props.get(*pw::keys::AUDIO_CHANNEL).unwrap_or("").to_string();
+                        let channel = props
+                            .get(*pw::keys::AUDIO_CHANNEL)
+                            .unwrap_or("")
+                            .to_string();
                         ports_for_global.borrow_mut().insert(
                             global.id,
                             PortEntry {
@@ -1090,7 +1099,8 @@ fn setup_pw_process(
                 let (linked_out_owner, was_self_in_port): (Option<u32>, bool) = {
                     let ports = ports_for_remove.borrow();
                     let owner = ports.get(&id).and_then(|p| {
-                        if p.direction == "out" && linked_for_remove.borrow().contains_key(&p.node_id)
+                        if p.direction == "out"
+                            && linked_for_remove.borrow().contains_key(&p.node_id)
                         {
                             Some(p.node_id)
                         } else {
@@ -1658,7 +1668,9 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
     // 抜けられる。done は必ず来るので無限化しない。
     let done = Rc::new(std::cell::Cell::new(false));
     let stage = Rc::new(std::cell::Cell::new(0u8));
-    let pending1 = core.sync(0).map_err(|e| format!("pipewire sync failed: {e}"))?;
+    let pending1 = core
+        .sync(0)
+        .map_err(|e| format!("pipewire sync failed: {e}"))?;
     let pending1 = Rc::new(std::cell::Cell::new(pending1.seq()));
 
     let done_for_cb = done.clone();
@@ -1769,10 +1781,10 @@ fn extract_json_name(value: &str) -> Option<String> {
 /// PipeWire レジストリを**永続的に**監視してデバイスの着脱（ホットプラグ）を
 /// [`DeviceEvent`] として配信する watcher。
 ///
-/// # [`PwSystemBackend`] / [`enumerate_pw`] との関係
+/// # [`PwSystemBackend`] / `enumerate_pw` との関係
 ///
 /// [`PwSystemBackend`] と同型の「専用スレッド 1 本所有」方式だが、性質が異なる:
-/// - **短命でなく永続**: [`enumerate_pw`] は `core.sync` の `done` で `quit()` して
+/// - **短命でなく永続**: `enumerate_pw` は `core.sync` の `done` で `quit()` して
 ///   即終了するが、こちらは `done` でも `quit()` せず**回し続け**、registry の
 ///   `global` / `global_remove` を [`stop`](Self::stop) まで受け取り続ける。
 /// - **RawSink 無し**: 音声は録らず、registry の global/global_remove だけを見る。
@@ -1879,7 +1891,7 @@ impl PwDeviceWatcher {
 
     /// 監視を停止する（二重 stop / 未 start 後の stop に安全）。
     ///
-    /// [`PwSystemBackend::stop`] と同型: 監視スレッドへ [`Terminate`] を送ると、
+    /// [`PwSystemBackend::stop`] と同型: 監視スレッドへ `Terminate` を送ると、
     /// loop に attach 済みの受信端コールバックが `main_loop.quit()` を
     /// **スレッド自身から**呼び、`run()` を抜ける。`join()` で破棄完了まで待つ。
     pub fn stop(&mut self) {
@@ -2200,7 +2212,9 @@ fn setup_watch(
     // property ダンプ」が揃っているので、以後の global/global_remove/property
     // 変化を「ユーザー起因の着脱・既定変更」とみなして配信できる。
     let stage = Rc::new(Cell::new(0u8));
-    let pending = core.sync(0).map_err(|e| format!("pipewire sync failed: {e}"))?;
+    let pending = core
+        .sync(0)
+        .map_err(|e| format!("pipewire sync failed: {e}"))?;
     let pending = Rc::new(Cell::new(pending.seq()));
 
     let stage_for_cb = stage.clone();
@@ -2429,14 +2443,18 @@ mod tests {
         let (prod, mut cons) = raw_ring(1 << 18);
         let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
         let mut be = PwSystemBackend::new(false);
-        be.start(sink).expect("start should succeed on a PipeWire desktop");
+        be.start(sink)
+            .expect("start should succeed on a PipeWire desktop");
         // 録音が回るのを少し待つ。
         thread::sleep(Duration::from_millis(500));
         be.stop();
         // 何らかのサンプルが届いている（無音 sink でも 0.0 サンプルは流れる）。
         let mut out = vec![0.0f32; 1920];
         let got = cons.pop_slice(&mut out);
-        assert!(got > 0, "expected captured samples from the default sink monitor");
+        assert!(
+            got > 0,
+            "expected captured samples from the default sink monitor"
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -2777,7 +2795,12 @@ mod tests {
         // 上限 + 10 件積む。id を node 番号として埋め込み、どれが残ったか追える。
         let total = MAX_WATCH_EVENTS + 10;
         for i in 0..total {
-            enqueue_event(&events, DeviceEvent::Removed { id: format!("n{i}") });
+            enqueue_event(
+                &events,
+                DeviceEvent::Removed {
+                    id: format!("n{i}"),
+                },
+            );
         }
         let q = events.lock().unwrap();
         // 長さは上限を超えない。

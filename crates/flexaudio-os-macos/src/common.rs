@@ -130,7 +130,9 @@ fn read_tap_asbd(tap_id: AudioObjectID) -> Option<AudioStreamBasicDescription> {
             0,
             core::ptr::null(),
             NonNull::from(&mut size),
-            NonNull::new_unchecked((&mut asbd as *mut AudioStreamBasicDescription).cast::<c_void>()),
+            NonNull::new_unchecked(
+                (&mut asbd as *mut AudioStreamBasicDescription).cast::<c_void>(),
+            ),
         )
     };
     if status != NO_ERR {

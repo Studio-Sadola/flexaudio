@@ -3,6 +3,8 @@
 //! [`Stream`] が 1 ソースのキャプチャパイプライン（backend → RawRing → 加工スレッド
 //! → Normalizer → ChunkRing → poll + ウォッチドッグ復帰）を駆動する。
 
+#![warn(missing_docs)]
+
 pub use flexaudio_core as core;
 
 pub mod device_watcher;
@@ -182,7 +184,9 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
         SourceKind::SystemLoopback => {
             #[cfg(target_os = "linux")]
             {
-                Box::new(flexaudio_os_linux::PwSystemBackend::new(config.exclude_self))
+                Box::new(flexaudio_os_linux::PwSystemBackend::new(
+                    config.exclude_self,
+                ))
             }
             #[cfg(target_os = "windows")]
             {
@@ -192,7 +196,9 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
             }
             #[cfg(target_os = "macos")]
             {
-                Box::new(flexaudio_os_macos::MacSystemBackend::new(config.exclude_self))
+                Box::new(flexaudio_os_macos::MacSystemBackend::new(
+                    config.exclude_self,
+                ))
             }
             #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             {

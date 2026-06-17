@@ -102,7 +102,10 @@ enum EncodingArg {
 
 /// flexaudio キャプチャ CLI。
 #[derive(Debug, Parser)]
-#[command(name = "flexaudio-cli", about = "flexaudio キャプチャ CLI（実機テスト用）")]
+#[command(
+    name = "flexaudio-cli",
+    about = "flexaudio キャプチャ CLI（実機テスト用）"
+)]
 struct Cli {
     /// 録音せず、利用可能なオーディオデバイスを一覧表示して終了する
     /// （`devices()` の統合列挙。`--source` 等とは独立に動く）。
@@ -114,7 +117,7 @@ struct Cli {
     #[arg(long)]
     watch_devices: bool,
 
-    /// キャプチャするソース（mic / system[Linux] / process[Linux]）。
+    /// キャプチャするソース（mic / system\[Linux\] / process\[Linux\]）。
     #[arg(long, value_enum, default_value_t = SourceArg::Mic)]
     source: SourceArg,
 
@@ -357,9 +360,7 @@ impl SwitchScheduler {
                     eprintln!("[switch] -> {label}");
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[switch] 警告: {label} への切替に失敗しました（録音は継続）: {e}"
-                    );
+                    eprintln!("[switch] 警告: {label} への切替に失敗しました（録音は継続）: {e}");
                 }
             }
             self.next += 1;
@@ -444,50 +445,48 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         (first, label)
     } else {
         match cli.source {
-        SourceArg::Mic => (SourceKind::Mic, "mic（既定入力デバイス）"),
-        SourceArg::System => {
-            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-            {
-                (
-                    SourceKind::SystemLoopback,
-                    "system（既定出力の monitor / PipeWire）",
-                )
-            }
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            {
-                return Err(
+            SourceArg::Mic => (SourceKind::Mic, "mic（既定入力デバイス）"),
+            SourceArg::System => {
+                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                {
+                    (
+                        SourceKind::SystemLoopback,
+                        "system（既定出力の monitor / PipeWire）",
+                    )
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+                {
+                    return Err(
                     "--source system（システム出力ループバック）は現在 Linux / Windows / macOS のみ対応です。"
                         .into(),
                 );
+                }
             }
-        }
-        SourceArg::Process => {
-            // process では PID 必須。無ければ分かりやすいエラーで止める
-            // （facade も InvalidArg を返すが、CLI では人間向け文言で先に弾く）。
-            // PID 必須チェックは OS 非依存（system/process 対応 OS なら常に要求）。
-            if cli.process_id.is_none() {
-                return Err(
-                    "--source process には --process-id <PID> が必要です。\
+            SourceArg::Process => {
+                // process では PID 必須。無ければ分かりやすいエラーで止める
+                // （facade も InvalidArg を返すが、CLI では人間向け文言で先に弾く）。
+                // PID 必須チェックは OS 非依存（system/process 対応 OS なら常に要求）。
+                if cli.process_id.is_none() {
+                    return Err("--source process には --process-id <PID> が必要です。\
                      （対象プロセスの PID を指定してください。例: \
                      speaker-test を鳴らして得た PID）"
-                        .into(),
-                );
-            }
-            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-            {
-                (
-                    SourceKind::ProcessLoopback,
-                    "process（特定 PID 出力の fan-out / PipeWire）",
-                )
-            }
-            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-            {
-                return Err(
+                        .into());
+                }
+                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                {
+                    (
+                        SourceKind::ProcessLoopback,
+                        "process（特定 PID 出力の fan-out / PipeWire）",
+                    )
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+                {
+                    return Err(
                     "--source process（プロセス出力ループバック）は現在 Linux / Windows / macOS のみ対応です。"
                         .into(),
                 );
+                }
             }
-        }
         }
     };
 
@@ -546,7 +545,10 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
             .map(|s| format!("{}:{}s", source_kind_label(s.kind), s.secs))
             .collect();
         let total: u32 = segs.iter().map(|s| s.secs).sum();
-        log!("スケジュール       : {}（計 {total} 秒・1 本の連続ストリーム）", plan.join(" -> "));
+        log!(
+            "スケジュール       : {}（計 {total} 秒・1 本の連続ストリーム）",
+            plan.join(" -> ")
+        );
     } else if cli.seconds == 0 {
         log!("キャプチャ秒数     : 無限（Ctrl-C / パイプ切れで停止）");
     } else {
@@ -577,8 +579,7 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
 /// id は安定 ID（cpal=デバイス名 / PipeWire=node.name）。デバイスが 1 つも無い環境では
 /// その旨を表示する（エラーにはしない）。
 fn list_devices() -> std::result::Result<(), String> {
-    let devices =
-        flexaudio::devices().map_err(|e| format!("デバイス列挙に失敗しました: {e}"))?;
+    let devices = flexaudio::devices().map_err(|e| format!("デバイス列挙に失敗しました: {e}"))?;
 
     if devices.is_empty() {
         println!("利用可能なオーディオデバイスが見つかりませんでした。");
@@ -664,11 +665,7 @@ fn watch_devices_loop() -> std::result::Result<(), String> {
                     eprintln!("[-] REMOVED {id}");
                 }
                 DeviceEvent::DefaultChanged { kind, id } => {
-                    eprintln!(
-                        "[*] DEFAULT {:<7} -> {}",
-                        source_kind_label(kind),
-                        id,
-                    );
+                    eprintln!("[*] DEFAULT {:<7} -> {}", source_kind_label(kind), id,);
                 }
                 // DeviceEvent は #[non_exhaustive]。将来バリアント追加に備えた前方互換アーム
                 // （未知種別もデバッグ表現で表示し、握り潰さない）。
@@ -819,7 +816,7 @@ fn run_wav(
 /// stdout raw PCM ストリーミング経路。
 ///
 /// チャンク到着次第すぐ stdout へ書き、各回 flush して溜め込まない（低レイテンシ）。
-/// `--seconds 0` なら無限（Ctrl-C / パイプ切れ[BrokenPipe] で正常停止）、
+/// `--seconds 0` なら無限（Ctrl-C / パイプ切れ `BrokenPipe` で正常停止）、
 /// `--seconds N>0` なら N 秒で停止。どちらも stop 後にリング残チャンクを出し切る。
 fn run_stdout_stream(
     cli: &Cli,
@@ -960,11 +957,7 @@ fn run_stdout_stream(
 ///
 /// 各サンプル単位の小書き込みを避けるため、チャンク分のバイト列を一旦まとめてから
 /// 1 回の `write_all` で出す。書き込み後すぐ flush（低レイテンシ・溜め込み無し）。
-fn write_chunk<W: Write>(
-    out: &mut W,
-    chunk: &AudioChunk,
-    encoding: EncodingArg,
-) -> io::Result<()> {
+fn write_chunk<W: Write>(out: &mut W, chunk: &AudioChunk, encoding: EncodingArg) -> io::Result<()> {
     match encoding {
         EncodingArg::F32 => {
             // f32 LE: 契約そのまま。1 サンプル 4 byte。
@@ -1063,9 +1056,7 @@ fn describe_error(err: Error) -> String {
         Error::PermissionDenied => {
             "マイクへのアクセス権限がありません。OS のマイク権限設定を確認してください。".into()
         }
-        Error::DeviceLost => {
-            "キャプチャ中に入力デバイスが失われました（切断など）。".into()
-        }
+        Error::DeviceLost => "キャプチャ中に入力デバイスが失われました（切断など）。".into(),
         other => format!("ストリーム初期化に失敗しました: {other}"),
     }
 }

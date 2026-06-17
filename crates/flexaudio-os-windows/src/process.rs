@@ -131,9 +131,10 @@ unsafe fn make_blob_propvariant(
     };
     // from_raw の引数型 imp::PROPVARIANT は private で名前を書けないため、`_` 推論で
     // transmute する（RawPropVariant とレイアウト一致を上の const assert で担保）。
-    core::mem::ManuallyDrop::new(PROPVARIANT::from_raw(
-        core::mem::transmute::<RawPropVariant, _>(raw),
-    ))
+    core::mem::ManuallyDrop::new(PROPVARIANT::from_raw(core::mem::transmute::<
+        RawPropVariant,
+        _,
+    >(raw)))
 }
 
 /// `ActivateCompleted` で起動側スレッドへ完了を知らせるだけの完了ハンドラ。
@@ -278,7 +279,7 @@ fn fixed_process_format() -> WAVEFORMATEX {
         nChannels: NATIVE_CHANNELS,                // 2
         nSamplesPerSec: NATIVE_RATE,               // 48000
         wBitsPerSample: 32,
-        nBlockAlign: 8,                  // channels * bits/8 = 2 * 4
+        nBlockAlign: 8,                   // channels * bits/8 = 2 * 4
         nAvgBytesPerSec: NATIVE_RATE * 8, // rate * blockAlign
         cbSize: 0,
     }
@@ -394,7 +395,8 @@ pub(crate) unsafe fn setup_process_loopback(
     if let Err(e) = hr.ok() {
         return Err(map_process_activation_err("activation result HRESULT", e));
     }
-    let unknown = unknown.ok_or_else(|| Error::Backend("activation returned null interface".into()))?;
+    let unknown =
+        unknown.ok_or_else(|| Error::Backend("activation returned null interface".into()))?;
     let client: IAudioClient = unknown
         .cast()
         .map_err(|e| map_hr("cast activated IUnknown to IAudioClient", e))?;

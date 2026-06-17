@@ -23,6 +23,8 @@
 //!                                       ChunkRing (ringbuf, DROP_OLDEST) --try_pop--> [poll]
 //! ```
 
+#![warn(missing_docs)]
+
 pub mod backend;
 pub mod chunk_ring;
 pub mod clock;

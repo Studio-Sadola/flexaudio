@@ -1,7 +1,7 @@
 //! ハード不要のテスト/検証用キャプチャバックエンド。
 //!
 //! [`MockBackend`] は実 OS デバイスの代わりにサイン波を生成し、概ねリアルタイムの
-//! ペースで [`RawSink`](flexaudio_core::RawSink) へ push する。これにより
+//! ペースで [`RawSink`] へ push する。これにより
 //! [`Stream`](crate::Stream) を実機なしで end-to-end 駆動できる。
 
 use std::f32::consts::PI;
@@ -80,7 +80,8 @@ impl CaptureBackend for MockBackend {
         let handle = thread::Builder::new()
             .name("flexaudio-mock-gen".into())
             .spawn(move || {
-                let frames_per_block = ((sample_rate as u64 * BLOCK_MS as u64) / 1000).max(1) as usize;
+                let frames_per_block =
+                    ((sample_rate as u64 * BLOCK_MS as u64) / 1000).max(1) as usize;
                 let block_dur = Duration::from_millis(BLOCK_MS as u64);
                 let two_pi_f_over_sr = 2.0 * PI * freq / sample_rate as f32;
 
@@ -114,7 +115,9 @@ impl CaptureBackend for MockBackend {
                     thread::sleep(block_dur);
                 }
             })
-            .map_err(|e| flexaudio_core::types::Error::Backend(format!("spawn mock thread: {e}")))?;
+            .map_err(|e| {
+                flexaudio_core::types::Error::Backend(format!("spawn mock thread: {e}"))
+            })?;
 
         self.handle = Some(handle);
         Ok(())

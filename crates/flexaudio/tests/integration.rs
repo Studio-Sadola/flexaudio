@@ -38,7 +38,12 @@ fn mock_mono_44100_to_stereo_960_chunks() {
     }
     // seq は単調増加（DROP_OLDEST が起きても増加は保たれる）
     for w in chunks.windows(2) {
-        assert!(w[1].seq > w[0].seq, "seq が単調増加していない: {} -> {}", w[0].seq, w[1].seq);
+        assert!(
+            w[1].seq > w[0].seq,
+            "seq が単調増加していない: {} -> {}",
+            w[0].seq,
+            w[1].seq
+        );
     }
 }
 
@@ -82,9 +87,18 @@ fn mock_output_16k_mono() {
         assert_eq!(c.frames, 320, "16k 20ms = 320 frame でない");
         assert_eq!(c.data.len(), 320, "mono interleaved (320*1) でない");
         // peak/rms 妥当性（合成サイン波 amplitude 0.5）。
-        assert!(c.peak > 0.0 && c.peak <= 1.5, "peak が妥当でない: {}", c.peak);
+        assert!(
+            c.peak > 0.0 && c.peak <= 1.5,
+            "peak が妥当でない: {}",
+            c.peak
+        );
         assert!(c.rms > 0.0 && c.rms <= 1.0, "rms が妥当でない: {}", c.rms);
-        assert!(c.peak >= c.rms, "peak >= rms のはず: peak={} rms={}", c.peak, c.rms);
+        assert!(
+            c.peak >= c.rms,
+            "peak >= rms のはず: peak={} rms={}",
+            c.peak,
+            c.rms
+        );
     }
 }
 
@@ -109,7 +123,11 @@ fn mock_output_16k_stereo() {
     for c in &chunks {
         assert_eq!(c.frames, 320, "16k 20ms = 320 frame でない");
         assert_eq!(c.data.len(), 640, "stereo interleaved (320*2) でない");
-        assert!(c.peak > 0.0 && c.peak <= 1.5, "peak が妥当でない: {}", c.peak);
+        assert!(
+            c.peak > 0.0 && c.peak <= 1.5,
+            "peak が妥当でない: {}",
+            c.peak
+        );
         assert!(c.rms > 0.0 && c.rms <= 1.0, "rms が妥当でない: {}", c.rms);
     }
 }

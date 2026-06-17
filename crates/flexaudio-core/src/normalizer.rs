@@ -453,7 +453,11 @@ impl OutputStage {
             None
         } else {
             // 入力は内部正規形 48000、出力は out_sample_rate。チャンネルは out_channels。
-            Some(ResamplerState::new(SAMPLE_RATE, out_sample_rate, out_channels)?)
+            Some(ResamplerState::new(
+                SAMPLE_RATE,
+                out_sample_rate,
+                out_channels,
+            )?)
         };
         Ok(Self {
             out_channels,
@@ -647,7 +651,10 @@ mod tests {
             chunks += 1;
         }
         // 16000/320 = 50 チャンク/秒。リサンプラ遅延で約 50。
-        assert!((47..=50).contains(&chunks), "expected ~50 chunks, got {chunks}");
+        assert!(
+            (47..=50).contains(&chunks),
+            "expected ~50 chunks, got {chunks}"
+        );
     }
 
     /// 出力 {16000, 2} → 320 frame・640 sample（stereo）。
@@ -670,7 +677,10 @@ mod tests {
             assert_eq!(c.len(), 640, "16k stereo 20ms = 320 frame * 2 = 640 sample");
             chunks += 1;
         }
-        assert!((47..=50).contains(&chunks), "expected ~50 chunks, got {chunks}");
+        assert!(
+            (47..=50).contains(&chunks),
+            "expected ~50 chunks, got {chunks}"
+        );
     }
 
     /// 出力 {8000, 2} → 160 frame・320 sample。
@@ -681,7 +691,9 @@ mod tests {
             channels: 2,
         };
         let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
-        let stereo: Vec<f32> = (0..48_000 * 2).map(|i| (i as f32 * 1e-5).sin() * 0.2).collect();
+        let stereo: Vec<f32> = (0..48_000 * 2)
+            .map(|i| (i as f32 * 1e-5).sin() * 0.2)
+            .collect();
         for block in stereo.chunks(480 * 2) {
             n.push(block, 0).expect("push");
         }
@@ -690,7 +702,10 @@ mod tests {
             assert_eq!(c.len(), 320, "8k stereo 20ms = 160 frame * 2 = 320 sample");
             chunks += 1;
         }
-        assert!((47..=50).contains(&chunks), "expected ~50 chunks, got {chunks}");
+        assert!(
+            (47..=50).contains(&chunks),
+            "expected ~50 chunks, got {chunks}"
+        );
     }
 
     /// stereo→mono は L/R 平均（L=+a, R=-a の逆相は 0 に近づく）。

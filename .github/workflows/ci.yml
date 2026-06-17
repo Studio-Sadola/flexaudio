@@ -17,16 +17,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
+      - name: Rustfmt (check formatting)
+        run: cargo fmt --all --check
       - name: Clippy (deny warnings)
         run: >-
           cargo clippy
           -p flexaudio -p flexaudio-core -p flexaudio-cli -p flexaudio-mic
           -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
           --all-targets -- -D warnings
+      - name: Doc (deny warnings, docs.rs-equivalent for Linux crates)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: >-
+          cargo doc --no-deps
+          -p flexaudio -p flexaudio-core -p flexaudio-cli -p flexaudio-mic
+          -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
       - name: Test (ignored real-audio tests auto-skip)
         run: >-
           cargo test

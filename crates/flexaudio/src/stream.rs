@@ -1,15 +1,16 @@
 //! 1 ソースのキャプチャパイプラインを所有する [`Stream`]。
 //!
-//! コア部品（[`RawRing`](flexaudio_core::raw_ring) / [`Normalizer`] /
-//! [`ChunkRing`](flexaudio_core::chunk_ring) / [`ClockNormalizer`] /
+//! コア部品（[`RawRing`](mod@flexaudio_core::raw_ring) / [`Normalizer`] /
+//! [`ChunkRing`](mod@flexaudio_core::chunk_ring) / [`ClockNormalizer`] /
 //! [`CaptureBackend`]）を配線し、プル型 API（[`poll_chunk`](Stream::poll_chunk) /
 //! [`poll_event`](Stream::poll_event)）で消費側へ供給する。
 //!
 //! # スレッド構成
-//! - **backend の RT スレッド**: [`RawSink`] 経由で生フレームを [`RawRing`] へ push のみ
-//!   （非ブロッキング）。
+//! - **backend の RT スレッド**: [`RawSink`] 経由で生フレームを
+//!   [`RawRing`](mod@flexaudio_core::raw_ring) へ push のみ（非ブロッキング）。
 //! - **取り込み/加工スレッド (1 本・通常優先度)**: RawRing を pop → [`Normalizer`] で
-//!   48k/stereo/20ms 化 → 単調増加 `seq` を付与 → [`ChunkRing`]（DROP_OLDEST）へ push。
+//!   48k/stereo/20ms 化 → 単調増加 `seq` を付与 →
+//!   [`ChunkRing`](mod@flexaudio_core::chunk_ring)（DROP_OLDEST）へ push。
 //!   最後にサンプルを処理した時刻を `AtomicI64` で更新する。
 //! - **ウォッチドッグスレッド (1 本・~250ms tick)**: 一定時間サンプル更新が止まったら
 //!   「無音死」と判定し、backend を指数バックオフ（250ms→5s・ジッタ）で再オープンする。
@@ -137,9 +138,7 @@ impl Stream {
     /// から [`Normalizer`] を構成する。
     pub fn open(config: StreamConfig, backend: Box<dyn CaptureBackend>) -> Result<Stream> {
         if config.ring_capacity_chunks == 0 {
-            return Err(Error::InvalidArg(
-                "ring_capacity_chunks must be > 0".into(),
-            ));
+            return Err(Error::InvalidArg("ring_capacity_chunks must be > 0".into()));
         }
         // 出力フォーマットが MVP の対応域か検証（非対応は UnsupportedFormat）。
         config.output.validate()?;
@@ -203,7 +202,11 @@ impl Stream {
         // 取り込み/加工スレッド。初期 native_format は shared から読む
         // （以降は世代変化のたびに run_intake が shared を読み直して追従する）。
         let worker_shared = self.shared.clone();
-        let initial_native = *self.shared.native_format.lock().expect("native_format mutex");
+        let initial_native = *self
+            .shared
+            .native_format
+            .lock()
+            .expect("native_format mutex");
         let output = self.config.output;
         let worker = thread::Builder::new()
             .name("flexaudio-intake".into())
@@ -282,7 +285,11 @@ impl Stream {
     /// [`switch_source`](Self::switch_source) でソースを切り替えると新 backend の
     /// 値に更新される。表示・診断用（出力フォーマットは `config().output`）。
     pub fn native_format(&self) -> (u32, u16) {
-        *self.shared.native_format.lock().expect("native_format mutex")
+        *self
+            .shared
+            .native_format
+            .lock()
+            .expect("native_format mutex")
     }
 
     // --- 内部 ---
@@ -405,8 +412,11 @@ impl Stream {
                     //
                     // shared.native_format を新ソースの値へ更新。
                     {
-                        let mut nf =
-                            self.shared.native_format.lock().expect("native_format mutex");
+                        let mut nf = self
+                            .shared
+                            .native_format
+                            .lock()
+                            .expect("native_format mutex");
                         *nf = (rate, channels);
                     }
                     // 意図的切替なので RECOVERED は付けず DISCONTINUITY のみ。
@@ -425,8 +435,7 @@ impl Stream {
                     *be = new_backend;
                     // 新 consumer を共有へ載せ替え（旧 consumer は drop）。最後に行う。
                     {
-                        let mut rc =
-                            self.shared.raw_consumer.lock().expect("raw_consumer mutex");
+                        let mut rc = self.shared.raw_consumer.lock().expect("raw_consumer mutex");
                         *rc = Some(consumer);
                     }
                 }
@@ -458,7 +467,7 @@ impl Stream {
 
     /// 録音を止めずに入力ソース（mic/system/process）を切り替える高レベル入口。
     ///
-    /// `new_config` からソース別バックエンドを [`build_backend`](crate::build_backend)
+    /// `new_config` からソース別バックエンドを `build_backend`（facade 内 private）
     /// で構築し（失敗時は旧ソース無傷のまま `Err`）、[`switch_backend`](Self::switch_backend)
     /// で差し替える。出力フォーマット（`output`）は **切替不可**（チャンク
     /// frames/data.len が変わると連続ストリームが壊れるため）。変更要求は
@@ -472,7 +481,7 @@ impl Stream {
     /// - 未 start → [`Error::InvalidState`]。
     /// - `output` 変更要求 → [`Error::InvalidArg`]。
     /// - 新ソースの backend 構築失敗（process の PID 欠落・非対応 OS 等）→
-    ///   [`build_backend`](crate::build_backend) 由来のエラー（旧ソースは無傷）。
+    ///   `build_backend`（facade 内 private）由来のエラー（旧ソースは無傷）。
     /// - 新 backend の start 失敗 → [`switch_backend`](Self::switch_backend) が
     ///   旧ソースへ復帰したうえで当該エラーを返す。
     pub fn switch_source(&mut self, new_config: StreamConfig) -> Result<()> {

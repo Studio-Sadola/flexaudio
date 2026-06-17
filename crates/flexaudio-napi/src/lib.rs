@@ -384,20 +384,15 @@ impl FlexStream {
 
         // bridge スレッドへコマンドを送り、結果を同期受信する。
         let cmd_tx = self.cmd_tx.as_ref().ok_or_else(|| {
-            NapiError::new(
-                Status::GenericFailure,
-                "stream already stopped".to_string(),
-            )
+            NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
         })?;
         let (result_tx, result_rx) = mpsc::channel();
-        cmd_tx
-            .send(SwitchCmd { config, result_tx })
-            .map_err(|_| {
-                NapiError::new(
-                    Status::GenericFailure,
-                    "bridge thread is not running".to_string(),
-                )
-            })?;
+        cmd_tx.send(SwitchCmd { config, result_tx }).map_err(|_| {
+            NapiError::new(
+                Status::GenericFailure,
+                "bridge thread is not running".to_string(),
+            )
+        })?;
         // bridge スレッドが switch_source を実行して結果を返すのを待つ（同期）。
         match result_rx.recv() {
             Ok(Ok(())) => Ok(()),
@@ -489,7 +484,10 @@ pub fn watch_devices(on_event: DeviceTsfn) -> NapiResult<DeviceWatcherHandle> {
                 break;
             }
             while let Some(ev) = watcher.poll_event() {
-                on_event.call(device_event_to_js(ev), ThreadsafeFunctionCallMode::NonBlocking);
+                on_event.call(
+                    device_event_to_js(ev),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
             }
             thread::sleep(DEVICE_POLL_INTERVAL);
         }
@@ -525,7 +523,11 @@ pub fn open_mock_stream(
         },
         ..Default::default()
     };
-    let backend = Box::new(flexaudio::MockBackend::new(sample_rate, channels, freq_hz as f32));
+    let backend = Box::new(flexaudio::MockBackend::new(
+        sample_rate,
+        channels,
+        freq_hz as f32,
+    ));
     let mut stream = flexaudio::Stream::open(config, backend).map_err(to_napi_err)?;
     stream.start().map_err(to_napi_err)?;
     Ok(FlexStream::spawn(stream, on_chunk, None))
