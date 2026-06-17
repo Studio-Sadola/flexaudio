@@ -18,7 +18,9 @@
 //! use flexaudio_mic::CpalMicBackend;
 //! use flexaudio_core::{CaptureBackend, RawSink, raw_ring};
 //!
-//! let mut backend = CpalMicBackend::new();
+//! // 既定入力デバイス（device_id = None）。特定デバイスを選ぶなら
+//! // `CpalMicBackend::new(Some("デバイス名".into()))`（id = デバイス名）。
+//! let mut backend = CpalMicBackend::new(None);
 //! let (rate, channels) = backend.native_format();
 //! let (prod, _cons) = raw_ring(rate as usize * channels as usize); // 1 秒ぶん
 //! let sink = RawSink::new(prod, rate, channels);
@@ -33,7 +35,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::SampleFormat;
+use cpal::{Device, SampleFormat};
 
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::clock::monotonic_now_ns;
@@ -46,11 +48,13 @@ const FALLBACK_FORMAT: (u32, u16) = (48_000, 1);
 
 /// cpal を用いたマイク入力キャプチャバックエンド。
 ///
-/// 既定入力デバイスから生 interleaved `f32` フレームをキャプチャし
-/// [`RawSink`](flexaudio_core::RawSink) へ流す。詳細はモジュールドキュメント参照。
+/// 既定入力デバイス（`device_id = None`）または **安定 ID（= デバイス名）で選んだ
+/// 特定入力デバイス**（`device_id = Some(id)`）から生 interleaved `f32` フレームを
+/// キャプチャし [`RawSink`](flexaudio_core::RawSink) へ流す。詳細はモジュールドキュメント参照。
 ///
 /// この型は `Send`（保持するのは停止フラグ・[`JoinHandle`]・キャッシュ済み
-/// フォーマットのみ。`!Send` な [`cpal::Stream`] は所有スレッド内に閉じ込める）。
+/// フォーマット・選択 device_id のみ。`!Send` な [`cpal::Stream`] は所有スレッド内に
+/// 閉じ込める）。
 pub struct CpalMicBackend {
     /// 所有スレッドへの停止指示。`true` で stream を drop して終了する。
     stop_flag: Arc<AtomicBool>,
@@ -58,36 +62,74 @@ pub struct CpalMicBackend {
     handle: Option<JoinHandle<()>>,
     /// `new` 時に問い合わせてキャッシュしたネイティブフォーマット。
     native: (u32, u16),
+    /// 選択する入力デバイスの安定 ID（= デバイス名）。`None` で既定入力デバイス。
+    device_id: Option<String>,
 }
 
 impl CpalMicBackend {
     /// 新しいマイクバックエンドを構築する。
     ///
-    /// 構築時に既定入力デバイスのネイティブフォーマットを問い合わせてキャッシュする。
-    /// デバイスが無い／問い合わせに失敗した場合は [`FALLBACK_FORMAT`]（`(48000, 1)`）を
-    /// キャッシュし、実際の [`start`](Self::start) でデバイスが無ければ
-    /// [`Error::DeviceNotFound`] を返す。この関数は panic しない。
-    pub fn new() -> Self {
-        let native = query_native_format().unwrap_or(FALLBACK_FORMAT);
+    /// `device_id`:
+    /// - `None` → 既定入力デバイス（`host.default_input_device()`。従来挙動と同一）。
+    /// - `Some(id)` → `host.input_devices()` を走査し `device.name()? == id` の最初の
+    ///   デバイスを選ぶ（id は [`list_devices`] が返す安定 ID = デバイス名）。
+    ///
+    /// 構築時に**選択したデバイス**のネイティブフォーマットを問い合わせてキャッシュする。
+    /// デバイスが無い／一致しない／問い合わせに失敗した場合は [`FALLBACK_FORMAT`]
+    /// （`(48000, 1)`）をキャッシュし、実際の [`start`](Self::start) で
+    /// **device_id が一致しなければ [`Error::DeviceNotFound`]** を返す（new は panic
+    /// もエラーもせず必ず成功し、解決の成否は start/native_format で一貫させる）。
+    pub fn new(device_id: Option<String>) -> Self {
+        let native = query_native_format(device_id.as_deref()).unwrap_or(FALLBACK_FORMAT);
         Self {
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
             native,
+            device_id,
         }
     }
 }
 
 impl Default for CpalMicBackend {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
-/// 既定入力デバイスのネイティブフォーマット `(sample_rate, channels)` を取得する。
-/// デバイス／設定が取れなければ `None`。
-fn query_native_format() -> Option<(u32, u16)> {
+/// `device_id` で指定された入力デバイスを cpal ホストから解決する。
+///
+/// - `None` → `host.default_input_device()`（取れなければ [`Error::DeviceNotFound`]）。
+/// - `Some(id)` → `host.input_devices()` を走査し `device.name()? == id` の**最初の
+///   一致**を返す。一致が無ければ [`Error::DeviceNotFound`]。
+///
+/// 名前が取れないデバイス（安定キーを作れない）はスキップする。`input_devices()`
+/// 自体が失敗する環境（ALSA 不在等）も [`Error::DeviceNotFound`] に写す。
+fn resolve_input_device(host: &cpal::Host, device_id: Option<&str>) -> Result<Device> {
+    match device_id {
+        // 既定入力デバイス（従来挙動）。
+        None => host.default_input_device().ok_or(Error::DeviceNotFound),
+        // 安定 ID（= デバイス名）で一致する最初のデバイスを選ぶ。
+        Some(id) => {
+            let devices = host.input_devices().map_err(|_| Error::DeviceNotFound)?;
+            for device in devices {
+                // 名前が取れないデバイスは比較できないのでスキップ。
+                if let Ok(name) = device.name() {
+                    if name == id {
+                        return Ok(device);
+                    }
+                }
+            }
+            Err(Error::DeviceNotFound)
+        }
+    }
+}
+
+/// `device_id` で選択した入力デバイスのネイティブフォーマット
+/// `(sample_rate, channels)` を取得する。デバイス解決／設定取得に失敗すれば `None`
+/// （呼び元が [`FALLBACK_FORMAT`] へ落とす）。
+fn query_native_format(device_id: Option<&str>) -> Option<(u32, u16)> {
     let host = cpal::default_host();
-    let device = host.default_input_device()?;
+    let device = resolve_input_device(&host, device_id).ok()?;
     let config = device.default_input_config().ok()?;
     Some((config.sample_rate().0, config.channels()))
 }
@@ -158,13 +200,16 @@ impl CaptureBackend for CpalMicBackend {
         self.stop_flag.store(false, Ordering::SeqCst);
 
         let stop_flag = self.stop_flag.clone();
+        // 選択デバイスを所有スレッドへ move（cpal::Device は !Send なのでスレッド内で
+        // 解決する。device_id 文字列だけを渡してスレッド内で resolve する）。
+        let device_id = self.device_id.clone();
         // build/play の成否を所有スレッドから start() へ返すための ready channel。
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
 
         let handle = thread::Builder::new()
             .name("flexaudio-mic-cpal".into())
             .spawn(move || {
-                run_capture_thread(sink, stop_flag, ready_tx);
+                run_capture_thread(sink, device_id, stop_flag, ready_tx);
             })
             .map_err(|e| Error::Backend(format!("spawn cpal mic thread: {e}")))?;
 
@@ -213,10 +258,11 @@ impl Drop for CpalMicBackend {
 /// `stream` を drop することでキャプチャを停止する。
 fn run_capture_thread(
     sink: RawSink,
+    device_id: Option<String>,
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<()>>,
 ) {
-    let stream = match build_stream(sink) {
+    let stream = match build_stream(sink, device_id.as_deref()) {
         Ok(s) => s,
         Err(e) => {
             // 失敗を報告して即終了。
@@ -304,17 +350,18 @@ impl TransientGuard {
     }
 }
 
-/// 既定入力デバイスへ input stream を build する（まだ `play` はしない）。
+/// `device_id` で選択した入力デバイスへ input stream を build する（まだ `play` は
+/// しない）。`device_id = None` で既定入力デバイス（従来挙動）。一致するデバイスが
+/// 無ければ [`Error::DeviceNotFound`]。
 ///
 /// sample format に応じてコールバックを分岐し、F32 はそのまま、I16/U16/I32 は
 /// `f32` `[-1.0, 1.0]` へ変換して [`RawSink::push`] へ渡す。開始直後の
 /// プライミング過渡バッファは [`TransientGuard`] が**信号統計で検出して**破棄する
 /// （PipeWire ALSA ブリッジ対策。過渡の無い環境では 1 バッファも捨てない）。
-fn build_stream(sink: RawSink) -> Result<cpal::Stream> {
+fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or(Error::DeviceNotFound)?;
+    // device_id を解決（None=既定 / Some=name 一致の最初。不一致は DeviceNotFound）。
+    let device = resolve_input_device(&host, device_id)?;
 
     // 既定入力 config が取れない＝広告されたデバイスが実際には開けない
     // （サウンドカード無しのサーバ等で ALSA "default" PCM が開けない場合を含む）。
@@ -477,13 +524,38 @@ mod tests {
     }
 
     /// `new` + `native_format` が panic しないこと（入力デバイス有無を問わず）。
+    /// device_id = None（既定）でも Some（特定デバイス）でも new は必ず成功する。
     #[test]
     fn new_and_native_format_do_not_panic() {
-        let backend = CpalMicBackend::new();
+        // 既定入力デバイス（device_id = None）。
+        let backend = CpalMicBackend::new(None);
         let (rate, channels) = backend.native_format();
         // フォーマットは常に正の値（デバイス無しなら FALLBACK_FORMAT）。
         assert!(rate > 0);
         assert!(channels > 0);
+
+        // 存在しない device_id でも new は panic せず成功し、FALLBACK_FORMAT を返す
+        // （解決失敗の表面化は start/build_stream まで遅延する設計）。
+        let backend = CpalMicBackend::new(Some("__no_such_device__".into()));
+        let (rate, channels) = backend.native_format();
+        assert_eq!((rate, channels), FALLBACK_FORMAT);
+    }
+
+    /// 存在しない device_id を指定した `start` は panic せず
+    /// [`Error::DeviceNotFound`] になる（cold-start/TransientGuard と整合）。
+    /// 既定入力デバイスの有無に依らず、不一致 id は必ず DeviceNotFound。
+    #[test]
+    fn start_with_unknown_device_id_yields_device_not_found() {
+        let mut backend = CpalMicBackend::new(Some("__no_such_device__".into()));
+        let (rate, channels) = backend.native_format();
+        let cap = (rate as usize * channels as usize).max(1);
+        let (prod, _cons) = raw_ring(cap);
+        let sink = RawSink::new(prod, rate, channels);
+
+        match backend.start(sink) {
+            Err(Error::DeviceNotFound) => {}
+            other => panic!("unknown device_id は DeviceNotFound であるべき: {other:?}"),
+        }
     }
 
     /// [`list_devices`] はデバイス有無を問わず panic せず `Ok(Vec)` を返す。
@@ -509,7 +581,7 @@ mod tests {
     /// 入力デバイスがある環境では実際にキャプチャが起動し、stop で停止する。
     #[test]
     fn start_then_stop_tolerates_missing_device() {
-        let mut backend = CpalMicBackend::new();
+        let mut backend = CpalMicBackend::new(None);
         let (rate, channels) = backend.native_format();
         let cap = (rate as usize * channels as usize).max(1); // 約 1 秒
         let (prod, _cons) = raw_ring(cap);
@@ -537,7 +609,7 @@ mod tests {
     fn end_to_end_captures_real_audio() {
         use std::time::Duration;
 
-        let mut backend = CpalMicBackend::new();
+        let mut backend = CpalMicBackend::new(None);
         let (rate, channels) = backend.native_format();
         let cap = rate as usize * channels as usize * 2; // 約 2 秒
         let (prod, mut cons) = raw_ring(cap);

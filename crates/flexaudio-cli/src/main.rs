@@ -15,6 +15,16 @@
 //! flexaudio-cli --source system --output-rate 16000 --output-channels 1 --out 16k.wav --seconds 3
 //! ```
 //!
+//! `--source mic` では `--device-id <ID>` で入力デバイスを選べる（ID は
+//! `--list-devices` の ID 列＝安定キー＝デバイス名。省略で既定入力デバイス）。
+//! device_id は **mic 専用**で、system（既定 render 固定）・process（target_pid 固定）
+//! では無視される。
+//!
+//! ```text
+//! flexaudio-cli --list-devices
+//! flexaudio-cli --source mic --device-id "ステレオ ミキサー (Realtek(R) Audio)" --out cap.wav
+//! ```
+//!
 //! また `--out -` を指定すると、WAV ではなく **ヘッダ無し raw PCM** を
 //! stdout（バイナリ）へチャンク到着次第ストリーミングする。受け手
 //! （例: WhisperApp の `spawn('flexaudio-cli', ...)` + stdout 読み）が
@@ -98,6 +108,14 @@ struct Cli {
     /// ユーザーのスピーカーは鳴ったまま）。対象が後から鳴り始めるのは正常系。
     #[arg(long)]
     process_id: Option<u32>,
+
+    /// `--source mic` で選ぶ入力デバイスの安定 ID（= デバイス名）。
+    /// `--list-devices` の ID 列からコピーする。省略すると既定入力デバイス。
+    /// **mic 専用**: system は既定 render、process は `--process-id` 固定で、
+    /// この値は無視される（system の render 選択は将来対応）。
+    /// 一致するデバイスが無ければクラッシュせず DeviceNotFound で終了する。
+    #[arg(long)]
+    device_id: Option<String>,
 
     /// 自プロセスの再生音を除外する（フィードバックループ防止）。
     /// `--source process` では対象 PID のみ録るため**常に成立し no-op**
@@ -228,6 +246,9 @@ fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
         output: cli.output_format(),
         target_pid: cli.process_id,
         exclude_self: cli.exclude_self,
+        // device_id は mic のみで honor される（system/process では facade が無視）。
+        // セグメント config でも一様に載せておけば mic セグメントだけ効く。
+        device_id: cli.device_id.clone(),
         ..Default::default()
     }
 }
@@ -449,6 +470,8 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         output,
         target_pid: cli.process_id,
         exclude_self: cli.exclude_self,
+        // device_id は mic 選択用（system/process では facade が無視する）。
+        device_id: cli.device_id.clone(),
         ..Default::default()
     };
     let mut stream = flexaudio::open(config).map_err(describe_error)?;
@@ -456,6 +479,14 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     // --- ネイティブフォーマット表示 ---
     let (native_rate, native_ch) = stream.native_format();
     log!("ソース            : {source_label}");
+    // device_id 指定時は選択デバイスを明示（mic のみ有効。system/process では無視）。
+    if let Some(id) = &cli.device_id {
+        if kind == SourceKind::Mic {
+            log!("デバイス ID        : {id}");
+        } else {
+            log!("デバイス ID        : {id}（注: mic 以外では無視されます）");
+        }
+    }
     log!("ネイティブフォーマット: {native_rate} Hz / {native_ch} ch");
     if stdout_stream {
         let enc = match cli.encoding {
@@ -536,7 +567,10 @@ fn list_devices() -> std::result::Result<(), String> {
         );
     }
     println!();
-    println!("（DEFAULT の * は OS 既定デバイス。ID は --device-id 等で使える安定キー。）");
+    println!(
+        "（DEFAULT の * は OS 既定デバイス。ID は `--source mic --device-id <ID>` で\
+         入力デバイスを選ぶのに使える安定キー。system/process では device_id は無視。）"
+    );
     Ok(())
 }
 

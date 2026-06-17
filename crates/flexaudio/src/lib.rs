@@ -146,6 +146,10 @@ pub fn open(config: StreamConfig) -> Result<Stream> {
 ///
 /// 分岐・エラーは [`open`] のドキュメントと同一:
 /// - [`SourceKind::Mic`] → [`flexaudio_mic::CpalMicBackend`]（全 OS）。
+///   `config.device_id` を渡して特定入力デバイスを選べる（`None` で既定入力。
+///   id は [`devices`] が返す安定 ID = デバイス名。不一致は `start` 時に
+///   [`Error::DeviceNotFound`]）。device_id は **mic のみ**に効く
+///   （system/process は既定 render / target_pid 固定で device_id を見ない）。
 /// - [`SourceKind::SystemLoopback`] → Linux のみ
 ///   [`flexaudio_os_linux::PwSystemBackend`]。非 Linux は [`Error::Unsupported`]。
 /// - [`SourceKind::ProcessLoopback`] → Linux のみ
@@ -157,8 +161,9 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
     use flexaudio_core::types::Error;
 
     let backend: Box<dyn CaptureBackend> = match config.kind {
-        // マイク入力は全 OS 共通（cpal）。
-        SourceKind::Mic => Box::new(flexaudio_mic::CpalMicBackend::new()),
+        // マイク入力は全 OS 共通（cpal）。device_id で特定入力デバイスを選べる
+        // （None=既定入力デバイス。id は devices() が返す安定 ID = デバイス名）。
+        SourceKind::Mic => Box::new(flexaudio_mic::CpalMicBackend::new(config.device_id.clone())),
 
         // システム出力ループバックは Linux / Windows 対応。
         SourceKind::SystemLoopback => {
