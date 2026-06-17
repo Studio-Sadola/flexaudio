@@ -746,11 +746,12 @@ fn run_wav(
         chunks.push(chunk);
     }
 
+    // チャンクが 1 つも来なくても録音自体は走ったので失敗にはしない。空の WAV を書き出して
+    // 警告だけ出す（ソースが無音・除外・選んだエンドポイントが非アクティブ等で起こる）。
     if chunks.is_empty() {
-        return Err(
-            "チャンクを 1 つも取得できませんでした。\
-             デバイスは開けましたがサンプルが流れていません（ミュート/権限等を確認してください）。"
-                .into(),
+        eprintln!(
+            "警告: 音声を取得できませんでした（ソースが無音・除外・選んだエンドポイントが\
+             非アクティブ等の可能性）。空の WAV を書き出します。"
         );
     }
 
@@ -790,8 +791,23 @@ fn run_wav(
     );
     println!("WAV 書き出し       : {}", cli.out.display());
 
+    // チャンクは来たが中身がほぼ無音（peak/RMS がほぼ 0）なら、空 WAV のときと同じ趣旨で
+    // 警告する。OS 差で無音フレームが流れる場合（無音 WAV になる）にも「無音だった」と
+    // 分かるようにする。
+    if !chunks.is_empty() && stats.peak < SILENCE_PEAK && stats.rms < SILENCE_RMS {
+        eprintln!(
+            "警告: 音声を取得できませんでした（ソースが無音・除外・選んだエンドポイントが\
+             非アクティブ等の可能性）。録音はほぼ無音です。"
+        );
+    }
+
     Ok(())
 }
+
+/// 「ほぼ無音」と判定するピーク / RMS（線形）のしきい値。これ未満なら無音扱いで警告する。
+/// -60 dBFS 付近を目安にした緩いしきい値（厳密な値ではない）。
+const SILENCE_PEAK: f32 = 1.0e-3;
+const SILENCE_RMS: f64 = 1.0e-4;
 
 /// stdout raw PCM ストリーミング経路。
 ///
@@ -1031,7 +1047,9 @@ fn fmt_dbfs(db: f64) -> String {
 fn describe_error(err: Error) -> String {
     match err {
         Error::DeviceNotFound => {
-            "入力デバイスが見つかりません。マイクのある実機で実行してください。".into()
+            "指定したデバイス／エンドポイントが見つかりません。`--list-devices` の ID を\
+             確認してください。"
+                .into()
         }
         Error::PermissionDenied => {
             "マイクへのアクセス権限がありません。OS のマイク権限設定を確認してください。".into()
@@ -1197,12 +1215,23 @@ mod tests {
     /// 主要な Error バリアントが人間向け文言へ変換される（種別ごとに分岐）。
     #[test]
     fn describe_error_maps_known_variants() {
-        assert!(describe_error(Error::DeviceNotFound).contains("入力デバイスが見つかりません"));
+        assert!(describe_error(Error::DeviceNotFound).contains("見つかりません"));
         assert!(describe_error(Error::PermissionDenied).contains("権限"));
         assert!(describe_error(Error::DeviceLost).contains("失われました"));
         // その他は汎用文言 + Display を含む。
         let msg = describe_error(Error::Unsupported);
         assert!(msg.contains("ストリーム初期化に失敗しました"));
+    }
+
+    /// DeviceNotFound の文言は source 非依存（mic 前提の語を含まない）。system や process で
+    /// 不正な device-id を指定したときにも適切な案内になる。
+    #[test]
+    fn describe_error_device_not_found_is_source_neutral() {
+        let msg = describe_error(Error::DeviceNotFound);
+        assert!(!msg.contains("マイク"));
+        assert!(!msg.contains("入力デバイス"));
+        // ID の確認を促す案内になっている。
+        assert!(msg.contains("--list-devices"));
     }
 
     // --- source_kind_label / truncate ---
