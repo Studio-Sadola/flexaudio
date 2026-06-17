@@ -7,6 +7,7 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "macOS system and per-process audio capture backend (Core Audio process taps) for flexaudio."
+readme = "README.md"
 keywords = ["audio", "coreaudio", "loopback", "capture", "macos"]
 categories = ["multimedia::audio", "os::macos-apis"]
 documentation = "https://docs.rs/flexaudio-os-macos"

@@ -7,6 +7,7 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Cross-platform microphone capture backend (cpal) for flexaudio."
+readme = "README.md"
 keywords = ["audio", "microphone", "capture", "cpal", "recording"]
 categories = ["multimedia::audio"]
 documentation = "https://docs.rs/flexaudio-mic"

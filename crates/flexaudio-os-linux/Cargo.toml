@@ -7,6 +7,7 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Linux system and per-process audio capture backend (PipeWire) for flexaudio."
+readme = "README.md"
 keywords = ["audio", "pipewire", "loopback", "capture", "linux"]
 categories = ["multimedia::audio", "os::unix-apis"]
 documentation = "https://docs.rs/flexaudio-os-linux"
