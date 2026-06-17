@@ -33,7 +33,7 @@ use rubato::{
     WindowFunction,
 };
 
-use crate::types::{OutputFormat, CHANNELS, SAMPLE_RATE};
+use crate::types::{Error, OutputFormat, Result, CHANNELS, SAMPLE_RATE};
 
 /// 内部正規形 1 チャンクのフレーム数（20ms @ 48kHz）。第 1 段の切り出し境界。
 pub const CHUNK_FRAMES: usize = 960;
@@ -127,14 +127,20 @@ impl Normalizer {
     ///
     /// `output` は呼び出し側が事前に [`OutputFormat::validate`] 済みであることを
     /// 期待する（ここでは防御的に妥当域へ丸めはしない）。
-    pub fn new(in_sample_rate: u32, in_channels: u16, output: OutputFormat) -> Self {
+    ///
+    /// rubato リサンプラの構築は内部的に失敗し得る（極端なレート比等）。従来は
+    /// `expect` で panic させていたが、これは非 RT の取り込みスレッドを無言で
+    /// 殺す（=ストリームの無言停止）ため、[`Error::Backend`] として返すよう
+    /// 変更した。呼び出し側（facade の `Stream::open` / 取り込みスレッド）が
+    /// `Error` を伝播・記録する。
+    pub fn new(in_sample_rate: u32, in_channels: u16, output: OutputFormat) -> Result<Self> {
         let in_channels = in_channels.max(1) as usize;
 
         // 第 1 段リサンプラ（→48000）。
         let stage1_resampler = if in_sample_rate == SAMPLE_RATE {
             None
         } else {
-            Some(ResamplerState::new(in_sample_rate, SAMPLE_RATE, INNER_CH))
+            Some(ResamplerState::new(in_sample_rate, SAMPLE_RATE, INNER_CH)?)
         };
 
         let out_channels = (output.channels.max(1)) as usize;
@@ -144,10 +150,10 @@ impl Normalizer {
         let stage2 = if output.sample_rate == SAMPLE_RATE && out_channels == INNER_CH {
             None
         } else {
-            Some(OutputStage::new(output.sample_rate, out_channels))
+            Some(OutputStage::new(output.sample_rate, out_channels)?)
         };
 
-        Self {
+        Ok(Self {
             in_sample_rate,
             in_channels,
             output,
@@ -161,7 +167,7 @@ impl Normalizer {
             pts_anchor: None,
             total_out_frames: 0,
             total_inner_frames: 0,
-        }
+        })
     }
 
     /// 入力サンプルレート（Hz）。
@@ -188,13 +194,17 @@ impl Normalizer {
     ///
     /// `interleaved` の長さは `in_channels` の倍数であること。`device_pts_ns` は
     /// この push の先頭フレームに対応するデバイス由来 PTS。
-    pub fn push(&mut self, interleaved: &[f32], device_pts_ns: i64) {
+    ///
+    /// rubato の `process` は理論上失敗し得る（従来は `expect` で panic）。
+    /// 非 RT の取り込みスレッドを無言で殺さないよう、失敗時は
+    /// [`Error::Backend`] を返す（呼び出し側がストリームを明示停止できる）。
+    pub fn push(&mut self, interleaved: &[f32], device_pts_ns: i64) -> Result<()> {
         if interleaved.is_empty() {
-            return;
+            return Ok(());
         }
         let in_frames = interleaved.len() / self.in_channels;
         if in_frames == 0 {
-            return;
+            return Ok(());
         }
 
         // この push の先頭フレームが将来現れる出力フレーム位置を比で近似し、
@@ -213,12 +223,12 @@ impl Normalizer {
             }
             Some(rs) => {
                 rs.in_accum.extend_from_slice(&stereo);
-                rs.drain_into(&mut self.inner_buf, &mut self.total_inner_frames);
+                rs.drain_into(&mut self.inner_buf, &mut self.total_inner_frames)?;
             }
         }
 
         // 内部正規形が 960frame 溜まるごとに第 2 段へ流し込む。
-        self.pump_stage2();
+        self.pump_stage2()
     }
 
     /// 完成済みの出力チャンクを 1 つ取り出す。
@@ -248,7 +258,7 @@ impl Normalizer {
 
     /// `inner_buf` に溜まった内部正規形を 960frame 境界で第 2 段へ流し、
     /// 生成された出力フレームを `out_buf` へ追記する。
-    fn pump_stage2(&mut self) {
+    fn pump_stage2(&mut self) -> Result<()> {
         let inner_chunk = CHUNK_FRAMES * INNER_CH;
 
         match &mut self.stage2 {
@@ -266,10 +276,15 @@ impl Normalizer {
                 while self.inner_buf.len() >= inner_chunk {
                     // 借用衝突回避のため 1 チャンク分をローカルへ取り出す。
                     let chunk: Vec<f32> = self.inner_buf.drain(..inner_chunk).collect();
-                    stage.process_inner_chunk(&chunk, &mut self.out_buf, &mut self.total_out_frames);
+                    stage.process_inner_chunk(
+                        &chunk,
+                        &mut self.out_buf,
+                        &mut self.total_out_frames,
+                    )?;
                 }
             }
         }
+        Ok(())
     }
 
     /// 任意 ch interleaved を stereo interleaved へ mix して `dst` に push する。
@@ -341,7 +356,10 @@ impl Normalizer {
 
 impl ResamplerState {
     /// `in_sr` → `out_sr` の固定比リサンプラを `channels` ch で作る。
-    fn new(in_sr: u32, out_sr: u32, channels: usize) -> Self {
+    ///
+    /// rubato の構築は理論上失敗し得る（極端なレート比等）。従来は `expect` で
+    /// panic していたが、無言のスレッド死を避けるため [`Error::Backend`] を返す。
+    fn new(in_sr: u32, out_sr: u32, channels: usize) -> Result<Self> {
         let ratio = out_sr as f64 / in_sr as f64;
         // 入力固定チャンク: 20ms 相当の入力フレーム（端数は rubato が内部保持）。
         let chunk_in_frames = (in_sr as usize / 50).max(64);
@@ -362,33 +380,44 @@ impl ResamplerState {
             channels,
             FixedAsync::Input,
         )
-        .expect("rubato Async sinc resampler construction");
+        .map_err(|e| Error::Backend(format!("rubato sinc resampler construction failed: {e}")))?;
 
         let max_out_frames = inner.output_frames_max();
 
-        Self {
+        Ok(Self {
             inner,
             channels,
             chunk_in_frames,
             max_out_frames,
             in_accum: Vec::with_capacity(chunk_in_frames * channels * 4),
             out_scratch: vec![0.0; max_out_frames * channels],
-        }
+        })
     }
 
     /// `in_accum` に溜まった分を chunk_in_frames 単位で可能な限りリサンプルし、
     /// 生成した interleaved を `out_buf` へ追記する。
-    fn drain_into(&mut self, out_buf: &mut Vec<f32>, total_out_frames: &mut u64) {
+    ///
+    /// rubato の adapter 構築・`process_into_buffer` は理論上失敗し得る（従来は
+    /// `expect` で panic）。取り込みスレッドの無言死を避けるため、失敗時は
+    /// [`Error::Backend`] を返す。
+    fn drain_into(&mut self, out_buf: &mut Vec<f32>, total_out_frames: &mut u64) -> Result<()> {
         let step = self.chunk_in_frames * self.channels;
 
         while self.in_accum.len() >= step {
             let in_adapter =
                 InterleavedSlice::new(&self.in_accum[..step], self.channels, self.chunk_in_frames)
-                    .expect("interleaved input adapter");
+                    .map_err(|e| {
+                        Error::Backend(format!("rubato interleaved input adapter failed: {e}"))
+                    })?;
 
-            let mut out_adapter =
-                InterleavedSlice::new_mut(&mut self.out_scratch[..], self.channels, self.max_out_frames)
-                    .expect("interleaved output adapter");
+            let mut out_adapter = InterleavedSlice::new_mut(
+                &mut self.out_scratch[..],
+                self.channels,
+                self.max_out_frames,
+            )
+            .map_err(|e| {
+                Error::Backend(format!("rubato interleaved output adapter failed: {e}"))
+            })?;
 
             let indexing = Indexing {
                 input_offset: 0,
@@ -400,7 +429,7 @@ impl ResamplerState {
             let (_in_used, out_written) = self
                 .inner
                 .process_into_buffer(&in_adapter, &mut out_adapter, Some(&indexing))
-                .expect("rubato process_into_buffer");
+                .map_err(|e| Error::Backend(format!("rubato process_into_buffer failed: {e}")))?;
 
             let n_samples = out_written * self.channels;
             out_buf.extend_from_slice(&self.out_scratch[..n_samples]);
@@ -409,6 +438,7 @@ impl ResamplerState {
             // 消費した入力を取り除く（FixedAsync::Input なので chunk_in_frames 固定消費）。
             self.in_accum.drain(..step);
         }
+        Ok(())
     }
 }
 
@@ -416,18 +446,20 @@ impl OutputStage {
     /// 出力レート / 出力チャンネル数を指定して出口段を作る。
     ///
     /// `out_sample_rate == 48000` なら SR 変換はパススルー（チャンネル変換のみ）。
-    fn new(out_sample_rate: u32, out_channels: usize) -> Self {
+    ///
+    /// rubato 構築失敗は [`Error::Backend`] として伝播する（panic しない）。
+    fn new(out_sample_rate: u32, out_channels: usize) -> Result<Self> {
         let resampler = if out_sample_rate == SAMPLE_RATE {
             None
         } else {
             // 入力は内部正規形 48000、出力は out_sample_rate。チャンネルは out_channels。
-            Some(ResamplerState::new(SAMPLE_RATE, out_sample_rate, out_channels))
+            Some(ResamplerState::new(SAMPLE_RATE, out_sample_rate, out_channels)?)
         };
-        Self {
+        Ok(Self {
             out_channels,
             resampler,
             ch_scratch: Vec::with_capacity(CHUNK_FRAMES * out_channels),
-        }
+        })
     }
 
     /// 内部正規形 1 チャンク（48k/stereo・960frame interleaved）を処理して、
@@ -437,7 +469,7 @@ impl OutputStage {
         inner_stereo: &[f32],
         out_buf: &mut Vec<f32>,
         total_out_frames: &mut u64,
-    ) {
+    ) -> Result<()> {
         debug_assert_eq!(inner_stereo.len(), CHUNK_FRAMES * INNER_CH);
 
         // 1) チャンネル変換: stereo(2ch) → out_channels。
@@ -476,9 +508,10 @@ impl OutputStage {
             }
             Some(rs) => {
                 rs.in_accum.extend_from_slice(&self.ch_scratch);
-                rs.drain_into(out_buf, total_out_frames);
+                rs.drain_into(out_buf, total_out_frames)?;
             }
         }
+        Ok(())
     }
 }
 
@@ -494,12 +527,12 @@ mod tests {
 
     #[test]
     fn mono_48k_to_stereo_duplicates_channels() {
-        let mut n = Normalizer::new(48_000, 1, default_out());
+        let mut n = Normalizer::new(48_000, 1, default_out()).expect("normalizer");
         assert!(n.is_passthrough());
         assert!(n.is_output_passthrough());
         // 960 フレーム分の mono 入力（パススルーなので 1 チャンクちょうど）。
         let mono: Vec<f32> = (0..CHUNK_FRAMES).map(|i| (i as f32) * 0.001).collect();
-        n.push(&mono, 0);
+        n.push(&mono, 0).expect("push");
         let (chunk, _pts) = n.pop_chunk().expect("one chunk");
         assert_eq!(chunk.len(), CHUNK_FRAMES * 2);
         // L == R がフレーム毎に成立。
@@ -511,13 +544,13 @@ mod tests {
 
     #[test]
     fn passthrough_preserves_frame_count() {
-        let mut n = Normalizer::new(48_000, 2, default_out());
+        let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
         assert!(n.is_passthrough());
         assert!(n.is_output_passthrough());
         // 2 チャンク分 + 端数。
         let frames = CHUNK_FRAMES * 2 + 100;
         let stereo: Vec<f32> = (0..frames * 2).map(|i| (i as f32) * 1e-4).collect();
-        n.push(&stereo, 0);
+        n.push(&stereo, 0).expect("push");
 
         let mut got_frames = 0usize;
         while let Some((c, _)) = n.pop_chunk() {
@@ -531,7 +564,7 @@ mod tests {
 
     #[test]
     fn stereo_44100_to_48000_yields_about_50_chunks_per_second() {
-        let mut n = Normalizer::new(44_100, 2, default_out());
+        let mut n = Normalizer::new(44_100, 2, default_out()).expect("normalizer");
         assert!(!n.is_passthrough());
 
         // 1 秒分の 44100Hz ステレオ サイン波。
@@ -547,7 +580,7 @@ mod tests {
         // 細切れ push（実機の小バッファ到着を模す）でも panic しないこと。
         let mut pts = 0i64;
         for block in interleaved.chunks(441 * 2) {
-            n.push(block, pts);
+            n.push(block, pts).expect("push");
             pts += (block.len() as i64 / 2) * 1_000_000_000 / 44_100;
         }
 
@@ -564,10 +597,10 @@ mod tests {
 
     #[test]
     fn pts_increases_monotonically_across_chunks() {
-        let mut n = Normalizer::new(48_000, 2, default_out());
+        let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
         let frames = CHUNK_FRAMES * 3;
         let stereo = vec![0.0f32; frames * 2];
-        n.push(&stereo, 100_000_000);
+        n.push(&stereo, 100_000_000).expect("push");
 
         let mut last = i64::MIN;
         let mut count = 0;
@@ -588,7 +621,7 @@ mod tests {
             sample_rate: 16_000,
             channels: 1,
         };
-        let mut n = Normalizer::new(48_000, 2, out);
+        let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
         assert!(n.is_passthrough()); // 第 1 段は SR パススルー（48k 入力）。
         assert!(!n.is_output_passthrough()); // 第 2 段は有効。
 
@@ -604,7 +637,7 @@ mod tests {
                 block.push(s);
                 block.push(s);
             }
-            n.push(&block, pts);
+            n.push(&block, pts).expect("push");
             pts += 480 * 1_000_000_000 / 48_000;
         }
 
@@ -624,13 +657,13 @@ mod tests {
             sample_rate: 16_000,
             channels: 2,
         };
-        let mut n = Normalizer::new(48_000, 2, out);
+        let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
         let in_frames = 48_000;
         let stereo: Vec<f32> = (0..in_frames * 2)
             .map(|i| ((i / 2) as f32 * 0.0001).sin() * 0.3)
             .collect();
         for block in stereo.chunks(480 * 2) {
-            n.push(block, 0);
+            n.push(block, 0).expect("push");
         }
         let mut chunks = 0usize;
         while let Some((c, _)) = n.pop_chunk() {
@@ -647,10 +680,10 @@ mod tests {
             sample_rate: 8_000,
             channels: 2,
         };
-        let mut n = Normalizer::new(48_000, 2, out);
+        let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
         let stereo: Vec<f32> = (0..48_000 * 2).map(|i| (i as f32 * 1e-5).sin() * 0.2).collect();
         for block in stereo.chunks(480 * 2) {
-            n.push(block, 0);
+            n.push(block, 0).expect("push");
         }
         let mut chunks = 0usize;
         while let Some((c, _)) = n.pop_chunk() {
@@ -668,14 +701,14 @@ mod tests {
             sample_rate: 48_000,
             channels: 1,
         };
-        let mut n = Normalizer::new(48_000, 2, out);
+        let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
         // 完全逆相（L=+0.5, R=-0.5）→ 平均 0。
         let mut stereo = Vec::with_capacity(CHUNK_FRAMES * 2);
         for _ in 0..CHUNK_FRAMES {
             stereo.push(0.5);
             stereo.push(-0.5);
         }
-        n.push(&stereo, 0);
+        n.push(&stereo, 0).expect("push");
         let (chunk, _) = n.pop_chunk().expect("one mono chunk");
         assert_eq!(chunk.len(), CHUNK_FRAMES); // mono 960 sample。
         for &s in &chunk {

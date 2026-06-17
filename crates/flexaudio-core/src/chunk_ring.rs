@@ -58,7 +58,9 @@ impl ChunkProducer {
     /// （[`crate::types::Event::ChunkDropped`] 発火判断に使える）。ドロップが
     /// 無ければ `None`。
     pub fn push(&mut self, mut chunk: AudioChunk) -> Option<u64> {
-        let mut rb = self.rb.lock().expect("chunk ring mutex");
+        // poison（別スレッドがロック保持中に panic）でも本リングは torn しないので、
+        // expect で連鎖 panic させず内部値を回収して処理を続行する（graceful degradation）。
+        let mut rb = self.rb.lock().unwrap_or_else(|e| e.into_inner());
 
         // この push が最古を追い出すか（満杯か）を先に判定する。
         let will_evict = rb.is_full();
@@ -97,13 +99,18 @@ pub struct ChunkConsumer {
 impl ChunkConsumer {
     /// 最古のチャンクを 1 つ取り出す。無ければ `None`（非ブロッキング）。
     pub fn try_pop(&mut self) -> Option<AudioChunk> {
-        let mut rb = self.rb.lock().expect("chunk ring mutex");
+        // poison でも torn しないので連鎖 panic させず回収して続行する。
+        let mut rb = self.rb.lock().unwrap_or_else(|e| e.into_inner());
         rb.try_pop()
     }
 
     /// 現在リングに溜まっているチャンク数。
     pub fn len(&self) -> usize {
-        self.rb.lock().expect("chunk ring mutex").occupied_len()
+        // poison でも torn しないので連鎖 panic させず回収して続行する。
+        self.rb
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .occupied_len()
     }
 
     /// リングが空か。

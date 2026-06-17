@@ -31,6 +31,7 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::VecDeque;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -51,6 +52,29 @@ use spa::pod::Pod;
 const NATIVE_RATE: u32 = 48_000;
 /// ネイティブチャンネル数。ステレオを要求し PipeWire に変換させる。
 const NATIVE_CHANNELS: u16 = 2;
+
+/// 監視 watcher の配信キュー上限（イベント数）。着脱は本来低頻度だが、消費側が
+/// `poll_event` を長時間呼ばない/暴走デバイスが連続着脱するケースで `VecDeque` が
+/// 無制限に膨らむのを防ぐ。超過時は最古から捨てる（coalesce/cap）。
+const MAX_WATCH_EVENTS: usize = 1024;
+
+/// [`enumerate_pw`] の同期待ちループのデッドライン（ミリ秒）。`done` は通常すぐ来るが、
+/// PipeWire デーモンの異常等で `done` が来ない場合に `while !done { run() }` が
+/// 無限タイトループ/ハングするのを防ぐ安全弁。超過したら打ち切って収集済み分を返す。
+const ENUMERATE_DEADLINE_MS: u128 = 2_000;
+
+/// プロセスグローバルに [`pipewire::init`] を **1 回だけ**呼ぶ。
+///
+/// `pw::init()` はライブラリ内部のグローバル初期化で、複数スレッド（system / process /
+/// watch / enumerate の各バックエンドスレッド）から並行に呼ばれ得る。素の `pw::init()`
+/// 多重呼び出しはスレッド競合の懸念があるため、[`std::sync::Once`] で 1 回に集約する。
+fn pw_init_once() {
+    use std::sync::Once;
+    static PW_INIT: Once = Once::new();
+    PW_INIT.call_once(|| {
+        pw::init();
+    });
+}
 
 /// PipeWire 経由でシステム音声出力（既定 sink の monitor）をキャプチャする
 /// [`CaptureBackend`]。
@@ -622,7 +646,7 @@ fn setup_pw_process(
     use std::collections::HashMap;
     use std::rc::Rc;
 
-    pw::init();
+    pw_init_once();
 
     let main_loop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|e| format!("create pipewire main loop failed: {e}"))?;
@@ -769,9 +793,10 @@ fn setup_pw_process(
         if pairs.is_empty() {
             return;
         }
+        let want = pairs.len();
 
-        // link-factory で各ペアをリンクする。1 つでも張れたらリンク確立とみなす。
-        let mut created: Vec<pw::link::Link> = Vec::with_capacity(pairs.len());
+        // link-factory で各ペアをリンクする。
+        let mut created: Vec<pw::link::Link> = Vec::with_capacity(want);
         for (out_port_id, in_port_id) in pairs {
             let link_props = properties! {
                 *pw::keys::LINK_OUTPUT_NODE => target_node_id.to_string(),
@@ -782,17 +807,24 @@ fn setup_pw_process(
             match core.create_object::<pw::link::Link>("link-factory", &link_props) {
                 Ok(link) => created.push(link),
                 Err(_e) => {
-                    // このペアのリンク生成に失敗。他ペアは試す（best-effort）。
+                    // このペアのリンク生成に失敗。残りは試さず部分リンクを避ける。
+                    break;
                 }
             }
         }
 
-        if created.is_empty() {
-            // 全ペア失敗。リンクせず待機を続ける（drop で何も残らない）。
+        // **全ペアが張れたときだけ**リンク確立とみなす。片チャンネルだけ成功した
+        // 部分リンク（例: FL だけ繋がり FR が落ちる）を「確立」と誤認すると、対象が
+        // 実質モノラルに固定化されてしまう。全ペア揃わなければ、ここで作った Link を
+        // 破棄（drop）して未リンクのまま待機を続け、次の global 到着で再評価する
+        // （残りポートが後から出る/リンクが落ちた一時状態に対して冪等にリトライ）。
+        if created.len() != want {
+            // created を drop してリンクを残さない（部分リンクを確定させない）。
+            drop(created);
             return;
         }
 
-        // 1 つ以上張れた。Link プロキシを保持してリンク確立とみなす。
+        // 全ペア確立。Link プロキシを保持してリンク確立とみなす。
         links.borrow_mut().extend(created);
         linked_node_id.set(Some(target_node_id));
     }
@@ -824,134 +856,166 @@ fn setup_pw_process(
     let _registry_listener = registry
         .add_listener_local()
         .global(move |global| {
-            let Some(props) = global.props else {
-                return;
-            };
-            match global.type_ {
-                pw::types::ObjectType::Client => {
-                    // PID は Client の pipewire.sec.pid に常在（実機 stock 検証で確定。
-                    // デーモンがソケット資格情報から付与＝詐称不能）。
-                    let Some(pid_str) = props.get(*pw::keys::SEC_PID) else {
-                        return;
-                    };
-                    let Ok(pid) = pid_str.parse::<u32>() else {
-                        return;
-                    };
-                    client_pid_for_global.borrow_mut().insert(global.id, pid);
-                    if pid == target_pid {
-                        target_client_for_global.set(Some(global.id));
+            // FFI 越えの panic は UB。本体を catch_unwind で包む（defense-in-depth。
+            // inner の return は inner から返るだけで従来と等価）。
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                let Some(props) = global.props else {
+                    return;
+                };
+                match global.type_ {
+                    pw::types::ObjectType::Client => {
+                        // PID は Client の pipewire.sec.pid に常在（実機 stock 検証で確定。
+                        // デーモンがソケット資格情報から付与＝詐称不能）。
+                        let Some(pid_str) = props.get(*pw::keys::SEC_PID) else {
+                            return;
+                        };
+                        let Ok(pid) = pid_str.parse::<u32>() else {
+                            return;
+                        };
+                        client_pid_for_global.borrow_mut().insert(global.id, pid);
+                        if pid == target_pid {
+                            target_client_for_global.set(Some(global.id));
+                        }
                     }
-                }
-                pw::types::ObjectType::Node => {
-                    // アプリの**出力**ノードだけを対象にする（再生ストリーム）。
-                    let media_class = props.get(*pw::keys::MEDIA_CLASS).unwrap_or("");
-                    if media_class != "Stream/Output/Audio" {
-                        return;
+                    pw::types::ObjectType::Node => {
+                        // アプリの**出力**ノードだけを対象にする（再生ストリーム）。
+                        let media_class = props.get(*pw::keys::MEDIA_CLASS).unwrap_or("");
+                        if media_class != "Stream/Output/Audio" {
+                            return;
+                        }
+                        // 所有 Client を指す client.id。
+                        let owning_client_id =
+                            props.get(*pw::keys::CLIENT_ID).and_then(|s| s.parse::<u32>().ok());
+                        // 将来互換: ノード自身に PID が載れば直接照合可。
+                        let app_pid = props
+                            .get(*pw::keys::SEC_PID)
+                            .and_then(|s| s.parse::<u32>().ok());
+                        nodes_for_global.borrow_mut().insert(
+                            global.id,
+                            NodeEntry {
+                                owning_client_id,
+                                app_pid,
+                            },
+                        );
                     }
-                    // 所有 Client を指す client.id。
-                    let owning_client_id =
-                        props.get(*pw::keys::CLIENT_ID).and_then(|s| s.parse::<u32>().ok());
-                    // 将来互換: ノード自身に PID が載れば直接照合可。
-                    let app_pid = props
-                        .get(*pw::keys::SEC_PID)
-                        .and_then(|s| s.parse::<u32>().ok());
-                    nodes_for_global.borrow_mut().insert(
-                        global.id,
-                        NodeEntry {
-                            owning_client_id,
-                            app_pid,
-                        },
-                    );
-                }
-                pw::types::ObjectType::Port => {
-                    // ポートを蓄積する（対象出力ポート・自入力ポートの双方をここから引く）。
-                    let Some(node_id) =
-                        props.get(*pw::keys::NODE_ID).and_then(|s| s.parse::<u32>().ok())
-                    else {
-                        return;
-                    };
-                    let direction = props.get(*pw::keys::PORT_DIRECTION).unwrap_or("").to_string();
-                    if direction != "out" && direction != "in" {
-                        return;
+                    pw::types::ObjectType::Port => {
+                        // ポートを蓄積する（対象出力ポート・自入力ポートの双方をここから引く）。
+                        let Some(node_id) =
+                            props.get(*pw::keys::NODE_ID).and_then(|s| s.parse::<u32>().ok())
+                        else {
+                            return;
+                        };
+                        let direction =
+                            props.get(*pw::keys::PORT_DIRECTION).unwrap_or("").to_string();
+                        if direction != "out" && direction != "in" {
+                            return;
+                        }
+                        let channel = props.get(*pw::keys::AUDIO_CHANNEL).unwrap_or("").to_string();
+                        ports_for_global.borrow_mut().insert(
+                            global.id,
+                            PortEntry {
+                                node_id,
+                                direction,
+                                channel,
+                            },
+                        );
                     }
-                    let channel = props.get(*pw::keys::AUDIO_CHANNEL).unwrap_or("").to_string();
-                    ports_for_global.borrow_mut().insert(
-                        global.id,
-                        PortEntry {
-                            node_id,
-                            direction,
-                            channel,
-                        },
-                    );
+                    _ => return,
                 }
-                _ => return,
-            }
 
-            // Client / Node / Port どの到着でも状態が更新されたので再評価する
-            // （到着順非依存）。ここはループスレッド上なので `!Send` core/stream を触ってよい。
-            try_link(
-                &core_for_global,
-                &stream_for_global,
-                target_pid,
-                &self_node_for_global,
-                &nodes_for_global,
-                &client_pid_for_global,
-                &ports_for_global,
-                &linked_for_global,
-                &links_for_global,
-            );
+                // Client / Node / Port どの到着でも状態が更新されたので再評価する
+                // （到着順非依存）。ここはループスレッド上なので `!Send` core/stream を触ってよい。
+                try_link(
+                    &core_for_global,
+                    &stream_for_global,
+                    target_pid,
+                    &self_node_for_global,
+                    &nodes_for_global,
+                    &client_pid_for_global,
+                    &ports_for_global,
+                    &linked_for_global,
+                    &links_for_global,
+                );
+            }));
         })
         .global_remove(move |id| {
-            // 消えた id の種類に応じて表から除去し、リンク状態を見直す。
-            let mut relink_needed = false;
+            // FFI 越えの panic は UB。本体を catch_unwind で包む（defense-in-depth）。
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                // 消えた id の種類に応じて表から除去し、リンク状態を見直す。
+                let mut relink_needed = false;
 
-            // 消えた id が「リンク中ノード」or「対象 Client」or「対象出力ポート」なら
-            // 保持中の Link を drop してリンク解除し再待機する。
-            let was_linked_node = linked_for_remove.get() == Some(id);
-            let was_target_client = target_client_for_remove.get() == Some(id);
-            // リンク中ノードに属する出力ポートが消えたか（ports 表で判定）。
-            let was_linked_port = {
-                if let Some(linked) = linked_for_remove.get() {
-                    ports_for_remove
-                        .borrow()
-                        .get(&id)
-                        .map(|p| p.node_id == linked && p.direction == "out")
-                        .unwrap_or(false)
-                } else {
-                    false
+                // 消えた id が「リンク中ノード」or「対象 Client」or「対象出力ポート」or
+                // **自ノード** or **自入力ポート**なら、保持中の Link を drop してリンク
+                // 解除し再待機する。
+                let was_linked_node = linked_for_remove.get() == Some(id);
+                let was_target_client = target_client_for_remove.get() == Some(id);
+                // 自ノード（自前キャプチャ stream のノード）自体が消えたか。
+                let was_self_node = self_node_for_remove.get() == Some(id);
+                // リンク中ノードに属する出力ポート、または **自ノードに属する入力ポート**が
+                // 消えたか（ports 表で判定）。自入力ポートの消失を見逃すと、入力ポートが
+                // 落ちているのに linked 扱いのまま固着し、無音のまま復帰しなくなる。
+                let (was_linked_out_port, was_self_in_port) = {
+                    let ports = ports_for_remove.borrow();
+                    let linked_out = if let Some(linked) = linked_for_remove.get() {
+                        ports
+                            .get(&id)
+                            .map(|p| p.node_id == linked && p.direction == "out")
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    let self_in = if let Some(self_nid) = self_node_for_remove.get() {
+                        ports
+                            .get(&id)
+                            .map(|p| p.node_id == self_nid && p.direction == "in")
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    (linked_out, self_in)
+                };
+
+                if was_linked_node
+                    || was_target_client
+                    || was_linked_out_port
+                    || was_self_node
+                    || was_self_in_port
+                {
+                    // 保持中の Link を全部 drop（= リンク解除）して未リンクに戻す。
+                    links_for_remove.borrow_mut().clear();
+                    linked_for_remove.set(None);
+                    relink_needed = true;
                 }
-            };
+                if was_target_client {
+                    target_client_for_remove.set(None);
+                }
+                if was_self_node {
+                    // 自ノードが消えたら id キャッシュをクリア（try_link が stream から
+                    // 読み直す。再生成時に新 id を拾えるようにする）。
+                    self_node_for_remove.set(None);
+                }
 
-            if was_linked_node || was_target_client || was_linked_port {
-                // 保持中の Link を全部 drop（= リンク解除）して未リンクに戻す。
-                links_for_remove.borrow_mut().clear();
-                linked_for_remove.set(None);
-                relink_needed = true;
-            }
-            if was_target_client {
-                target_client_for_remove.set(None);
-            }
+                // 各表から消えた id を除去（pid/port 解決が古い値を引かないように）。
+                nodes_for_remove.borrow_mut().remove(&id);
+                client_pid_for_remove.borrow_mut().remove(&id);
+                ports_for_remove.borrow_mut().remove(&id);
 
-            // 各表から消えた id を除去（pid/port 解決が古い値を引かないように）。
-            nodes_for_remove.borrow_mut().remove(&id);
-            client_pid_for_remove.borrow_mut().remove(&id);
-            ports_for_remove.borrow_mut().remove(&id);
-
-            // 消失で再待機状態になったら、別の対象が既に揃っていれば即再リンクを試みる
-            // （冪等に再リンク可能）。
-            if relink_needed {
-                try_link(
-                    &core_for_remove,
-                    &stream_for_remove,
-                    target_pid,
-                    &self_node_for_remove,
-                    &nodes_for_remove,
-                    &client_pid_for_remove,
-                    &ports_for_remove,
-                    &linked_for_remove,
-                    &links_for_remove,
-                );
-            }
+                // 消失で再待機状態になったら、別の対象が既に揃っていれば即再リンクを試みる
+                // （冪等に再リンク可能）。
+                if relink_needed {
+                    try_link(
+                        &core_for_remove,
+                        &stream_for_remove,
+                        target_pid,
+                        &self_node_for_remove,
+                        &nodes_for_remove,
+                        &client_pid_for_remove,
+                        &ports_for_remove,
+                        &linked_for_remove,
+                        &links_for_remove,
+                    );
+                }
+            }));
         })
         .register();
 
@@ -992,87 +1056,112 @@ fn add_capture_listener(
     stream: &pw::stream::StreamRc,
     user_data: UserData,
 ) -> std::result::Result<pw::stream::StreamListener<UserData>, String> {
+    // RT の process コールバックが f32 詰め替えに使う thread-local スクラッチを、
+    // **stream セットアップ時（このループスレッド上）で最大想定ブロック長に事前確保**
+    // しておく。これで process 内の初回/拡大 reserve（= RT アロケート・xrun リスク）を
+    // 定常状態で排除する。setup_pw / setup_pw_process は登録後にこの関数を呼ぶので、
+    // ここでの reserve はループスレッド（非 RT のセットアップ局面）で 1 回行われる。
+    PROC_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        let cap = s.capacity();
+        if cap < PROC_SCRATCH_CAP {
+            s.reserve(PROC_SCRATCH_CAP - cap);
+        }
+    });
+
     stream
         .add_local_listener_with_user_data(user_data)
         .param_changed(|_stream, user_data, id, param| {
-            // NULL は format クリア。
-            let Some(param) = param else {
-                return;
-            };
-            if id != pw::spa::param::ParamType::Format.as_raw() {
-                return;
-            }
-            let (media_type, media_subtype) = match format_utils::parse_format(param) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            // raw audio のみ受理。
-            if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
-                return;
-            }
-            // 確定フォーマットを控える（process でチャンネル数として使う）。
-            if user_data.format.parse(param).is_err() {
-                // パース失敗時は更新しない（直前の値を保持）。
-            }
+            // FFI 境界越えの panic は UB。defense-in-depth で本体を catch_unwind で包む
+            // （現状 live なパニック経路は無いが構造防御）。inner の return は inner
+            // クロージャから返るだけで、従来の制御フローと等価。
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                // NULL は format クリア。
+                let Some(param) = param else {
+                    return;
+                };
+                if id != pw::spa::param::ParamType::Format.as_raw() {
+                    return;
+                }
+                let (media_type, media_subtype) = match format_utils::parse_format(param) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                // raw audio のみ受理。
+                if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
+                    return;
+                }
+                // 確定フォーマットを控える（process でチャンネル数として使う）。
+                if user_data.format.parse(param).is_err() {
+                    // パース失敗時は更新しない（直前の値を保持）。
+                }
+            }));
         })
         .process(|stream, user_data| {
             // RT スレッドで呼ばれる。ブロック禁止・確保禁止が望ましい。
-            // バッファが無ければ何もしない（panic しない）。
-            let Some(mut buffer) = stream.dequeue_buffer() else {
-                return;
-            };
-            let datas = buffer.datas_mut();
-            if datas.is_empty() {
-                return;
-            }
-            let data = &mut datas[0];
-            // 有効バイト数とオフセット（リング上の位置）を控えてから data() を借りる。
-            let chunk = data.chunk();
-            let size = chunk.size() as usize;
-            let offset = chunk.offset() as usize;
-            if size == 0 {
-                return;
-            }
-            let Some(bytes) = data.data() else {
-                return;
-            };
-            // [offset, offset+size) が有効領域。範囲外は弾く（防御的）。
-            let end = offset.saturating_add(size);
-            if end > bytes.len() {
-                return;
-            }
-            let valid = &bytes[offset..end];
-            // f32 の倍数だけ取り出す（端数バイトは無視）。
-            let n_floats = valid.len() / std::mem::size_of::<f32>();
-            if n_floats == 0 {
-                return;
-            }
-            // バイト列を f32 interleaved として読む。`data` のアライメントは
-            // 保証されないため、align_to ではなく from_le_bytes で安全に読む。
-            // スタック上の小バッファに詰めてから 1 回で push する（RawSink::push は
-            // 非ブロッキングで満杯時 DROP）。
-            //
-            // 典型ブロックは ~数百〜数千 frames。スレッドローカルな再利用バッファ
-            // を使い、process ごとの確保を避ける。
-            PROC_SCRATCH.with(|cell| {
-                let mut scratch = cell.borrow_mut();
-                scratch.clear();
-                scratch.reserve(n_floats);
-                for i in 0..n_floats {
-                    let b = i * 4;
-                    let v = f32::from_le_bytes([
-                        valid[b],
-                        valid[b + 1],
-                        valid[b + 2],
-                        valid[b + 3],
-                    ]);
-                    scratch.push(v);
+            // FFI 境界越えの panic は UB なので本体全体を catch_unwind で包む
+            // （defense-in-depth。inner の return は inner から返るだけで等価）。
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                // バッファが無ければ何もしない（panic しない）。
+                let Some(mut buffer) = stream.dequeue_buffer() else {
+                    return;
+                };
+                let datas = buffer.datas_mut();
+                if datas.is_empty() {
+                    return;
                 }
-                // PTS は将来 pw_buffer.time の device クロックを使う（TODO）。
-                // 現状は到着時刻の単調クロックで代用（§clock の ClockNormalizer が
-                // 初回原点を取るため、単調近似でも下流は破綻しない）。
-                user_data.sink.push(&scratch, monotonic_now_ns());
-            });
+                let data = &mut datas[0];
+                // 有効バイト数とオフセット（リング上の位置）を控えてから data() を借りる。
+                let chunk = data.chunk();
+                let size = chunk.size() as usize;
+                let offset = chunk.offset() as usize;
+                if size == 0 {
+                    return;
+                }
+                let Some(bytes) = data.data() else {
+                    return;
+                };
+                // [offset, offset+size) が有効領域。範囲外は弾く（防御的）。
+                let end = offset.saturating_add(size);
+                if end > bytes.len() {
+                    return;
+                }
+                let valid = &bytes[offset..end];
+                // f32 の倍数だけ取り出す（端数バイトは無視）。
+                let n_floats = valid.len() / std::mem::size_of::<f32>();
+                if n_floats == 0 {
+                    return;
+                }
+                // バイト列を f32 interleaved として読む。`data` のアライメントは
+                // 保証されないため、align_to ではなく from_le_bytes で安全に読む。
+                // 再利用バッファ（事前確保済み）に詰めてから 1 回で push する（RawSink::push
+                // は非ブロッキングで満杯時 DROP）。
+                PROC_SCRATCH.with(|cell| {
+                    let mut scratch = cell.borrow_mut();
+                    // 事前確保済み（PROC_SCRATCH_CAP）なら定常状態で reserve は no-op
+                    // ＝ RT アロケート無し。想定超ブロックのみ一度だけ広げる安全側
+                    // フォールバック（以後その容量を保つ）。
+                    let cap = scratch.capacity();
+                    if n_floats > cap {
+                        scratch.reserve(n_floats - cap);
+                    }
+                    scratch.clear();
+                    for i in 0..n_floats {
+                        let b = i * 4;
+                        let v = f32::from_le_bytes([
+                            valid[b],
+                            valid[b + 1],
+                            valid[b + 2],
+                            valid[b + 3],
+                        ]);
+                        scratch.push(v);
+                    }
+                    // PTS は将来 pw_buffer.time の device クロックを使う（TODO）。
+                    // 現状は到着時刻の単調クロックで代用（§clock の ClockNormalizer が
+                    // 初回原点を取るため、単調近似でも下流は破綻しない）。
+                    user_data.sink.push(&scratch, monotonic_now_ns());
+                });
+            }));
         })
         .register()
         .map_err(|e| format!("register pipewire stream listener failed: {e}"))
@@ -1169,8 +1258,8 @@ fn setup_pw(
     ),
     String,
 > {
-    // pw::init は何度呼んでもよい（内部で参照カウント）。
-    pw::init();
+    // pw::init はプロセスグローバルに 1 回だけ（Once 集約でスレッド競合を防ぐ）。
+    pw_init_once();
 
     let main_loop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|e| format!("create pipewire main loop failed: {e}"))?;
@@ -1230,8 +1319,16 @@ fn setup_pw(
     Ok((main_loop, stream, listener))
 }
 
+/// `process` の f32 詰め替えスクラッチを stream セットアップ時に事前確保する容量
+/// （f32 個数）。ネイティブ要求は 48000 Hz / 2ch なので **1 秒ぶん** = 96000 を採る。
+/// 実機の process ブロックは ~数百〜数千 frames（≪ 1 秒）なので、これだけ確保すれば
+/// 定常状態で RT 内の reserve（容量拡大アロケート）は起きない。
+const PROC_SCRATCH_CAP: usize = (NATIVE_RATE as usize) * (NATIVE_CHANNELS as usize);
+
 thread_local! {
     /// `process` コールバックの f32 詰め替え用スクラッチ（確保回避）。
+    /// 実体は [`add_capture_listener`] が stream セットアップ時に [`PROC_SCRATCH_CAP`]
+    /// まで事前確保するので、RT の process 内では定常状態で再確保が起きない。
     static PROC_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -1301,7 +1398,7 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    pw::init();
+    pw_init_once();
 
     let main_loop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|e| format!("create pipewire main loop failed: {e}"))?;
@@ -1328,76 +1425,82 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
     let _reg_listener = registry
         .add_listener_local()
         .global(move |global| {
-            let Some(props) = global.props else {
-                return;
-            };
-            match global.type_ {
-                pw::types::ObjectType::Node => {
-                    // media.class が Audio/Sink|Source のノードだけ拾う。
-                    let media_class = props.get(*pw::keys::MEDIA_CLASS).unwrap_or("");
-                    if media_class != "Audio/Sink" && media_class != "Audio/Source" {
-                        return;
+            // FFI 越えの panic は UB。本体を catch_unwind で包む（defense-in-depth）。
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                let Some(props) = global.props else {
+                    return;
+                };
+                match global.type_ {
+                    pw::types::ObjectType::Node => {
+                        // media.class が Audio/Sink|Source のノードだけ拾う。
+                        let media_class = props.get(*pw::keys::MEDIA_CLASS).unwrap_or("");
+                        if media_class != "Audio/Sink" && media_class != "Audio/Source" {
+                            return;
+                        }
+                        let node_name = props.get(*pw::keys::NODE_NAME).unwrap_or("");
+                        if node_name.is_empty() {
+                            // 安定キーが無いノードは列挙できない（スキップ）。
+                            return;
+                        }
+                        let description = props
+                            .get(*pw::keys::NODE_DESCRIPTION)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(node_name);
+                        // audio.rate のキー定数は pipewire crate で feature gate 下（未有効）
+                        // のため文字列指定。registry のノード props には載らないことも多く、
+                        // その場合は下流で既定値（48000/2）にフォールバックする。
+                        let rate = props.get("audio.rate").and_then(|s| s.parse::<u32>().ok());
+                        let channels = props
+                            .get(*pw::keys::AUDIO_CHANNELS)
+                            .and_then(|s| s.parse::<u16>().ok());
+                        state_for_global.borrow_mut().nodes.push(NodeRecord {
+                            node_name: node_name.to_string(),
+                            description: description.to_string(),
+                            media_class: media_class.to_string(),
+                            rate,
+                            channels,
+                        });
                     }
-                    let node_name = props.get(*pw::keys::NODE_NAME).unwrap_or("");
-                    if node_name.is_empty() {
-                        // 安定キーが無いノードは列挙できない（スキップ）。
-                        return;
+                    pw::types::ObjectType::Metadata => {
+                        // 既定 sink/source を保持する "default" メタデータだけ bind する。
+                        // ("metadata.name" のキー定数は pipewire crate に無いので文字列指定)
+                        let meta_name = props.get("metadata.name").unwrap_or("");
+                        if meta_name != "default" {
+                            return;
+                        }
+                        let metadata: pw::metadata::Metadata =
+                            match registry_for_global.bind(global) {
+                                Ok(m) => m,
+                                Err(_) => return,
+                            };
+                        let state_for_meta = state_for_global.clone();
+                        let listener = metadata
+                            .add_listener_local()
+                            .property(move |_subject, key, _type, value| {
+                                // property コールバックも FFI 越えなので catch_unwind で包む。
+                                catch_unwind(AssertUnwindSafe(|| {
+                                    // value は JSON（例: {"name":"alsa_output...."}）。name を抜く。
+                                    if let (Some(key), Some(value)) = (key, value) {
+                                        if key == "default.audio.sink" {
+                                            state_for_meta.borrow_mut().default_sink =
+                                                extract_json_name(value);
+                                        } else if key == "default.audio.source" {
+                                            state_for_meta.borrow_mut().default_source =
+                                                extract_json_name(value);
+                                        }
+                                    }
+                                }))
+                                .ok();
+                                0
+                            })
+                            .register();
+                        meta_keep_for_global
+                            .borrow_mut()
+                            .push((Box::new(metadata), Box::new(listener)));
                     }
-                    let description = props
-                        .get(*pw::keys::NODE_DESCRIPTION)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(node_name);
-                    // audio.rate のキー定数は pipewire crate で feature gate 下（未有効）
-                    // のため文字列指定。registry のノード props には載らないことも多く、
-                    // その場合は下流で既定値（48000/2）にフォールバックする。
-                    let rate = props
-                        .get("audio.rate")
-                        .and_then(|s| s.parse::<u32>().ok());
-                    let channels = props
-                        .get(*pw::keys::AUDIO_CHANNELS)
-                        .and_then(|s| s.parse::<u16>().ok());
-                    state_for_global.borrow_mut().nodes.push(NodeRecord {
-                        node_name: node_name.to_string(),
-                        description: description.to_string(),
-                        media_class: media_class.to_string(),
-                        rate,
-                        channels,
-                    });
+                    _ => {}
                 }
-                pw::types::ObjectType::Metadata => {
-                    // 既定 sink/source を保持する "default" メタデータだけ bind する。
-                    // ("metadata.name" のキー定数は pipewire crate に無いので文字列指定)
-                    let meta_name = props.get("metadata.name").unwrap_or("");
-                    if meta_name != "default" {
-                        return;
-                    }
-                    let metadata: pw::metadata::Metadata = match registry_for_global.bind(global) {
-                        Ok(m) => m,
-                        Err(_) => return,
-                    };
-                    let state_for_meta = state_for_global.clone();
-                    let listener = metadata
-                        .add_listener_local()
-                        .property(move |_subject, key, _type, value| {
-                            // value は JSON（例: {"name":"alsa_output...."}）。name を抜く。
-                            if let (Some(key), Some(value)) = (key, value) {
-                                if key == "default.audio.sink" {
-                                    state_for_meta.borrow_mut().default_sink =
-                                        extract_json_name(value);
-                                } else if key == "default.audio.source" {
-                                    state_for_meta.borrow_mut().default_source =
-                                        extract_json_name(value);
-                                }
-                            }
-                            0
-                        })
-                        .register();
-                    meta_keep_for_global
-                        .borrow_mut()
-                        .push((Box::new(metadata), Box::new(listener)));
-                }
-                _ => {}
-            }
+            }));
         })
         .register();
 
@@ -1454,9 +1557,17 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
         })
         .register();
 
-    // done が立つ（= 2 段の往復完了）まで回す。done で必ず quit するので無限化しない。
+    // done が立つ（= 2 段の往復完了）まで回す。done で必ず quit する設計だが、
+    // 万一 done が来ないまま run() が即時 return を繰り返すと（spurious quit 等）
+    // タイトループ/ハングになる。デッドラインで打ち切り、収集済み分を返す安全弁を置く
+    // （列挙は best-effort で、揃わなくても panic/ハングはさせない）。
+    let deadline = std::time::Instant::now();
     while !done.get() {
         main_loop.run();
+        if deadline.elapsed().as_millis() >= ENUMERATE_DEADLINE_MS {
+            // done が立たないまま上限超過。打ち切って収集済みを返す（無限化を防ぐ）。
+            break;
+        }
     }
 
     // --- 収集した生ノードから DeviceInfo を組み立てる ---
@@ -1761,7 +1872,7 @@ fn setup_watch(
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    pw::init();
+    pw_init_once();
 
     let main_loop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|e| format!("create pipewire main loop failed: {e}"))?;
@@ -1792,138 +1903,149 @@ fn setup_watch(
     let _registry_listener = registry
         .add_listener_local()
         .global(move |global| {
-            let Some(props) = global.props else {
-                return;
-            };
-            match global.type_ {
-                pw::types::ObjectType::Node => {
-                    // enumerate_pw と同一の抽出ロジック。
-                    // media.class が Audio/Sink|Source のノードだけ拾う。
-                    let media_class = props.get(*pw::keys::MEDIA_CLASS).unwrap_or("");
-                    if media_class != "Audio/Sink" && media_class != "Audio/Source" {
-                        return;
-                    }
-                    let node_name = props.get(*pw::keys::NODE_NAME).unwrap_or("");
-                    if node_name.is_empty() {
-                        // 安定キーが無いノードは扱えない（スキップ）。
-                        return;
-                    }
-                    let description = props
-                        .get(*pw::keys::NODE_DESCRIPTION)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(node_name);
-                    let rate = props.get("audio.rate").and_then(|s| s.parse::<u32>().ok());
-                    let channels = props
-                        .get(*pw::keys::AUDIO_CHANNELS)
-                        .and_then(|s| s.parse::<u16>().ok());
+            // FFI 越えの panic は UB。本体を catch_unwind で包む（defense-in-depth）。
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                let Some(props) = global.props else {
+                    return;
+                };
+                match global.type_ {
+                    pw::types::ObjectType::Node => {
+                        // enumerate_pw と同一の抽出ロジック。
+                        // media.class が Audio/Sink|Source のノードだけ拾う。
+                        let media_class = props.get(*pw::keys::MEDIA_CLASS).unwrap_or("");
+                        if media_class != "Audio/Sink" && media_class != "Audio/Source" {
+                            return;
+                        }
+                        let node_name = props.get(*pw::keys::NODE_NAME).unwrap_or("");
+                        if node_name.is_empty() {
+                            // 安定キーが無いノードは扱えない（スキップ）。
+                            return;
+                        }
+                        let description = props
+                            .get(*pw::keys::NODE_DESCRIPTION)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(node_name);
+                        let rate = props.get("audio.rate").and_then(|s| s.parse::<u32>().ok());
+                        let channels = props
+                            .get(*pw::keys::AUDIO_CHANNELS)
+                            .and_then(|s| s.parse::<u16>().ok());
 
-                    let is_loopback = media_class == "Audio/Sink";
-                    let source_kind = if is_loopback {
-                        SourceKind::SystemLoopback
-                    } else {
-                        SourceKind::Mic
-                    };
-                    // is_default は既知の default メタデータ値と突き合わせる。
-                    // 初期スキャン中はメタデータがまだ来ていないこともあり、その場合は
-                    // false。正確化は DefaultChanged 経由で後追いされる。
-                    let mut st = state_for_global.borrow_mut();
-                    let is_default = if is_loopback {
-                        st.default_sink.as_deref() == Some(node_name)
-                    } else {
-                        st.default_source.as_deref() == Some(node_name)
-                    };
+                        let is_loopback = media_class == "Audio/Sink";
+                        let source_kind = if is_loopback {
+                            SourceKind::SystemLoopback
+                        } else {
+                            SourceKind::Mic
+                        };
+                        // is_default は既知の default メタデータ値と突き合わせる。
+                        // 初期スキャン中はメタデータがまだ来ていないこともあり、その場合は
+                        // false。正確化は DefaultChanged 経由で後追いされる。
+                        let mut st = state_for_global.borrow_mut();
+                        let is_default = if is_loopback {
+                            st.default_sink.as_deref() == Some(node_name)
+                        } else {
+                            st.default_source.as_deref() == Some(node_name)
+                        };
 
-                    let info = DeviceInfo {
-                        id: node_name.to_string(),
-                        name: description.to_string(),
-                        source_kind,
-                        // 取れなければ要求ネイティブ（48000/2）を既定にする（enumerate_pw 同様）。
-                        sample_rate: rate.unwrap_or(NATIVE_RATE),
-                        channels: channels.unwrap_or(NATIVE_CHANNELS),
-                        is_loopback,
-                        is_default,
-                    };
-                    st.by_global_id.insert(global.id, info.clone());
-                    let initial_scan_done = st.initial_scan_done;
-                    drop(st);
+                        let info = DeviceInfo {
+                            id: node_name.to_string(),
+                            name: description.to_string(),
+                            source_kind,
+                            // 取れなければ要求ネイティブ（48000/2）を既定にする（enumerate_pw 同様）。
+                            sample_rate: rate.unwrap_or(NATIVE_RATE),
+                            channels: channels.unwrap_or(NATIVE_CHANNELS),
+                            is_loopback,
+                            is_default,
+                        };
+                        st.by_global_id.insert(global.id, info.clone());
+                        let initial_scan_done = st.initial_scan_done;
+                        drop(st);
 
-                    // 初期スキャン中は登録のみ（Added を抑制）。完了後の出現だけ配信。
-                    if initial_scan_done {
-                        enqueue_event(&events_for_global, DeviceEvent::Added(info));
+                        // 初期スキャン中は登録のみ（Added を抑制）。完了後の出現だけ配信。
+                        if initial_scan_done {
+                            enqueue_event(&events_for_global, DeviceEvent::Added(info));
+                        }
                     }
-                }
-                pw::types::ObjectType::Metadata => {
-                    // 既定 sink/source を保持する "default" メタデータだけ bind する
-                    // （enumerate_pw と同型）。
-                    let meta_name = props.get("metadata.name").unwrap_or("");
-                    if meta_name != "default" {
-                        return;
-                    }
-                    let metadata: pw::metadata::Metadata = match registry_for_global.bind(global) {
-                        Ok(m) => m,
-                        Err(_) => return,
-                    };
-                    let state_for_meta = state_for_global.clone();
-                    let events_for_meta = events_for_global.clone();
-                    let listener = metadata
-                        .add_listener_local()
-                        .property(move |_subject, key, _type, value| {
-                            // value は JSON（例: {"name":"alsa_output...."}）。name を抜く。
-                            if let (Some(key), Some(value)) = (key, value) {
-                                let new_name = extract_json_name(value);
-                                let mut st = state_for_meta.borrow_mut();
-                                if key == "default.audio.sink" {
-                                    if st.default_sink != new_name {
-                                        st.default_sink = new_name.clone();
-                                        // 初期スキャン完了後の変化のみ配信。
-                                        if st.initial_scan_done {
-                                            if let Some(id) = new_name {
-                                                drop(st);
-                                                enqueue_event(
-                                                    &events_for_meta,
-                                                    DeviceEvent::DefaultChanged {
-                                                        kind: SourceKind::SystemLoopback,
-                                                        id,
-                                                    },
-                                                );
+                    pw::types::ObjectType::Metadata => {
+                        // 既定 sink/source を保持する "default" メタデータだけ bind する
+                        // （enumerate_pw と同型）。
+                        let meta_name = props.get("metadata.name").unwrap_or("");
+                        if meta_name != "default" {
+                            return;
+                        }
+                        let metadata: pw::metadata::Metadata =
+                            match registry_for_global.bind(global) {
+                                Ok(m) => m,
+                                Err(_) => return,
+                            };
+                        let state_for_meta = state_for_global.clone();
+                        let events_for_meta = events_for_global.clone();
+                        let listener = metadata
+                            .add_listener_local()
+                            .property(move |_subject, key, _type, value| {
+                                // property コールバックも FFI 越えなので catch_unwind で包む。
+                                catch_unwind(AssertUnwindSafe(|| {
+                                    // value は JSON（例: {"name":"alsa_output...."}）。name を抜く。
+                                    if let (Some(key), Some(value)) = (key, value) {
+                                        let new_name = extract_json_name(value);
+                                        let mut st = state_for_meta.borrow_mut();
+                                        if key == "default.audio.sink" {
+                                            if st.default_sink != new_name {
+                                                st.default_sink = new_name.clone();
+                                                // 初期スキャン完了後の変化のみ配信。
+                                                if st.initial_scan_done {
+                                                    if let Some(id) = new_name {
+                                                        drop(st);
+                                                        enqueue_event(
+                                                            &events_for_meta,
+                                                            DeviceEvent::DefaultChanged {
+                                                                kind: SourceKind::SystemLoopback,
+                                                                id,
+                                                            },
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else if key == "default.audio.source"
+                                            && st.default_source != new_name
+                                        {
+                                            st.default_source = new_name.clone();
+                                            if st.initial_scan_done {
+                                                if let Some(id) = new_name {
+                                                    drop(st);
+                                                    enqueue_event(
+                                                        &events_for_meta,
+                                                        DeviceEvent::DefaultChanged {
+                                                            kind: SourceKind::Mic,
+                                                            id,
+                                                        },
+                                                    );
+                                                }
                                             }
                                         }
                                     }
-                                } else if key == "default.audio.source"
-                                    && st.default_source != new_name
-                                {
-                                    st.default_source = new_name.clone();
-                                    if st.initial_scan_done {
-                                        if let Some(id) = new_name {
-                                            drop(st);
-                                            enqueue_event(
-                                                &events_for_meta,
-                                                DeviceEvent::DefaultChanged {
-                                                    kind: SourceKind::Mic,
-                                                    id,
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            0
-                        })
-                        .register();
-                    meta_keep_for_global
-                        .borrow_mut()
-                        .push((Box::new(metadata), Box::new(listener)));
+                                }))
+                                .ok();
+                                0
+                            })
+                            .register();
+                        meta_keep_for_global
+                            .borrow_mut()
+                            .push((Box::new(metadata), Box::new(listener)));
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
+            }));
         })
         .global_remove(move |id| {
-            // 逆引き表にヒットしたノードだけ Removed を配信。表に無い id は無視
-            // （Metadata 等の非ノード global の除去も来るが、表に無いので素通り）。
-            let removed = state_for_remove.borrow_mut().by_global_id.remove(&id);
-            if let Some(info) = removed {
-                enqueue_event(&events_for_remove, DeviceEvent::Removed { id: info.id });
-            }
+            // FFI 越えの panic は UB。本体を catch_unwind で包む（defense-in-depth）。
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                // 逆引き表にヒットしたノードだけ Removed を配信。表に無い id は無視
+                // （Metadata 等の非ノード global の除去も来るが、表に無いので素通り）。
+                let removed = state_for_remove.borrow_mut().by_global_id.remove(&id);
+                if let Some(info) = removed {
+                    enqueue_event(&events_for_remove, DeviceEvent::Removed { id: info.id });
+                }
+            }));
         })
         .register();
 
@@ -2006,9 +2128,17 @@ fn setup_watch(
 }
 
 /// 配信キューへイベントを 1 つ積む。lock 失敗時は何もしない（panic しない）。
-/// `VecDeque` は無制限（着脱は低頻度・取りこぼし不可）。
+///
+/// 着脱は本来低頻度だが、消費側が `poll_event` を長時間呼ばない／デバイスが連続着脱
+/// するような病的ケースでは `VecDeque` が無制限に膨らみメモリを食い続ける。これを防ぐ
+/// ため [`MAX_WATCH_EVENTS`] を上限とし、超過時は **最古から捨てて**新規を積む
+/// （cap + 古いもの破棄）。lock 失敗時は何もしない（panic しない）。
 fn enqueue_event(events: &Arc<Mutex<VecDeque<DeviceEvent>>>, ev: DeviceEvent) {
     if let Ok(mut q) = events.lock() {
+        // 上限に達していたら最古を捨ててから積む（無制限増加を防ぐ）。
+        while q.len() >= MAX_WATCH_EVENTS {
+            q.pop_front();
+        }
         q.push_back(ev);
     }
 }
@@ -2438,5 +2568,31 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// `enqueue_event` は配信キューを [`MAX_WATCH_EVENTS`] で上限化し、超過時は最古を
+    /// 捨てて新規を積む（無制限増加を防ぐ）。上限ぴったり + α を積み、長さが上限を超えず
+    /// 最新側が残ることを確認する。
+    #[test]
+    fn enqueue_event_caps_queue_and_drops_oldest() {
+        let events: Arc<Mutex<VecDeque<DeviceEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
+        // 上限 + 10 件積む。id を node 番号として埋め込み、どれが残ったか追える。
+        let total = MAX_WATCH_EVENTS + 10;
+        for i in 0..total {
+            enqueue_event(&events, DeviceEvent::Removed { id: format!("n{i}") });
+        }
+        let q = events.lock().unwrap();
+        // 長さは上限を超えない。
+        assert_eq!(q.len(), MAX_WATCH_EVENTS, "キュー長は上限で頭打ち");
+        // 最古 10 件（n0..n9）は捨てられ、先頭は n10 になる。
+        match q.front().unwrap() {
+            DeviceEvent::Removed { id } => assert_eq!(id, "n10", "最古から捨てられる"),
+            other => panic!("想定外イベント: {other:?}"),
+        }
+        // 最新（n{total-1}）は残る。
+        match q.back().unwrap() {
+            DeviceEvent::Removed { id } => assert_eq!(id, &format!("n{}", total - 1)),
+            other => panic!("想定外イベント: {other:?}"),
+        }
     }
 }

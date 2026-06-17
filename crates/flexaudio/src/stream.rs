@@ -523,7 +523,15 @@ fn run_intake(
     output: OutputFormat,
 ) {
     let (mut rate, mut channels) = initial_native;
-    let mut normalizer = Normalizer::new(rate, channels, output);
+    // Normalizer 構築失敗（rubato 構築失敗等）は無言で死なせず Event::Error を出して終了。
+    // 従来は Normalizer::new が panic していたため取り込みスレッドが無言死していた。
+    let mut normalizer = match Normalizer::new(rate, channels, output) {
+        Ok(n) => n,
+        Err(e) => {
+            shared.push_event(Event::Error(format!("normalizer init failed: {e}")));
+            return;
+        }
+    };
     let mut clock = ClockNormalizer::new();
     let mut seq: u64 = 0;
     let mut current_generation = shared.raw_generation.load(Ordering::SeqCst);
@@ -547,12 +555,25 @@ fn run_intake(
             let nf = *shared.native_format.lock().expect("native_format mutex");
             rate = nf.0;
             channels = nf.1;
-            normalizer = Normalizer::new(rate, channels, output);
+            // 新ソース向け Normalizer 再構築。失敗（rubato 構築失敗等）は無言死せず
+            // Event::Error を出して取り込みを終了する。
+            normalizer = match Normalizer::new(rate, channels, output) {
+                Ok(n) => n,
+                Err(e) => {
+                    shared.push_event(Event::Error(format!(
+                        "normalizer rebuild failed after source change: {e}"
+                    )));
+                    return;
+                }
+            };
             clock = ClockNormalizer::new();
         }
 
         // RawRing から取り出して Normalizer へ。
         let mut produced_any = false;
+        // Normalizer::push の失敗（rubato process 失敗等）を持ち越す。ロックを保持した
+        // まま return しないよう、ブロック内では結果だけ控えてブロック後に処理する。
+        let mut push_err: Option<Error> = None;
         {
             let mut rc_guard = shared.raw_consumer.lock().expect("raw_consumer mutex");
             if let Some(rc) = rc_guard.as_mut() {
@@ -565,13 +586,23 @@ fn run_intake(
                     // device PTS: ネイティブ SR を基準にした単調近似（到着時刻）。
                     let device_pts = monotonic_now_ns();
                     let norm_pts = clock.normalize(device_pts);
-                    normalizer.push(samples, norm_pts);
-                    shared
-                        .last_sample_ns
-                        .store(monotonic_now_ns(), Ordering::SeqCst);
-                    produced_any = true;
+                    // push 失敗（理論上の rubato process 失敗）は無言で殺さず控える。
+                    if let Err(e) = normalizer.push(samples, norm_pts) {
+                        push_err = Some(e);
+                    } else {
+                        shared
+                            .last_sample_ns
+                            .store(monotonic_now_ns(), Ordering::SeqCst);
+                        produced_any = true;
+                    }
                 }
             }
+        }
+
+        // push が失敗していたら Event::Error を出して取り込みを終了（無言死しない）。
+        if let Some(e) = push_err {
+            shared.push_event(Event::Error(format!("normalizer push failed: {e}")));
+            return;
         }
 
         // 完成チャンクを全て取り出して ChunkRing へ。

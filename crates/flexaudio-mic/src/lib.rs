@@ -29,6 +29,7 @@
 //! backend.stop();
 //! ```
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -288,6 +289,38 @@ fn run_capture_thread(
     drop(stream);
 }
 
+/// RT 変換コールバックのスクラッチ事前確保に使う「最大想定ブロック長」（秒）。
+///
+/// cpal の 1 コールバックが運ぶ最大フレーム数を、ネイティブ SR×ch から
+/// **この秒数ぶん**で見積もって stream セットアップ時に確保する。実機のブロックは
+/// 通常 ~数 ms〜数十 ms（≪ 1 秒）なので、1 秒ぶんあれば定常状態で容量拡大
+/// （= RT 内アロケート）は起きない。仮に想定を超える巨大ブロックが来ても、
+/// [`fill_scratch`] が一度だけ `reserve` で広げて以後その容量を保つ（torn せず
+/// panic もしない）安全側フォールバックにする。
+const MAX_SCRATCH_SECONDS: usize = 1;
+
+/// 変換経路（I16/U16/I32）の RT コールバックで使う事前確保済みスクラッチへ、
+/// interleaved 入力を変換しながら詰める共通ヘルパ。
+///
+/// `scratch` は stream セットアップ時に最大想定ブロック長で確保済み。定常状態では
+/// `len == 0`〜容量内なので `set_len` 相当の `resize` も再確保を起こさない
+/// （`reserve` は容量内では no-op）。万一 `n` が容量超なら一度だけ `reserve` で
+/// 広げる（想定外の巨大ブロックに対する安全側フォールバック。以後はその容量を保つ）。
+/// RT 安全性のため分岐・確保を最小化し、`convert` を各サンプルへ適用して書き込む。
+#[inline]
+fn fill_scratch<T: Copy>(scratch: &mut Vec<f32>, data: &[T], convert: impl Fn(T) -> f32) {
+    let n = data.len();
+    // 定常状態では capacity 内なので reserve は no-op（RT 内アロケート無し）。
+    // 想定超ブロックのみ一度広げる安全側フォールバック。
+    if n > scratch.capacity() {
+        scratch.reserve(n - scratch.capacity());
+    }
+    scratch.clear();
+    for &s in data {
+        scratch.push(convert(s));
+    }
+}
+
 /// プライミング過渡バッファと判定する f32 ピーク振幅の閾値。
 ///
 /// flexaudio の f32 サンプルは契約上 `[-1.0, 1.0]` に正規化される。Linux の PipeWire
@@ -378,8 +411,21 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
         let _ = e;
     };
 
+    // 変換経路のスクラッチを **stream セットアップ時に最大想定ブロック長で事前確保**
+    // する（ネイティブ SR×ch × MAX_SCRATCH_SECONDS）。これで RT コールバック内の初回/
+    // 拡大ヒープアロケート（xrun リスク）を定常状態で排除する。最低 1 は確保する。
+    let scratch_cap = (config.sample_rate.0 as usize)
+        .saturating_mul(config.channels as usize)
+        .saturating_mul(MAX_SCRATCH_SECONDS)
+        .max(1);
+
     // sink はコールバックへ move する。F32 以外は変換用に閉じ込める。
     // 過渡判定は f32 値に対して行うため、変換フォーマットでは変換後に判定する。
+    //
+    // **catch_unwind ガード**: cpal の data コールバックは FFI（C ABI）境界を越えて
+    // 呼ばれるため、ここで panic すると未定義動作になり得る。現状 live なパニック経路は
+    // 無いが、defense-in-depth として各コールバック本体を catch_unwind で包み、万一の
+    // panic を握り潰す（その回のブロックを捨てるだけで stream は継続）。
     let stream = match sample_format {
         SampleFormat::F32 => {
             let mut sink = sink;
@@ -387,11 +433,13 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
             device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    // 既に interleaved f32。プライミング過渡なら捨てる。
-                    if guard.should_drop(data) {
-                        return;
-                    }
-                    sink.push(data, monotonic_now_ns());
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        // 既に interleaved f32。プライミング過渡なら捨てる。
+                        if guard.should_drop(data) {
+                            return;
+                        }
+                        sink.push(data, monotonic_now_ns());
+                    }));
                 },
                 err_fn,
                 None,
@@ -399,18 +447,19 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
         }
         SampleFormat::I16 => {
             let mut sink = sink;
-            // 変換用スクラッチ。コールバック内に閉じ込めて再利用（アロケート回避）。
-            let mut scratch: Vec<f32> = Vec::new();
+            // 変換用スクラッチ。最大想定ブロック長で事前確保し、RT 内で容量拡大させない。
+            let mut scratch: Vec<f32> = Vec::with_capacity(scratch_cap);
             let mut guard = TransientGuard::new();
             device.build_input_stream(
                 &config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    scratch.clear();
-                    scratch.extend(data.iter().map(|&s| s as f32 / -(i16::MIN as f32)));
-                    if guard.should_drop(&scratch) {
-                        return;
-                    }
-                    sink.push(&scratch, monotonic_now_ns());
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        fill_scratch(&mut scratch, data, |s| s as f32 / -(i16::MIN as f32));
+                        if guard.should_drop(&scratch) {
+                            return;
+                        }
+                        sink.push(&scratch, monotonic_now_ns());
+                    }));
                 },
                 err_fn,
                 None,
@@ -418,21 +467,19 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
         }
         SampleFormat::U16 => {
             let mut sink = sink;
-            let mut scratch: Vec<f32> = Vec::new();
+            let mut scratch: Vec<f32> = Vec::with_capacity(scratch_cap);
             let mut guard = TransientGuard::new();
             device.build_input_stream(
                 &config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    scratch.clear();
-                    // u16 [0, 65535] を中点 32768 基準で [-1, 1) へ。
-                    scratch.extend(
-                        data.iter()
-                            .map(|&s| (s as f32 - 32_768.0) / 32_768.0),
-                    );
-                    if guard.should_drop(&scratch) {
-                        return;
-                    }
-                    sink.push(&scratch, monotonic_now_ns());
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        // u16 [0, 65535] を中点 32768 基準で [-1, 1) へ。
+                        fill_scratch(&mut scratch, data, |s| (s as f32 - 32_768.0) / 32_768.0);
+                        if guard.should_drop(&scratch) {
+                            return;
+                        }
+                        sink.push(&scratch, monotonic_now_ns());
+                    }));
                 },
                 err_fn,
                 None,
@@ -440,17 +487,18 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
         }
         SampleFormat::I32 => {
             let mut sink = sink;
-            let mut scratch: Vec<f32> = Vec::new();
+            let mut scratch: Vec<f32> = Vec::with_capacity(scratch_cap);
             let mut guard = TransientGuard::new();
             device.build_input_stream(
                 &config,
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
-                    scratch.clear();
-                    scratch.extend(data.iter().map(|&s| s as f32 / -(i32::MIN as f32)));
-                    if guard.should_drop(&scratch) {
-                        return;
-                    }
-                    sink.push(&scratch, monotonic_now_ns());
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        fill_scratch(&mut scratch, data, |s| s as f32 / -(i32::MIN as f32));
+                        if guard.should_drop(&scratch) {
+                            return;
+                        }
+                        sink.push(&scratch, monotonic_now_ns());
+                    }));
                 },
                 err_fn,
                 None,
@@ -521,6 +569,28 @@ mod tests {
         assert!(!g.should_drop(&[]));
         // 空で latch したので、以後の範囲外バッファも通す。
         assert!(!g.should_drop(&make_buf(1024, 3.3)));
+    }
+
+    /// [`fill_scratch`] が事前確保容量内では再確保（容量拡大）を起こさず、変換も正しい
+    /// こと。RT コールバックでの定常状態アロケート無しを担保する核心。
+    #[test]
+    fn fill_scratch_no_realloc_in_steady_state() {
+        // 最大想定ブロック長で確保。
+        let cap = 480 * 2; // 10ms @ 48k stereo 相当
+        let mut scratch: Vec<f32> = Vec::with_capacity(cap);
+        let before = scratch.capacity();
+
+        // 容量内のブロックを何度詰めても容量は変わらない（= 再確保が起きない）。
+        let data: Vec<i16> = (0..cap as i16).collect();
+        for _ in 0..100 {
+            fill_scratch(&mut scratch, &data, |s| s as f32 / -(i16::MIN as f32));
+            assert_eq!(scratch.len(), data.len());
+            assert_eq!(scratch.capacity(), before, "定常状態で容量拡大しない");
+        }
+        // 変換が正しい（i16::MIN は -1.0 にマップ）。
+        let mut one = Vec::with_capacity(1);
+        fill_scratch(&mut one, &[i16::MIN], |s| s as f32 / -(i16::MIN as f32));
+        assert_eq!(one[0], -1.0);
     }
 
     /// `new` + `native_format` が panic しないこと（入力デバイス有無を問わず）。
