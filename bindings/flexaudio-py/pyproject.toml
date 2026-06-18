@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "flexaudio"
+version = "0.2.0"
+description = "Flexible cross-platform audio capture (microphone, system loopback, per-process) for Python, via native bindings to the flexaudio Rust library."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "tsubome (Aratech)" }]
+keywords = ["audio", "capture", "loopback", "recording", "pyo3"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+    "License :: OSI Approved :: MIT License",
+]
+
+[project.urls]
+Repository = "https://github.com/tsubome/flexaudio"
+
+# extension-module を有効にしてビルド（libpython を直接リンクしない）。crate feature
+# 経由なので cargo test では無効のまま（テストバイナリが libpython をリンクできない罠を
+# 避ける）。abi3 設定は Cargo.toml の pyo3 features（abi3-py38）が決める。
+[tool.maturin]
+features = ["extension-module"]
+# import 名を `flexaudio` に固定する（[lib] name と一致）。
+module-name = "flexaudio"

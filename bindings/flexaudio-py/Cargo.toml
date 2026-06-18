@@ -3,11 +3,35 @@ name = "flexaudio-py"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+# pyo3 0.29 のツールチェインが workspace の 1.85 より新しい rustc を要求しないが、
+# pyo3 自身の MSRV（1.83）に合わせてここで明示する（flexaudio-napi が napi の要求で
+# 1.88 を個別指定しているのと同じ要領）。
+rust-version = "1.83"
 authors.workspace = true
 repository.workspace = true
-description = "PyO3 Python binding scaffold for flexaudio (placeholder; distributed via PyPI, not crates.io)."
-# PyO3 拡張のスキャフォルド。crates.io へは公開しない（PyPI 配布）。
+description = "PyO3 Python binding for flexaudio. Distributed via PyPI, not crates.io."
+# cdylib は crates.io ではライブラリとして消費できない（PyPI 配布）。
 publish = false
 
+# Python 拡張モジュール。Python アプリが flexaudio をインプロセスで叩く経路。
+# cdylib を `flexaudio`（プラットフォーム拡張 .so/.pyd）として import する。
+[lib]
+name = "flexaudio"
+crate-type = ["cdylib"]
+
+[features]
+# maturin（pyproject の [tool.maturin] features）が拡張ビルドで有効化する。
+# extension-module を default に入れると `cargo test` のテストバイナリが libpython を
+# リンクできず壊れるので（拡張は実行時に Python 本体へリンクする前提）、これだけ
+# optional にして cargo build / test は素のままにする。
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
+flexaudio = { path = "../../crates/flexaudio" }
+
+# pyo3 0.29（2025 系の安定最新）。
+# - abi3-py38: Python 3.8 以降で共通の安定 ABI ホイールを 1 つ吐く（毎マイナーで
+#   ビルドし直さなくてよい）。
+# - extension-module（libpython を直接リンクせず Python 拡張として読み込む）は上の
+#   crate feature 経由で maturin だけが有効化する。
+pyo3 = { version = "0.29", features = ["abi3-py38"] }

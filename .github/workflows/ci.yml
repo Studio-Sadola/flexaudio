@@ -28,6 +28,7 @@ jobs:
           cargo clippy
           -p flexaudio -p flexaudio-core -p flexaudio-cli -p flexaudio-mic
           -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
+          -p flexaudio-ffi -p flexaudio-py
           --all-targets -- -D warnings
       - name: Doc (deny warnings, docs.rs-equivalent for Linux crates)
         env:
@@ -36,11 +37,21 @@ jobs:
           cargo doc --no-deps
           -p flexaudio -p flexaudio-core -p flexaudio-cli -p flexaudio-mic
           -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
+          -p flexaudio-ffi
       - name: Test (ignored real-audio tests auto-skip)
         run: >-
           cargo test
           -p flexaudio -p flexaudio-core -p flexaudio-cli -p flexaudio-mic
           -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
+          -p flexaudio-ffi
+      - name: Python binding (maturin build + import)
+        run: |
+          python3 -m venv /tmp/pyenv
+          . /tmp/pyenv/bin/activate
+          pip install -q 'maturin[patchelf]'
+          maturin build --manifest-path bindings/flexaudio-py/Cargo.toml --out /tmp/wheels
+          pip install --no-index --find-links /tmp/wheels flexaudio
+          python -c "import flexaudio; assert isinstance(flexaudio.devices(), list); print('flexaudio import OK; devices:', len(flexaudio.devices()))"
 
   build-test-windows:
     name: Build & Test (Windows / WASAPI)
@@ -50,7 +61,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build -p flexaudio -p flexaudio-os-windows -p flexaudio-mic -p flexaudio-core -p flexaudio-cli
+        run: cargo build -p flexaudio -p flexaudio-os-windows -p flexaudio-mic -p flexaudio-core -p flexaudio-cli -p flexaudio-ffi
       # flexaudio-mic (cpal/WASAPI) is built above but its tests are not run here:
       # on the headless GitHub Windows runner (no audio endpoint) cpal's device
       # enumeration access-violates during process teardown — a cpal/runner issue,
@@ -67,7 +78,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build -p flexaudio -p flexaudio-os-macos -p flexaudio-mic -p flexaudio-core -p flexaudio-cli
+        run: cargo build -p flexaudio -p flexaudio-os-macos -p flexaudio-mic -p flexaudio-core -p flexaudio-cli -p flexaudio-ffi
       - name: Test (ignored real-audio tests auto-skip)
         run: cargo test -p flexaudio -p flexaudio-os-macos -p flexaudio-mic -p flexaudio-core -p flexaudio-cli
 
