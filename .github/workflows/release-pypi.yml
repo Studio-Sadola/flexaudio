@@ -38,11 +38,15 @@ jobs:
   # --- Linux wheels (manylinux), built inside maturin-action's container ---
   linux:
     name: Wheels (manylinux ${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64, aarch64]
+        include:
+          - target: x86_64
+            runner: ubuntu-latest
+          - target: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - name: Build wheels
@@ -60,8 +64,9 @@ jobs:
           # The manylinux container is RHEL-based (dnf/yum). flexaudio-os-linux
           # links PipeWire and flexaudio-mic links ALSA, so install the dev
           # packages before the Rust build runs. clang is needed by pipewire-rs
-          # bindgen. The aarch64 build is QEMU-emulated; deps install the same
-          # way inside the container.
+          # bindgen. Each arch builds natively on its own runner (x86_64 on
+          # ubuntu-latest, aarch64 on the hosted arm64 runner), so pkg-config
+          # resolves the libs without cross-compilation.
           #
           # NOTE: if pipewire-devel is ever unavailable for the chosen
           # manylinux image/arch, the Linux build will fail loudly here rather

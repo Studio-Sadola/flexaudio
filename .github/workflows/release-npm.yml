@@ -138,8 +138,8 @@ jobs:
       # optionalDependencies versions in the root package.json.
       - name: Prepare per-platform npm packages
         run: |
-          npx napi create-npm-dirs
-          npx napi artifacts --output-dir ./artifacts
+          npx napi create-npm-dir -t .
+          npx napi artifacts --dir artifacts
           npx napi prepublish -t npm --skip-gh-release
 
       - name: Publish (root + per-platform packages)
