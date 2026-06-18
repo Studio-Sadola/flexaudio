@@ -121,6 +121,11 @@ struct SharedState {
     /// true にし、取り込みスレッドが次チャンクへ DISCONTINUITY（RECOVERED は
     /// 付けない＝自動復帰ではなく意図的切替）を立てて false に戻す。
     discontinuity_pending: AtomicBool,
+
+    /// ポーズ中フラグ。pause() で true。取り込みスレッドは完成チャンクを破棄して
+    /// 配信しない（RawRing の取り込みは続けるのでデバイスは止まらず、ウォッチドッグの
+    /// 失速判定もぶれない）。resume() で false に戻し、次チャンクへ DISCONTINUITY を立てる。
+    paused: AtomicBool,
 }
 
 impl SharedState {
@@ -192,6 +197,7 @@ impl Stream {
             native_format: Mutex::new(native_format),
             switching: AtomicBool::new(false),
             discontinuity_pending: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
         });
 
         Ok(Stream {
@@ -214,6 +220,10 @@ impl Stream {
             return Ok(());
         }
         self.shared.stopping.store(false, Ordering::SeqCst);
+
+        // 新しい start はポーズ状態を引き継がない（前回 pause したまま stop していても、
+        // 再 start は通常状態から始める）。
+        self.shared.paused.store(false, Ordering::SeqCst);
 
         // 初回 backend 起動: RawRing を作り sink を backend へ渡す。
         Self::open_backend_once(&self.shared)?;
@@ -289,6 +299,38 @@ impl Stream {
         }
 
         self.started = false;
+    }
+
+    /// キャプチャを一時停止する。
+    ///
+    /// OS 側のキャプチャは動かしたまま、完成チャンクの配信だけを止める。停止中は
+    /// [`poll_chunk`](Self::poll_chunk) が新しいチャンクを返さない。内部では取り込みを続けて
+    /// デバイスを生かしておくので、再開は素早く、ウォッチドッグの失速判定も誤発火しない。
+    /// 既に停止中なら何もしない（多重呼び出し安全）。
+    ///
+    /// [`start`](Self::start) する前に呼んでもフラグは立つが、効くのは取り込みが回り始めてから。
+    pub fn pause(&self) {
+        self.shared.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// [`pause`](Self::pause) を解除して配信を再開する。
+    ///
+    /// 再開後に最初に届くチャンクへ [`ChunkFlags::DISCONTINUITY`] を立てる（ポーズで音が時間的に
+    /// 飛んだことを消費側へ伝える）。チャンクの `seq` はポーズ前後で連続し、ポーズ区間ぶんの
+    /// 無音は挿入しない。停止していなければ何もしない（多重呼び出し安全）。
+    pub fn resume(&self) {
+        // 実際にポーズ中だったときだけ不連続を立てる（ポーズしていないのに resume を
+        // 呼んでも余計な DISCONTINUITY を出さない）。
+        if self.shared.paused.swap(false, Ordering::SeqCst) {
+            self.shared
+                .discontinuity_pending
+                .store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// 現在ポーズ中かどうか。
+    pub fn is_paused(&self) -> bool {
+        self.shared.paused.load(Ordering::SeqCst)
     }
 
     /// 完成済みチャンクを 1 つ取り出す（非ブロッキング）。無ければ `None`。
@@ -689,6 +731,14 @@ fn run_intake(
         let out_channels = output.channels.max(1) as usize;
         let mut emitted_any = false;
         while let Some((data, pts_ns)) = normalizer.pop_chunk() {
+            // ポーズ中は完成チャンクを破棄する。直前の RawRing 取り込みで last_sample_ns は
+            // 更新済みなのでデバイスは止まらず、ウォッチドッグの失速判定もぶれない。
+            // recovered_pending / discontinuity_pending はここでは消費せず持ち越し、resume 後の
+            // 最初のチャンクへまとめて DISCONTINUITY として立てる。seq も進めないので、消費側
+            // から見た seq はポーズ前後で連続する。
+            if shared.paused.load(Ordering::SeqCst) {
+                continue;
+            }
             // data は出力フォーマット（output.channels interleaved）。
             // frames は時間ベース 20ms 固定（48k=960 / 16k=320 / ...）。
             debug_assert_eq!(data.len() % out_channels, 0);
@@ -1140,6 +1190,194 @@ mod tests {
                 c.flags
             );
         }
+    }
+
+    // --- pause / resume（配信だけ止める） ---
+
+    /// ポーズすると新しいチャンクが届かなくなる。ポーズ前に最低 1 個は取れて、ポーズ後の
+    /// 一定窓では新規がゼロであることを確認する。
+    #[test]
+    fn pause_stops_delivering_chunks() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.start().expect("start");
+
+        // ポーズ前に少なくとも 1 個チャンクが届くまで待つ。
+        let got_before = wait_until(|| stream.poll_chunk().is_some(), Duration::from_secs(2));
+        assert!(got_before, "ポーズ前にチャンクが届くはず");
+
+        // ポーズ。直後にリングへ残っていたぶんは取り切っておく。
+        stream.pause();
+        while stream.poll_chunk().is_some() {}
+
+        // ポーズ後の窓では新規チャンクが来ないこと。
+        let after = collect_for(&mut stream, Duration::from_millis(300));
+        stream.stop();
+        assert!(
+            after.is_empty(),
+            "ポーズ中は新しいチャンクが届かないはず: {} 個届いた",
+            after.len()
+        );
+    }
+
+    /// STALL_THRESHOLD を超える長いポーズでも失速判定されない。配信は止めても OS 側の
+    /// 取り込み（last_sample_ns の更新）は続くので、ウォッチドッグは idle を検出しない。
+    /// ポーズ窓は STALL_THRESHOLD + ウォッチドッグ tick より十分長く取る。
+    #[test]
+    fn long_pause_does_not_trigger_stall() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.start().expect("start");
+
+        // ポーズ前に少なくとも 1 個チャンクが届くまで待つ。
+        let got_before = wait_until(|| stream.poll_chunk().is_some(), Duration::from_secs(2));
+        assert!(got_before, "ポーズ前にチャンクが届くはず");
+
+        // ポーズ。直後にリングへ残っていたぶんは取り切っておく。
+        stream.pause();
+        while stream.poll_chunk().is_some() {}
+
+        // STALL_THRESHOLD（2s）を確実に超える時間ポーズを保ち、その間イベントを集める。
+        let mut saw_stalled = false;
+        let mut saw_recovered = false;
+        let deadline = Instant::now() + Duration::from_millis(2800);
+        while Instant::now() < deadline {
+            while let Some(ev) = stream.poll_event() {
+                match ev {
+                    Event::StreamStalled => saw_stalled = true,
+                    Event::StreamRecovered => saw_recovered = true,
+                    _ => {}
+                }
+            }
+            // ポーズ中はずっと paused のまま。
+            assert!(
+                stream.is_paused(),
+                "ポーズ窓の間は is_paused が true のはず"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // 長いポーズでも失速判定・復帰は一切起きないこと（これが主眼）。
+        assert!(
+            !saw_stalled,
+            "長いポーズでも StreamStalled は発火しないはず"
+        );
+        assert!(
+            !saw_recovered,
+            "失速していないので StreamRecovered も発火しないはず"
+        );
+
+        // resume するとチャンク配信が再開する。
+        stream.resume();
+        let resumed = wait_until(|| stream.poll_chunk().is_some(), Duration::from_secs(2));
+        stream.stop();
+        assert!(resumed, "resume 後にチャンク配信が再開するはず");
+    }
+
+    /// resume 後の最初のチャンクに DISCONTINUITY が立ち、seq はポーズ前後で連続する
+    /// （ポーズ前最後が N なら resume 後最初は N+1）。dropped_before も 0。
+    #[test]
+    fn resume_flags_discontinuity_and_keeps_seq_continuous() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.start().expect("start");
+
+        // ポーズ前のチャンクを集めて、最後の seq を控える。
+        let before = collect_for(&mut stream, Duration::from_millis(200));
+        assert!(!before.is_empty(), "ポーズ前にチャンクが届くはず");
+        let last_seq = before.last().unwrap().seq;
+
+        // ポーズして、リングに残ったぶんを取り切る。最後の seq を更新しておく。
+        stream.pause();
+        let mut last_seq = last_seq;
+        while let Some(c) = stream.poll_chunk() {
+            last_seq = c.seq;
+        }
+
+        // ポーズ中は新規が来ないことを軽く確認してから resume。
+        assert!(collect_for(&mut stream, Duration::from_millis(150)).is_empty());
+        stream.resume();
+
+        // resume 後の最初のチャンクを待つ。
+        let mut first_after: Option<AudioChunk> = None;
+        let got = wait_until(
+            || match stream.poll_chunk() {
+                Some(c) => {
+                    first_after = Some(c);
+                    true
+                }
+                None => false,
+            },
+            Duration::from_secs(2),
+        );
+        stream.stop();
+        assert!(got, "resume 後にチャンクが届くはず");
+
+        let first = first_after.unwrap();
+        assert!(
+            first.flags.contains(ChunkFlags::DISCONTINUITY),
+            "resume 後の最初のチャンクに DISCONTINUITY が立つはず: flags={:?}",
+            first.flags
+        );
+        assert_eq!(
+            first.seq,
+            last_seq + 1,
+            "seq はポーズ前後で連続するはず（{last_seq} -> {}）",
+            first.seq
+        );
+        assert_eq!(first.dropped_before, 0, "ポーズで取りこぼしは出ないはず");
+    }
+
+    /// ポーズしていないのに resume を呼んでも、次のチャンクに DISCONTINUITY は立たない
+    /// （no-op）。
+    #[test]
+    fn resume_without_pause_is_noop() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.start().expect("start");
+
+        // 最初のチャンク群を捨てて、起動直後の RECOVERED/DISCONTINUITY を流しておく。
+        let _ = collect_for(&mut stream, Duration::from_millis(200));
+
+        // ポーズしていない状態で resume。
+        stream.resume();
+
+        // 以降のチャンクに DISCONTINUITY が立たないこと。
+        let after = collect_for(&mut stream, Duration::from_millis(200));
+        stream.stop();
+        assert!(!after.is_empty(), "チャンクが届くはず");
+        for c in &after {
+            assert!(
+                !c.flags.contains(ChunkFlags::DISCONTINUITY),
+                "ポーズなしの resume では DISCONTINUITY は立たない: flags={:?}",
+                c.flags
+            );
+        }
+    }
+
+    /// pause を二重に呼んでも、resume 一回で正常に再開する（多重呼び出し安全）。
+    #[test]
+    fn double_pause_then_single_resume_recovers() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.start().expect("start");
+
+        let before = collect_for(&mut stream, Duration::from_millis(200));
+        assert!(!before.is_empty(), "ポーズ前にチャンクが届くはず");
+
+        // pause を二重に呼ぶ。
+        stream.pause();
+        stream.pause();
+        assert!(stream.is_paused());
+        while stream.poll_chunk().is_some() {}
+        assert!(collect_for(&mut stream, Duration::from_millis(150)).is_empty());
+
+        // resume は一回。
+        stream.resume();
+        assert!(!stream.is_paused());
+        let got = wait_until(|| stream.poll_chunk().is_some(), Duration::from_secs(2));
+        stream.stop();
+        assert!(got, "resume 一回で配信が再開するはず");
     }
 
     // --- 堅牢性: backend の panic で無言死しない（poison 連鎖 panic 防止） ---

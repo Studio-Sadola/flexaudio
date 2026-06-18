@@ -288,6 +288,17 @@ struct SwitchCmd {
     result_tx: mpsc::Sender<std::result::Result<(), String>>,
 }
 
+/// bridge スレッドへ送るコマンド。Stream を触るのは bridge スレッドだけなので、JS から
+/// の操作はすべてこのチャネル経由で依頼する。
+enum BridgeCmd {
+    /// 入力ソースのホットスワップ（結果を同期で返す）。
+    Switch(SwitchCmd),
+    /// 配信を一時停止する。
+    Pause,
+    /// 配信を再開する。
+    Resume,
+}
+
 /// 録音ストリームのハンドル。内部で bridge スレッドが `flexaudio::Stream` を
 /// 所有・ポーリングし、チャンク/イベントを TSFN 経由で JS へ送る。
 #[napi]
@@ -296,7 +307,7 @@ pub struct FlexStream {
     handle: Option<JoinHandle<()>>,
     /// bridge スレッドへ切替コマンドを送るチャネル。`shutdown` で drop してスレッド側の
     /// `try_recv` を打ち切る（停止自体は stop_flag が担う）。
-    cmd_tx: Option<mpsc::Sender<SwitchCmd>>,
+    cmd_tx: Option<mpsc::Sender<BridgeCmd>>,
 }
 
 impl FlexStream {
@@ -310,18 +321,24 @@ impl FlexStream {
     ) -> Self {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_stop = stop_flag.clone();
-        let (cmd_tx, cmd_rx) = mpsc::channel::<SwitchCmd>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<BridgeCmd>();
 
         let handle = thread::spawn(move || {
             loop {
                 if thread_stop.load(Ordering::SeqCst) {
                     break;
                 }
-                // 切替コマンドを poll と同じ周回でまとめて処理する。
+                // コマンドを poll と同じ周回でまとめて処理する。
                 while let Ok(cmd) = cmd_rx.try_recv() {
-                    let r = stream.switch_source(cmd.config).map_err(|e| e.to_string());
-                    // 受け手（switch_source 呼び出し元）が drop していても無視。
-                    let _ = cmd.result_tx.send(r);
+                    match cmd {
+                        BridgeCmd::Switch(sw) => {
+                            let r = stream.switch_source(sw.config).map_err(|e| e.to_string());
+                            // 受け手（switch_source 呼び出し元）が drop していても無視。
+                            let _ = sw.result_tx.send(r);
+                        }
+                        BridgeCmd::Pause => stream.pause(),
+                        BridgeCmd::Resume => stream.resume(),
+                    }
                 }
                 // チャンクは到着し次第すべて吐く。
                 while let Some(chunk) = stream.poll_chunk() {
@@ -387,12 +404,14 @@ impl FlexStream {
             NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
         })?;
         let (result_tx, result_rx) = mpsc::channel();
-        cmd_tx.send(SwitchCmd { config, result_tx }).map_err(|_| {
-            NapiError::new(
-                Status::GenericFailure,
-                "bridge thread is not running".to_string(),
-            )
-        })?;
+        cmd_tx
+            .send(BridgeCmd::Switch(SwitchCmd { config, result_tx }))
+            .map_err(|_| {
+                NapiError::new(
+                    Status::GenericFailure,
+                    "bridge thread is not running".to_string(),
+                )
+            })?;
         // bridge スレッドが switch_source を実行して結果を返すのを待つ（同期）。
         match result_rx.recv() {
             Ok(Ok(())) => Ok(()),
@@ -402,6 +421,37 @@ impl FlexStream {
                 "bridge thread dropped before responding".to_string(),
             )),
         }
+    }
+
+    /// 録音を一時停止する。デバイスは動かしたまま配信だけ止める。`resume` で再開し、
+    /// 再開後の最初のチャンクに DISCONTINUITY が立つ。既に `stop()` 済みなら例外。
+    #[napi]
+    pub fn pause(&self) -> NapiResult<()> {
+        let cmd_tx = self.cmd_tx.as_ref().ok_or_else(|| {
+            NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
+        })?;
+        cmd_tx.send(BridgeCmd::Pause).map_err(|_| {
+            NapiError::new(
+                Status::GenericFailure,
+                "bridge thread is not running".to_string(),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// 一時停止を解除して配信を再開する。既に `stop()` 済みなら例外。
+    #[napi]
+    pub fn resume(&self) -> NapiResult<()> {
+        let cmd_tx = self.cmd_tx.as_ref().ok_or_else(|| {
+            NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
+        })?;
+        cmd_tx.send(BridgeCmd::Resume).map_err(|_| {
+            NapiError::new(
+                Status::GenericFailure,
+                "bridge thread is not running".to_string(),
+            )
+        })?;
+        Ok(())
     }
 }
 
