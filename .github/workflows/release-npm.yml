@@ -1,0 +1,176 @@
+# Build the napi-rs native addon for every supported platform and publish the
+# npm packages (the main @aratech/flexaudio package plus one per-platform
+# optional package, the standard napi-rs distribution model).
+#
+# === What the maintainer must set up ===
+#  - Add a repository secret named NPM_TOKEN
+#    (Settings → Secrets and variables → Actions → New repository secret).
+#    Create an automation token at https://www.npmjs.com/settings/<user>/tokens
+#    with publish rights to the @aratech scope.
+#  - The package is published with `--access public` (publishConfig in
+#    package.json already sets access:public for the scoped package).
+#  - npm provenance (`--provenance`) is intentionally NOT enabled below: it
+#    requires a *public* repository. Once this repo is public, add `--provenance`
+#    to the publish command and `id-token: write` to permissions (see comments).
+#
+# Triggered by a version tag (e.g. v0.2.0) or run manually. No-op on PRs.
+
+name: Release (npm)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build all platforms but skip the npm publish step"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  # Enable id-token: write here too if/when you turn on npm --provenance
+  # (public repo only).
+
+# All napi commands run inside the addon crate directory.
+defaults:
+  run:
+    working-directory: crates/flexaudio-napi
+
+jobs:
+  build:
+    name: Build addon (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      # Matrix of host runner + Rust target triple.
+      #
+      # Covered: linux x64, linux arm64 (cross-compiled on the x64 ubuntu
+      # runner), macOS x64, macOS arm64, windows x64. This matches the napi
+      # "targets" in package.json EXCEPT aarch64-pc-windows-msvc (win arm64):
+      # GitHub does not offer a hosted Windows/arm64 runner and cross-linking a
+      # WASAPI cdylib for arm64 from x64 is not reliable here, so win-arm64 is
+      # deliberately omitted. If you need it, drop the matching
+      # @aratech/flexaudio-win32-arm64-msvc entry from optionalDependencies in
+      # package.json, or add a self-hosted win-arm64 runner — do not leave the
+      # optional dep pointing at a package that is never published.
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/flexaudio-napi/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      # Linux native deps (same set as ci.yml). For the aarch64-linux cross
+      # build we also pull the cross linker; cargo's linker for that target is
+      # configured via the env var below.
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          fi
+
+      - name: Install npm dependencies (@napi-rs/cli)
+        run: npm ci || npm install
+
+      # napi build --platform writes the .node next to index.js and emits the
+      # per-platform package suffix from package.json's "napi" config.
+      - name: Build native addon
+        shell: bash
+        env:
+          # cross-linker for the aarch64-linux target; ignored for native builds.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: npx napi build --platform --release --target ${{ matrix.target }}
+
+      - name: Upload addon artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          # The *.node files (named flexaudio.<platform>.node) are the build
+          # outputs we hand to the publish job.
+          path: crates/flexaudio-napi/*.node
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/flexaudio-napi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install npm dependencies (@napi-rs/cli)
+        run: npm ci || npm install
+
+      # Pull every per-platform .node back into the crate dir.
+      - name: Download all addon artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: crates/flexaudio-napi/artifacts
+          pattern: bindings-*
+          merge-multiple: true
+
+      # napi lays out one npm package per platform under npm/ and moves each
+      # downloaded .node into its package, then prepublish wires the
+      # optionalDependencies versions in the root package.json.
+      - name: Prepare per-platform npm packages
+        run: |
+          npx napi create-npm-dirs
+          npx napi artifacts --output-dir ./artifacts
+          npx napi prepublish -t npm --skip-gh-release
+
+      - name: Publish (root + per-platform packages)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        shell: bash
+        env:
+          # setup-node wrote an .npmrc that reads NODE_AUTH_TOKEN.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Publish each per-platform package first...
+          for dir in npm/*/; do
+            ( cd "$dir" && npm publish --access public || true )
+          done
+          # ...then the main package that depends on them.
+          # NOTE: append --provenance here (and set id-token: write) once the
+          # repo is public.
+          npm publish --access public
+
+      - name: Dry run (skip publish)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          echo "dry_run=true → packages prepared but not published."
+          npm publish --dry-run || true

@@ -1,0 +1,169 @@
+# Build abi3 wheels (+ sdist) for the PyO3 binding and publish them to PyPI.
+#
+# === What the maintainer must set up ===
+#  - Default: PyPI Trusted Publishing (OIDC) — NO token needed. Register this
+#    repo + workflow as a Trusted Publisher for the `flexaudio` project at
+#    https://pypi.org/manage/project/flexaudio/settings/publishing/
+#    (or, for the very first release, as a "pending publisher" at
+#    https://pypi.org/manage/account/publishing/). The `publish` job below
+#    requests an OIDC token via `permissions: id-token: write`.
+#  - Alternative (token) auth: add a repository secret PYPI_API_TOKEN
+#    (https://pypi.org/manage/account/token/) and use the commented variant in
+#    the publish step (`pypa/gh-action-pypi-publish` with `password:`, or
+#    maturin's MATURIN_PYPI_TOKEN). Then `id-token: write` is not required.
+#
+# Triggered by a version tag (e.g. v0.2.0) or run manually. No-op on PRs.
+
+name: Release (PyPI)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build wheels/sdist but skip the PyPI publish step"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # All maturin commands target the PyO3 binding crate.
+  MANIFEST: bindings/flexaudio-py/Cargo.toml
+
+jobs:
+  # --- Linux wheels (manylinux), built inside maturin-action's container ---
+  linux:
+    name: Wheels (manylinux ${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          # manylinux_2_28 ships a newer toolchain than the default 2014 image;
+          # needed because flexaudio-vad's ort toolchain requires rustc 1.88.
+          manylinux: 2_28
+          # abi3-py38 → a single wheel covers all CPython 3.8+, so we don't
+          # iterate over Python versions.
+          args: --release --out dist --manifest-path ${{ env.MANIFEST }}
+          # The manylinux container is RHEL-based (dnf/yum). flexaudio-os-linux
+          # links PipeWire and flexaudio-mic links ALSA, so install the dev
+          # packages before the Rust build runs. clang is needed by pipewire-rs
+          # bindgen. The aarch64 build is QEMU-emulated; deps install the same
+          # way inside the container.
+          #
+          # NOTE: if pipewire-devel is ever unavailable for the chosen
+          # manylinux image/arch, the Linux build will fail loudly here rather
+          # than silently shipping a broken wheel — pin a different manylinux
+          # tag or move Linux wheels to a self-hosted builder. Do not remove
+          # this step to "make it pass".
+          before-script-linux: |
+            if command -v dnf >/dev/null 2>&1; then
+              dnf install -y pipewire-devel alsa-lib-devel clang-devel || \
+                dnf install -y pipewire-devel alsa-lib-devel clang
+            else
+              yum install -y pipewire-devel alsa-lib-devel clang
+            fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  # --- macOS wheels (x86_64 + arm64) ---
+  macos:
+    name: Wheels (macOS ${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --manifest-path ${{ env.MANIFEST }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  # --- Windows wheels (x64) ---
+  windows:
+    name: Wheels (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --out dist --manifest-path ${{ env.MANIFEST }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x64
+          path: dist
+          if-no-files-found: error
+
+  # --- Source distribution ---
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path ${{ env.MANIFEST }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: [linux, macos, windows, sdist]
+    runs-on: ubuntu-latest
+    # Trusted Publishing requires an OIDC token.
+    permissions:
+      id-token: write
+    # Optional: gate releases behind a GitHub Environment named "pypi" for the
+    # tightest Trusted-Publisher binding (configure it in repo settings).
+    # environment: pypi
+    steps:
+      - name: Collect all wheels + sdist
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist
+
+      - name: Publish to PyPI (Trusted Publishing / OIDC)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # --- Token auth alternative (remove the id-token permission and the
+          # Trusted Publisher registration if you use this) ---
+          # password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Dry run (skip publish)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: echo "dry_run=true → wheels + sdist built and collected, but not uploaded to PyPI."
