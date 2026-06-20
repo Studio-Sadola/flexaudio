@@ -9,7 +9,7 @@ description = "Flexible cross-platform audio capture (microphone, system loopbac
 readme = "README.md"
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
-authors = [{ name = "tsubome (Aratech)" }]
+authors = [{ name = "tubome (Studio Sadola)" }]
 keywords = ["audio", "capture", "loopback", "recording", "pyo3"]
 classifiers = [
     "Programming Language :: Rust",
@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/tsubome/flexaudio"
+Repository = "https://github.com/Studio-Sadola/flexaudio"
 
 # extension-module を有効にしてビルド（libpython を直接リンクしない）。crate feature
 # 経由なので cargo test では無効のまま（テストバイナリが libpython をリンクできない罠を

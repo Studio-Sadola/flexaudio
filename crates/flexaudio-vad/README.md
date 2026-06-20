@@ -52,7 +52,7 @@ Rust **1.88** (required by the `ort` / ONNX Runtime toolchain).
 
 ## License & third-party notices
 
-[MIT](LICENSE) © 2026 tsubome / Aratech.
+[MIT](LICENSE) © 2026 tubome / Studio Sadola.
 
 This crate **redistributes** the Silero VAD model (MIT) and a statically linked
 build of Microsoft **ONNX Runtime** (MIT) inside every binary. You MUST ship the

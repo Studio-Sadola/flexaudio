@@ -3,7 +3,7 @@
 
 # Third-Party Notices
 
-flexaudio (Copyright (c) 2026 tsubome / Aratech, MIT) bundles, statically links,
+flexaudio (Copyright (c) 2026 tubome / Studio Sadola, MIT) bundles, statically links,
 or dynamically links against third-party software. This document collects the
 notices and license terms that must accompany binary and source distributions of
 flexaudio and its component crates.

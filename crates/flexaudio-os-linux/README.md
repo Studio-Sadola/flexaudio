@@ -24,4 +24,4 @@ targets (`#![cfg(target_os = "linux")]`).
 
 ## License
 
-[MIT](LICENSE) © 2026 tsubome / Aratech.
+[MIT](LICENSE) © 2026 tubome / Studio Sadola.

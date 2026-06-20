@@ -1,6 +1,6 @@
 # flexaudio (Python)
 
-Python bindings for [flexaudio](https://github.com/tsubome/flexaudio), a
+Python bindings for [flexaudio](https://github.com/Studio-Sadola/flexaudio), a
 cross-platform audio capture library (microphone, system loopback, and
 per-process loopback) written in Rust. Built with PyO3 and maturin.
 

@@ -19,8 +19,8 @@ version = "0.2.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
-repository = "https://github.com/tsubome/flexaudio"
-authors = ["tsubome (Aratech)"]
+repository = "https://github.com/Studio-Sadola/flexaudio"
+authors = ["tubome (Studio Sadola)"]
 
 [workspace.dependencies]
 # flexaudio-core が要求する純 Rust 依存 (システムライブラリ不要・実行時ネットワーク禁止)

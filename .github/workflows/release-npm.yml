@@ -1,12 +1,12 @@
 # Build the napi-rs native addon for every supported platform and publish the
-# npm packages (the main `flexaudio` package plus one per-platform optional
-# package, the standard napi-rs distribution model).
+# npm packages (the main `@studio-sadola/flexaudio` package plus one per-platform
+# optional package, the standard napi-rs distribution model).
 #
 # === What the maintainer must set up ===
 #  - Add a repository secret named NPM_TOKEN
 #    (Settings → Secrets and variables → Actions → New repository secret).
 #    Create an automation token at https://www.npmjs.com/settings/<user>/tokens
-#    with publish rights to the `flexaudio` package.
+#    with publish rights to the `@studio-sadola` scope.
 #  - Packages are published with `--access public` and `--provenance`. Provenance
 #    needs a public repository and `id-token: write` (both set below); it signs
 #    the packages with a verifiable link back to this workflow run.
@@ -133,14 +133,16 @@ jobs:
           pattern: bindings-*
           merge-multiple: true
 
-      # napi lays out one npm package per platform under npm/ and moves each
-      # downloaded .node into its package, then prepublish wires the
-      # optionalDependencies versions in the root package.json.
+      # napi creates one npm package dir per platform under npm/ and moves each
+      # downloaded .node into it. The root package.json already declares the
+      # matching optionalDependencies and index.js/index.d.ts are committed, so
+      # nothing else is needed here. (We intentionally do NOT run `napi
+      # prepublish`: in napi-rs v2 it actually *publishes* the per-platform
+      # packages, which the explicit, auth-gated npm publish step below handles.)
       - name: Prepare per-platform npm packages
         run: |
           npx napi create-npm-dir -t .
           npx napi artifacts --dir artifacts
-          npx napi prepublish -t npm --skip-gh-release
 
       - name: Publish (root + per-platform packages)
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
@@ -157,8 +159,17 @@ jobs:
           # ...then the main package that depends on them.
           npm publish --access public --provenance
 
-      - name: Dry run (skip publish)
+      - name: Dry run (validate packaging, skip publish)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        shell: bash
         run: |
-          echo "dry_run=true → packages prepared but not published."
-          npm publish --dry-run || true
+          set -euo pipefail
+          echo "dry_run=true → validate every package's packaging, do not publish."
+          # --dry-run is a local pack/simulation (no auth, no upload). Let it fail
+          # loudly so packaging problems are caught here instead of at real publish.
+          for dir in npm/*/; do
+            echo "::group::dry-run ${dir}"
+            ( cd "$dir" && npm publish --dry-run )
+            echo "::endgroup::"
+          done
+          npm publish --dry-run

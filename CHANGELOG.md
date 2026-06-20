@@ -54,5 +54,5 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
 - Declared per-crate MSRV: `1.85` for core/facade/OS/mic crates, `1.88` for
   `flexaudio-vad` and `flexaudio-napi`.
 
-[Unreleased]: https://github.com/tsubome/flexaudio/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/tsubome/flexaudio/releases/tag/v0.2.0
+[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Studio-Sadola/flexaudio/releases/tag/v0.2.0

@@ -29,4 +29,4 @@ The crate compiles as an empty stub on non-macOS targets
 
 ## License
 
-[MIT](LICENSE) © 2026 tsubome / Aratech.
+[MIT](LICENSE) © 2026 tubome / Studio Sadola.

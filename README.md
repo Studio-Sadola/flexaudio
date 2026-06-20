@@ -205,7 +205,7 @@ into compatible updates only. See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
-[MIT](LICENSE) © 2026 tsubome / Aratech.
+[MIT](LICENSE) © 2026 tubome / Studio Sadola.
 
 This project bundles / links third-party software (Silero VAD model, ONNX
 Runtime, PipeWire, and permissively-licensed Rust crates). See

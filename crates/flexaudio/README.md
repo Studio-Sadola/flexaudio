@@ -47,7 +47,7 @@ cargo add flexaudio
 Audio capture requires user consent: macOS TCC (`kTCCServiceAudioCapture`, add
 `NSAudioCaptureUsageDescription` to `Info.plist`), the Windows Microphone privacy
 setting, and a running PipeWire session on Linux for system/process capture. See
-the [workspace README](https://github.com/tsubome/flexaudio#os-specific-permission-requirements).
+the [workspace README](https://github.com/Studio-Sadola/flexaudio#os-specific-permission-requirements).
 
 On macOS, system/process loopback (Core Audio process taps) requires macOS 14.4
 or later.
@@ -58,5 +58,5 @@ Rust **1.85**.
 
 ## License
 
-[MIT](LICENSE) © 2026 tsubome / Aratech. Third-party notices:
+[MIT](LICENSE) © 2026 tubome / Studio Sadola. Third-party notices:
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
