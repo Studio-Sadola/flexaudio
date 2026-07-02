@@ -28,6 +28,7 @@ jobs:
           cargo clippy
           -p flexaudio -p flexaudio-core -p flexaudio-cli -p flexaudio-mic
           -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
+          -p flexaudio-encode -p flexaudio-denoise
           -p flexaudio-ffi -p flexaudio-py
           --all-targets -- -D warnings
       - name: Doc (deny warnings, docs.rs-equivalent for Linux crates)
@@ -37,12 +38,14 @@ jobs:
           cargo doc --no-deps
           -p flexaudio -p flexaudio-core -p flexaudio-cli -p flexaudio-mic
           -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
+          -p flexaudio-encode -p flexaudio-denoise
           -p flexaudio-ffi
       - name: Test (ignored real-audio tests auto-skip)
         run: >-
           cargo test
           -p flexaudio -p flexaudio-core -p flexaudio-cli -p flexaudio-mic
           -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
+          -p flexaudio-encode -p flexaudio-denoise
           -p flexaudio-ffi
       - name: Python binding (maturin build + import)
         run: |

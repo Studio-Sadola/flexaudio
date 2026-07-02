@@ -1,0 +1,22 @@
+[package]
+name = "flexaudio-denoise"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Offline noise suppression (RNNoise via nnnoiseless, model weights embedded) for flexaudio."
+keywords = ["denoise", "rnnoise", "noise-suppression", "audio", "dsp"]
+categories = ["multimedia::audio"]
+readme = "README.md"
+documentation = "https://docs.rs/flexaudio-denoise"
+# crates.io への公開はワークスペース全体の公開整備と同時に解禁する。
+publish = false
+
+[dependencies]
+# RNNoise の純 Rust 移植 (BSD-3-Clause)。モデル重みはクレート内に埋め込み済みで、
+# 実行時のモデルファイルもネットワークも不要。default features は CLI (`bin` =
+# clap/hound 等) と dasp 連携を引き込むので無効化し、ライブラリ本体
+# (easyfft + once_cell のみ) だけを使う。
+nnnoiseless = { version = "0.5", default-features = false }

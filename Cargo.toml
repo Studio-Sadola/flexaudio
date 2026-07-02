@@ -11,6 +11,8 @@ members = [
     "crates/flexaudio-ffi",
     "crates/flexaudio-napi",
     "crates/flexaudio-vad",
+    "crates/flexaudio-encode",
+    "crates/flexaudio-denoise",
     "bindings/flexaudio-py",
 ]
 

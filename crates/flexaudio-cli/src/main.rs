@@ -44,9 +44,23 @@
 //! flexaudio-cli --source system --out - --encoding s16 --output-rate 16000 --output-channels 1 --seconds 0 | aplay -f S16_LE -r 16000 -c 1
 //! ```
 //!
+//! `--split-seconds <N>`（既定 0 = 分割なし）で WAV を N 秒毎の連番ファイルへ分割
+//! 録音できる。`--out rec.wav` なら `rec-001.wav, rec-002.wav, ...`（拡張子の前に
+//! 3 桁ゼロ詰め連番。1000 ファイル目以降は桁が自然に増える）。境界はチャンク粒度
+//! （20ms）で「書き込んだフレーム数が `N × 出力サンプルレート` 以上になったら次へ」
+//! なので、各ファイルは指定秒より最大 1 チャンク（±20ms）長くなりうる。チャンクは
+//! 分割せず取りこぼしも無い（次ファイルは次のチャンクから始まる）。フレーム数ベース
+//! なので `--sources`（ホットスワップ）や mix とも直交して効く。stdout ストリーミング
+//! （`--out -`）とは併用できない（起動時にエラー）。
+//!
+//! ```text
+//! flexaudio-cli --source mic --seconds 30 --split-seconds 10 --out rec.wav
+//! ```
+//!
 //! 入力デバイスが無い環境（サーバー・CI 等）では実キャプチャはできず、分かりやすい
 //! メッセージを表示して非ゼロ終了する（panic しない）。
 
+use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -166,6 +180,16 @@ struct Cli {
     /// 出力先。ファイルパスなら WAV 書き出し、`-` なら stdout へ raw PCM ストリーミング。
     #[arg(long, default_value = "capture.wav")]
     out: PathBuf,
+
+    /// WAV 分割録音の 1 ファイルあたりの秒数。既定 0 = 分割なし（従来どおり 1 ファイル）。
+    /// 1 以上を指定すると、書き込んだフレーム数が `split-seconds × 出力サンプルレート` に
+    /// 達するたびに現在のファイルを確定（WAV ヘッダ確定）して次の連番ファイルへ切り替える
+    /// （`--out rec.wav` なら `rec-001.wav, rec-002.wav, ...`）。境界はチャンク粒度（20ms）の
+    /// 「以上になったら次へ」なので、各ファイルは指定秒より最大 1 チャンク長くなりうる。
+    /// チャンクは分割せず取りこぼしも無い（次ファイルは次のチャンクから始まる）。
+    /// stdout ストリーミング（`--out -`）とは併用できない。
+    #[arg(long, default_value_t = 0)]
+    split_seconds: u64,
 
     /// stdout ストリーミング時の標本形式（`--out -` 専用。WAV 出力では無視）。
     #[arg(long, value_enum, default_value_t = EncodingArg::F32)]
@@ -421,6 +445,16 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
 
     let stdout_stream = cli.is_stdout_stream();
 
+    // --split-seconds は WAV ファイル出力専用。stdout ストリーミング（--out -）には
+    // 「ファイル」の境界が無く分割できないので、ストリームを開く前にここで弾く。
+    if stdout_stream && cli.split_seconds > 0 {
+        return Err(
+            "--split-seconds（分割録音）は WAV ファイル出力専用です。--out -（stdout への \
+             raw PCM ストリーミング）とは併用できません。--out にファイルパスを指定してください。"
+                .into(),
+        );
+    }
+
     // ログ出力先の切り替え。stdout ストリーミング時は全ログを stderr へ（stdout は PCM
     // 専用）、ファイル出力時は stdout サマリでよい。以降の println!/eprintln! はこれを通す。
     macro_rules! log {
@@ -603,6 +637,14 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     }
     if stdout_stream {
         log!("出力先             : stdout（raw PCM ストリーミング）");
+    } else if cli.split_seconds > 0 {
+        // 分割録音時はベースパスそのままのファイルは作らないので、実際の連番名を見せる。
+        log!(
+            "出力パス           : {}, {}, ...（{} 秒毎に分割）",
+            split_file_path(&cli.out, 1).display(),
+            split_file_path(&cli.out, 2).display(),
+            cli.split_seconds
+        );
     } else {
         log!("出力パス           : {}", cli.out.display());
     }
@@ -781,19 +823,28 @@ fn run_wav(
     // ホットスワップスケジューラ（--sources 指定時のみ・出力先は 1 本のまま）。
     let mut scheduler = segments.map(|segs| SwitchScheduler::new(cli, segs, start));
 
-    // 総録音時間ぶん poll_chunk をループして全チャンクを集める。
-    let mut chunks: Vec<AudioChunk> = Vec::new();
+    // WAV ライター。チャンクは貯め込まず到着次第書く（分割境界で即 finalize するため。
+    // 長時間録音でメモリも溜めない）。--split-seconds 0 なら従来どおり --out へ 1 ファイル、
+    // 1 以上なら連番ファイルへローテーションする。ピーク / RMS は録音全体で通算する。
+    let mut writer = RotatingWavWriter::new(&cli.out, output, cli.split_seconds);
+    let mut chunk_count: u64 = 0;
+
+    // 総録音時間ぶん poll_chunk をループして全チャンクを書き切る。
     let deadline = start + total;
     while Instant::now() < deadline {
-        // セグメント境界に達していればソースを切り替える（貯める先は同じ 1 ファイル）。
+        // セグメント境界に達していればソースを切り替える（書く先のローテーションとは独立）。
         if let Some(sch) = scheduler.as_mut() {
             sch.tick(stream, Instant::now());
         }
 
         let mut got_any = false;
         while let Some(chunk) = stream.poll_chunk() {
-            chunks.push(chunk);
             got_any = true;
+            chunk_count += 1;
+            if let Err(e) = write_wav_chunk(&mut writer, &chunk) {
+                stream.stop();
+                return Err(e);
+            }
         }
         // poll_event は表示用に消化（イベントがあれば出す）。
         while let Some(ev) = stream.poll_event() {
@@ -808,25 +859,28 @@ fn run_wav(
     let dropped = stream.dropped_chunks();
     stream.stop();
 
-    // stop 後にもリングへ残ったチャンクを取り切る。
+    // stop 後にもリングへ残ったチャンクを書き切る（取りこぼしゼロ）。
     while let Some(chunk) = stream.poll_chunk() {
-        chunks.push(chunk);
+        chunk_count += 1;
+        write_wav_chunk(&mut writer, &chunk)?;
     }
 
     // チャンクが 1 つも来なくても録音自体は走ったので失敗にはしない。空の WAV を書き出して
     // 警告だけ出す（ソースが無音・除外・選んだエンドポイントが非アクティブ等で起こる）。
-    if chunks.is_empty() {
+    if chunk_count == 0 {
         eprintln!(
             "警告: 音声を取得できませんでした（ソースが無音・除外・選んだエンドポイントが\
              非アクティブ等の可能性）。空の WAV を書き出します。"
         );
     }
 
-    // 解析（ピーク / RMS）と WAV 書き出し。WAV は現状 s16 固定（f32 WAV が要るなら
-    // encoding を WAV 出力にも適用できる）。ヘッダの rate/ch は output に追従する。
-    let total_frames: usize = chunks.iter().map(|c| c.frames).sum();
-    let stats =
-        write_wav(&cli.out, &chunks, output).map_err(|e| format!("WAV 書き出し失敗: {e}"))?;
+    // 書き終わり。開いているファイルの WAV ヘッダを確定し、録音全体のピーク / RMS を得る。
+    // WAV は現状 s16 固定（f32 WAV が要るなら encoding を WAV 出力にも適用できる）。
+    let summary = writer
+        .finish()
+        .map_err(|e| format!("WAV 書き出し失敗: {e}"))?;
+    let total_frames = summary.total_frames;
+    let stats = summary.stats;
 
     let captured_secs = total_frames as f64 / output.sample_rate as f64;
     let rms_dbfs = if stats.rms > 0.0 {
@@ -842,7 +896,7 @@ fn run_wav(
 
     println!();
     println!("=== 結果 ===");
-    println!("取得チャンク数     : {}", chunks.len());
+    println!("取得チャンク数     : {chunk_count}");
     println!("総フレーム数       : {total_frames}");
     println!("録れた秒数         : {captured_secs:.3} 秒");
     println!("ドロップチャンク数 : {dropped}");
@@ -856,12 +910,24 @@ fn run_wav(
         stats.rms,
         fmt_dbfs(rms_dbfs)
     );
-    println!("WAV 書き出し       : {}", cli.out.display());
+    // 分割録音で複数ファイルになったときは先頭〜末尾の連番で示す（finish は最低 1 ファイル
+    // を保証するので files は非空）。1 ファイルなら従来どおりパスをそのまま出す。
+    if summary.files.len() == 1 {
+        println!("WAV 書き出し       : {}", summary.files[0].display());
+    } else {
+        println!(
+            "WAV 書き出し       : {} 〜 {}（{} ファイル・{} 秒毎に分割）",
+            summary.files[0].display(),
+            summary.files[summary.files.len() - 1].display(),
+            summary.files.len(),
+            cli.split_seconds
+        );
+    }
 
     // チャンクは来たが中身がほぼ無音（peak/RMS がほぼ 0）なら、空 WAV のときと同じ趣旨で
     // 警告する。OS 差で無音フレームが流れる場合（無音 WAV になる）にも「無音だった」と
-    // 分かるようにする。
-    if !chunks.is_empty() && stats.peak < SILENCE_PEAK && stats.rms < SILENCE_RMS {
+    // 分かるようにする。無音判定は録音全体（全ファイル通算）の統計で行う。
+    if chunk_count > 0 && stats.peak < SILENCE_PEAK && stats.rms < SILENCE_RMS {
         eprintln!(
             "警告: 音声を取得できませんでした（ソースが無音・除外・選んだエンドポイントが\
              非アクティブ等の可能性）。録音はほぼ無音です。"
@@ -1052,51 +1118,189 @@ struct Stats {
     rms: f64,
 }
 
-/// チャンク列を `output.sample_rate` / `output.channels` / 16-bit PCM WAV として
-/// `path` へ書き出す。
+/// 分割録音の `index` 番目（1 始まり）のファイルパスを作る（純関数）。
 ///
-/// 各チャンクの interleaved f32 を `(x.clamp(-1,1) * 32767) as i16` で量子化する。
-/// 併せてピーク / RMS（線形）を計算して返す。
-fn write_wav(
-    path: &std::path::Path,
-    chunks: &[AudioChunk],
-    output: OutputFormat,
-) -> hound::Result<Stats> {
-    let spec = hound::WavSpec {
-        channels: output.channels,
-        sample_rate: output.sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
+/// `rec.wav` なら `rec-001.wav, rec-002.wav, ...` のように拡張子の前へ 3 桁ゼロ詰め
+/// 連番を挟む。1000 ファイル目以降は桁が自然に増える（`rec-1000.wav`）。拡張子が無い
+/// パス（`rec`）は末尾に連番を足す（`rec-001`）。親ディレクトリは保たれる。
+fn split_file_path(base: &Path, index: u64) -> PathBuf {
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name = match base.extension() {
+        Some(ext) => format!("{stem}-{index:03}.{}", ext.to_string_lossy()),
+        None => format!("{stem}-{index:03}"),
     };
-    let mut writer = hound::WavWriter::create(path, spec)?;
+    base.with_file_name(name)
+}
 
-    let mut peak: f32 = 0.0;
-    let mut sum_sq: f64 = 0.0;
-    let mut count: u64 = 0;
+/// 録音終了時のまとめ（書き出したファイル一覧・総フレーム数・録音全体の統計）。
+struct WavSummary {
+    /// 書き出したファイルのパス（書いた順・最低 1 つ）。
+    files: Vec<PathBuf>,
+    /// 全ファイル合計の総フレーム数。
+    total_frames: u64,
+    /// 録音全体（全ファイル通算）のピーク / RMS。
+    stats: Stats,
+}
 
-    for chunk in chunks {
-        for &x in &chunk.data {
-            let a = x.abs();
-            if a > peak {
-                peak = a;
-            }
-            sum_sq += (x as f64) * (x as f64);
-            count += 1;
+/// WAV 書き出しの分割（ローテーション）を担う小さなライター。
+///
+/// `--split-seconds 0`（分割なし）では `--out` のパスへ従来どおり 1 ファイルを書く。
+/// 1 以上では [`split_file_path`] の連番パスへ書き、書き込んだフレーム数が
+/// `split_seconds × 出力サンプルレート` に達するたびに現在のファイルを finalize
+/// （WAV ヘッダ確定）して閉じ、次のチャンクから次ファイルへ書く。境界はチャンク粒度
+/// （20ms）の「以上になったら次へ」なので、各ファイルは指定秒より最大 1 チャンク
+/// 長くなりうる（チャンクは分割せず、取りこぼしも無い）。
+///
+/// ファイルは次のチャンクが来るまで開かない（遅延生成）ので、録音がちょうど境界で
+/// 終わっても空の末尾ファイルは残らない。ピーク / RMS は録音全体（全ファイル通算）で
+/// 集計する（従来の単一ファイル時と同じ意味の統計・無音警告を保つため）。
+/// 量子化は従来どおり `(x.clamp(-1,1) * 32767) as i16` の 16-bit PCM 固定。
+struct RotatingWavWriter {
+    /// `--out` のベースパス（分割時は連番の元、分割なしはこのまま使う）。
+    base: PathBuf,
+    /// WAV ヘッダ仕様（出力フォーマット追従・16-bit PCM 固定）。
+    spec: hound::WavSpec,
+    /// 1 ファイルあたりのフレーム数しきい値（split_seconds × rate）。0 = 分割なし。
+    frames_per_file: u64,
+    /// 現在書き込み中のライター（遅延生成。ローテーション直後や書き込み前は None）。
+    writer: Option<hound::WavWriter<BufWriter<File>>>,
+    /// 現在のファイルへ書き込んだフレーム数（ローテーションで 0 に戻る）。
+    frames_in_current: u64,
+    /// これまでに書き始めたファイルのパス（書いた順）。
+    files: Vec<PathBuf>,
+    /// 録音全体のピーク（線形絶対値の最大）。
+    peak: f32,
+    /// 録音全体の二乗和（RMS 計算用）。
+    sum_sq: f64,
+    /// 録音全体のサンプル数（RMS 計算用）。
+    samples: u64,
+    /// 全ファイル合計の総フレーム数。
+    total_frames: u64,
+}
 
-            let clamped = x.clamp(-1.0, 1.0);
-            let s = (clamped * 32767.0) as i16;
-            writer.write_sample(s)?;
+impl RotatingWavWriter {
+    /// ベースパス・出力フォーマット・分割秒数（0 = 分割なし）からライターを作る。
+    /// この時点ではファイルを開かない（最初のチャンクで開く）。
+    fn new(out: &Path, output: OutputFormat, split_seconds: u64) -> Self {
+        let spec = hound::WavSpec {
+            channels: output.channels,
+            sample_rate: output.sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        Self {
+            base: out.to_path_buf(),
+            spec,
+            frames_per_file: split_seconds * output.sample_rate as u64,
+            writer: None,
+            frames_in_current: 0,
+            files: Vec::new(),
+            peak: 0.0,
+            sum_sq: 0.0,
+            samples: 0,
+            total_frames: 0,
         }
     }
-    writer.finalize()?;
 
-    let rms = if count > 0 {
-        (sum_sq / count as f64).sqrt()
-    } else {
-        0.0
-    };
+    /// 分割録音か（`--split-seconds` が 1 以上か）。
+    fn is_split(&self) -> bool {
+        self.frames_per_file > 0
+    }
 
-    Ok(Stats { peak, rms })
+    /// 次に開くファイルのパス。分割なしはベースパスそのまま、分割ありは 1 始まり連番。
+    fn next_path(&self) -> PathBuf {
+        if self.is_split() {
+            split_file_path(&self.base, self.files.len() as u64 + 1)
+        } else {
+            self.base.clone()
+        }
+    }
+
+    /// 1 チャンクを書く。チャンクは丸ごと現在のファイルへ入れ（分割しない）、書き込み後に
+    /// フレーム数がしきい値以上ならその場で finalize して次ファイルへローテーションする
+    /// （次のチャンクが新しいファイルの先頭になる）。finalize したファイルのパスを返す
+    /// （ローテーションの進捗表示用。ローテーションしなければ None）。
+    fn write_chunk(&mut self, chunk: &AudioChunk) -> hound::Result<Option<PathBuf>> {
+        // ファイルはチャンクが来た時点で開く（遅延生成）。
+        if self.writer.is_none() {
+            let path = self.next_path();
+            self.writer = Some(hound::WavWriter::create(&path, self.spec)?);
+            self.files.push(path);
+        }
+        let writer = self.writer.as_mut().expect("直前で開いている");
+        for &x in &chunk.data {
+            // 統計は録音全体（全ファイル通算）で集計する。
+            let a = x.abs();
+            if a > self.peak {
+                self.peak = a;
+            }
+            self.sum_sq += (x as f64) * (x as f64);
+            self.samples += 1;
+
+            let s = (x.clamp(-1.0, 1.0) * 32767.0) as i16;
+            writer.write_sample(s)?;
+        }
+        self.frames_in_current += chunk.frames as u64;
+        self.total_frames += chunk.frames as u64;
+
+        // 分割境界: しきい値「以上」に達したら即 finalize（±1 チャンクの誤差は仕様どおり）。
+        if self.is_split() && self.frames_in_current >= self.frames_per_file {
+            let writer = self.writer.take().expect("上で書いたばかり");
+            writer.finalize()?;
+            self.frames_in_current = 0;
+            return Ok(self.files.last().cloned());
+        }
+        Ok(None)
+    }
+
+    /// 録音終了。開いているファイルの WAV ヘッダを確定する。チャンクが 1 つも来なかった
+    /// 場合は従来どおり空 WAV を 1 つ書く（分割ありなら連番 1 番）ので、返る `files` は
+    /// 最低 1 つ。全体統計と総フレーム数も返す。
+    fn finish(mut self) -> hound::Result<WavSummary> {
+        if let Some(writer) = self.writer.take() {
+            writer.finalize()?;
+        } else if self.files.is_empty() {
+            // 1 チャンクも来なかった。録音自体は走った証跡として空 WAV を残す（従来挙動）。
+            let path = self.next_path();
+            hound::WavWriter::create(&path, self.spec)?.finalize()?;
+            self.files.push(path);
+        }
+        let rms = if self.samples > 0 {
+            (self.sum_sq / self.samples as f64).sqrt()
+        } else {
+            0.0
+        };
+        Ok(WavSummary {
+            files: self.files,
+            total_frames: self.total_frames,
+            stats: Stats {
+                peak: self.peak,
+                rms,
+            },
+        })
+    }
+}
+
+/// `run_wav` の 1 チャンク書き込み。ローテーションが起きたら `[switch]` と同じ調子で
+/// stderr に進捗を出し、書き込みエラーは人間向けメッセージへ変換する。
+fn write_wav_chunk(
+    writer: &mut RotatingWavWriter,
+    chunk: &AudioChunk,
+) -> std::result::Result<(), String> {
+    match writer.write_chunk(chunk) {
+        Ok(Some(done)) => {
+            eprintln!(
+                "[split] {} を確定（次のチャンクから次ファイル）",
+                done.display()
+            );
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(format!("WAV 書き出し失敗: {e}")),
+    }
 }
 
 /// dBFS を読みやすく整形する（無音時は `-inf dBFS`）。
@@ -1365,23 +1569,96 @@ mod tests {
         assert!(jp.ends_with('…'));
     }
 
-    // --- write_wav ---
+    // --- split_file_path ---
 
-    /// `write_wav` が出力フォーマットどおりの WAV ヘッダ（rate/ch/16bit）を書き、
-    /// peak/rms を正しく計算する。書いた WAV を hound で読み戻して検証する。
+    /// 拡張子の前に 3 桁ゼロ詰め連番を挟み、1000 以降は桁が自然に増える。
     #[test]
-    fn write_wav_header_and_stats() {
-        // 出力 {16000, 1} で 2 チャンク分の既知サンプルを書く。
+    fn split_file_path_inserts_padded_index() {
+        assert_eq!(
+            split_file_path(Path::new("rec.wav"), 1),
+            PathBuf::from("rec-001.wav")
+        );
+        assert_eq!(
+            split_file_path(Path::new("rec.wav"), 42),
+            PathBuf::from("rec-042.wav")
+        );
+        assert_eq!(
+            split_file_path(Path::new("rec.wav"), 999),
+            PathBuf::from("rec-999.wav")
+        );
+        // 1000 ファイル目以降はゼロ詰め幅を超えて桁が自然に増える。
+        assert_eq!(
+            split_file_path(Path::new("rec.wav"), 1000),
+            PathBuf::from("rec-1000.wav")
+        );
+    }
+
+    /// 親ディレクトリは保たれ、拡張子なしのパスは末尾に連番を足す。
+    #[test]
+    fn split_file_path_keeps_parent_and_handles_no_extension() {
+        assert_eq!(
+            split_file_path(Path::new("/tmp/dir/rec.wav"), 3),
+            PathBuf::from("/tmp/dir/rec-003.wav")
+        );
+        assert_eq!(
+            split_file_path(Path::new("rec"), 1),
+            PathBuf::from("rec-001")
+        );
+        // ドットを複数含む名前は最後の拡張子の前に挟む。
+        assert_eq!(
+            split_file_path(Path::new("a.b.wav"), 2),
+            PathBuf::from("a.b-002.wav")
+        );
+    }
+
+    // --- RotatingWavWriter ---
+
+    /// テスト用チャンク（全サンプル同値・interleaved）を作る。
+    fn chunk_of(frames: usize, channels: usize, value: f32) -> AudioChunk {
+        AudioChunk {
+            data: vec![value; frames * channels],
+            frames,
+            pts_ns: 0,
+            seq: 0,
+            flags: flexaudio::core::ChunkFlags::empty(),
+            dropped_before: 0,
+            peak: value.abs(),
+            rms: value.abs(),
+        }
+    }
+
+    /// テスト専用の空一時ディレクトリを作って返す（テスト名で分離・並列実行に安全）。
+    fn test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("flexaudio_cli_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    /// WAV を読み戻してフレーム数（= サンプル数 / チャンネル数）を返す。
+    fn wav_frames(path: &Path) -> u64 {
+        let reader = hound::WavReader::open(path).expect("open wav");
+        (reader.len() / reader.spec().channels as u32) as u64
+    }
+
+    /// 分割なし（split 0）は従来どおりベースパスへ 1 ファイルを書き、ヘッダ
+    /// （rate/ch/16bit）と peak/rms を正しく出す。書いた WAV を hound で読み戻して検証。
+    #[test]
+    fn rotating_writer_without_split_matches_legacy_single_file() {
         let output = OutputFormat {
             sample_rate: 16_000,
             channels: 1,
         };
+        let dir = test_dir("nosplit");
+        let path = dir.join("capture.wav");
+
         // 振幅 0.5 / -0.5 の交互（peak=0.5, rms=0.5）。
         let data: Vec<f32> = (0..320)
             .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
             .collect();
         let chunk = AudioChunk {
-            data: data.clone(),
+            data,
             frames: 320,
             pts_ns: 0,
             seq: 0,
@@ -1391,13 +1668,25 @@ mod tests {
             rms: 0.5,
         };
 
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("flexaudio_cli_test_{}.wav", std::process::id()));
-        let stats = write_wav(&path, std::slice::from_ref(&chunk), output).expect("write wav");
+        let mut writer = RotatingWavWriter::new(&path, output, 0);
+        assert!(writer.write_chunk(&chunk).expect("write").is_none());
+        let summary = writer.finish().expect("finish");
+
+        // 分割なしは連番を付けずベースパスそのまま 1 ファイル（完全互換）。
+        assert_eq!(summary.files, vec![path.clone()]);
+        assert_eq!(summary.total_frames, 320);
 
         // peak/rms は既知（全サンプル |0.5| なので peak=0.5, rms=0.5）。
-        assert!((stats.peak - 0.5).abs() < 1e-6, "peak: {}", stats.peak);
-        assert!((stats.rms - 0.5).abs() < 1e-6, "rms: {}", stats.rms);
+        assert!(
+            (summary.stats.peak - 0.5).abs() < 1e-6,
+            "peak: {}",
+            summary.stats.peak
+        );
+        assert!(
+            (summary.stats.rms - 0.5).abs() < 1e-6,
+            "rms: {}",
+            summary.stats.rms
+        );
 
         // ヘッダを読み戻して rate/ch/bits を検証。
         let reader = hound::WavReader::open(&path).expect("open wav");
@@ -1406,11 +1695,249 @@ mod tests {
         assert_eq!(spec.channels, 1);
         assert_eq!(spec.bits_per_sample, 16);
         assert_eq!(spec.sample_format, hound::SampleFormat::Int);
-        // サンプル数 = 320（mono 1 チャンク）。
         assert_eq!(reader.len(), 320);
 
-        // 一時ファイル削除。
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 分割境界の計算（フレーム数ベースの決定論）: 16kHz mono / split 1 秒（しきい値
+    /// 16000 フレーム）へ 20ms チャンク（320 フレーム）を 150 個書くと、ちょうど
+    /// 50 個ずつの 3 ファイルになり、合計フレーム数が一致する（欠落ゼロ）。
+    #[test]
+    fn rotating_writer_splits_exactly_on_multiple() {
+        let output = OutputFormat {
+            sample_rate: 16_000,
+            channels: 1,
+        };
+        let dir = test_dir("split_exact");
+        let base = dir.join("rec.wav");
+        let mut writer = RotatingWavWriter::new(&base, output, 1);
+
+        let mut rotations = Vec::new();
+        for i in 0..150 {
+            if let Some(done) = writer.write_chunk(&chunk_of(320, 1, 0.25)).expect("write") {
+                rotations.push((i, done));
+            }
+        }
+        // 16000 / 320 = 50 なので 50・100・150 個目（0 始まりで 49・99・149）で確定する。
+        assert_eq!(
+            rotations.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![49, 99, 149]
+        );
+
+        let summary = writer.finish().expect("finish");
+        // ちょうど境界で書き終えたので空の 4 本目は作られない。
+        assert_eq!(summary.files.len(), 3);
+        assert_eq!(
+            summary.files,
+            vec![
+                dir.join("rec-001.wav"),
+                dir.join("rec-002.wav"),
+                dir.join("rec-003.wav"),
+            ]
+        );
+        assert_eq!(summary.total_frames, 150 * 320);
+
+        // 読み戻し: 各ファイルちょうど 1 秒分・合計 = 入力（取りこぼしゼロ）。
+        let mut read_total = 0u64;
+        for f in &summary.files {
+            let frames = wav_frames(f);
+            assert_eq!(frames, 16_000);
+            read_total += frames;
+        }
+        assert_eq!(read_total, summary.total_frames);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 境界はチャンク粒度の「以上になったら次へ」: しきい値がチャンクの倍数でないとき、
+    /// ファイルはしきい値を跨いだチャンクまで含む（最大 1 チャンクの超過）。チャンクは
+    /// 分割されず、次ファイルは次のチャンクから始まる。
+    #[test]
+    fn rotating_writer_rounds_boundary_up_to_chunk() {
+        // しきい値 1000 フレーム（1000Hz × 1 秒）・チャンク 320 フレーム。
+        // 4 チャンク目で 1280 >= 1000 となり確定（±1 チャンクの誤差は仕様）。
+        let output = OutputFormat {
+            sample_rate: 1_000,
+            channels: 1,
+        };
+        let dir = test_dir("split_roundup");
+        let base = dir.join("rec.wav");
+        let mut writer = RotatingWavWriter::new(&base, output, 1);
+
+        // 7 チャンク: 4 個で 1 本目確定、残り 3 個（960 < 1000）は finish で 2 本目に確定。
+        let mut rotated_at = Vec::new();
+        for i in 0..7 {
+            if writer
+                .write_chunk(&chunk_of(320, 1, 0.25))
+                .expect("write")
+                .is_some()
+            {
+                rotated_at.push(i);
+            }
+        }
+        assert_eq!(rotated_at, vec![3]);
+
+        let summary = writer.finish().expect("finish");
+        assert_eq!(summary.files.len(), 2);
+        // 1 本目 = 4 チャンク（1280 フレーム・しきい値 1000 の切り上げ）、2 本目 = 残り全部。
+        assert_eq!(wav_frames(&summary.files[0]), 1280);
+        assert_eq!(wav_frames(&summary.files[1]), 960);
+        assert_eq!(summary.total_frames, 7 * 320);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ステレオでも境界は「フレーム数」で数える（サンプル数ではない）。
+    #[test]
+    fn rotating_writer_counts_frames_not_samples_for_stereo() {
+        // しきい値 640 フレーム・320 フレーム（640 サンプル）のステレオチャンク。
+        // サンプル数で数えると 1 チャンク目で誤ローテーションする。
+        let output = OutputFormat {
+            sample_rate: 640,
+            channels: 2,
+        };
+        let dir = test_dir("split_stereo");
+        let base = dir.join("rec.wav");
+        let mut writer = RotatingWavWriter::new(&base, output, 1);
+
+        assert!(writer
+            .write_chunk(&chunk_of(320, 2, 0.25))
+            .expect("write")
+            .is_none());
+        assert!(writer
+            .write_chunk(&chunk_of(320, 2, 0.25))
+            .expect("write")
+            .is_some());
+
+        let summary = writer.finish().expect("finish");
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(wav_frames(&summary.files[0]), 640);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// チャンクが 1 つも来なくても finish は空 WAV を 1 つ残す（従来挙動の維持）。
+    /// 分割なしはベースパス、分割ありは連番 1 番になる。
+    #[test]
+    fn rotating_writer_finish_writes_empty_wav_when_no_chunks() {
+        let output = OutputFormat {
+            sample_rate: 16_000,
+            channels: 2,
+        };
+        let dir = test_dir("split_empty");
+
+        // 分割なし → capture.wav（従来どおり）。
+        let base = dir.join("capture.wav");
+        let summary = RotatingWavWriter::new(&base, output, 0)
+            .finish()
+            .expect("finish");
+        assert_eq!(summary.files, vec![base.clone()]);
+        assert_eq!(summary.total_frames, 0);
+        assert_eq!(wav_frames(&base), 0);
+
+        // 分割あり → rec-001.wav（空の 1 本目）。
+        let base2 = dir.join("rec.wav");
+        let summary2 = RotatingWavWriter::new(&base2, output, 5)
+            .finish()
+            .expect("finish");
+        assert_eq!(summary2.files, vec![dir.join("rec-001.wav")]);
+        assert_eq!(wav_frames(&dir.join("rec-001.wav")), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MockBackend で Stream を実駆動する統合テスト: 3 秒相当を split 1 秒で録ると
+    /// 3 ファイルでき、読み戻した合計フレーム数が書き込んだフレーム数と一致する
+    /// （欠落ゼロ）。停止条件は壁時計でなく「確定ファイル数」で数える決定論形。
+    #[test]
+    fn rotating_writer_splits_three_seconds_from_mock_backend() {
+        use flexaudio::MockBackend;
+
+        let output = OutputFormat {
+            sample_rate: 16_000,
+            channels: 1,
+        };
+        let config = StreamConfig {
+            kind: SourceKind::Mic,
+            output,
+            ..Default::default()
+        };
+        // 48kHz mono のサイン波ソース（実機不要）。Stream が出力 16k/mono へ変換する。
+        let backend = Box::new(MockBackend::new(48_000, 1, 440.0));
+        let mut stream = Stream::open(config, backend).expect("open stream");
+        stream.start().expect("start stream");
+
+        let dir = test_dir("split_mock");
+        let base = dir.join("rec.wav");
+        let mut writer = RotatingWavWriter::new(&base, output, 1);
+
+        // 3 本目が確定する（= 3 秒相当を書き切る）までチャンクを流し込む。届いたチャンクは
+        // 全て書くので、書いたフレーム数（fed_frames）が正解値になる。安全弁として上限
+        // チャンク数だけ設ける（比率・経過時間のアサーションはしない）。
+        let mut fed_frames: u64 = 0;
+        let mut max_chunk_frames: u64 = 0;
+        let mut finalized = 0usize;
+        let mut polled_chunks = 0u64;
+        while finalized < 3 {
+            match stream.poll_chunk() {
+                Some(chunk) => {
+                    polled_chunks += 1;
+                    fed_frames += chunk.frames as u64;
+                    max_chunk_frames = max_chunk_frames.max(chunk.frames as u64);
+                    if writer.write_chunk(&chunk).expect("write").is_some() {
+                        finalized += 1;
+                    }
+                }
+                None => thread::sleep(Duration::from_millis(5)),
+            }
+            assert!(
+                polled_chunks < 2_000,
+                "3 ファイル確定前にチャンク上限へ到達（Stream が流れていない）"
+            );
+        }
+        stream.stop();
+
+        let summary = writer.finish().expect("finish");
+        // ちょうど 3 本目の確定で止めたので、空の 4 本目は作られない。
+        assert_eq!(summary.files.len(), 3);
+        assert_eq!(
+            summary.files,
+            vec![
+                dir.join("rec-001.wav"),
+                dir.join("rec-002.wav"),
+                dir.join("rec-003.wav"),
+            ]
+        );
+        assert_eq!(summary.total_frames, fed_frames);
+
+        // 読み戻し: 合計 = 書き込み量（欠落ゼロ）・各ファイルは 1 秒分以上かつ超過は
+        // 1 チャンク未満（境界はチャンク粒度の切り上げ）。
+        let mut read_total = 0u64;
+        for f in &summary.files {
+            let frames = wav_frames(f);
+            assert!(frames >= 16_000, "各ファイルは split 秒分以上: {frames}");
+            assert!(
+                frames < 16_000 + max_chunk_frames,
+                "超過は 1 チャンク未満: {frames}"
+            );
+            read_total += frames;
+        }
+        assert_eq!(read_total, fed_frames, "読み戻し合計 = 書き込みフレーム数");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- run: --out - と --split-seconds の併用拒否 ---
+
+    /// stdout ストリーミング（--out -）と --split-seconds の併用は、ストリームを開く前に
+    /// 分かりやすい日本語エラーで拒否される（デバイス不要で検証できる）。
+    #[test]
+    fn run_rejects_split_seconds_with_stdout_stream() {
+        let cli = cli_from(&["--out", "-", "--split-seconds", "5"]);
+        let err = run(&cli).expect_err("must be rejected");
+        assert!(err.contains("--split-seconds"), "err: {err}");
+        assert!(err.contains("併用できません"), "err: {err}");
     }
 
     /// `write_chunk` の s16 量子化: f32 [-1,1] → i16。clamp とスケールを検証する。

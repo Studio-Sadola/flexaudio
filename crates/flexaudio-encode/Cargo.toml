@@ -1,0 +1,26 @@
+[package]
+name = "flexaudio-encode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Streaming FLAC encoding sink for recorded audio (pure Rust, fully offline)."
+keywords = ["flac", "audio", "encoder", "lossless", "recording"]
+categories = ["multimedia::audio", "multimedia::encoding", "compression"]
+readme = "README.md"
+documentation = "https://docs.rs/flexaudio-encode"
+# crates.io 公開は準備でき次第（それまで誤 publish を防ぐ）。
+publish = false
+
+[dependencies]
+# 純 Rust FLAC エンコーダ (Apache-2.0)。default features (log/par/serde) は
+# 一括エンコード経路のマルチスレッド化や設定のシリアライズ向けで、フレーム単位の
+# 逐次エンコードには不要なので落とす（crossbeam-channel / serde / log を引かない）。
+flacenc = { version = "0.5", default-features = false }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# 往復検証用の純 Rust FLAC デコーダ (Apache-2.0)。テストのみ。
+claxon = "0.4"
