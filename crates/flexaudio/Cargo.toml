@@ -1,0 +1,34 @@
+[package]
+name = "flexaudio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Flexible cross-platform audio capture (microphone, system loopback, per-process) for Linux, Windows, and macOS with a unified API."
+keywords = ["audio", "capture", "loopback", "recording", "cross-platform"]
+categories = ["multimedia::audio"]
+readme = "README.md"
+documentation = "https://docs.rs/flexaudio"
+
+[dependencies]
+flexaudio-core = { path = "../flexaudio-core", version = "0.2.0" }
+# デバイス列挙（`devices()`）でマイク入力（cpal, 全 OS）を束ねる。
+flexaudio-mic = { path = "../flexaudio-mic", version = "0.2.0" }
+
+# デバイス列挙でシステム出力 sink（PipeWire）を束ねる（Linux のみ）。
+[target.'cfg(target_os = "linux")'.dependencies]
+flexaudio-os-linux = { path = "../flexaudio-os-linux", version = "0.2.0" }
+
+# システム/プロセスループバック（WASAPI）を束ねる（Windows のみ）。
+[target.'cfg(target_os = "windows")'.dependencies]
+flexaudio-os-windows = { path = "../flexaudio-os-windows", version = "0.2.0" }
+
+# システム/プロセスループバック（CoreAudio Process Taps）を束ねる（macOS のみ）。
+[target.'cfg(target_os = "macos")'.dependencies]
+flexaudio-os-macos = { path = "../flexaudio-os-macos", version = "0.2.0" }
+
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]

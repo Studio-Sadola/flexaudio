@@ -1,0 +1,178 @@
+# Build the napi-rs native addon for every supported platform and publish the
+# npm packages (the main `@studio-sadola/flexaudio` package plus one per-platform
+# optional package, the standard napi-rs distribution model).
+#
+# === What the maintainer must set up ===
+#  - Add a repository secret named NPM_TOKEN
+#    (Settings → Secrets and variables → Actions → New repository secret).
+#    Create an automation token at https://www.npmjs.com/settings/<user>/tokens
+#    with publish rights to the `@studio-sadola` scope.
+#  - Packages are published with `--access public` and `--provenance`. Provenance
+#    needs a public repository and `id-token: write` (both set below); it signs
+#    the packages with a verifiable link back to this workflow run.
+#
+# Triggered by a version tag (e.g. v0.2.0) or run manually. No-op on PRs.
+
+name: Release (npm)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build all platforms but skip the npm publish step"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  # Required for npm --provenance: signs the published packages from this
+  # public repo's workflow run (no effect on private repos).
+  id-token: write
+
+# All napi commands run inside the addon crate directory.
+defaults:
+  run:
+    working-directory: crates/flexaudio-napi
+
+jobs:
+  build:
+    name: Build addon (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      # Matrix of host runner + Rust target triple.
+      #
+      # Covered: linux x64, linux arm64 (native on a hosted arm64 runner),
+      # macOS arm64, windows x64. This matches the napi "triples" /
+      # optionalDependencies in package.json.
+      #
+      # macOS x64 (Intel) is deliberately left out: since VAD added ONNX Runtime,
+      # ort can't be built for x86_64-apple-darwin. Cross-building it on Apple
+      # Silicon fails (no prebuilt / no xcframework linking) and GitHub no longer
+      # provides hosted Intel macOS runners. Intel Macs are EOL; arm64 covers
+      # every Mac since 2020. Rust users on Intel Macs are unaffected (crates.io
+      # builds from source). To add it back, restore the target, the optional dep,
+      # and a runner (or ONNX build) that can produce it.
+      #
+      # Windows on arm64 is likewise left out: no hosted Windows/arm64 runner.
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      # Linux native deps (same set as ci.yml). Both linux targets build
+      # natively on their own runner (x64 on ubuntu-latest, arm64 on the hosted
+      # arm64 runner), so no cross toolchain is needed.
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
+
+      - name: Install npm dependencies (@napi-rs/cli)
+        run: npm ci || npm install
+
+      # napi build --platform writes the .node next to index.js and emits the
+      # per-platform package suffix from package.json's "napi" config.
+      - name: Build native addon
+        shell: bash
+        run: npx napi build --platform --release --target ${{ matrix.target }}
+
+      - name: Upload addon artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          # The *.node files (named flexaudio.<platform>.node) are the build
+          # outputs we hand to the publish job.
+          path: crates/flexaudio-napi/*.node
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/flexaudio-napi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install npm dependencies (@napi-rs/cli)
+        run: npm ci || npm install
+
+      # Pull every per-platform .node back into the crate dir.
+      - name: Download all addon artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: crates/flexaudio-napi/artifacts
+          pattern: bindings-*
+          merge-multiple: true
+
+      # napi creates one npm package dir per platform under npm/ and moves each
+      # downloaded .node into it. The root package.json already declares the
+      # matching optionalDependencies and index.js/index.d.ts are committed, so
+      # nothing else is needed here. (We intentionally do NOT run `napi
+      # prepublish`: in napi-rs v2 it actually *publishes* the per-platform
+      # packages, which the explicit, auth-gated npm publish step below handles.)
+      - name: Prepare per-platform npm packages
+        run: |
+          npx napi create-npm-dir -t .
+          npx napi artifacts --dir artifacts
+
+      - name: Publish (root + per-platform packages)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        shell: bash
+        env:
+          # setup-node wrote an .npmrc that reads NODE_AUTH_TOKEN.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Publish each per-platform package first...
+          for dir in npm/*/; do
+            ( cd "$dir" && npm publish --access public --provenance || true )
+          done
+          # ...then the main package that depends on them.
+          npm publish --access public --provenance
+
+      - name: Dry run (validate packaging, skip publish)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "dry_run=true → validate every package's packaging, do not publish."
+          # --dry-run is a local pack/simulation (no auth, no upload). Let it fail
+          # loudly so packaging problems are caught here instead of at real publish.
+          for dir in npm/*/; do
+            echo "::group::dry-run ${dir}"
+            ( cd "$dir" && npm publish --dry-run )
+            echo "::endgroup::"
+          done
+          npm publish --dry-run

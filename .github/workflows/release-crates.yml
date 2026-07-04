@@ -1,0 +1,166 @@
+# Publish the flexaudio Rust crates to crates.io.
+#
+# === What the maintainer must set up ===
+#  - Default (token) auth: add a repository secret named CARGO_REGISTRY_TOKEN
+#    (Settings → Secrets and variables → Actions → New repository secret).
+#    Generate the token at https://crates.io/settings/tokens with the
+#    "publish-new" + "publish-update" scopes.
+#  - Alternative (no token) — crates.io Trusted Publishing via OIDC:
+#    register this repo + workflow as a Trusted Publisher for each crate at
+#    https://crates.io/crates/<name>/settings, then use the OIDC exchange shown
+#    in the commented block below instead of CARGO_REGISTRY_TOKEN. That needs
+#    `permissions: id-token: write` (already declared) and removes the secret.
+#
+# Triggered by pushing a version tag (e.g. v0.2.0) or run manually. It is a
+# no-op on ordinary pushes / PRs.
+
+name: Release (crates.io)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build/package only; do not actually publish to crates.io"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  # Required only if you switch to crates.io Trusted Publishing (OIDC). Harmless
+  # to leave declared when using token auth.
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish crates (dependency order)
+    runs-on: ubuntu-latest
+    env:
+      # cargo publish reads this automatically. Keep it scoped to this job.
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Same system dependencies as ci.yml so the Linux crates resolve their
+      # native deps (PipeWire / ALSA / libclang). The platform-specific Windows
+      # and macOS crates are published with --no-verify (see below), so their
+      # native SDKs are not needed on this Linux runner.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
+
+      # --- Optional: crates.io Trusted Publishing (OIDC), token-free ---
+      # Uncomment to mint a short-lived token from GitHub's OIDC identity and
+      # drop the CARGO_REGISTRY_TOKEN secret entirely. Requires each crate to be
+      # registered as a Trusted Publisher on crates.io.
+      #
+      # - name: Authenticate to crates.io via OIDC
+      #   uses: rust-lang/crates-io-auth-action@v1
+      #   id: auth
+      # # then export the minted token for the publish step:
+      # #   echo "CARGO_REGISTRY_TOKEN=${{ steps.auth.outputs.token }}" >> "$GITHUB_ENV"
+
+      - name: Publish crates in dependency order
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Publish order: flexaudio-core first, then everything that depends on
+          # it ({mic, os-linux, os-macos, os-windows, vad}), then the facade
+          # crate (flexaudio) last. flexaudio-cli / -ffi / -napi / -py are
+          # publish=false and are intentionally excluded.
+          CRATES=(
+            flexaudio-core
+            flexaudio-mic
+            flexaudio-os-linux
+            flexaudio-os-macos
+            flexaudio-os-windows
+            flexaudio-vad
+            flexaudio-encode
+            flexaudio-denoise
+            flexaudio
+          )
+
+          VERSION="$(cargo metadata --format-version=1 --no-deps \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="flexaudio-core"))')"
+          echo "Publishing flexaudio workspace version ${VERSION}"
+
+          UA="flexaudio-release-workflow (https://github.com/${GITHUB_REPOSITORY})"
+
+          # Return 0 if <name>@<version> is already on the crates.io index.
+          already_published() {
+            local name="$1" ver="$2"
+            curl -fsSL -A "${UA}" "https://crates.io/api/v1/crates/${name}/${ver}" \
+              >/dev/null 2>&1
+          }
+
+          # Block until <name>@<version> is visible on the index, so the next
+          # crate in the chain can resolve it. crates.io index propagation is
+          # not instantaneous; a fixed sleep is fragile, so we poll.
+          wait_for_index() {
+            local name="$1" ver="$2"
+            echo "Waiting for ${name}@${ver} to appear on the crates.io index..."
+            for _ in $(seq 1 60); do
+              if already_published "${name}" "${ver}"; then
+                echo "  ${name}@${ver} is live."
+                return 0
+              fi
+              sleep 5
+            done
+            echo "::error::Timed out waiting for ${name}@${ver} on crates.io index."
+            return 1
+          }
+
+          for crate in "${CRATES[@]}"; do
+            echo "::group::${crate}"
+
+            if already_published "${crate}" "${VERSION}"; then
+              # Idempotent re-runs: treat an already-published version as success
+              # (not an error), so re-triggering the tag does not fail.
+              echo "${crate}@${VERSION} already published — skipping."
+              echo "::endgroup::"
+              continue
+            fi
+
+            if [ "${DRY_RUN}" = "true" ]; then
+              # cargo publish --dry-run resolves deps against the live index, so a
+              # crate that depends on another *workspace* crate fails ("no matching
+              # package") until that dep is actually published — a chicken-and-egg
+              # cargo can't solve in a dry run. So in dry-run we only package the
+              # leaf crates (no workspace deps); the dependent crates are exercised
+              # for real at publish time, where wait_for_index makes each dep
+              # resolvable before the next crate goes up.
+              # --no-verify: os-windows/os-macos can't verification-build on Linux
+              # (native SDKs absent); each OS is already verified in ci.yml.
+              case " flexaudio-core flexaudio-vad flexaudio-encode flexaudio-denoise " in
+                *" ${crate} "*)
+                  echo "[dry-run] cargo publish -p ${crate} --no-verify"
+                  cargo publish -p "${crate}" --no-verify --dry-run --allow-dirty
+                  ;;
+                *)
+                  echo "[dry-run] skip ${crate} (depends on workspace crates not yet on the index; validated at real publish)"
+                  ;;
+              esac
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "Publishing ${crate}@${VERSION}..."
+            cargo publish -p "${crate}" --no-verify
+
+            # Don't wait after the final crate; nothing depends on it.
+            if [ "${crate}" != "flexaudio" ]; then
+              wait_for_index "${crate}" "${VERSION}"
+            fi
+
+            echo "::endgroup::"
+          done
+
+          echo "All crates processed."

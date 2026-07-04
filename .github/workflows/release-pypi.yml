@@ -1,0 +1,233 @@
+# Build abi3 wheels (+ sdist) for the PyO3 binding and publish them to PyPI.
+#
+# === What the maintainer must set up ===
+#  - Default: PyPI Trusted Publishing (OIDC) — NO token needed. Register this
+#    repo + workflow as a Trusted Publisher for the `flexaudio` project at
+#    https://pypi.org/manage/project/flexaudio/settings/publishing/
+#    (or, for the very first release, as a "pending publisher" at
+#    https://pypi.org/manage/account/publishing/). The `publish` job below
+#    requests an OIDC token via `permissions: id-token: write`.
+#  - Alternative (token) auth: add a repository secret PYPI_API_TOKEN
+#    (https://pypi.org/manage/account/token/) and use the commented variant in
+#    the publish step (`pypa/gh-action-pypi-publish` with `password:`, or
+#    maturin's MATURIN_PYPI_TOKEN). Then `id-token: write` is not required.
+#
+# Triggered by a version tag (e.g. v0.2.0) or run manually. No-op on PRs.
+
+name: Release (PyPI)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build wheels/sdist but skip the PyPI publish step"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # All maturin commands target the PyO3 binding crate.
+  MANIFEST: bindings/flexaudio-py/Cargo.toml
+
+jobs:
+  # --- Linux wheels (manylinux), built inside maturin-action's container ---
+  linux:
+    name: Wheels (manylinux ${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64
+            runner: ubuntu-latest
+          - target: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      # We deliberately build the wheel WITHOUT letting maturin/auditwheel bundle
+      # its native dependencies, then run auditwheel ourselves in the next step so
+      # we can EXCLUDE the system audio libraries. See that step for the "why".
+      - name: Build wheels (unrepaired)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          # Pick the manylinux_2_34 (AlmaLinux 9) container explicitly with
+          # `container:` instead of the `manylinux:` input on purpose: the
+          # `manylinux:` input makes maturin-action prepend `--manylinux 2_34`,
+          # which would tag/repair the wheel automatically and re-bundle the libs
+          # we want to keep external. Selecting the image directly lets us pass
+          # `--auditwheel skip` and get a plain linux_<arch> wheel that we repair
+          # by hand below.
+          #
+          # manylinux_2_34 ships a recent toolchain and, crucially, a recent
+          # PipeWire — el8's 0.3.6 (manylinux_2_28) is too old for the
+          # pipewire-rs / libspa bindings and fails to compile. A 2_34 wheel needs
+          # glibc 2.34+ on the user's machine (RHEL 9 / Ubuntu 22.04+ / Debian 12+).
+          container: quay.io/pypa/manylinux_2_34_${{ matrix.target }}
+          # abi3-py38 → a single wheel covers all CPython 3.8+, so we don't
+          # iterate over Python versions. `--auditwheel skip` leaves the wheel
+          # unrepaired (no libs grafted); the repair step below does the grafting
+          # with the right exclusions.
+          args: --release --out dist-unrepaired --manifest-path ${{ env.MANIFEST }} --auditwheel skip
+          # The manylinux container is RHEL-based (dnf/yum). flexaudio-os-linux
+          # links PipeWire and flexaudio-mic links ALSA, so install the dev
+          # packages before the Rust build runs. clang is needed by pipewire-rs
+          # bindgen. Each arch builds natively on its own runner (x86_64 on
+          # ubuntu-latest, aarch64 on the hosted arm64 runner), so pkg-config
+          # resolves the libs without cross-compilation.
+          #
+          # NOTE: if pipewire-devel is ever unavailable for the chosen
+          # manylinux image/arch, the Linux build will fail loudly here rather
+          # than silently shipping a broken wheel — pin a different manylinux
+          # tag or move Linux wheels to a self-hosted builder. Do not remove
+          # this step to "make it pass".
+          before-script-linux: |
+            if command -v dnf >/dev/null 2>&1; then
+              dnf install -y pipewire-devel alsa-lib-devel clang-devel || \
+                dnf install -y pipewire-devel alsa-lib-devel clang
+            else
+              yum install -y pipewire-devel alsa-lib-devel clang
+            fi
+      # Repair the wheel ourselves so we can bundle everything EXCEPT the system
+      # audio client libraries.
+      #
+      # Why exclude PipeWire/ALSA: flexaudio is an audio *client* — it talks to
+      # the PipeWire daemon already running on the user's machine. Its client libs
+      # (libpipewire-0.3.so.0 and the libspa plugins it dlopen()s at runtime) plus
+      # ALSA's libasound.so.2 must therefore come from the host at runtime, exactly
+      # like python-sounddevice. If auditwheel copies libpipewire into the wheel,
+      # that vendored copy can't find the host's SPA plugin directory and capture
+      # dies at runtime with "connect pipewire capture stream failed:
+      # Invalid argument (os error 22)". So we hand those three SONAMEs to
+      # `--exclude` and let the loader resolve them from the system instead.
+      #
+      # Why NOT exclude ONNX Runtime: the `ort` crate links onnxruntime
+      # *statically* into the extension (there is no libonnxruntime.so to graft),
+      # so nothing here touches it — it must stay embedded and must never be
+      # excluded. libspa-0.2.so is listed defensively; the current build dlopen()s
+      # SPA rather than linking it, so auditwheel simply doesn't encounter it, but
+      # the exclude keeps us safe if a future build links it directly.
+      #
+      # `--plat manylinux_2_34_<arch>` re-applies the PyPI-valid manylinux tag
+      # (auditwheel would otherwise leave the plain linux_<arch> tag, which PyPI
+      # rejects). auditwheel + patchelf run in a throwaway venv to avoid PEP 668
+      # "externally managed" issues on the runner's system Python. The repair runs
+      # natively on each arch's own runner, so no cross-arch handling is needed.
+      - name: Repair wheel (bundle everything except system PipeWire/ALSA)
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/auditwheel-venv"
+          "${RUNNER_TEMP}/auditwheel-venv/bin/pip" install --upgrade pip auditwheel patchelf
+          export PATH="${RUNNER_TEMP}/auditwheel-venv/bin:${PATH}"
+          mkdir -p dist
+          for whl in dist-unrepaired/*.whl; do
+            auditwheel repair "$whl" \
+              --plat "manylinux_2_34_${{ matrix.target }}" \
+              --exclude libpipewire-0.3.so.0 \
+              --exclude libspa-0.2.so \
+              --exclude libasound.so.2 \
+              --wheel-dir dist
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  # --- macOS wheels (arm64 / Apple Silicon only) ---
+  # macOS x86_64 (Intel) is deliberately dropped: since VAD added ONNX Runtime,
+  # ort can't build for x86_64-apple-darwin — cross-building on Apple Silicon
+  # fails and GitHub no longer provides hosted Intel macOS runners. Intel Macs
+  # are EOL; arm64 covers every Mac since 2020. Intel-Mac Rust users are
+  # unaffected (crates.io builds from source); only the prebuilt wheel is gone.
+  macos:
+    name: Wheels (macOS aarch64)
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --manifest-path ${{ env.MANIFEST }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  # --- Windows wheels (x64) ---
+  windows:
+    name: Wheels (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --out dist --manifest-path ${{ env.MANIFEST }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x64
+          path: dist
+          if-no-files-found: error
+
+  # --- Source distribution ---
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path ${{ env.MANIFEST }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: [linux, macos, windows, sdist]
+    runs-on: ubuntu-latest
+    # Trusted Publishing requires an OIDC token.
+    permissions:
+      id-token: write
+    # Optional: gate releases behind a GitHub Environment named "pypi" for the
+    # tightest Trusted-Publisher binding (configure it in repo settings).
+    # environment: pypi
+    steps:
+      - name: Collect all wheels + sdist
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist
+
+      - name: Publish to PyPI (Trusted Publishing / OIDC)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # --- Token auth alternative (remove the id-token permission and the
+          # Trusted Publisher registration if you use this) ---
+          # password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Dry run (skip publish)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: echo "dry_run=true → wheels + sdist built and collected, but not uploaded to PyPI."

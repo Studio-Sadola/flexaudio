@@ -1,0 +1,30 @@
+[package]
+name = "flexaudio-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Reference command-line capture tool for flexaudio (WAV output and raw-PCM streaming)."
+# バイナリ。当面 crates.io へは公開しない。
+publish = false
+
+[[bin]]
+name = "flexaudio-cli"
+path = "src/main.rs"
+
+[dependencies]
+flexaudio = { path = "../flexaudio" }
+flexaudio-mic = { path = "../flexaudio-mic" }
+# WAV 書き出し（純 Rust・システムライブラリ不要・寛容ライセンス Apache-2.0/MIT/Zlib）
+hound = "3.5"
+# 引数解析（純 Rust・寛容ライセンス Apache-2.0/MIT）
+clap = { version = "4", features = ["derive"] }
+# Ctrl-C(SIGINT) ハンドラ。無限ストリーミング（--seconds 0）の綺麗な停止に使う。
+# 純 Rust + OS シグナル API のみ（実行時ネットワーク不要・寛容ライセンス MIT/Apache-2.0）。
+ctrlc = "3"
+
+# システム音声（PipeWire）バックエンド。--source system 用（Linux のみ）
+[target.'cfg(target_os = "linux")'.dependencies]
+flexaudio-os-linux = { path = "../flexaudio-os-linux" }

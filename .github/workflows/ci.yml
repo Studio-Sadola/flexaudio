@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [redesign/flexaudio-rust, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint-test-linux:
+    name: Lint & Test (Linux / PipeWire)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
+      - name: Rustfmt (check formatting)
+        run: cargo fmt --all --check
+      - name: Clippy (deny warnings)
+        run: >-
+          cargo clippy
+          -p flexaudio -p flexaudio-core -p flexaudio-cli -p flexaudio-mic
+          -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
+          -p flexaudio-encode -p flexaudio-denoise
+          -p flexaudio-ffi -p flexaudio-py
+          --all-targets -- -D warnings
+      - name: Doc (deny warnings, docs.rs-equivalent for Linux crates)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: >-
+          cargo doc --no-deps
+          -p flexaudio -p flexaudio-core -p flexaudio-cli -p flexaudio-mic
+          -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
+          -p flexaudio-encode -p flexaudio-denoise
+          -p flexaudio-ffi
+      - name: Test (ignored real-audio tests auto-skip)
+        run: >-
+          cargo test
+          -p flexaudio -p flexaudio-core -p flexaudio-cli -p flexaudio-mic
+          -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
+          -p flexaudio-encode -p flexaudio-denoise
+          -p flexaudio-ffi
+      - name: Python binding (maturin build + import)
+        run: |
+          python3 -m venv /tmp/pyenv
+          . /tmp/pyenv/bin/activate
+          pip install -q 'maturin[patchelf]'
+          maturin build --manifest-path bindings/flexaudio-py/Cargo.toml --out /tmp/wheels
+          pip install --no-index --find-links /tmp/wheels flexaudio
+          python -c "import flexaudio; assert isinstance(flexaudio.devices(), list); print('flexaudio import OK; devices:', len(flexaudio.devices()))"
+
+  build-test-windows:
+    name: Build & Test (Windows / WASAPI)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build -p flexaudio -p flexaudio-os-windows -p flexaudio-mic -p flexaudio-core -p flexaudio-cli -p flexaudio-ffi
+      # flexaudio-mic (cpal/WASAPI) is built above but its tests are not run here:
+      # on the headless GitHub Windows runner (no audio endpoint) cpal's device
+      # enumeration access-violates during process teardown — a cpal/runner issue,
+      # not a flexaudio logic bug. mic is test-covered on the Linux & macOS jobs
+      # and on real Windows hardware.
+      - name: Test (ignored real-audio tests auto-skip)
+        run: cargo test -p flexaudio -p flexaudio-os-windows -p flexaudio-core -p flexaudio-cli
+
+  build-test-macos:
+    name: Build & Test (macOS / Core Audio Taps)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build -p flexaudio -p flexaudio-os-macos -p flexaudio-mic -p flexaudio-core -p flexaudio-cli -p flexaudio-ffi
+      - name: Test (ignored real-audio tests auto-skip)
+        run: cargo test -p flexaudio -p flexaudio-os-macos -p flexaudio-mic -p flexaudio-core -p flexaudio-cli
+
+  msrv:
+    name: MSRV 1.85 (core/facade/mic/os-linux/cli)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
+      - name: Build at MSRV (flexaudio-vad / -napi require 1.88 and are excluded)
+        run: cargo build -p flexaudio -p flexaudio-core -p flexaudio-mic -p flexaudio-os-linux -p flexaudio-cli

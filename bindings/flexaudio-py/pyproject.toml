@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "flexaudio"
+version = "0.2.0"
+description = "Flexible cross-platform audio capture (microphone, system loopback, per-process) for Python, via native bindings to the flexaudio Rust library."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "tubome (Studio Sadola)" }]
+keywords = ["audio", "capture", "loopback", "recording", "pyo3"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+    "License :: OSI Approved :: MIT License",
+]
+
+[project.urls]
+Repository = "https://github.com/Studio-Sadola/flexaudio"
+
+# extension-module を有効にしてビルド（libpython を直接リンクしない）。crate feature
+# 経由なので cargo test では無効のまま（テストバイナリが libpython をリンクできない罠を
+# 避ける）。abi3 設定は Cargo.toml の pyo3 features（abi3-py38）が決める。
+[tool.maturin]
+features = ["extension-module"]
+# import 名を `flexaudio` に固定する（[lib] name と一致）。
+module-name = "flexaudio"
+# 第三者ライセンス表記を wheel と sdist の両方へ同梱する。VAD 経由で ONNX Runtime
+# （静的リンク）と Silero VAD モデル（埋め込み）を再配布するため、その notices を配布物
+# に必ず含める必要がある。LICENSE 本体は上の `license = { file = "LICENSE" }` が
+# .dist-info へ格納する。include のプレーンな文字列は sdist・wheel の両方に入る。
+include = ["THIRD_PARTY_NOTICES.md"]

@@ -1,0 +1,43 @@
+[package]
+name = "flexaudio-os-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "macOS system and per-process audio capture backend (Core Audio process taps) for flexaudio."
+readme = "README.md"
+keywords = ["audio", "coreaudio", "loopback", "capture", "macos"]
+categories = ["multimedia::audio", "os::macos-apis"]
+documentation = "https://docs.rs/flexaudio-os-macos"
+
+# macOS 専用。非 macOS では lib.rs が `#![cfg(target_os = "macos")]` で空コンパイルになり、
+# objc2 系依存も以下の target 限定セクションでのみ引かれる（Linux/Windows ビルドは無傷）。
+#
+# バージョンは Cargo.lock の既存ピン（cpal が引く objc2 系）に合わせ、重複コンパイルを避ける。
+[target.'cfg(target_os = "macos")'.dependencies]
+flexaudio-core = { path = "../flexaudio-core", version = "0.2.0" }
+objc2 = "=0.6.4"
+objc2-foundation = { version = "=0.3.2", features = [
+    "NSArray",
+    "NSValue",
+    "NSString",
+    "NSUUID",
+    "NSDictionary",
+] }
+# default features に AudioHardware / objc2-core-audio-types 等が含まれる。
+objc2-core-audio = "=0.3.2"
+objc2-core-audio-types = "=0.3.2"
+objc2-core-foundation = { version = "=0.3.2", features = [
+    "CFDictionary",
+    "CFString",
+    "CFNumber",
+    "CFArray",
+    "CFBase",
+] }
+block2 = "=0.6.2"
+
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]

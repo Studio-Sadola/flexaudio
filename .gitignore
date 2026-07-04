@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.so
+*.dylib
+*.dll
+.venv/
+venv/
+env/
+.env
+*.onnx
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+.DS_Store
+Thumbs.db
+
+# Rust
+/target
+# Cargo.lock はコミットする（ワークスペースに配布物 cdylib/Python wheel を含むため）
+
+# VAD モデルは同梱必須（完全オフライン要件）。*.onnx の除外から復帰させる
+!crates/flexaudio-vad/assets/*.onnx

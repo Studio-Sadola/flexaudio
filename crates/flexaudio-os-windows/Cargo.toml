@@ -1,0 +1,42 @@
+[package]
+name = "flexaudio-os-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Windows system and per-process audio capture backend (WASAPI loopback) for flexaudio."
+readme = "README.md"
+keywords = ["audio", "wasapi", "loopback", "capture", "windows"]
+categories = ["multimedia::audio", "os::windows-apis"]
+documentation = "https://docs.rs/flexaudio-os-windows"
+
+# Windows 専用クレート。非 Windows では lib.rs が `#![cfg(target_os = "windows")]`
+# で空コンパイルになり、windows 依存も以下の target 限定セクションでしか引かれない。
+[target.'cfg(target_os = "windows")'.dependencies]
+flexaudio-core = { path = "../flexaudio-core", version = "0.2.0" }
+
+# windows は cpal（flexaudio-mic 経由）と版を揃えるため =0.54.0 にピン。
+# feature は WASAPI / process loopback / COM / PROPVARIANT 周りを手で列挙する。
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "=0.54.0"
+features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    # 出力エンドポイント列挙: プロパティストアと FriendlyName キー。
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Devices_FunctionDiscovery",
+]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
