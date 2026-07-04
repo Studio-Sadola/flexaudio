@@ -156,11 +156,15 @@ jobs:
         run: |
           set -euo pipefail
           # Publish each per-platform package first...
+          # --ignore-scripts: the root package.json has a napi-rs `prepublishOnly`
+          # hook (`napi prepublish`) that would otherwise fire on `npm publish` and
+          # try to cut a GitHub release + re-publish the platform packages itself.
+          # We publish explicitly here, so skip lifecycle scripts entirely.
           for dir in npm/*/; do
-            ( cd "$dir" && npm publish --access public --provenance || true )
+            ( cd "$dir" && npm publish --ignore-scripts --access public --provenance || true )
           done
           # ...then the main package that depends on them.
-          npm publish --access public --provenance
+          npm publish --ignore-scripts --access public --provenance
 
       - name: Dry run (validate packaging, skip publish)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
@@ -172,7 +176,7 @@ jobs:
           # loudly so packaging problems are caught here instead of at real publish.
           for dir in npm/*/; do
             echo "::group::dry-run ${dir}"
-            ( cd "$dir" && npm publish --dry-run )
+            ( cd "$dir" && npm publish --ignore-scripts --dry-run )
             echo "::endgroup::"
           done
-          npm publish --dry-run
+          npm publish --ignore-scripts --dry-run
