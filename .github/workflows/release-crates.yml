@@ -118,6 +118,32 @@ jobs:
             return 1
           }
 
+          # Publish one crate, waiting out crates.io's new-crate rate limit
+          # instead of failing on it. Publishing several brand-new crates in a
+          # row trips a 429 ("published too many new crates in a short period");
+          # crates.io then allows roughly one more every ~10 minutes. On a 429 we
+          # sleep and retry the same crate rather than letting the run go red, so
+          # a first-time multi-crate release completes in a single (slow) run.
+          # Any non-429 failure is a real error and stops the run.
+          publish_with_retry() {
+            local crate="$1" attempt
+            for attempt in $(seq 1 10); do
+              if cargo publish -p "${crate}" --no-verify 2>/tmp/pub_err.txt; then
+                cat /tmp/pub_err.txt >&2 || true
+                return 0
+              fi
+              cat /tmp/pub_err.txt >&2 || true
+              if grep -qi "429 Too Many Requests" /tmp/pub_err.txt; then
+                echo "::notice::${crate}: crates.io new-crate rate limit hit; waiting ~11 min then retrying (attempt ${attempt}/10)."
+                sleep 660
+                continue
+              fi
+              return 1
+            done
+            echo "::error::${crate}: still rate-limited after 10 attempts."
+            return 1
+          }
+
           for crate in "${CRATES[@]}"; do
             echo "::group::${crate}"
 
@@ -153,7 +179,7 @@ jobs:
             fi
 
             echo "Publishing ${crate}@${VERSION}..."
-            cargo publish -p "${crate}" --no-verify
+            publish_with_retry "${crate}"
 
             # Don't wait after the final crate; nothing depends on it.
             if [ "${crate}" != "flexaudio" ]; then
