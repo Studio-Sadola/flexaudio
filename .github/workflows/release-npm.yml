@@ -125,6 +125,12 @@ jobs:
           node-version: 22
           registry-url: "https://registry.npmjs.org"
 
+      # Staged publishing (new packages under a 2FA-required scope submit to a
+      # staging area for interactive approval, instead of failing) needs a recent
+      # npm CLI. Upgrade to the latest before publishing.
+      - name: Upgrade npm CLI (staging support)
+        run: npm install -g npm@latest && npm --version
+
       - name: Install npm dependencies (@napi-rs/cli)
         run: npm ci || npm install
 
