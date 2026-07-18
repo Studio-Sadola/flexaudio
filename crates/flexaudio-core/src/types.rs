@@ -289,7 +289,7 @@ pub struct StreamConfig {
     /// はなく `pts_ns` による時刻対応で突き合わせる。副タップは常に `f32`（sample encoding
     /// を持たない）。`None` なら副タップは作られず、`poll_secondary` は常に `None`。
     ///
-    /// [`Stream::switch_source`] では変更できない（open 時に固定）。
+    /// `Stream::switch_source` では変更できない（open 時に固定）。
     pub secondary_output: Option<OutputFormat>,
     /// 開始時の入力ゲイン（線形倍率）。1.0=そのまま、2.0=約+6dB、0.0=無音。既定 1.0。
     /// 有限かつ 0.0 以上であること（外れていれば open が [`Error::InvalidArg`]）。
