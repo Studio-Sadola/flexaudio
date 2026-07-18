@@ -688,9 +688,7 @@ impl PairingBridge {
         discontinuity: bool,
         dropped_before: u32,
     ) -> Option<Vec<JsVadEvent>> {
-        if self.vad.is_none() {
-            return None;
-        }
+        self.vad.as_ref()?;
         // 不連続 or ChunkRing 欠落増分で内部状態をリセットし、累積位置を 0 へ張り直す。
         let dropped_jump = dropped_before > self.vad_last_dropped;
         self.vad_last_dropped = dropped_before;
@@ -924,11 +922,8 @@ impl PairingBridge {
     /// なら pop してペア、まだ来ていない/窓より新しいなら `secondary=undefined` で主だけ配送
     /// （副は残し次の主で対応）。pts 窓なので恒久ズレしない（1:1 zip の欠陥を回避）。
     fn drain_pairs(&mut self) {
-        loop {
-            let p_pts = match self.primary_fifo.front() {
-                Some(p) => p.pts_ns,
-                None => break,
-            };
+        while let Some(front) = self.primary_fifo.front() {
+            let p_pts = front.pts_ns;
             let matched = loop {
                 match self.secondary_fifo.front() {
                     None => break None,
