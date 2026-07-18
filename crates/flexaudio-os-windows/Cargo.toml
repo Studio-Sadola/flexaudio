@@ -15,7 +15,7 @@ documentation = "https://docs.rs/flexaudio-os-windows"
 # Windows 専用クレート。非 Windows では lib.rs が `#![cfg(target_os = "windows")]`
 # で空コンパイルになり、windows 依存も以下の target 限定セクションでしか引かれない。
 [target.'cfg(target_os = "windows")'.dependencies]
-flexaudio-core = { path = "../flexaudio-core", version = "0.2.0" }
+flexaudio-core = { path = "../flexaudio-core", version = "0.3.0" }
 
 # windows は cpal（flexaudio-mic 経由）と版を揃えるため =0.54.0 にピン。
 # feature は WASAPI / process loopback / COM / PROPVARIANT 周りを手で列挙する。

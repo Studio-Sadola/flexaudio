@@ -18,6 +18,8 @@ documentation = "https://docs.rs/flexaudio-encode"
 # 逐次エンコードには不要なので落とす（crossbeam-channel / serde / log を引かない）。
 flacenc = { version = "0.5", default-features = false }
 thiserror = { workspace = true }
+# f32→s16 量子化の正典（全層で同一実装を共有するため core の quantize_i16 を使う）。
+flexaudio-core = { path = "../flexaudio-core", version = "0.3.0" }
 
 [dev-dependencies]
 # 往復検証用の純 Rust FLAC デコーダ (Apache-2.0)。テストのみ。

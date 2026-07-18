@@ -29,20 +29,60 @@ export interface JsAudioChunk {
   droppedBefore: number
   peak: number
   rms: number
-  /** このチャンクで確定した VAD イベント（統合 VAD 有効時のみ）。 */
+  /** このチャンクで確定した VAD イベント（`vadTap` が 'primary' のときのみ）。 */
+  vadEvents?: Array<JsVadEvent>
+  /**
+   * 時刻対応する副タップチャンク（`secondaryOutput` 設定時のみ）。同一コールバックで
+   * ペア配送する（`onChunk(primary)` の `primary.secondary`）。副が未達の周回は
+   * `undefined`。主↔副の対応は `ptsNs`（時刻）で取ること（`seq` は各タップ独立）。
+   */
+  secondary?: JsSecondaryChunk
+}
+/**
+ * JS 側の副タップチャンク（`secondaryOutput` 設定時のみ）。
+ *
+ * `data` は `encoding` に一致する typed array（`'s16'` なら `Int16Array`、`'f32'` なら
+ * `Float32Array`）。サンプル値はホストのネイティブエンディアン。s16le の wire 形式へ
+ * 直列化するのは受け手（消費側）の責務。`ptsNs` は主と同じ録音 0 起点時計に乗るが、値は
+ * 主とは独立で、副 Stage2 のリサンプラ群遅延ぶん主より 20〜60ms 遅れる。
+ */
+export interface JsSecondaryChunk {
+  data: Int16Array | Float32Array
+  /** 'f32' | 's16'（`data` の型を絞り込むための判別子）。 */
+  encoding: string
+  frames: number
+  ptsNs: number
+  seq: bigint
+  flags: number
+  droppedBefore: number
+  /** 量子化前 f32 で算出（s16 でもメーター精度を落とさない）。 */
+  peak: number
+  rms: number
+  /** このチャンクで確定した VAD イベント（`vadTap` が 'secondary' のときのみ）。 */
   vadEvents?: Array<JsVadEvent>
 }
 /**
- * JS 側 VAD イベント。`type` は "speechStart" | "speechEnd"。
+ * JS 側 VAD イベント（発話区間の開始/終了）。
+ *
+ * `type` は `'speechStart' | 'speechEnd'` の 2 値のみ（他イベントの `type` と統一）。
  *
  * `atSample` は **VAD の内部レート（`sampleRate`＝8000 か 16000、既定 16000）基準**の
- * 絶対サンプル位置で、入力チャンクのサンプル基準ではない。秒に直すなら
- * `atSample / sampleRate`、入力サンプル位置の目安は
+ * 絶対サンプル位置で、入力チャンクのサンプル基準ではない（silero 生値・単体/デバッグ用）。
+ * 秒に直すなら `atSample / sampleRate`、入力サンプル位置の目安は
  * `atSample * inputSampleRate / sampleRate` で近似できる。
  */
 export interface JsVadEvent {
-  type: string
+  /** 'speechStart' | 'speechEnd'（発話区間の開始/終了）。 */
+  type: 'speechStart' | 'speechEnd'
   atSample: number
+  /**
+   * 録音 0 起点の絶対ナノ秒（`number`＝f64）。統合 VAD（`openStream` の `vad`）経由でのみ
+   * 埋まる（チャンクの `ptsNs` とチャンク内オフセットから F4 再基準化式で算出）。同一
+   * チャンクで配送され、チャンクをまたいで単調非減少。`flushVad` の最終イベントも同じ
+   * `vadEvents` 配列に載る。単体 `Vad` クラス（`process`/`flush`）は pts 文脈が無いため
+   * `undefined`。（時刻は録音長で有界なので `number`。生 u64 カウンタの `seq` のみ `bigint`。）
+   */
+  atNs?: number
 }
 /** JS 側ネイティブフォーマット（`FlexStream.nativeFormat` の戻り）。 */
 export interface JsNativeFormat {
@@ -65,7 +105,13 @@ export interface VadOptions {
   minSilenceMs?: number
   /** セグメント境界を前後に広げるパディング (ms)。既定 30。 */
   speechPadMs?: number
-  /** 1 セグメントの最大長 (ms)。0 = 無制限。既定 0。 */
+  /**
+   * 1 セグメントの最大長 (ms)。0 = 無制限。超過時は強制分割。
+   *
+   * 単体 `Vad` クラスは silero 忠実で既定 0（無制限）。**統合 VAD（`openStream` の `vad`）は
+   * 省略時 30000ms（長広舌を有界化して RT 遅延を抑える）**。明示指定（`0` を含む）があれば
+   * それが勝つ。
+   */
   maxSpeechMs?: number
   /** VAD の内部サンプルレート。8000 または 16000 のみ。既定 16000。 */
   sampleRate?: number
@@ -82,6 +128,23 @@ export interface JsDeviceEvent {
   device?: JsDeviceInfo
   id?: string
   sourceKind?: string
+}
+/**
+ * 副出力タップの指定（`OpenOptions.secondaryOutput`）。
+ *
+ * 主出力（`outputRate`/`outputChannels`）と同じキャプチャを別フォーマットで同時に返す。
+ * 保存 48k/stereo + 認識 16k/mono/s16 のようなペア取得に使う。
+ */
+export interface SecondaryOutputOptions {
+  /** 副出力サンプルレート（Hz）。例 16000。 */
+  rate: number
+  /** 副出力チャンネル数（1=mono / 2=stereo）。例 1。 */
+  channels: number
+  /**
+   * 副チャンクのサンプルエンコーディング。'f32'（既定）| 's16'。s16 は VAD の後に
+   * 量子化して `Int16Array` で返す（値はネイティブエンディアン）。
+   */
+  encoding?: string
 }
 /** openStream / __openMockStream のオプション。 */
 export interface OpenOptions {
@@ -121,26 +184,49 @@ export interface OpenOptions {
   /** mix の system 側の合成前倍率（線形・mix 専用）。既定 1.0。 */
   systemGain?: number
   /**
-   * 統合 VAD の設定。指定すると各チャンクを VAD に通し、確定イベントをそのチャンクの
-   * `vadEvents` に添える（音声自体は加工しない）。省略時は VAD 無効。
+   * 統合 VAD の設定。指定すると `vadTap` で選んだタップを VAD に通し、確定イベントを
+   * そのタップのチャンクの `vadEvents` に添える（音声自体は加工しない）。省略時は VAD 無効。
    */
   vad?: VadOptions
   /**
+   * VAD を走らせるタップ。'primary'（既定）| 'secondary'。'secondary' は
+   * `secondaryOutput` 設定時のみ有効で、副が 16k/mono ならリサンプル省略で効率的。
+   */
+  vadTap?: string
+  /**
    * true で録音時ノイズ抑制を有効化。**出力が 48000 Hz のときだけ使える**
-   * （RNNoise は 48kHz 固定）。有効時は配信/保存されるチャンクの `data` 自体が
-   * ノイズ抑制後の音に置き換わる。48kHz 以外で true にすると `openStream` が
-   * InvalidArg を投げる。省略/false でノイズ抑制なし。
+   * （RNNoise は 48kHz 固定）。有効時は 48kHz/stereo の内部正規形へ 1 度だけ適用され、
+   * 主・副の両タップが除去済み音声を受ける（+10ms の固定遅延）。48kHz 以外で true に
+   * すると `openStream` が InvalidArg を投げる。省略/false でノイズ抑制なし。
    */
   denoise?: boolean
+  /**
+   * 副出力タップ。指定すると主とペアで別フォーマットのチャンクを同時に返す
+   * （`onChunk` の `primary.secondary`）。省略時は副タップなし＝従来どおり。
+   */
+  secondaryOutput?: SecondaryOutputOptions
 }
 /** 利用可能なデバイスを列挙する。ヘッドレス環境では空配列でも throw しない。 */
 export declare function devices(): Array<JsDeviceInfo>
 /**
  * ストリームを開いて開始し、チャンク/イベントをコールバックへ送る `FlexStream` を返す。
  *
- * `options.denoise` / `options.vad` を指定すると統合ノイズ抑制・VAD が有効になる
- * （詳細は [`OpenOptions`] と内部の `emit_chunk`）。denoise の 48kHz 前提や VAD 設定の
- * 不正は、ここでストリームを開く前に検証して弾く。
+ * `options.denoise` を指定すると core（内部正規形）でノイズ抑制が有効になり、主・副の両
+ * タップが除去済み音声を受ける。`options.vad` を指定すると `vadTap` で選んだタップを VAD に
+ * 通し、確定イベントをそのタップのチャンクの `vadEvents`（録音 0 起点の絶対時刻 `atNs` 付き）
+ * に添える。`options.secondaryOutput` を指定すると副タップが有効になり、主とペアで別
+ * フォーマットのチャンクを返す（`onChunk` の `primary.secondary`）。denoise の 48kHz 前提や
+ * VAD 設定の不正は、ここでストリームを開く前に検証して弾く。
+ *
+ * Standard operation enables the secondary tap and VAD for the entire recording.
+ * Toggle transcription by keeping or discarding the delivered results, not by
+ * re-opening the stream; the secondary format is fixed at open (see
+ * `switchSource`), so the recognition resample + VAD run on every recording —
+ * budget for them as a constant cost, not an opt-in. The integrated VAD defaults
+ * `maxSpeechMs` to 30 s so a monologue with no silence stays bounded; call
+ * `flushVad` to force-close the open utterance (e.g. when pausing recognition).
+ * Per-chunk `vadEvents[].atNs` is a recording zero-based absolute time that is
+ * monotonic non-decreasing across chunks.
  */
 export declare function openStream(options: OpenOptions, onChunk: ChunkTsfn, onEvent?: EventTsfn | undefined | null): FlexStream
 /** デバイス着脱を監視し、イベントをコールバックへ送る `DeviceWatcherHandle` を返す。 */
@@ -152,10 +238,15 @@ export declare function watchDevices(onEvent: DeviceTsfn): DeviceWatcherHandle
  * 同じ bridge / TSFN 経路で回す。実音なしで marshaling 全経路（Float32Array・BigInt・
  * peak/rms・frames）を end-to-end 検証する。本番コードからは使わないこと。
  *
+ * `secondaryRate` を渡すと副タップ（`secondaryChannels`＝既定 1・`secondaryEncoding`＝
+ * 'f32'|'s16'、既定 'f32'）を有効化し、ペア合成・s16 量子化・`Int16Array` を検証できる。
+ * `vadThreshold` を渡すと統合 VAD（`vadTap`＝'primary'|'secondary'、既定 'primary'）を
+ * 有効化し、`flushVad`・`vadEvents` の `atNs`・`stop()` 自動 flush を検証できる。
+ *
  * JS 名は `__openMockStream`。先頭 `__` で公開 API 外を示す。napi の既定変換は先頭
  * アンダースコアを落として `openMockStream` にしてしまうので `js_name` で固定する。
  */
-export declare function __openMockStream(sampleRate: number, channels: number, freqHz: number, onChunk: ChunkTsfn): FlexStream
+export declare function __openMockStream(sampleRate: number, channels: number, freqHz: number, onChunk: ChunkTsfn, secondaryRate?: number | undefined | null, secondaryChannels?: number | undefined | null, secondaryEncoding?: string | undefined | null, vadThreshold?: number | undefined | null, vadTap?: string | undefined | null): FlexStream
 /**
  * 録音ストリームのハンドル。内部で bridge スレッドが `flexaudio::Stream` を
  * 所有・ポーリングし、チャンク/イベントを TSFN 経由で JS へ送る。
@@ -183,6 +274,21 @@ export class FlexStream {
   pause(): void
   /** 一時停止を解除して配信を再開する。既に `stop()` 済みなら例外。 */
   resume(): void
+  /**
+   * 統合 VAD の「今開いている発話」を強制的に確定する（runtime 操作）。
+   *
+   * silero は無音が来ない限り `speechEnd` を出さないので、認識を一時停止する・録音末尾で
+   * 最後の発話を確定したいときにこれを呼ぶ。開いている発話があれば最終 `speechEnd`（と対の
+   * `speechStart`）が、次に届くタップのチャンクの `vadEvents`（録音 0 起点 `atNs` 付き）
+   * 先頭に載る（20ms 毎にチャンクが流れるので遅延 ≤ 1 チャンク）。呼び出し後 VAD は
+   * リセットされ、次の発話は新しい文脈で拾う。
+   *
+   * これは config を変えない（`secondaryOutput`/encoding の open 時固定＝`switchSource` で
+   * 変更不可、とは無関係）。また音の stop-flush とは別物で、音サンプルは加工しない。VAD
+   * 未設定なら何もしない。`stop()` は音の stop-flush の後にこれを自動実行する。既に `stop()`
+   * 済みなら例外。
+   */
+  flushVad(): void
   /**
    * 入力ゲイン（線形倍率）を変更する。1.0=そのまま、2.0=約+6dB、0.0=無音。録音中
    * いつでも呼べて、次のチャンクから効く（20ms 粒度）。乗算後のサンプルは ±1.0 に
@@ -233,6 +339,15 @@ export class Vad {
    * VAD 内部レート基準（[`JsVadEvent`] を参照）。
    */
   process(samples: Float32Array, inputSampleRate: number, inputChannels: number): Array<JsVadEvent>
+  /**
+   * 今開いている発話を強制的に確定し、確定した [`JsVadEvent`] を返す（入力終端に達したのと
+   * 同じ挙動）。呼び出し後は内部状態がリセットされ、次の `process` は新しい文脈から始まる。
+   * モデル推論は走らないので軽量・決定的。
+   *
+   * 単体 `Vad` は pts 文脈を持たないので `atNs` は `undefined`（`atSample` は VAD 内部レート
+   * 基準の生の累積位置）。無発話中は空配列を返す。
+   */
+  flush(): Array<JsVadEvent>
   /** 内部状態（state / context / 状態機械 / サンプル位置 / リサンプラ）を初期化する。 */
   reset(): void
 }

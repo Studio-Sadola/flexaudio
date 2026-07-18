@@ -27,11 +27,79 @@ use std::time::Duration;
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::chunk_ring::{chunk_ring, ChunkConsumer, ChunkProducer};
 use flexaudio_core::clock::{monotonic_now_ns, ClockNormalizer};
-use flexaudio_core::normalizer::Normalizer;
+use flexaudio_core::normalizer::{InnerProcessor, Normalizer};
 use flexaudio_core::raw_ring::{raw_ring, RawConsumer};
-use flexaudio_core::types::{
-    AudioChunk, ChunkFlags, Error, Event, OutputFormat, Result, StreamConfig,
+use flexaudio_core::secondary_ring::{
+    secondary_chunk_ring, SecondaryChunkConsumer, SecondaryChunkProducer,
 };
+use flexaudio_core::types::{
+    AudioChunk, ChunkFlags, Error, Event, OutputFormat, Result, SecondaryChunk, StreamConfig,
+};
+
+/// Wraps [`flexaudio_denoise::Denoiser`] as a core [`InnerProcessor`] so the
+/// core stays independent of the concrete noise-suppression implementation.
+///
+/// The processor runs on the internal normalized form (48kHz / stereo), so the
+/// denoiser is always constructed for two channels regardless of the primary
+/// output channel count. `process`/`flush` forward to the denoiser (any error
+/// is swallowed: the normalized form always has an even length, so
+/// [`Denoiser::process`](flexaudio_denoise::Denoiser::process) never rejects it).
+struct DenoiseInnerProcessor {
+    denoiser: flexaudio_denoise::Denoiser,
+}
+
+impl DenoiseInnerProcessor {
+    /// Build a fresh stereo denoiser. Called once per intake generation so a
+    /// source switch / reopen starts with clean RNNoise state (no bleed across
+    /// the discontinuity).
+    fn new() -> Self {
+        // Denoiser::new(2) only fails for an out-of-range channel count; 2 is
+        // always valid, so unwrap is safe here.
+        Self {
+            denoiser: flexaudio_denoise::Denoiser::new(2)
+                .expect("stereo denoiser construction is infallible"),
+        }
+    }
+}
+
+impl InnerProcessor for DenoiseInnerProcessor {
+    fn process(&mut self, samples: &mut [f32]) {
+        let _ = self.denoiser.process(samples);
+    }
+    fn flush(&mut self) -> Vec<f32> {
+        self.denoiser.flush()
+    }
+}
+
+/// Build the optional inner processor for a Normalizer, honoring the current
+/// `denoise_enabled` flag. Returns `None` when denoise is off.
+fn build_inner_processor(shared: &SharedState) -> Option<Box<dyn InnerProcessor>> {
+    if shared.denoise_enabled.load(Ordering::SeqCst) {
+        Some(Box::new(DenoiseInnerProcessor::new()))
+    } else {
+        None
+    }
+}
+
+/// Build the [`Normalizer`] for the current generation: primary output, the
+/// optional secondary tap, and the optional denoise inner processor. Kept in one
+/// place so `start` and the intake generation-change path stay in sync.
+fn build_normalizer(
+    shared: &SharedState,
+    rate: u32,
+    channels: u16,
+    output: OutputFormat,
+    secondary_output: Option<OutputFormat>,
+) -> Result<Normalizer> {
+    let mut n = Normalizer::new(rate, channels, output)?;
+    if let Some(sec) = secondary_output {
+        n = n.with_secondary(sec)?;
+    }
+    if let Some(proc) = build_inner_processor(shared) {
+        n = n.with_inner_processor(proc);
+    }
+    Ok(n)
+}
 
 /// RawRing の容量（f32 サンプル単位）。ネイティブ SR×ch に依存させず、
 /// 多めに確保して RT 経路のドロップを避ける（約 0.5 秒 @ 48k stereo 相当の余裕）。
@@ -62,6 +130,9 @@ pub struct Stream {
 
     /// 消費側が取り出すチャンクリングの consumer。
     chunk_consumer: ChunkConsumer,
+
+    /// 副タップの consumer（`config.secondary_output` が `Some` のときのみ）。
+    secondary_consumer: Option<SecondaryChunkConsumer>,
 
     /// イベントキューの consumer 側（共有）。
     events: Arc<Mutex<VecDeque<Event>>>,
@@ -132,6 +203,18 @@ struct SharedState {
     /// open() で config.gain から初期化し、set_gain() が録音中いつでも書き換える。
     /// 取り込みスレッドが完成チャンクごとに読み、1.0 以外なら各サンプルへ乗算する。
     gain_bits: AtomicU32,
+
+    /// 録音エポック（ns）。「最初に配信された主チャンクの算出 pts」を 1 度だけ確定し、
+    /// 以後全チャンク（主・副）から引いて録音開始 0 起点にする。番兵 `i64::MIN` = 未確定。
+    /// reopen/switch をまたいでもリセットしない（録音全体で 1 本の時計）。
+    recording_epoch_ns: AtomicI64,
+
+    /// 内部正規形へのノイズ抑制を有効にするか。取り込みスレッドが Normalizer を（再）構築
+    /// するときに読み、有効なら core の InnerProcessor へ denoise を注入する。
+    denoise_enabled: AtomicBool,
+
+    /// 副 ChunkRing の producer（副タップ設定時のみ Some）。取り込みスレッドが使う。
+    secondary_producer: Mutex<Option<SecondaryChunkProducer>>,
 }
 
 impl SharedState {
@@ -188,6 +271,10 @@ impl Stream {
         }
         // 出力フォーマットが対応域か検証（非対応は UnsupportedFormat）。
         config.output.validate()?;
+        // 副出力フォーマットも同様に検証する（設定時のみ）。
+        if let Some(sec) = config.secondary_output {
+            sec.validate()?;
+        }
         let native_format = backend.native_format();
         if native_format.0 == 0 || native_format.1 == 0 {
             return Err(Error::InvalidArg(
@@ -196,6 +283,13 @@ impl Stream {
         }
 
         let (chunk_producer, chunk_consumer) = chunk_ring(config.ring_capacity_chunks);
+        // 副タップ設定時のみ専用リングを作る（公開 chunk_ring<AudioChunk> は不変）。
+        let (secondary_producer, secondary_consumer) = if config.secondary_output.is_some() {
+            let (p, c) = secondary_chunk_ring(config.ring_capacity_chunks);
+            (Some(p), Some(c))
+        } else {
+            (None, None)
+        };
         let events = Arc::new(Mutex::new(VecDeque::new()));
 
         let shared = Arc::new(SharedState {
@@ -212,12 +306,16 @@ impl Stream {
             discontinuity_pending: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             gain_bits: AtomicU32::new(config.gain.to_bits()),
+            recording_epoch_ns: AtomicI64::new(i64::MIN),
+            denoise_enabled: AtomicBool::new(false),
+            secondary_producer: Mutex::new(secondary_producer),
         });
 
         Ok(Stream {
             config,
             shared,
             chunk_consumer,
+            secondary_consumer,
             events,
             worker: None,
             watchdog: None,
@@ -239,6 +337,11 @@ impl Stream {
         // 再 start は通常状態から始める）。
         self.shared.paused.store(false, Ordering::SeqCst);
 
+        // 新しい録音は 0 起点の時計を張り直す（前回録音のエポックを持ち越さない）。
+        self.shared
+            .recording_epoch_ns
+            .store(i64::MIN, Ordering::SeqCst);
+
         // 初回 backend 起動: RawRing を作り sink を backend へ渡す。
         Self::open_backend_once(&self.shared)?;
 
@@ -252,6 +355,14 @@ impl Stream {
             .take()
             .ok_or_else(|| Error::InvalidState("chunk producer already taken".into()))?;
 
+        // 副タップ設定時はその producer も取り出して取り込みスレッドへ移す。
+        let secondary_producer = self
+            .shared
+            .secondary_producer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+
         // 取り込み/加工スレッド。初期 native_format は shared から読む
         // （以降は世代変化のたびに run_intake が shared を読み直して追従する）。
         let worker_shared = self.shared.clone();
@@ -262,10 +373,18 @@ impl Stream {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let output = self.config.output;
+        let secondary_output = self.config.secondary_output;
         let worker = thread::Builder::new()
             .name("flexaudio-intake".into())
             .spawn(move || {
-                run_intake(worker_shared, chunk_producer, initial_native, output);
+                run_intake(
+                    worker_shared,
+                    chunk_producer,
+                    secondary_producer,
+                    initial_native,
+                    output,
+                    secondary_output,
+                );
             })
             .map_err(|e| Error::Backend(format!("spawn intake thread: {e}")))?;
         self.worker = Some(worker);
@@ -378,6 +497,27 @@ impl Stream {
     /// `peak`/`rms` は最終 data に対して算出済み。`seq` は単調増加。
     pub fn poll_chunk(&mut self) -> Option<AudioChunk> {
         self.chunk_consumer.try_pop()
+    }
+
+    /// 完成済みの副タップチャンクを 1 つ取り出す（非ブロッキング）。無ければ `None`。
+    ///
+    /// 副タップは `config.secondary_output` が `Some` のときだけ生成される。未設定なら
+    /// 常に `None`。副チャンクは主 [`AudioChunk`] と同じ録音時計（0 起点）に乗る `pts_ns`
+    /// を持つが、値は主とは独立で、副 Stage2 のリサンプラ群遅延ぶん主より 20〜60ms 遅れる。
+    /// 主↔副の対応は `pts_ns`（時刻）で取ること（`seq` は各タップ独立カウンタ）。
+    pub fn poll_secondary(&mut self) -> Option<SecondaryChunk> {
+        self.secondary_consumer.as_mut().and_then(|c| c.try_pop())
+    }
+
+    /// 内部正規形へのノイズ抑制（RNNoise）を有効/無効にする。
+    ///
+    /// [`start`](Self::start) の前に呼ぶこと（取り込みスレッドが Normalizer を構築する
+    /// ときに反映される。録音中の変更は次の世代交代＝ソース切替/自動復帰で反映される）。
+    /// 有効時は 48kHz/stereo の内部正規形へ 1 度だけ適用され、主・副の両タップが除去済み
+    /// 音声を受ける（+10ms の固定遅延）。core は denoise 非依存で、この facade が実装を
+    /// 差し込む。
+    pub fn set_denoise(&self, enabled: bool) {
+        self.shared.denoise_enabled.store(enabled, Ordering::SeqCst);
     }
 
     /// 未配信イベントを 1 つ取り出す（非ブロッキング）。無ければ `None`。
@@ -636,6 +776,12 @@ impl Stream {
                 "output format cannot change during switch_source".into(),
             ));
         }
+        // 副タップのフォーマットも open 時固定（切替中に副 Normalizer/リングを再構成しない）。
+        if new_config.secondary_output != self.config.secondary_output {
+            return Err(Error::InvalidArg(
+                "secondary output format cannot change during switch_source".into(),
+            ));
+        }
         // 新ソースの backend を構築（失敗時は旧ソース無傷のまま早期 return）。
         let backend = crate::build_backend(&new_config)?;
         // 差し替え（連続性は switch_backend が保証）。
@@ -661,22 +807,49 @@ impl Drop for Stream {
     }
 }
 
+/// 録音開始 0 起点の絶対時刻へ写す。最初に配信される（主）チャンクの算出 pts を録音
+/// エポックとして 1 度だけ確定し（番兵 `i64::MIN` から書き換え）、以後全チャンクから引く。
+/// 取り込みスレッドだけが書くので競合しない。以後 reopen/switch をまたいでも固定なので、
+/// pts は 0 起点で録音全体を通して連続する。
+fn apply_epoch(shared: &SharedState, raw_pts: i64) -> i64 {
+    let epoch = shared.recording_epoch_ns.load(Ordering::SeqCst);
+    if epoch == i64::MIN {
+        shared.recording_epoch_ns.store(raw_pts, Ordering::SeqCst);
+        0
+    } else {
+        raw_pts - epoch
+    }
+}
+
+/// 完成チャンクの `data` へ入力ゲイン（線形倍率）を適用する。1.0 のときはサンプルに一切
+/// 触れない（バイト完全パススルー）。1.0 以外なら各サンプルへ乗算し ±1.0 にクランプする。
+fn apply_gain(data: &mut [f32], gain: f32) {
+    if gain != 1.0 {
+        for x in data.iter_mut() {
+            *x = (*x * gain).clamp(-1.0, 1.0);
+        }
+    }
+}
+
 /// 取り込み/加工スレッド本体。
 ///
-/// RawConsumer を pop → [`Normalizer`]（2 段: 内部正規化 → 出力フォーマット再変換）
-/// へ投入 → 完成チャンクへ `seq`・peak/rms 付与 → ChunkRing へ push。世代変化
-/// （再オープン）を検知したら Normalizer/Clock を作り直し、次チャンクへ
-/// RECOVERED|DISCONTINUITY を立てる。
+/// RawConsumer を pop → [`Normalizer`]（Stage1 共有 → 主/副の各 Stage2 へ分岐）へ投入 →
+/// 完成チャンクへ `seq`・録音 0 起点 pts・peak/rms・不連続フラグを付与 → 主/副リングへ
+/// push。世代変化（再オープン / ソース切替）を検知したら Normalizer/Clock を作り直し、
+/// 次チャンクへ RECOVERED|DISCONTINUITY を立てる。RawRing オーバーフロー（キャプチャ側の
+/// 欠落）も検知し、次の主・副チャンク両方へ DISCONTINUITY を立てる。停止時は Normalizer を
+/// flush して末尾テールを吐き切る。
 fn run_intake(
     shared: Arc<SharedState>,
     mut chunk_producer: ChunkProducer,
+    mut secondary_producer: Option<SecondaryChunkProducer>,
     initial_native: (u32, u16),
     output: OutputFormat,
+    secondary_output: Option<OutputFormat>,
 ) {
     let (mut rate, mut channels) = initial_native;
     // Normalizer 構築失敗（rubato 構築失敗等）は無言で死なせず Event::Error を出して終了。
-    // 従来は Normalizer::new が panic していたため取り込みスレッドが無言死していた。
-    let mut normalizer = match Normalizer::new(rate, channels, output) {
+    let mut normalizer = match build_normalizer(&shared, rate, channels, output, secondary_output) {
         Ok(n) => n,
         Err(e) => {
             shared.push_event(Event::Error(format!("normalizer init failed: {e}")));
@@ -684,35 +857,51 @@ fn run_intake(
         }
     };
     let mut clock = ClockNormalizer::new();
-    let mut seq: u64 = 0;
+    let mut seq: u64 = 0; // 主タップ seq。
+    let mut sec_seq: u64 = 0; // 副タップ seq（主とは別カウンタ）。
     let mut current_generation = shared.raw_generation.load(Ordering::SeqCst);
+    // RawRing オーバーフロー累計の前回観測値（世代交代でリングが作り直され 0 に戻る）。
+    let mut overflow_baseline: u64 = 0;
 
-    // pop 用スクラッチ（ネイティブ ch のフレーム×ある程度）。
+    // 不連続 pending をタップ毎に持つ（共有 AtomicBool を両タップのローカルへ扇状に配る）。
+    // rec_* は RECOVERED|DISCONTINUITY、disc_* は DISCONTINUITY のみ。持ち越すことで
+    // ポーズ中に破棄しても resume 後の最初のチャンクへ確実に載る。
+    let mut rec_primary = false;
+    let mut rec_secondary = false;
+    let mut disc_primary = false;
+    let mut disc_secondary = false;
+
+    // タップ毎の最後に配信した pts。契約（録音 0 起点・非減少）を保証するため、各
+    // チャンクの pts をこの値と 0 でクランプする。起動直後は各タップの PTS 外挿がわずかに
+    // 負へ振れうる（主エポック基準・数 ms）ので 0 で下限を切る。世代交代をまたぐ後退も
+    // ここで吸収する。
+    let mut last_pts_primary: i64 = 0;
+    let mut last_pts_secondary: i64 = 0;
+
+    let out_channels = output.channels.max(1) as usize;
+    let sec_channels = secondary_output
+        .map(|f| f.channels.max(1) as usize)
+        .unwrap_or(1);
+
+    // pop 用スクラッチ（RawRing 容量ぶん確保。1 回で全量取り出せる）。
     let mut scratch = vec![0.0f32; RAW_RING_SAMPLES];
 
     loop {
-        if shared.stopping.load(Ordering::SeqCst) {
-            // 停止前に Normalizer/RawRing に残ったものは捨てる（部分チャンクは出さない）。
-            break;
-        }
+        let stopping = shared.stopping.load(Ordering::SeqCst);
 
-        // 世代変化（再オープン / ソース切替）検知 → 新しいソースへリセット。
-        // ソース切替では native_format が変わり得るので shared を読み直し、
-        // 第 1 段（native 依存）の Normalizer を作り直す（ウォッチドッグ復帰では
-        // 同じ値が読めるため挙動は従来どおり）。
+        // 世代変化（再オープン / ソース切替）検知 → 新しいソースへリセット。native_format が
+        // 変わり得るので shared を読み直し、第 1 段（native 依存）の Normalizer を作り直す。
+        // 録音エポックはここでリセットしない（0 起点で世代跨ぎ連続）。
         let gen = shared.raw_generation.load(Ordering::SeqCst);
         if gen != current_generation {
             current_generation = gen;
-            // poison でも回収して継続（取り込みスレッドを無言死させない）。
             let nf = *shared
                 .native_format
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             rate = nf.0;
             channels = nf.1;
-            // 新ソース向け Normalizer 再構築。失敗（rubato 構築失敗等）は無言死せず
-            // Event::Error を出して取り込みを終了する。
-            normalizer = match Normalizer::new(rate, channels, output) {
+            normalizer = match build_normalizer(&shared, rate, channels, output, secondary_output) {
                 Ok(n) => n,
                 Err(e) => {
                     shared.push_event(Event::Error(format!(
@@ -722,31 +911,38 @@ fn run_intake(
                 }
             };
             clock = ClockNormalizer::new();
+            // 新しい RawConsumer は overflow を 0 起点から数える（偽の巨大差分を避ける）。
+            overflow_baseline = 0;
         }
 
-        // RawRing から取り出して Normalizer へ。
+        // 共有 pending をタップ毎ローカルへ配る。切替中は switching でウォッチドッグを止める
+        // ので両方同時には立たないが、立っても OR で合成される。
+        if shared.recovered_pending.swap(false, Ordering::SeqCst) {
+            rec_primary = true;
+            rec_secondary = true;
+        }
+        if shared.discontinuity_pending.swap(false, Ordering::SeqCst) {
+            disc_primary = true;
+            disc_secondary = true;
+        }
+
+        // RawRing から取り出して Normalizer へ。overflow（キャプチャ側の欠落）も観測する。
         let mut produced_any = false;
-        // Normalizer::push の失敗（rubato process 失敗等）を持ち越す。ロックを保持した
-        // まま return しないよう、ブロック内では結果だけ控えてブロック後に処理する。
         let mut push_err: Option<Error> = None;
+        let mut overflow_now = overflow_baseline;
         {
-            // poison でも回収して継続する。取り込みループは無言死させず、pop を続ける
-            // （push 経路にヒープ確保・ブロッキングは増やさない＝RT 安全は不変）。
             let mut rc_guard = shared
                 .raw_consumer
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(rc) = rc_guard.as_mut() {
                 let got = rc.pop_slice(&mut scratch);
+                overflow_now = rc.overflow_count();
                 if got > 0 {
-                    // pop_slice は consumer ロック内で完結。Normalizer 投入はロック外で
-                    // 行いたいので、必要分をローカルへ移す。
-                    // （ここでは小さな move コピーで十分。RT 経路には触れない。）
                     let samples = &scratch[..got];
                     // device PTS: ネイティブ SR を基準にした単調近似（到着時刻）。
                     let device_pts = monotonic_now_ns();
                     let norm_pts = clock.normalize(device_pts);
-                    // push 失敗（理論上の rubato process 失敗）は無言で殺さず控える。
                     if let Err(e) = normalizer.push(samples, norm_pts) {
                         push_err = Some(e);
                     } else {
@@ -765,47 +961,46 @@ fn run_intake(
             return;
         }
 
-        // 完成チャンクを全て取り出して ChunkRing へ。
-        let out_channels = output.channels.max(1) as usize;
+        // RawRing オーバーフロー（RT が intake を追い越しサンプルを捨てた）を検知したら、
+        // 次の主・副チャンク両方へ DISCONTINUITY を立てる（正規形以前の欠落＝両タップが
+        // 等しく影響を受ける）。pts は wall-clock 再アンカーで既にギャップを反映する。
+        if overflow_now > overflow_baseline {
+            disc_primary = true;
+            disc_secondary = true;
+        }
+        overflow_baseline = overflow_now;
+
+        // 停止時は末尾テール（denoise 遅延線 + リサンプラ残余）を flush して吐き切る。
+        if stopping {
+            normalizer.flush();
+        }
+
+        // --- 主タップ: 完成チャンクを全て取り出して ChunkRing へ。---
+        let paused = shared.paused.load(Ordering::SeqCst);
+        let gain = f32::from_bits(shared.gain_bits.load(Ordering::Relaxed));
         let mut emitted_any = false;
-        while let Some((mut data, pts_ns)) = normalizer.pop_chunk() {
-            // ポーズ中は完成チャンクを破棄する。直前の RawRing 取り込みで last_sample_ns は
-            // 更新済みなのでデバイスは止まらず、ウォッチドッグの失速判定もぶれない。
-            // recovered_pending / discontinuity_pending はここでは消費せず持ち越し、resume 後の
-            // 最初のチャンクへまとめて DISCONTINUITY として立てる。seq も進めないので、消費側
-            // から見た seq はポーズ前後で連続する。
-            if shared.paused.load(Ordering::SeqCst) {
+        while let Some((mut data, raw_pts)) = normalizer.pop_chunk() {
+            // ポーズ中は破棄する（pop で out_frame_origin は進むので pts は前進を保つ）。
+            // pending は消費せず持ち越し、resume 後の最初のチャンクへ載せる。
+            if paused {
                 continue;
             }
-            // data は出力フォーマット（output.channels interleaved）。
-            // frames は時間ベース 20ms 固定（48k=960 / 16k=320 / ...）。
+            // 0 起点化 → 非負・非減少へクランプ（契約: 録音 0 起点・非減少）。
+            let pts_ns = apply_epoch(&shared, raw_pts).max(last_pts_primary);
+            last_pts_primary = pts_ns;
             debug_assert_eq!(data.len() % out_channels, 0);
             let frames = data.len() / out_channels;
-
-            // 入力ゲインを適用する（peak/rms の算出より前＝メーターはゲイン後の実レベル
-            // を示す）。1.0 のときはサンプルに一切触れないバイト完全パススルー。1.0 以外
-            // なら各サンプルへ乗算し、±1.0 にクランプする。
-            let gain = f32::from_bits(shared.gain_bits.load(Ordering::Relaxed));
-            if gain != 1.0 {
-                for x in data.iter_mut() {
-                    *x = (*x * gain).clamp(-1.0, 1.0);
-                }
-            }
-
-            // 最終 data に対して peak / rms（線形）を算出する（20ms なので極小コスト）。
+            apply_gain(&mut data, gain);
             let (peak, rms) = peak_rms(&data);
 
-            // フラグは二系統:
-            //  - recovered_pending: ウォッチドッグ自動復帰 → RECOVERED|DISCONTINUITY。
-            //  - discontinuity_pending: 意図的なソース切替 → DISCONTINUITY のみ。
-            // 切替中は switching でウォッチドッグを止めるので両方同時には立たないが、
-            // 立っても OR で合成されるだけ（RECOVERED|DISCONTINUITY）。
             let mut flags = ChunkFlags::empty();
-            if shared.recovered_pending.swap(false, Ordering::SeqCst) {
+            if rec_primary {
                 flags |= ChunkFlags::RECOVERED | ChunkFlags::DISCONTINUITY;
+                rec_primary = false;
             }
-            if shared.discontinuity_pending.swap(false, Ordering::SeqCst) {
+            if disc_primary {
                 flags |= ChunkFlags::DISCONTINUITY;
+                disc_primary = false;
             }
 
             let chunk = AudioChunk {
@@ -820,11 +1015,57 @@ fn run_intake(
             };
             seq += 1;
 
-            // DROP_OLDEST。ドロップ発生なら ChunkDropped を通知。
             if let Some(total) = chunk_producer.push(chunk) {
                 shared.push_event(Event::ChunkDropped { count: total });
             }
             emitted_any = true;
+        }
+
+        // --- 副タップ: 設定時のみ。主と対称に pop・破棄・flag 付与する。---
+        if let Some(sec_prod) = secondary_producer.as_mut() {
+            while let Some((mut samples, raw_pts)) = normalizer.pop_secondary() {
+                // ポーズ中は副も pop して破棄する（out_buf の無限成長を防ぐ）。
+                if paused {
+                    continue;
+                }
+                // 0 起点化 → 非負・非減少へクランプ（契約: 録音 0 起点・非減少）。
+                let pts_ns = apply_epoch(&shared, raw_pts).max(last_pts_secondary);
+                last_pts_secondary = pts_ns;
+                debug_assert_eq!(samples.len() % sec_channels, 0);
+                let frames = samples.len() / sec_channels;
+                apply_gain(&mut samples, gain);
+                let (peak, rms) = peak_rms(&samples);
+
+                let mut flags = ChunkFlags::empty();
+                if rec_secondary {
+                    flags |= ChunkFlags::RECOVERED | ChunkFlags::DISCONTINUITY;
+                    rec_secondary = false;
+                }
+                if disc_secondary {
+                    flags |= ChunkFlags::DISCONTINUITY;
+                    disc_secondary = false;
+                }
+
+                let chunk = SecondaryChunk {
+                    samples,
+                    frames,
+                    pts_ns,
+                    seq: sec_seq,
+                    flags,
+                    dropped_before: 0, // 副リングが push 時に上書きする。
+                    peak,
+                    rms,
+                };
+                sec_seq += 1;
+                // 副タップのドロップは dropped_before で観測できる（専用イベントは出さない）。
+                let _ = sec_prod.push(chunk);
+                emitted_any = true;
+            }
+        }
+
+        // 停止指示なら末尾を吐き切ったので終了。
+        if stopping {
+            break;
         }
 
         // データが無ければ少し眠って CPU を空転させない。
@@ -1678,5 +1919,302 @@ mod tests {
             "再オープンでの backend panic は Event::Error(\"reopen failed: ...\") として\
              表に出るはず（無言死しない）"
         );
+    }
+
+    // --- 絶対クロック（録音 0 起点） ---
+
+    /// 最初に配信されるチャンクの pts_ns は録音エポックそのものなので厳密に 0 で始まる。
+    #[test]
+    fn recording_clock_is_zero_based() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.start().expect("start");
+
+        let mut first: Option<AudioChunk> = None;
+        let got = wait_until(
+            || match stream.poll_chunk() {
+                Some(c) => {
+                    first = Some(c);
+                    true
+                }
+                None => false,
+            },
+            Duration::from_secs(2),
+        );
+        stream.stop();
+        assert!(got, "最初のチャンクが届くはず");
+        let first = first.unwrap();
+        assert_eq!(
+            first.pts_ns, 0,
+            "最初に配信されるチャンクは録音 0 起点（pts_ns == 0）のはず: {}",
+            first.pts_ns
+        );
+    }
+
+    /// pause 跨ぎで pts が pause 継続時間ぶん前進する（キャプチャ実時間の時計）。resume 後の
+    /// 最初のチャンクに DISCONTINUITY・seq 連続・dropped_before 0 も確認する。
+    #[test]
+    fn pause_preserves_absolute_clock() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.start().expect("start");
+
+        // pause 前のチャンクを集め、最後の (pts_ns, seq) を控える。
+        let before = collect_for(&mut stream, Duration::from_millis(250));
+        assert!(!before.is_empty(), "pause 前にチャンクが届くはず");
+        let mut last = before.last().cloned().unwrap();
+
+        stream.pause();
+        while let Some(c) = stream.poll_chunk() {
+            last = c;
+        }
+
+        // 既知時間 D の pause を保つ（STALL_THRESHOLD 未満）。
+        let d = Duration::from_millis(600);
+        thread::sleep(d);
+        stream.resume();
+
+        let mut first_after: Option<AudioChunk> = None;
+        let got = wait_until(
+            || match stream.poll_chunk() {
+                Some(c) => {
+                    first_after = Some(c);
+                    true
+                }
+                None => false,
+            },
+            Duration::from_secs(2),
+        );
+        stream.stop();
+        assert!(got, "resume 後にチャンクが届くはず");
+        let first = first_after.unwrap();
+
+        assert!(
+            first.flags.contains(ChunkFlags::DISCONTINUITY),
+            "resume 後の最初のチャンクに DISCONTINUITY が立つはず: {:?}",
+            first.flags
+        );
+        assert_eq!(first.seq, last.seq + 1, "seq は pause 前後で連続するはず");
+        assert_eq!(first.dropped_before, 0, "pause で取りこぼしは出ない");
+
+        // pts は pause 継続時間 D ぶん前進する（キャプチャ実時間）。CI 揺れを避けるため下限
+        // D*0.8、上限 D + 余裕で挟む。
+        let delta = first.pts_ns - last.pts_ns;
+        let d_ns = d.as_nanos() as i64;
+        assert!(
+            delta >= d_ns * 4 / 5,
+            "pts は pause ぶん（>= {} ns）前進するはず: delta={delta} ns",
+            d_ns * 4 / 5
+        );
+        assert!(
+            delta <= d_ns + 500_000_000,
+            "pts の前進が過大でない（<= D + 500ms）: delta={delta} ns"
+        );
+    }
+
+    // --- デュアル出力（主 + 副タップ） ---
+
+    /// secondary_output を設定すると主（48k/stereo）と副（16k/mono）が同時に配信される。
+    /// 副チャンクは 320 sample、pts は主と同じ 0 起点時計に乗る。
+    #[test]
+    fn dual_output_delivers_primary_and_secondary() {
+        let config = StreamConfig {
+            secondary_output: Some(OutputFormat {
+                sample_rate: 16_000,
+                channels: 1,
+            }),
+            // 収集窓の間に DROP_OLDEST で先頭（pts 0）が流れ去らないよう大きめに取る。
+            ring_capacity_chunks: 200,
+            ..Default::default()
+        };
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(config, backend).expect("open");
+        stream.start().expect("start");
+
+        let mut primary: Vec<AudioChunk> = Vec::new();
+        let mut secondary: Vec<SecondaryChunk> = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            while let Some(c) = stream.poll_chunk() {
+                primary.push(c);
+            }
+            while let Some(c) = stream.poll_secondary() {
+                secondary.push(c);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        stream.stop();
+        while let Some(c) = stream.poll_chunk() {
+            primary.push(c);
+        }
+        while let Some(c) = stream.poll_secondary() {
+            secondary.push(c);
+        }
+
+        assert!(!primary.is_empty(), "主チャンクが届くはず");
+        assert!(!secondary.is_empty(), "副チャンクが届くはず");
+        for c in &primary {
+            assert_eq!(c.data.len(), 960 * 2, "主は 48k/stereo = 1920 sample");
+        }
+        for c in &secondary {
+            assert_eq!(c.samples.len(), 320, "副は 16k/mono = 320 sample");
+        }
+        // 両タップとも 0 起点で非減少。主の先頭は 0。
+        assert_eq!(primary[0].pts_ns, 0, "主先頭は 0 起点");
+        for w in secondary.windows(2) {
+            assert!(w[1].pts_ns >= w[0].pts_ns, "副 pts は非減少");
+        }
+        assert!(secondary[0].pts_ns >= 0, "副 pts は非負（主エポック基準）");
+        // 副 seq は独自カウンタで 0 始まり単調。
+        assert_eq!(secondary[0].seq, 0);
+        for w in secondary.windows(2) {
+            assert_eq!(w[1].seq, w[0].seq + 1, "副 seq は単調連番");
+        }
+    }
+
+    /// switch_source では secondary_output を変更できない（open 時固定）。
+    #[test]
+    fn secondary_output_cannot_change_on_switch() {
+        let config = StreamConfig {
+            secondary_output: Some(OutputFormat {
+                sample_rate: 16_000,
+                channels: 1,
+            }),
+            ..Default::default()
+        };
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(config, backend).expect("open");
+        stream.start().expect("start");
+
+        // 副フォーマットを変える切替要求は InvalidArg で弾かれる（backend 構築より前）。
+        let new_config = StreamConfig {
+            secondary_output: Some(OutputFormat {
+                sample_rate: 8_000,
+                channels: 1,
+            }),
+            ..Default::default()
+        };
+        let err = stream.switch_source(new_config);
+        stream.stop();
+        assert!(
+            matches!(err, Err(Error::InvalidArg(_))),
+            "副フォーマット変更は InvalidArg のはず: {err:?}"
+        );
+    }
+
+    // --- RawRing オーバーフロー → DISCONTINUITY ---
+
+    /// RawRing を溢れさせる擬似バックエンド。start で 1 バーストがリング容量の 2 倍を
+    /// push し続け、必ず overflow を起こす。テスト専用。
+    struct FloodingMockBackend {
+        running: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl FloodingMockBackend {
+        fn new() -> Self {
+            Self {
+                running: Arc::new(AtomicBool::new(false)),
+                handle: None,
+            }
+        }
+    }
+
+    impl CaptureBackend for FloodingMockBackend {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 2)
+        }
+        fn start(&mut self, mut sink: RawSink) -> Result<()> {
+            self.running.store(true, Ordering::SeqCst);
+            let running = self.running.clone();
+            let handle = thread::spawn(move || {
+                // リング容量の 2 倍を毎バースト push（必ず溢れる）。
+                let burst = vec![0.1f32; RAW_RING_SAMPLES * 2];
+                while running.load(Ordering::SeqCst) {
+                    sink.push(&burst, 0);
+                    thread::sleep(Duration::from_millis(5));
+                }
+            });
+            self.handle = Some(handle);
+            Ok(())
+        }
+        fn stop(&mut self) {
+            self.running.store(false, Ordering::SeqCst);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// 持続的な RawRing オーバーフローが検知され、いずれかのチャンクに DISCONTINUITY が
+    /// 立つ（フレッシュ start では overflow 以外の不連続源が無いので、DISCONTINUITY =
+    /// overflow 由来）。
+    #[test]
+    fn ring_overflow_marks_discontinuity() {
+        let backend = Box::new(FloodingMockBackend::new());
+        // ChunkRing を大きめにして DROP_OLDEST で観測前に流れ去るのを避ける。
+        let config = StreamConfig {
+            ring_capacity_chunks: 200,
+            ..Default::default()
+        };
+        let mut stream = Stream::open(config, backend).expect("open");
+        stream.start().expect("start");
+
+        let mut saw_discontinuity = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !saw_discontinuity {
+            while let Some(c) = stream.poll_chunk() {
+                if c.flags.contains(ChunkFlags::DISCONTINUITY) {
+                    saw_discontinuity = true;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        stream.stop();
+        while let Some(c) = stream.poll_chunk() {
+            if c.flags.contains(ChunkFlags::DISCONTINUITY) {
+                saw_discontinuity = true;
+            }
+        }
+        assert!(
+            saw_discontinuity,
+            "RawRing オーバーフローで DISCONTINUITY が立つはず"
+        );
+    }
+
+    // --- denoise を内部正規形へ注入（core InnerProcessor 経由） ---
+
+    /// set_denoise(true) 後も主・副の両タップが配信され続ける（denoise 配線のスモーク）。
+    /// 実際の除去効果は core のフラッシュ/処理テストで担保する。
+    #[test]
+    fn denoise_enabled_still_delivers_both_taps() {
+        let config = StreamConfig {
+            secondary_output: Some(OutputFormat {
+                sample_rate: 16_000,
+                channels: 1,
+            }),
+            ..Default::default()
+        };
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(config, backend).expect("open");
+        stream.set_denoise(true);
+        stream.start().expect("start");
+
+        let mut primary = 0usize;
+        let mut secondary = 0usize;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            while let Some(_c) = stream.poll_chunk() {
+                primary += 1;
+            }
+            while let Some(c) = stream.poll_secondary() {
+                assert_eq!(c.samples.len(), 320, "副は 16k/mono = 320 sample");
+                secondary += 1;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        stream.stop();
+        assert!(primary > 0, "denoise 有効でも主チャンクが届くはず");
+        assert!(secondary > 0, "denoise 有効でも副チャンクが届くはず");
     }
 }

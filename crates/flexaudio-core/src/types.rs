@@ -60,6 +60,39 @@ pub struct AudioChunk {
     pub rms: f32,
 }
 
+/// One 20ms chunk of a secondary output tap.
+///
+/// A secondary tap is an additional rendering of the same capture in its own
+/// format (see [`StreamConfig::secondary_output`]). It always carries `f32`
+/// samples; encoding to another sample type (e.g. signed 16-bit) is the
+/// binding layer's responsibility and happens downstream. The secondary tap
+/// carries its own `pts_ns`/`seq` on the same recording clock as the primary
+/// [`AudioChunk`], but the values are independent of the primary tap: consumers
+/// pair a primary chunk with a secondary chunk by `pts_ns` (time), never by
+/// `seq` (each tap has its own counter). Because the secondary tap runs through
+/// its own resampler, its chunks lag the primary by roughly one to three chunks
+/// (about 20-60ms).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SecondaryChunk {
+    /// interleaved `f32` サンプル。長さ = `frames * secondary_output.channels`。
+    pub samples: Vec<f32>,
+    /// チャンク内のフレーム数（1 フレーム = 全出力チャンネル 1 サンプル組）。
+    pub frames: usize,
+    /// 先頭サンプルの録音開始 0 起点プレゼンテーションタイムスタンプ（ns）。
+    /// 主 [`AudioChunk`] と同じ録音時計に乗るが、値は主とは独立。
+    pub pts_ns: i64,
+    /// 副タップ独自の単調シーケンス番号（主タップとは別カウンタ）。
+    pub seq: u64,
+    /// このチャンクの状態フラグ。
+    pub flags: ChunkFlags,
+    /// このチャンクが届くまでに（直前に）ドロップされた副チャンク数。
+    pub dropped_before: u32,
+    /// `samples`（量子化前 f32）における全サンプル絶対値の最大（線形振幅）。
+    pub peak: f32,
+    /// `samples`（量子化前 f32）における二乗平均平方根（線形）。
+    pub rms: f32,
+}
+
 /// `devices()` が 1 デバイスにつき返す情報。
 ///
 /// 全 OS バックエンド共通の形。マイク入力（[`SourceKind::Mic`]）とシステム音声出力
@@ -247,6 +280,17 @@ pub struct StreamConfig {
     pub exclude_self: bool,
     /// 出力チャンクのフォーマット。既定 `{48000, 2}`（パススルー）。
     pub output: OutputFormat,
+    /// 副出力タップのフォーマット（省略 = 副タップなし）。
+    ///
+    /// `Some(fmt)` を指定すると、同じキャプチャを主 [`output`](Self::output) とは別の
+    /// フォーマットへ再変換した副タップが有効になり、[`SecondaryChunk`] として
+    /// `poll_secondary` から取り出せる。内部正規形（48k/stereo）は 1 度だけ生成し、
+    /// 主・副はそれぞれ独立の第 2 段で再変換されるので、両者は「同一区間のサンプル」で
+    /// はなく `pts_ns` による時刻対応で突き合わせる。副タップは常に `f32`（sample encoding
+    /// を持たない）。`None` なら副タップは作られず、`poll_secondary` は常に `None`。
+    ///
+    /// [`Stream::switch_source`] では変更できない（open 時に固定）。
+    pub secondary_output: Option<OutputFormat>,
     /// 開始時の入力ゲイン（線形倍率）。1.0=そのまま、2.0=約+6dB、0.0=無音。既定 1.0。
     /// 有限かつ 0.0 以上であること（外れていれば open が [`Error::InvalidArg`]）。
     /// 実行時変更は `Stream::set_gain`。
@@ -277,6 +321,7 @@ impl Default for StreamConfig {
             mode: ProcessMode::Include,
             exclude_self: false,
             output: OutputFormat::default(),
+            secondary_output: None,
             gain: 1.0,
             mix_mic_device_id: None,
             mix_system_device_id: None,
@@ -371,6 +416,8 @@ mod tests {
         assert_eq!(c.output.sample_rate, SAMPLE_RATE);
         assert_eq!(c.output.channels, CHANNELS);
         assert_eq!(c.output, OutputFormat::default());
+        // 既定では副タップなし。
+        assert_eq!(c.secondary_output, None);
     }
 
     #[test]

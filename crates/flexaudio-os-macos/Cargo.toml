@@ -17,7 +17,7 @@ documentation = "https://docs.rs/flexaudio-os-macos"
 #
 # バージョンは Cargo.lock の既存ピン（cpal が引く objc2 系）に合わせ、重複コンパイルを避ける。
 [target.'cfg(target_os = "macos")'.dependencies]
-flexaudio-core = { path = "../flexaudio-core", version = "0.2.0" }
+flexaudio-core = { path = "../flexaudio-core", version = "0.3.0" }
 objc2 = "=0.6.4"
 objc2-foundation = { version = "=0.3.2", features = [
     "NSArray",

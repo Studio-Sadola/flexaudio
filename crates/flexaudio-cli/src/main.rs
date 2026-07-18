@@ -1097,10 +1097,11 @@ fn write_chunk<W: Write>(out: &mut W, chunk: &AudioChunk, encoding: EncodingArg)
             out.write_all(&buf)?;
         }
         EncodingArg::S16 => {
-            // s16 LE: (clamp(-1,1) * 32767) as i16。1 サンプル 2 byte。
+            // s16 LE: 量子化は全層共通の正典 [`flexaudio::core::quantize_i16`]
+            // （scale 32768・round・clamp・NaN→0）。1 サンプル 2 byte。
             let mut buf = Vec::with_capacity(chunk.data.len() * 2);
             for &x in &chunk.data {
-                let s = (x.clamp(-1.0, 1.0) * 32767.0) as i16;
+                let s = flexaudio::core::quantize_i16(x);
                 buf.extend_from_slice(&s.to_le_bytes());
             }
             out.write_all(&buf)?;
@@ -1157,7 +1158,8 @@ struct WavSummary {
 /// ファイルは次のチャンクが来るまで開かない（遅延生成）ので、録音がちょうど境界で
 /// 終わっても空の末尾ファイルは残らない。ピーク / RMS は録音全体（全ファイル通算）で
 /// 集計する（従来の単一ファイル時と同じ意味の統計・無音警告を保つため）。
-/// 量子化は従来どおり `(x.clamp(-1,1) * 32767) as i16` の 16-bit PCM 固定。
+/// 量子化は全層共通の正典 [`flexaudio::core::quantize_i16`]（scale 32768・round・clamp）の
+/// 16-bit PCM 固定。
 struct RotatingWavWriter {
     /// `--out` のベースパス（分割時は連番の元、分割なしはこのまま使う）。
     base: PathBuf,
@@ -1240,7 +1242,7 @@ impl RotatingWavWriter {
             self.sum_sq += (x as f64) * (x as f64);
             self.samples += 1;
 
-            let s = (x.clamp(-1.0, 1.0) * 32767.0) as i16;
+            let s = flexaudio::core::quantize_i16(x);
             writer.write_sample(s)?;
         }
         self.frames_in_current += chunk.frames as u64;
@@ -1940,11 +1942,13 @@ mod tests {
         assert!(err.contains("併用できません"), "err: {err}");
     }
 
-    /// `write_chunk` の s16 量子化: f32 [-1,1] → i16。clamp とスケールを検証する。
+    /// `write_chunk` の s16 量子化: f32 → i16。全層共通の正典 `quantize_i16`
+    /// （scale 32768・round・clamp・NaN→0）に一本化済み。負側フルスケール `-1.0` は
+    /// `-32768`、範囲外は飽和。
     #[test]
     fn write_chunk_s16_quantizes_and_clamps() {
         let chunk = AudioChunk {
-            // 0.0 / 1.0 / -1.0 / 範囲外 2.0(→clamp 1.0) / -2.0(→clamp -1.0)。
+            // 0.0 / 1.0 / -1.0 / 範囲外 2.0(→clamp 32767) / -2.0(→clamp -32768)。
             data: vec![0.0, 1.0, -1.0, 2.0, -2.0],
             frames: 5,
             pts_ns: 0,
@@ -1960,10 +1964,10 @@ mod tests {
         assert_eq!(buf.len(), 10);
         let s = |i: usize| i16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]);
         assert_eq!(s(0), 0); // 0.0
-        assert_eq!(s(1), 32767); // 1.0 * 32767
-        assert_eq!(s(2), -32767); // -1.0 * 32767
-        assert_eq!(s(3), 32767); // 2.0 clamp 1.0
-        assert_eq!(s(4), -32767); // -2.0 clamp -1.0
+        assert_eq!(s(1), 32767); // 1.0 → clamp 32767
+        assert_eq!(s(2), -32768); // -1.0 → 負側フルスケール -32768
+        assert_eq!(s(3), 32767); // 2.0 → clamp 32767
+        assert_eq!(s(4), -32768); // -2.0 → clamp -32768
     }
 
     /// `write_chunk` の f32 経路: バイト長 = サンプル数 × 4、LE 復元が一致する。

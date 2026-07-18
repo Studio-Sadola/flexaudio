@@ -16,4 +16,4 @@ documentation = "https://docs.rs/flexaudio-os-linux"
 # pipewire 依存も下の target 限定セクションでしか引かれない。
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire = { workspace = true }
-flexaudio-core = { path = "../flexaudio-core", version = "0.2.0" }
+flexaudio-core = { path = "../flexaudio-core", version = "0.3.0" }

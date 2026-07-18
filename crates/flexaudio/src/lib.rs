@@ -23,7 +23,7 @@ pub use stream::Stream;
 pub use flexaudio_core::backend::CaptureBackend;
 pub use flexaudio_core::types::{
     AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Error, Event, OutputFormat, ProcessMode,
-    Result, SourceKind, StreamConfig,
+    Result, SecondaryChunk, SourceKind, StreamConfig,
 };
 
 /// 全ソースのオーディオデバイスを 1 つのリストで返す。

@@ -13,5 +13,5 @@ categories = ["multimedia::audio"]
 documentation = "https://docs.rs/flexaudio-mic"
 
 [dependencies]
-flexaudio-core = { path = "../flexaudio-core", version = "0.2.0" }
+flexaudio-core = { path = "../flexaudio-core", version = "0.3.0" }
 cpal = { workspace = true }

@@ -31,16 +31,20 @@ pub mod backend;
 pub mod chunk_ring;
 pub mod clock;
 pub mod normalizer;
+pub mod quant;
 pub mod raw_ring;
+pub mod secondary_ring;
 pub mod types;
 
 // 主要型をクレート直下へ再エクスポート。
 pub use backend::{CaptureBackend, RawSink};
 pub use chunk_ring::{chunk_ring, ChunkConsumer, ChunkProducer};
 pub use clock::{monotonic_now_ns, ClockNormalizer};
-pub use normalizer::{Normalizer, CHUNK_FRAMES};
+pub use normalizer::{InnerProcessor, Normalizer, CHUNK_FRAMES};
+pub use quant::quantize_i16;
 pub use raw_ring::{raw_ring, RawConsumer, RawProducer};
+pub use secondary_ring::{secondary_chunk_ring, SecondaryChunkConsumer, SecondaryChunkProducer};
 pub use types::{
     AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Error, Event, OutputFormat, Result,
-    SourceKind, StreamConfig, CHANNELS, SAMPLE_RATE,
+    SecondaryChunk, SourceKind, StreamConfig, CHANNELS, SAMPLE_RATE,
 };

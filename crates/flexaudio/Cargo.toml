@@ -13,21 +13,24 @@ readme = "README.md"
 documentation = "https://docs.rs/flexaudio"
 
 [dependencies]
-flexaudio-core = { path = "../flexaudio-core", version = "0.2.0" }
+flexaudio-core = { path = "../flexaudio-core", version = "0.3.0" }
 # デバイス列挙（`devices()`）でマイク入力（cpal, 全 OS）を束ねる。
-flexaudio-mic = { path = "../flexaudio-mic", version = "0.2.0" }
+flexaudio-mic = { path = "../flexaudio-mic", version = "0.3.0" }
+# 録音時ノイズ抑制（RNNoise）を内部正規形へ注入する（facade が intake を駆動する配線点）。
+# core は denoise 非依存のまま（core の InnerProcessor 抽象へこの facade が実装を差し込む）。
+flexaudio-denoise = { path = "../flexaudio-denoise", version = "0.3.0" }
 
 # デバイス列挙でシステム出力 sink（PipeWire）を束ねる（Linux のみ）。
 [target.'cfg(target_os = "linux")'.dependencies]
-flexaudio-os-linux = { path = "../flexaudio-os-linux", version = "0.2.0" }
+flexaudio-os-linux = { path = "../flexaudio-os-linux", version = "0.3.0" }
 
 # システム/プロセスループバック（WASAPI）を束ねる（Windows のみ）。
 [target.'cfg(target_os = "windows")'.dependencies]
-flexaudio-os-windows = { path = "../flexaudio-os-windows", version = "0.2.0" }
+flexaudio-os-windows = { path = "../flexaudio-os-windows", version = "0.3.0" }
 
 # システム/プロセスループバック（CoreAudio Process Taps）を束ねる（macOS のみ）。
 [target.'cfg(target_os = "macos")'.dependencies]
-flexaudio-os-macos = { path = "../flexaudio-os-macos", version = "0.2.0" }
+flexaudio-os-macos = { path = "../flexaudio-os-macos", version = "0.3.0" }
 
 [package.metadata.docs.rs]
 default-target = "x86_64-unknown-linux-gnu"

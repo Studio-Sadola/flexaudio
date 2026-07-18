@@ -316,6 +316,38 @@ impl Vad {
         &self.last_probs
     }
 
+    /// Force-close any open speech segment at the current position and return the
+    /// resulting events (as if the input had ended here), then reset internal
+    /// state so the next input starts a fresh context.
+    ///
+    /// This is the streaming counterpart of what [`get_speech_timestamps`] does at
+    /// the end of a batch: an open segment is only ever closed by trailing silence,
+    /// `max_speech_ms`, or the end of input, so a real-time caller that stops (or
+    /// pauses) recognition needs a way to materialize the segment it is currently
+    /// inside. Cheap and deterministic: no model inference is run (unlike feeding
+    /// trailing silence), and the terminal position is `next_pos` regardless of any
+    /// buffered partial frame. Returned event positions (`at_sample`) are on the
+    /// pre-reset accumulator, so ordering and positions are preserved.
+    ///
+    /// Returns an empty vector when no speech segment is open (or the open segment
+    /// is shorter than `min_speech_ms` and is discarded, matching the segmenter).
+    pub fn flush(&mut self) -> Vec<VadEvent> {
+        let mut segments_out = Vec::new();
+        self.segmenter.flush(&mut segments_out);
+        let mut events = Vec::new();
+        for seg in segments_out {
+            events.push(VadEvent::SpeechStart {
+                at_sample: seg.start_sample,
+            });
+            events.push(VadEvent::SpeechEnd {
+                at_sample: seg.end_sample,
+            });
+        }
+        // 次の入力は新しい文脈から始める（累積位置・state・端数を初期化）。
+        self.reset();
+        events
+    }
+
     /// state / context / 状態機械 / サンプル位置 / 端数バッファ / リサンプラ状態を
     /// すべて初期化する。
     pub fn reset(&mut self) {
@@ -635,6 +667,87 @@ mod tests {
         let zeros = vec![0.0f32; 16000];
         let segs = get_speech_timestamps(&zeros, &VadConfig::default()).unwrap();
         assert!(segs.is_empty(), "silence yields no segments, got {segs:?}");
+    }
+
+    // ---- flush（開いた発話の強制確定） ----
+
+    /// threshold=0 で全フレームを発話扱いにすると、無音が来ないので `process` では
+    /// セグメントが確定しない。`flush` で開いている発話を強制確定でき、確定後は reset
+    /// 済み（累積位置が 0 起点へ戻る）で次の入力が新しい文脈から始まる。
+    #[test]
+    fn flush_closes_open_speech_segment() {
+        let cfg = VadConfig {
+            threshold: 0.0,
+            neg_threshold: Some(0.0),
+            min_speech_ms: 0,
+            min_silence_ms: 0,
+            speech_pad_ms: 0,
+            max_speech_ms: 0,
+            sample_rate: 16_000,
+        };
+        let mut vad = Vad::new(cfg).unwrap();
+        // 1 秒ぶん流す。無音が来ないので process ではセグメント未確定。
+        let sig = vec![0.1f32; 16_000];
+        let during = vad.process(&sig);
+        assert!(
+            during.is_empty(),
+            "無音が来ないので process ではセグメントは確定しない: {during:?}"
+        );
+        // flush で開いた発話を確定 → speechStart + speechEnd のペア。
+        let flushed = vad.flush();
+        assert_eq!(
+            flushed.len(),
+            2,
+            "flush は開いた発話を確定する: {flushed:?}"
+        );
+        assert!(matches!(flushed[0], VadEvent::SpeechStart { at_sample: 0 }));
+        assert!(matches!(flushed[1], VadEvent::SpeechEnd { .. }));
+
+        // flush 後は reset 済み＝新しい文脈。同一入力で開始位置が 0 起点へ戻る。
+        let after = vad.process(&sig);
+        assert!(
+            after.is_empty(),
+            "reset 後は新規セグメントが未確定: {after:?}"
+        );
+        let flushed2 = vad.flush();
+        assert_eq!(flushed2.len(), 2);
+        assert_eq!(
+            flushed[0], flushed2[0],
+            "reset 後は開始位置が 0 起点へ戻り、同一入力で同一開始になる"
+        );
+    }
+
+    /// 発話が開いていない（無音のみ）ときの flush は空を返す。
+    #[test]
+    fn flush_on_idle_returns_empty() {
+        let mut vad = Vad::new(VadConfig::default()).unwrap();
+        let zeros = vec![0.0f32; 16_000];
+        vad.process(&zeros);
+        let flushed = vad.flush();
+        assert!(flushed.is_empty(), "無発話中の flush は空: {flushed:?}");
+    }
+
+    /// min_speech 未満の開いた発話は flush でも破棄される（segmenter の篩いに従う）。
+    #[test]
+    fn flush_discards_segment_shorter_than_min_speech() {
+        let cfg = VadConfig {
+            threshold: 0.0,
+            neg_threshold: Some(0.0),
+            min_speech_ms: 1_000, // 1 秒未満は破棄。
+            min_silence_ms: 0,
+            speech_pad_ms: 0,
+            max_speech_ms: 0,
+            sample_rate: 16_000,
+        };
+        let mut vad = Vad::new(cfg).unwrap();
+        // 300ms ぶん（< min_speech 1000ms）だけ流して flush。
+        let sig = vec![0.1f32; 16_000 * 300 / 1000];
+        vad.process(&sig);
+        let flushed = vad.flush();
+        assert!(
+            flushed.is_empty(),
+            "min_speech 未満の open セグメントは flush でも破棄される: {flushed:?}"
+        );
     }
 
     // ---- process_pcm（自己完結入口） ----
