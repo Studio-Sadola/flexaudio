@@ -57,7 +57,8 @@ jobs:
       # builds from source). To add it back, restore the target, the optional dep,
       # and a runner (or ONNX build) that can produce it.
       #
-      # Windows on arm64 is likewise left out: no hosted Windows/arm64 runner.
+      # Windows on arm64 has no hosted runner, but napi-rs cross-compiles it
+      # cleanly from the x64 Windows runner (VS ships the ARM64 toolchain).
       matrix:
         include:
           - runner: ubuntu-latest
@@ -68,6 +69,8 @@ jobs:
             target: aarch64-apple-darwin
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
 
