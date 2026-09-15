@@ -72,6 +72,11 @@ fn pw_init_once() {
     });
 }
 
+// 録れるプロセスの列挙（`list_processes`）。PID 解決はプロセス別キャプチャと同じ
+// `resolve_node_pid` を共有する。
+mod processes;
+pub use processes::list_processes;
+
 /// PipeWire 経由でシステム音声出力（sink の monitor）をキャプチャする
 /// [`CaptureBackend`]。
 ///

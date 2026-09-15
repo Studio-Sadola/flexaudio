@@ -29,7 +29,7 @@ use objc2_core_foundation::{CFRetained, CFString};
 
 use flexaudio_core::types::{DeviceInfo, Result, SourceKind};
 
-use crate::common::FALLBACK_FORMAT;
+use crate::common::{read_system_object_list, FALLBACK_FORMAT};
 
 /// プロパティアドレスを scope/element 指定で作る。
 fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
@@ -42,53 +42,22 @@ fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
 
 /// system object の `kAudioHardwarePropertyDevices` を読み、全 `AudioObjectID` を返す。
 ///
-/// 取得できなければ空 vec（呼び出し側は空リストを返すだけ）。
+/// 取得できなければ空 vec（呼び出し側は空リストを返すだけ）。読み取り本体はプロセス列挙と
+/// 共有の [`read_system_object_list`]。
 fn all_device_ids() -> Vec<AudioObjectID> {
-    let addr = address(
-        kAudioHardwarePropertyDevices,
-        kAudioObjectPropertyScopeGlobal,
-    );
-    let mut size: u32 = 0;
-    // SAFETY: addr/size は有効なローカル。qualifier 不要。
-    let status = unsafe {
-        AudioObjectGetPropertyDataSize(
-            kAudioObjectSystemObject as AudioObjectID,
-            NonNull::from(&addr),
-            0,
-            core::ptr::null(),
-            NonNull::from(&mut size),
-        )
-    };
-    if status != 0 || size == 0 {
-        return Vec::new();
-    }
-    let count = size as usize / core::mem::size_of::<AudioObjectID>();
-    let mut ids: Vec<AudioObjectID> = vec![0; count];
-    // SAFETY: ids は count 要素ぶん確保済み。size はその総バイト数。
-    let status = unsafe {
-        AudioObjectGetPropertyData(
-            kAudioObjectSystemObject as AudioObjectID,
-            NonNull::from(&addr),
-            0,
-            core::ptr::null(),
-            NonNull::from(&mut size),
-            NonNull::new_unchecked(ids.as_mut_ptr().cast::<c_void>()),
-        )
-    };
-    if status != 0 {
-        return Vec::new();
-    }
-    // 実際に書かれた要素数に詰める（size が縮むことがある）。
-    let written = size as usize / core::mem::size_of::<AudioObjectID>();
-    ids.truncate(written);
-    ids
+    read_system_object_list(kAudioHardwarePropertyDevices).unwrap_or_default()
 }
 
-/// CFString 型プロパティ（名前 / UID）を読んで `String` にする。取得できなければ `None`。
+/// CFString 型プロパティ（名前 / UID / bundle ID）を読んで `String` にする。取得できなければ
+/// `None`。デバイス列挙とプロセス列挙（`kAudioProcessPropertyBundleID`）が共有する。
 ///
 /// これらのプロパティは `CFStringRef` を +1 retain で返す（CF の Copy 規約）。
 /// `CFRetained::from_raw` で所有権を受け取り、drop で release する。
-fn read_cfstring_property(object: AudioObjectID, selector: u32, scope: u32) -> Option<String> {
+pub(crate) fn read_cfstring_property(
+    object: AudioObjectID,
+    selector: u32,
+    scope: u32,
+) -> Option<String> {
     let addr = address(selector, scope);
     let mut cf_ref: *const CFString = core::ptr::null();
     let mut size = core::mem::size_of::<*const CFString>() as u32;

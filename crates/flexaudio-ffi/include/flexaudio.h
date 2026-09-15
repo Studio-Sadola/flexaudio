@@ -69,6 +69,19 @@ typedef enum FlexEventKind {
     FLEX_EVENT_KIND_UNKNOWN = 6,
 } FlexEventKind;
 
+// プロセスが今音声を出力中か（[`flexaudio::ProcessInfo::is_output_active`] に対応）。
+//
+// OS がその状態を公開しないときは `Unknown`（Rust の `None`）。
+typedef enum FlexOutputActivity {
+    // OS が状態を公開していない／読めなかった。
+    FLEX_OUTPUT_ACTIVITY_UNKNOWN = 0,
+    // 出力していない（Linux=ノードが Running 以外 / Windows=セッションが Inactive /
+    // macOS=IsRunningOutput が 0）。
+    FLEX_OUTPUT_ACTIVITY_INACTIVE = 1,
+    // 出力中。
+    FLEX_OUTPUT_ACTIVITY_ACTIVE = 2,
+} FlexOutputActivity;
+
 // デバイス着脱イベントの種別（[`flexaudio::DeviceEvent`] に対応）。
 typedef enum FlexDeviceEventKind {
     // デバイスが追加された（`device`/`name` 等が埋まる）。
@@ -252,6 +265,24 @@ typedef struct FlexDeviceInfo {
     bool is_default;
 } FlexDeviceInfo;
 
+// 列挙された 1 プロセスの情報（[`flexaudio::ProcessInfo`] に対応）。
+//
+// `pid` を `FlexConfig::process_id` に渡すとそのプロセスを録れる。文字列は flexaudio 所有の
+// UTF-8 NUL 終端で、配列ごと `flexaudio_processes_free` で解放する（C の free は使わない）。
+// `executable` / `bundle_id` は取れなかったとき NULL。
+typedef struct FlexProcessInfo {
+    // OS のプロセス ID（0 以外）。
+    uint32_t pid;
+    // 表示名（常に非空。`flexaudio_processes_free` で解放）。
+    char *name;
+    // 実行ファイルのベース名。取れなければ NULL。
+    char *executable;
+    // macOS の bundle ID。取れなければ（macOS 以外は常に）NULL。
+    char *bundle_id;
+    // 出力中か（不明なら `Unknown`）。
+    enum FlexOutputActivity output_activity;
+} FlexProcessInfo;
+
 // 取得した 1 つのデバイスイベント。`flexaudio_watcher_poll` が埋める。
 //
 // フィールドの有効範囲は `kind` による:
@@ -421,6 +452,26 @@ int32_t flexaudio_devices(struct FlexDeviceInfo **out_array,
 // `arr`/`count` は `flexaudio_devices` が返したもの（または NULL/0）でなければならない。
 void flexaudio_devices_free(struct FlexDeviceInfo *arr,
                             uintptr_t count);
+
+// プロセス別キャプチャの対象にできる、音声出力を持つプロセスを列挙し、配列を確保して
+// `out_array` / `out_count` にセットする。呼び出し元プロセス自身は含まない。
+//
+// 成功で 0。候補が無ければ 0 件（`out_array=NULL` / `out_count=0`）で成功。確保した配列は
+// `flexaudio_processes_free` で解放する。この環境でプロセス別キャプチャが使えない
+// （Linux で PipeWire に接続できない・macOS 14.4 未満・非対応 OS）か、OS が 3 秒以内に
+// 応答しなかったときは `FLEX_FAILURE`（理由は `flexaudio_last_error`）。
+//
+// # Safety
+// `out_array` / `out_count` は有効な書き込み先でなければならない（NULL は InvalidArg）。
+int32_t flexaudio_processes(struct FlexProcessInfo **out_array,
+                            uintptr_t *out_count);
+
+// `flexaudio_processes` が確保した配列と各文字列を解放する。NULL 安全。
+//
+// # Safety
+// `arr`/`count` は `flexaudio_processes` が返したもの（または NULL/0）でなければならない。
+void flexaudio_processes_free(struct FlexProcessInfo *arr,
+                              uintptr_t count);
 
 // 現在のスレッドの直近エラーメッセージを返す。
 //

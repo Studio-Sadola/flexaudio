@@ -43,7 +43,7 @@ mod stream;
 mod vad;
 mod watcher;
 
-use marshal::device_info_to_py;
+use marshal::{device_info_to_py, process_info_to_py};
 
 // ---------------------------------------------------------------------------
 // エラー変換
@@ -147,6 +147,18 @@ fn devices() -> PyResult<Vec<marshal::PyDeviceInfo>> {
     Ok(list.into_iter().map(device_info_to_py).collect())
 }
 
+/// プロセス別キャプチャ（`open("process", process_id=...)`）の対象にできる、音声出力を
+/// 持つプロセスを列挙する。呼び出し元プロセス自身は含まない。
+///
+/// 並びは出力中が先頭 → 表示名 → pid。空リスト＝使えるが候補なし。この環境でプロセス別
+/// キャプチャが使えない（Linux で PipeWire 不在・macOS 14.4 未満・非対応 OS）か OS が 3 秒
+/// 以内に応答しないときは `RuntimeError`。列挙中（最大 3 秒）は GIL を解放する。
+#[pyfunction]
+fn processes(py: Python<'_>) -> PyResult<Vec<marshal::PyProcessInfo>> {
+    let list = py.detach(fa::processes).map_err(to_py_err)?;
+    Ok(list.into_iter().map(process_info_to_py).collect())
+}
+
 // ---------------------------------------------------------------------------
 // モジュール定義
 // ---------------------------------------------------------------------------
@@ -156,6 +168,7 @@ fn devices() -> PyResult<Vec<marshal::PyDeviceInfo>> {
 fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // 関数。
     m.add_function(wrap_pyfunction!(devices, m)?)?;
+    m.add_function(wrap_pyfunction!(processes, m)?)?;
     m.add_function(wrap_pyfunction!(stream::open, m)?)?;
     m.add_function(wrap_pyfunction!(watcher::watch_devices, m)?)?;
 
@@ -164,6 +177,7 @@ fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<marshal::PyAudioChunk>()?;
     m.add_class::<marshal::PyStreamEvent>()?;
     m.add_class::<marshal::PyDeviceInfo>()?;
+    m.add_class::<marshal::PyProcessInfo>()?;
     m.add_class::<marshal::PyVadEvent>()?;
     m.add_class::<marshal::PyDeviceEvent>()?;
 

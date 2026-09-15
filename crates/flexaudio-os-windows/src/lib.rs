@@ -12,6 +12,8 @@
 //!   （`AUDIOCLIENT_ACTIVATION_PARAMS`）で特定 PID（そのプロセスツリー）の音声を録る。
 //!   `exclude_self` で「対象ツリーを除く全システム音」へ反転する。
 //!
+//! 録れるプロセスの候補（音声セッションを持つプロセス）は [`list_processes`] で取れる。
+//!
 //! # `!Send` 回避
 //!
 //! WASAPI の `IAudioClient` 等の COM インターフェイスは `!Send` だが、コア契約
@@ -30,7 +32,9 @@
 
 mod common;
 mod process;
+mod processes;
 mod system;
 
 pub use process::WasapiProcessBackend;
+pub use processes::list_processes;
 pub use system::{list_output_devices, WasapiSystemBackend};

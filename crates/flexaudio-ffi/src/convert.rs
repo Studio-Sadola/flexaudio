@@ -11,14 +11,14 @@ use std::ptr;
 use std::slice;
 
 use flexaudio::{
-    AudioChunk, DeviceInfo, Event, OutputFormat, ProcessMode, SourceKind, StreamConfig,
+    AudioChunk, DeviceInfo, Event, OutputFormat, ProcessInfo, ProcessMode, SourceKind, StreamConfig,
 };
 use flexaudio_vad::{VadConfig, VadEvent};
 
 use crate::error::set_last_error;
 use crate::types::{
-    FlexChunk, FlexConfig, FlexDeviceInfo, FlexEvent, FlexEventKind, FlexProcessMode,
-    FlexSourceKind, FlexVadConfig, FlexVadEvent,
+    FlexChunk, FlexConfig, FlexDeviceInfo, FlexEvent, FlexEventKind, FlexOutputActivity,
+    FlexProcessInfo, FlexProcessMode, FlexSourceKind, FlexVadConfig, FlexVadEvent,
 };
 
 // 番兵 0 を既定へ写すときの値（StreamConfig 既定と揃える）。
@@ -382,6 +382,60 @@ pub unsafe fn free_device_array(arr: *mut FlexDeviceInfo, count: usize) {
     drop(infos);
 }
 
+/// `Option<bool>`（出力中か・不明）を C の 3 値へ写す。
+pub(crate) fn output_activity_to_c(active: Option<bool>) -> FlexOutputActivity {
+    match active {
+        None => FlexOutputActivity::Unknown,
+        Some(false) => FlexOutputActivity::Inactive,
+        Some(true) => FlexOutputActivity::Active,
+    }
+}
+
+/// `Option<String>` を C へ渡す。`None` は NULL。
+fn optional_string_to_c(s: Option<String>) -> *mut c_char {
+    s.map(string_to_c).unwrap_or(std::ptr::null_mut())
+}
+
+/// C へ渡した文字列を回収して解放する（NULL なら何もしない）。
+///
+/// # Safety
+/// `p` は [`string_to_c`] が返したもの（または NULL）で、まだ解放していないこと。
+unsafe fn reclaim_c_string(p: *mut c_char) {
+    if !p.is_null() {
+        drop(CString::from_raw(p));
+    }
+}
+
+/// [`ProcessInfo`] を `FlexProcessInfo` に写す。文字列は CString として C へ渡す。
+pub fn process_info_to_c(info: ProcessInfo) -> FlexProcessInfo {
+    FlexProcessInfo {
+        pid: info.pid,
+        name: string_to_c(info.name),
+        executable: optional_string_to_c(info.executable),
+        bundle_id: optional_string_to_c(info.bundle_id),
+        output_activity: output_activity_to_c(info.is_output_active),
+    }
+}
+
+/// `flexaudio_processes_free` の本体。各文字列の CString を復元して drop し、配列自体も
+/// `Vec` として復元して drop する。
+///
+/// # Safety
+/// `arr`/`count` は `flexaudio_processes` が返したもの（または NULL/0）でなければならない。
+pub unsafe fn free_process_array(arr: *mut FlexProcessInfo, count: usize) {
+    if arr.is_null() {
+        return;
+    }
+    // Box<[T]> で要素数ぴったりに確保したものを Vec として復元する（capacity = count）。
+    let infos = Vec::from_raw_parts(arr, count, count);
+    for info in &infos {
+        reclaim_c_string(info.name);
+        reclaim_c_string(info.executable);
+        reclaim_c_string(info.bundle_id);
+    }
+    drop(infos);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,6 +651,53 @@ mod tests {
         // free が CString と配列を解放する（leak/二重解放しない）。
         let ptr = Box::into_raw(boxed) as *mut FlexDeviceInfo;
         unsafe { free_device_array(ptr, count) };
+    }
+
+    #[test]
+    fn process_info_to_c_and_free_roundtrip() {
+        let infos = vec![
+            ProcessInfo {
+                pid: 4321,
+                name: "Music".to_string(),
+                executable: Some("Music".to_string()),
+                bundle_id: Some("com.apple.Music".to_string()),
+                is_output_active: Some(true),
+            },
+            ProcessInfo {
+                pid: 99,
+                name: "pid 99".to_string(),
+                executable: None,
+                bundle_id: None,
+                is_output_active: None,
+            },
+        ];
+        let boxed: Box<[FlexProcessInfo]> = infos.into_iter().map(process_info_to_c).collect();
+        let count = boxed.len();
+        let first = &boxed[0];
+        assert_eq!(first.pid, 4321);
+        assert_eq!(first.output_activity, FlexOutputActivity::Active);
+        let bundle = unsafe { CStr::from_ptr(first.bundle_id) }.to_str().unwrap();
+        assert_eq!(bundle, "com.apple.Music");
+        let second = &boxed[1];
+        assert!(second.executable.is_null(), "None becomes NULL");
+        assert!(second.bundle_id.is_null());
+        assert_eq!(second.output_activity, FlexOutputActivity::Unknown);
+        let name = unsafe { CStr::from_ptr(second.name) }.to_str().unwrap();
+        assert_eq!(name, "pid 99");
+        let ptr = Box::into_raw(boxed) as *mut FlexProcessInfo;
+        unsafe { free_process_array(ptr, count) };
+        // NULL は何もしない。
+        unsafe { free_process_array(std::ptr::null_mut(), 0) };
+    }
+
+    #[test]
+    fn output_activity_maps_all_three_states() {
+        assert_eq!(output_activity_to_c(None), FlexOutputActivity::Unknown);
+        assert_eq!(
+            output_activity_to_c(Some(false)),
+            FlexOutputActivity::Inactive
+        );
+        assert_eq!(output_activity_to_c(Some(true)), FlexOutputActivity::Active);
     }
 
     #[test]

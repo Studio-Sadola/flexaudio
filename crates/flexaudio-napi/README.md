@@ -49,6 +49,62 @@ stream.stop();
 `stream.switchSource(options)` hot-swaps the input source without stopping.
 `watchDevices(cb)` reports hotplug (added / removed / defaultChanged) events.
 
+## Picking a process to capture
+
+`processes()` lists the processes that currently have an audio output stream and
+can be captured per process. Pass `pid` as `processId`:
+
+```js
+const { processes, openStream } = require('@studio-sadola/flexaudio');
+
+const list = processes();
+// [{ pid: 4242, name: 'Firefox', executable: 'firefox', isOutputActive: true }, …]
+// bundleId is set on macOS only; executable / isOutputActive are undefined when
+// the OS does not expose them. The calling process is never listed.
+
+const stream = openStream({ kind: 'process', processId: list[0].pid }, (chunk) => {});
+```
+
+An empty array means per-process capture works but nothing is playing. A throw
+means per-process capture is unavailable here (Linux without a reachable
+PipeWire session, macOS before 14.4, or an unsupported OS) or the OS did not
+answer within 3 seconds. On Windows the list works everywhere, but capturing a
+listed PID needs process loopback (Windows 11 / build 20348+).
+
+## Chunk delivery shape (primary, secondary, VAD)
+
+`onChunk` is called with **one** argument, the primary chunk. When
+`secondaryOutput` is set, the paired secondary chunk travels **inside** it as
+`chunk.secondary` — it is not a second callback argument. VAD events ride on the
+chunk of the tap selected by `vadTap`.
+
+```js
+const stream = openStream(
+  {
+    kind: 'system',
+    outputRate: 48000, outputChannels: 2,                       // primary: save
+    secondaryOutput: { rate: 16000, channels: 1, encoding: 's16' }, // secondary: recognize
+    vad: { threshold: 0.5 },
+    vadTap: 'secondary',
+  },
+  (chunk) => {                    // ONE argument
+    save(chunk.data);             // Float32Array, 48 kHz stereo
+    const sec = chunk.secondary;  // undefined on rounds where it has not arrived yet
+    if (sec) {
+      recognize(sec.data);        // Int16Array because encoding is 's16'
+      for (const ev of sec.vadEvents ?? []) {
+        // ev.type: 'speechStart' | 'speechEnd'; ev.atNs: time since recording start
+      }
+    }
+    // With vadTap: 'primary' (the default) the events are on chunk.vadEvents instead.
+  },
+);
+```
+
+Pair primary and secondary chunks by `ptsNs` (a zero-based recording clock),
+never by `seq`: each tap counts its own sequence, and the secondary tap runs
+about 20–60 ms behind the primary.
+
 `stream` also exposes `pause()` / `resume()`, `setGain(x)`, and the read-only
 `isPaused()`, `gain()`, `nativeFormat()` (`{ sampleRate, channels }`) and
 `droppedChunks()` (a `bigint` running total).
@@ -107,8 +163,9 @@ npx napi build --platform --release   # also produces the .node binary
 ```
 
 `napi build` writes `index.js`, `index.d.ts`, and the platform `.node` artifact.
-These generated files are git-ignored and produced at build/publish time
-(`prepublishOnly` runs `napi prepublish`). Do not hand-edit them.
+`index.js` and `index.d.ts` are committed (regenerate them after changing the
+`#[napi]` exports); the `.node` binaries are git-ignored. Do not hand-edit the
+generated files — change the doc comments in `src/lib.rs` and rebuild.
 
 ## Permissions
 

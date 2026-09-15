@@ -26,7 +26,7 @@ use napi::{Error as NapiError, Status};
 use napi_derive::napi;
 
 use flexaudio::{
-    AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Event, OutputFormat, ProcessMode,
+    AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Event, OutputFormat, ProcessInfo, ProcessMode,
     SecondaryChunk, SourceKind, StreamConfig,
 };
 
@@ -121,8 +121,34 @@ pub struct JsDeviceInfo {
     pub is_default: bool,
 }
 
+/// JS 側 ProcessInfo（`processes()` の要素）。プロセス別キャプチャの対象候補。
+///
+/// `pid` を `openStream({ kind: 'process', processId: pid })` に渡すとそのプロセスを録れる。
+/// `name` / `executable` / `bundleId` は表示用（アプリ自身が名乗る値を含む）で、同一性の
+/// キーは `pid`。
+#[napi(object)]
+pub struct JsProcessInfo {
+    /// OS のプロセス ID（0 以外）。`openStream` の `processId` に渡す。
+    pub pid: u32,
+    /// 表示名（常に非空）。OS が名乗る名前 → 実行ファイル名 → bundle ID → `"pid <N>"`。
+    pub name: String,
+    /// 実行ファイルのベース名（例 `firefox` / `chrome.exe`）。取れたときだけ。
+    pub executable: Option<String>,
+    /// macOS の bundle ID（例 `com.apple.Music`）。macOS で取れたときだけ。
+    pub bundle_id: Option<String>,
+    /// 今まさに音声を出力中か。OS が公開しているときだけ（Linux=ノードが Running /
+    /// Windows=セッションが Active / macOS=IsRunningOutput）。`undefined` は不明。
+    pub is_output_active: Option<bool>,
+}
+
 /// JS 側 AudioChunk。`data` は interleaved f32（len = frames * channels）。
 /// `seq`(u64) は精度欠落を避けて BigInt。`flags` は ChunkFlags のビット(u32)。
+///
+/// 配送の形（0.3.0）: `openStream(options, onChunk)` の `onChunk` は **引数 1 つ**
+/// （この主チャンク）で呼ばれる。副タップ（`secondaryOutput`）のチャンクは第 2 引数では
+/// なく、この主チャンクの `secondary` プロパティに入って届く。VAD の確定イベントも別
+/// コールバックではなく、`vadTap` で選んだタップのチャンクの `vadEvents` に載る
+/// （'primary' なら `chunk.vadEvents`、'secondary' なら `chunk.secondary?.vadEvents`）。
 ///
 /// `vadEvents` は `openStream` に `vad` を指定したときだけ埋まる。VAD 無効時は未設定
 /// （`undefined`）。有効でもそのチャンクで確定イベントが無ければ空配列になる。
@@ -139,8 +165,9 @@ pub struct JsAudioChunk {
     /// このチャンクで確定した VAD イベント（`vadTap` が 'primary' のときのみ）。
     pub vad_events: Option<Vec<JsVadEvent>>,
     /// 時刻対応する副タップチャンク（`secondaryOutput` 設定時のみ）。同一コールバックで
-    /// ペア配送する（`onChunk(primary)` の `primary.secondary`）。副が未達の周回は
-    /// `undefined`。主↔副の対応は `ptsNs`（時刻）で取ること（`seq` は各タップ独立）。
+    /// ペア配送する（`onChunk(primary)` の `primary.secondary`。第 2 引数ではない）。副が
+    /// 未達の周回は `undefined`。主↔副の対応は `ptsNs`（時刻）で取ること（`seq` は各タップ
+    /// 独立）。
     pub secondary: Option<JsSecondaryChunk>,
 }
 
@@ -167,20 +194,25 @@ pub struct JsSecondaryChunk {
     pub vad_events: Option<Vec<JsVadEvent>>,
 }
 
-/// JS 側 VAD イベント。`type` は "speechStart" | "speechEnd"。
+/// JS 側 VAD イベント（発話区間の開始/終了）。
+///
+/// `type` は `'speechStart' | 'speechEnd'` の 2 値のみ（他イベントの `type` と統一）。
 ///
 /// `atSample` は **VAD の内部レート（`sampleRate`＝8000 か 16000、既定 16000）基準**の
-/// 絶対サンプル位置で、入力チャンクのサンプル基準ではない。秒に直すなら
-/// `atSample / sampleRate`、入力サンプル位置の目安は
+/// 絶対サンプル位置で、入力チャンクのサンプル基準ではない（silero 生値・単体/デバッグ用）。
+/// 秒に直すなら `atSample / sampleRate`、入力サンプル位置の目安は
 /// `atSample * inputSampleRate / sampleRate` で近似できる。
 #[napi(object)]
 pub struct JsVadEvent {
-    #[napi(js_name = "type")]
+    /// 'speechStart' | 'speechEnd'（発話区間の開始/終了）。
+    #[napi(js_name = "type", ts_type = "'speechStart' | 'speechEnd'")]
     pub kind: String,
     pub at_sample: i64,
-    /// 録音 0 起点の絶対時刻（ns）。統合 VAD（`openStream` の `vad`）経由でのみ埋まる
-    /// （チャンクの `ptsNs` とチャンク内オフセットから算出）。単体 `Vad` クラスでは
-    /// pts 文脈が無いため `undefined`。
+    /// 録音 0 起点の絶対ナノ秒（`number`＝f64）。統合 VAD（`openStream` の `vad`）経由でのみ
+    /// 埋まる（チャンクの `ptsNs` とチャンク内オフセットから F4 再基準化式で算出）。同一
+    /// チャンクで配送され、チャンクをまたいで単調非減少。`flushVad` の最終イベントも同じ
+    /// `vadEvents` 配列に載る。単体 `Vad` クラス（`process`/`flush`）は pts 文脈が無いため
+    /// `undefined`。（時刻は録音長で有界なので `number`。生 u64 カウンタの `seq` のみ `bigint`。）
     pub at_ns: Option<i64>,
 }
 
@@ -206,7 +238,11 @@ pub struct VadOptions {
     pub min_silence_ms: Option<u32>,
     /// セグメント境界を前後に広げるパディング (ms)。既定 30。
     pub speech_pad_ms: Option<u32>,
-    /// 1 セグメントの最大長 (ms)。0 = 無制限。既定 0。
+    /// 1 セグメントの最大長 (ms)。0 = 無制限。超過時は強制分割。
+    ///
+    /// 単体 `Vad` クラスは silero 忠実で既定 0（無制限）。**統合 VAD（`openStream` の `vad`）は
+    /// 省略時 30000ms（長広舌を有界化して RT 遅延を抑える）**。明示指定（`0` を含む）があれば
+    /// それが勝つ。
     pub max_speech_ms: Option<u32>,
     /// VAD の内部サンプルレート。8000 または 16000 のみ。既定 16000。
     pub sample_rate: Option<u32>,
@@ -342,6 +378,16 @@ fn device_info_to_js(info: DeviceInfo) -> JsDeviceInfo {
         channels: info.channels,
         is_loopback: info.is_loopback,
         is_default: info.is_default,
+    }
+}
+
+fn process_info_to_js(info: ProcessInfo) -> JsProcessInfo {
+    JsProcessInfo {
+        pid: info.pid,
+        name: info.name,
+        executable: info.executable,
+        bundle_id: info.bundle_id,
+        is_output_active: info.is_output_active,
     }
 }
 
@@ -1313,6 +1359,27 @@ pub fn devices() -> napi::Result<Vec<JsDeviceInfo>> {
     Ok(list.into_iter().map(device_info_to_js).collect())
 }
 
+/// プロセス別キャプチャ（`openStream({ kind: 'process', processId })`）の対象にできる、
+/// 音声出力を持つプロセスを列挙する。呼び出し元プロセス自身は含まない。
+///
+/// 並びは「出力中（`isOutputActive: true`）が先頭 → 表示名 → pid」で、同じ pid は 1 件に
+/// まとめてある。読み取り専用で権限プロンプトは出さない。OS の応答が無くても最大 3 秒で
+/// 戻る（同期関数なので呼び出し中はそのスレッドを塞ぐ。通常は数十 ms）。
+///
+/// - Linux（PipeWire）: `Stream/Output/Audio` ノードを持つクライアント。
+/// - Windows: 有効な出力デバイスの音声セッションを持つプロセス（列挙はどの版でも動くが、
+///   その pid を録るプロセスループバックは Windows 11 / build 20348 以降が必要）。
+/// - macOS 14.4+: Core Audio のプロセスオブジェクト（`bundleId` 付き）。
+///
+/// 戻り値の読み方: 空配列＝プロセス別キャプチャは使えるが今は候補が無い。throw＝この
+/// 環境ではプロセス別キャプチャが使えない（Linux で PipeWire に繋がらない・macOS 14.4 未満
+/// は `unsupported OS version`・その他 OS は `unsupported`）か、OS が時間内に応答しなかった。
+#[napi]
+pub fn processes() -> napi::Result<Vec<JsProcessInfo>> {
+    let list = flexaudio::processes().map_err(to_napi_err)?;
+    Ok(list.into_iter().map(process_info_to_js).collect())
+}
+
 /// ストリームを開いて開始し、チャンク/イベントをコールバックへ送る `FlexStream` を返す。
 ///
 /// `options.denoise` を指定すると core（内部正規形）でノイズ抑制が有効になり、主・副の
@@ -1331,11 +1398,19 @@ pub fn devices() -> napi::Result<Vec<JsDeviceInfo>> {
 /// silence stays bounded; call `flushVad` to force-close the open utterance
 /// (e.g. when pausing recognition). Per-chunk `vadEvents[].atNs` is a recording
 /// zero-based absolute time that is monotonic non-decreasing across chunks.
+///
+/// `onChunk` is called with **one** argument, the primary `JsAudioChunk`. When
+/// `secondaryOutput` is set, the paired secondary chunk arrives as
+/// `chunk.secondary` (it is not a second callback argument). VAD results ride
+/// on the chunk of the tap selected by `vadTap`: `chunk.vadEvents` for
+/// 'primary', `chunk.secondary?.vadEvents` for 'secondary'.
 #[napi]
 pub fn open_stream(
     options: OpenOptions,
-    on_chunk: ChunkTsfn,
-    on_event: Option<EventTsfn>,
+    #[napi(ts_arg_type = "(chunk: JsAudioChunk) => void")] on_chunk: ChunkTsfn,
+    #[napi(ts_arg_type = "((event: JsStreamEvent) => void) | undefined | null")] on_event: Option<
+        EventTsfn,
+    >,
 ) -> napi::Result<FlexStream> {
     let config = build_config(&options)?;
     let output_rate = config.output.sample_rate;
@@ -1403,7 +1478,9 @@ pub fn open_stream(
 
 /// デバイス着脱を監視し、イベントをコールバックへ送る `DeviceWatcherHandle` を返す。
 #[napi]
-pub fn watch_devices(on_event: DeviceTsfn) -> napi::Result<DeviceWatcherHandle> {
+pub fn watch_devices(
+    #[napi(ts_arg_type = "(event: JsDeviceEvent) => void")] on_event: DeviceTsfn,
+) -> napi::Result<DeviceWatcherHandle> {
     let mut watcher = flexaudio::watch_devices().map_err(to_napi_err)?;
     let stop_flag = Arc::new(AtomicBool::new(false));
     let thread_stop = stop_flag.clone();
@@ -1453,7 +1530,7 @@ pub fn open_mock_stream(
     sample_rate: u32,
     channels: u16,
     freq_hz: f64,
-    on_chunk: ChunkTsfn,
+    #[napi(ts_arg_type = "(chunk: JsAudioChunk) => void")] on_chunk: ChunkTsfn,
     secondary_rate: Option<u32>,
     secondary_channels: Option<u16>,
     secondary_encoding: Option<String>,

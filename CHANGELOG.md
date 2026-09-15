@@ -12,6 +12,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - not yet released
+
+### Added
+- **Process enumeration: `flexaudio::processes() -> Result<Vec<ProcessInfo>>`.**
+  Lists the processes that currently have an audio output stream and can be
+  passed to per-process capture as `target_pid`. The calling process is
+  excluded, entries are deduplicated by PID, and the list is sorted with
+  actively-playing processes first. `ProcessInfo` carries `pid`, `name`
+  (always non-empty), and, when the OS exposes them, `executable`, `bundle_id`
+  (macOS), and `is_output_active`.
+  - **Linux:** PipeWire clients that own a `Stream/Output/Audio` node; the PID
+    comes from the client's `pipewire.sec.pid` (the same resolution the
+    capture backend uses); activity = node state `Running`.
+  - **Windows:** audio sessions on every active render endpoint
+    (`IAudioSessionManager2`); activity = session state `Active`. Capturing a
+    listed PID needs process loopback (Windows 11 / build 20348+).
+  - **macOS 14.4+:** Core Audio process objects with bundle ID and
+    `kAudioProcessPropertyIsRunningOutput`; older macOS returns
+    `Error::UnsupportedOsVersion`.
+  - The call is read-only, triggers no permission prompt, and always returns
+    within 3 seconds. `Ok(empty)` means "available, nothing playing";
+    `Err` means per-process capture is unavailable in this environment.
+  - Exposed in every binding: N-API `processes(): JsProcessInfo[]`, C
+    `flexaudio_processes` / `flexaudio_processes_free` (`FlexProcessInfo`,
+    `FlexOutputActivity`), Python `flexaudio.processes()` (`ProcessInfo`), and
+    `flexaudio-cli --list-processes`.
+- **Secondary output tap:** `StreamConfig::secondary_output` renders the same
+  capture in a second format (for example 48 kHz stereo for saving plus 16 kHz
+  mono for recognition), pulled with `Stream::poll_secondary` as
+  `SecondaryChunk`. The N-API binding can deliver it as signed 16-bit
+  (`secondaryOutput.encoding: 's16'`, an `Int16Array`); quantization goes
+  through the shared NaN/Inf-safe `flexaudio_core::quantize_i16`.
+- **Recording clock:** `pts_ns` is a zero-based recording clock (0 at the first
+  delivered chunk) that stays continuous across pause/resume and source
+  switches. Primary and secondary chunks share the clock, so pair them by
+  `pts_ns`, never by `seq` (each tap has its own counter).
+- **Integrated VAD control (N-API):** `vadTap: 'primary' | 'secondary'`,
+  `FlexStream.flushVad()` to close the open utterance (run automatically by
+  `stop()`), and a 30 s `maxSpeechMs` default for the integrated VAD when the
+  option is left unset (the standalone `Vad` keeps silero's unbounded default).
+- Denoise now runs once on the shared 48 kHz normalized signal, so both the
+  primary and the secondary tap receive denoised audio.
+
+### Changed
+- The N-API TypeScript declarations now type the callbacks:
+  `openStream(options, onChunk: (chunk: JsAudioChunk) => void, onEvent?)` and
+  `watchDevices(onEvent: (event: JsDeviceEvent) => void)` instead of the
+  undefined `ChunkTsfn` / `EventTsfn` / `DeviceTsfn` names.
+
+### Migration from 0.2
+- **Rust `StreamConfig` literals:** the struct gained `secondary_output`. A
+  literal that lists every field without `..Default::default()` no longer
+  compiles; add `secondary_output: None` or end the literal with
+  `..Default::default()`.
+- **N-API chunk delivery:** `onChunk` receives **one** argument. With
+  `secondaryOutput` set, the paired secondary chunk is `chunk.secondary` (it is
+  `undefined` on rounds where it has not arrived yet) — it is **not** a second
+  callback argument. Code written as `(primary, secondary) => …` always sees
+  `secondary === undefined`. VAD events ride on the chunk of the tap chosen by
+  `vadTap`: `chunk.vadEvents` for `'primary'`, `chunk.secondary?.vadEvents` for
+  `'secondary'`.
+- **Timestamps:** treat `pts_ns` as time since the recording started, not as a
+  host monotonic timestamp.
+- **Integrated VAD:** if you relied on unbounded utterances, pass
+  `vad.maxSpeechMs: 0` explicitly.
+- **Process pickers:** list candidates with `processes()` instead of deriving
+  them from `devices()` (which lists endpoints, never processes).
+
 ## [0.2.0] - 2026-06-17
 
 The first Rust workspace release — a ground-up Rust rewrite of the earlier prototype.

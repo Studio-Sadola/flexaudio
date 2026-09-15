@@ -17,7 +17,8 @@ use flexaudio_core::types::Error;
 use objc2_core_audio::{
     kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyElementMain,
     kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioTapPropertyFormat,
-    AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress,
+    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
+    AudioObjectPropertyAddress,
 };
 use objc2_core_audio_types::{kAudioFormatFlagIsFloat, AudioStreamBasicDescription};
 
@@ -110,6 +111,52 @@ pub(crate) fn translate_pid_to_object(pid: i32) -> Result<AudioObjectID, Error> 
         ));
     }
     Ok(out_object)
+}
+
+/// system object の「`AudioObjectID` の配列」型プロパティを読む
+/// （`kAudioHardwarePropertyDevices` のデバイス一覧、`kAudioHardwarePropertyProcessObjectList`
+/// のプロセスオブジェクト一覧など）。
+///
+/// 失敗時は生の `OSStatus` を返す。空扱いにするか [`map_os_status`] で型付きエラーにするかは
+/// 呼び出し側が決める（デバイス列挙は空扱い、プロセス列挙は型付きエラー）。
+pub(crate) fn read_system_object_list(selector: u32) -> Result<Vec<AudioObjectID>, i32> {
+    let address = global_address(selector);
+    let mut size: u32 = 0;
+    // SAFETY: address/size は有効なローカル。qualifier 不要（null/0）。
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            kAudioObjectSystemObject as AudioObjectID,
+            NonNull::from(&address),
+            0,
+            core::ptr::null(),
+            NonNull::from(&mut size),
+        )
+    };
+    if status != NO_ERR {
+        return Err(status);
+    }
+    let count = size as usize / core::mem::size_of::<AudioObjectID>();
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut ids: Vec<AudioObjectID> = vec![0; count];
+    // SAFETY: ids は count 要素ぶん確保済み。size はその総バイト数。
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject as AudioObjectID,
+            NonNull::from(&address),
+            0,
+            core::ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::new_unchecked(ids.as_mut_ptr().cast::<c_void>()),
+        )
+    };
+    if status != NO_ERR {
+        return Err(status);
+    }
+    // 実際に書かれた要素数に詰める（2 回の呼び出しの間に一覧が縮むことがある）。
+    ids.truncate(size as usize / core::mem::size_of::<AudioObjectID>());
+    Ok(ids)
 }
 
 /// tap の `kAudioTapPropertyFormat`（ASBD）を読む。

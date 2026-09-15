@@ -105,20 +105,77 @@ The facade crate `flexaudio` re-exports everything you need:
 - `Stream::switch_source` — hot-swap the input source without stopping the
   stream (chunk `seq` stays continuous; the first chunk after a switch carries a
   discontinuity flag).
-- `flexaudio::devices() -> Result<Vec<DeviceInfo>>` — enumerate available audio
-  devices in one list (Linux: also lists system sinks; Windows/macOS: input
-  devices only for now).
+- `flexaudio::devices() -> Result<Vec<DeviceInfo>>` — enumerate microphones
+  (cpal, all platforms) and system output endpoints (Linux: PipeWire sinks and
+  sources; Windows: active render endpoints; macOS: output devices) in one list.
+- `flexaudio::processes() -> Result<Vec<ProcessInfo>>` — list the processes that
+  currently have an audio output stream and can be captured per process (see
+  [Listing capturable processes](#listing-capturable-processes)).
 - `flexaudio::watch_devices() -> Result<DeviceWatcher>` — pull-style hotplug
   (added / removed / default-changed) notifications (Linux only; Windows/macOS
   return a no-op watcher).
 - Re-exported types: `StreamConfig`, `SourceKind`, `ProcessMode`, `OutputFormat`,
-  `AudioChunk`, `ChunkFlags`, `DeviceInfo`, `DeviceEvent`, `Event`, `Error`,
-  `Result`.
+  `AudioChunk`, `SecondaryChunk`, `ChunkFlags`, `DeviceInfo`, `ProcessInfo`,
+  `DeviceEvent`, `Event`, `Error`, `Result`.
 
 Voice activity detection (`flexaudio-vad`): `Vad::new` / `Vad::process` for
 streaming `SpeechStart` / `SpeechEnd` events, and `get_speech_timestamps` for
 batch segmentation. The Silero VAD model is embedded in the binary, so VAD runs
 fully offline with no runtime model file or network access.
+
+---
+
+## Listing capturable processes
+
+`flexaudio::processes()` returns the processes you can hand to per-process
+capture (`SourceKind::ProcessLoopback` with `target_pid`). The calling process is
+excluded, entries are deduplicated by PID, and the list is sorted with
+actively-playing processes first, then by name, then by PID.
+
+```rust
+use flexaudio::{open, processes, SourceKind, StreamConfig};
+
+for p in processes()? {
+    println!("{:>7} {} {:?} active={:?}", p.pid, p.name, p.executable, p.is_output_active);
+}
+let target = processes()?.into_iter().next();
+if let Some(p) = target {
+    let mut stream = open(StreamConfig {
+        kind: SourceKind::ProcessLoopback,
+        target_pid: Some(p.pid),
+        ..Default::default()
+    })?;
+    stream.start()?;
+    stream.stop();
+}
+# Ok::<(), flexaudio::Error>(())
+```
+
+| Field / platform | Linux (PipeWire) | Windows (WASAPI) | macOS (Core Audio) |
+|---|---|---|---|
+| What is listed | Clients that own a `Stream/Output/Audio` node | Audio sessions on every active render endpoint (system-sounds and expired sessions skipped) | Core Audio process objects (`kAudioHardwarePropertyProcessObjectList`) |
+| `pid` | The client's `pipewire.sec.pid` (the same resolution the capture backend uses) | `IAudioSessionControl2::GetProcessId` | `kAudioProcessPropertyPID` |
+| `name` | `application.name` of the node, else of the client | Image file name without `.exe` | Executable name |
+| `executable` | Basename of `/proc/<pid>/exe` | Basename of the process image | Basename from `proc_pidpath` |
+| `bundle_id` | — | — | `kAudioProcessPropertyBundleID` |
+| `is_output_active` | Node state is `Running` | Session state is `Active` | `kAudioProcessPropertyIsRunningOutput` |
+| Requirement | A running PipeWire session | Listing works on any Windows; capturing the PID needs process loopback (Windows 11 / build 20348+) | macOS 14.4+, otherwise `Error::UnsupportedOsVersion` |
+
+`name` is always non-empty (falling back to the executable, the bundle ID, then
+`pid <N>`); `executable`, `bundle_id`, and `is_output_active` are `None` when the
+OS does not expose them. Names are self-reported by applications and are for
+display only — the PID is the key.
+
+How to read the result:
+
+- `Ok(non-empty)` — per-process capture is available and these are candidates.
+- `Ok(empty)` — per-process capture is available but nothing is playing audio.
+- `Err(..)` — per-process capture is not available here (Linux: PipeWire is not
+  reachable → `Error::Backend`; macOS before 14.4 → `Error::UnsupportedOsVersion`;
+  other OSes → `Error::Unsupported`), or the OS did not answer in time.
+
+The call is read-only, never triggers a permission prompt, and is bounded: it
+returns within 3 seconds even if the OS audio service hangs.
 
 ---
 
@@ -189,7 +246,7 @@ into compatible updates only. See [`CHANGELOG.md`](CHANGELOG.md).
 
 | Crate | crates.io | Description |
 |-------|-----------|-------------|
-| `flexaudio` | ✅ | Facade: unified `open()` / `devices()` / `watch_devices()`. |
+| `flexaudio` | ✅ | Facade: unified `open()` / `devices()` / `processes()` / `watch_devices()`. |
 | `flexaudio-core` | ✅ | Source-agnostic stream engine, types, resampling/normalizer. |
 | `flexaudio-mic` | ✅ | Microphone backend (cpal), all platforms. |
 | `flexaudio-os-linux` | ✅ | PipeWire system / per-process backend (Linux). |

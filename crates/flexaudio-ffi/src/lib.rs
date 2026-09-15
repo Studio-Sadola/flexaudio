@@ -32,7 +32,7 @@ use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use error::{clear_last_error, code, last_error_ptr, set_last_error};
-use types::{FlexChunk, FlexConfig, FlexDeviceInfo, FlexEvent, FlexStream};
+use types::{FlexChunk, FlexConfig, FlexDeviceInfo, FlexEvent, FlexProcessInfo, FlexStream};
 
 // ---------------------------------------------------------------------------
 // panic ガード
@@ -445,22 +445,32 @@ pub unsafe extern "C" fn flexaudio_devices(
             Ok(list) => list,
             Err(e) => return fail(e),
         };
-        if list.is_empty() {
-            // 空でも成功。配列は確保しない。
-            out_array.write(std::ptr::null_mut());
-            out_count.write(0);
-            return code::FLEX_OK;
-        }
-        // Box<[T]> へ集約すると確保サイズが要素数ぴったり（capacity == len）になり、
-        // free 側の Vec::from_raw_parts(ptr, count, count) と整合する。
-        let boxed: Box<[FlexDeviceInfo]> =
-            list.into_iter().map(convert::device_info_to_c).collect();
-        let count = boxed.len();
-        let ptr = Box::into_raw(boxed) as *mut FlexDeviceInfo;
-        out_array.write(ptr);
-        out_count.write(count);
+        write_c_array(
+            list.into_iter().map(convert::device_info_to_c).collect(),
+            out_array,
+            out_count,
+        );
         code::FLEX_OK
     })
+}
+
+/// 変換済みの配列を C へ渡す（`flexaudio_devices` / `flexaudio_processes` 共通）。
+///
+/// 空なら `out_array=NULL` / `out_count=0`（確保しない）。`Box<[T]>` へ集約すると確保
+/// サイズが要素数ぴったり（capacity == len）になり、free 側の
+/// `Vec::from_raw_parts(ptr, count, count)` と整合する。
+///
+/// # Safety
+/// `out_array` / `out_count` は NULL でない有効な書き込み先であること（呼び出し側で検査済み）。
+unsafe fn write_c_array<T>(items: Box<[T]>, out_array: *mut *mut T, out_count: *mut usize) {
+    if items.is_empty() {
+        out_array.write(std::ptr::null_mut());
+        out_count.write(0);
+        return;
+    }
+    let count = items.len();
+    out_array.write(Box::into_raw(items) as *mut T);
+    out_count.write(count);
 }
 
 /// `flexaudio_devices` が確保した配列と各 `id`/`name` を解放する。NULL 安全。
@@ -471,6 +481,56 @@ pub unsafe extern "C" fn flexaudio_devices(
 pub unsafe extern "C" fn flexaudio_devices_free(arr: *mut FlexDeviceInfo, count: usize) {
     guard_i32(|| {
         convert::free_device_array(arr, count);
+        code::FLEX_OK
+    });
+}
+
+// ---------------------------------------------------------------------------
+// プロセス列挙
+// ---------------------------------------------------------------------------
+
+/// プロセス別キャプチャの対象にできる、音声出力を持つプロセスを列挙し、配列を確保して
+/// `out_array` / `out_count` にセットする。呼び出し元プロセス自身は含まない。
+///
+/// 成功で 0。候補が無ければ 0 件（`out_array=NULL` / `out_count=0`）で成功。確保した配列は
+/// `flexaudio_processes_free` で解放する。この環境でプロセス別キャプチャが使えない
+/// （Linux で PipeWire に接続できない・macOS 14.4 未満・非対応 OS）か、OS が 3 秒以内に
+/// 応答しなかったときは `FLEX_FAILURE`（理由は `flexaudio_last_error`）。
+///
+/// # Safety
+/// `out_array` / `out_count` は有効な書き込み先でなければならない（NULL は InvalidArg）。
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_processes(
+    out_array: *mut *mut FlexProcessInfo,
+    out_count: *mut usize,
+) -> i32 {
+    guard_i32(|| {
+        clear_last_error();
+        if out_array.is_null() || out_count.is_null() {
+            set_last_error("flexaudio_processes: output pointer is null");
+            return code::FLEX_INVALID_ARG;
+        }
+        let list = match flexaudio::processes() {
+            Ok(list) => list,
+            Err(e) => return fail(e),
+        };
+        write_c_array(
+            list.into_iter().map(convert::process_info_to_c).collect(),
+            out_array,
+            out_count,
+        );
+        code::FLEX_OK
+    })
+}
+
+/// `flexaudio_processes` が確保した配列と各文字列を解放する。NULL 安全。
+///
+/// # Safety
+/// `arr`/`count` は `flexaudio_processes` が返したもの（または NULL/0）でなければならない。
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_processes_free(arr: *mut FlexProcessInfo, count: usize) {
+    guard_i32(|| {
+        convert::free_process_array(arr, count);
         code::FLEX_OK
     });
 }

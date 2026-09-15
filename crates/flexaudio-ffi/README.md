@@ -13,6 +13,11 @@ flexaudio をインプロセスで叩く第三の経路（第一は CLI パイ�
 
 VAD / denoise はストリームに組み込むこともできる（`FlexConfig` の `has_vad` / `denoise`）。
 デバイス着脱の監視（ホットプラグ）は `flexaudio_watch_devices` 系で取れる。
+プロセス別キャプチャの対象候補（音声出力を持つプロセス・自プロセスを除く）は
+`flexaudio_processes` で列挙し、`flexaudio_processes_free` で解放する（各要素は
+`FlexProcessInfo`。`pid` を `FlexConfig::process_id` に渡す。`executable` / `bundle_id` は
+取れなければ NULL、`output_activity` は `FLEX_OUTPUT_ACTIVITY_UNKNOWN|INACTIVE|ACTIVE`）。
+0 件は成功、プロセス別キャプチャ自体が使えない環境では `FLEX_FAILURE`。
 
 ## ビルドとヘッダ生成
 

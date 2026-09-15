@@ -205,6 +205,40 @@ pub struct FlexDeviceInfo {
     pub is_default: bool,
 }
 
+/// プロセスが今音声を出力中か（[`flexaudio::ProcessInfo::is_output_active`] に対応）。
+///
+/// OS がその状態を公開しないときは `Unknown`（Rust の `None`）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlexOutputActivity {
+    /// OS が状態を公開していない／読めなかった。
+    Unknown = 0,
+    /// 出力していない（Linux=ノードが Running 以外 / Windows=セッションが Inactive /
+    /// macOS=IsRunningOutput が 0）。
+    Inactive = 1,
+    /// 出力中。
+    Active = 2,
+}
+
+/// 列挙された 1 プロセスの情報（[`flexaudio::ProcessInfo`] に対応）。
+///
+/// `pid` を `FlexConfig::process_id` に渡すとそのプロセスを録れる。文字列は flexaudio 所有の
+/// UTF-8 NUL 終端で、配列ごと `flexaudio_processes_free` で解放する（C の free は使わない）。
+/// `executable` / `bundle_id` は取れなかったとき NULL。
+#[repr(C)]
+pub struct FlexProcessInfo {
+    /// OS のプロセス ID（0 以外）。
+    pub pid: u32,
+    /// 表示名（常に非空。`flexaudio_processes_free` で解放）。
+    pub name: *mut c_char,
+    /// 実行ファイルのベース名。取れなければ NULL。
+    pub executable: *mut c_char,
+    /// macOS の bundle ID。取れなければ（macOS 以外は常に）NULL。
+    pub bundle_id: *mut c_char,
+    /// 出力中か（不明なら `Unknown`）。
+    pub output_activity: FlexOutputActivity,
+}
+
 /// 録音ストリームの不透明ハンドル。中身は [`flexaudio::Stream`] と、有効時に同居する
 /// アドオン（denoise / VAD）で、C 側はポインタだけを持つ。`flexaudio_open` で作り
 /// `flexaudio_free` で解放する。

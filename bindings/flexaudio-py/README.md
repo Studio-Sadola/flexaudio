@@ -42,6 +42,20 @@ with flexaudio.open("mic") as stream:
 - `flexaudio.open("process", process_id=<pid>)` — a single process's output.
   Pass `mode="exclude"` to capture everything *except* that process.
 
+To find a `process_id`, list the processes that currently have an audio output
+stream (the calling process is never listed):
+
+```python
+for p in flexaudio.processes():
+    print(p.pid, p.name, p.executable, p.bundle_id, p.is_output_active)
+```
+
+An empty list means per-process capture works but nothing is playing;
+`RuntimeError` means per-process capture is unavailable here (Linux without a
+reachable PipeWire session, macOS before 14.4, an unsupported OS) or the OS did
+not answer within 3 seconds. `executable`, `bundle_id` (macOS only), and
+`is_output_active` are `None` when the OS does not expose them.
+
 Optional keyword arguments: `device_id`, `output_rate` (default 48000),
 `output_channels` (default 2), `chunk_ms` (default 20), plus the integrated
 add-ons `vad` and `denoise` (see below).

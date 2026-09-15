@@ -95,13 +95,40 @@ stream.stop();
 - `Stream::start` / `Stream::stop` — キャプチャの制御。
 - `Stream::poll_chunk` / `Stream::poll_event` — `AudioChunk` と `Event` を取り出します。
 - `Stream::switch_source` — ストリームを停止せずに入力ソースをホットスワップします（チャンクの `seq` は連続したまま維持され、切替後の最初のチャンクに非連続フラグが付きます）。
-- `flexaudio::devices() -> Result<Vec<DeviceInfo>>` — 利用可能な音声デバイスを一覧で取得します（Linux: システムシンクも含む、Windows/macOS: 現時点では入力デバイスのみ）。
+- `flexaudio::devices() -> Result<Vec<DeviceInfo>>` — マイク（cpal・全プラットフォーム）とシステム出力エンドポイント（Linux: PipeWire の sink と source、Windows: 有効な render エンドポイント、macOS: 出力デバイス）を 1 つのリストで取得します。
+- `flexaudio::processes() -> Result<Vec<ProcessInfo>>` — 今音声出力を持ち、プロセス単位でキャプチャできるプロセスを一覧で取得します（[録れるプロセスの列挙](#録れるプロセスの列挙) を参照）。
 - `flexaudio::watch_devices() -> Result<DeviceWatcher>` — プル型のホットプラグ通知（追加 / 削除 / デフォルト変更）を取得します（Linux のみ、Windows/macOS はノーオップのウォッチャーを返します）。
 - Re-export された型: `StreamConfig`, `SourceKind`, `ProcessMode`, `OutputFormat`,
-  `AudioChunk`, `ChunkFlags`, `DeviceInfo`, `DeviceEvent`, `Event`, `Error`,
-  `Result`。
+  `AudioChunk`, `SecondaryChunk`, `ChunkFlags`, `DeviceInfo`, `ProcessInfo`,
+  `DeviceEvent`, `Event`, `Error`, `Result`。
 
 Voice activity detection (`flexaudio-vad`): ストリーミング `SpeechStart` / `SpeechEnd` イベントには `Vad::new` / `Vad::process`、バッチ分割には `get_speech_timestamps` を使用します。Silero VAD モデルはバイナリに埋め込まれており、VAD はランタイムモデルファイルやネットワークアクセスなしで完全オフライン動作します。
+
+---
+
+## 録れるプロセスの列挙
+
+`flexaudio::processes()` は、プロセス単位キャプチャ（`SourceKind::ProcessLoopback` + `target_pid`）に渡せるプロセスを返します。呼び出し元プロセス自身は除外され、同じ PID は 1 件にまとめられ、出力中のプロセスが先頭 → 名前 → PID の順に並びます。
+
+| 項目 / OS | Linux（PipeWire） | Windows（WASAPI） | macOS（Core Audio） |
+|---|---|---|---|
+| 列挙の元 | `Stream/Output/Audio` ノードを持つ Client | 有効な全 render エンドポイントの音声セッション（システム音・期限切れセッションは除外） | Core Audio のプロセスオブジェクト（`kAudioHardwarePropertyProcessObjectList`） |
+| `pid` | Client の `pipewire.sec.pid`（キャプチャ側と同じ解決経路） | `IAudioSessionControl2::GetProcessId` | `kAudioProcessPropertyPID` |
+| `name` | ノード（無ければ Client）の `application.name` | イメージ名（`.exe` を除く） | 実行ファイル名 |
+| `executable` | `/proc/<pid>/exe` のベース名 | プロセスイメージのベース名 | `proc_pidpath` のベース名 |
+| `bundle_id` | — | — | `kAudioProcessPropertyBundleID` |
+| `is_output_active` | ノード状態が `Running` | セッション状態が `Active` | `kAudioProcessPropertyIsRunningOutput` |
+| 必要条件 | PipeWire セッションが動いていること | 列挙はどの Windows でも可。その PID を録るにはプロセスループバック（Windows 11 / build 20348 以降）が必要 | macOS 14.4 以降（未満は `Error::UnsupportedOsVersion`） |
+
+`name` は常に非空です（実行ファイル名 → bundle ID → `pid <N>` の順で補完）。`executable` / `bundle_id` / `is_output_active` は OS が公開しない場合 `None` になります。名前はアプリ自身が名乗る値を含むので表示専用で、キーは PID です。
+
+戻り値の読み方:
+
+- `Ok(空でないリスト)` — プロセス単位キャプチャが使え、候補がある。
+- `Ok(空)` — プロセス単位キャプチャは使えるが、今は音を出しているプロセスが無い。
+- `Err(..)` — この環境ではプロセス単位キャプチャが使えない（Linux: PipeWire に接続できない → `Error::Backend`、macOS 14.4 未満 → `Error::UnsupportedOsVersion`、その他の OS → `Error::Unsupported`）、または OS が時間内に応答しなかった。
+
+読み取り専用で権限プロンプトは出さず、OS の音声サービスが応答しなくても 3 秒以内に必ず戻ります。
 
 ---
 
@@ -153,7 +180,7 @@ flexaudio は [Semantic Versioning](https://semver.org/) に従います。ク�
 
 | クレート | crates.io | 説明 |
 |----------|-----------|------|
-| `flexaudio` | ✅ | ファサード: 統一 `open()` / `devices()` / `watch_devices()`。 |
+| `flexaudio` | ✅ | ファサード: 統一 `open()` / `devices()` / `processes()` / `watch_devices()`。 |
 | `flexaudio-core` | ✅ | ソース非依存のストリームエンジン、型定義、リサンプリング／ノーマライザー。 |
 | `flexaudio-mic` | ✅ | マイクバックエンド（cpal）、全プラットフォーム対応。 |
 | `flexaudio-os-linux` | ✅ | PipeWire システム / プロセス単位バックエンド（Linux）。 |

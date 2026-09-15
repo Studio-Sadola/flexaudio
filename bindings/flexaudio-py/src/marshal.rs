@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use ::flexaudio as fa;
-use fa::{AudioChunk, DeviceEvent, DeviceInfo, Event};
+use fa::{AudioChunk, DeviceEvent, DeviceInfo, Event, ProcessInfo};
 
 use crate::{bool_repr, source_kind_str};
 
@@ -60,6 +60,69 @@ pub(crate) fn device_info_to_py(info: DeviceInfo) -> PyDeviceInfo {
         channels: info.channels,
         is_loopback: info.is_loopback,
         is_default: info.is_default,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ProcessInfo（pyclass・getter）
+// ---------------------------------------------------------------------------
+
+/// `processes()` が返すプロセス情報（プロセス別キャプチャの対象候補）。
+///
+/// `pid` を `open("process", process_id=pid)` に渡すとそのプロセスを録れる。
+/// `executable` / `bundle_id` は取れなければ `None`、`is_output_active` は OS が状態を
+/// 公開しないとき `None`。
+#[pyclass(module = "flexaudio", name = "ProcessInfo", frozen)]
+pub struct PyProcessInfo {
+    #[pyo3(get)]
+    pid: u32,
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    executable: Option<String>,
+    #[pyo3(get)]
+    bundle_id: Option<String>,
+    #[pyo3(get)]
+    is_output_active: Option<bool>,
+}
+
+/// Python の repr 風に `Option<String>` を書く（`None` か `'...'`）。
+fn optional_str_repr(value: &Option<String>) -> String {
+    match value {
+        Some(v) => format!("{v:?}"),
+        None => "None".to_string(),
+    }
+}
+
+/// Python の repr 風に `Option<bool>` を書く（`None` / `True` / `False`）。
+fn optional_bool_repr(value: Option<bool>) -> &'static str {
+    match value {
+        Some(b) => bool_repr(b),
+        None => "None",
+    }
+}
+
+#[pymethods]
+impl PyProcessInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "ProcessInfo(pid={}, name={:?}, executable={}, bundle_id={}, is_output_active={})",
+            self.pid,
+            self.name,
+            optional_str_repr(&self.executable),
+            optional_str_repr(&self.bundle_id),
+            optional_bool_repr(self.is_output_active),
+        )
+    }
+}
+
+pub(crate) fn process_info_to_py(info: ProcessInfo) -> PyProcessInfo {
+    PyProcessInfo {
+        pid: info.pid,
+        name: info.name,
+        executable: info.executable,
+        bundle_id: info.bundle_id,
+        is_output_active: info.is_output_active,
     }
 }
 

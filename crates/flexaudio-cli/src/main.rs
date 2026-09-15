@@ -28,6 +28,7 @@
 //!
 //! ```text
 //! flexaudio-cli --list-devices
+//! flexaudio-cli --list-processes
 //! flexaudio-cli --source mic --device-id "ステレオ ミキサー (Realtek(R) Audio)" --out cap.wav
 //! ```
 //!
@@ -124,6 +125,12 @@ struct Cli {
     /// （`devices()` の統合列挙。`--source` 等とは独立に動く）。
     #[arg(long)]
     list_devices: bool,
+
+    /// 録音せず、プロセス別キャプチャ（`--source process --process-id <PID>`）の対象に
+    /// できる、音声出力を持つプロセスを一覧表示して終了する（`processes()`。`--source` 等とは
+    /// 独立に動く）。
+    #[arg(long)]
+    list_processes: bool,
 
     /// 録音せず、デバイスの着脱（ホットプラグ）を監視して stderr に表示し続ける
     /// （`watch_devices()`。Ctrl-C で停止。`--source` 等とは独立に動く）。
@@ -438,6 +445,11 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         return list_devices();
     }
 
+    // プロセス一覧モード（録音せず列挙して終了）。これも `--source` 等とは独立。
+    if cli.list_processes {
+        return list_processes();
+    }
+
     // デバイス着脱監視モード（録音せず監視し続ける）。これも `--source` 等とは独立。
     if cli.watch_devices {
         return watch_devices_loop();
@@ -703,6 +715,52 @@ fn list_devices() -> std::result::Result<(), String> {
     println!(
         "（DEFAULT の * は OS 既定デバイス。ID は `--device-id <ID>` でデバイスを選ぶのに\
          使える安定キー。mic は入力デバイス、system は出力エンドポイント。process では無視。）"
+    );
+    Ok(())
+}
+
+/// `--list-processes`: `processes()` で録れるプロセスを取得して表形式で表示する。
+///
+/// 列: ACTIVE（出力中なら `*`、不明なら `?`）/ PID / NAME / EXECUTABLE / BUNDLE。
+/// PID は `--source process --process-id <PID>` に渡せる。候補が無い環境ではその旨を表示し、
+/// プロセス別キャプチャ自体が使えない環境ではエラーにする。
+fn list_processes() -> std::result::Result<(), String> {
+    let processes = flexaudio::processes().map_err(|e| {
+        format!("プロセス列挙に失敗しました（この環境ではプロセス別キャプチャを使えません）: {e}")
+    })?;
+
+    if processes.is_empty() {
+        println!("音声出力を持つプロセスが見つかりませんでした。");
+        println!("（音を再生中のアプリがある状態で実行してください。）");
+        return Ok(());
+    }
+
+    println!("録れるプロセス: {} 件", processes.len());
+    println!();
+    println!(
+        "{:<6} {:>7}  {:<28} {:<24} BUNDLE",
+        "ACTIVE", "PID", "NAME", "EXECUTABLE"
+    );
+    println!("{}", "-".repeat(88));
+    for p in &processes {
+        let active = match p.is_output_active {
+            Some(true) => "*",
+            Some(false) => "",
+            None => "?",
+        };
+        println!(
+            "{:<6} {:>7}  {:<28} {:<24} {}",
+            active,
+            p.pid,
+            truncate(&p.name, 28),
+            truncate(p.executable.as_deref().unwrap_or("-"), 24),
+            p.bundle_id.as_deref().unwrap_or("-"),
+        );
+    }
+    println!();
+    println!(
+        "（ACTIVE の * は出力中、? は OS が状態を公開していないもの。PID は\
+         `--source process --process-id <PID>` に渡せる。）"
     );
     Ok(())
 }

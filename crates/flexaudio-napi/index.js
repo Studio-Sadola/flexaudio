@@ -224,17 +224,32 @@ switch (platform) {
         }
         break
       case 'arm':
-        localFileExisted = existsSync(
-          join(__dirname, 'index.linux-arm-gnueabihf.node')
-        )
-        try {
-          if (localFileExisted) {
-            nativeBinding = require('./index.linux-arm-gnueabihf.node')
-          } else {
-            nativeBinding = require('@studio-sadola/flexaudio-linux-arm-gnueabihf')
+        if (isMusl()) {
+          localFileExisted = existsSync(
+            join(__dirname, 'index.linux-arm-musleabihf.node')
+          )
+          try {
+            if (localFileExisted) {
+              nativeBinding = require('./index.linux-arm-musleabihf.node')
+            } else {
+              nativeBinding = require('@studio-sadola/flexaudio-linux-arm-musleabihf')
+            }
+          } catch (e) {
+            loadError = e
           }
-        } catch (e) {
-          loadError = e
+        } else {
+          localFileExisted = existsSync(
+            join(__dirname, 'index.linux-arm-gnueabihf.node')
+          )
+          try {
+            if (localFileExisted) {
+              nativeBinding = require('./index.linux-arm-gnueabihf.node')
+            } else {
+              nativeBinding = require('@studio-sadola/flexaudio-linux-arm-gnueabihf')
+            }
+          } catch (e) {
+            loadError = e
+          }
         }
         break
       case 'riscv64':
@@ -295,11 +310,12 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { FlexStream, DeviceWatcherHandle, devices, openStream, watchDevices, __openMockStream, Vad, FlacEncoder, Denoiser } = nativeBinding
+const { FlexStream, DeviceWatcherHandle, devices, processes, openStream, watchDevices, __openMockStream, Vad, FlacEncoder, Denoiser } = nativeBinding
 
 module.exports.FlexStream = FlexStream
 module.exports.DeviceWatcherHandle = DeviceWatcherHandle
 module.exports.devices = devices
+module.exports.processes = processes
 module.exports.openStream = openStream
 module.exports.watchDevices = watchDevices
 module.exports.__openMockStream = __openMockStream

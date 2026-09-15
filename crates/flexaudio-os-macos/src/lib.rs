@@ -29,10 +29,12 @@
 mod common;
 mod devices;
 mod process;
+mod processes;
 mod system;
 mod tap;
 mod version;
 
 pub use devices::list_output_devices;
 pub use process::MacProcessBackend;
+pub use processes::list_processes;
 pub use system::MacSystemBackend;

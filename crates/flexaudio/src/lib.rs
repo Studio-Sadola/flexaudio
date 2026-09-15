@@ -12,18 +12,20 @@ pub use flexaudio_core as core;
 pub mod device_watcher;
 mod mix;
 pub mod mock;
+mod processes;
 pub mod stream;
 
 pub use device_watcher::DeviceWatcher;
 pub use mock::MockBackend;
+pub use processes::processes;
 pub use stream::Stream;
 
 // `open()` と一緒に使う型を facade トップから直接出す。利用側や napi バインディングが
 // `flexaudio::core` を経由せず `flexaudio::{StreamConfig, SourceKind, ...}` で揃えられる。
 pub use flexaudio_core::backend::CaptureBackend;
 pub use flexaudio_core::types::{
-    AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Error, Event, OutputFormat, ProcessMode,
-    Result, SecondaryChunk, SourceKind, StreamConfig,
+    AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Error, Event, OutputFormat, ProcessInfo,
+    ProcessMode, Result, SecondaryChunk, SourceKind, StreamConfig,
 };
 
 /// 全ソースのオーディオデバイスを 1 つのリストで返す。
