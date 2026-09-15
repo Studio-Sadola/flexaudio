@@ -16,28 +16,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Process enumeration: `flexaudio::processes() -> Result<Vec<ProcessInfo>>`.**
-  Lists the processes that currently have an audio output stream and can be
+  Lists the processes that have an audio output session/stream and can be
   passed to per-process capture as `target_pid`. The calling process is
   excluded, entries are deduplicated by PID, and the list is sorted with
-  actively-playing processes first. `ProcessInfo` carries `pid`, `name`
-  (always non-empty), and, when the OS exposes them, `executable`, `bundle_id`
-  (macOS), and `is_output_active`.
+  actively-playing processes first. Idle/stopped processes stay on the list;
+  whether something is playing now is `is_output_active`. `ProcessInfo`
+  carries `pid`, `name` (always non-empty), and, when the OS exposes them,
+  `executable`, `bundle_id` (macOS), and `is_output_active`.
   - **Linux:** PipeWire clients that own a `Stream/Output/Audio` node; the PID
     comes from the client's `pipewire.sec.pid` (the same resolution the
-    capture backend uses); activity = node state `Running`.
+    capture backend uses); activity = node state `Running`. `executable` is
+    the basename of `/proc/<pid>/exe`, falling back to `/proc/<pid>/comm`.
   - **Windows:** audio sessions on every active render endpoint
-    (`IAudioSessionManager2`); activity = session state `Active`. Capturing a
-    listed PID needs process loopback (Windows 11 / build 20348+).
-  - **macOS 14.4+:** Core Audio process objects with bundle ID and
+    (`IAudioSessionManager2`); activity = session state `Active`. Listing and
+    capturing both require Windows build 20348 or later (Windows 11 /
+    Windows Server 2022).
+  - **macOS 14.4+:** process objects Core Audio knows about (including
+    input-only processes), with bundle ID and
     `kAudioProcessPropertyIsRunningOutput`; older macOS returns
     `Error::UnsupportedOsVersion`.
   - The call is read-only, triggers no permission prompt, and always returns
-    within 3 seconds. `Ok(empty)` means "available, nothing playing";
-    `Err` means per-process capture is unavailable in this environment.
-  - Exposed in every binding: N-API `processes(): JsProcessInfo[]`, C
+    within 3 seconds. `Ok(empty)` means per-process capture is available but
+    no such process exists right now (not "nothing is playing"). `Err` means
+    per-process capture is unavailable here, permission was denied, the OS
+    did not answer in time, or a previous enumeration is still in progress.
+  - Exposed in every binding: N-API `processes(): Promise<JsProcessInfo[]>`
+    (libuv thread pool; does not block the JS event loop), C
     `flexaudio_processes` / `flexaudio_processes_free` (`FlexProcessInfo`,
-    `FlexOutputActivity`), Python `flexaudio.processes()` (`ProcessInfo`), and
-    `flexaudio-cli --list-processes`.
+    `FlexOutputActivity`), Python `flexaudio.processes()` (`ProcessInfo`, still
+    synchronous), and `flexaudio-cli --list-processes`.
 - **Secondary output tap:** `StreamConfig::secondary_output` renders the same
   capture in a second format (for example 48 kHz stereo for saving plus 16 kHz
   mono for recognition), pulled with `Stream::poll_secondary` as
@@ -60,6 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `openStream(options, onChunk: (chunk: JsAudioChunk) => void, onEvent?)` and
   `watchDevices(onEvent: (event: JsDeviceEvent) => void)` instead of the
   undefined `ChunkTsfn` / `EventTsfn` / `DeviceTsfn` names.
+- **N-API `processes()` is async:** it returns `Promise<JsProcessInfo[]>`.
+  Rejection uses the same error type and message as the former thrown error.
+- **N-API `FlexStream.stop()` is async:** it returns `Promise<void>`. The
+  promise resolves only after every `onChunk` queued before stop — including
+  the last PCM and the `frames:0` terminator — has been delivered to JS.
 
 ### Migration from 0.2
 - **Rust `StreamConfig` literals:** the struct gained `secondary_output`. A
@@ -79,6 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `vad.maxSpeechMs: 0` explicitly.
 - **Process pickers:** list candidates with `processes()` instead of deriving
   them from `devices()` (which lists endpoints, never processes).
+- **N-API `processes()`:** `await processes()` (it is no longer synchronous).
+- **N-API `FlexStream.stop()`:** `await stream.stop()` so the last PCM and the
+  `frames:0` terminator have been delivered before you tear down.
 
 ## [0.2.0] - 2026-06-17
 

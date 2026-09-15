@@ -151,8 +151,10 @@ fn devices() -> PyResult<Vec<marshal::PyDeviceInfo>> {
 /// 持つプロセスを列挙する。呼び出し元プロセス自身は含まない。
 ///
 /// 並びは出力中が先頭 → 表示名 → pid。空リスト＝使えるが候補なし。この環境でプロセス別
-/// キャプチャが使えない（Linux で PipeWire 不在・macOS 14.4 未満・非対応 OS）か OS が 3 秒
-/// 以内に応答しないときは `RuntimeError`。列挙中（最大 3 秒）は GIL を解放する。
+/// キャプチャが使えない（Linux で PipeWire 不在・macOS 14.4 未満・Windows が
+/// Windows build 20348 or later (Windows 11 / Windows Server 2022) 未満・非対応 OS）か
+/// OS が 3 秒以内に応答しないとき、または前の問い合わせがまだ終わっていないときは
+/// `RuntimeError`。列挙中（最大 3 秒）は GIL を解放する。
 #[pyfunction]
 fn processes(py: Python<'_>) -> PyResult<Vec<marshal::PyProcessInfo>> {
     let list = py.detach(fa::processes).map_err(to_py_err)?;

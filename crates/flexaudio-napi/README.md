@@ -43,7 +43,7 @@ const stream = openStream(
 );
 
 // later:
-stream.stop();
+await stream.stop();
 ```
 
 `stream.switchSource(options)` hot-swaps the input source without stopping.
@@ -51,25 +51,33 @@ stream.stop();
 
 ## Picking a process to capture
 
-`processes()` lists the processes that currently have an audio output stream and
-can be captured per process. Pass `pid` as `processId`:
+`processes()` lists the processes that have an audio output session/stream and
+can be captured per process. Idle/stopped processes are included; whether
+something is playing now is `isOutputActive`. Pass `pid` as `processId`:
 
 ```js
 const { processes, openStream } = require('@studio-sadola/flexaudio');
 
-const list = processes();
+const list = await processes();
 // [{ pid: 4242, name: 'Firefox', executable: 'firefox', isOutputActive: true }, …]
 // bundleId is set on macOS only; executable / isOutputActive are undefined when
 // the OS does not expose them. The calling process is never listed.
 
-const stream = openStream({ kind: 'process', processId: list[0].pid }, (chunk) => {});
+const target = list[0];
+if (target) {
+  const stream = openStream({ kind: 'process', processId: target.pid }, (chunk) => {});
+  // …
+  await stream.stop();
+}
 ```
 
-An empty array means per-process capture works but nothing is playing. A throw
-means per-process capture is unavailable here (Linux without a reachable
-PipeWire session, macOS before 14.4, or an unsupported OS) or the OS did not
-answer within 3 seconds. On Windows the list works everywhere, but capturing a
-listed PID needs process loopback (Windows 11 / build 20348+).
+An empty array means per-process capture works but no such process exists right
+now (not "nothing is playing"). A rejection means per-process capture is
+unavailable here (Linux without a reachable PipeWire session, macOS before 14.4,
+an unsupported OS, or a permission denial), the OS did not answer within 3
+seconds, or a previous enumeration is still in progress. On Windows, listing
+and capturing both need Windows build 20348 or later (Windows 11 / Windows
+Server 2022).
 
 ## Chunk delivery shape (primary, secondary, VAD)
 

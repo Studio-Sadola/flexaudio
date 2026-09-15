@@ -489,13 +489,18 @@ pub unsafe extern "C" fn flexaudio_devices_free(arr: *mut FlexDeviceInfo, count:
 // プロセス列挙
 // ---------------------------------------------------------------------------
 
-/// プロセス別キャプチャの対象にできる、音声出力を持つプロセスを列挙し、配列を確保して
-/// `out_array` / `out_count` にセットする。呼び出し元プロセス自身は含まない。
+/// プロセス別キャプチャの対象にできる、音声出力のセッション（ストリーム）を持つ
+/// プロセスを列挙し、配列を確保して `out_array` / `out_count` にセットする。
+/// 呼び出し元プロセス自身は含まない。停止中・Idle も載る。今鳴っているかは
+/// `output_activity` で見る。
 ///
-/// 成功で 0。候補が無ければ 0 件（`out_array=NULL` / `out_count=0`）で成功。確保した配列は
-/// `flexaudio_processes_free` で解放する。この環境でプロセス別キャプチャが使えない
-/// （Linux で PipeWire に接続できない・macOS 14.4 未満・非対応 OS）か、OS が 3 秒以内に
-/// 応答しなかったときは `FLEX_FAILURE`（理由は `flexaudio_last_error`）。
+/// 成功で 0。候補が無ければ 0 件（`out_array=NULL` / `out_count=0`）で成功
+/// （プロセス別キャプチャは使えるが、そういうプロセスが今は無い）。確保した配列は
+/// `flexaudio_processes_free` で **1 回だけ** 解放する。この環境でプロセス別キャプチャが
+/// 使えない（Linux で PipeWire に届かない・macOS 14.4 未満・Windows が
+/// Windows build 20348 or later (Windows 11 / Windows Server 2022) 未満・
+/// 非対応 OS・権限拒否）、OS が 3 秒以内に応答しなかった、または前の問い合わせが
+/// まだ終わっていないときは `FLEX_FAILURE`（理由は `flexaudio_last_error`）。
 ///
 /// # Safety
 /// `out_array` / `out_count` は有効な書き込み先でなければならない（NULL は InvalidArg）。
@@ -524,9 +529,11 @@ pub unsafe extern "C" fn flexaudio_processes(
 }
 
 /// `flexaudio_processes` が確保した配列と各文字列を解放する。NULL 安全。
+/// **1 回だけ**呼ぶこと（同じポインタへの二度呼びは二重解放＝未定義動作）。
 ///
 /// # Safety
-/// `arr`/`count` は `flexaudio_processes` が返したもの（または NULL/0）でなければならない。
+/// `arr`/`count` は `flexaudio_processes` が返したもの（または NULL/0）でなければならず、
+/// この関数は同じ `arr` に対して 1 回だけ呼ぶ。
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_processes_free(arr: *mut FlexProcessInfo, count: usize) {
     guard_i32(|| {

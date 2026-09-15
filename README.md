@@ -109,8 +109,9 @@ The facade crate `flexaudio` re-exports everything you need:
   (cpal, all platforms) and system output endpoints (Linux: PipeWire sinks and
   sources; Windows: active render endpoints; macOS: output devices) in one list.
 - `flexaudio::processes() -> Result<Vec<ProcessInfo>>` — list the processes that
-  currently have an audio output stream and can be captured per process (see
-  [Listing capturable processes](#listing-capturable-processes)).
+  have an audio output session/stream and can be captured per process (see
+  [Listing capturable processes](#listing-capturable-processes)). Idle/stopped
+  processes are included; whether something is playing now is `is_output_active`.
 - `flexaudio::watch_devices() -> Result<DeviceWatcher>` — pull-style hotplug
   (added / removed / default-changed) notifications (Linux only; Windows/macOS
   return a no-op watcher).
@@ -153,13 +154,13 @@ if let Some(p) = target {
 
 | Field / platform | Linux (PipeWire) | Windows (WASAPI) | macOS (Core Audio) |
 |---|---|---|---|
-| What is listed | Clients that own a `Stream/Output/Audio` node | Audio sessions on every active render endpoint (system-sounds and expired sessions skipped) | Core Audio process objects (`kAudioHardwarePropertyProcessObjectList`) |
+| What is listed | Clients that own a `Stream/Output/Audio` node | Audio sessions on every active render endpoint (system-sounds and expired sessions skipped) | Process objects Core Audio knows about (`kAudioHardwarePropertyProcessObjectList`; includes input-only processes) |
 | `pid` | The client's `pipewire.sec.pid` (the same resolution the capture backend uses) | `IAudioSessionControl2::GetProcessId` | `kAudioProcessPropertyPID` |
 | `name` | `application.name` of the node, else of the client | Image file name without `.exe` | Executable name |
-| `executable` | Basename of `/proc/<pid>/exe` | Basename of the process image | Basename from `proc_pidpath` |
+| `executable` | Basename of `/proc/<pid>/exe`, falling back to `/proc/<pid>/comm` when `exe` is unreadable | Basename of the process image | Basename from `proc_pidpath` |
 | `bundle_id` | — | — | `kAudioProcessPropertyBundleID` |
 | `is_output_active` | Node state is `Running` | Session state is `Active` | `kAudioProcessPropertyIsRunningOutput` |
-| Requirement | A running PipeWire session | Listing works on any Windows; capturing the PID needs process loopback (Windows 11 / build 20348+) | macOS 14.4+, otherwise `Error::UnsupportedOsVersion` |
+| Requirement | A running PipeWire session | Windows build 20348 or later (Windows 11 / Windows Server 2022) | macOS 14.4+, otherwise `Error::UnsupportedOsVersion` |
 
 `name` is always non-empty (falling back to the executable, the bundle ID, then
 `pid <N>`); `executable`, `bundle_id`, and `is_output_active` are `None` when the
@@ -168,14 +169,21 @@ display only — the PID is the key.
 
 How to read the result:
 
-- `Ok(non-empty)` — per-process capture is available and these are candidates.
-- `Ok(empty)` — per-process capture is available but nothing is playing audio.
+- `Ok(non-empty)` — per-process capture is available, and there are processes
+  that have an audio output session/stream. Idle/stopped processes are listed;
+  whether something is playing now is `is_output_active`.
+- `Ok(empty)` — per-process capture is available, but no such process exists
+  right now (this is **not** "nothing is playing").
 - `Err(..)` — per-process capture is not available here (Linux: PipeWire is not
-  reachable → `Error::Backend`; macOS before 14.4 → `Error::UnsupportedOsVersion`;
-  other OSes → `Error::Unsupported`), or the OS did not answer in time.
+  reachable → `Error::Backend`; macOS before 14.4 or Windows build before 20348
+  → `Error::UnsupportedOsVersion`; other OSes → `Error::Unsupported`),
+  permission was denied (`Error::PermissionDenied`), the OS did not answer
+  in time, or a previous enumeration is still in progress (`Error::Backend`).
 
 The call is read-only, never triggers a permission prompt, and is bounded: it
-returns within 3 seconds even if the OS audio service hangs.
+returns within 3 seconds even if the OS audio service hangs. The N-API binding
+exposes `await processes()` and `await stream.stop()` so they do not block the
+JS event loop.
 
 ---
 
@@ -255,8 +263,8 @@ into compatible updates only. See [`CHANGELOG.md`](CHANGELOG.md).
 | `flexaudio-vad` | ✅ | Silero VAD add-on (offline, embedded model). |
 | `flexaudio-cli` | — | Reference CLI / streaming capture tool. |
 | `flexaudio-napi` | — (npm) | Node.js N-API addon (published to npm, not crates.io). |
-| `flexaudio-ffi` | — | C FFI scaffold (placeholder). |
-| `bindings/flexaudio-py` | — | PyO3 Python binding scaffold (placeholder). |
+| `flexaudio-ffi` | — | C ABI (pull-based capture, VAD / FLAC / denoise, `flexaudio_processes`). |
+| `bindings/flexaudio-py` | — | PyO3 Python binding (`open` / `devices` / `processes` / add-ons). |
 
 ---
 

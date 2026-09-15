@@ -13,11 +13,16 @@ flexaudio をインプロセスで叩く第三の経路（第一は CLI パイ�
 
 VAD / denoise はストリームに組み込むこともできる（`FlexConfig` の `has_vad` / `denoise`）。
 デバイス着脱の監視（ホットプラグ）は `flexaudio_watch_devices` 系で取れる。
-プロセス別キャプチャの対象候補（音声出力を持つプロセス・自プロセスを除く）は
-`flexaudio_processes` で列挙し、`flexaudio_processes_free` で解放する（各要素は
-`FlexProcessInfo`。`pid` を `FlexConfig::process_id` に渡す。`executable` / `bundle_id` は
-取れなければ NULL、`output_activity` は `FLEX_OUTPUT_ACTIVITY_UNKNOWN|INACTIVE|ACTIVE`）。
-0 件は成功、プロセス別キャプチャ自体が使えない環境では `FLEX_FAILURE`。
+プロセス別キャプチャの対象候補（音声出力のセッション／ストリームを持つプロセス・
+自プロセスを除く。停止中・Idle も含む）は `flexaudio_processes` で列挙し、
+`flexaudio_processes_free` で **1 回だけ** 解放する（各要素は `FlexProcessInfo`。
+`pid` を `FlexConfig::process_id` に渡す。`executable` / `bundle_id` は取れなければ
+NULL、`output_activity` は `FLEX_OUTPUT_ACTIVITY_UNKNOWN|INACTIVE|ACTIVE`）。
+0 件は成功（使えるが今は候補が無い）。プロセス別キャプチャ自体が使えない環境
+（Linux で PipeWire に届かない・macOS 14.4 未満・Windows が Windows build 20348
+or later (Windows 11 / Windows Server 2022) 未満・非対応 OS・権限拒否）、OS が
+3 秒以内に応答しなかった、または前の問い合わせがまだ終わっていないときは
+`FLEX_FAILURE`。
 
 ## ビルドとヘッダ生成
 

@@ -24,3 +24,9 @@ echo "== copied $SO -> $TEST_DIR/flexaudio.node =="
 
 echo "== node smoke.mjs =="
 node "$TEST_DIR/smoke.mjs"
+
+echo "== node dual.mjs =="
+node "$TEST_DIR/dual.mjs"
+
+echo "== node async-api.mjs =="
+node "$TEST_DIR/async-api.mjs"

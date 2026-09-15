@@ -42,19 +42,25 @@ with flexaudio.open("mic") as stream:
 - `flexaudio.open("process", process_id=<pid>)` — a single process's output.
   Pass `mode="exclude"` to capture everything *except* that process.
 
-To find a `process_id`, list the processes that currently have an audio output
-stream (the calling process is never listed):
+To find a `process_id`, list the processes that have an audio output
+session/stream (the calling process is never listed). Idle/stopped processes
+are included; whether something is playing now is `is_output_active`:
 
 ```python
 for p in flexaudio.processes():
     print(p.pid, p.name, p.executable, p.bundle_id, p.is_output_active)
 ```
 
-An empty list means per-process capture works but nothing is playing;
-`RuntimeError` means per-process capture is unavailable here (Linux without a
-reachable PipeWire session, macOS before 14.4, an unsupported OS) or the OS did
-not answer within 3 seconds. `executable`, `bundle_id` (macOS only), and
-`is_output_active` are `None` when the OS does not expose them.
+An empty list means per-process capture works but no such process exists right
+now (not "nothing is playing"). `RuntimeError` means per-process capture is
+unavailable here (Linux without a reachable PipeWire session, macOS before 14.4,
+an unsupported OS, or a permission denial), the OS did not answer within 3
+seconds, or a previous enumeration is still in progress. On Windows, listing
+and capturing both need Windows build 20348 or later (Windows 11 / Windows
+Server 2022). `executable`, `bundle_id` (macOS only), and `is_output_active`
+are `None` when the OS does not expose them. On Linux, `executable` is
+`/proc/<pid>/exe` and falls back to `/proc/<pid>/comm` when `exe` is
+unreadable.
 
 Optional keyword arguments: `device_id`, `output_rate` (default 48000),
 `output_channels` (default 2), `chunk_ms` (default 20), plus the integrated

@@ -1,5 +1,5 @@
 //! flexaudio-os-windows — Windows バックエンド: WASAPI ループバック / プロセス
-//! ループバック（windows-rs 0.54, Win11+）。
+//! ループバック（windows-rs 0.54, Windows build 20348 or later）。
 //!
 //! 2 つの [`CaptureBackend`](flexaudio_core::backend::CaptureBackend) を提供する:
 //!
@@ -24,17 +24,29 @@
 //!
 //! # 非 Windows
 //!
-//! `#![cfg(target_os = "windows")]` で非 Windows では空コンパイルになり、`windows`
-//! 依存も `Cargo.toml` の `target.'cfg(...windows)'` セクションでしか引かれない。
+//! バックエンド本体は `#[cfg(target_os = "windows")]` で非 Windows では空コンパイルに
+//! なり、`windows` 依存も `Cargo.toml` の `target.'cfg(...windows)'` セクションでしか
+//! 引かれない。ビルド番号の判定（純粋関数）だけは非 Windows でもコンパイルし、単体
+//! テストする。
 
-#![cfg(target_os = "windows")]
 #![warn(missing_docs)]
 
+/// ビルド番号 → プロセスループバック可否。OS 呼び出しから切り離してあるので
+/// 非 Windows でも単体テストできる。
+mod version;
+
+#[cfg(target_os = "windows")]
 mod common;
+#[cfg(target_os = "windows")]
 mod process;
+#[cfg(target_os = "windows")]
 mod processes;
+#[cfg(target_os = "windows")]
 mod system;
 
+#[cfg(target_os = "windows")]
 pub use process::WasapiProcessBackend;
+#[cfg(target_os = "windows")]
 pub use processes::list_processes;
+#[cfg(target_os = "windows")]
 pub use system::{list_output_devices, WasapiSystemBackend};

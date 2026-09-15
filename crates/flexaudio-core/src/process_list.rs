@@ -31,8 +31,9 @@ pub fn executable_basename(path: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 出力中フラグを統合する。どれかが `Some(true)` なら `Some(true)`、どちらかが
-/// `Some(false)` なら `Some(false)`、両方 `None` なら `None`（不明のまま）。
+/// 出力中フラグを統合する。どれか 1 つでも `Some(true)` なら `Some(true)`
+/// （出力中が勝つ）。true が無く `Some(false)` があれば `Some(false)`。両方 `None`
+/// なら `None`（不明のまま）。
 fn merge_activity(a: Option<bool>, b: Option<bool>) -> Option<bool> {
     match (a, b) {
         (Some(true), _) | (_, Some(true)) => Some(true),

@@ -331,6 +331,9 @@ pub(crate) unsafe fn setup_process_loopback(
     HANDLE,
     u16,
 )> {
+    // 列挙と同じ版チェック。反応的な E_NOTIMPL / E_NOINTERFACE の写しは残す。
+    crate::version::ensure_process_loopback_supported()?;
+
     // activation params を組む。mode で INCLUDE/EXCLUDE を切り替える。
     let loopback_mode = match mode {
         ProcessMode::Include => PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,

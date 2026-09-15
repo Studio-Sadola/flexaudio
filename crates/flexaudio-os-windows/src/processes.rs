@@ -44,10 +44,13 @@ struct SessionRecord {
 
 /// 音声セッションを持つプロセスを列挙する（生リスト）。
 ///
-/// render エンドポイントが 1 つも無ければ `Ok(空)`。エンドポイントはあるのにどれからも
-/// セッションマネージャを取れなかったときは、最後の失敗を型付き [`Error`] で返す
+/// プロセスループバックに要る OS の版（build 20348 以上）を先に確かめ、未満なら
+/// [`Error::UnsupportedOsVersion`]（録音側と同じ関数）。render エンドポイントが
+/// 1 つも無ければ `Ok(空)`。エンドポイントはあるのにどれからもセッションマネージャを
+/// 取れなかったときは、最後の失敗を型付き [`Error`] で返す
 /// （例: アクセス拒否 → [`Error::PermissionDenied`]）。
 pub fn list_processes() -> Result<Vec<ProcessInfo>> {
+    crate::version::ensure_process_loopback_supported()?;
     let _com = ComThread::new();
     // SAFETY: この関数内で COM を初期化済み（ComThread）。COM インターフェイスはこの関数内
     // （同一スレッド）でだけ使い、スレッド境界を跨がない。
@@ -136,7 +139,9 @@ unsafe fn read_session(
 ) -> Option<SessionRecord> {
     let control = session_list.GetSession(session_index).ok()?;
     let control2: IAudioSessionControl2 = control.cast().ok()?;
-    // S_OK = システム音セッション（通知音など・特定アプリではない）。S_FALSE = 通常。
+    // windows 0.54 の `IsSystemSoundsSession` は `HRESULT` を返す（`Result<()>` ではない）。
+    // S_OK = システム音セッション（通知音など・特定アプリではない）。S_FALSE (1) = 通常。
+    // S_FALSE も成功扱い（HRESULT >= 0）なので `Result<()>` に包むと区別が消える。
     if control2.IsSystemSoundsSession() == S_OK {
         return None;
     }

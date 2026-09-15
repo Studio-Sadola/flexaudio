@@ -18,7 +18,8 @@ teardown happen on a dedicated thread; only `Send`-safe handles (stop flag,
 `JoinHandle`, cached format) cross thread boundaries.
 
 **Platform requirement:** WASAPI loopback is available on Windows Vista and later;
-process loopback (`WasapiProcessBackend`) requires Windows 10 build 20348 or later.
+process loopback (`WasapiProcessBackend`) and process listing (`list_processes`)
+require Windows build 20348 or later (Windows 11 / Windows Server 2022).
 The crate compiles as an empty stub on non-Windows targets
 (`#![cfg(target_os = "windows")]`).
 

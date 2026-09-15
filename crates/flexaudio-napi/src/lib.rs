@@ -8,21 +8,31 @@
 //! - チャンク/イベントは `ThreadsafeFunction`（ErrorStrategy::Fatal）で JS コールバックへ送る。
 //! - `FlexStream` 構築時に bridge スレッドを spawn し、`stream.start()` 後に
 //!   `poll_chunk` / `poll_event` を 1ms 間隔でポーリングして TSFN へ NonBlocking で渡す。
-//! - 停止は `Arc<AtomicBool>` のフラグ + `JoinHandle::join()`。Drop でも止める。
+//! - 停止は `stop(): Promise<void>`。join は JS スレッドでは行わず、最後の PCM と
+//!   `frames:0` の締めを同じ TSFN に積んだあと「終わりの合図」を 1 つ積み、その合図が
+//!   JS で処理されたときに Promise を resolve する。Drop（GC）は JS を止めず reaper
+//!   スレッドで join する。
 //!
 //! 実行時にネットワーク通信はしない（napi は N-API ブリッジのみ）。
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use napi::bindgen_prelude::{BigInt, Either, Float32Array, Int16Array};
-use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{Error as NapiError, Status};
+use napi::bindgen_prelude::{
+    AsyncTask, BigInt, Either, Float32Array, FromNapiValue, Function, Int16Array, Unknown,
+};
+use napi::threadsafe_function::{
+    ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
+};
+use napi::{
+    check_status, sys, Env, Error as NapiError, JsObject, NapiRaw, NapiValue, Status, Task,
+};
 use napi_derive::napi;
 
 use flexaudio::{
@@ -71,13 +81,179 @@ const DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 // ErrorStrategy::Fatal の TSFN 別名。`.call(value, mode)` が値を直接取れる
 // （CalleeHandled だと `.call(Result<T>, mode)` になり Result ラップが要る）。
-type ChunkTsfn = ThreadsafeFunction<JsAudioChunk, ErrorStrategy::Fatal>;
+type ChunkTsfn = ThreadsafeFunction<ChunkEmit, ErrorStrategy::Fatal>;
+type SettleTsfn = ThreadsafeFunction<(), ErrorStrategy::Fatal>;
 type EventTsfn = ThreadsafeFunction<JsStreamEvent, ErrorStrategy::Fatal>;
 type DeviceTsfn = ThreadsafeFunction<JsDeviceEvent, ErrorStrategy::Fatal>;
+
+/// onChunk TSFN に積む値。チャンクはユーザーの `onChunk` へ渡し、`StopFlushed` は
+/// 同じ列の「終わりの合図」（JS の onChunk には出さない）。
+enum ChunkEmit {
+    Chunk(Box<JsAudioChunk>),
+    StopFlushed,
+}
+
+/// `napi_deferred` は生ポインタ。JS スレッドで作って TSFN で resolve する。
+#[derive(Clone, Copy)]
+struct SendDeferred(sys::napi_deferred);
+unsafe impl Send for SendDeferred {}
+unsafe impl Sync for SendDeferred {}
+
+/// `stop()` の完了待ち合わせ。Waiters は `napi_create_promise` の deferred。
+enum StopPhase {
+    Running,
+    Stopping { waiters: Vec<SendDeferred> },
+    Stopped,
+}
+
+struct StreamInner {
+    handle: Option<JoinHandle<()>>,
+    cmd_tx: Option<mpsc::Sender<BridgeCmd>>,
+}
+
+/// JS の onChunk を TSFN の寿命まで保持する。`FunctionRef<JsAudioChunk, _>` は
+/// PhantomData 経由で Send にならないことがあるので生の `napi_ref` にする。
+/// Drop は TSFN finalize（JS スレッド）から呼ばれる。
+struct UserChunkCb {
+    env: sys::napi_env,
+    refer: sys::napi_ref,
+}
+
+unsafe impl Send for UserChunkCb {}
+unsafe impl Sync for UserChunkCb {}
+
+impl Drop for UserChunkCb {
+    fn drop(&mut self) {
+        if !self.env.is_null() && !self.refer.is_null() {
+            let _ = unsafe { sys::napi_delete_reference(self.env, self.refer) };
+        }
+    }
+}
 
 /// flexaudio::Error → napi::Error。メッセージを文字列化して GenericFailure にする。
 fn to_napi_err(err: flexaudio::Error) -> NapiError {
     NapiError::new(Status::GenericFailure, err.to_string())
+}
+
+fn lock_poisoned<T>(
+    p: std::sync::PoisonError<std::sync::MutexGuard<T>>,
+) -> std::sync::MutexGuard<T> {
+    p.into_inner()
+}
+
+fn create_js_promise(env: &Env) -> napi::Result<(SendDeferred, JsObject)> {
+    let mut deferred = ptr::null_mut();
+    let mut promise = ptr::null_mut();
+    check_status!(unsafe { sys::napi_create_promise(env.raw(), &mut deferred, &mut promise) })?;
+    Ok((SendDeferred(deferred), unsafe {
+        JsObject::from_raw_unchecked(env.raw(), promise)
+    }))
+}
+
+fn resolve_undefined(env: sys::napi_env, deferred: SendDeferred) {
+    let mut undefined = ptr::null_mut();
+    let _ = unsafe { sys::napi_get_undefined(env, &mut undefined) };
+    let _ = unsafe { sys::napi_resolve_deferred(env, deferred.0, undefined) };
+}
+
+fn take_stop_waiters(phase: &Mutex<StopPhase>) -> Vec<SendDeferred> {
+    let mut g = phase.lock().unwrap_or_else(lock_poisoned);
+    match std::mem::replace(&mut *g, StopPhase::Stopped) {
+        StopPhase::Stopping { waiters } => waiters,
+        StopPhase::Stopped => vec![],
+        StopPhase::Running => vec![],
+    }
+}
+
+/// ユーザーの `onChunk` を呼ぶ TSFN。チャンクはユーザーへ渡し、`StopFlushed` は同じ列で
+/// deferred を resolve する（ユーザーの onChunk は呼ばない）。ポンプ関数は no-op。
+fn make_chunk_tsfn(
+    env: &Env,
+    on_chunk: Function<JsAudioChunk, Unknown>,
+    stop_phase: Arc<Mutex<StopPhase>>,
+) -> napi::Result<ChunkTsfn> {
+    let mut refer = ptr::null_mut();
+    check_status!(unsafe { sys::napi_create_reference(env.raw(), on_chunk.raw(), 1, &mut refer) })?;
+    let user = Arc::new(UserChunkCb {
+        env: env.raw(),
+        refer,
+    });
+
+    let pump =
+        env.create_function_from_closure("flexaudioChunkPump", |ctx| ctx.env.get_undefined())?;
+    pump.create_threadsafe_function::<ChunkEmit, Unknown, _, ErrorStrategy::Fatal>(0, {
+        let user = user;
+        move |ctx: ThreadSafeCallContext<ChunkEmit>| {
+            let refer = user.refer;
+            match ctx.value {
+                ChunkEmit::Chunk(chunk) => {
+                    let mut value = ptr::null_mut();
+                    check_status!(unsafe {
+                        sys::napi_get_reference_value(ctx.env.raw(), refer, &mut value)
+                    })?;
+                    let func: Function<JsAudioChunk, Unknown> =
+                        unsafe { Function::from_napi_value(ctx.env.raw(), value)? };
+                    let _ = func.call(*chunk);
+                    Ok(Vec::<Unknown>::new())
+                }
+                ChunkEmit::StopFlushed => {
+                    for deferred in take_stop_waiters(&stop_phase) {
+                        resolve_undefined(ctx.env.raw(), deferred);
+                    }
+                    Ok(Vec::<Unknown>::new())
+                }
+            }
+        }
+    })
+}
+
+/// JS スレッドへ戻って stop() の Promise を決着させる専用 TSFN。
+/// chunk TSFN が Closing のとき（届けるべき onChunk はもう無い）に使う。
+fn make_settle_tsfn(env: &Env, stop_phase: Arc<Mutex<StopPhase>>) -> napi::Result<SettleTsfn> {
+    let pump =
+        env.create_function_from_closure("flexaudioStopSettle", |ctx| ctx.env.get_undefined())?;
+    pump.create_threadsafe_function::<(), Unknown, _, ErrorStrategy::Fatal>(0, {
+        move |ctx: ThreadSafeCallContext<()>| {
+            for deferred in take_stop_waiters(&stop_phase) {
+                resolve_undefined(ctx.env.raw(), deferred);
+            }
+            Ok(Vec::<Unknown>::new())
+        }
+    })
+}
+
+/// chunk TSFN に StopFlushed を積む。Closing なら決着用 TSFN へ。それも Closing なら
+/// Node 終了中なので deferred を捨ててよい。
+fn post_stop_flushed(chunk: &ChunkTsfn, settle: &SettleTsfn, phase: &Mutex<StopPhase>) {
+    let st = chunk.call(
+        ChunkEmit::StopFlushed,
+        ThreadsafeFunctionCallMode::NonBlocking,
+    );
+    if st == Status::Closing {
+        let st2 = settle.call((), ThreadsafeFunctionCallMode::NonBlocking);
+        if st2 == Status::Closing {
+            // 決着用 TSFN まで Closing = JS イベントループがもう動かない（Node 終了中）。
+            // この時だけ unresolved deferred を捨ててよい。JS が生きている限りは
+            // settle TSFN が JS スレッドで resolve_undefined する。
+            let _ = take_stop_waiters(phase);
+        }
+    }
+}
+
+/// libuv スレッドプールで `flexaudio::processes()` を実行する。
+pub struct ProcessesTask;
+
+impl Task for ProcessesTask {
+    type Output = Vec<ProcessInfo>;
+    type JsValue = Vec<JsProcessInfo>;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        flexaudio::processes().map_err(to_napi_err)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(output.into_iter().map(process_info_to_js).collect())
+    }
 }
 
 /// VadError → napi::Error。設定不正は呼び出し側のミスなので InvalidArg、
@@ -209,7 +385,7 @@ pub struct JsVadEvent {
     pub kind: String,
     pub at_sample: i64,
     /// 録音 0 起点の絶対ナノ秒（`number`＝f64）。統合 VAD（`openStream` の `vad`）経由でのみ
-    /// 埋まる（チャンクの `ptsNs` とチャンク内オフセットから F4 再基準化式で算出）。同一
+    /// 埋まる（チャンクの `ptsNs` と、VAD 内部レートでのチャンク内オフセットから算出）。同一
     /// チャンクで配送され、チャンクをまたいで単調非減少。`flushVad` の最終イベントも同じ
     /// `vadEvents` 配列に載る。単体 `Vad` クラス（`process`/`flush`）は pts 文脈が無いため
     /// `undefined`。（時刻は録音長で有界なので `number`。生 u64 カウンタの `seq` のみ `bigint`。）
@@ -671,7 +847,7 @@ enum BridgeCmd {
     /// 現在値のスナップショットを同期で返す（ゲッタ用）。
     Query(QueryCmd),
     /// 統合 VAD の開いている発話を強制確定する（`flushVad`）。runtime 操作で config は
-    /// 変更しない（`secondaryOutput`/encoding の open 時固定＝F11 とは無関係）。音の
+    /// 変更しない（`secondaryOutput` / encoding は open 時に固定）。音の
     /// stop-flush とは別物で、最終 speechEnd を次に届くタップのチャンクへ載せる。
     FlushVad,
 }
@@ -691,6 +867,7 @@ struct SecondaryTapCfg {
 /// タップに束縛し（`vad_tap`）、量子化前の f32 を Rust 内で食う。副 s16 化は VAD の後。
 struct PairingBridge {
     on_chunk: ChunkTsfn,
+    stop_phase: Arc<Mutex<StopPhase>>,
     /// 統合 VAD（設定時のみ）。単一インスタンス・単一タップ。
     vad: Option<CoreVad>,
     vad_tap: VadTap,
@@ -701,7 +878,7 @@ struct PairingBridge {
     /// VAD タップの前チャンクの `dropped_before`（欠落差分の検知用）。
     vad_last_dropped: u32,
     /// 直近に VAD へ食わせたチャンクの基準点（`(vad_sample_base, pts_base)`）。`flushVad`
-    /// が生成する最終イベントの絶対時刻（F4 の式）を、その周回で処理する新チャンクが無くても
+    /// が生成する最終イベントの絶対時刻を、その周回で処理する新チャンクが無くても
     /// 算出できるように保持する。
     vad_anchor_sample: i64,
     vad_anchor_pts: i64,
@@ -784,8 +961,8 @@ impl PairingBridge {
         merged
     }
 
-    /// 統合 VAD の開いている発話を強制確定し、確定イベントを JS 向けに（F4 の絶対時刻式・
-    /// 直近アンカー基準で `atNs` を付けて）返す。`flush()` は VAD を reset するので累積カウンタ
+    /// 統合 VAD の開いている発話を強制確定し、確定イベントを JS 向けに（直近アンカー基準の
+    /// 絶対時刻で `atNs` を付けて）返す。`flush()` は VAD を reset するので累積カウンタ
     /// を 0 へ張り直す。開いた発話が無ければ空。
     fn flush_vad_events(&mut self) -> Vec<JsVadEvent> {
         let Some(vad) = self.vad.as_mut() else {
@@ -821,20 +998,14 @@ impl PairingBridge {
         }
     }
 
-    /// stop 時の最終 flush。開いている発話を確定し、専用の末尾キャリアチャンクで**必ず**配送
-    /// する（ペア合成に依存しない）。理由: 副タップの最終イベントは副チャンクに載るが、stop 時に
-    /// 主テールが無い（例: 48k/stereo パススルーでバッファ境界が揃った）と副が主と対にならず
-    /// 落ちるため。専用キャリア（frames=0・末尾 1 個）で取りこぼしを構造的に防ぐ（fail-closed）。
-    ///
-    /// 音の stop-flush（末尾サンプル）は別物で、通常のペア配送で既に届く。これはイベントのみ。
+    /// stop 時の最終 flush。開いている発話を確定し、専用の末尾キャリアチャンク
+    /// （`frames:0`）で**必ず**配送する。VAD イベントが無くても締めの `frames:0` は出す
+    /// （`stop()` の resolve より前に onChunk へ届ける契約）。
     fn flush_vad_final(&mut self) {
         let js = self.flush_vad_events();
         // 実行中に溜まった pending があれば先頭へ（時刻順）。
         let mut events = std::mem::take(&mut self.pending_flush_events);
         events.extend(js);
-        if events.is_empty() {
-            return;
-        }
         // 主 pts の非減少契約を保つよう、キャリア pts は直近アンカーと最終配送 pts の大きい方。
         let pts = self.vad_anchor_pts.max(self.last_emitted_primary_pts);
         let mut carrier = JsAudioChunk {
@@ -872,8 +1043,10 @@ impl PairingBridge {
                 });
             }
         }
-        self.on_chunk
-            .call(carrier, ThreadsafeFunctionCallMode::NonBlocking);
+        self.on_chunk.call(
+            ChunkEmit::Chunk(Box::new(carrier)),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
     }
 
     /// 主チャンクを取り込む。VAD が primary なら通し、JS 化して FIFO へ積む。
@@ -991,8 +1164,10 @@ impl PairingBridge {
             let mut p = self.primary_fifo.pop_front().unwrap();
             self.last_emitted_primary_pts = p.pts_ns.max(self.last_emitted_primary_pts);
             p.secondary = matched;
-            self.on_chunk
-                .call(p, ThreadsafeFunctionCallMode::NonBlocking);
+            self.on_chunk.call(
+                ChunkEmit::Chunk(Box::new(p)),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
         }
     }
 }
@@ -1002,10 +1177,10 @@ impl PairingBridge {
 #[napi]
 pub struct FlexStream {
     stop_flag: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
-    /// bridge スレッドへ切替コマンドを送るチャネル。`shutdown` で drop してスレッド側の
-    /// `try_recv` を打ち切る（停止自体は stop_flag が担う）。
-    cmd_tx: Option<mpsc::Sender<BridgeCmd>>,
+    inner: Arc<Mutex<StreamInner>>,
+    stop_phase: Arc<Mutex<StopPhase>>,
+    chunk_tsfn: ChunkTsfn,
+    settle_tsfn: SettleTsfn,
 }
 
 impl FlexStream {
@@ -1016,9 +1191,13 @@ impl FlexStream {
         mut stream: flexaudio::Stream,
         mut bridge: PairingBridge,
         on_event: Option<EventTsfn>,
+        settle_tsfn: SettleTsfn,
     ) -> Self {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_stop = stop_flag.clone();
+        let stop_phase = bridge.stop_phase.clone();
+        let chunk_tsfn = bridge.on_chunk.clone();
+        let settle_for_bridge = settle_tsfn.clone();
         let (cmd_tx, cmd_rx) = mpsc::channel::<BridgeCmd>();
 
         let handle = thread::spawn(move || {
@@ -1099,33 +1278,60 @@ impl FlexStream {
                 bridge.on_secondary(chunk); // ②（secondary タップの VAD もここで末尾を食う）
             }
             bridge.drain_pairs(); // ② 末尾テールの音を配送
-            bridge.flush_vad_final(); // ③ 最終イベントを専用キャリアで確実に配送（音の後）
+            bridge.flush_vad_final(); // ③ 最終イベント + frames:0 の締め
+                                      // ④ 同じ TSFN 列の終わりの合図。これが JS で処理されたとき stop() の Promise が
+                                      // resolve する（AsyncTask / 別 TSFN だと onChunk より先に resolve し得る）。
+                                      // chunk TSFN が Closing なら決着用 TSFN へ（届けるべき onChunk はもう無い）。
+            post_stop_flushed(&bridge.on_chunk, &settle_for_bridge, &bridge.stop_phase);
         });
 
         Self {
             stop_flag,
-            handle: Some(handle),
-            cmd_tx: Some(cmd_tx),
+            inner: Arc::new(Mutex::new(StreamInner {
+                handle: Some(handle),
+                cmd_tx: Some(cmd_tx),
+            })),
+            stop_phase,
+            chunk_tsfn,
+            settle_tsfn,
         }
     }
 
-    fn shutdown(&mut self) {
-        self.stop_flag.store(true, Ordering::SeqCst);
-        // 切替チャネルを閉じて bridge スレッドの try_recv を Disconnected にする。
-        self.cmd_tx = None;
-        if let Some(h) = self.handle.take() {
-            // 二重 stop / Drop でも安全（handle が take 済みなら何もしない）。
-            let _ = h.join();
-        }
+    fn take_join_handle(&self) -> Option<JoinHandle<()>> {
+        let mut g = self.inner.lock().unwrap_or_else(lock_poisoned);
+        g.cmd_tx = None;
+        g.handle.take()
+    }
+
+    fn spawn_stop_worker(&self, h: JoinHandle<()>) {
+        let tsfn = self.chunk_tsfn.clone();
+        let settle = self.settle_tsfn.clone();
+        let phase = self.stop_phase.clone();
+        let _ = thread::Builder::new()
+            .name("flexaudio-napi-stop".into())
+            .spawn(move || {
+                let _ = h.join();
+                // bridge が panic などで合図を積めなかったときだけフォールバック。
+                let needs_flush = {
+                    let g = phase.lock().unwrap_or_else(lock_poisoned);
+                    matches!(*g, StopPhase::Stopping { .. })
+                };
+                if needs_flush {
+                    post_stop_flushed(&tsfn, &settle, &phase);
+                }
+            });
     }
 
     /// bridge スレッドへ Query を送り、ストリームの現在値スナップショットを同期受信する。
     /// 各ゲッタ（`is_paused`/`gain`/`native_format`/`dropped_chunks`）の実体。既に
     /// `stop()` 済みなら例外。
     fn query_snapshot(&self) -> napi::Result<StreamSnapshot> {
-        let cmd_tx = self.cmd_tx.as_ref().ok_or_else(|| {
-            NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
-        })?;
+        let cmd_tx = {
+            let g = self.inner.lock().unwrap_or_else(lock_poisoned);
+            g.cmd_tx.clone().ok_or_else(|| {
+                NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
+            })?
+        };
         let (result_tx, result_rx) = mpsc::channel();
         cmd_tx
             .send(BridgeCmd::Query(QueryCmd { result_tx }))
@@ -1146,10 +1352,60 @@ impl FlexStream {
 
 #[napi]
 impl FlexStream {
-    /// 録音を停止し bridge スレッドを join する。二重呼び出し安全。
-    #[napi]
-    pub fn stop(&mut self) {
-        self.shutdown();
+    /// 録音を停止する。Promise が resolve した時点で、stop の前に TSFN へ積まれた
+    /// `onChunk`（最後の PCM と `frames:0` の締め）はすべて JS に渡し終わっている。
+    /// 二重呼び出しは同じ完了を待つ／済みなら即 resolve。`onChunk` の中から呼んでも
+    /// JS スレッドで join しないので固まらない。
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn stop(&self, env: Env) -> napi::Result<JsObject> {
+        let (deferred, promise) = create_js_promise(&env)?;
+        // ここは JS スレッド。TSFN が既に閉じている・join handle が無い・phase が
+        // Stopped なら、napi_resolve_deferred をこの場で呼んでよい。
+        let chunk_closed = self.chunk_tsfn.aborted();
+        let mut phase = self.stop_phase.lock().unwrap_or_else(lock_poisoned);
+        match &mut *phase {
+            StopPhase::Stopped => {
+                drop(phase);
+                resolve_undefined(env.raw(), deferred);
+                return Ok(promise);
+            }
+            StopPhase::Stopping { waiters } => {
+                waiters.push(deferred);
+                return Ok(promise);
+            }
+            StopPhase::Running => {
+                *phase = StopPhase::Stopping {
+                    waiters: vec![deferred],
+                };
+            }
+        }
+        drop(phase);
+
+        self.stop_flag.store(true, Ordering::SeqCst);
+        match self.take_join_handle() {
+            None => {
+                // join handle が無い（Drop の reaper が持っていった等）。届けるべき
+                // callback は別経路で掃除中／もう無い。JS スレッドで即 resolve。
+                for d in take_stop_waiters(&self.stop_phase) {
+                    resolve_undefined(env.raw(), d);
+                }
+            }
+            Some(h) if chunk_closed => {
+                // chunk TSFN は既に閉じている。届けるべき onChunk はもう無い
+                // （順番の契約は空に成立）。JS が生きているこのスレッドで即 resolve。
+                // join は JS を止めないよう reaper に渡す。
+                let _ = thread::Builder::new()
+                    .name("flexaudio-napi-reaper".into())
+                    .spawn(move || {
+                        let _ = h.join();
+                    });
+                for d in take_stop_waiters(&self.stop_phase) {
+                    resolve_undefined(env.raw(), d);
+                }
+            }
+            Some(h) => self.spawn_stop_worker(h),
+        }
+        Ok(promise)
     }
 
     /// 録音を止めずに入力ソース（mic/system/process）をホットスワップする。
@@ -1168,9 +1424,12 @@ impl FlexStream {
         let config = build_config(&options)?;
 
         // bridge スレッドへコマンドを送り、結果を同期受信する。
-        let cmd_tx = self.cmd_tx.as_ref().ok_or_else(|| {
-            NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
-        })?;
+        let cmd_tx = {
+            let g = self.inner.lock().unwrap_or_else(lock_poisoned);
+            g.cmd_tx.clone().ok_or_else(|| {
+                NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
+            })?
+        };
         let (result_tx, result_rx) = mpsc::channel();
         cmd_tx
             .send(BridgeCmd::Switch(SwitchCmd { config, result_tx }))
@@ -1195,9 +1454,12 @@ impl FlexStream {
     /// 再開後の最初のチャンクに DISCONTINUITY が立つ。既に `stop()` 済みなら例外。
     #[napi]
     pub fn pause(&self) -> napi::Result<()> {
-        let cmd_tx = self.cmd_tx.as_ref().ok_or_else(|| {
-            NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
-        })?;
+        let cmd_tx = {
+            let g = self.inner.lock().unwrap_or_else(lock_poisoned);
+            g.cmd_tx.clone().ok_or_else(|| {
+                NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
+            })?
+        };
         cmd_tx.send(BridgeCmd::Pause).map_err(|_| {
             NapiError::new(
                 Status::GenericFailure,
@@ -1210,9 +1472,12 @@ impl FlexStream {
     /// 一時停止を解除して配信を再開する。既に `stop()` 済みなら例外。
     #[napi]
     pub fn resume(&self) -> napi::Result<()> {
-        let cmd_tx = self.cmd_tx.as_ref().ok_or_else(|| {
-            NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
-        })?;
+        let cmd_tx = {
+            let g = self.inner.lock().unwrap_or_else(lock_poisoned);
+            g.cmd_tx.clone().ok_or_else(|| {
+                NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
+            })?
+        };
         cmd_tx.send(BridgeCmd::Resume).map_err(|_| {
             NapiError::new(
                 Status::GenericFailure,
@@ -1236,9 +1501,12 @@ impl FlexStream {
     /// 済みなら例外。
     #[napi]
     pub fn flush_vad(&self) -> napi::Result<()> {
-        let cmd_tx = self.cmd_tx.as_ref().ok_or_else(|| {
-            NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
-        })?;
+        let cmd_tx = {
+            let g = self.inner.lock().unwrap_or_else(lock_poisoned);
+            g.cmd_tx.clone().ok_or_else(|| {
+                NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
+            })?
+        };
         cmd_tx.send(BridgeCmd::FlushVad).map_err(|_| {
             NapiError::new(
                 Status::GenericFailure,
@@ -1261,9 +1529,12 @@ impl FlexStream {
                 format!("gain must be finite and >= 0.0, got {gain}"),
             ));
         }
-        let cmd_tx = self.cmd_tx.as_ref().ok_or_else(|| {
-            NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
-        })?;
+        let cmd_tx = {
+            let g = self.inner.lock().unwrap_or_else(lock_poisoned);
+            g.cmd_tx.clone().ok_or_else(|| {
+                NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
+            })?
+        };
         cmd_tx.send(BridgeCmd::SetGain(gain)).map_err(|_| {
             NapiError::new(
                 Status::GenericFailure,
@@ -1308,8 +1579,17 @@ impl FlexStream {
 
 impl Drop for FlexStream {
     fn drop(&mut self) {
-        // JS が stop を呼ばずに捨てても、ゾンビスレッドを残さない。
-        self.shutdown();
+        // GC 経路。JS スレッド（GC）を join で止めない。stop_flag を立てて handle を
+        // reaper スレッドで join する。資源（bridge・TSFN・キャプチャ）は bridge 終了時に
+        // 破棄される。Promise の待ち手は居ない（明示 stop していない）。
+        self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(h) = self.take_join_handle() {
+            let _ = thread::Builder::new()
+                .name("flexaudio-napi-reaper".into())
+                .spawn(move || {
+                    let _ = h.join();
+                });
+        }
     }
 }
 
@@ -1360,24 +1640,29 @@ pub fn devices() -> napi::Result<Vec<JsDeviceInfo>> {
 }
 
 /// プロセス別キャプチャ（`openStream({ kind: 'process', processId })`）の対象にできる、
-/// 音声出力を持つプロセスを列挙する。呼び出し元プロセス自身は含まない。
+/// 音声出力のセッション（ストリーム）を持つプロセスを列挙する。呼び出し元プロセス自身は
+/// 含まない。停止中・Idle も載る。今鳴っているかは `isOutputActive` で見る。
 ///
 /// 並びは「出力中（`isOutputActive: true`）が先頭 → 表示名 → pid」で、同じ pid は 1 件に
 /// まとめてある。読み取り専用で権限プロンプトは出さない。OS の応答が無くても最大 3 秒で
-/// 戻る（同期関数なので呼び出し中はそのスレッドを塞ぐ。通常は数十 ms）。
+/// 戻る。libuv スレッドプールで実行するので JS のイベントループは塞がない。
 ///
-/// - Linux（PipeWire）: `Stream/Output/Audio` ノードを持つクライアント。
-/// - Windows: 有効な出力デバイスの音声セッションを持つプロセス（列挙はどの版でも動くが、
-///   その pid を録るプロセスループバックは Windows 11 / build 20348 以降が必要）。
-/// - macOS 14.4+: Core Audio のプロセスオブジェクト（`bundleId` 付き）。
+/// - Linux（PipeWire）: `Stream/Output/Audio` ノードを持つクライアント。`executable` は
+///   `/proc/<pid>/exe`、読めなければ `/proc/<pid>/comm`。
+/// - Windows: 有効な出力デバイスの音声セッションを持つプロセス。列挙も録音も
+///   Windows build 20348 or later (Windows 11 / Windows Server 2022) が必要。
+/// - macOS 14.4+: Core Audio が把握しているプロセスオブジェクト（`bundleId` 付き。
+///   入力だけのプロセスも含む）。
 ///
-/// 戻り値の読み方: 空配列＝プロセス別キャプチャは使えるが今は候補が無い。throw＝この
-/// 環境ではプロセス別キャプチャが使えない（Linux で PipeWire に繋がらない・macOS 14.4 未満
-/// は `unsupported OS version`・その他 OS は `unsupported`）か、OS が時間内に応答しなかった。
-#[napi]
-pub fn processes() -> napi::Result<Vec<JsProcessInfo>> {
-    let list = flexaudio::processes().map_err(to_napi_err)?;
-    Ok(list.into_iter().map(process_info_to_js).collect())
+/// 戻り値の読み方: 空配列＝プロセス別キャプチャは使えるが、そういうプロセスが今は無い
+/// （「何も鳴っていない」ではない）。reject＝この環境ではプロセス別キャプチャが使えない
+/// （Linux で PipeWire に届かない・macOS 14.4 未満 / Windows build 20348 未満は
+/// `unsupported OS version`・その他 OS は `unsupported`・権限拒否）、OS が時間内に
+/// 応答しなかった、または前の問い合わせがまだ終わっていない（同期時代と同じ `Error`
+/// 型・文言）。
+#[napi(ts_return_type = "Promise<Array<JsProcessInfo>>")]
+pub fn processes() -> AsyncTask<ProcessesTask> {
+    AsyncTask::new(ProcessesTask)
 }
 
 /// ストリームを開いて開始し、チャンク/イベントをコールバックへ送る `FlexStream` を返す。
@@ -1406,8 +1691,12 @@ pub fn processes() -> napi::Result<Vec<JsProcessInfo>> {
 /// 'primary', `chunk.secondary?.vadEvents` for 'secondary'.
 #[napi]
 pub fn open_stream(
+    env: Env,
     options: OpenOptions,
-    #[napi(ts_arg_type = "(chunk: JsAudioChunk) => void")] on_chunk: ChunkTsfn,
+    #[napi(ts_arg_type = "(chunk: JsAudioChunk) => void")] on_chunk: Function<
+        JsAudioChunk,
+        Unknown,
+    >,
     #[napi(ts_arg_type = "((event: JsStreamEvent) => void) | undefined | null")] on_event: Option<
         EventTsfn,
     >,
@@ -1456,8 +1745,12 @@ pub fn open_stream(
     }
     stream.start().map_err(to_napi_err)?;
 
+    let stop_phase = Arc::new(Mutex::new(StopPhase::Running));
+    let on_chunk = make_chunk_tsfn(&env, on_chunk, stop_phase.clone())?;
+    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone())?;
     let bridge = PairingBridge {
         on_chunk,
+        stop_phase,
         vad,
         vad_tap,
         vad_rate: vad_rate as i64,
@@ -1473,7 +1766,7 @@ pub fn open_stream(
         secondary_fifo: VecDeque::new(),
         last_emitted_primary_pts: 0,
     };
-    Ok(FlexStream::spawn(stream, bridge, on_event))
+    Ok(FlexStream::spawn(stream, bridge, on_event, settle_tsfn))
 }
 
 /// デバイス着脱を監視し、イベントをコールバックへ送る `DeviceWatcherHandle` を返す。
@@ -1527,10 +1820,14 @@ pub fn watch_devices(
 #[napi(js_name = "__openMockStream")]
 #[allow(clippy::too_many_arguments)]
 pub fn open_mock_stream(
+    env: Env,
     sample_rate: u32,
     channels: u16,
     freq_hz: f64,
-    #[napi(ts_arg_type = "(chunk: JsAudioChunk) => void")] on_chunk: ChunkTsfn,
+    #[napi(ts_arg_type = "(chunk: JsAudioChunk) => void")] on_chunk: Function<
+        JsAudioChunk,
+        Unknown,
+    >,
     secondary_rate: Option<u32>,
     secondary_channels: Option<u16>,
     secondary_encoding: Option<String>,
@@ -1595,8 +1892,12 @@ pub fn open_mock_stream(
     stream.start().map_err(to_napi_err)?;
     // モック経路は統合 denoise を通さない。VAD は `vadThreshold` 指定時のみ通す（flushVad・
     // vadEvents・ペア合成経路の検証が目的）。
+    let stop_phase = Arc::new(Mutex::new(StopPhase::Running));
+    let on_chunk = make_chunk_tsfn(&env, on_chunk, stop_phase.clone())?;
+    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone())?;
     let bridge = PairingBridge {
         on_chunk,
+        stop_phase,
         vad,
         vad_tap,
         vad_rate: 16_000,
@@ -1612,7 +1913,7 @@ pub fn open_mock_stream(
         secondary_fifo: VecDeque::new(),
         last_emitted_primary_pts: 0,
     };
-    Ok(FlexStream::spawn(stream, bridge, None))
+    Ok(FlexStream::spawn(stream, bridge, None, settle_tsfn))
 }
 
 // ---------------------------------------------------------------------------

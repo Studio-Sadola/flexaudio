@@ -15,12 +15,13 @@ use flexaudio_core::clock::monotonic_now_ns;
 use flexaudio_core::types::Error;
 
 use objc2_core_audio::{
-    kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioTapPropertyFormat,
-    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
-    AudioObjectPropertyAddress,
+    kAudioHardwareBadPropertySizeError, kAudioHardwarePropertyTranslatePIDToProcessObject,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject,
+    kAudioTapPropertyFormat, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioObjectID, AudioObjectPropertyAddress,
 };
 use objc2_core_audio_types::{kAudioFormatFlagIsFloat, AudioStreamBasicDescription};
+use objc2_core_foundation::{CFRetained, CFString};
 
 /// CoreAudio の `OSStatus` 成功値 `noErr`。
 pub(crate) const NO_ERR: i32 = 0;
@@ -74,13 +75,51 @@ pub(crate) fn map_os_status(ctx: &str, status: i32) -> Error {
     }
 }
 
-/// global scope / main element のプロパティアドレスを作る。
-fn global_address(selector: u32) -> AudioObjectPropertyAddress {
+/// プロパティアドレスを scope / main element 指定で作る。
+fn property_address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress {
         mSelector: selector,
-        mScope: kAudioObjectPropertyScopeGlobal,
+        mScope: scope,
         mElement: kAudioObjectPropertyElementMain,
     }
+}
+
+/// global scope / main element のプロパティアドレスを作る。
+fn global_address(selector: u32) -> AudioObjectPropertyAddress {
+    property_address(selector, kAudioObjectPropertyScopeGlobal)
+}
+
+/// CFString 型プロパティ（デバイス名 / UID / プロセスの bundle ID）を読んで `String`
+/// にする。取得できなければ `None`。
+///
+/// これらのプロパティは `CFStringRef` を +1 retain で返す（CF の Copy 規約）。
+/// `CFRetained::from_raw` で所有権を受け取り、drop で release する。
+pub(crate) fn read_cfstring_property(
+    object: AudioObjectID,
+    selector: u32,
+    scope: u32,
+) -> Option<String> {
+    let addr = property_address(selector, scope);
+    let mut cf_ref: *const CFString = core::ptr::null();
+    let mut size = core::mem::size_of::<*const CFString>() as u32;
+    // SAFETY: addr/size は有効なローカル。out は CFStringRef 1 個ぶんのポインタ領域。
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            NonNull::from(&addr),
+            0,
+            core::ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::new_unchecked((&mut cf_ref as *mut *const CFString).cast::<c_void>()),
+        )
+    };
+    if status != NO_ERR || cf_ref.is_null() {
+        return None;
+    }
+    // SAFETY: cf_ref は OS が +1 retain して返した有効な CFString。from_raw で所有権を取り、
+    // この関数を抜けるときに drop が release する。
+    let cf = unsafe { CFRetained::from_raw(NonNull::new_unchecked(cf_ref as *mut CFString)) };
+    Some(cf.to_string())
 }
 
 /// PID を `AudioObjectID`（プロセスオブジェクト）へ変換する。
@@ -117,9 +156,29 @@ pub(crate) fn translate_pid_to_object(pid: i32) -> Result<AudioObjectID, Error> 
 /// （`kAudioHardwarePropertyDevices` のデバイス一覧、`kAudioHardwarePropertyProcessObjectList`
 /// のプロセスオブジェクト一覧など）。
 ///
+/// size 照会と data 読みのあいだに一覧の大きさが変わると
+/// `kAudioHardwareBadPropertySizeError` になり得るので、一時的な失敗は数回読み直す。
+/// `GetPropertyData` に渡す大きさは要素数 × 要素の大きさ（確保したバッファちょうどの
+/// バイト数）。
+///
 /// 失敗時は生の `OSStatus` を返す。空扱いにするか [`map_os_status`] で型付きエラーにするかは
 /// 呼び出し側が決める（デバイス列挙は空扱い、プロセス列挙は型付きエラー）。
 pub(crate) fn read_system_object_list(selector: u32) -> Result<Vec<AudioObjectID>, i32> {
+    const MAX_ATTEMPTS: u32 = 4;
+    let mut last_status = NO_ERR;
+    for _ in 0..MAX_ATTEMPTS {
+        match read_system_object_list_once(selector) {
+            Ok(ids) => return Ok(ids),
+            Err(status) if status == kAudioHardwareBadPropertySizeError => {
+                last_status = status;
+            }
+            Err(status) => return Err(status),
+        }
+    }
+    Err(last_status)
+}
+
+fn read_system_object_list_once(selector: u32) -> Result<Vec<AudioObjectID>, i32> {
     let address = global_address(selector);
     let mut size: u32 = 0;
     // SAFETY: address/size は有効なローカル。qualifier 不要（null/0）。
@@ -135,19 +194,21 @@ pub(crate) fn read_system_object_list(selector: u32) -> Result<Vec<AudioObjectID
     if status != NO_ERR {
         return Err(status);
     }
-    let count = size as usize / core::mem::size_of::<AudioObjectID>();
+    let elem = core::mem::size_of::<AudioObjectID>();
+    let count = size as usize / elem;
     if count == 0 {
         return Ok(Vec::new());
     }
     let mut ids: Vec<AudioObjectID> = vec![0; count];
-    // SAFETY: ids は count 要素ぶん確保済み。size はその総バイト数。
+    let mut data_size = (count * elem) as u32;
+    // SAFETY: ids は count 要素ぶん確保済み。data_size は要素数×要素の大きさ。
     let status = unsafe {
         AudioObjectGetPropertyData(
             kAudioObjectSystemObject as AudioObjectID,
             NonNull::from(&address),
             0,
             core::ptr::null(),
-            NonNull::from(&mut size),
+            NonNull::from(&mut data_size),
             NonNull::new_unchecked(ids.as_mut_ptr().cast::<c_void>()),
         )
     };
@@ -155,7 +216,7 @@ pub(crate) fn read_system_object_list(selector: u32) -> Result<Vec<AudioObjectID
         return Err(status);
     }
     // 実際に書かれた要素数に詰める（2 回の呼び出しの間に一覧が縮むことがある）。
-    ids.truncate(size as usize / core::mem::size_of::<AudioObjectID>());
+    ids.truncate(data_size as usize / elem);
     Ok(ids)
 }
 

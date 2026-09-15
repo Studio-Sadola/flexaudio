@@ -418,10 +418,11 @@ pub fn process_info_to_c(info: ProcessInfo) -> FlexProcessInfo {
 }
 
 /// `flexaudio_processes_free` の本体。各文字列の CString を復元して drop し、配列自体も
-/// `Vec` として復元して drop する。
+/// `Vec` として復元して drop する。同じポインタに対して **1 回だけ**呼ぶ。
 ///
 /// # Safety
-/// `arr`/`count` は `flexaudio_processes` が返したもの（または NULL/0）でなければならない。
+/// `arr`/`count` は `flexaudio_processes` が返したもの（または NULL/0）でなければならず、
+/// この関数は同じ `arr` に対して 1 回だけ呼ぶ。
 pub unsafe fn free_process_array(arr: *mut FlexProcessInfo, count: usize) {
     if arr.is_null() {
         return;

@@ -12,8 +12,9 @@ keywords = ["audio", "wasapi", "loopback", "capture", "windows"]
 categories = ["multimedia::audio", "os::windows-apis"]
 documentation = "https://docs.rs/flexaudio-os-windows"
 
-# Windows 専用クレート。非 Windows では lib.rs が `#![cfg(target_os = "windows")]`
-# で空コンパイルになり、windows 依存も以下の target 限定セクションでしか引かれない。
+# Windows 専用クレート。バックエンド本体は `#[cfg(target_os = "windows")]` で空コンパイルに
+# なり、windows 依存も以下の target 限定セクションでしか引かれない。ビルド番号の純粋関数
+# だけは非 Windows でもコンパイルする。
 [target.'cfg(target_os = "windows")'.dependencies]
 flexaudio-core = { path = "../flexaudio-core", version = "0.3.0" }
 
@@ -28,6 +29,9 @@ features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Threading",
+    # RtlGetVersion（互換モードで偽られない実ビルド番号）と OSVERSIONINFOW。
+    "Win32_System_SystemInformation",
+    "Wdk_System_SystemServices",
     "Win32_System_Variant",
     "Win32_Media_Audio",
     "Win32_Media_KernelStreaming",

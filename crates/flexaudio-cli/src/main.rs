@@ -127,8 +127,8 @@ struct Cli {
     list_devices: bool,
 
     /// 録音せず、プロセス別キャプチャ（`--source process --process-id <PID>`）の対象に
-    /// できる、音声出力を持つプロセスを一覧表示して終了する（`processes()`。`--source` 等とは
-    /// 独立に動く）。
+    /// できる、音声出力のセッション（ストリーム）を持つプロセスを一覧表示して終了する
+    /// （`processes()`。停止中・Idle も載る。`--source` 等とは独立に動く）。
     #[arg(long)]
     list_processes: bool,
 
@@ -730,8 +730,9 @@ fn list_processes() -> std::result::Result<(), String> {
     })?;
 
     if processes.is_empty() {
-        println!("音声出力を持つプロセスが見つかりませんでした。");
-        println!("（音を再生中のアプリがある状態で実行してください。）");
+        println!("音声出力のセッション（ストリーム）を持つプロセスは今ありません。");
+        println!("（プロセス別キャプチャはこの環境で使えます。一覧には停止中・Idle も載るので、");
+        println!("  空なのは「何も鳴っていない」ではなく、出力セッション自体が無い状態です。）");
         return Ok(());
     }
 

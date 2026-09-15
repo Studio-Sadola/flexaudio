@@ -14,8 +14,11 @@
 //! （読めなければ `/proc/<pid>/comm`）から取る。
 //!
 //! # 上限時間
-//! レジストリの往復は通常すぐ終わるが、ループに期限タイマー（[`LIST_DEADLINE`]）を
-//! 仕掛けてあり、応答が無くても必ず戻る（期限切れは `Err`）。
+//! 接続（`connect`）からレジストリ往復まで同じ期限（[`LIST_DEADLINE`]）の内側。
+//! 応答が無くても必ず戻る。期限切れでも出力ノードが 1 件でも集まっていればその分を
+//! `Ok` で返す（出力中か分からないものは `None`）。期限切れで出力ノードが 0 件なら
+//! `Err`（Client だけ集まった空リストを「使えるが今は無い」にしない）。期限内に完了して
+//! 本当に 0 件なら `Ok([])`。
 //!
 //! 返すのは生リスト（同じ PID のノードが複数あれば重複する）で、重複統合・自プロセス
 //! 除外・並べ替えは facade が行う。
@@ -33,7 +36,7 @@ use pipewire as pw;
 
 use crate::{pw_init_once, resolve_node_pid, NodeEntry};
 
-/// レジストリ往復の期限。これを過ぎたら打ち切って `Err` を返す。
+/// 接続＋レジストリ往復の期限。これを過ぎても集めた分があれば `Ok`、空なら `Err`。
 const LIST_DEADLINE: Duration = Duration::from_millis(2_000);
 
 /// プロセス別キャプチャがリンク対象にするアプリ出力ノードの `media.class`。
@@ -64,8 +67,10 @@ struct RegistrySnapshot {
 /// 音声出力ストリーム（`Stream/Output/Audio`）を持つプロセスを列挙する（生リスト）。
 ///
 /// PipeWire に接続できない（デーモン不在・`XDG_RUNTIME_DIR` 未設定など）ときや、
-/// 期限内にレジストリが応答しないときは [`Error::Backend`]。プロセス別キャプチャも同じ
-/// 環境では使えないので、`Err` は「この環境ではプロセス別キャプチャ不可」の合図になる。
+/// 期限内に出力ノードが 1 件も集まらなかったときは [`Error::Backend`]。期限切れでも
+/// 出力ノードが 1 件でもあればその分を `Ok` で返す（出力中か分からないものは `None`）。
+/// 期限内に完了して本当に 0 件なら `Ok([])`。プロセス別キャプチャも同じ環境では
+/// 使えないので、空の `Err` は「この環境ではプロセス別キャプチャ不可」の合図になる。
 pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     let snapshot = collect_snapshot().map_err(Error::Backend)?;
     Ok(build_process_list(&snapshot, read_executable))
@@ -140,14 +145,24 @@ fn non_empty(value: Option<&str>) -> Option<String> {
 /// 2 段目で bind したノードの info＝状態が届く）。加えて期限タイマーでループを必ず抜ける。
 fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
     pw_init_once();
+    let started = std::time::Instant::now();
 
     let main_loop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|e| format!("create pipewire main loop failed: {e}"))?;
     let context = pw::context::ContextRc::new(&main_loop, None)
         .map_err(|e| format!("create pipewire context failed: {e}"))?;
+    // 接続も期限の内側。connect 自体は中断できないので、戻ってきた時点で期限を過ぎて
+    // いればレジストリ待ちに入らず打ち切る。ハングした場合は facade の 3 秒上限
+    // （single-flight）が呼び出し側を解放する。
     let core = context
         .connect_rc(None)
         .map_err(|e| format!("connect to pipewire daemon failed (is PipeWire running?): {e}"))?;
+    if started.elapsed() >= LIST_DEADLINE {
+        return Err(format!(
+            "pipewire connect did not finish within {} ms",
+            LIST_DEADLINE.as_millis()
+        ));
+    }
     let registry = core
         .get_registry_rc()
         .map_err(|e| format!("get pipewire registry failed: {e}"))?;
@@ -278,30 +293,46 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
         })
         .register();
 
-    // 期限タイマー。レジストリが応答しなくてもループを必ず抜ける。
-    let timed_out = Rc::new(Cell::new(false));
-    let timed_out_for_timer = timed_out.clone();
-    let loop_for_timer = main_loop.clone();
-    let deadline = main_loop.loop_().add_timer(move |_expirations| {
-        timed_out_for_timer.set(true);
-        loop_for_timer.quit();
-    });
-    deadline
-        .update_timer(Some(LIST_DEADLINE), None)
-        .into_result()
-        .map_err(|e| format!("arm pipewire deadline timer failed: {e}"))?;
+    // 期限タイマー。接続に使った分を引いた残り時間。レジストリが応答しなくても
+    // ループを必ず抜ける。タイマーは run() 中ずっと生存させる。
+    let remaining = LIST_DEADLINE.saturating_sub(started.elapsed());
+    let timed_out = Rc::new(Cell::new(remaining.is_zero()));
+    let _deadline = if remaining.is_zero() {
+        None
+    } else {
+        let timed_out_for_timer = timed_out.clone();
+        let loop_for_timer = main_loop.clone();
+        let deadline = main_loop.loop_().add_timer(move |_expirations| {
+            timed_out_for_timer.set(true);
+            loop_for_timer.quit();
+        });
+        deadline
+            .update_timer(Some(remaining), None)
+            .into_result()
+            .map_err(|e| format!("arm pipewire deadline timer failed: {e}"))?;
+        Some(deadline)
+    };
 
     while !done.get() && !timed_out.get() {
         main_loop.run();
     }
-    if !done.get() {
+
+    finish_snapshot(done.get(), snapshot.take())
+}
+
+/// レジストリ収集の締め。`complete` は PipeWire の done が期限内に来たとき true。
+/// 期限切れで出力ノード 0 件なら Err（Client だけ集まった空リストを「使えるが今は無い」
+/// の `Ok([])` にしない）。期限内に完了して本当に 0 件なら `Ok` の空スナップショット。
+fn finish_snapshot(
+    complete: bool,
+    collected: RegistrySnapshot,
+) -> std::result::Result<RegistrySnapshot, String> {
+    if !complete && collected.nodes.is_empty() {
         return Err(format!(
             "pipewire registry did not answer within {} ms",
             LIST_DEADLINE.as_millis()
         ));
     }
-
-    let collected = snapshot.take();
     Ok(collected)
 }
 
@@ -386,6 +417,33 @@ mod tests {
         assert_eq!(non_empty(Some("  mpv ")).as_deref(), Some("mpv"));
         assert_eq!(non_empty(Some("   ")), None);
         assert_eq!(non_empty(None), None);
+    }
+
+    #[test]
+    fn timeout_with_no_output_nodes_is_err_even_if_clients_arrived() {
+        let mut snap = RegistrySnapshot::default();
+        snap.client_pid.insert(40, 1234);
+        snap.client_name.insert(40, "silent-client".into());
+        let err = finish_snapshot(false, snap).expect_err("timeout + 0 nodes must be Err");
+        assert!(
+            err.contains("did not answer"),
+            "timeout error should mention the deadline, got {err}"
+        );
+    }
+
+    #[test]
+    fn timeout_with_output_nodes_keeps_the_partial_list() {
+        let mut snap = RegistrySnapshot::default();
+        snap.nodes.insert(1, node(Some(40), None, Some("app")));
+        let got = finish_snapshot(false, snap).expect("timeout + some nodes is Ok");
+        assert_eq!(got.nodes.len(), 1);
+    }
+
+    #[test]
+    fn complete_with_zero_nodes_is_empty_ok() {
+        let snap = RegistrySnapshot::default();
+        let got = finish_snapshot(true, snap).expect("in-time empty is Ok");
+        assert!(got.nodes.is_empty());
     }
 
     #[test]

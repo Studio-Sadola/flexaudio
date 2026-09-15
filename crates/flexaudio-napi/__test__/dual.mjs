@@ -51,14 +51,15 @@ async function dualOutput() {
         secShapeBad = `secondary.data is not Int16Array (encoding=${s.encoding})`;
       }
       if (s.encoding !== 's16') secShapeBad = `secondary.encoding !== 's16' (${s.encoding})`;
-      if (s.data.length !== 320) secShapeBad = `secondary length ${s.data.length} !== 320 (16k/mono 20ms)`;
+      if (primary.frames !== 0 && s.data.length !== 320) {
+        secShapeBad = `secondary length ${s.data.length} !== 320 (16k/mono 20ms)`;
+      }
     }
     chunks.push(rec);
   }, 16000, 1, 's16');
 
   await sleep(700);
-  stream.stop();
-  await sleep(150);
+  await stream.stop();
 
   console.log(`[A1] primary chunks: ${chunks.length}, paired-with-secondary: ${pairedCount}`);
   assert(chunks.length > 0, 'expected primary chunks');
@@ -130,8 +131,7 @@ async function flushVadMidStream() {
   checkVadEvents(events);
   console.log('[B2] atNs recording-0-based & monotonic OK');
 
-  stream.stop();
-  await sleep(150);
+  await stream.stop();
   checkVadEvents(events); // stop 自動 flush 後も単調非減少。
   console.log('[B] FLUSHVAD MID-STREAM OK');
 }
@@ -152,8 +152,7 @@ async function flushVadOnStop() {
   await sleep(300);
   assert(events.length === 0, `expected no vad events before stop, got ${events.length}`);
 
-  stream.stop();      // flushVad は呼ばない。stop が自動実行するはず。
-  await sleep(200);
+  await stream.stop();      // flushVad は呼ばない。stop が自動実行するはず。
 
   const ends = events.filter((e) => e.type === 'speechEnd');
   console.log(`[C1] speechEnd delivered via stop auto-flush: ${ends.length}`);

@@ -65,10 +65,7 @@ async function main() {
   // 一定時間チャンクを受信。
   await new Promise((r) => setTimeout(r, 500));
 
-  stream.stop();
-
-  // stop 後に追加で少し待ち、コールバックの残りを消化させてから判定。
-  await new Promise((r) => setTimeout(r, 100));
+  await stream.stop();
 
   console.log(`[2] received ${received} chunk(s)`);
   assert(received > 0, 'expected received > 0 chunks');

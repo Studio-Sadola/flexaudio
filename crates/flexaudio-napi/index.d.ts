@@ -106,7 +106,7 @@ export interface JsVadEvent {
   atSample: number
   /**
    * 録音 0 起点の絶対ナノ秒（`number`＝f64）。統合 VAD（`openStream` の `vad`）経由でのみ
-   * 埋まる（チャンクの `ptsNs` とチャンク内オフセットから F4 再基準化式で算出）。同一
+   * 埋まる（チャンクの `ptsNs` と、VAD 内部レートでのチャンク内オフセットから算出）。同一
    * チャンクで配送され、チャンクをまたいで単調非減少。`flushVad` の最終イベントも同じ
    * `vadEvents` 配列に載る。単体 `Vad` クラス（`process`/`flush`）は pts 文脈が無いため
    * `undefined`。（時刻は録音長で有界なので `number`。生 u64 カウンタの `seq` のみ `bigint`。）
@@ -239,22 +239,28 @@ export interface OpenOptions {
 export declare function devices(): Array<JsDeviceInfo>
 /**
  * プロセス別キャプチャ（`openStream({ kind: 'process', processId })`）の対象にできる、
- * 音声出力を持つプロセスを列挙する。呼び出し元プロセス自身は含まない。
+ * 音声出力のセッション（ストリーム）を持つプロセスを列挙する。呼び出し元プロセス自身は
+ * 含まない。停止中・Idle も載る。今鳴っているかは `isOutputActive` で見る。
  *
  * 並びは「出力中（`isOutputActive: true`）が先頭 → 表示名 → pid」で、同じ pid は 1 件に
  * まとめてある。読み取り専用で権限プロンプトは出さない。OS の応答が無くても最大 3 秒で
- * 戻る（同期関数なので呼び出し中はそのスレッドを塞ぐ。通常は数十 ms）。
+ * 戻る。libuv スレッドプールで実行するので JS のイベントループは塞がない。
  *
- * - Linux（PipeWire）: `Stream/Output/Audio` ノードを持つクライアント。
- * - Windows: 有効な出力デバイスの音声セッションを持つプロセス（列挙はどの版でも動くが、
- *   その pid を録るプロセスループバックは Windows 11 / build 20348 以降が必要）。
- * - macOS 14.4+: Core Audio のプロセスオブジェクト（`bundleId` 付き）。
+ * - Linux（PipeWire）: `Stream/Output/Audio` ノードを持つクライアント。`executable` は
+ *   `/proc/<pid>/exe`、読めなければ `/proc/<pid>/comm`。
+ * - Windows: 有効な出力デバイスの音声セッションを持つプロセス。列挙も録音も
+ *   Windows build 20348 or later (Windows 11 / Windows Server 2022) が必要。
+ * - macOS 14.4+: Core Audio が把握しているプロセスオブジェクト（`bundleId` 付き。
+ *   入力だけのプロセスも含む）。
  *
- * 戻り値の読み方: 空配列＝プロセス別キャプチャは使えるが今は候補が無い。throw＝この
- * 環境ではプロセス別キャプチャが使えない（Linux で PipeWire に繋がらない・macOS 14.4 未満
- * は `unsupported OS version`・その他 OS は `unsupported`）か、OS が時間内に応答しなかった。
+ * 戻り値の読み方: 空配列＝プロセス別キャプチャは使えるが、そういうプロセスが今は無い
+ * （「何も鳴っていない」ではない）。reject＝この環境ではプロセス別キャプチャが使えない
+ * （Linux で PipeWire に届かない・macOS 14.4 未満 / Windows build 20348 未満は
+ * `unsupported OS version`・その他 OS は `unsupported`・権限拒否）、OS が時間内に
+ * 応答しなかった、または前の問い合わせがまだ終わっていない（同期時代と同じ `Error`
+ * 型・文言）。
  */
-export declare function processes(): Array<JsProcessInfo>
+export declare function processes(): Promise<Array<JsProcessInfo>>
 /**
  * ストリームを開いて開始し、チャンク/イベントをコールバックへ送る `FlexStream` を返す。
  *
@@ -309,8 +315,13 @@ export declare function __openMockStream(sampleRate: number, channels: number, f
  * 所有・ポーリングし、チャンク/イベントを TSFN 経由で JS へ送る。
  */
 export declare class FlexStream {
-  /** 録音を停止し bridge スレッドを join する。二重呼び出し安全。 */
-  stop(): void
+  /**
+   * 録音を停止する。Promise が resolve した時点で、stop の前に TSFN へ積まれた
+   * `onChunk`（最後の PCM と `frames:0` の締め）はすべて JS に渡し終わっている。
+   * 二重呼び出しは同じ完了を待つ／済みなら即 resolve。`onChunk` の中から呼んでも
+   * JS スレッドで join しないので固まらない。
+   */
+  stop(): Promise<void>
   /**
    * 録音を止めずに入力ソース（mic/system/process）をホットスワップする。
    *

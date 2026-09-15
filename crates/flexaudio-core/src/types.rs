@@ -127,11 +127,16 @@ pub struct DeviceInfo {
 /// `processes()` が 1 プロセスにつき返す情報（プロセス別キャプチャの対象候補）。
 ///
 /// 全 OS バックエンド共通の形。列挙されるのは「今そのプロセス別キャプチャ経路
-/// （[`SourceKind::ProcessLoopback`]）で録れる見込みがある、音声出力を持つプロセス」:
+/// （[`SourceKind::ProcessLoopback`]）で録れる見込みがある、音声出力のセッション
+/// （ストリーム）を持つプロセス」。停止中・Idle も載る。今鳴っているかは
+/// [`is_output_active`](Self::is_output_active) で見る:
 /// - Linux（PipeWire）: `Stream/Output/Audio` ノードを持つ Client（PID は Client の
 ///   `pipewire.sec.pid`＝デーモンがソケット資格情報から付与する値）。
-/// - Windows（WASAPI）: 有効な render エンドポイント上の音声セッションを持つプロセス。
-/// - macOS（Core Audio, 14.4+）: Core Audio のプロセスオブジェクト。
+/// - Windows（WASAPI）: 有効な render エンドポイント上の音声セッションを持つプロセス
+///   （Windows build 20348 or later (Windows 11 / Windows Server 2022)。未満は列挙
+///   自体が [`Error::UnsupportedOsVersion`]）。
+/// - macOS（Core Audio, 14.4+）: Core Audio が把握しているプロセスオブジェクト
+///   （入力だけのプロセスを含む）。
 ///
 /// [`pid`](Self::pid) を [`StreamConfig::target_pid`] に渡せばそのプロセスを録れる。
 /// `name` / `executable` / `bundle_id` は表示用で、アプリ自身が名乗る値を含むので
@@ -144,6 +149,7 @@ pub struct ProcessInfo {
     /// 実行ファイル名 → bundle ID → `"pid <N>"` の順で決まる。
     pub name: String,
     /// 実行ファイルのベース名（例 `firefox` / `chrome.exe`）。取得できたときだけ `Some`。
+    /// Linux は `/proc/<pid>/exe` を試し、読めなければ `/proc/<pid>/comm` に落ちる。
     pub executable: Option<String>,
     /// macOS の bundle ID（例 `com.apple.Music`）。macOS で取得できたときだけ `Some`。
     pub bundle_id: Option<String>,

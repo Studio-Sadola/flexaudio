@@ -8,6 +8,12 @@
 //!
 //! を読む。実行ファイル名は `proc_pidpath`（libSystem）で取る。
 //!
+//! 載せる範囲は Linux / Windows と完全には揃わない。Core Audio のプロセスオブジェクト
+//! 属性（`kAudioProcessPropertyDevices` は「今使っているデバイス」、
+//! `IsRunningOutput` は「今出力 IO が動いているか」）では「出力を持ったことがない」
+//! プロセスだけを、停止中・Idle の出力プロセスを落とさずに判別できない。そのため
+//! 入力だけのプロセスも含め、Core Audio が把握しているプロセスをそのまま載せる。
+//!
 //! Process Tap と同じく macOS 14.4 以上が前提で、未満は [`Error::UnsupportedOsVersion`]
 //! （[`MacProcessBackend`](crate::MacProcessBackend) の `start` と同じゲート）。
 //! 列挙は読み取り専用で、tap を作らないので TCC（`kTCCServiceAudioCapture`）の
@@ -28,8 +34,7 @@ use objc2_core_audio::{
 use flexaudio_core::process_list::executable_basename;
 use flexaudio_core::types::{ProcessInfo, Result};
 
-use crate::common::{map_os_status, read_system_object_list, NO_ERR};
-use crate::devices::read_cfstring_property;
+use crate::common::{map_os_status, read_cfstring_property, read_system_object_list, NO_ERR};
 
 // libproc（libSystem に常在）。PID の実行ファイルの絶対パスを buffer へ書き、書いた
 // バイト数（NUL 除く）を返す。失敗時は 0 以下。
@@ -45,6 +50,9 @@ const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
 /// 14.4 未満は [`Error::UnsupportedOsVersion`](flexaudio_core::types::Error)。プロセス
 /// オブジェクト一覧そのものを読めないときは `OSStatus` を型付きエラーへ写して返す
 /// （[`map_os_status`]）。個々のオブジェクトの PID が読めないものは飛ばす。
+/// 載せるのは Core Audio が把握しているプロセス（入力だけも含む）。出力を持ったことが
+/// ないプロセスだけを落とす属性は無い（`Devices` は今使っているデバイス、
+/// `IsRunningOutput` は今動いているか）。
 pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     crate::version::ensure_process_tap_supported()?;
 

@@ -25,11 +25,10 @@ use objc2_core_audio::{
     AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
 };
 use objc2_core_audio_types::AudioBufferList;
-use objc2_core_foundation::{CFRetained, CFString};
 
 use flexaudio_core::types::{DeviceInfo, Result, SourceKind};
 
-use crate::common::{read_system_object_list, FALLBACK_FORMAT};
+use crate::common::{read_cfstring_property, read_system_object_list, FALLBACK_FORMAT};
 
 /// プロパティアドレスを scope/element 指定で作る。
 fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
@@ -46,39 +45,6 @@ fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
 /// 共有の [`read_system_object_list`]。
 fn all_device_ids() -> Vec<AudioObjectID> {
     read_system_object_list(kAudioHardwarePropertyDevices).unwrap_or_default()
-}
-
-/// CFString 型プロパティ（名前 / UID / bundle ID）を読んで `String` にする。取得できなければ
-/// `None`。デバイス列挙とプロセス列挙（`kAudioProcessPropertyBundleID`）が共有する。
-///
-/// これらのプロパティは `CFStringRef` を +1 retain で返す（CF の Copy 規約）。
-/// `CFRetained::from_raw` で所有権を受け取り、drop で release する。
-pub(crate) fn read_cfstring_property(
-    object: AudioObjectID,
-    selector: u32,
-    scope: u32,
-) -> Option<String> {
-    let addr = address(selector, scope);
-    let mut cf_ref: *const CFString = core::ptr::null();
-    let mut size = core::mem::size_of::<*const CFString>() as u32;
-    // SAFETY: addr/size は有効なローカル。out は CFStringRef 1 個ぶんのポインタ領域。
-    let status = unsafe {
-        AudioObjectGetPropertyData(
-            object,
-            NonNull::from(&addr),
-            0,
-            core::ptr::null(),
-            NonNull::from(&mut size),
-            NonNull::new_unchecked((&mut cf_ref as *mut *const CFString).cast::<c_void>()),
-        )
-    };
-    if status != 0 || cf_ref.is_null() {
-        return None;
-    }
-    // SAFETY: cf_ref は OS が +1 retain して返した有効な CFString。from_raw で所有権を取り、
-    // この関数を抜けるときに drop が release する。
-    let cf = unsafe { CFRetained::from_raw(NonNull::new_unchecked(cf_ref as *mut CFString)) };
-    Some(cf.to_string())
 }
 
 /// デバイスの `kAudioDevicePropertyNominalSampleRate`（output scope, Float64）を読む。
