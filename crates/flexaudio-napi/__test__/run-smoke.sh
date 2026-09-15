@@ -3,7 +3,10 @@
 # napi CLI を使わず cargo build + 手動リネームで .node を用意（ネット最小化）。
 set -euo pipefail
 
-. "$HOME/.cargo/env"
+if [[ -f "$HOME/.cargo/env" ]]; then
+  # shellcheck source=/dev/null
+  . "$HOME/.cargo/env"
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"   # flexaudio ルート
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -1,6 +1,6 @@
 {
   "name": "@studio-sadola/flexaudio",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Flexible cross-platform audio capture (microphone, system loopback, per-process) for Node.js, via native N-API bindings to the flexaudio Rust library.",
   "author": "tubome (Studio Sadola)",
   "license": "MIT",
@@ -43,10 +43,11 @@
     "node": ">= 16"
   },
   "optionalDependencies": {
-    "@studio-sadola/flexaudio-linux-x64-gnu": "0.2.0",
-    "@studio-sadola/flexaudio-linux-arm64-gnu": "0.2.0",
-    "@studio-sadola/flexaudio-win32-x64-msvc": "0.2.0",
-    "@studio-sadola/flexaudio-darwin-arm64": "0.2.0"
+    "@studio-sadola/flexaudio-linux-x64-gnu": "0.3.0",
+    "@studio-sadola/flexaudio-linux-arm64-gnu": "0.3.0",
+    "@studio-sadola/flexaudio-win32-x64-msvc": "0.3.0",
+    "@studio-sadola/flexaudio-win32-arm64-msvc": "0.3.0",
+    "@studio-sadola/flexaudio-darwin-arm64": "0.3.0"
   },
   "scripts": {
     "artifacts": "napi artifacts",

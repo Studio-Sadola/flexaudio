@@ -461,9 +461,9 @@ void flexaudio_devices_free(struct FlexDeviceInfo *arr,
 // 成功で 0。候補が無ければ 0 件（`out_array=NULL` / `out_count=0`）で成功
 // （プロセス別キャプチャは使えるが、そういうプロセスが今は無い）。確保した配列は
 // `flexaudio_processes_free` で **1 回だけ** 解放する。この環境でプロセス別キャプチャが
-// 使えない（Linux で PipeWire に届かない・macOS 14.4 未満・Windows が
-// Windows build 20348 or later (Windows 11 / Windows Server 2022) 未満・
-// 非対応 OS・権限拒否）、OS が 3 秒以内に応答しなかった、または前の問い合わせが
+// 使えない（Linux で PipeWire に届かない・macOS 14.4 未満・Windows build 20348
+// 以上（Windows 11・Windows Server 2022）でない・非対応 OS・権限拒否）、OS が
+// 3 秒以内に応答しなかった、または前の問い合わせが
 // まだ終わっていないときは `FLEX_FAILURE`（理由は `flexaudio_last_error`）。
 //
 // # Safety

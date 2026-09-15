@@ -1,4 +1,4 @@
-<!-- THIRD_PARTY_NOTICES.md — generated/curated for flexaudio v0.2.0 distribution. -->
+<!-- THIRD_PARTY_NOTICES.md — generated/curated for flexaudio v0.3.0 distribution. -->
 <!-- See README and individual upstream repositories for canonical license text. -->
 
 # Third-Party Notices

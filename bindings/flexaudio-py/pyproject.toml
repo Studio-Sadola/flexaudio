@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "flexaudio"
-version = "0.2.0"
+version = "0.3.0"
 description = "Flexible cross-platform audio capture (microphone, system loopback, per-process) for Python, via native bindings to the flexaudio Rust library."
 readme = "README.md"
 requires-python = ">=3.8"

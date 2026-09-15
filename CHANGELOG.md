@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **0.x stability note:** while in the `0.x` series the public API is not yet
 > stable. Per SemVer, a **minor** bump (`0.2 → 0.3`) may include breaking
 > changes; **patch** bumps (`0.2.0 → 0.2.1`) remain backward-compatible. Pin to
-> `0.2` to receive only compatible updates.
+> `0.3` to receive only compatible updates.
 
 ## [Unreleased]
 
@@ -137,5 +137,6 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
 - Declared per-crate MSRV: `1.85` for core/facade/OS/mic crates, `1.88` for
   `flexaudio-vad` and `flexaudio-napi`.
 
-[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Studio-Sadola/flexaudio/releases/tag/v0.2.0

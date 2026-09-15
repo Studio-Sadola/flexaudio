@@ -85,6 +85,21 @@ jobs:
       - name: Test (ignored real-audio tests auto-skip)
         run: cargo test -p flexaudio -p flexaudio-os-macos -p flexaudio-mic -p flexaudio-core -p flexaudio-cli
 
+  napi-contract-linux:
+    name: N-API contract (Linux / mock)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
+      - name: N-API smoke / dual / async-api (mock only)
+        run: bash crates/flexaudio-napi/__test__/run-smoke.sh
+
   msrv:
     name: MSRV 1.85 (core/facade/mic/os-linux/cli)
     runs-on: ubuntu-latest

@@ -1,12 +1,18 @@
 # Releasing flexaudio
 
-Releases are cut by pushing a version tag (e.g. `v0.2.0`), which triggers the
+Releases are cut by pushing a version tag (e.g. `v0.3.0`), which triggers the
 three workflows in `.github/workflows/release-*.yml`.
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
+
+## 0.3.0 — not yet released
+
+0.3.0 is not published. Tag `v0.3.0` only when the remaining work is done; the
+0.2.0 registry-status table below stays as the last published snapshot until
+then.
 
 ## Registry status — 0.2.0
 
