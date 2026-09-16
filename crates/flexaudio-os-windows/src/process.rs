@@ -34,9 +34,9 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::{
     ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
-    IAudioClient, AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
-    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
-    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+    IAudioClient, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDIOCLIENT_ACTIVATION_PARAMS,
+    AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
     PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
     WAVEFORMATEX,
 };
@@ -403,9 +403,15 @@ pub(crate) unsafe fn setup_process_loopback(
         .cast()
         .map_err(|e| map_hr("cast activated IUnknown to IAudioClient", e))?;
 
-    // 固定フォーマットで Initialize（LOOPBACK|EVENTCALLBACK）→ event → capture。
+    // 固定フォーマットで Initialize → event → capture。
+    // AUTOCONVERTPCM は公式 ApplicationLoopback サンプルと同じ旗（プロセスループバックは
+    // MixFormat を返さないので、要求形式への変換をエンジンに任せる）。
     let wfx = fixed_process_format();
-    let (capture, event) = init_loopback_capture(&client, &wfx as *const WAVEFORMATEX)?;
+    let (capture, event) = init_loopback_capture(
+        &client,
+        &wfx as *const WAVEFORMATEX,
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    )?;
 
     // params/prop/handler/op をここまで生かしてから drop（BLOB 参照・ハンドラ生存）。
     drop(op);

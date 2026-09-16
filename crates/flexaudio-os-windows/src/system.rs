@@ -408,7 +408,7 @@ unsafe fn setup_system_loopback(
     };
 
     // Initialize（LOOPBACK|EVENTCALLBACK）→ event → capture サービス。
-    let init = init_loopback_capture(&client, pwfx as *const WAVEFORMATEX);
+    let init = init_loopback_capture(&client, pwfx as *const WAVEFORMATEX, 0);
     // pwfx は Initialize がフォーマットをコピーするので、ここで解放してよい。
     CoTaskMemFree(Some(pwfx as *const _ as *const _));
     let (capture, event) = init?;

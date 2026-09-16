@@ -258,6 +258,10 @@ pub(crate) unsafe fn capture_loop(
 ///
 /// `pwfx` は Initialize に渡すフォーマット（System は `GetMixFormat` の生ポインタ、
 /// Process は自前固定 WAVEFORMATEX のポインタ）。
+/// `AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK` は常に付ける。
+/// `extra_streamflags` はそれに足す旗（プロセスループバックは公式
+/// ApplicationLoopback サンプルと同じ `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`、
+/// 古典 loopback は `0`）。
 ///
 /// # Safety
 /// `client` は同一スレッドで Activate 済みの有効な COM オブジェクト。`pwfx` は有効な
@@ -265,11 +269,12 @@ pub(crate) unsafe fn capture_loop(
 pub(crate) unsafe fn init_loopback_capture(
     client: &IAudioClient,
     pwfx: *const WAVEFORMATEX,
+    extra_streamflags: u32,
 ) -> Result<(IAudioCaptureClient, HANDLE), Error> {
     client
         .Initialize(
             AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | extra_streamflags,
             0, // hnsBufferDuration: 0 = エンジン既定
             0, // hnsPeriodicity: 共有モードは 0
             pwfx,
