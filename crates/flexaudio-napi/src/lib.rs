@@ -165,12 +165,34 @@ fn take_stop_waiters(phase: &Mutex<StopPhase>) -> Vec<SendDeferred> {
     }
 }
 
+/// chunk TSFN のクローン置き場。`StopFlushed` / 決着用コールバックが resolve のあと
+/// unref するために使う（作成時点では TSFN がまだ無いので後から差し込む）。
+type ChunkTsfnSlot = Arc<Mutex<Option<ChunkTsfn>>>;
+
+/// 配送 TSFN のイベントループ保持を外す。`stop()` 決着のあと、ストリーム参照が
+/// 残っていても Node が自分で終われるようにする。idempotent（二回目は no-op）。
+fn unref_chunk_tsfn(tsfn: &ChunkTsfn, env: &Env) {
+    if tsfn.aborted() {
+        return;
+    }
+    let mut tsfn = tsfn.clone();
+    let _ = tsfn.unref(env);
+}
+
+fn unref_chunk_slot(slot: &Mutex<Option<ChunkTsfn>>, env: &Env) {
+    if let Some(tsfn) = slot.lock().unwrap_or_else(lock_poisoned).as_mut() {
+        let _ = tsfn.unref(env);
+    }
+}
+
 /// ユーザーの `onChunk` を呼ぶ TSFN。チャンクはユーザーへ渡し、`StopFlushed` は同じ列で
 /// deferred を resolve する（ユーザーの onChunk は呼ばない）。ポンプ関数は no-op。
+/// resolve のあと chunk TSFN を unref し、ループ保持を解放する。
 fn make_chunk_tsfn(
     env: &Env,
     on_chunk: Function<JsAudioChunk, Unknown>,
     stop_phase: Arc<Mutex<StopPhase>>,
+    chunk_slot: ChunkTsfnSlot,
 ) -> napi::Result<ChunkTsfn> {
     let mut refer = ptr::null_mut();
     check_status!(unsafe { sys::napi_create_reference(env.raw(), on_chunk.raw(), 1, &mut refer) })?;
@@ -181,38 +203,48 @@ fn make_chunk_tsfn(
 
     let pump =
         env.create_function_from_closure("flexaudioChunkPump", |ctx| ctx.env.get_undefined())?;
-    pump.create_threadsafe_function::<ChunkEmit, Unknown, _, ErrorStrategy::Fatal>(0, {
-        let user = user;
-        move |ctx: ThreadSafeCallContext<ChunkEmit>| {
-            let refer = user.refer;
-            match ctx.value {
-                ChunkEmit::Chunk(chunk) => {
-                    let mut value = ptr::null_mut();
-                    check_status!(unsafe {
-                        sys::napi_get_reference_value(ctx.env.raw(), refer, &mut value)
-                    })?;
-                    let func: Function<JsAudioChunk, Unknown> =
-                        unsafe { Function::from_napi_value(ctx.env.raw(), value)? };
-                    let _ = func.call(*chunk);
-                    Ok(Vec::<Unknown>::new())
-                }
-                ChunkEmit::StopFlushed => {
-                    for deferred in take_stop_waiters(&stop_phase) {
-                        resolve_undefined(ctx.env.raw(), deferred);
+    let tsfn =
+        pump.create_threadsafe_function::<ChunkEmit, Unknown, _, ErrorStrategy::Fatal>(0, {
+            let user = user;
+            let chunk_slot = chunk_slot.clone();
+            move |ctx: ThreadSafeCallContext<ChunkEmit>| {
+                let refer = user.refer;
+                match ctx.value {
+                    ChunkEmit::Chunk(chunk) => {
+                        let mut value = ptr::null_mut();
+                        check_status!(unsafe {
+                            sys::napi_get_reference_value(ctx.env.raw(), refer, &mut value)
+                        })?;
+                        let func: Function<JsAudioChunk, Unknown> =
+                            unsafe { Function::from_napi_value(ctx.env.raw(), value)? };
+                        let _ = func.call(*chunk);
+                        Ok(Vec::<Unknown>::new())
                     }
-                    Ok(Vec::<Unknown>::new())
+                    ChunkEmit::StopFlushed => {
+                        for deferred in take_stop_waiters(&stop_phase) {
+                            resolve_undefined(ctx.env.raw(), deferred);
+                        }
+                        // 締めと resolve が終わってからループ保持を外す（順番の契約）。
+                        unref_chunk_slot(&chunk_slot, &ctx.env);
+                        Ok(Vec::<Unknown>::new())
+                    }
                 }
             }
-        }
-    })
+        })?;
+    *chunk_slot.lock().unwrap_or_else(lock_poisoned) = Some(tsfn.clone());
+    Ok(tsfn)
 }
 
 /// JS スレッドへ戻って stop() の Promise を決着させる専用 TSFN。
 /// chunk TSFN が Closing のとき（届けるべき onChunk はもう無い）に使う。
 ///
-/// chunk TSFN がイベントループを保持している間は、ここを unref してもコールバックは
-/// 落ちない。unref しないと stop 後もこの TSFN がループを生かし、プロセスが終了できない。
-fn make_settle_tsfn(env: &Env, stop_phase: Arc<Mutex<StopPhase>>) -> napi::Result<SettleTsfn> {
+/// 作成時から unref。生存中は chunk TSFN がループを保持するので決着コールバックは落ちない。
+/// ここへ来たとき（chunk がもう使えない）も resolve のあと chunk 側を unref する。
+fn make_settle_tsfn(
+    env: &Env,
+    stop_phase: Arc<Mutex<StopPhase>>,
+    chunk_slot: ChunkTsfnSlot,
+) -> napi::Result<SettleTsfn> {
     let pump =
         env.create_function_from_closure("flexaudioStopSettle", |ctx| ctx.env.get_undefined())?;
     let mut tsfn = pump.create_threadsafe_function::<(), Unknown, _, ErrorStrategy::Fatal>(0, {
@@ -220,6 +252,7 @@ fn make_settle_tsfn(env: &Env, stop_phase: Arc<Mutex<StopPhase>>) -> napi::Resul
             for deferred in take_stop_waiters(&stop_phase) {
                 resolve_undefined(ctx.env.raw(), deferred);
             }
+            unref_chunk_slot(&chunk_slot, &ctx.env);
             Ok(Vec::<Unknown>::new())
         }
     })?;
@@ -1391,6 +1424,7 @@ impl FlexStream {
             StopPhase::Stopped => {
                 drop(phase);
                 resolve_undefined(env.raw(), deferred);
+                unref_chunk_tsfn(&self.chunk_tsfn, &env);
                 return Ok(promise);
             }
             StopPhase::Stopping { waiters } => {
@@ -1413,6 +1447,7 @@ impl FlexStream {
                 for d in take_stop_waiters(&self.stop_phase) {
                     resolve_undefined(env.raw(), d);
                 }
+                unref_chunk_tsfn(&self.chunk_tsfn, &env);
             }
             Some(h) if chunk_closed => {
                 // chunk_tsfn.aborted() は napi-rs 2.16 では Rust 側フラグで、次のときだけ
@@ -1432,6 +1467,7 @@ impl FlexStream {
                 for d in take_stop_waiters(&self.stop_phase) {
                     resolve_undefined(env.raw(), d);
                 }
+                unref_chunk_tsfn(&self.chunk_tsfn, &env);
             }
             Some(h) => self.spawn_stop_worker(h),
         }
@@ -1778,8 +1814,9 @@ pub fn open_stream(
     stream.start().map_err(to_napi_err)?;
 
     let stop_phase = Arc::new(Mutex::new(StopPhase::Running));
-    let on_chunk = make_chunk_tsfn(&env, on_chunk, stop_phase.clone())?;
-    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone())?;
+    let chunk_slot: ChunkTsfnSlot = Arc::new(Mutex::new(None));
+    let on_chunk = make_chunk_tsfn(&env, on_chunk, stop_phase.clone(), chunk_slot.clone())?;
+    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone(), chunk_slot)?;
     let bridge = PairingBridge {
         on_chunk,
         stop_phase,
@@ -1925,8 +1962,9 @@ pub fn open_mock_stream(
     // モック経路は統合 denoise を通さない。VAD は `vadThreshold` 指定時のみ通す（flushVad・
     // vadEvents・ペア合成経路の検証が目的）。
     let stop_phase = Arc::new(Mutex::new(StopPhase::Running));
-    let on_chunk = make_chunk_tsfn(&env, on_chunk, stop_phase.clone())?;
-    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone())?;
+    let chunk_slot: ChunkTsfnSlot = Arc::new(Mutex::new(None));
+    let on_chunk = make_chunk_tsfn(&env, on_chunk, stop_phase.clone(), chunk_slot.clone())?;
+    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone(), chunk_slot)?;
     let bridge = PairingBridge {
         on_chunk,
         stop_phase,

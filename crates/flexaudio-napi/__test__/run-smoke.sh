@@ -33,3 +33,23 @@ node "$TEST_DIR/dual.mjs"
 
 echo "== node async-api.mjs =="
 node "$TEST_DIR/async-api.mjs"
+
+echo "== node exit.mjs (must self-exit within 10s) =="
+node "$TEST_DIR/exit.mjs" &
+exit_pid=$!
+exited=0
+for _ in $(seq 1 20); do
+  if ! kill -0 "$exit_pid" 2>/dev/null; then
+    exited=1
+    break
+  fi
+  sleep 0.5
+done
+if [[ "$exited" -eq 0 ]]; then
+  kill "$exit_pid" 2>/dev/null || true
+  wait "$exit_pid" 2>/dev/null || true
+  echo "ERROR: exit.mjs did not self-exit within 10s" >&2
+  exit 1
+fi
+wait "$exit_pid"
+echo "== exit.mjs self-exited =="
