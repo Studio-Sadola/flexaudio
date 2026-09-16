@@ -209,35 +209,59 @@ fn make_chunk_tsfn(
 
 /// JS スレッドへ戻って stop() の Promise を決着させる専用 TSFN。
 /// chunk TSFN が Closing のとき（届けるべき onChunk はもう無い）に使う。
+///
+/// chunk TSFN がイベントループを保持している間は、ここを unref してもコールバックは
+/// 落ちない。unref しないと stop 後もこの TSFN がループを生かし、プロセスが終了できない。
 fn make_settle_tsfn(env: &Env, stop_phase: Arc<Mutex<StopPhase>>) -> napi::Result<SettleTsfn> {
     let pump =
         env.create_function_from_closure("flexaudioStopSettle", |ctx| ctx.env.get_undefined())?;
-    pump.create_threadsafe_function::<(), Unknown, _, ErrorStrategy::Fatal>(0, {
+    let mut tsfn = pump.create_threadsafe_function::<(), Unknown, _, ErrorStrategy::Fatal>(0, {
         move |ctx: ThreadSafeCallContext<()>| {
             for deferred in take_stop_waiters(&stop_phase) {
                 resolve_undefined(ctx.env.raw(), deferred);
             }
             Ok(Vec::<Unknown>::new())
         }
-    })
+    })?;
+    tsfn.unref(env)?;
+    Ok(tsfn)
 }
 
-/// chunk TSFN に StopFlushed を積む。Closing なら決着用 TSFN へ。それも Closing なら
-/// Node 終了中なので deferred を捨ててよい。
+/// chunk TSFN に StopFlushed を積む。失敗（Closing / QueueFull など）なら決着用 TSFN へ。
+/// 決着用も失敗なら、JS スレッドへ戻れないので deferred を捨てる。
+///
+/// chunk TSFN は `max_queue_size=0`（無制限）なので QueueFull は通常来ない。万一起きた
+/// 場合、決着用は別列なので onChunk より先に resolve し得る。同じ列へ Blocking で
+/// 乗せ直して順番を守ってから、それでも失敗したときだけ決着用へ倒す。
 fn post_stop_flushed(chunk: &ChunkTsfn, settle: &SettleTsfn, phase: &Mutex<StopPhase>) {
     let st = chunk.call(
         ChunkEmit::StopFlushed,
         ThreadsafeFunctionCallMode::NonBlocking,
     );
-    if st == Status::Closing {
-        let st2 = settle.call((), ThreadsafeFunctionCallMode::NonBlocking);
-        if st2 == Status::Closing {
-            // 決着用 TSFN まで Closing = JS イベントループがもう動かない（Node 終了中）。
-            // この時だけ unresolved deferred を捨ててよい。JS が生きている限りは
-            // settle TSFN が JS スレッドで resolve_undefined する。
-            let _ = take_stop_waiters(phase);
+    if st == Status::Ok {
+        return;
+    }
+    if st != Status::Closing {
+        // QueueFull 等: 同じ TSFN 列へ Blocking で乗せ、積済み onChunk の後ろに付ける。
+        let st_block = chunk.call(ChunkEmit::StopFlushed, ThreadsafeFunctionCallMode::Blocking);
+        if st_block == Status::Ok {
+            return;
         }
     }
+    let st2 = settle.call((), ThreadsafeFunctionCallMode::NonBlocking);
+    if st2 == Status::Ok {
+        return;
+    }
+    if st2 != Status::Closing {
+        let st2b = settle.call((), ThreadsafeFunctionCallMode::Blocking);
+        if st2b == Status::Ok {
+            return;
+        }
+    }
+    // 決着用 TSFN まで失敗 = JS イベントループがもう動かない（Node 終了中）。
+    // この時だけ unresolved deferred を捨ててよい。JS が生きている限りは
+    // settle TSFN が JS スレッドで resolve_undefined する。
+    let _ = take_stop_waiters(phase);
 }
 
 /// libuv スレッドプールで `flexaudio::processes()` を実行する。
@@ -1281,7 +1305,7 @@ impl FlexStream {
             bridge.flush_vad_final(); // ③ 最終イベント + frames:0 の締め
                                       // ④ 同じ TSFN 列の終わりの合図。これが JS で処理されたとき stop() の Promise が
                                       // resolve する（AsyncTask / 別 TSFN だと onChunk より先に resolve し得る）。
-                                      // chunk TSFN が Closing なら決着用 TSFN へ（届けるべき onChunk はもう無い）。
+                                      // chunk TSFN が失敗（Closing / QueueFull など）なら決着用 TSFN へ。
             post_stop_flushed(&bridge.on_chunk, &settle_for_bridge, &bridge.stop_phase);
         });
 
@@ -1391,8 +1415,14 @@ impl FlexStream {
                 }
             }
             Some(h) if chunk_closed => {
-                // chunk TSFN は既に閉じている。届けるべき onChunk はもう無い
-                // （順番の契約は空に成立）。JS が生きているこのスレッドで即 resolve。
+                // chunk_tsfn.aborted() は napi-rs 2.16 では Rust 側フラグで、次のときだけ
+                // true になる:
+                //   - `abort()`（`napi_tsfn_abort`＝列の未処理アイテムを破棄して即破壊）
+                //   - TSFN の finalize（release 後。release モードでは未処理アイテムを
+                //     処理し終えてから finalize が走る）
+                // 「Closing だが列に onChunk が残っている」状態ではない。ここへ来た時点で
+                // 届けるべき onChunk はもう無い（破棄済み or 渡し済み）ので、順番の契約は
+                // 空に成立する。JS が生きているこのスレッドで即 resolve してよい。
                 // join は JS を止めないよう reaper に渡す。
                 let _ = thread::Builder::new()
                     .name("flexaudio-napi-reaper".into())
@@ -1688,7 +1718,9 @@ pub fn processes() -> AsyncTask<ProcessesTask> {
 /// `secondaryOutput` is set, the paired secondary chunk arrives as
 /// `chunk.secondary` (it is not a second callback argument). VAD results ride
 /// on the chunk of the tap selected by `vadTap`: `chunk.vadEvents` for
-/// 'primary', `chunk.secondary?.vadEvents` for 'secondary'.
+/// 'primary', `chunk.secondary?.vadEvents` for 'secondary'. Do not block
+/// synchronously inside `onChunk` (defer heavy work to a later task); blocking
+/// stalls terminator delivery and delays `stop()` resolving.
 #[napi]
 pub fn open_stream(
     env: Env,

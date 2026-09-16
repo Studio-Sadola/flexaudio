@@ -285,7 +285,9 @@ export declare function processes(): Promise<Array<JsProcessInfo>>
  * `secondaryOutput` is set, the paired secondary chunk arrives as
  * `chunk.secondary` (it is not a second callback argument). VAD results ride
  * on the chunk of the tap selected by `vadTap`: `chunk.vadEvents` for
- * 'primary', `chunk.secondary?.vadEvents` for 'secondary'.
+ * 'primary', `chunk.secondary?.vadEvents` for 'secondary'. Do not block
+ * synchronously inside `onChunk` (defer heavy work to a later task); blocking
+ * stalls terminator delivery and delays `stop()` resolving.
  */
 export declare function openStream(options: OpenOptions, onChunk: (chunk: JsAudioChunk) => void, onEvent?: ((event: JsStreamEvent) => void) | undefined | null): FlexStream
 /** デバイス着脱を監視し、イベントをコールバックへ送る `DeviceWatcherHandle` を返す。 */

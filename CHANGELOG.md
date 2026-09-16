@@ -71,7 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Rejection uses the same error type and message as the former thrown error.
 - **N-API `FlexStream.stop()` is async:** it returns `Promise<void>`. The
   promise resolves only after every `onChunk` queued before stop — including
-  the last PCM and the `frames:0` terminator — has been delivered to JS.
+  the last PCM and the `frames:0` terminator — has been delivered to JS. Do
+  not block synchronously inside `onChunk`, or terminator delivery and
+  `stop()` resolution can stall.
 
 ### Migration from 0.2
 - **Rust `StreamConfig` literals:** the struct gained `secondary_output`. A

@@ -199,6 +199,10 @@ struct SharedState {
     /// 失速判定もぶれない）。resume() で false に戻し、次チャンクへ DISCONTINUITY を立てる。
     paused: AtomicBool,
 
+    /// `pause()` とチャンク push の排他。pause が返ったあと、取り込みスレッドが
+    /// 組み立て済みのチャンクを後から列へ入れる競合を閉じる。
+    delivery: Mutex<()>,
+
     /// 入力ゲイン（線形倍率）の f32 ビット表現（`f32::to_bits`/`from_bits` で保持）。
     /// open() で config.gain から初期化し、set_gain() が録音中いつでも書き換える。
     /// 取り込みスレッドが完成チャンクごとに読み、1.0 以外なら各サンプルへ乗算する。
@@ -305,6 +309,7 @@ impl Stream {
             switching: AtomicBool::new(false),
             discontinuity_pending: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            delivery: Mutex::new(()),
             gain_bits: AtomicU32::new(config.gain.to_bits()),
             recording_epoch_ns: AtomicI64::new(i64::MIN),
             denoise_enabled: AtomicBool::new(false),
@@ -441,8 +446,19 @@ impl Stream {
     /// デバイスを生かしておくので、再開は素早く、ウォッチドッグの失速判定も誤発火しない。
     /// 既に停止中なら何もしない（多重呼び出し安全）。
     ///
+    /// この呼び出しが返った時点で、取り込みスレッドが組み立て中だったチャンクは列へ入るか
+    /// 破棄される。既に列にある分を取り切れば、その後 [`poll_chunk`](Self::poll_chunk) は
+    /// 新しいチャンクを返さない。
+    ///
     /// [`start`](Self::start) する前に呼んでもフラグは立つが、効くのは取り込みが回り始めてから。
     pub fn pause(&self) {
+        // delivery を握ってからフラグを立てる。取り込みスレッドの push と同じロックなので、
+        // ここを出たあと「組み立て済みチャンクが後から列に入る」窓は無い。
+        let _g = self
+            .shared
+            .delivery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.shared.paused.store(true, Ordering::SeqCst);
     }
 
@@ -976,13 +992,12 @@ fn run_intake(
         }
 
         // --- 主タップ: 完成チャンクを全て取り出して ChunkRing へ。---
-        let paused = shared.paused.load(Ordering::SeqCst);
         let gain = f32::from_bits(shared.gain_bits.load(Ordering::Relaxed));
         let mut emitted_any = false;
         while let Some((mut data, raw_pts)) = normalizer.pop_chunk() {
             // ポーズ中は破棄する（pop で out_frame_origin は進むので pts は前進を保つ）。
             // pending は消費せず持ち越し、resume 後の最初のチャンクへ載せる。
-            if paused {
+            if shared.paused.load(Ordering::SeqCst) {
                 continue;
             }
             // 0 起点化 → 非負・非減少へクランプ（契約: 録音 0 起点・非減少）。
@@ -996,11 +1011,9 @@ fn run_intake(
             let mut flags = ChunkFlags::empty();
             if rec_primary {
                 flags |= ChunkFlags::RECOVERED | ChunkFlags::DISCONTINUITY;
-                rec_primary = false;
             }
             if disc_primary {
                 flags |= ChunkFlags::DISCONTINUITY;
-                disc_primary = false;
             }
 
             let chunk = AudioChunk {
@@ -1013,19 +1026,30 @@ fn run_intake(
                 peak,
                 rms,
             };
-            seq += 1;
 
-            if let Some(total) = chunk_producer.push(chunk) {
-                shared.push_event(Event::ChunkDropped { count: total });
+            // pause() と同じ delivery ロックの下で再確認してから push する。
+            // 組み立て中に pause が返っていても、列へは入らない（破棄）か、
+            // pause 側がこの push を待ってから返る。
+            {
+                let _g = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
+                if shared.paused.load(Ordering::SeqCst) {
+                    continue;
+                }
+                rec_primary = false;
+                disc_primary = false;
+                seq += 1;
+                if let Some(total) = chunk_producer.push(chunk) {
+                    shared.push_event(Event::ChunkDropped { count: total });
+                }
+                emitted_any = true;
             }
-            emitted_any = true;
         }
 
         // --- 副タップ: 設定時のみ。主と対称に pop・破棄・flag 付与する。---
         if let Some(sec_prod) = secondary_producer.as_mut() {
             while let Some((mut samples, raw_pts)) = normalizer.pop_secondary() {
                 // ポーズ中は副も pop して破棄する（out_buf の無限成長を防ぐ）。
-                if paused {
+                if shared.paused.load(Ordering::SeqCst) {
                     continue;
                 }
                 // 0 起点化 → 非負・非減少へクランプ（契約: 録音 0 起点・非減少）。
@@ -1039,11 +1063,9 @@ fn run_intake(
                 let mut flags = ChunkFlags::empty();
                 if rec_secondary {
                     flags |= ChunkFlags::RECOVERED | ChunkFlags::DISCONTINUITY;
-                    rec_secondary = false;
                 }
                 if disc_secondary {
                     flags |= ChunkFlags::DISCONTINUITY;
-                    disc_secondary = false;
                 }
 
                 let chunk = SecondaryChunk {
@@ -1056,10 +1078,18 @@ fn run_intake(
                     peak,
                     rms,
                 };
-                sec_seq += 1;
-                // 副タップのドロップは dropped_before で観測できる（専用イベントは出さない）。
-                let _ = sec_prod.push(chunk);
-                emitted_any = true;
+                {
+                    let _g = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
+                    if shared.paused.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    rec_secondary = false;
+                    disc_secondary = false;
+                    sec_seq += 1;
+                    // 副タップのドロップは dropped_before で観測できる（専用イベントは出さない）。
+                    let _ = sec_prod.push(chunk);
+                    emitted_any = true;
+                }
             }
         }
 

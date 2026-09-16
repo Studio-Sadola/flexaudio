@@ -84,7 +84,9 @@ Server 2022).
 `onChunk` is called with **one** argument, the primary chunk. When
 `secondaryOutput` is set, the paired secondary chunk travels **inside** it as
 `chunk.secondary` — it is not a second callback argument. VAD events ride on the
-chunk of the tap selected by `vadTap`.
+chunk of the tap selected by `vadTap`. Do not block synchronously inside
+`onChunk` (defer heavy work); blocking stalls terminator delivery and delays
+`stop()` resolving.
 
 ```js
 const stream = openStream(

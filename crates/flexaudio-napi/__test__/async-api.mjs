@@ -2,13 +2,14 @@
 // 実音不要。前提は smoke.mjs と同じ（同じディレクトリの flexaudio.node）。
 //
 // (a) processes() は Promise を返し、配列か型のあるエラーで終わる
-// (b) mock が流す最後の PCM（frames>0 の最後）と frames:0 の締めの両方が、
-//     stop() の resolve より前に onChunk に届く
+// (b) stop() の resolve より前に frames:0 の締めが届く。stop() の後に frames>0
+//     が来たならそれも resolve より前（来なければこの確かめは飛ばす）。
+//     resolve の後に onChunk は来ない。
 // (c) onChunk の中から stop() を呼んでも resolve まで行く（固まらない）
 // (d) stop() を 2 回呼んでも両方 resolve
 // (e) 既に止まった後の stop() は JS スレッドで即 resolve（P1 の経路 a）
-//     Closing そのものは mock では作れない（napi TSFN の Closing は
-//     環境＝Node 終了中の状態）ので、Stopped 後の即 resolve で代わる。
+//     TSFN の Closing は mock では作れない（napi TSFN の Closing は
+//     環境＝Node 終了中の状態）。Stopped 後の即 resolve で代わる。
 
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -51,24 +52,42 @@ async function testStopFlushesLastPcmAndTerminatorBeforeResolve() {
   let sawLastPcm = false;
   let sawFramesZero = false;
   let resolved = false;
+  let stopInvoked = false;
+  let lastPcmAfterStop = false;
+  let chunksAfterResolve = 0;
   const stream = native.__openMockStream(48000, 2, 440.0, (chunk) => {
     if (!chunk) {
+      return;
+    }
+    if (resolved) {
+      chunksAfterResolve += 1;
       return;
     }
     if (chunk.frames > 0) {
       assert(!resolved, 'last frames>0 PCM must arrive before stop() resolves');
       sawLastPcm = true;
+      if (stopInvoked) {
+        lastPcmAfterStop = true;
+      }
     } else if (chunk.frames === 0) {
       assert(!resolved, 'frames:0 terminator must arrive before stop() resolves');
       sawFramesZero = true;
     }
   });
   await new Promise((r) => setTimeout(r, 120));
+  stopInvoked = true;
   await withTimeout(stream.stop(), 5000, 'stop()');
   resolved = true;
   assert(sawLastPcm, 'expected a frames>0 PCM chunk before stop() resolved');
+  if (lastPcmAfterStop) {
+    console.log('[b] frames>0 after stop() arrived before resolve');
+  } else {
+    console.log('[b] no frames>0 after stop() was invoked (order check skipped)');
+  }
   assert(sawFramesZero, 'expected a frames:0 terminator chunk before stop() resolved');
-  console.log('[b] last PCM (frames>0) and frames:0 terminator arrived before stop() resolved');
+  await new Promise((r) => setTimeout(r, 50));
+  assert(chunksAfterResolve === 0, `no onChunk after stop() resolves, got ${chunksAfterResolve}`);
+  console.log('[b] frames:0 terminator arrived before resolve; no onChunk after resolve');
 }
 
 async function testStopFromOnChunk() {
@@ -98,7 +117,8 @@ async function testStopTwice() {
 
 async function testStopAfterAlreadyStoppedResolvesImmediately() {
   // P1 経路 (a): phase が既に Stopped なら、TSFN 往復を待たず JS スレッドで
-  // resolve_undefined する。Closing そのものは mock では作れない。
+  // resolve_undefined する。TSFN の Closing は mock では作れない（napi の
+  // Closing は Node 終了中の環境状態）。
   const stream = native.__openMockStream(48000, 2, 440.0, () => {});
   await new Promise((r) => setTimeout(r, 50));
   await withTimeout(stream.stop(), 5000, 'first stop()');
