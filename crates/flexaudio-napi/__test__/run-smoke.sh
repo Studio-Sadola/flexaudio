@@ -53,3 +53,6 @@ if [[ "$exited" -eq 0 ]]; then
 fi
 wait "$exit_pid"
 echo "== exit.mjs self-exited =="
+
+echo "== node --expose-gc leak.mjs =="
+node --expose-gc "$TEST_DIR/leak.mjs"
