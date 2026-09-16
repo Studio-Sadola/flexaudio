@@ -14,11 +14,37 @@ TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "== cargo build -p flexaudio-napi (release) =="
 cargo build -p flexaudio-napi --release --manifest-path "$ROOT/Cargo.toml"
 
-# cdylib の生成物を探す（package 名 flexaudio-napi -> libflexaudio_napi.so）。
-SO="$ROOT/target/release/libflexaudio_napi.so"
-if [[ ! -f "$SO" ]]; then
-  echo "ERROR: built cdylib not found at $SO" >&2
-  ls -la "$ROOT/target/release/" | grep -i flexaudio_napi || true
+# cdylib の生成物を探す（package 名 flexaudio-napi -> プラットフォーム別ファイル名）。
+RELEASE_DIR="$ROOT/target/release"
+
+cdylib_basenames_for_platform() {
+  case "$(uname -s)" in
+    Linux*)              printf '%s\n' 'libflexaudio_napi.so' ;;
+    Darwin*)             printf '%s\n' 'libflexaudio_napi.dylib' ;;
+    MINGW*|MSYS*|CYGWIN*) printf '%s\n' 'flexaudio_napi.dll' ;;
+    *)
+      printf '%s\n' 'libflexaudio_napi.so' 'libflexaudio_napi.dylib' 'flexaudio_napi.dll'
+      ;;
+  esac
+}
+
+SO=""
+SEARCHED=()
+while IFS= read -r base; do
+  path="$RELEASE_DIR/$base"
+  SEARCHED+=("$path")
+  if [[ -f "$path" ]]; then
+    SO="$path"
+    break
+  fi
+done < <(cdylib_basenames_for_platform)
+
+if [[ -z "$SO" ]]; then
+  echo "ERROR: built cdylib not found. Searched:" >&2
+  for path in "${SEARCHED[@]}"; do
+    echo "  $path" >&2
+  done
+  ls -la "$RELEASE_DIR/" | grep -i flexaudio_napi || true
   exit 1
 fi
 
