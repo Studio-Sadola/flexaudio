@@ -216,7 +216,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     /// 単体テスト同士が同じ single-flight スロットを奪い合わないように直列化する。
     static TEST_SERIAL: Mutex<()> = Mutex::new(());
@@ -237,6 +237,52 @@ mod tests {
         let result = f();
         wait_until_idle();
         result
+    }
+
+    /// 合図するまで終わらない仕事。呼び出し側が完了を待ってしまう不具合でも、
+    /// 2 秒の見張りと Drop が解放するのでテストは永久に止まらない。
+    struct StuckJob {
+        finished: Arc<AtomicBool>,
+        release_tx: mpsc::Sender<()>,
+    }
+
+    impl StuckJob {
+        fn park() -> (Self, impl FnOnce() -> Result<()> + Send + 'static) {
+            let finished = Arc::new(AtomicBool::new(false));
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let watchdog_tx = release_tx.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs(2));
+                let _ = watchdog_tx.send(());
+            });
+            let finished_for_job = Arc::clone(&finished);
+            let job = move || {
+                let _ = release_rx.recv();
+                finished_for_job.store(true, Ordering::SeqCst);
+                Ok(())
+            };
+            (
+                Self {
+                    finished,
+                    release_tx,
+                },
+                job,
+            )
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finished.load(Ordering::SeqCst)
+        }
+
+        fn release(&self) {
+            let _ = self.release_tx.send(());
+        }
+    }
+
+    impl Drop for StuckJob {
+        fn drop(&mut self) {
+            let _ = self.release_tx.send(());
+        }
     }
 
     #[test]
@@ -272,19 +318,22 @@ mod tests {
     #[test]
     fn run_bounded_times_out_instead_of_blocking() {
         with_enum_lock(|| {
+            let (stuck, job) = StuckJob::park();
             let started = std::time::Instant::now();
-            let err = run_bounded(Duration::from_millis(50), || {
-                thread::sleep(Duration::from_millis(200));
-                Ok(())
-            });
+            let err = run_bounded(Duration::from_millis(50), job);
             match err {
                 Err(Error::Backend(msg)) => assert!(msg.contains("timed out"), "{msg}"),
                 other => panic!("expected a timeout error, got {other:?}"),
             }
             assert!(
-                started.elapsed() < Duration::from_millis(180),
+                !stuck.is_finished(),
                 "the caller must not wait for the stuck job"
             );
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "timeout must return well before the watchdog releases the job"
+            );
+            stuck.release();
         });
     }
 
@@ -304,15 +353,17 @@ mod tests {
     #[test]
     fn run_bounded_does_not_spawn_another_thread_after_timeout() {
         with_enum_lock(|| {
+            let (stuck, job) = StuckJob::park();
             let before = ENUM_SPAWN_COUNT.load(Ordering::SeqCst);
-            let err = run_bounded(Duration::from_millis(40), || {
-                thread::sleep(Duration::from_millis(250));
-                Ok(())
-            });
+            let err = run_bounded(Duration::from_millis(40), job);
             match err {
                 Err(Error::Backend(msg)) => assert!(msg.contains("timed out"), "{msg}"),
                 other => panic!("expected a timeout error, got {other:?}"),
             }
+            assert!(
+                !stuck.is_finished(),
+                "the timed-out job must still be in flight"
+            );
             assert_eq!(ENUM_SPAWN_COUNT.load(Ordering::SeqCst), before + 1);
             for _ in 0..8 {
                 let started = std::time::Instant::now();
@@ -327,8 +378,8 @@ mod tests {
                     other => panic!("expected in-progress error, got {other:?}"),
                 }
                 assert!(
-                    started.elapsed() < Duration::from_millis(20),
-                    "in-progress callers must return immediately"
+                    started.elapsed() < Duration::from_secs(1),
+                    "in-progress callers must return well before the watchdog releases the job"
                 );
             }
             assert_eq!(
@@ -336,6 +387,7 @@ mod tests {
                 before + 1,
                 "timed-out callers must not spawn another OS-query thread"
             );
+            stuck.release();
         });
     }
 
