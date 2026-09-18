@@ -164,7 +164,7 @@ flexaudio は音声をキャプチャするため、各プラットフォーム�
 ## 対応 Rust バージョン（MSRV）
 
 - **コア / ファサード / OS バックエンド / マイク:** Rust **1.85**。
-- **`flexaudio-vad` および `flexaudio-napi`:** Rust **1.88**（`ort` / `napi-build` ツールチェーン依存に必要）。
+- **`flexaudio-vad`、`flexaudio-napi`、`flexaudio-ffi`、`flexaudio-py`:** Rust **1.91**（`tract-onnx` 0.23.7 の要求）。
 
 ワークスペースは各クレートの `rust-version` で MSRV を固定しています。
 
@@ -198,4 +198,4 @@ flexaudio は [Semantic Versioning](https://semver.org/) に従います。ク�
 
 [MIT](LICENSE) © 2026 tubome / Studio Sadola.
 
-このプロジェクトはサードパーティのソフトウェア（Silero VAD モデル、ONNX Runtime、PipeWire、およびパーミッシブライセンスの Rust クレート）をバンドル / リンクしています。必要な表示については [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) を参照してください。
+このプロジェクトはサードパーティのソフトウェア（Silero VAD モデル、tract、PipeWire、およびパーミッシブライセンスの Rust クレート）をバンドル / リンクしています。必要な表示については [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) を参照してください。

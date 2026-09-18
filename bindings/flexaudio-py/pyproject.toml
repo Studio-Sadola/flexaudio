@@ -28,8 +28,7 @@ Repository = "https://github.com/Studio-Sadola/flexaudio"
 features = ["extension-module"]
 # import 名を `flexaudio` に固定する（[lib] name と一致）。
 module-name = "flexaudio"
-# 第三者ライセンス表記を wheel と sdist の両方へ同梱する。VAD 経由で ONNX Runtime
-# （静的リンク）と Silero VAD モデル（埋め込み）を再配布するため、その notices を配布物
-# に必ず含める必要がある。LICENSE 本体は上の `license = { file = "LICENSE" }` が
+# 第三者ライセンス表記を wheel と sdist の両方へ同梱する。VAD 経由で pure-Rust tract と
+# Silero VAD モデル（埋め込み）を再配布するため、その notices を配布物に必ず含める必要がある。LICENSE 本体は上の `license = { file = "LICENSE" }` が
 # .dist-info へ格納する。include のプレーンな文字列は sdist・wheel の両方に入る。
 include = ["THIRD_PARTY_NOTICES.md"]

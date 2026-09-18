@@ -128,8 +128,8 @@ MIT.
 This binding statically links the following flexaudio add-ons, which embed
 their models/tables and require no runtime files or network access:
 
-- **flexaudio-vad** — uses [ONNX Runtime](https://github.com/microsoft/onnxruntime)
-  (MIT) and the embedded [Silero VAD](https://github.com/snakers4/silero-vad)
+- **flexaudio-vad** — uses pure-Rust [tract](https://github.com/snipsco/tract)
+  (MIT OR Apache-2.0) and the embedded [Silero VAD](https://github.com/snakers4/silero-vad)
   model (MIT).
 - **flexaudio-encode** — uses [flacenc](https://github.com/yotarok/flacenc-rs)
   (Apache-2.0) for pure-Rust FLAC encoding.

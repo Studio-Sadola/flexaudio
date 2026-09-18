@@ -1,9 +1,10 @@
 # flexaudio-vad
 
 **Offline Voice Activity Detection for Rust**, powered by the [Silero VAD] model
-running on [ONNX Runtime]. The model is embedded into the binary via
+running on [tract] (`tract-onnx`). The model is embedded into the binary via
 `include_bytes!`, so detection runs **fully offline** — no model file to ship and
-no network access at runtime.
+no network access at runtime. Inference is pure Rust (no ONNX Runtime / no
+MSVC++ redistributable).
 
 This crate is independent of `flexaudio-core`: it consumes a plain `&[f32]`
 sample stream, so you can pair it with any audio source.
@@ -38,7 +39,9 @@ for s in segments {
 ```
 
 `VadConfig` ships `aggressive()`, `balanced()`, and `conservative()` presets.
-Input is expected as 16 kHz mono `f32`.
+Input is expected as 8 kHz or 16 kHz mono `f32`. The embedded model is 16 kHz
+only; 8 kHz input is upsampled internally. Event times and frame counts stay on
+the **input** sample rate.
 
 ## Install
 
@@ -48,17 +51,16 @@ cargo add flexaudio-vad
 
 ## MSRV
 
-Rust **1.88** (required by the `ort` / ONNX Runtime toolchain).
+Rust **1.91** (required by `tract-onnx` 0.23.7).
 
 ## License & third-party notices
 
 [MIT](LICENSE) © 2026 tubome / Studio Sadola.
 
-This crate **redistributes** the Silero VAD model (MIT) and a statically linked
-build of Microsoft **ONNX Runtime** (MIT) inside every binary. You MUST ship the
-accompanying notices — see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
-The ONNX Runtime `ThirdPartyNotices.txt` for the pinned release still needs to be
-attached (legal review); this is flagged in that file.
+This crate **redistributes** the Silero VAD model (MIT) inside every binary. You
+MUST ship the accompanying notices — see
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Inference uses
+[`tract-onnx`](https://github.com/snipsco/tract) (MIT OR Apache-2.0).
 
 [Silero VAD]: https://github.com/snakers4/silero-vad
-[ONNX Runtime]: https://github.com/microsoft/onnxruntime
+[tract]: https://github.com/snipsco/tract

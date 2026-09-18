@@ -3,9 +3,9 @@ name = "flexaudio-napi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-# napi-build / napi-derive のツールチェインが rustc 1.88 を要求するので、workspace
-# の 1.85 をここだけ上書きする。
-rust-version = "1.88"
+# napi-build / napi-derive に加え、flexaudio-vad（tract-onnx 0.23.7）が rustc 1.91 を
+# 要求するので、workspace の 1.85 をここだけ上書きする。
+rust-version = "1.91"
 authors.workspace = true
 repository.workspace = true
 description = "Node.js (N-API) addon for flexaudio. Distributed via npm, not crates.io."
@@ -20,9 +20,9 @@ crate-type = ["cdylib"]
 [dependencies]
 flexaudio = { path = "../flexaudio" }
 
-# アドオン 3 種を Node へ露出する。いずれも純 Rust（vad のみ ORT を静的リンク）で、
+# アドオン 3 種を Node へ露出する。いずれも純 Rust（モデルは埋め込み）で、
 # 実行時のモデルファイルもネットワークも要らない。バージョンは workspace の各クレートに
-# 追従する（path 依存）。vad が rustc 1.88 を要求するのは上の rust-version で許容済み。
+# 追従する（path 依存）。vad が rustc 1.91 を要求するのは上の rust-version で許容済み。
 flexaudio-vad = { path = "../flexaudio-vad" }
 flexaudio-encode = { path = "../flexaudio-encode" }
 flexaudio-denoise = { path = "../flexaudio-denoise" }

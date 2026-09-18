@@ -1,4 +1,4 @@
-//! flexaudio-vad — silero-VAD を ONNX でオフライン実行する VAD アドオン。
+//! flexaudio-vad — silero-VAD を純 Rust（tract-onnx）でオフライン実行する VAD アドオン。
 //!
 //! `flexaudio-core` には依存せず、`&[f32]` のサンプル列だけを受け取る。silero-VAD
 //! モデル (MIT) をバイナリに埋め込むので、実行時のモデルファイルもネットワークも要らない。
@@ -31,6 +31,7 @@
 #![warn(missing_docs)]
 
 mod config;
+mod infer;
 mod resample;
 mod segmenter;
 
@@ -38,16 +39,9 @@ pub use config::VadConfig;
 pub use resample::PcmFormat;
 pub use segmenter::Segment;
 
-use ort::session::Session;
-use ort::value::Tensor;
+use infer::{SileroEngine, MODEL_FRAME_SIZE, MODEL_SAMPLE_RATE};
 use resample::PcmConverter;
 use segmenter::Segmenter;
-
-/// silero-VAD モデル (v6, MIT)。実行時ファイルを要らなくするためバイナリへ埋め込む。
-static MODEL_BYTES: &[u8] = include_bytes!("../assets/silero_vad.onnx");
-
-/// state テンソルの要素数 (2 * 1 * 128)。
-const STATE_LEN: usize = 2 * 128;
 
 /// VAD が確定したイベント。サンプル位置はパディング適用後。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,20 +81,16 @@ impl std::fmt::Display for VadError {
 
 impl std::error::Error for VadError {}
 
-/// ストリーミング VAD。1 インスタンスが ONNX `Session` を 1 つ持つ（共有しない）。
+/// ストリーミング VAD。1 インスタンスが最適化済みの tract 計画を 1 つ持つ（共有しない）。
 ///
-/// 任意長の `&[f32]` を [`Vad::process`] に流すと、内部で frame (16k=512) 単位に束ねて
-/// silero 推論し、セグメント状態機械を回して確定したイベントを返す。
+/// 任意長の `&[f32]` を [`Vad::process`] に流すと、内部で frame (16k=512 / 8k=256) 単位に
+/// 束ねて silero 推論し、セグメント状態機械を回して確定したイベントを返す。
 pub struct Vad {
-    session: Session,
+    engine: SileroEngine,
     config: VadConfig,
     segmenter: Segmenter,
 
-    /// silero state テンソル `[2,1,128]`（フレーム間で継承）。
-    state: Vec<f32>,
-    /// 前回フレーム末尾の context (16k=64)。次フレームの前置に使う。
-    context: Vec<f32>,
-    /// frame_size に満たない端数サンプルの残り。
+    /// frame_size に満たない端数サンプルの残り（入力サンプルレート基準）。
     pending: Vec<f32>,
 
     /// 直近 [`Vad::process`] で計算した各フレームの生発話確率。
@@ -110,30 +100,34 @@ pub struct Vad {
     /// 変換が要らないフォーマット（VAD レートの mono）では作られない。入力フォーマットが
     /// 変わったら作り直す。
     converter: Option<PcmConverter>,
+    /// 8 kHz 設定専用の連続した 8→16 kHz rubato 変換器。モデル入力だけを16 kHzへ
+    /// 上げ、公開のフレーム数・位置は `pending` と `segmenter` の8 kHz基準を保つ。
+    upsampler_8k: Option<PcmConverter>,
 }
 
 impl Vad {
-    /// 埋め込みモデルをロードして VAD を構築する。
+    /// 埋め込みモデルを最適化して VAD を構築する。
+    ///
+    /// 計画の構築（`into_optimized`）に失敗したら [`VadError::ModelLoad`] を返す。
     pub fn new(config: VadConfig) -> Result<Vad, VadError> {
         config.validate().map_err(VadError::InvalidConfig)?;
 
-        let session = Session::builder()
-            .map_err(|e| VadError::ModelLoad(e.to_string()))?
-            .commit_from_memory(MODEL_BYTES)
-            .map_err(|e| VadError::ModelLoad(e.to_string()))?;
-
+        let engine = SileroEngine::load()?;
         let segmenter = Segmenter::new(&config);
-        let ctx_size = config.context_size();
+        let upsampler_8k = if config.sample_rate == 8_000 {
+            Some(PcmConverter::new_8k_to_16k_frame_resampler().map_err(VadError::ModelLoad)?)
+        } else {
+            None
+        };
 
         Ok(Vad {
-            session,
+            engine,
             config,
             segmenter,
-            state: vec![0.0f32; STATE_LEN],
-            context: vec![0.0f32; ctx_size],
             pending: Vec::new(),
             last_probs: Vec::new(),
             converter: None,
+            upsampler_8k,
         })
     }
 
@@ -242,71 +236,43 @@ impl Vad {
         self.process(&converted)
     }
 
-    /// 1 フレーム (frame_size サンプル) を silero に通し発話確率を返す。
+    /// 1 フレーム (公開 `frame_size` サンプル) を silero に通し発話確率を返す。
     ///
-    /// silero の入力は frame そのものではなく `concat(context, frame)` で、長さは
-    /// `context_size + frame_size` (16k=64+512=576)。推論後、context を今回入力末尾の
-    /// `context_size` サンプルで、state を出力 state で更新する。
+    /// モデルは 16 kHz / 512 サンプル専用。8 kHz 設定では状態を持つ rubato の sinc
+    /// リサンプラで 256 サンプルを512にしてから同じ 64+512 の前置・state引き継ぎ経路へ
+    /// 渡す。公開側の時刻・
+    /// サンプル位置・フレーム数は入力レート基準のまま（セグメンタが `frame_size` で進む）。
     fn infer_frame(&mut self, frame: &[f32]) -> Result<f32, VadError> {
-        let ctx_size = self.config.context_size();
-        let frame_size = self.config.frame_size();
-        debug_assert_eq!(frame.len(), frame_size);
-        debug_assert_eq!(self.context.len(), ctx_size);
-
-        // x = concat(context, frame)。長さ ctx_size + frame_size (16k=576)。
-        let input_len = ctx_size + frame_size;
-        let mut x = Vec::with_capacity(input_len);
-        x.extend_from_slice(&self.context);
-        x.extend_from_slice(frame);
-
-        // 次回 context = 今回入力末尾の ctx_size サンプル。x は run へ move されるので
-        // 先に控えておく。
-        let next_context: Vec<f32> = x[input_len - ctx_size..].to_vec();
-
-        // 入力テンソル: input f32 [1, input_len], state f32 [2,1,128], sr int64 scalar。
-        let input_tensor = Tensor::from_array(([1_i64, input_len as i64], x))
-            .map_err(|e| VadError::Inference(e.to_string()))?;
-        let state_tensor = Tensor::from_array(([2_i64, 1, 128], self.state.clone()))
-            .map_err(|e| VadError::Inference(e.to_string()))?;
-        // sr はランク0スカラー int64（モデル入力 shape は []）。
-        let sr_tensor =
-            Tensor::from_array((vec![] as Vec<i64>, vec![self.config.sample_rate as i64]))
-                .map_err(|e| VadError::Inference(e.to_string()))?;
-
-        let outputs = self
-            .session
-            .run(ort::inputs![
-                "input" => input_tensor,
-                "state" => state_tensor,
-                "sr" => sr_tensor,
-            ])
-            .map_err(|e| VadError::Inference(e.to_string()))?;
-
-        // 出力名: 確率 = "output", 更新後 state = "stateN"（実モデルで確認済み）。
-        let (_pshape, prob_slice) = outputs["output"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| VadError::Inference(e.to_string()))?;
-        let prob = *prob_slice
-            .first()
-            .ok_or_else(|| VadError::Inference("empty output tensor".to_string()))?;
-
-        let (_sshape, state_slice) = outputs["stateN"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| VadError::Inference(e.to_string()))?;
-        if state_slice.len() != STATE_LEN {
-            return Err(VadError::Inference(format!(
-                "unexpected state length {} (expected {STATE_LEN})",
-                state_slice.len()
-            )));
+        debug_assert_eq!(frame.len(), self.config.frame_size());
+        // 公開レートの context を 16 kHz に直すと常に 64（8 kHz は 32×2）。
+        debug_assert_eq!(
+            if self.config.sample_rate == 8000 {
+                self.config.context_size() * 2
+            } else {
+                self.config.context_size()
+            },
+            64
+        );
+        if self.config.sample_rate == MODEL_SAMPLE_RATE {
+            debug_assert_eq!(frame.len(), MODEL_FRAME_SIZE);
+            self.engine.infer_16k_frame(frame)
+        } else {
+            let upsampler = self
+                .upsampler_8k
+                .as_mut()
+                .ok_or_else(|| VadError::Inference("8 kHz resampler is unavailable".to_string()))?;
+            let mut up = Vec::with_capacity(MODEL_FRAME_SIZE);
+            upsampler
+                .convert(frame, &mut up)
+                .map_err(VadError::Inference)?;
+            if up.len() != MODEL_FRAME_SIZE {
+                return Err(VadError::Inference(format!(
+                    "8 kHz resampler produced {} samples (expected {MODEL_FRAME_SIZE})",
+                    up.len()
+                )));
+            }
+            self.engine.infer_16k_frame(&up)
         }
-        let new_state = state_slice.to_vec();
-
-        // 出力の借用が outputs/session を握っているので、コピーし終えてから更新する。
-        drop(outputs);
-        self.state = new_state;
-        self.context = next_context;
-
-        Ok(prob)
     }
 
     /// 直近 [`Vad::process`] で計算した各フレームの生発話確率を返す。
@@ -351,14 +317,18 @@ impl Vad {
     /// state / context / 状態機械 / サンプル位置 / 端数バッファ / リサンプラ状態を
     /// すべて初期化する。
     pub fn reset(&mut self) {
-        self.state = vec![0.0f32; STATE_LEN];
-        self.context = vec![0.0f32; self.config.context_size()];
+        self.engine.reset();
         self.pending.clear();
         self.last_probs.clear();
         self.segmenter.reset();
         // 変換器を捨てる。次の process_pcm がフォーマットに応じて作り直すので、
         // リサンプラの内部遅延・端数もまとめてリセットされる。
         self.converter = None;
+        if self.config.sample_rate == 8_000 {
+            // 専用コンストラクタは pre-roll も含む。一般変換器として再構築すると初回だけ
+            // 508 samples になり公開フレームとの対応が崩れるため、必ずこちらを使う。
+            self.upsampler_8k = PcmConverter::new_8k_to_16k_frame_resampler().ok();
+        }
     }
 
     /// 現在の設定への参照。
@@ -418,6 +388,80 @@ mod tests {
             max_speech_ms: 0,
             sample_rate: 16000,
         }
+    }
+
+    /// 16 kHz の実音声を rubato で8 kHzへ落とし、同じ8 kHz信号を正しい sinc 8→16 kHz
+    /// 変換で直接モデルへ渡した場合と、`Vad` の8 kHz経路へ渡した場合を比べる。
+    ///
+    /// 0.05 は実音声に対してリサンプラ実装差を許容しつつ、旧来のサンプル反復で測定した
+    /// 最大差 0.3705613 より十分小さい。0.5判定は全フレームで一致しなければならない。
+    #[test]
+    fn eight_khz_inference_matches_sinc_upsampled_reference() {
+        let wav = include_bytes!("../tests/fixtures/jp_2spk_FF_4s_16k.wav");
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        let samples16: Vec<f32> = wav[44..]
+            .chunks_exact(2)
+            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32768.0)
+            .collect();
+
+        let mut downsampler = PcmConverter::new(
+            PcmFormat {
+                sample_rate: 16_000,
+                channels: 1,
+            },
+            8_000,
+        )
+        .expect("16 kHz to 8 kHz resampler");
+        let mut samples8 = Vec::new();
+        downsampler
+            .convert(&samples16, &mut samples8)
+            .expect("downsample fixture");
+        samples8.truncate(samples8.len() / 256 * 256);
+        assert!(!samples8.is_empty());
+
+        let mut reference_upsampler = PcmConverter::new_8k_to_16k_frame_resampler()
+            .expect("8 kHz to 16 kHz reference resampler");
+        let mut reference16 = Vec::with_capacity(samples8.len() * 2);
+        for frame in samples8.chunks_exact(256) {
+            let before = reference16.len();
+            reference_upsampler
+                .convert(frame, &mut reference16)
+                .expect("upsample reference frame");
+            assert_eq!(reference16.len() - before, 512);
+        }
+
+        let mut vad16 = Vad::new(VadConfig::default()).expect("16 kHz model load");
+        let _ = vad16.process(&reference16);
+        let probs16 = vad16.last_frame_probabilities();
+
+        let cfg8 = VadConfig {
+            sample_rate: 8_000,
+            ..VadConfig::default()
+        };
+        let mut vad8 = Vad::new(cfg8).expect("8 kHz model load");
+        let _ = vad8.process(&samples8);
+        let probs8 = vad8.last_frame_probabilities().to_vec();
+
+        assert_eq!(probs8.len(), samples8.len() / 256);
+        assert_eq!(probs8.len(), probs16.len());
+        for (frame, (&prob8, &prob16)) in probs8.iter().zip(probs16.iter()).enumerate() {
+            assert!(
+                (prob8 - prob16).abs() <= 0.05,
+                "frame {frame}: 8 kHz={prob8}, sinc 16 kHz reference={prob16}"
+            );
+            assert_eq!(
+                prob8 >= 0.5,
+                prob16 >= 0.5,
+                "frame {frame}: speech threshold decision differs"
+            );
+        }
+
+        // reset 後も専用コンストラクタの pre-roll から始めるので、1 フレーム=512 samples
+        // の対応と確率列が初回と変わらない。
+        vad8.reset();
+        let _ = vad8.process(&samples8);
+        assert_eq!(vad8.last_frame_probabilities(), probs8);
     }
 
     #[test]
@@ -593,7 +637,7 @@ mod tests {
         assert_eq!(segs[0].end_sample, 15 * 512);
     }
 
-    // ---- ONNX 経路スモークテスト ----
+    // ---- 推論経路スモークテスト ----
 
     #[test]
     fn vad_loads_model() {

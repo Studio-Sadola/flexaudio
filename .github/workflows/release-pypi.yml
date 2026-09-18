@@ -106,10 +106,8 @@ jobs:
       # Invalid argument (os error 22)". So we hand those three SONAMEs to
       # `--exclude` and let the loader resolve them from the system instead.
       #
-      # Why NOT exclude ONNX Runtime: the `ort` crate links onnxruntime
-      # *statically* into the extension (there is no libonnxruntime.so to graft),
-      # so nothing here touches it — it must stay embedded and must never be
-      # excluded. libspa-0.2.so is listed defensively; the current build dlopen()s
+      # VAD inference uses pure-Rust tract, so it contributes no C/C++ runtime
+      # library for auditwheel to graft or exclude. libspa-0.2.so is listed defensively; the current build dlopen()s
       # SPA rather than linking it, so auditwheel simply doesn't encounter it, but
       # the exclude keeps us safe if a future build links it directly.
       #
@@ -139,11 +137,9 @@ jobs:
           if-no-files-found: error
 
   # --- macOS wheels (arm64 / Apple Silicon only) ---
-  # macOS x86_64 (Intel) is deliberately dropped: since VAD added ONNX Runtime,
-  # ort can't build for x86_64-apple-darwin — cross-building on Apple Silicon
-  # fails and GitHub no longer provides hosted Intel macOS runners. Intel Macs
-  # are EOL; arm64 covers every Mac since 2020. Intel-Mac Rust users are
-  # unaffected (crates.io builds from source); only the prebuilt wheel is gone.
+  # macOS x86_64 (Intel) is deliberately left out of the prebuilt wheel matrix.
+  # Intel-Mac Rust users can still build from source; re-enable it only with a
+  # supported runner and package target.
   macos:
     name: Wheels (macOS aarch64)
     runs-on: macos-latest

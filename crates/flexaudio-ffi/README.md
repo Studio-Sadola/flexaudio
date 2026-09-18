@@ -172,13 +172,13 @@ flexaudio_watcher_free(w);
 
 このクレート自体は MIT（ワークスペース全体と同じ・`LICENSE` を参照）。C ABI から露出する
 アドオンは、以下のオフライン処理ライブラリ／モデルに依存する。いずれも実行時の
-ネットワークもモデルファイル配布も要らない（重み・モデルはビルド時に埋め込む／取得する）。
+ネットワークもモデルファイル配布も要らない（重み・モデルはバイナリに埋め込む）。
 
 | コンポーネント | 用途 | ライセンス |
 | --- | --- | --- |
 | [flacenc](https://crates.io/crates/flacenc) | FLAC エンコード（`flexaudio-encode`） | Apache-2.0 |
 | [nnnoiseless](https://crates.io/crates/nnnoiseless)（RNNoise 移植） | ノイズ抑制（`flexaudio-denoise`） | BSD-3-Clause |
-| [ort](https://crates.io/crates/ort) / ONNX Runtime | VAD の推論実行（`flexaudio-vad`） | MIT OR Apache-2.0 / ONNX Runtime は MIT |
+| [tract-onnx](https://crates.io/crates/tract-onnx) | VAD の純 Rust 推論実行（`flexaudio-vad`） | MIT OR Apache-2.0 |
 | Silero VAD モデル | VAD のモデル重み（バイナリ埋め込み） | MIT |
 
 再配布時は上記の著作権表示・ライセンス条項を同梱すること。

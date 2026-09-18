@@ -10,17 +10,17 @@ flexaudio and its component crates.
 
 The list below is generated from `cargo metadata` for the workspace. Optional /
 platform-specific dependencies (Windows `windows-*`, macOS `objc2-*`, Linux
-`pipewire`/`libspa`, ONNX Runtime, etc.) are only pulled in — and only need to be
+`pipewire`/`libspa`, etc.) are only pulled in — and only need to be
 reproduced — on the platforms / feature sets that use them.
 
 ---
 
 ## 1. Bundled assets (shipped inside the binary)
 
-### Silero VAD model — `silero_vad.onnx`
+### Silero VAD model — `silero_vad_openvino_16k.onnx`
 
 `flexaudio-vad` embeds the Silero VAD ONNX model
-(`crates/flexaudio-vad/assets/silero_vad.onnx`) into the compiled artifact via
+(`crates/flexaudio-vad/assets/silero_vad_openvino_16k.onnx`) into the compiled artifact via
 `include_bytes!`. The model weights are therefore present in every binary that
 links `flexaudio-vad`, and this notice MUST be reproduced in distributions.
 
@@ -55,8 +55,13 @@ SOFTWARE.
 > NOTE: Confirmed against upstream. The Silero VAD `LICENSE` on the `master`
 > branch (https://github.com/snakers4/silero-vad/blob/master/LICENSE) reads
 > "Copyright (c) 2020-present Silero Team" under the MIT License; the block above
-> is reproduced verbatim from it. The vendored model is Silero VAD **v6** (see
-> `crates/flexaudio-vad/src/lib.rs`).
+> is reproduced verbatim from it. The vendored weights are
+> `src/silero_vad/data/silero_vad_openvino_16k.onnx` from commit
+> `1a26f187f9dbc77d9dcaee0bfefafcc092ef7970`
+> (https://github.com/snakers4/silero-vad/blob/1a26f187f9dbc77d9dcaee0bfefafcc092ef7970/src/silero_vad/data/silero_vad_openvino_16k.onnx),
+> sha256 `7776b81ad1b0350c15d7f1555943b9232eb53e9ca5d989c6d0cea9ebc8664d87`.
+> 16 kHz dedicated graph (no `If` nodes, no `sr` input). Embedded as
+> `crates/flexaudio-vad/assets/silero_vad_openvino_16k.onnx`.
 
 ### RNNoise model weights — embedded in `nnnoiseless`
 
@@ -101,101 +106,34 @@ ARE DISCLAIMED. ...
 
 ---
 
-## 2. Statically linked native libraries
+## 2. Inference engine (compiled Rust)
 
-### ONNX Runtime (via `ort` 2.0.0-rc.12, `download-binaries` feature)
+### tract (`tract-onnx` 0.23.7)
 
-`flexaudio-vad` runs the Silero VAD model through the `ort` crate. With the
-`download-binaries` feature enabled, the build downloads a prebuilt **Microsoft
-ONNX Runtime** binary and links it into the artifact. ONNX Runtime is therefore
-**redistributed inside `flexaudio-vad` binaries** and its notices MUST accompany
-distributions.
+`flexaudio-vad` runs the Silero VAD model through the pure-Rust `tract-onnx`
+crate. No Microsoft ONNX Runtime binary is downloaded or linked; there is no
+`download-binaries` HTTP fetch at build time.
 
-  - Project: ONNX Runtime — https://github.com/microsoft/onnxruntime
-  - Copyright (c) Microsoft Corporation
-  - License: MIT
+  - Project: tract — https://github.com/snipsco/tract
+  - Crate: `tract-onnx` 0.23.7 (and its `tract-*` workspace crates at the same version)
+  - License: **MIT OR Apache-2.0** (from `cargo metadata` for `tract-onnx` 0.23.7;
+    `license` field and the crate's `LICENSE` file)
 
 ```
-MIT License
-
-Copyright (c) Microsoft Corporation
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Licensed under either of
+ * Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+ * MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+at your option.
 ```
 
-**ONNX Runtime version:** `ort` 2.0.0-rc.12 statically links **Microsoft ONNX
-Runtime `v1.24.2`**. This is pinned by `ort-sys` 2.0.0-rc.12: every prebuilt-binary
-download URL in its `build/download/dist.txt` points at the pyke CDN path
-`https://cdn.pyke.io/0/pyke:ort-rs/ms@1.24.2/<target>` (verified in the vendored
-crate source `ort-sys-2.0.0-rc.12/build/download/dist.txt`; `ms@1.24.2` is the
-Microsoft ONNX Runtime 1.24.2 release).
+The full Apache-2.0 and MIT texts ship in the `tract-onnx` crate source
+(`LICENSE-APACHE`, `LICENSE-MIT`). Reproduce them with binary distributions
+that include `flexaudio-vad`.
 
-ONNX Runtime bundles its own third-party code; its complete notices live in ONNX
-Runtime's `ThirdPartyNotices.txt` at the matching tag — this is the authoritative
-notice and **MUST accompany any binary that statically links ONNX Runtime**:
-
-  - https://github.com/microsoft/onnxruntime/blob/v1.24.2/ThirdPartyNotices.txt
-  - raw: https://raw.githubusercontent.com/microsoft/onnxruntime/v1.24.2/ThirdPartyNotices.txt
-
-Ship that file alongside the `flexaudio-vad` binary (or paste its full text
-here). Its components, grouped by the license each is provided under **as stated
-in that file** (transcribed from tag `v1.24.2`; the pinned file governs the exact
-terms of each), are:
-
-  - **Apache-2.0** — onnx, oneDNN (intel/dnnl), TensorFlow, google/benchmark,
-    DMLC common codebase, DLPack, JDAI-CV/DNNLibrary, google/flatbuffers,
-    abseil-cpp, Android Open Source Project, huggingface/transformers,
-    msgpack-python, tensorflow/tensorboard, google/sentencepiece, OpenSSL,
-    pthreads4w, TensorFlow.js, Intel neural-compressor, neural-speed, KleidiAI
-  - **MIT** — Microsoft GSL, Microsoft Cognitive Toolkit (CNTK), HalideIR,
-    HowardHinnant/date, onnx/onnx-tensorrt, microsoft/wil, nlohmann/json,
-    dcleblanc/SafeInt, lanpa/tensorboardX, gtest-ios-framework, emsdk,
-    react-native, dlfcn-win32, Tencent/rapidjson, microsoft/mimalloc,
-    nvidia/cutlass (MurmurHash3 via SMHasher's MIT license; MurmurHash itself is
-    public domain)
-  - **BSD-3-Clause** — protocolbuffers/protobuf, pybind/pybind11, NumPy, Caffe2
-    (in PyTorch), FreeBSD getopt.c, google/googletest, Scikit-learn, google/re2,
-    google/glog, Open MPI, coremltools, google/XNNPACK, Triton Inference Server &
-    Client, FlashAttention, dawn
-  - **BSD-2-Clause** — Caffe, pytorch/cpuinfo, mpi4py
-  - **MPL-2.0** — Eigen (the one weak-copyleft component; its obligations are met
-    by shipping ONNX Runtime's `ThirdPartyNotices.txt`, which reproduces the MPL text)
-  - **BSL-1.0 (Boost)** — Boost / boostorg/boost
-  - **Zlib** — madler/zlib
-  - **ISC** — cerberus
-  - **HPND** — Python Imaging Library (PIL / Pillow)
-  - **NCSA (Univ. of Illinois)** — LLVM Compiler Infrastructure
-  - **Intel Simplified Software License** — Intel Math Kernel Library (Intel MKL)
-  - **Public Domain / Unlicense** — SQLite, libb64, G3log
-
-> NOTE: The CPU build `ort` downloads does not exercise every component above
-> (e.g. Intel MKL / CUDA / TensorRT / CoreML / XNNPACK paths depend on which
-> execution providers are compiled in), but ONNX Runtime's own `ThirdPartyNotices.txt`
-> enumerates the full set, so the complete file is reproduced by reference to stay
-> conservative. This inventory was transcribed from ONNX Runtime `v1.24.2`
-> `ThirdPartyNotices.txt` (the release `ort` 2.0.0-rc.12 downloads); that pinned
-> file remains authoritative for the exact license text of each component.
-
-The Rust glue crates around ONNX Runtime are themselves permissively licensed:
-
-  - `ort` 2.0.0-rc.12 — MIT OR Apache-2.0 (https://github.com/pykeio/ort)
-  - `ort-sys` 2.0.0-rc.12 — MIT OR Apache-2.0
+Related `tract-*` crates resolved at 0.23.7 (all MIT OR Apache-2.0 per
+`cargo metadata`): `tract-core`, `tract-data`, `tract-extra`, `tract-hir`,
+`tract-linalg`, `tract-nnef`, `tract-onnx-opl`, `tract-pulse`, `tract-pulse-opl`,
+`tract-transformers`.
 
 ---
 
@@ -235,6 +173,29 @@ platform / feature build).
 
 | Crate | SPDX License |
 |-------|--------------|
+| adler2 | Apache-2.0 OR MIT |
+| anyhow | MIT OR Apache-2.0 |
+| bit-set | Apache-2.0 OR MIT |
+| bit-vec | Apache-2.0 OR MIT |
+| flate2 | MIT OR Apache-2.0 |
+| prost | Apache-2.0 |
+| rayon | MIT OR Apache-2.0 |
+| safetensors | Apache-2.0 |
+| serde_json | MIT OR Apache-2.0 |
+| tar | MIT OR Apache-2.0 |
+| tempfile | MIT OR Apache-2.0 |
+| tract-core | MIT OR Apache-2.0 |
+| tract-data | MIT OR Apache-2.0 |
+| tract-extra | MIT OR Apache-2.0 |
+| tract-hir | MIT OR Apache-2.0 |
+| tract-linalg | MIT OR Apache-2.0 |
+| tract-nnef | MIT OR Apache-2.0 |
+| tract-onnx | MIT OR Apache-2.0 |
+| tract-onnx-opl | MIT OR Apache-2.0 |
+| tract-pulse | MIT OR Apache-2.0 |
+| tract-pulse-opl | MIT OR Apache-2.0 |
+| tract-transformers | MIT OR Apache-2.0 |
+| zlib-rs | MIT OR Apache-2.0 |
 | aho-corasick | Unlicense OR MIT |
 | alsa | Apache-2.0 OR MIT |
 | alsa-sys | MIT |
@@ -249,7 +210,6 @@ platform / feature build).
 | audioadapter-buffers | MIT OR Apache-2.0 |
 | audioadapter-sample | MIT OR Apache-2.0 |
 | autocfg | Apache-2.0 OR MIT |
-| base64 | MIT OR Apache-2.0 |
 | bindgen | BSD-3-Clause |
 | bitflags | MIT OR Apache-2.0 |
 | block2 | MIT |
@@ -290,10 +250,7 @@ platform / feature build).
 | glob | MIT OR Apache-2.0 |
 | hashbrown | MIT OR Apache-2.0 |
 | heck | MIT OR Apache-2.0 |
-| hmac-sha256 | ISC |
 | hound | Apache-2.0 |
-| http | MIT OR Apache-2.0 |
-| httparse | MIT OR Apache-2.0 |
 | indexmap | Apache-2.0 OR MIT |
 | is_terminal_polyfill | MIT OR Apache-2.0 |
 | itertools | MIT OR Apache-2.0 |
@@ -308,7 +265,6 @@ platform / feature build).
 | libspa-sys | MIT |
 | linux-raw-sys | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | log | MIT OR Apache-2.0 |
-| lzma-rust2 | Apache-2.0 |
 | mach2 | BSD-2-Clause OR MIT OR Apache-2.0 |
 | matrixmultiply | MIT OR Apache-2.0 |
 | memchr | Unlicense OR MIT |
@@ -340,9 +296,6 @@ platform / feature build).
 | objc2-foundation | MIT |
 | once_cell | MIT OR Apache-2.0 |
 | once_cell_polyfill | MIT OR Apache-2.0 |
-| ort | MIT OR Apache-2.0 |
-| ort-sys | MIT OR Apache-2.0 |
-| percent-encoding | MIT OR Apache-2.0 |
 | pin-project-lite | Apache-2.0 OR MIT |
 | pipewire | MIT |
 | pipewire-sys | MIT |
@@ -358,16 +311,12 @@ platform / feature build).
 | regex | MIT OR Apache-2.0 |
 | regex-automata | MIT OR Apache-2.0 |
 | regex-syntax | MIT OR Apache-2.0 |
-| ring | Apache-2.0 AND ISC |
 | ringbuf | MIT OR Apache-2.0 |
 | rtrb | MIT OR Apache-2.0 |
 | rubato | MIT |
 | rustc-hash | Apache-2.0 OR MIT |
 | rustfft | MIT OR Apache-2.0 |
 | rustix | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
-| rustls | Apache-2.0 OR ISC OR MIT |
-| rustls-pki-types | MIT OR Apache-2.0 |
-| rustls-webpki | ISC |
 | rustversion | MIT OR Apache-2.0 |
 | same-file | Unlicense OR MIT |
 | semver | MIT OR Apache-2.0 |
@@ -377,10 +326,8 @@ platform / feature build).
 | shlex | MIT OR Apache-2.0 |
 | slab | MIT |
 | smallvec | MIT OR Apache-2.0 |
-| socks | MIT OR Apache-2.0 |
 | strength_reduce | MIT OR Apache-2.0 |
 | strsim | MIT |
-| subtle | BSD-3-Clause |
 | syn | MIT OR Apache-2.0 |
 | system-deps | MIT OR Apache-2.0 |
 | target-lexicon | Apache-2.0 WITH LLVM-exception |
@@ -392,32 +339,21 @@ platform / feature build).
 | toml_edit | MIT OR Apache-2.0 |
 | toml_parser | MIT OR Apache-2.0 |
 | toml_writer | MIT OR Apache-2.0 |
-| tracing | MIT |
-| tracing-core | MIT |
 | transpose | MIT OR Apache-2.0 |
 | unicode-ident | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | unicode-segmentation | MIT OR Apache-2.0 |
 | unicode-width | MIT OR Apache-2.0 |
-| untrusted | ISC |
-| ureq | MIT OR Apache-2.0 |
-| ureq-proto | MIT OR Apache-2.0 |
-| utf8-zero | MIT OR Apache-2.0 |
 | utf8parse | Apache-2.0 OR MIT |
 | version-compare | MIT |
 | visibility | Zlib OR MIT OR Apache-2.0 |
 | walkdir | Unlicense OR MIT |
-| wasi | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | wasm-bindgen | MIT OR Apache-2.0 |
 | wasm-bindgen-futures | MIT OR Apache-2.0 |
 | wasm-bindgen-macro | MIT OR Apache-2.0 |
 | wasm-bindgen-macro-support | MIT OR Apache-2.0 |
 | wasm-bindgen-shared | MIT OR Apache-2.0 |
 | web-sys | MIT OR Apache-2.0 |
-| webpki-roots | CDLA-Permissive-2.0 |
-| winapi | MIT OR Apache-2.0 |
-| winapi-i686-pc-windows-gnu | MIT OR Apache-2.0 |
 | winapi-util | Unlicense OR MIT |
-| winapi-x86_64-pc-windows-gnu | MIT OR Apache-2.0 |
 | windowfunctions | MIT |
 | windows | MIT OR Apache-2.0 |
 | windows-core | MIT OR Apache-2.0 |
@@ -436,12 +372,6 @@ platform / feature build).
 | windows_x86_64_gnullvm | MIT OR Apache-2.0 |
 | windows_x86_64_msvc | MIT OR Apache-2.0 |
 | winnow | MIT |
-| zeroize | Apache-2.0 OR MIT |
-
-> Note on `webpki-roots` (CDLA-Permissive-2.0) and `unicode-ident`
-> (Unicode-3.0): these are build-time / TLS-root data dependencies pulled by
-> `ort`'s `download-binaries` HTTP fetch and by proc-macro tooling; they are not
-> part of the runtime audio path but appear in the full dependency graph.
 
 ### Additional permissive crates from the VAD / FLAC / noise-suppression add-ons
 

@@ -49,13 +49,9 @@ jobs:
       # macOS arm64, windows x64. This matches the napi "triples" /
       # optionalDependencies in package.json.
       #
-      # macOS x64 (Intel) is deliberately left out: since VAD added ONNX Runtime,
-      # ort can't be built for x86_64-apple-darwin. Cross-building it on Apple
-      # Silicon fails (no prebuilt / no xcframework linking) and GitHub no longer
-      # provides hosted Intel macOS runners. Intel Macs are EOL; arm64 covers
-      # every Mac since 2020. Rust users on Intel Macs are unaffected (crates.io
-      # builds from source). To add it back, restore the target, the optional dep,
-      # and a runner (or ONNX build) that can produce it.
+      # macOS x64 (Intel) is deliberately left out of the prebuilt package matrix.
+      # Rust users on Intel Macs can still build from crates.io. Re-enable it only
+      # together with a supported runner and package target.
       #
       # Windows on arm64 has no hosted runner, but napi-rs cross-compiles it
       # cleanly from the x64 Windows runner (VS ships the ARM64 toolchain).
@@ -100,9 +96,55 @@ jobs:
 
       # napi build --platform writes the .node next to index.js and emits the
       # per-platform package suffix from package.json's "napi" config.
-      - name: Build native addon
+      - name: Build native addon (non-Windows)
+        if: runner.os != 'Windows'
         shell: bash
         run: npx napi build --platform --release --target ${{ matrix.target }}
+
+      - name: Build native addon (Windows, static CRT)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: npx napi build --platform --release --target ${{ matrix.target }}
+
+      - name: Verify native addon dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $nodes = Get-ChildItem -Path . -Filter '*.node' -File
+          if ($nodes.Count -eq 0) {
+            throw 'napi build produced no .node file to inspect'
+          }
+
+          foreach ($node in $nodes) {
+            Write-Host "::group::dumpbin /DEPENDENTS $($node.Name)"
+            $dump = (& dumpbin /DEPENDENTS $node.FullName 2>&1 | Out-String)
+            $exitCode = $LASTEXITCODE
+            Write-Host $dump
+            Write-Host '::endgroup::'
+            if ($exitCode -ne 0) {
+              throw "dumpbin failed for $($node.FullName) with exit code $exitCode"
+            }
+
+            $dependencies = @(
+              [regex]::Matches($dump, '(?im)^\s+([A-Za-z0-9_.-]+\.dll)\s*$') |
+                ForEach-Object { $_.Groups[1].Value }
+            )
+            if ($dependencies.Count -eq 0) {
+              throw "could not read any DLL dependencies from $($node.FullName)"
+            }
+            Write-Host "Dependencies for $($node.Name): $($dependencies -join ', ')"
+
+            $forbidden = @(
+              $dependencies | Where-Object {
+                $_ -match '(?i)(msvcp|vcruntime|vcomp|directml|onnxruntime)'
+              }
+            )
+            if ($forbidden.Count -ne 0) {
+              throw "forbidden native dependency in $($node.Name): $($forbidden -join ', ')"
+            }
+          }
 
       - name: Upload addon artifact
         uses: actions/upload-artifact@v4

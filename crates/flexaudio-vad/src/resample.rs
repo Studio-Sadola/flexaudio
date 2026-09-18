@@ -42,11 +42,44 @@ impl PcmConverter {
     /// rubato の構築は極端なレート比などで失敗し得るので、その場合はエラー文字列を返す
     /// （呼び出し側で panic させずに扱う）。
     pub(crate) fn new(format: PcmFormat, target_rate: u32) -> Result<Self, String> {
+        Self::new_with_resampler_chunk(format, target_rate, None)
+    }
+
+    /// VAD の 8 kHz フレーム（256 samples）を、連続性を保ったまま 16 kHz の 512 samples
+    /// へ変換する専用変換器を作る。
+    pub(crate) fn new_8k_to_16k_frame_resampler() -> Result<Self, String> {
+        let mut converter = Self::new_with_resampler_chunk(
+            PcmFormat {
+                sample_rate: 8_000,
+                channels: 1,
+            },
+            16_000,
+            Some(256),
+        )?;
+
+        // rubato の sinc は開始時に未来側のタップを待つため、最初の実フレームだけ 508
+        // samples になる。256 samples の無音 pre-roll を先に通し、対応する出力を捨てる。
+        // 以降は実フレームごとに512 samplesとなり、実音声側の境界でゼロ埋めやフレーム
+        // 分割をしない。
+        let mut discarded = Vec::new();
+        converter.convert(&[0.0; 256], &mut discarded)?;
+        Ok(converter)
+    }
+
+    fn new_with_resampler_chunk(
+        format: PcmFormat,
+        target_rate: u32,
+        resampler_chunk_in_frames: Option<usize>,
+    ) -> Result<Self, String> {
         let channels = usize::from(format.channels.max(1));
         let resampler = if format.sample_rate == target_rate {
             None
         } else {
-            Some(MonoResampler::new(format.sample_rate, target_rate)?)
+            Some(MonoResampler::new(
+                format.sample_rate,
+                target_rate,
+                resampler_chunk_in_frames,
+            )?)
         };
         Ok(PcmConverter {
             format,
@@ -122,10 +155,10 @@ struct MonoResampler {
 }
 
 impl MonoResampler {
-    fn new(in_sr: u32, out_sr: u32) -> Result<Self, String> {
+    fn new(in_sr: u32, out_sr: u32, input_chunk_frames: Option<usize>) -> Result<Self, String> {
         let ratio = out_sr as f64 / in_sr as f64;
         // 固定入力チャンクは 20ms 相当の入力フレーム（端数は rubato が内部に保持する）。
-        let chunk_in_frames = (in_sr as usize / 50).max(64);
+        let chunk_in_frames = input_chunk_frames.unwrap_or_else(|| (in_sr as usize / 50).max(64));
 
         let params = SincInterpolationParameters {
             sinc_len: 128,
@@ -306,6 +339,25 @@ mod tests {
             conv.convert(chunk, &mut split).unwrap();
         }
         assert_eq!(bulk, split);
+    }
+
+    #[test]
+    fn frame_resampler_returns_one_16k_frame_per_8k_frame() {
+        let mut converter = PcmConverter::new_8k_to_16k_frame_resampler().unwrap();
+        let mut output = Vec::new();
+        let input: Vec<f32> = (0..(256 * 4))
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / 8_000.0).sin() * 0.5)
+            .collect();
+
+        for frame in input.chunks_exact(256) {
+            let before = output.len();
+            converter.convert(frame, &mut output).unwrap();
+            assert_eq!(
+                output.len() - before,
+                512,
+                "8 kHz frame must yield exactly one 16 kHz model frame"
+            );
+        }
     }
 
     fn rms(samples: &[f32]) -> f32 {

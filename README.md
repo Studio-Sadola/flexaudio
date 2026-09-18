@@ -233,8 +233,8 @@ gated by the **TCC** privacy subsystem under `kTCCServiceAudioCapture`.
 ## Supported Rust version (MSRV)
 
 - **Core / facade / OS backends / mic:** Rust **1.85**.
-- **`flexaudio-vad` and `flexaudio-napi`:** Rust **1.88** (required by their
-  `ort` / `napi-build` toolchain dependencies).
+- **`flexaudio-vad`, `flexaudio-napi`, `flexaudio-ffi`, and `flexaudio-py`:**
+  Rust **1.91** (required by `tract-onnx` 0.23.7).
 
 The workspace pins MSRV via `rust-version` in each crate.
 

@@ -36,4 +36,4 @@ cpal = "0.16"
 # Linux システム出力キャプチャ (flexaudio-os-linux)。libpipewire-0.3 + libclang を要求し
 # target.'cfg(target_os = "linux")' でのみ引く（非 Linux はビルドに pipewire を一切引かない）。
 pipewire = "0.10"
-# 実装フェーズで追加 (ort, pyo3, numpy 等)
+# 実装フェーズで追加（tract-onnx、pyo3、numpy 等）

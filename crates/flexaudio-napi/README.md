@@ -6,7 +6,7 @@ microphone, system output (loopback), and per-process capture on **Linux**,
 **Windows**, and **macOS**.
 
 Three offline audio add-ons are compiled into the same binary and exposed to
-JavaScript: **voice activity detection** (Silero VAD on ONNX Runtime),
+JavaScript: **voice activity detection** (Silero VAD on pure-Rust tract),
 **noise suppression** (RNNoise), and streaming **FLAC** encoding. They run fully
 offline — no model files to ship, no network at runtime.
 
@@ -191,6 +191,6 @@ macOS 14.4 or later.
 ## License
 
 [MIT](LICENSE) © 2026 tubome / Studio Sadola. This package redistributes native code
-and bundled assets: statically linked ONNX Runtime plus the embedded Silero VAD
-model (built-in VAD add-on), and the embedded RNNoise weights (noise suppression).
+and bundled assets: the embedded Silero VAD model (built-in VAD add-on), the
+pure-Rust tract inference crates, and the embedded RNNoise weights (noise suppression).
 See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

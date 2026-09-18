@@ -109,5 +109,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
-      - name: Build at MSRV (flexaudio-vad / -napi require 1.88 and are excluded)
+      - name: Build at MSRV (tract-based add-ons require 1.91 and are excluded)
         run: cargo build -p flexaudio -p flexaudio-core -p flexaudio-mic -p flexaudio-os-linux -p flexaudio-cli

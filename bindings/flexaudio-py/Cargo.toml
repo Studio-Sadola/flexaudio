@@ -3,10 +3,10 @@ name = "flexaudio-py"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-# VAD アドオン（flexaudio-vad）が ort / ONNX Runtime のツールチェインの要求で 1.88 を
-# 指定しているため、それを引くこのクレートも 1.88 に揃える（flexaudio-napi も napi の
-# 要求で 1.88。pyo3 自身の MSRV は 1.83 だが、依存の最大値に合わせる）。
-rust-version = "1.88"
+# VAD アドオン（flexaudio-vad）が tract-onnx 0.23.7 の要求で 1.91 を指定しているため、
+# それを引くこのクレートも 1.91 に揃える（flexaudio-napi も同様。pyo3 自身の MSRV は
+# 1.83 だが、依存の最大値に合わせる）。
+rust-version = "1.91"
 authors.workspace = true
 repository.workspace = true
 description = "PyO3 Python binding for flexaudio. Distributed via PyPI, not crates.io."
