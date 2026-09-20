@@ -108,43 +108,33 @@ jobs:
           RUSTFLAGS: -C target-feature=+crt-static
         run: npx napi build --platform --release --target ${{ matrix.target }}
 
+      # The addon is built with the static CRT (see RUSTFLAGS above), so it must
+      # not pull in an MSVC redistributable DLL (msvcp*/vcruntime*/vcomp*) or an
+      # inference runtime that would have to ship next to it (DirectML /
+      # onnxruntime). The check reads the PE import tables itself, in Node, via
+      # crates/flexaudio-napi/__test__/check-pe-dependencies.mjs, and inspects
+      # both the normal and the delay-import directory.
+      #
+      # It deliberately does NOT call dumpbin: dumpbin ships with MSVC and is
+      # only on PATH inside a developer command prompt, so the check used to
+      # depend on the runner's environment rather than on the artifact (it
+      # failed with "The term 'dumpbin' is not recognized ..." on run
+      # 35509560651 and skipped the artifact upload, even though the build
+      # itself had succeeded).
       - name: Verify native addon dependencies (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: bash
         run: |
-          $nodes = Get-ChildItem -Path . -Filter '*.node' -File
-          if ($nodes.Count -eq 0) {
-            throw 'napi build produced no .node file to inspect'
-          }
-
-          foreach ($node in $nodes) {
-            Write-Host "::group::dumpbin /DEPENDENTS $($node.Name)"
-            $dump = (& dumpbin /DEPENDENTS $node.FullName 2>&1 | Out-String)
-            $exitCode = $LASTEXITCODE
-            Write-Host $dump
-            Write-Host '::endgroup::'
-            if ($exitCode -ne 0) {
-              throw "dumpbin failed for $($node.FullName) with exit code $exitCode"
-            }
-
-            $dependencies = @(
-              [regex]::Matches($dump, '(?im)^\s+([A-Za-z0-9_.-]+\.dll)\s*$') |
-                ForEach-Object { $_.Groups[1].Value }
-            )
-            if ($dependencies.Count -eq 0) {
-              throw "could not read any DLL dependencies from $($node.FullName)"
-            }
-            Write-Host "Dependencies for $($node.Name): $($dependencies -join ', ')"
-
-            $forbidden = @(
-              $dependencies | Where-Object {
-                $_ -match '(?i)(msvcp|vcruntime|vcomp|directml|onnxruntime)'
-              }
-            )
-            if ($forbidden.Count -ne 0) {
-              throw "forbidden native dependency in $($node.Name): $($forbidden -join ', ')"
-            }
-          }
+          set -euo pipefail
+          shopt -s nullglob
+          nodes=(./*.node)
+          if [ "${#nodes[@]}" -eq 0 ]; then
+            echo "::error::napi build produced no .node file to inspect"
+            exit 1
+          fi
+          # Relative to the job's defaults.run.working-directory
+          # (crates/flexaudio-napi), same as the ./*.node glob above.
+          node ./__test__/check-pe-dependencies.mjs "${nodes[@]}"
 
       - name: Upload addon artifact
         uses: actions/upload-artifact@v4
