@@ -1,5 +1,19 @@
 name: CI
 
+# 門（= 赤くなったら止める検査）が使う Rust の版は 1.98.1 に固定する。理由:
+# `dtolnay/rust-toolchain@stable` は上流の更新で、コードを 1 行も変えていないのに
+# ある日 CI を赤くする（2026-09-21 に実際に起きた: clippy 1.98 が新しい lint を
+# 追加した）。
+#
+# ⚠️ GitHub Actions の `uses:` には式も環境変数も書けない（GitHub Docs
+# "Context availability" の表に `jobs.<job_id>.steps.uses` の行が無く、
+# `steps.with` にはある）。なので版は各 `uses: dtolnay/rust-toolchain@<版>` に
+# 直接書くしかなく、同じ版がこのファイルの中に何度も現れる。写し違いは
+# `toolchain-pin-guard` ジョブ（.github/scripts/check-toolchain-pins.py）が赤にする。
+#
+# MSRV のジョブだけは「クレートが宣言した rust-version」で回すのが目的なので、
+# 意図的に別の版（1.85.0 / 1.91.0）を固定する。
+
 on:
   push:
     branches: [redesign/flexaudio-rust, main]
@@ -15,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -61,10 +75,20 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          # 下の Clippy ステップのため（既定では clippy は入っていない）。
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build -p flexaudio -p flexaudio-os-windows -p flexaudio-mic -p flexaudio-core -p flexaudio-cli -p flexaudio-ffi
+      # flexaudio-os-windows は Windows でしか建てられない（非 Windows では
+      # #[cfg(target_os = "windows")] で空コンパイルになる）ので、Linux の clippy
+      # ステップの対象外 = ここで lint しないとどの lint もかからない。厳しさは
+      # Linux 側と揃える（--all-targets と -D warnings）: Linux 側だけ厳しいと、
+      # 同じ誤りがプラットフォームによって見つかったり見つからなかったりする。
+      - name: Clippy (deny warnings, Windows-exclusive crates)
+        run: cargo clippy -p flexaudio-os-windows --all-targets -- -D warnings
       # flexaudio-mic (cpal/WASAPI) is built above but its tests are not run here:
       # on the headless GitHub Windows runner (no audio endpoint) cpal's device
       # enumeration access-violates during process teardown — a cpal/runner issue,
@@ -78,10 +102,19 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          # 下の Clippy ステップのため（既定では clippy は入っていない）。
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build -p flexaudio -p flexaudio-os-macos -p flexaudio-mic -p flexaudio-core -p flexaudio-cli -p flexaudio-ffi
+      # flexaudio-os-macos は macOS でしか建てられない（非 macOS では
+      # #![cfg(target_os = "macos")] で空コンパイルになる）ので、Linux の clippy
+      # ステップの対象外 = ここで lint しないとどの lint もかからない。厳しさは
+      # Linux 側と揃える（--all-targets と -D warnings）: 理由は Windows 側と同じ。
+      - name: Clippy (deny warnings, macOS-exclusive crates)
+        run: cargo clippy -p flexaudio-os-macos --all-targets -- -D warnings
       - name: Test (ignored real-audio tests auto-skip)
         run: cargo test -p flexaudio -p flexaudio-os-macos -p flexaudio-mic -p flexaudio-core -p flexaudio-cli
 
@@ -90,7 +123,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
@@ -101,13 +134,95 @@ jobs:
         run: bash crates/flexaudio-napi/__test__/run-smoke.sh
 
   msrv:
-    name: MSRV 1.85 (core/facade/mic/os-linux/cli)
+    name: MSRV 1.85 (all crates declaring 1.85)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          # プラットフォーム専用クレートを cross で見るために、その target の std を
+          # 入れる（cross の check はリンカが要らないので Linux から見られる）。
+          targets: aarch64-apple-darwin, x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
-      - name: Build at MSRV (tract-based add-ons require 1.91 and are excluded)
-        run: cargo build -p flexaudio -p flexaudio-core -p flexaudio-mic -p flexaudio-os-linux -p flexaudio-cli
+      # MSRV の門では clippy を使わない。lint は版で変わってしまうので、ここで
+      # 見たいのは「その版でコンパイルできるか」だけ。
+      - name: Build at MSRV 1.85 (Linux-native crates)
+        run: >-
+          cargo build
+          -p flexaudio -p flexaudio-core -p flexaudio-mic -p flexaudio-os-linux
+          -p flexaudio-cli -p flexaudio-denoise -p flexaudio-encode
+      # os-macos / os-windows は Linux では空コンパイルになるので、それぞれの
+      # target へ cross して中身をコンパイルする。cross ではリンクできない
+      # （MSVC / Apple のリンカと SDK が無い）ので check に留める: ここで見ている
+      # のは「その版で型検査が通るか」までで、リンクと実機の挙動は 1.98.1 に固定
+      # した native のジョブ（build-test-windows / build-test-macos）が受け持つ。
+      - name: Check at MSRV 1.85 (platform-exclusive crates, cross / check only)
+        run: |
+          cargo check --all-targets -p flexaudio-os-windows --target x86_64-pc-windows-msvc
+          cargo check --all-targets -p flexaudio-os-macos --target aarch64-apple-darwin
+
+  msrv-1_91:
+    name: MSRV 1.91 (tract-dependent add-ons)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        # python3-dev は PyO3（flexaudio-py）のため: extension-module を付けない
+        # cargo build は libpython へリンクするので、共有ライブラリと
+        # ヘッダが要る（CI 側で本当に足りるかは未検証。下の報告を参照）。
+        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev python3-dev
+      # ここも clippy は使わない（理由は msrv ジョブと同じ）。
+      - name: Build at MSRV 1.91 (ffi / napi / py / vad)
+        run: >-
+          cargo build
+          -p flexaudio-ffi -p flexaudio-napi -p flexaudio-vad -p flexaudio-py
+
+  # ⚠️ これは門ではない。上流の stable が動いたことを「赤」ではなく「予告」として
+  # 受け取るための先行警報。continue-on-error: true なので、ここが落ちても CI 全体は
+  # 緑のまま（落ちた事実は Checks に残る）。門の版（1.98.1）を上げるかどうかを
+  # 判断する材料にする。中身は Linux の門と同じ clippy と test（同じクレート一覧）
+  # にして、差分がそのまま「上流で何が変わったか」になるようにしている。
+  preview-upstream-stable:
+    name: "Preview: upstream Rust stable (NOT a gate — advance warning only)"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
+      - name: Clippy (same crate list and strictness as the Linux gate)
+        run: >-
+          cargo clippy
+          -p flexaudio -p flexaudio-core -p flexaudio-cli -p flexaudio-mic
+          -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
+          -p flexaudio-encode -p flexaudio-denoise
+          -p flexaudio-ffi -p flexaudio-py
+          --all-targets -- -D warnings
+      - name: Test (ignored real-audio tests auto-skip)
+        run: >-
+          cargo test
+          -p flexaudio -p flexaudio-core -p flexaudio-cli -p flexaudio-mic
+          -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
+          -p flexaudio-encode -p flexaudio-denoise
+          -p flexaudio-ffi
+
+  # 門の toolchain 固定版が食い違っていないことの検査。`uses:` に式が書けない以上、
+  # 版は何度も写されるので、写し違いを赤にする門が要る。
+  # MSRV ジョブの除外は job 名の一覧ではなく、cargo metadata から取った「宣言済み
+  # rust-version」で判定する（MSRV を宣言するクレートが増えても壊れない）。
+  toolchain-pin-guard:
+    name: Toolchain pin guard (gated jobs share one pinned version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Check that every gate pins the same toolchain version
+        run: python3 .github/scripts/check-toolchain-pins.py
