@@ -349,7 +349,7 @@ mod tests {
             .map(|i| (2.0 * PI * 440.0 * i as f32 / 8_000.0).sin() * 0.5)
             .collect();
 
-        for frame in input.chunks_exact(256) {
+        for frame in input.as_chunks::<256>().0 {
             let before = output.len();
             converter.convert(frame, &mut output).unwrap();
             assert_eq!(

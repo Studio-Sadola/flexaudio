@@ -401,7 +401,9 @@ mod tests {
         assert_eq!(&wav[..4], b"RIFF");
         assert_eq!(&wav[8..12], b"WAVE");
         let samples16: Vec<f32> = wav[44..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32768.0)
             .collect();
 
@@ -423,7 +425,7 @@ mod tests {
         let mut reference_upsampler = PcmConverter::new_8k_to_16k_frame_resampler()
             .expect("8 kHz to 16 kHz reference resampler");
         let mut reference16 = Vec::with_capacity(samples8.len() * 2);
-        for frame in samples8.chunks_exact(256) {
+        for frame in samples8.as_chunks::<256>().0 {
             let before = reference16.len();
             reference_upsampler
                 .convert(frame, &mut reference16)

@@ -60,7 +60,9 @@ fn load_pcm16_mono_wav(path: &Path) -> (u32, Vec<f32>) {
     assert_eq!(fmt_channels, 1, "fixture must be mono");
     assert_eq!(fmt_bits, 16, "fixture must be pcm16");
     let samples = data
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
         .collect();
     (fmt_rate, samples)
