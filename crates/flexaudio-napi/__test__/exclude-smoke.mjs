@@ -4,7 +4,9 @@
 // the path Electron/Chromium uses), B = 3 kHz via native PipeWire (pw-play).
 // The addon must (1) list A under A's real pid, (2) capture B but not A when
 // A's pid is excluded from a `system` capture, (3) capture both when nothing
-// is excluded. Requires: pw-cli, pw-play, paplay on PATH; XDG_RUNTIME_DIR set.
+// is excluded, reading the test sink's own monitor (deviceId) so the check
+// doesn't depend on this sink being the PipeWire default. Requires: pw-cli,
+// pw-play, paplay on PATH; XDG_RUNTIME_DIR set.
 //
 // Detector: Goertzel at exact FFT bins. The bin index is round(N*f/rate) —
 // the +0.5 variant lands one bin off and reads a pure tone as silence.
@@ -83,7 +85,7 @@ try {
   // (2) exclusion by the libpulse child's real pid.
   expect('exclude-A', await capture({ kind: 'system', excludePids: [a.pid] }), false, true);
   // (3) control: nothing excluded, both present.
-  expect('control', await capture({ kind: 'system' }), true, true);
+  expect('control', await capture({ kind: 'system', deviceId: sinkName }), true, true);
 } finally {
   a.kill(); b.kill();
   rmSync(dir, { recursive: true, force: true });
