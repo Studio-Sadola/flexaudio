@@ -4,7 +4,11 @@
 // the path Electron/Chromium uses), B = 3 kHz via native PipeWire (pw-play).
 // The addon must (1) list A under A's real pid, (2) capture B but not A when
 // A's pid is excluded from a `system` capture, (3) capture both when nothing
-// is excluded. Both (2) and (3) name the test sink via `deviceId` so neither
+// is excluded, and (4) capture the surviving tone at (near) the level the
+// control reads — a fan-in that links only one channel of a stereo source
+// halves the amplitude after stereo→mono averaging, which checks (2) and (3)
+// alone cannot see. The control capture runs FIRST so (4) has its reference.
+// Both (2) and (3) name the test sink via `deviceId` so neither
 // depends on this sink being the PipeWire default. Today `excludePids` is
 // unimplemented and ignored, so (2)'s capture is just the test sink's plain
 // monitor and the failure is the real leak (1 kHz still present); once
@@ -89,12 +93,21 @@ try {
   if (!rowA) fail(`processes() has no entry with pid ${a.pid} (paplay); libpulse clients resolve to pipewire-pulse's pid`);
   else if (!['paplay', 'pacat'].includes(rowA.executable)) fail(`pid ${a.pid} listed with executable ${rowA.executable}`);
 
+  // (3) control: nothing excluded, both present. Captured FIRST so (4) has its
+  // reference level for the surviving tone.
+  const ctl = await capture({ kind: 'system', deviceId: sinkName });
   // (2) exclusion by the libpulse child's real pid, also scoped to the test
   // sink (see header: deviceId is ignored once excludePids takes the fan-in
   // path, so this scoping only matters for today's pre-implementation read).
-  expect('exclude-A', await capture({ kind: 'system', deviceId: sinkName, excludePids: [a.pid] }), false, true);
-  // (3) control: nothing excluded, both present.
-  expect('control', await capture({ kind: 'system', deviceId: sinkName }), true, true);
+  const excl = await capture({ kind: 'system', deviceId: sinkName, excludePids: [a.pid] });
+  expect('exclude-A', excl, false, true);
+  expect('control', ctl, true, true);
+
+  // (4) The surviving tone must come through at (near) the control's level:
+  // a half-linked fan-in (one channel silent) would read ≈50 % here.
+  const ratio = excl.amp3k / ctl.amp3k;
+  console.log(`[fan-in level] exclude/control = ${ratio.toFixed(3)}`);
+  if (ratio < 0.9) fail(`fan-in captured the surviving tone at ${(ratio * 100).toFixed(0)}% of the control — a channel is missing`);
 } finally {
   if (a) a.kill();
   if (b) b.kill();

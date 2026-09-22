@@ -713,6 +713,18 @@ fn pair_ports(out_ports: &[(u32, String)], in_ports: &[(u32, String)]) -> Vec<(u
     pairs
 }
 
+/// Decide whether a fan-in link for one target node can be committed now.
+///
+/// Registry globals arrive one port at a time, so `try_link` can run while
+/// only some of the capture stream's input ports (or the target's output
+/// ports) exist. Committing a partial pairing latches the node in `linked`
+/// and it is never re-paired — a stereo source then feeds one channel.
+/// Complete means: every target output port got a pair. (A mono source
+/// duplicated onto both inputs also satisfies this: one output, one pair.)
+fn link_plan_is_complete(out_ports_len: usize, pairs_len: usize) -> bool {
+    out_ports_len > 0 && pairs_len >= out_ports_len
+}
+
 /// ノードの PID を解決する（PipeWire 非依存・到着順非依存）。
 ///
 /// ノード自身に PID があればそれを使い、無ければ `client.id` で所有 Client を引いて
@@ -1061,7 +1073,15 @@ fn setup_pw_process(
 
             // チャンネル対応（FL→FL/FR→FR、モノは複製、取れなければ順序）でペアを作る。
             let pairs = pair_ports(&out_ports, &in_ports);
-            if pairs.is_empty() {
+            // Commit only a complete plan: every output port of the target must
+            // have a pair. Input-port globals arrive one at a time, so pairing
+            // against a half-arrived `in_ports` set would link FL alone — and
+            // inserting into `linked` below fossilises that, because a linked
+            // node is never re-paired. Leaving the node OUT of `linked` here is
+            // deliberate: the next port global re-evaluates it, and by then the
+            // missing port exists. (Subsumes the old is-empty check: a complete
+            // plan has at least one pair.)
+            if !link_plan_is_complete(out_ports.len(), pairs.len()) {
                 continue;
             }
             let want = pairs.len();
@@ -3014,6 +3034,18 @@ mod tests {
         // 出力 1 ポートなのでモノ複製規則が走り、残り入力へ複製される。
         let pairs = pair_ports(&out_fl, &in_fr);
         assert_eq!(pairs, vec![(70, 80)], "出力1ポートは残り入力へ複製");
+    }
+
+    #[test]
+    fn link_plan_is_complete_requires_every_output_paired() {
+        assert!(!link_plan_is_complete(0, 0), "nothing to link");
+        assert!(
+            !link_plan_is_complete(2, 1),
+            "FL paired, FR still waiting for its input port"
+        );
+        assert!(link_plan_is_complete(2, 2));
+        assert!(link_plan_is_complete(1, 1), "mono source, single pair");
+        assert!(link_plan_is_complete(1, 2), "mono duplicated onto FL+FR");
     }
 
     /// スモークテスト: プロセスキャプチャの `start` は PipeWire 不在/registry 取得

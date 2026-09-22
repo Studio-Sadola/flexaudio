@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Windows: one process tree — `exclude_self` wins, otherwise the first pid.
 
 ### Fixed
+- **Linux: fan-in capture no longer latches a half-linked node.** `try_link`
+  now commits a target only once every one of its output ports has a pair;
+  a `try_link` fired by the first input-port global used to link FL alone and
+  never revisit the node, so stereo sources came through at half level with
+  one channel missing.
 - **Linux: libpulse clients now resolve to their own pid.** Stream nodes are
   bound and `application.process.id` is read from their info props (the
   registry `global` event omits it); `pipewire.sec.pid` remains the fallback.
