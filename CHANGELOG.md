@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Linux: libpulse clients now resolve to their own pid.** Stream nodes are
+  bound and `application.process.id` is read from their info props (the
+  registry `global` event omits it); `pipewire.sec.pid` remains the fallback.
+  For every client speaking the PulseAudio protocol (Electron/Chromium, Zoom,
+  …) `pipewire.sec.pid` is pipewire-pulse's pid, so those apps were listed as
+  one process by `processes()` and could not be excluded individually.
+
 ## [0.3.0] - not yet released
 
 ### Added
