@@ -632,6 +632,12 @@ struct NodeEntry {
     /// Set true by the info callback whether or not it carried `application.process.id`;
     /// read by `exclude_decidable` to gate Exclude-mode linking.
     info_seen: bool,
+    /// How many output ports the node itself declares (`NodeInfoRef::n_output_ports`),
+    /// filled from the bound node's info; `None` until that info arrives (and in
+    /// `processes.rs`, which does not read it). Port globals trickle in one at a
+    /// time, so this declared count is what tells `link_plan_is_complete` that a
+    /// stereo node's FR port is still missing rather than that the node is mono.
+    n_output_ports: Option<u32>,
 }
 
 /// 1 ポートの登録情報（registry の `ObjectType::Port` global から拾う）。
@@ -714,15 +720,23 @@ fn pair_ports(out_ports: &[(u32, String)], in_ports: &[(u32, String)]) -> Vec<(u
 }
 
 /// Decide whether a fan-in link for one target node can be committed now.
-///
-/// Registry globals arrive one port at a time, so `try_link` can run while
-/// only some of the capture stream's input ports (or the target's output
-/// ports) exist. Committing a partial pairing latches the node in `linked`
-/// and it is never re-paired — a stereo source then feeds one channel.
-/// Complete means: every target output port got a pair. (A mono source
-/// duplicated onto both inputs also satisfies this: one output, one pair.)
-fn link_plan_is_complete(out_ports_len: usize, pairs_len: usize) -> bool {
-    out_ports_len > 0 && pairs_len >= out_ports_len
+/// Globals arrive one port at a time on BOTH sides: the capture stream's own
+/// inputs and the target's outputs. A partial pairing latched into `linked`
+/// is never revisited, so commit only when (a) every capture input exists,
+/// (b) every target output the node declared exists, and (c) each channel the
+/// capture can take is paired — `min(out, capture)` so a 5.1 source links its
+/// front pair instead of waiting forever.
+fn link_plan_is_complete(
+    expected_out: Option<u32>, // bound info's n_output_ports, if known
+    out_ports_len: usize,
+    in_ports_len: usize,
+    pairs_len: usize,
+    capture_channels: usize, // NATIVE_CHANNELS as usize
+) -> bool {
+    in_ports_len >= capture_channels
+        && out_ports_len > 0
+        && expected_out.is_none_or(|n| out_ports_len >= n as usize)
+        && pairs_len >= out_ports_len.min(capture_channels)
 }
 
 /// ノードの PID を解決する（PipeWire 非依存・到着順非依存）。
@@ -1073,15 +1087,29 @@ fn setup_pw_process(
 
             // チャンネル対応（FL→FL/FR→FR、モノは複製、取れなければ順序）でペアを作る。
             let pairs = pair_ports(&out_ports, &in_ports);
-            // Commit only a complete plan: every output port of the target must
-            // have a pair. Input-port globals arrive one at a time, so pairing
-            // against a half-arrived `in_ports` set would link FL alone — and
-            // inserting into `linked` below fossilises that, because a linked
-            // node is never re-paired. Leaving the node OUT of `linked` here is
-            // deliberate: the next port global re-evaluates it, and by then the
-            // missing port exists. (Subsumes the old is-empty check: a complete
-            // plan has at least one pair.)
-            if !link_plan_is_complete(out_ports.len(), pairs.len()) {
+            // The node's own declared output-port count, if its bound info has
+            // arrived. Borrow of `nodes` ends with this block — nothing below is
+            // allowed to hold it across `create_object`.
+            let expected_out: Option<u32> = nodes
+                .borrow()
+                .get(&target_node_id)
+                .and_then(|entry| entry.n_output_ports);
+            // Commit only a complete plan. Port globals arrive one at a time on
+            // BOTH sides, and a partial pairing inserted into `linked` below is
+            // fossilised, because a linked node is never re-paired: half-arrived
+            // capture inputs link FL alone, and a half-arrived target (one output
+            // port of a declared stereo node) makes `pair_ports`' mono rule
+            // duplicate FL onto both inputs. Leaving the node OUT of `linked`
+            // here is deliberate: the next port global re-evaluates it, and by
+            // then the missing port exists. (Subsumes the old is-empty check: a
+            // complete plan has at least one pair.)
+            if !link_plan_is_complete(
+                expected_out,
+                out_ports.len(),
+                in_ports.len(),
+                pairs.len(),
+                NATIVE_CHANNELS as usize,
+            ) {
                 continue;
             }
             let want = pairs.len();
@@ -1194,6 +1222,8 @@ fn setup_pw_process(
                                 owning_client_id,
                                 app_pid,
                                 info_seen: false,
+                                // Only the bound info carries the declared port count.
+                                n_output_ports: None,
                             },
                         );
 
@@ -1225,11 +1255,20 @@ fn setup_pw_process(
                                             )
                                         });
 
+                                        // The node's own declared output-port count. Port
+                                        // globals arrive one at a time, so this is what
+                                        // distinguishes "stereo, FR not here yet" from
+                                        // "mono" in link_plan_is_complete.
+                                        let n_out = info.n_output_ports();
+
                                         // 判定材料が変わったか: info_seen が初めて立つ
                                         // （これまで判定不能だったノードが判定可能になる）
                                         // か、app_pid が新しい値に更新されるか。どちらも
                                         // try_link の対象集合を変え得るので、その場合だけ
                                         // 以降の unlink 判定 / try_link を行う。
+                                        // A change of the declared output-port count counts
+                                        // too: it changes what link_plan_is_complete will
+                                        // accept for this node, so it must re-run try_link.
                                         let updated_entry: Option<NodeEntry> = {
                                             let mut nodes = nodes_for_info.borrow_mut();
                                             let Some(entry) = nodes.get_mut(&node_id) else {
@@ -1241,7 +1280,12 @@ fn setup_pw_process(
                                             if pid_changed {
                                                 entry.app_pid = pid;
                                             }
-                                            (newly_decidable || pid_changed).then_some(*entry)
+                                            let n_out_changed = entry.n_output_ports != Some(n_out);
+                                            if n_out_changed {
+                                                entry.n_output_ports = Some(n_out);
+                                            }
+                                            (newly_decidable || pid_changed || n_out_changed)
+                                                .then_some(*entry)
                                         };
                                         let Some(entry) = updated_entry else {
                                             return;
@@ -2799,6 +2843,7 @@ mod tests {
             owning_client_id: Some(60),
             app_pid: None,
             info_seen: false,
+            n_output_ports: None,
         };
 
         // --- Node が先に来て Client がまだ表に無い状態 → 未解決（None）。
@@ -2822,6 +2867,7 @@ mod tests {
             owning_client_id: None,
             app_pid: None,
             info_seen: false,
+            n_output_ports: None,
         };
         assert_eq!(resolve_node_pid(&orphan, &client_pid), None);
 
@@ -2831,6 +2877,7 @@ mod tests {
             owning_client_id: Some(99), // 表に無い client.id でも
             app_pid: Some(424242),
             info_seen: true,
+            n_output_ports: None,
         };
         let empty: HashMap<u32, u32> = HashMap::new();
         assert_eq!(
@@ -2844,6 +2891,7 @@ mod tests {
             owning_client_id: Some(61),
             app_pid: None,
             info_seen: false,
+            n_output_ports: None,
         };
         // client 61 は未登録なので None、登録すればその PID。
         assert_eq!(resolve_node_pid(&other_node, &client_pid), None);
@@ -2884,6 +2932,7 @@ mod tests {
                     owning_client_id: None,
                     app_pid: None,
                     info_seen: false,
+                    n_output_ports: None,
                 },
                 false,
                 "info 未到達・PID 未解決 → 判定不能",
@@ -2893,6 +2942,7 @@ mod tests {
                     owning_client_id: Some(60),
                     app_pid: None,
                     info_seen: false,
+                    n_output_ports: None,
                 },
                 false,
                 "client.id 経由の暫定解決が Some でも、info 未到達なら判定不能\
@@ -2903,6 +2953,7 @@ mod tests {
                     owning_client_id: None,
                     app_pid: Some(28551),
                     info_seen: true,
+                    n_output_ports: None,
                 },
                 true,
                 "info 到達・PID 解決済み → 判定可能",
@@ -2912,6 +2963,7 @@ mod tests {
                     owning_client_id: Some(60),
                     app_pid: None,
                     info_seen: true,
+                    n_output_ports: None,
                 },
                 true,
                 "info は届いたが application.process.id 自体は無かった場合も、\
@@ -3036,16 +3088,91 @@ mod tests {
         assert_eq!(pairs, vec![(70, 80)], "出力1ポートは残り入力へ複製");
     }
 
+    /// Both sides of the fan-in race, as a table:
+    /// (expected_out, out_ports_len, in_ports_len, pairs_len, capture_channels).
     #[test]
-    fn link_plan_is_complete_requires_every_output_paired() {
-        assert!(!link_plan_is_complete(0, 0), "nothing to link");
-        assert!(
-            !link_plan_is_complete(2, 1),
-            "FL paired, FR still waiting for its input port"
-        );
-        assert!(link_plan_is_complete(2, 2));
-        assert!(link_plan_is_complete(1, 1), "mono source, single pair");
-        assert!(link_plan_is_complete(1, 2), "mono duplicated onto FL+FR");
+    fn link_plan_is_complete_requires_every_channel_on_both_sides() {
+        struct Case {
+            expected_out: Option<u32>,
+            out_len: usize,
+            in_len: usize,
+            pairs_len: usize,
+            chans: usize,
+            want: bool,
+            why: &'static str,
+        }
+        let case = |expected_out, out_len, in_len, pairs_len, chans, want, why| Case {
+            expected_out,
+            out_len,
+            in_len,
+            pairs_len,
+            chans,
+            want,
+            why,
+        };
+        let cases = [
+            case(
+                Some(2),
+                2,
+                1,
+                1,
+                2,
+                false,
+                "capture input FR has not arrived yet",
+            ),
+            case(Some(2), 2, 2, 2, 2, true, "stereo source fully paired"),
+            case(
+                Some(2),
+                1,
+                2,
+                2,
+                2,
+                false,
+                "target output FR missing — pair_ports' mono rule duplicated FL onto both \
+                 inputs, which must not latch",
+            ),
+            case(
+                Some(1),
+                1,
+                2,
+                2,
+                2,
+                true,
+                "genuine mono source duplicated onto FL+FR",
+            ),
+            case(
+                Some(6),
+                6,
+                2,
+                2,
+                2,
+                true,
+                "5.1 source links its front pair instead of waiting forever",
+            ),
+            case(
+                None,
+                2,
+                2,
+                2,
+                2,
+                true,
+                "declared count unknown — current ports fully paired",
+            ),
+            case(None, 0, 2, 0, 2, false, "nothing to link"),
+        ];
+        for c in cases {
+            assert_eq!(
+                link_plan_is_complete(c.expected_out, c.out_len, c.in_len, c.pairs_len, c.chans),
+                c.want,
+                "{} ({:?}, {}, {}, {}, {})",
+                c.why,
+                c.expected_out,
+                c.out_len,
+                c.in_len,
+                c.pairs_len,
+                c.chans
+            );
+        }
     }
 
     /// スモークテスト: プロセスキャプチャの `start` は PipeWire 不在/registry 取得

@@ -9,12 +9,11 @@
 // halves the amplitude after stereo→mono averaging, which checks (2) and (3)
 // alone cannot see. The control capture runs FIRST so (4) has its reference.
 // Both (2) and (3) name the test sink via `deviceId` so neither
-// depends on this sink being the PipeWire default. Today `excludePids` is
-// unimplemented and ignored, so (2)'s capture is just the test sink's plain
-// monitor and the failure is the real leak (1 kHz still present); once
-// `excludePids` is implemented, a non-empty exclusion set is expected to
-// take the Linux fan-in path, which ignores `deviceId` — so a green run
-// there is genuine pid exclusion, not an artifact of sink scoping.
+// depends on this sink being the PipeWire default. `excludePids` is now
+// implemented, and a non-empty exclusion set takes the Linux fan-in path,
+// which ignores `deviceId` — so a green (2) is genuine pid exclusion, not an
+// artifact of sink scoping, and its failure mode is the real leak (1 kHz
+// still present). `deviceId` still scopes (3), the control capture.
 // Requires: pw-cli, pw-play, paplay on PATH; XDG_RUNTIME_DIR set.
 //
 // Detector: Goertzel at exact FFT bins. The bin index is round(N*f/rate) —

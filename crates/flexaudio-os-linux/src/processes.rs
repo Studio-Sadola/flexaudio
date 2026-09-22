@@ -211,6 +211,9 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                             // concern only. `NodeEntry` is shared, so this file just
                             // needs a value.
                             info_seen: false,
+                            // Same: the declared output-port count is only read by
+                            // `setup_pw_process`'s link planner.
+                            n_output_ports: None,
                         };
                         snapshot_for_global.borrow_mut().nodes.insert(
                             global.id,
@@ -355,6 +358,7 @@ mod tests {
                 owning_client_id: client,
                 app_pid,
                 info_seen: false,
+                n_output_ports: None,
             },
             app_name: name.map(str::to_string),
             running: None,
