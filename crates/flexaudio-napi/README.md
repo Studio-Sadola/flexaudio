@@ -94,6 +94,11 @@ Linux and macOS exclude every listed pid. Windows excludes one process *tree*
 (`excludeSelf` wins, otherwise the first pid) — for an Electron host that is
 the whole app, since helpers are children of the main process.
 
+On **macOS** each pid is resolved to a Core Audio process object once, when the
+capture starts. A helper that has not yet rendered any audio has no such object
+and is therefore not excluded. Open the capture while the app is already
+playing, or reopen it when a new helper appears.
+
 ## Chunk delivery shape (primary, secondary, VAD)
 
 `onChunk` is called with **one** argument, the primary chunk. When

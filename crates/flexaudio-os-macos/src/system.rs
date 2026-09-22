@@ -109,6 +109,18 @@ impl MacSystemBackend {
     /// Exclude these pids' output in addition to `exclude_self`. Each pid is
     /// translated to its Core Audio process object at `start`; pids with no
     /// audio object (not producing sound) are skipped, not errors.
+    ///
+    /// A translation failure on a caller-supplied pid is also skipped: the
+    /// caller's list races process churn (an Electron helper can exit between
+    /// enumeration and `start`), and losing all system audio over one dead
+    /// helper pid is the wrong trade. Only `exclude_self`'s own pid keeps the
+    /// pre-change contract of failing the capture, because a failure there
+    /// means TCC denied the tap and the capture would echo our own output.
+    ///
+    /// The resolution happens once, when the capture starts: a helper that has
+    /// not yet rendered audio has no Core Audio process object and is therefore
+    /// not excluded. Open the capture while the app is already playing, or
+    /// reopen it when a new helper appears.
     pub fn with_exclude_pids(mut self, pids: Vec<u32>) -> Self {
         self.exclude_pids = pids;
         self
@@ -164,11 +176,18 @@ impl CaptureBackend for MacSystemBackend {
                             // 除外すべき音が無いので、エラーにせず飛ばす。
                             Ok(0) => {}
                             Ok(object_id) => ids.push(object_id),
-                            // 変換自体が失敗（TCC 等）。readiness として Err を返して終了。
-                            Err(e) => {
+                            // Translation failed (TCC etc.). For our own pid this is the
+                            // pre-change contract: fail readiness, because capturing while
+                            // unable to exclude ourselves would echo our own output.
+                            Err(e) if pid == std::process::id() => {
                                 let _ = ready_tx.send(Err(e));
                                 return;
                             }
+                            // For a caller-supplied pid, skip it like `Ok(0)`. The caller's
+                            // list races process churn (an Electron helper can exit between
+                            // enumeration and `start`), and losing all system audio over one
+                            // dead helper pid is the wrong trade.
+                            Err(_) => {}
                         }
                     }
                     TapKind::ExcludeProcesses(ids)

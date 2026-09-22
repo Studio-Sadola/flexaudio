@@ -727,6 +727,12 @@ fn pair_ports(out_ports: &[(u32, String)], in_ports: &[(u32, String)]) -> Vec<(u
 /// capture can take is paired — `min(out, capture)` so a 5.1 source links its
 /// front pair instead of waiting forever.
 ///
+/// A declared count of `Some(0)` is treated as "not known yet", not as "this
+/// node has no outputs": a node that has published ports but declares zero of
+/// them has not finished describing itself, so committing a plan against it
+/// would latch whatever arrived first. Only `None` (no info yet) falls back to
+/// "whatever ports are visible are all of them".
+///
 /// Known bound: (b) trusts that every declared output port eventually surfaces
 /// as a registry `Port` global. If one never does — props without `node.id` or
 /// `port.direction`, or a registry permission that hides it — `out_ports_len >=
@@ -741,7 +747,7 @@ fn link_plan_is_complete(
 ) -> bool {
     in_ports_len >= capture_channels
         && out_ports_len > 0
-        && expected_out.is_none_or(|n| out_ports_len >= n as usize)
+        && expected_out.is_none_or(|n| n > 0 && out_ports_len >= n as usize)
         && pairs_len >= out_ports_len.min(capture_channels)
 }
 
@@ -1275,7 +1281,7 @@ fn setup_pw_process(
                                         // A change of the declared output-port count counts
                                         // too: it changes what link_plan_is_complete will
                                         // accept for this node, so it must re-run try_link.
-                                        let updated_entry: Option<NodeEntry> = {
+                                        let updated_entry: Option<(NodeEntry, bool)> = {
                                             let mut nodes = nodes_for_info.borrow_mut();
                                             let Some(entry) = nodes.get_mut(&node_id) else {
                                                 return;
@@ -1291,9 +1297,9 @@ fn setup_pw_process(
                                                 entry.n_output_ports = Some(n_out);
                                             }
                                             (newly_decidable || pid_changed || n_out_changed)
-                                                .then_some(*entry)
+                                                .then_some((*entry, n_out_changed))
                                         };
-                                        let Some(entry) = updated_entry else {
+                                        let Some((entry, n_out_changed)) = updated_entry else {
                                             return;
                                         };
 
@@ -1305,8 +1311,18 @@ fn setup_pw_process(
                                             let client_pid = client_pid_for_info.borrow();
                                             resolve_node_pid(&entry, &client_pid)
                                         };
-                                        if linked_for_info.borrow().contains_key(&node_id)
-                                            && !select_for_info.selects(resolved)
+                                        // A declared output-port count that changed after we
+                                        // already committed a plan means the plan we latched
+                                        // was built against the old count and may be
+                                        // incomplete (e.g. the node declared 1 port when we
+                                        // linked and now declares 2). `try_link` only adds,
+                                        // so drop the existing links here and let it rebuild
+                                        // the plan against the new count; a plan that became
+                                        // incomplete must be revisited.
+                                        let already_linked =
+                                            linked_for_info.borrow().contains_key(&node_id);
+                                        if already_linked
+                                            && (!select_for_info.selects(resolved) || n_out_changed)
                                         {
                                             linked_for_info.borrow_mut().remove(&node_id);
                                         }
@@ -1422,9 +1438,19 @@ fn setup_pw_process(
                 // 委ねる。
                 // - 自ノード/自入力ポート: 入力側が消えたので全リンクが無効。
                 // - 対象/除外 Client: Include ならその PID の全ノードが消える（録る対象消滅）。
-                //   Exclude でも一括解除→再リンクで結果は正しい（除外 Client のノードはこの後
-                //   nodes 表から消えるので再リンクされず、残す側だけ張り直される）。
-                if was_self_node || was_self_in_port || was_target_client {
+                //   (Japanese above: the Exclude case used to be cleared here too, on the
+                //   grounds that clear-all then relink also ends up correct.) That applies
+                //   to Include only. In Exclude mode a tracked client id is an EXCLUDED
+                //   client, whose nodes are never in `linked` — so clearing every link on
+                //   its departure drops audio we were legitimately recording and costs an
+                //   audible gap while the links are rebuilt, which an Electron host pays
+                //   every time one of its libpulse helper clients closes. Nothing needs
+                //   clearing: the excluded client's own nodes get their own `global_remove`,
+                //   which handles any staleness.
+                if was_self_node
+                    || was_self_in_port
+                    || (was_target_client && matches!(select_for_remove, PidSelect::Include(_)))
+                {
                     // 保持中の Link を全部 drop（= リンク解除）して未リンクに戻す。
                     linked_for_remove.borrow_mut().clear();
                     relink_needed = true;
@@ -3165,6 +3191,16 @@ mod tests {
                 "declared count unknown — current ports fully paired",
             ),
             case(None, 0, 2, 0, 2, false, "nothing to link"),
+            case(
+                Some(0),
+                1,
+                2,
+                2,
+                2,
+                false,
+                "a declared count of 0 alongside a visible port means the node has not \
+                 finished describing itself — not known yet, so incomplete",
+            ),
         ];
         for c in cases {
             assert_eq!(

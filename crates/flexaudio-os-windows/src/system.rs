@@ -112,11 +112,17 @@ impl WasapiSystemBackend {
     /// `exclude_self` (this process's tree) wins, otherwise the first pid's tree.
     /// Callers that need several unrelated trees excluded must open several
     /// captures. Switches the native format to the process-loopback format.
+    ///
+    /// Idempotent: `native` is recomputed from the resulting exclude root, so
+    /// calling this again with an empty list restores the classic-loopback
+    /// format instead of leaving the process-loopback one latched.
     pub fn with_exclude_pids(mut self, pids: Vec<u32>) -> Self {
         self.exclude_pids = pids;
-        if !self.exclude_pids.is_empty() {
-            self.native = PROCESS_LOOPBACK_FORMAT;
-        }
+        self.native = if self.exclude_root().is_some() {
+            PROCESS_LOOPBACK_FORMAT
+        } else {
+            query_native_format(self.device_id.as_deref()).unwrap_or(FALLBACK_FORMAT)
+        };
         self
     }
 
@@ -495,6 +501,17 @@ mod tests {
         let selfy = WasapiSystemBackend::new(true, None).with_exclude_pids(vec![4242]);
         assert_eq!(selfy.exclude_root(), Some(std::process::id()));
         assert_eq!(WasapiSystemBackend::new(false, None).exclude_root(), None);
+
+        // Idempotence: clearing the list drops back out of the exclude path.
+        // `native` is recomputed by `query_native_format`, which needs COM and a
+        // render endpoint, so its exact value is environment-dependent here —
+        // only the root (pure) is asserted; the format restoration is covered by
+        // the same code path as `new`.
+        let cleared = WasapiSystemBackend::new(false, None)
+            .with_exclude_pids(vec![4242])
+            .with_exclude_pids(vec![]);
+        assert_eq!(cleared.exclude_root(), None);
+        assert!(cleared.exclude_pids.is_empty());
     }
 
     /// `list_output_devices` が panic しないこと。返ったエントリは loopback 扱い。
