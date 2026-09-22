@@ -89,13 +89,12 @@ jobs:
       # 同じ誤りがプラットフォームによって見つかったり見つからなかったりする。
       - name: Clippy (deny warnings, Windows-exclusive crates)
         run: cargo clippy -p flexaudio-os-windows --all-targets -- -D warnings
-      # flexaudio-mic (cpal/WASAPI) is built above but its tests are not run here:
-      # on the headless GitHub Windows runner (no audio endpoint) cpal's device
-      # enumeration access-violates during process teardown — a cpal/runner issue,
-      # not a flexaudio logic bug. mic is test-covered on the Linux & macOS jobs
-      # and on real Windows hardware.
+      # cpal 0.16 の WASAPI backend は process-wide `IMMDeviceEnumerator` を最初の
+      # STA スレッドに作るが、その COM cleanup は thread-local である。短命スレッドが
+      # 最初に列挙すると、次の cpal 呼出しが access violation になる。flexaudio-mic は
+      # 長命 keeper で先に初期化してこの上流欠陥を回避し、下の Windows テストで回帰を守る。
       - name: Test (ignored real-audio tests auto-skip)
-        run: cargo test -p flexaudio -p flexaudio-os-windows -p flexaudio-core -p flexaudio-cli
+        run: cargo test -p flexaudio -p flexaudio-os-windows -p flexaudio-mic -p flexaudio-core -p flexaudio-cli
 
   build-test-macos:
     name: Build & Test (macOS / Core Audio Taps)

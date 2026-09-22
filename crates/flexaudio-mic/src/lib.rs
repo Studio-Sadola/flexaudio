@@ -41,10 +41,26 @@ use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::clock::monotonic_now_ns;
 use flexaudio_core::types::{DeviceInfo, Error, Result, SourceKind};
 
+#[cfg(windows)]
+mod windows_keeper;
+
 /// 入力デバイスが取れないとき [`native_format`](CpalMicBackend::native_format) が
 /// 返す既定フォーマット `(48000 Hz, mono)`。`start` 時にデバイスが無ければ
 /// [`Error::DeviceNotFound`] になる。
 const FALLBACK_FORMAT: (u32, u16) = (48_000, 1);
+
+/// cpal の既定ホストを返す唯一の入口。
+///
+/// Windows では、cpal 0.16 の process-wide WASAPI enumerator が最初に生成された STA
+/// スレッドの COM lifetime に依存する。先に keeper で enumerator を初期化完了してから
+/// host を返すことで、短命な呼出側スレッドが最初の生成元になる競合を構造的に防ぐ。
+/// 他 OS では keeper を作らず、従来どおり `cpal::default_host()` をそのまま返す。
+fn cpal_default_host() -> Result<cpal::Host> {
+    #[cfg(windows)]
+    windows_keeper::ensure()?;
+
+    Ok(cpal::default_host())
+}
 
 /// cpal によるマイク入力キャプチャバックエンド。
 ///
@@ -125,7 +141,7 @@ fn resolve_input_device(host: &cpal::Host, device_id: Option<&str>) -> Result<De
 /// `(sample_rate, channels)` を取得する。デバイス解決／設定取得に失敗すれば `None`
 /// （呼び元が [`FALLBACK_FORMAT`] へ落とす）。
 fn query_native_format(device_id: Option<&str>) -> Option<(u32, u16)> {
-    let host = cpal::default_host();
+    let host = cpal_default_host().ok()?;
     let device = resolve_input_device(&host, device_id).ok()?;
     let config = device.default_input_config().ok()?;
     Some((config.sample_rate().0, config.channels()))
@@ -144,7 +160,7 @@ fn query_native_format(device_id: Option<&str>) -> Option<(u32, u16)> {
 /// デバイスが無い／ホスト初期化失敗の環境では空 `Vec`（panic しない）。同名デバイス
 /// が複数あると id が重複し得るが、cpal でこれ以上安定なキーは取れないので許容する。
 pub fn list_devices() -> Result<Vec<DeviceInfo>> {
-    let host = cpal::default_host();
+    let host = cpal_default_host()?;
 
     // 既定入力デバイス名（is_default 判定用）。取れなければ既定一致は付かない。
     let default_name = host.default_input_device().and_then(|d| d.name().ok());
@@ -373,7 +389,7 @@ impl TransientGuard {
 /// `f32` `[-1.0, 1.0]` へ変換して [`RawSink::push`] へ渡す。開始直後のプライミング
 /// 過渡バッファは [`TransientGuard`] が破棄する（PipeWire ALSA ブリッジ対策）。
 fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> {
-    let host = cpal::default_host();
+    let host = cpal_default_host()?;
     // None=既定 / Some=name 一致の最初。不一致は DeviceNotFound。
     let device = resolve_input_device(&host, device_id)?;
 
