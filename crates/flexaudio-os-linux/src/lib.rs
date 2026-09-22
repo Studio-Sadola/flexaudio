@@ -726,6 +726,12 @@ fn pair_ports(out_ports: &[(u32, String)], in_ports: &[(u32, String)]) -> Vec<(u
 /// (b) every target output the node declared exists, and (c) each channel the
 /// capture can take is paired — `min(out, capture)` so a 5.1 source links its
 /// front pair instead of waiting forever.
+///
+/// Known bound: (b) trusts that every declared output port eventually surfaces
+/// as a registry `Port` global. If one never does — props without `node.id` or
+/// `port.direction`, or a registry permission that hides it — `out_ports_len >=
+/// n` is unsatisfiable and the node is never linked. There is no timeout and no
+/// fallback to the ports that did arrive.
 fn link_plan_is_complete(
     expected_out: Option<u32>, // bound info's n_output_ports, if known
     out_ports_len: usize,

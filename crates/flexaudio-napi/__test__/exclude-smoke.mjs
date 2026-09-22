@@ -95,18 +95,20 @@ try {
   // (3) control: nothing excluded, both present. Captured FIRST so (4) has its
   // reference level for the surviving tone.
   const ctl = await capture({ kind: 'system', deviceId: sinkName });
-  // (2) exclusion by the libpulse child's real pid, also scoped to the test
-  // sink (see header: deviceId is ignored once excludePids takes the fan-in
-  // path, so this scoping only matters for today's pre-implementation read).
+  // (2) exclusion by the libpulse child's real pid. `deviceId` is ignored on
+  // the fan-in path a non-empty exclusion set takes (see header); it is kept
+  // here so that a failure is the real leak and not this sink losing scope.
   const excl = await capture({ kind: 'system', deviceId: sinkName, excludePids: [a.pid] });
   expect('exclude-A', excl, false, true);
   expect('control', ctl, true, true);
 
   // (4) The surviving tone must come through at (near) the control's level:
-  // a half-linked fan-in (one channel silent) would read ≈50 % here.
+  // a half-linked fan-in (one channel silent) would read ≈50 % here, and a
+  // node linked twice would read above 100 %.
   const ratio = excl.amp3k / ctl.amp3k;
   console.log(`[fan-in level] exclude/control = ${ratio.toFixed(3)}`);
   if (ratio < 0.9) fail(`fan-in captured the surviving tone at ${(ratio * 100).toFixed(0)}% of the control — a channel is missing`);
+  else if (ratio > 1.15) fail(`fan-in captured the surviving tone at ${(ratio * 100).toFixed(0)}% of the control — the source is double-linked`);
 } finally {
   if (a) a.kill();
   if (b) b.kill();
