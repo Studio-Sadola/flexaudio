@@ -206,6 +206,11 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                                 .get(*pw::keys::CLIENT_ID)
                                 .and_then(|s| s.parse::<u32>().ok()),
                             app_pid: pid_from_props(props.get(*pw::keys::APP_PROCESS_ID), None),
+                            // Not read by anything in this file — `exclude_decidable`
+                            // and Include/Exclude linking are `setup_pw_process`'s
+                            // concern only. `NodeEntry` is shared, so this file just
+                            // needs a value.
+                            info_seen: false,
                         };
                         snapshot_for_global.borrow_mut().nodes.insert(
                             global.id,
@@ -349,6 +354,7 @@ mod tests {
             entry: NodeEntry {
                 owning_client_id: client,
                 app_pid,
+                info_seen: false,
             },
             app_name: name.map(str::to_string),
             running: None,
