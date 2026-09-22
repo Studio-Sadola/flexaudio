@@ -4,9 +4,14 @@
 // the path Electron/Chromium uses), B = 3 kHz via native PipeWire (pw-play).
 // The addon must (1) list A under A's real pid, (2) capture B but not A when
 // A's pid is excluded from a `system` capture, (3) capture both when nothing
-// is excluded, reading the test sink's own monitor (deviceId) so the check
-// doesn't depend on this sink being the PipeWire default. Requires: pw-cli,
-// pw-play, paplay on PATH; XDG_RUNTIME_DIR set.
+// is excluded. Both (2) and (3) name the test sink via `deviceId` so neither
+// depends on this sink being the PipeWire default. Today `excludePids` is
+// unimplemented and ignored, so (2)'s capture is just the test sink's plain
+// monitor and the failure is the real leak (1 kHz still present); once
+// `excludePids` is implemented, a non-empty exclusion set is expected to
+// take the Linux fan-in path, which ignores `deviceId` — so a green run
+// there is genuine pid exclusion, not an artifact of sink scoping.
+// Requires: pw-cli, pw-play, paplay on PATH; XDG_RUNTIME_DIR set.
 //
 // Detector: Goertzel at exact FFT bins. The bin index is round(N*f/rate) —
 // the +0.5 variant lands one bin off and reads a pure tone as silence.
@@ -62,19 +67,21 @@ function expect(label, r, want1k, want3k) {
 
 const sinkName = process.env.FLEX_SMOKE_SINK || `flexaudio-smoke-${process.pid}`;
 const ownSink = !process.env.FLEX_SMOKE_SINK;
-if (ownSink) {
-  execSync(`pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name=${sinkName} media.class=Audio/Sink object.linger=true audio.position=[FL FR] }'`, { stdio: 'ignore' });
-}
-const dir = mkdtempSync(join(tmpdir(), 'flexaudio-smoke-'));
-writeToneWav(join(dir, '1k.wav'), { freqHz: 1000, seconds: 30 });
-writeToneWav(join(dir, '3k.wav'), { freqHz: 3000, seconds: 30 });
-
-const a = spawn('paplay', ['--volume=65536', join(dir, '1k.wav')], { env: { ...process.env, PULSE_SINK: sinkName }, stdio: 'ignore' });
-const b = spawn('pw-play', ['--target', sinkName, '--volume', '1.0', join(dir, '3k.wav')], { stdio: 'ignore' });
-await new Promise((r) => setTimeout(r, 2000));
-console.log(`children: paplay(1k, libpulse) pid=${a.pid}  pw-play(3k, native) pid=${b.pid}  sink=${sinkName}`);
+let a, b, dir;
 
 try {
+  if (ownSink) {
+    execSync(`pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name=${sinkName} media.class=Audio/Sink object.linger=true audio.position=[FL FR] }'`, { stdio: 'ignore' });
+  }
+  dir = mkdtempSync(join(tmpdir(), 'flexaudio-smoke-'));
+  writeToneWav(join(dir, '1k.wav'), { freqHz: 1000, seconds: 30 });
+  writeToneWav(join(dir, '3k.wav'), { freqHz: 3000, seconds: 30 });
+
+  a = spawn('paplay', ['--volume=65536', join(dir, '1k.wav')], { env: { ...process.env, PULSE_SINK: sinkName }, stdio: 'ignore' });
+  b = spawn('pw-play', ['--target', sinkName, '--volume', '1.0', join(dir, '3k.wav')], { stdio: 'ignore' });
+  await new Promise((r) => setTimeout(r, 2000));
+  console.log(`children: paplay(1k, libpulse) pid=${a.pid}  pw-play(3k, native) pid=${b.pid}  sink=${sinkName}`);
+
   // (1) processes() lists the libpulse child under its real pid.
   const list = await flex.processes();
   const rowA = list.find((p) => p.pid === a.pid);
@@ -82,13 +89,16 @@ try {
   if (!rowA) fail(`processes() has no entry with pid ${a.pid} (paplay); libpulse clients resolve to pipewire-pulse's pid`);
   else if (!['paplay', 'pacat'].includes(rowA.executable)) fail(`pid ${a.pid} listed with executable ${rowA.executable}`);
 
-  // (2) exclusion by the libpulse child's real pid.
-  expect('exclude-A', await capture({ kind: 'system', excludePids: [a.pid] }), false, true);
+  // (2) exclusion by the libpulse child's real pid, also scoped to the test
+  // sink (see header: deviceId is ignored once excludePids takes the fan-in
+  // path, so this scoping only matters for today's pre-implementation read).
+  expect('exclude-A', await capture({ kind: 'system', deviceId: sinkName, excludePids: [a.pid] }), false, true);
   // (3) control: nothing excluded, both present.
   expect('control', await capture({ kind: 'system', deviceId: sinkName }), true, true);
 } finally {
-  a.kill(); b.kill();
-  rmSync(dir, { recursive: true, force: true });
+  if (a) a.kill();
+  if (b) b.kill();
+  if (dir) rmSync(dir, { recursive: true, force: true });
   if (ownSink && !process.env.FLEX_SMOKE_KEEP_SINK) {
     try { execSync(`pw-cli destroy ${sinkName}`, { stdio: 'ignore' }); } catch {}
   }
