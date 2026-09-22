@@ -11,6 +11,10 @@
 //! - `exclude_self == true` → 自ホストプロセス（[`std::process::id`]）を除外
 //!   `excludeProcesses([self_object])`。自分の出力を取り込まない（フィードバック防止）。
 //!
+//! exclude_pids extends the exclusion set with arbitrary pids (Electron helper tree):
+//! the effective set is `exclude_pids ∪ {self if exclude_self}`, and a non-empty set
+//! takes the exclusion path (so it also applies when `exclude_self == false`).
+//!
 //! `exclude_self` は system ソース専用で、process ソースの
 //! [`ProcessMode`](flexaudio_core::types::ProcessMode) とは合成しない（system ソースは
 //! `mode` を見ない）。
@@ -26,6 +30,8 @@
 //!
 //! `exclude_self == true` のときは `device_id` を無視し、既定出力の自プロセス除外 tap にする
 //! （自分の音の除外を優先）。
+//! Since `exclude_pids` was added this holds whenever the effective exclusion set is
+//! non-empty, not only when `exclude_self == true`.
 //!
 //! # スレッド / Send
 //! tap/aggregate/ioproc 周りの `!Send` な ObjC オブジェクト（[`TapChain`]）は専用スレッド内に
@@ -58,6 +64,10 @@ pub struct MacSystemBackend {
     /// 自ホストプロセス除外フラグ。`true` で自分（[`std::process::id`]）の出力を除外集合に
     /// 加える（`excludeProcesses([self])`）、`false` で除外なしの全システム音。
     exclude_self: bool,
+    /// Extra pids excluded from the tap (see `StreamConfig::exclude_pids`). The
+    /// effective exclusion set is `exclude_pids ∪ {self if exclude_self}`; a
+    /// non-empty set takes the exclusion path.
+    exclude_pids: Vec<u32>,
     /// 対象出力デバイス名（= [`DeviceInfo::id`](flexaudio_core::types::DeviceInfo)）。`None` で
     /// 既定出力の global tap、`Some(name)` でその出力デバイスを対象にする。`exclude_self == true`
     /// のときは無視される。
@@ -88,11 +98,20 @@ impl MacSystemBackend {
     pub fn new(exclude_self: bool, device_id: Option<String>) -> Self {
         Self {
             exclude_self,
+            exclude_pids: Vec::new(),
             device_id,
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
             native: FALLBACK_FORMAT,
         }
+    }
+
+    /// Exclude these pids' output in addition to `exclude_self`. Each pid is
+    /// translated to its Core Audio process object at `start`; pids with no
+    /// audio object (not producing sound) are skipped, not errors.
+    pub fn with_exclude_pids(mut self, pids: Vec<u32>) -> Self {
+        self.exclude_pids = pids;
+        self
     }
 }
 
@@ -121,31 +140,38 @@ impl CaptureBackend for MacSystemBackend {
 
         let stop_flag = self.stop_flag.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
-        // bool は Copy なのでそのままクロージャへ move できる。
-        let exclude_self = self.exclude_self;
-        // device_id（String）はクロージャへ move する。exclude_self のときは使わない。
+        // Effective exclusion set: `exclude_pids ∪ {self if exclude_self}`. Built here
+        // and moved into the closure (PID→object translation happens on that thread).
+        let mut excluded: Vec<u32> = self.exclude_pids.clone();
+        if self.exclude_self {
+            excluded.push(std::process::id());
+        }
+        // device_id（String）はクロージャへ move する。除外集合が非空なら使わない。
         let device_id = self.device_id.clone();
 
         let handle = thread::Builder::new()
             .name("flexaudio-macos-system".into())
             .spawn(move || {
-                let kind = if exclude_self {
-                    // exclude_self は device_id より優先。既定出力で自プロセスを除外する。
+                let kind = if !excluded.is_empty() {
+                    // Exclusion beats device_id: a global tap on the default output
+                    // minus every excluded process that currently has an audio object.
                     // PID → AudioObjectID 変換は CoreAudio を叩くので所有スレッド内で行う
-                    // （process.rs と同じ）。自ホストプロセスのオブジェクトを除外集合に入れる。
-                    match translate_pid_to_object(std::process::id() as i32) {
-                        // 自プロセスに対応するオーディオオブジェクトが無い（今は無音で出力していない
-                        // 等）。除外すべき自分の音が無いので、エラーにせず除外なしの全システム tap へ
-                        // 落とす（録り逃さない）。
-                        Ok(0) => TapKind::ExcludeProcesses(Vec::new()),
-                        // 自プロセスのオブジェクトを除外集合に加える（フィードバック防止）。
-                        Ok(self_object_id) => TapKind::ExcludeProcesses(vec![self_object_id]),
-                        // 変換自体が失敗（TCC 等）。readiness として Err を返して終了。
-                        Err(e) => {
-                            let _ = ready_tx.send(Err(e));
-                            return;
+                    // （process.rs と同じ）。
+                    let mut ids = Vec::with_capacity(excluded.len());
+                    for pid in excluded {
+                        match translate_pid_to_object(pid as i32) {
+                            // 対応するオーディオオブジェクトが無い（今は音を出していない等）。
+                            // 除外すべき音が無いので、エラーにせず飛ばす。
+                            Ok(0) => {}
+                            Ok(object_id) => ids.push(object_id),
+                            // 変換自体が失敗（TCC 等）。readiness として Err を返して終了。
+                            Err(e) => {
+                                let _ = ready_tx.send(Err(e));
+                                return;
+                            }
                         }
                     }
+                    TapKind::ExcludeProcesses(ids)
                 } else if let Some(name) = device_id {
                     // 指定出力デバイス。名前→UID を解決して、そのデバイス宛の全音（除外なし）を
                     // tap する。一致デバイスが無ければ DeviceNotFound。
@@ -294,6 +320,14 @@ mod tests {
             }
             Err(_e) => { /* TCC 未承認 / tap 不可 / 自 PID 変換不可は許容 */ }
         }
+    }
+
+    /// The `with_exclude_pids` builder stores the pids and leaves `exclude_self` alone.
+    #[test]
+    fn exclude_pids_builder_is_stored() {
+        let be = MacSystemBackend::new(false, None).with_exclude_pids(vec![11, 12]);
+        assert_eq!(be.exclude_pids, vec![11, 12]);
+        assert!(!be.exclude_self);
     }
 
     /// 存在しない出力デバイス名を指定すると `start` が `DeviceNotFound` を返すこと。

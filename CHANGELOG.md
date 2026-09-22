@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`StreamConfig::exclude_pids` / N-API `excludePids`.** System-loopback
+  capture can exclude a set of pids in addition to `exclude_self`. Electron
+  hosts render audio from a helper process, so excluding the addon's own pid
+  was not enough on Linux and macOS. Linux: fan-in over every app output whose
+  pid is outside the set. macOS: every pid is added to the tap's exclude list.
+  Windows: one process tree — `exclude_self` wins, otherwise the first pid.
+
 ### Fixed
 - **Linux: libpulse clients now resolve to their own pid.** Stream nodes are
   bound and `application.process.id` is read from their info props (the
