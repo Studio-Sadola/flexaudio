@@ -120,6 +120,10 @@ pub struct PwSystemBackend {
     /// その sink の monitor を target.object で指定して録る（[`list_devices`] が返す
     /// `DeviceInfo.id` がこの `node.name`）。`exclude_self == true` の fan-in 経路では
     /// 効かない（特定 sink を狙う経路ではないので無視する）。
+    /// Since `exclude_pids` was added, the fan-in path is taken whenever the
+    /// effective exclusion set (`exclude_pids ∪ {self if exclude_self}`) is
+    /// non-empty, and `device_id` is ignored on that path — not only when
+    /// `exclude_self == true`.
     device_id: Option<String>,
     /// 起動中フラグ（二重 start ガード／drop 判定用）。`Send`。
     running: Arc<AtomicBool>,
@@ -143,6 +147,10 @@ impl PwSystemBackend {
     ///
     /// `device_id` で録る sink を `node.name` で選ぶ。`None` なら既定 sink。
     /// `exclude_self == true` のときは無視する（fan-in は特定 sink を狙わない）。
+    /// Since `exclude_pids` was added, the fan-in path is taken whenever the
+    /// effective exclusion set (`exclude_pids ∪ {self if exclude_self}`,
+    /// see [`with_exclude_pids`](Self::with_exclude_pids)) is non-empty, and
+    /// `device_id` is ignored on that path — not only when `exclude_self == true`.
     /// 実際の接続・ストリーム作成は [`start`](CaptureBackend::start) 内で専用
     /// スレッド上で行う。
     pub fn new(exclude_self: bool, device_id: Option<String>) -> Self {
@@ -197,14 +205,10 @@ impl CaptureBackend for PwSystemBackend {
         // 取り違えないため）。exclude_self の fan-in 経路は特定 sink を狙わないので見ない。
         // The fan-in path is now chosen by the whole exclusion set below, not by
         // `exclude_self` alone.
-        // The effective exclusion set: `exclude_pids` plus self when asked.
-        // Non-empty means the fan-in path (link every app output except these
-        // pids); empty means the sink-monitor path.
-        let mut excluded: std::collections::HashSet<u32> =
-            self.exclude_pids.iter().copied().collect();
-        if self.exclude_self {
-            excluded.insert(std::process::id());
-        }
+        // The effective exclusion set decides the path: non-empty means fan-in
+        // (link every app output except these pids), empty means sink-monitor.
+        let excluded =
+            effective_exclusion(self.exclude_self, &self.exclude_pids, std::process::id());
         let fan_in = !excluded.is_empty();
         let device_id = self.device_id.clone();
         if !fan_in {
@@ -757,6 +761,25 @@ fn exclude_decidable(entry: &NodeEntry) -> bool {
 /// holds a whole set.
 fn capture_node_name(key: &str) -> String {
     format!("flexaudio-capture-{key}")
+}
+
+/// The effective exclusion set for a system capture: the configured
+/// `exclude_pids` plus `self_pid` when `exclude_self` is set (a set, so a
+/// self pid already listed in `exclude_pids` does not appear twice).
+///
+/// An empty result means the plain sink-monitor path; a non-empty one means the
+/// fan-in path. `self_pid` is a parameter rather than `std::process::id()` so
+/// the decision is testable without depending on the running process.
+fn effective_exclusion(
+    exclude_self: bool,
+    exclude_pids: &[u32],
+    self_pid: u32,
+) -> std::collections::HashSet<u32> {
+    let mut excluded: std::collections::HashSet<u32> = exclude_pids.iter().copied().collect();
+    if exclude_self {
+        excluded.insert(self_pid);
+    }
+    excluded
 }
 
 /// Node-selection predicate for the fan-in capture loop.
@@ -2896,6 +2919,47 @@ mod tests {
         assert!(inc.selects(Some(7)) && !inc.selects(Some(8)) && !inc.selects(None));
         assert_eq!(inc.node_key(), "7");
         assert_eq!(sel.node_key(), "excl-10");
+    }
+
+    /// `effective_exclusion` is table-driven and independent of the running
+    /// process: `exclude_pids` ∪ `{self_pid}` when `exclude_self`, deduped.
+    #[test]
+    fn effective_exclusion_unions_and_dedups() {
+        use std::collections::HashSet;
+        let self_pid = 4242u32;
+        let cases: &[(bool, &[u32], HashSet<u32>, &str)] = &[
+            (
+                false,
+                &[],
+                HashSet::new(),
+                "neither flag nor pids → sink-monitor path",
+            ),
+            (
+                true,
+                &[],
+                HashSet::from([self_pid]),
+                "exclude_self alone → just self",
+            ),
+            (
+                false,
+                &[5, 6],
+                HashSet::from([5, 6]),
+                "pids alone → fan-in without self",
+            ),
+            (
+                true,
+                &[5, 4242],
+                HashSet::from([5, self_pid]),
+                "self pid already listed → union, no duplicate",
+            ),
+        ];
+        for (excl_self, pids, want, msg) in cases {
+            assert_eq!(
+                effective_exclusion(*excl_self, pids, self_pid),
+                *want,
+                "{msg}"
+            );
+        }
     }
 
     /// `with_exclude_pids` records the extra pids without disturbing `exclude_self`.
