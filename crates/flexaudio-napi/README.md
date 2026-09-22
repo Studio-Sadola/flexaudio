@@ -79,6 +79,21 @@ seconds, or a previous enumeration is still in progress. On Windows, listing
 and capturing both need Windows build 20348 or later (Windows 11 / Windows
 Server 2022).
 
+## Excluding your own app (Electron hosts)
+
+`excludeSelf: true` excludes the process the addon runs in. Electron and
+Chromium render audio from a *helper* process, so also pass every pid of your
+process tree:
+
+```js
+const pids = app.getAppMetrics().map((m) => m.pid);   // main + helpers
+const stream = openStream({ kind: 'system', excludeSelf: true, excludePids: pids }, onChunk, onEvent);
+```
+
+Linux and macOS exclude every listed pid. Windows excludes one process *tree*
+(`excludeSelf` wins, otherwise the first pid) — for an Electron host that is
+the whole app, since helpers are children of the main process.
+
 ## Chunk delivery shape (primary, secondary, VAD)
 
 `onChunk` is called with **one** argument, the primary chunk. When
