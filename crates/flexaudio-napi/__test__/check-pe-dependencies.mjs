@@ -25,6 +25,7 @@
 //   同梱が要る依存であることに変わりはない。片方だけ見る検査は穴になる。
 
 import { readFileSync } from 'node:fs';
+import { isReadableDllName } from './pe-dll-name.mjs';
 
 /**
  * 禁止の柄。見つかったら非 0 で終了する。
@@ -65,10 +66,6 @@ const MAX_IMPORT_DESCRIPTORS = 4096;
 const MAX_DELAY_DESCRIPTORS = 4096;
 // DLL 名は短い。これを超えて NUL が来ない物は名前ではない。
 const MAX_DLL_NAME_BYTES = 260;
-
-// 解決結果が「依存 DLL 名」に見えるかの検証。名前らしくないバイト列を
-// 名前として採用してしまうと、RVA/VA の取り違えを検出できなくなる。
-const DLL_NAME_RE = /^[A-Za-z0-9_.-]{1,255}\.dll$/i;
 
 /** PE として読めなかったことを表す。呼び出し側が非 0 終了に変換する。 */
 class PeError extends Error {}
@@ -132,7 +129,7 @@ function readDllNameAt(image, offset) {
   let text = '';
   for (let i = offset; i < end; i += 1) {
     const byte = image.buf[i];
-    if (byte === 0) return DLL_NAME_RE.test(text) ? text : null;
+    if (byte === 0) return isReadableDllName(text) ? text : null;
     // 印字可能 ASCII 以外が混ざる＝そこは名前ではない。
     if (byte < 0x20 || byte > 0x7e) return null;
     text += String.fromCharCode(byte);

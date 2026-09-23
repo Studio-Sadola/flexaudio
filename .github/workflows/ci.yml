@@ -127,6 +127,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Test PE dependency checker
+        run: node --test crates/flexaudio-napi/__test__/check-pe-dependencies.test.mjs
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
       - name: N-API smoke / dual / async-api (mock only)
