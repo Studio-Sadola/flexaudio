@@ -13,9 +13,9 @@
 //   node check-pe-dependencies.mjs <pe-file> [more-pe-files ...]
 //
 // 終了コード:
-//   0 = 全ての入力を読めて、禁止の依存が 1 つも無い
-//   1 = 禁止の依存があった / 読めなかった（PE でない・壊れている・ファイルが無い・
-//       引数が 0 個）。**「読めないから合格」は絶対にしない（fail-closed）**。
+//   0 = 全ての入力を読めて、依存が全て pe-dependency-policy.mjs の許可集合に入っている
+//   1 = 禁止の依存・許可集合に無い依存があった / 読めなかった（PE でない・壊れている・
+//       ファイルが無い・引数が 0 個）。**「読めないから合格」は絶対にしない（fail-closed）**。
 //       読めない検査は、依存が増えた事実を静かに見逃す＝無いより悪い。
 //
 // 読み取り対象（両方を必ず見る）:
@@ -26,17 +26,7 @@
 
 import { readFileSync } from 'node:fs';
 import { isReadableDllName } from './pe-dll-name.mjs';
-
-/**
- * 禁止の柄。見つかったら非 0 で終了する。
- *
- *  - msvcp / vcruntime / vcomp: MSVC のランタイム。静的 CRT で組んである前提なので、
- *    これが import に現れる＝配布先に VC++ 再頒布可能パッケージが要る状態。
- *  - directml / onnxruntime: 推論ランタイム。実行時に同梱/配置が要る＝自己完結でない。
- *
- * 部分一致・大小文字無視で判定する（MSVCP140.dll / msvcp140.dll / MSVCP140_1.dll など）。
- */
-const FORBIDDEN_PATTERNS = ['msvcp', 'vcruntime', 'vcomp', 'directml', 'onnxruntime'];
+import { judgeDependencies } from './pe-dependency-policy.mjs';
 
 /** COFF ヘッダの Machine 値。 */
 const MACHINE_TYPES = new Map([
@@ -292,20 +282,6 @@ function dedupe(names) {
   return unique;
 }
 
-function forbiddenMatches(names) {
-  const hits = [];
-  for (const name of names) {
-    const lower = name.toLowerCase();
-    for (const pattern of FORBIDDEN_PATTERNS) {
-      if (lower.includes(pattern)) {
-        hits.push({ name, pattern });
-        break;
-      }
-    }
-  }
-  return hits;
-}
-
 function printList(label, names) {
   if (names.length === 0) {
     console.log(`   ${label}: (none)`);
@@ -352,17 +328,23 @@ function main(argv) {
       printReport(image, imported, delayed);
 
       const all = [...imported, ...delayed];
-      const hits = forbiddenMatches(all);
-      if (hits.length > 0) {
+      const { forbidden, unexpected } = judgeDependencies(all);
+      if (forbidden.length > 0) {
         fail(
-          `${file}: forbidden native dependency (${hits.map((hit) => `${hit.name} ~ /${hit.pattern}/`).join(', ')})`,
+          `${file}: forbidden native dependency (${forbidden.map((hit) => `${hit.name} ~ /${hit.pattern}/`).join(', ')})`,
         );
-      } else if (all.length === 0) {
+      }
+      if (unexpected.length > 0) {
+        fail(
+          `${file}: unexpected native dependency (${unexpected.join(', ')}) - not in ALLOWED_DLL_NAMES; add it there only with evidence that Windows itself provides it`,
+        );
+      }
+      if (all.length === 0) {
         // パースは通ったのに 1 件も読めなかった＝インポート表を読み違えている疑い。
         // ここで通すと「常に合格する壊れた検査」になる。
         fail(`${file}: parsed as PE but no DLL dependency could be read (refusing to pass)`);
-      } else {
-        console.log('   OK: no forbidden dependency');
+      } else if (forbidden.length === 0 && unexpected.length === 0) {
+        console.log('   OK: all dependencies are allowed');
       }
     } catch (err) {
       fail(`${file}: ${err instanceof Error ? err.message : String(err)}`);
@@ -373,7 +355,7 @@ function main(argv) {
     console.error(`FAILED: ${failures} of ${argv.length} file(s) did not pass the dependency check`);
     return 1;
   }
-  console.log(`OK: ${argv.length} file(s) inspected, no forbidden dependency`);
+  console.log(`OK: ${argv.length} file(s) inspected, all dependencies allowed`);
   return 0;
 }
 

@@ -110,10 +110,13 @@ jobs:
 
       # The addon is built with the static CRT (see RUSTFLAGS above), so it must
       # not pull in an MSVC redistributable DLL (msvcp*/vcruntime*/vcomp*) or an
-      # inference runtime that would have to ship next to it (DirectML /
-      # onnxruntime). The check reads the PE import tables itself, in Node, via
-      # crates/flexaudio-napi/__test__/check-pe-dependencies.mjs, and inspects
-      # both the normal and the delay-import directory.
+      # inference runtime that would have to ship next to it (DirectML / onnxruntime).
+      # Those names are rejected outright, even if someone adds them to the allowlist.
+      # The checker reads both PE import tables itself, in Node, via
+      # crates/flexaudio-napi/__test__/check-pe-dependencies.mjs. It accepts
+      # only documented Windows-provided DLLs (and api-ms-win-* API sets): the
+      # imported dependency set minus that allowlist must be empty. Thus a new
+      # bundled dependency fails even before it appears in a forbidden pattern.
       #
       # It deliberately does NOT call dumpbin: dumpbin ships with MSVC and is
       # only on PATH inside a developer command prompt, so the check used to
