@@ -150,12 +150,16 @@ impl CaptureBackend for MacSystemBackend {
                     // 指定出力デバイス。名前→UID を解決して、そのデバイス宛の全音（除外なし）を
                     // tap する。一致デバイスが無ければ DeviceNotFound。
                     match crate::devices::uid_for_device_name(&name) {
-                        Some(uid) => TapKind::ExcludeProcessesOnDevice {
+                        Ok(Some(uid)) => TapKind::ExcludeProcessesOnDevice {
                             ids: Vec::new(),
                             device_uid: uid,
                         },
-                        None => {
+                        Ok(None) => {
                             let _ = ready_tx.send(Err(Error::DeviceNotFound));
+                            return;
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
                             return;
                         }
                     }

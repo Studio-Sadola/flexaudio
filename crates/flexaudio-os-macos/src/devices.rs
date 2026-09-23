@@ -26,9 +26,11 @@ use objc2_core_audio::{
 };
 use objc2_core_audio_types::AudioBufferList;
 
-use flexaudio_core::types::{DeviceInfo, Result, SourceKind};
+use flexaudio_core::types::{DeviceInfo, Error, Result, SourceKind};
 
-use crate::common::{read_cfstring_property, read_system_object_list, FALLBACK_FORMAT};
+use crate::common::{
+    map_os_status, read_cfstring_property, read_system_object_list, FALLBACK_FORMAT,
+};
 
 /// プロパティアドレスを scope/element 指定で作る。
 fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
@@ -41,10 +43,16 @@ fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
 
 /// system object の `kAudioHardwarePropertyDevices` を読み、全 `AudioObjectID` を返す。
 ///
-/// 取得できなければ空 vec（呼び出し側は空リストを返すだけ）。読み取り本体はプロセス列挙と
-/// 共有の [`read_system_object_list`]。
-fn all_device_ids() -> Vec<AudioObjectID> {
-    read_system_object_list(kAudioHardwarePropertyDevices).unwrap_or_default()
+/// 取得に失敗したときは、[`map_os_status`] で統一した [`Error`] を返す。読み取り本体は
+/// プロセス列挙と共有の [`read_system_object_list`]。
+///
+/// reader を引数にしているのは、CoreAudio を呼ばずに「取得失敗」と「正常な空リスト」が別の
+/// 値であることを試験するため。本番の呼び出し元は常に [`read_system_object_list`] を渡す。
+type SystemObjectListReader = fn(u32) -> std::result::Result<Vec<AudioObjectID>, i32>;
+
+fn all_device_ids(reader: SystemObjectListReader) -> Result<Vec<AudioObjectID>> {
+    reader(kAudioHardwarePropertyDevices)
+        .map_err(|status| map_os_status("AudioObjectGetPropertyData(Devices)", status))
 }
 
 /// デバイスの `kAudioDevicePropertyNominalSampleRate`（output scope, Float64）を読む。
@@ -207,7 +215,7 @@ fn device_uid(device: AudioObjectID) -> Option<String> {
 pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
     let default_id = default_output_device();
     let mut out: Vec<DeviceInfo> = Vec::new();
-    for id in all_device_ids() {
+    for id in all_device_ids(read_system_object_list)? {
         if !is_output_device(id) {
             continue;
         }
@@ -231,18 +239,19 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
 /// 出力デバイス名から CoreAudio の device UID を引く。
 ///
 /// [`list_output_devices`] の `id`（= デバイス名）で受けた指定を、tap が要求する UID へ変換する。
-/// 同名が複数あれば最初の一致を使う。一致するデバイスが無ければ `None`（呼び出し側が
-/// [`Error::DeviceNotFound`](flexaudio_core::types::Error) を返す）。
-pub(crate) fn uid_for_device_name(name: &str) -> Option<String> {
-    for id in all_device_ids() {
+/// 同名が複数あれば最初の一致を使う。一致するデバイスが無ければ `Ok(None)`（呼び出し側が
+/// [`Error::DeviceNotFound`](flexaudio_core::types::Error) を返す）。一覧を取得できなければ
+/// `OSStatus` を含む `Err` を返す。
+pub(crate) fn uid_for_device_name(name: &str) -> Result<Option<String>> {
+    for id in all_device_ids(read_system_object_list)? {
         if !is_output_device(id) {
             continue;
         }
         if device_name(id).as_deref() == Some(name) {
-            return device_uid(id);
+            return Ok(device_uid(id));
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -264,9 +273,46 @@ mod tests {
         }
     }
 
+    /// CoreAudio の取得失敗と、正常にデバイスが 0 台だった場合は別の値である。
+    ///
+    /// この試験は `all_device_ids` 本体へ reader を注入するので、失敗を空 vec に戻すと
+    /// `failure` が `Err` ではなく `Ok(Vec::new())` になり必ず失敗する。
+    #[test]
+    fn all_device_ids_distinguishes_failure_from_empty_list() {
+        fn empty_reader(_: u32) -> std::result::Result<Vec<AudioObjectID>, i32> {
+            Ok(Vec::new())
+        }
+
+        fn failing_reader(_: u32) -> std::result::Result<Vec<AudioObjectID>, i32> {
+            Err(-1)
+        }
+
+        fn permission_denied_reader(_: u32) -> std::result::Result<Vec<AudioObjectID>, i32> {
+            Err(0x6e6f7065)
+        }
+
+        let empty = all_device_ids(empty_reader);
+        assert!(matches!(empty, Ok(ids) if ids.is_empty()));
+
+        match all_device_ids(failing_reader) {
+            Err(Error::Backend(message)) => {
+                assert_eq!(message, "AudioObjectGetPropertyData(Devices): OSStatus -1")
+            }
+            other => panic!("expected OSStatus-bearing error, got {other:?}"),
+        }
+
+        assert!(matches!(
+            all_device_ids(permission_denied_reader),
+            Err(Error::PermissionDenied)
+        ));
+    }
+
     /// 存在しない名前の UID 解決は `None`。
     #[test]
     fn uid_for_unknown_device_is_none() {
-        assert!(uid_for_device_name("flexaudio-no-such-output-device-xyzzy").is_none());
+        assert!(matches!(
+            uid_for_device_name("flexaudio-no-such-output-device-xyzzy"),
+            Ok(None)
+        ));
     }
 }
