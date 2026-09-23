@@ -196,12 +196,16 @@ struct SharedState {
 
     /// ポーズ中フラグ。pause() で true。取り込みスレッドは完成チャンクを破棄して
     /// 配信しない（RawRing の取り込みは続けるのでデバイスは止まらず、ウォッチドッグの
-    /// 失速判定もぶれない）。resume() で false に戻し、次チャンクへ DISCONTINUITY を立てる。
+    /// 失速判定もぶれない）。resume() で false に戻す。
     paused: AtomicBool,
 
     /// `pause()` とチャンク push の排他。pause が返ったあと、取り込みスレッドが
     /// 組み立て済みのチャンクを後から列へ入れる競合を閉じる。
     delivery: Mutex<()>,
+
+    /// 実際の pause→resume 遷移ごとの世代。各タップは delivery ロックの下でこれを
+    /// 観測し、変化後に最初に enqueue するチャンクへ DISCONTINUITY を立てる。
+    resume_generation: AtomicU64,
 
     /// 入力ゲイン（線形倍率）の f32 ビット表現（`f32::to_bits`/`from_bits` で保持）。
     /// open() で config.gain から初期化し、set_gain() が録音中いつでも書き換える。
@@ -310,6 +314,7 @@ impl Stream {
             discontinuity_pending: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             delivery: Mutex::new(()),
+            resume_generation: AtomicU64::new(0),
             gain_bits: AtomicU32::new(config.gain.to_bits()),
             recording_epoch_ns: AtomicI64::new(i64::MIN),
             denoise_enabled: AtomicBool::new(false),
@@ -464,16 +469,24 @@ impl Stream {
 
     /// [`pause`](Self::pause) を解除して配信を再開する。
     ///
-    /// 再開後に最初に届くチャンクへ [`ChunkFlags::DISCONTINUITY`] を立てる（ポーズで音が時間的に
-    /// 飛んだことを消費側へ伝える）。チャンクの `seq` はポーズ前後で連続し、ポーズ区間ぶんの
-    /// 無音は挿入しない。停止していなければ何もしない（多重呼び出し安全）。
+    /// 再開後、主・副それぞれのストリームで最初に届くチャンクへ
+    /// [`ChunkFlags::DISCONTINUITY`] を立てる（ポーズで音が時間的に飛んだことを消費側へ
+    /// 伝える）。各チャンクの `seq` はポーズ前後で連続し、ポーズ区間ぶんの無音は挿入しない。
+    /// 停止していなければ何もしない（多重呼び出し安全）。
     pub fn resume(&self) {
-        // 実際にポーズ中だったときだけ不連続を立てる（ポーズしていないのに resume を
+        // delivery を握って世代更新→paused=false を一つの enqueue 境界にする。
+        // intake は同じロック内で世代を読むので、resume 後に最初に入る各タップの
+        // チャンクを取りこぼさず DISCONTINUITY として識別できる。
+        let _g = self
+            .shared
+            .delivery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // 実際にポーズ中だったときだけ世代を進める（ポーズしていないのに resume を
         // 呼んでも余計な DISCONTINUITY を出さない）。
-        if self.shared.paused.swap(false, Ordering::SeqCst) {
-            self.shared
-                .discontinuity_pending
-                .store(true, Ordering::SeqCst);
+        if self.shared.paused.load(Ordering::SeqCst) {
+            self.shared.resume_generation.fetch_add(1, Ordering::SeqCst);
+            self.shared.paused.store(false, Ordering::SeqCst);
         }
     }
 
@@ -876,6 +889,13 @@ fn run_intake(
     let mut seq: u64 = 0; // 主タップ seq。
     let mut sec_seq: u64 = 0; // 副タップ seq（主とは別カウンタ）。
     let mut current_generation = shared.raw_generation.load(Ordering::SeqCst);
+    // resume 世代もタップごとに独立して観測する。副タップは主と別リング・別 consumer
+    // なので、主の観測済み世代を流用すると副の最初のチャンクに印を付け損ねる。
+    // 新しい intake は世代 0 から開始する。start() と worker 起動の間に resume() が
+    // 入っても、その resume は最初の配信に反映しなければならないため、共有の現在値で
+    // 初期化せず、その遷移を見逃さない。
+    let mut primary_resume_generation = 0;
+    let mut secondary_resume_generation = 0;
     // RawRing オーバーフロー累計の前回観測値（世代交代でリングが作り直され 0 に戻る）。
     let mut overflow_baseline: u64 = 0;
 
@@ -1016,7 +1036,7 @@ fn run_intake(
                 flags |= ChunkFlags::DISCONTINUITY;
             }
 
-            let chunk = AudioChunk {
+            let mut chunk = AudioChunk {
                 data,
                 frames,
                 pts_ns,
@@ -1035,12 +1055,19 @@ fn run_intake(
                 if shared.paused.load(Ordering::SeqCst) {
                     continue;
                 }
+                let resume_generation = shared.resume_generation.load(Ordering::SeqCst);
+                if resume_generation != primary_resume_generation {
+                    chunk.flags |= ChunkFlags::DISCONTINUITY;
+                }
                 rec_primary = false;
                 disc_primary = false;
                 seq += 1;
                 if let Some(total) = chunk_producer.push(chunk) {
                     shared.push_event(Event::ChunkDropped { count: total });
                 }
+                // push 成功と同じ臨界区間でだけ観測済みに進める。ポーズで破棄した
+                // チャンクでは進めないので、resume 後最初の配信へ印が持ち越される。
+                primary_resume_generation = resume_generation;
                 emitted_any = true;
             }
         }
@@ -1068,7 +1095,7 @@ fn run_intake(
                     flags |= ChunkFlags::DISCONTINUITY;
                 }
 
-                let chunk = SecondaryChunk {
+                let mut chunk = SecondaryChunk {
                     samples,
                     frames,
                     pts_ns,
@@ -1083,11 +1110,17 @@ fn run_intake(
                     if shared.paused.load(Ordering::SeqCst) {
                         continue;
                     }
+                    let resume_generation = shared.resume_generation.load(Ordering::SeqCst);
+                    if resume_generation != secondary_resume_generation {
+                        chunk.flags |= ChunkFlags::DISCONTINUITY;
+                    }
                     rec_secondary = false;
                     disc_secondary = false;
                     sec_seq += 1;
                     // 副タップのドロップは dropped_before で観測できる（専用イベントは出さない）。
                     let _ = sec_prod.push(chunk);
+                    // 主とは独立した副リングへ実際に enqueue した時点でだけ進める。
+                    secondary_resume_generation = resume_generation;
                     emitted_any = true;
                 }
             }
@@ -1645,6 +1678,77 @@ mod tests {
             first.seq
         );
         assert_eq!(first.dropped_before, 0, "ポーズで取りこぼしは出ないはず");
+    }
+
+    /// pause 後に両リングを空にしてから resume を繰り返しても、各独立ストリームで
+    /// resume 後の最初のチャンクには必ず DISCONTINUITY が立つ。
+    ///
+    /// これは resume と intake の競合を狙う負荷試験。主・副は別リング・別 seq の
+    /// ストリームなので、どちらか片方だけを確認してはならない。
+    #[test]
+    fn resume_stress_marks_first_chunk_of_each_tap_discontinuous() {
+        const ROUNDS: usize = 300;
+        let config = StreamConfig {
+            secondary_output: Some(OutputFormat {
+                sample_rate: 16_000,
+                channels: 1,
+            }),
+            ring_capacity_chunks: 200,
+            ..Default::default()
+        };
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(config, backend).expect("open");
+        stream.start().expect("start");
+        let mut failures = 0usize;
+
+        for round in 0..ROUNDS {
+            stream.pause();
+            // pause() は delivery と排他なので、ここで取り切った後に旧チャンクが
+            // 新たに入ることはない。副リングも必ず同時に空にする。
+            while stream.poll_chunk().is_some() {}
+            while stream.poll_secondary().is_some() {}
+
+            stream.resume();
+
+            let mut primary = None;
+            let got_primary = wait_until(
+                || match stream.poll_chunk() {
+                    Some(chunk) => {
+                        primary = Some(chunk);
+                        true
+                    }
+                    None => false,
+                },
+                Duration::from_secs(2),
+            );
+            let mut secondary = None;
+            let got_secondary = wait_until(
+                || match stream.poll_secondary() {
+                    Some(chunk) => {
+                        secondary = Some(chunk);
+                        true
+                    }
+                    None => false,
+                },
+                Duration::from_secs(2),
+            );
+
+            let primary_ok = got_primary
+                && primary.is_some_and(|chunk| chunk.flags.contains(ChunkFlags::DISCONTINUITY));
+            let secondary_ok = got_secondary
+                && secondary.is_some_and(|chunk| chunk.flags.contains(ChunkFlags::DISCONTINUITY));
+            if !primary_ok || !secondary_ok {
+                failures += 1;
+                eprintln!("round {round}: primary_ok={primary_ok}, secondary_ok={secondary_ok}");
+            }
+        }
+
+        stream.stop();
+        assert_eq!(
+            failures, 0,
+            "{failures} / {ROUNDS} resume 試行で主または副の最初のチャンクに \
+             DISCONTINUITY がなかった"
+        );
     }
 
     /// ポーズしていないのに resume を呼んでも、次のチャンクに DISCONTINUITY は立たない
