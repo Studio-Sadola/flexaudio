@@ -26,7 +26,7 @@ use objc2_core_audio::{
 };
 use objc2_core_audio_types::AudioBufferList;
 
-use flexaudio_core::types::{DeviceInfo, Error, Result, SourceKind};
+use flexaudio_core::types::{DeviceInfo, Result, SourceKind};
 
 use crate::common::{
     map_os_status, read_cfstring_property, read_system_object_list, FALLBACK_FORMAT,
@@ -43,8 +43,9 @@ fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
 
 /// system object の `kAudioHardwarePropertyDevices` を読み、全 `AudioObjectID` を返す。
 ///
-/// 取得に失敗したときは、[`map_os_status`] で統一した [`Error`] を返す。読み取り本体は
-/// プロセス列挙と共有の [`read_system_object_list`]。
+/// 取得に失敗したときは、[`map_os_status`] で統一した
+/// [`Error`](flexaudio_core::types::Error) を返す。読み取り本体はプロセス列挙と共有の
+/// [`read_system_object_list`]。
 ///
 /// reader を引数にしているのは、CoreAudio を呼ばずに「取得失敗」と「正常な空リスト」が別の
 /// 値であることを試験するため。本番の呼び出し元は常に [`read_system_object_list`] を渡す。
@@ -241,7 +242,7 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
 /// [`list_output_devices`] の `id`（= デバイス名）で受けた指定を、tap が要求する UID へ変換する。
 /// 同名が複数あれば最初の一致を使う。一致するデバイスが無ければ `Ok(None)`（呼び出し側が
 /// [`Error::DeviceNotFound`](flexaudio_core::types::Error) を返す）。一覧を取得できなければ
-/// `OSStatus` を含む `Err` を返す。
+/// [`map_os_status`] で対応づけた `Err` を返す。
 pub(crate) fn uid_for_device_name(name: &str) -> Result<Option<String>> {
     for id in all_device_ids(read_system_object_list)? {
         if !is_output_device(id) {
@@ -257,6 +258,8 @@ pub(crate) fn uid_for_device_name(name: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use flexaudio_core::types::Error;
 
     /// 列挙が panic せず `Ok` を返すこと（headless/CI でも出力デバイスは 0 個以上）。
     /// 各 DeviceInfo は契約どおり loopback=true / SystemLoopback で、妥当な rate/channels を持つ。
