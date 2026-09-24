@@ -1,65 +1,66 @@
-//! flexaudio-cli — リファレンス・キャプチャ CLI。
+//! flexaudio-cli — reference capture CLI.
 //!
-//! 既定マイク等から N 秒キャプチャし、出力フォーマット（既定 48000 Hz / stereo 2ch /
-//! interleaved f32）のチャンクを集めて 16-bit PCM WAV に書き出す。ピーク / RMS(dBFS) /
-//! チャンク数 / ドロップ数のサマリも出す。
+//! Captures N seconds from the default microphone (or another source), collects chunks in the
+//! output format (default 48000 Hz / stereo 2ch / interleaved f32) and writes them to a 16-bit
+//! PCM WAV. It also prints a summary of peak / RMS (dBFS) / chunk count / drop count.
 //!
-//! 出力フォーマットは `--output-rate <Hz>`（既定 48000）と
-//! `--output-channels <1|2>`（既定 2）で指定する。内部正規形（48k/stereo）から
-//! 第 2 段リサンプラ（rubato・アンチエイリアス込み）で再変換し、WAV ヘッダ・stdout の
-//! rate/ch もこれに追従する。チャンクは時間ベース 20ms 固定なので、レートで 1 チャンクの
-//! フレーム数が変わる（48k=960 / 16k=320）。
+//! The output format is set with `--output-rate <Hz>` (default 48000) and
+//! `--output-channels <1|2>` (default 2). The audio is re-converted from the internal canonical
+//! format (48k/stereo) by the second-stage resampler (rubato, anti-aliasing included), and the
+//! rate/ch of the WAV header and of stdout follow it. Chunks are fixed at 20ms of time, so the
+//! number of frames per chunk depends on the rate (48k=960 / 16k=320).
 //!
 //! ```text
 //! flexaudio-cli --source mic --seconds 5 --out mic.wav
 //! flexaudio-cli --source system --output-rate 16000 --output-channels 1 --out 16k.wav --seconds 3
 //! ```
 //!
-//! `--device-id <ID>` でデバイスを選べる（ID は `--list-devices` の ID 列）。mic では
-//! 入力デバイス、system では出力エンドポイントを選ぶ。省略で既定（mic=既定入力 /
-//! system=既定出力）。process は `--process-id` で対象を決めるので device_id は無視される。
+//! `--device-id <ID>` selects the device (the ID is the ID column of `--list-devices`). For mic
+//! it selects the input device; for system it selects the output endpoint. If omitted, the
+//! default is used (mic=default input / system=default output). process determines its target
+//! with `--process-id`, so device_id is ignored.
 //!
-//! process と system の概念は別フラグに分けてある（混ぜない）:
-//! - `--mode include|exclude`（process 専用・既定 include）: include=対象 PID だけ録る /
-//!   exclude=対象 PID 以外の全システム音を録る（`--process-id` 必須）。
-//! - `--exclude-self`（system 専用）: システム音から自プロセスの再生音を除く
-//!   （フィードバック防止）。
-//!   process ソースは `--exclude-self` を、system ソースは `--mode` を無視する。
+//! The process and system concepts are split into separate flags (they are not mixed):
+//! - `--mode include|exclude` (process only, default include): include=record only the target
+//!   PID / exclude=record all system audio except the target PID (`--process-id` required).
+//! - `--exclude-self` (system only): removes the host process's own playback from the system
+//!   audio (feedback prevention).
+//!   The process source ignores `--exclude-self`, and the system source ignores `--mode`.
 //!
 //! ```text
 //! flexaudio-cli --list-devices
 //! flexaudio-cli --list-processes
-//! flexaudio-cli --source mic --device-id "ステレオ ミキサー (Realtek(R) Audio)" --out cap.wav
+//! flexaudio-cli --source mic --device-id "Stereo Mix (Realtek(R) Audio)" --out cap.wav
 //! ```
 //!
-//! `--out -` を指定すると、WAV ではなくヘッダ無し raw PCM を stdout（バイナリ）へ
-//! チャンク到着次第ストリーミングする。受け手（例: ホストアプリが
-//! `spawn('flexaudio-cli', ...)` して stdout を読む）がリアルタイムに音声を受け取れる。
-//! `--encoding f32|s16` で標本形式を選ぶ。このモードでは stdout を PCM バイト専用とし、
-//! サマリ等のログは stderr へ出す。`--seconds 0` で無限ストリーミング（パイプ切れ /
-//! Ctrl-C で停止）。raw PCM のレート/ch も出力フォーマットに追従する（受け手の `-r/-c`
-//! を合わせること）。
+//! With `--out -`, instead of a WAV, headerless raw PCM is streamed to stdout (binary) as soon
+//! as each chunk arrives. The receiver (e.g. a host app that runs `spawn('flexaudio-cli', ...)`
+//! and reads stdout) can receive the audio in real time. `--encoding f32|s16` selects the
+//! sample format. In this mode stdout is dedicated to PCM bytes, and logs such as the summary go
+//! to stderr. `--seconds 0` streams forever (stopped by a broken pipe / Ctrl-C). The rate/ch of
+//! the raw PCM also follow the output format (match the receiver's `-r/-c`).
 //!
 //! ```text
 //! flexaudio-cli --source system --out - --encoding s16 --seconds 0 | aplay -f S16_LE -r 48000 -c 2
 //! flexaudio-cli --source system --out - --encoding s16 --output-rate 16000 --output-channels 1 --seconds 0 | aplay -f S16_LE -r 16000 -c 1
 //! ```
 //!
-//! `--split-seconds <N>`（既定 0 = 分割なし）で WAV を N 秒毎の連番ファイルへ分割
-//! 録音できる。`--out rec.wav` なら `rec-001.wav, rec-002.wav, ...`（拡張子の前に
-//! 3 桁ゼロ詰め連番。1000 ファイル目以降は桁が自然に増える）。境界はチャンク粒度
-//! （20ms）で「書き込んだフレーム数が `N × 出力サンプルレート` 以上になったら次へ」
-//! なので、各ファイルは指定秒より最大 1 チャンク（±20ms）長くなりうる。チャンクは
-//! 分割せず取りこぼしも無い（次ファイルは次のチャンクから始まる）。フレーム数ベース
-//! なので `--sources`（ホットスワップ）や mix とも直交して効く。stdout ストリーミング
-//! （`--out -`）とは併用できない（起動時にエラー）。
+//! `--split-seconds <N>` (default 0 = no splitting) splits the WAV recording into numbered files
+//! of N seconds each. With `--out rec.wav` they are `rec-001.wav, rec-002.wav, ...` (a 3-digit
+//! zero-padded number before the extension; from the 1000th file on the number simply gets more
+//! digits). The boundary has chunk granularity (20ms): "move to the next file once the frames
+//! written reach `N × output sample rate`", so each file can be up to 1 chunk (±20ms) longer
+//! than specified. Chunks are never split and nothing is dropped (the next file starts with the
+//! next chunk). Since it is based on frame counts, it works orthogonally with `--sources`
+//! (hot-swap) and mix. It cannot be combined with stdout streaming (`--out -`) (error at
+//! startup).
 //!
 //! ```text
 //! flexaudio-cli --source mic --seconds 30 --split-seconds 10 --out rec.wav
 //! ```
 //!
-//! 入力デバイスが無い環境（サーバー・CI 等）では実キャプチャはできず、分かりやすい
-//! メッセージを表示して非ゼロ終了する（panic しない）。
+//! In environments without an input device (servers, CI, etc.) real capture is not possible;
+//! the CLI prints a clear message and exits with a non-zero status (it does not panic).
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -75,27 +76,27 @@ use clap::{Parser, ValueEnum};
 use flexaudio::core::{AudioChunk, Error, OutputFormat, SourceKind, StreamConfig};
 use flexaudio::{ProcessMode, Stream};
 
-/// キャプチャするソース種別（CLI 引数用）。
+/// Kind of source to capture (for the CLI argument).
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SourceArg {
-    /// 既定マイク入力。
+    /// Default microphone input.
     Mic,
-    /// システム出力ループバック（Linux / Windows / macOS）。
+    /// System output loopback (Linux / Windows / macOS).
     System,
-    /// プロセス出力ループバック（Linux / Windows / macOS・`--process-id <PID>` 必須）。
+    /// Process output loopback (Linux / Windows / macOS, `--process-id <PID>` required).
     Process,
-    /// マイク + システム音声のミックス（Linux / Windows / macOS）。
-    /// デバイスは `--mic-device-id` / `--system-device-id`、側別ゲインは
-    /// `--mic-gain` / `--system-gain` で指定する。
+    /// Mix of microphone + system audio (Linux / Windows / macOS).
+    /// Devices are set with `--mic-device-id` / `--system-device-id`, and per-side gains with
+    /// `--mic-gain` / `--system-gain`.
     Mix,
 }
 
-/// `--source process` の対象 PID の扱い（process 専用）。
+/// How the target PID of `--source process` is handled (process only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ModeArg {
-    /// 対象 PID（そのツリー）だけを録る（既定）。
+    /// Record only the target PID (and its tree) (default).
     Include,
-    /// 対象 PID（そのツリー）以外の全システム音を録る（`--process-id` 必須）。
+    /// Record all system audio except the target PID (and its tree) (`--process-id` required).
     Exclude,
 }
 
@@ -108,142 +109,154 @@ impl From<ModeArg> for ProcessMode {
     }
 }
 
-/// stdout ストリーミング時の標本形式（`--out -` 専用）。
+/// Sample format for stdout streaming (`--out -` only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum EncodingArg {
-    /// interleaved f32 little-endian（内部正規形そのまま）。
+    /// interleaved f32 little-endian (the internal canonical format as is).
     F32,
-    /// interleaved i16 little-endian。`aplay -f S16_LE` 等の外部ツール互換。
+    /// interleaved i16 little-endian. Compatible with external tools such as `aplay -f S16_LE`.
     S16,
 }
 
-/// flexaudio キャプチャ CLI。
+/// flexaudio capture CLI.
 #[derive(Debug, Parser)]
-#[command(name = "flexaudio-cli", about = "flexaudio キャプチャ CLI")]
+#[command(name = "flexaudio-cli", about = "flexaudio capture CLI")]
 struct Cli {
-    /// 録音せず、利用可能なオーディオデバイスを一覧表示して終了する
-    /// （`devices()` の統合列挙。`--source` 等とは独立に動く）。
+    /// Do not record; list the available audio devices and exit
+    /// (unified enumeration of `devices()`. Works independently of `--source` etc.).
     #[arg(long)]
     list_devices: bool,
 
-    /// 録音せず、プロセス別キャプチャ（`--source process --process-id <PID>`）の対象に
-    /// できる、音声出力のセッション（ストリーム）を持つプロセスを一覧表示して終了する
-    /// （`processes()`。停止中・Idle も載る。`--source` 等とは独立に動く）。
+    /// Do not record; list the processes that have an audio output session (stream) and can
+    /// therefore be targets of per-process capture (`--source process --process-id <PID>`), then
+    /// exit (`processes()`. Stopped/Idle ones are listed too. Works independently of `--source`
+    /// etc.).
     #[arg(long)]
     list_processes: bool,
 
-    /// 録音せず、デバイスの着脱（ホットプラグ）を監視して stderr に表示し続ける
-    /// （`watch_devices()`。Ctrl-C で停止。`--source` 等とは独立に動く）。
+    /// Do not record; watch device hotplug (attach/detach) and keep printing it to stderr
+    /// (`watch_devices()`. Stop with Ctrl-C. Works independently of `--source` etc.).
     #[arg(long)]
     watch_devices: bool,
 
-    /// キャプチャするソース（mic / system / process）。
+    /// Source to capture (mic / system / process).
     #[arg(long, value_enum, default_value_t = SourceArg::Mic)]
     source: SourceArg,
 
-    /// 録音中にソースをシームレスにホットスワップするスケジュール。
-    /// `<src>:<secs>` をカンマ区切りで並べる（例: `mic:2,system:2,process:2`）。
-    /// 各セグメントを指定秒だけ録ってから次ソースへ `switch_source` で切り替える。
-    /// 出力先（ファイル/パイプ）は 1 本のままで、単一の連続チャンクストリームになる。
-    /// 指定すると `--source` / `--seconds` を上書きする（先頭セグメントが初期ソース、
-    /// 各 secs の総和が総録音時間）。`process` を含むなら `--process-id` が必須。
-    /// 切替境界で `[switch] -> <kind>` を stderr に出す。切替失敗時は警告を出して
-    /// 録音は継続する（旧ソースのまま）。WAV 出力では各 secs は 1 以上であること。
-    /// `--mode` / `--exclude-self` は全セグメントに一様に渡り、process セグメントは
-    /// `--mode`、system セグメントは `--exclude-self` だけが効く。
+    /// Schedule for seamlessly hot-swapping the source during recording.
+    /// A comma-separated list of `<src>:<secs>` (e.g. `mic:2,system:2,process:2`).
+    /// Each segment is recorded for the given seconds, then `switch_source` switches to the next
+    /// source. The destination (file/pipe) stays a single one, producing a single continuous
+    /// chunk stream. When given, it overrides `--source` / `--seconds` (the first segment is the
+    /// initial source, and the sum of the secs is the total recording time). If it contains
+    /// `process`, `--process-id` is required. At each switch boundary `[switch] -> <kind>` is
+    /// printed to stderr. If a switch fails, a warning is printed and recording continues (with
+    /// the old source). For WAV output each secs must be 1 or more.
+    /// `--mode` / `--exclude-self` apply uniformly to all segments; only `--mode` takes effect
+    /// for process segments and only `--exclude-self` for system segments.
     #[arg(long)]
     sources: Option<String>,
 
-    /// `--source process` の対象プロセス PID（Linux / Windows / macOS・process では必須）。
-    /// 対象 PID のアプリ出力ノードへ fan-out リンクして複製で録る。非侵襲で、ユーザーの
-    /// スピーカーは鳴ったまま。対象が後から鳴り始めるのは正常。
+    /// Target process PID for `--source process` (Linux / Windows / macOS, required for
+    /// process). Records a copy by fan-out linking to the target PID's app output nodes.
+    /// Non-invasive: the user's speakers keep playing. It is normal for the target to start
+    /// playing only later.
     #[arg(long)]
     process_id: Option<u32>,
 
-    /// 選ぶデバイスの ID（`--list-devices` の ID 列からコピーする）。mic では入力デバイス、
-    /// system では出力エンドポイントを選ぶ。省略すると既定（mic=既定入力 / system=既定出力）。
-    /// process は `--process-id` で対象を決めるのでこの値は無視される。一致するデバイスが
-    /// 無ければクラッシュせず DeviceNotFound で終了する。
+    /// ID of the device to select (copy it from the ID column of `--list-devices`). For mic it
+    /// selects the input device; for system it selects the output endpoint. If omitted, the
+    /// default is used (mic=default input / system=default output). process determines its
+    /// target with `--process-id`, so this value is ignored. If no device matches, it exits with
+    /// DeviceNotFound instead of crashing.
     #[arg(long)]
     device_id: Option<String>,
 
-    /// `--source process` の対象 PID の扱い（process 専用・既定 include）。
-    /// `include`=対象 PID だけ録る / `exclude`=対象 PID 以外の全システム音を録る
-    /// （`--process-id` 必須・Linux / Windows / macOS 対応）。mic / system では無視される。
-    /// 対象を除外したい用途は `--mode exclude` を使う（自プロセス除外用途ではない）。
+    /// How the target PID of `--source process` is handled (process only, default include).
+    /// `include`=record only the target PID / `exclude`=record all system audio except the
+    /// target PID (`--process-id` required, supported on Linux / Windows / macOS). Ignored for
+    /// mic / system. To exclude a target, use `--mode exclude` (it is not meant for excluding
+    /// the host process itself).
     #[arg(long, value_enum, default_value_t = ModeArg::Include)]
     mode: ModeArg,
 
-    /// システム音から自プロセスの再生音を除く（system 専用・フィードバック
-    /// ループ防止・Linux / Windows / macOS 対応）。`--source system` でのみ効き、
-    /// mic / process では無視。対象 PID の除外用途は `--mode exclude` を使う。
+    /// Remove the host process's own playback from the system audio (system only, prevents
+    /// feedback loops, supported on Linux / Windows / macOS). Only takes effect with
+    /// `--source system`; ignored for mic / process. To exclude a target PID, use
+    /// `--mode exclude`.
     #[arg(long, default_value_t = false)]
     exclude_self: bool,
 
-    /// キャプチャ秒数。`0` で無限ストリーミング（`--out -` 想定、Ctrl-C / パイプ切れで停止）。
+    /// Capture duration in seconds. `0` streams forever (intended for `--out -`; stopped by
+    /// Ctrl-C / a broken pipe).
     #[arg(long, default_value_t = 5)]
     seconds: u64,
 
-    /// 出力先。ファイルパスなら WAV 書き出し、`-` なら stdout へ raw PCM ストリーミング。
+    /// Destination. A file path writes a WAV; `-` streams raw PCM to stdout.
     #[arg(long, default_value = "capture.wav")]
     out: PathBuf,
 
-    /// WAV 分割録音の 1 ファイルあたりの秒数。既定 0 = 分割なし（従来どおり 1 ファイル）。
-    /// 1 以上を指定すると、書き込んだフレーム数が `split-seconds × 出力サンプルレート` に
-    /// 達するたびに現在のファイルを確定（WAV ヘッダ確定）して次の連番ファイルへ切り替える
-    /// （`--out rec.wav` なら `rec-001.wav, rec-002.wav, ...`）。境界はチャンク粒度（20ms）の
-    /// 「以上になったら次へ」なので、各ファイルは指定秒より最大 1 チャンク長くなりうる。
-    /// チャンクは分割せず取りこぼしも無い（次ファイルは次のチャンクから始まる）。
-    /// stdout ストリーミング（`--out -`）とは併用できない。
+    /// Seconds per file for split WAV recording. Default 0 = no splitting (a single file, as
+    /// before). When 1 or more, each time the frames written reach
+    /// `split-seconds × output sample rate`, the current file is finalized (WAV header
+    /// finalized) and recording switches to the next numbered file
+    /// (`--out rec.wav` gives `rec-001.wav, rec-002.wav, ...`). The boundary has chunk
+    /// granularity (20ms), "move to the next file once reached or exceeded", so each file can be
+    /// up to 1 chunk longer than specified. Chunks are never split and nothing is dropped (the
+    /// next file starts with the next chunk). Cannot be combined with stdout streaming
+    /// (`--out -`).
     #[arg(long, default_value_t = 0)]
     split_seconds: u64,
 
-    /// stdout ストリーミング時の標本形式（`--out -` 専用。WAV 出力では無視）。
+    /// Sample format for stdout streaming (`--out -` only; ignored for WAV output).
     #[arg(long, value_enum, default_value_t = EncodingArg::F32)]
     encoding: EncodingArg,
 
-    /// 出力サンプルレート（Hz）。既定 48000。例: `--output-rate 16000` で 16kHz へ
-    /// ダウンサンプル。WAV ヘッダ・stdout の標本レートもこれに追従する。
+    /// Output sample rate (Hz). Default 48000. E.g. `--output-rate 16000` downsamples to
+    /// 16kHz. The sample rate of the WAV header and of stdout follows it.
     #[arg(long, default_value_t = 48_000)]
     output_rate: u32,
 
-    /// 出力チャンネル数（1 = mono / 2 = stereo）。既定 2。stereo→mono は L/R 平均。
+    /// Number of output channels (1 = mono / 2 = stereo). Default 2. stereo→mono is the L/R
+    /// average.
     #[arg(long, default_value_t = 2)]
     output_channels: u16,
 
-    /// 入力ゲイン（線形倍率）。既定 1.0。1.0 でそのまま、2.0 で約 +6dB、0.0 で無音。
-    /// 乗算後のサンプルは ±1.0 にクランプされる。負・NaN はエラー。
+    /// Input gain (linear multiplier). Default 1.0. 1.0 leaves the audio unchanged, 2.0 is about
+    /// +6dB, 0.0 is silence. Samples are clamped to ±1.0 after multiplication. Negative values
+    /// and NaN are errors.
     #[arg(long, default_value_t = 1.0)]
     gain: f32,
 
-    /// `--source mix` の mic 側で選ぶ入力デバイスの ID（mix 専用・`--list-devices` の
-    /// ID 列からコピーする）。省略すると既定入力。mic / system / process では無視される。
+    /// ID of the input device selected for the mic side of `--source mix` (mix only; copy it
+    /// from the ID column of `--list-devices`). If omitted, the default input is used. Ignored
+    /// for mic / system / process.
     #[arg(long)]
     mic_device_id: Option<String>,
 
-    /// `--source mix` の system 側で選ぶ出力エンドポイントの ID（mix 専用）。
-    /// 省略すると既定出力。mic / system / process では無視される。
+    /// ID of the output endpoint selected for the system side of `--source mix` (mix only).
+    /// If omitted, the default output is used. Ignored for mic / system / process.
     #[arg(long)]
     system_device_id: Option<String>,
 
-    /// `--source mix` の mic 側の合成前倍率（線形・mix 専用）。既定 1.0。合成後に
-    /// `--gain` が掛かる。負・NaN はエラー。
+    /// Pre-mix multiplier for the mic side of `--source mix` (linear, mix only). Default 1.0.
+    /// `--gain` is applied after mixing. Negative values and NaN are errors.
     #[arg(long, default_value_t = 1.0)]
     mic_gain: f32,
 
-    /// `--source mix` の system 側の合成前倍率（線形・mix 専用）。既定 1.0。
-    /// 負・NaN はエラー。
+    /// Pre-mix multiplier for the system side of `--source mix` (linear, mix only). Default
+    /// 1.0. Negative values and NaN are errors.
     #[arg(long, default_value_t = 1.0)]
     system_gain: f32,
 }
 
 impl Cli {
-    /// `--out -`（ハイフン 1 文字）かどうか。true なら stdout へ raw PCM ストリーミング。
+    /// Whether this is `--out -` (a single hyphen). If true, stream raw PCM to stdout.
     fn is_stdout_stream(&self) -> bool {
         self.out == Path::new("-")
     }
 
-    /// CLI 引数から [`OutputFormat`] を組み立てる。
+    /// Builds the [`OutputFormat`] from the CLI arguments.
     fn output_format(&self) -> OutputFormat {
         OutputFormat {
             sample_rate: self.output_rate,
@@ -252,32 +265,30 @@ impl Cli {
     }
 }
 
-/// `--sources` の 1 セグメント: 切り替え先ソースとその継続秒数。
+/// One segment of `--sources`: the source to switch to and its duration in seconds.
 #[derive(Debug, Clone, Copy)]
 struct Segment {
     kind: SourceKind,
     secs: u32,
 }
 
-/// `--sources "mic:2,system:2,process:2"` を `Vec<Segment>` へパースする。
+/// Parses `--sources "mic:2,system:2,process:2"` into a `Vec<Segment>`.
 ///
-/// 各要素は `<src>:<secs>`。`<src>` は `mic|system|process`、`<secs>` は正の整数
-/// （秒）。空・不正な要素・非対応 OS のソースはエラー（人間向け `String`）。
-/// 非 Linux で system/process を含む場合もここで弾く。
+/// Each element is `<src>:<secs>`. `<src>` is `mic|system|process` and `<secs>` is a positive
+/// integer (seconds). Empty or invalid elements and sources unsupported on the OS are errors (a
+/// human-readable `String`). A system/process entry on a non-Linux OS is also rejected here.
 fn parse_sources(spec: &str) -> std::result::Result<Vec<Segment>, String> {
     let mut segments = Vec::new();
     for (idx, raw) in spec.split(',').enumerate() {
         let item = raw.trim();
         if item.is_empty() {
             return Err(format!(
-                "--sources の {} 番目が空です（形式: <src>:<secs>、例 mic:2）",
+                "element {} of --sources is empty (format: <src>:<secs>, e.g. mic:2)",
                 idx + 1
             ));
         }
         let (src, secs_str) = item.split_once(':').ok_or_else(|| {
-            format!(
-                "--sources の要素 {item:?} は <src>:<secs> 形式である必要があります（例 mic:2）"
-            )
+            format!("element {item:?} of --sources must be in the form <src>:<secs> (e.g. mic:2)")
         })?;
         let kind = match src.trim() {
             "mic" => SourceKind::Mic,
@@ -289,7 +300,7 @@ fn parse_sources(spec: &str) -> std::result::Result<Vec<Segment>, String> {
                 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
                 {
                     return Err(
-                        "--sources の system（システム出力ループバック）は現在 Linux / Windows / macOS のみ対応です。"
+                        "system (system output loopback) in --sources is currently supported only on Linux / Windows / macOS."
                             .into(),
                     );
                 }
@@ -302,50 +313,52 @@ fn parse_sources(spec: &str) -> std::result::Result<Vec<Segment>, String> {
                 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
                 {
                     return Err(
-                        "--sources の process（プロセス出力ループバック）は現在 Linux / Windows / macOS のみ対応です。"
+                        "process (process output loopback) in --sources is currently supported only on Linux / Windows / macOS."
                             .into(),
                     );
                 }
             }
             other => {
                 return Err(format!(
-                    "--sources の未知のソース {other:?}（mic|system|process のいずれか）"
+                    "unknown source {other:?} in --sources (must be one of mic|system|process)"
                 ))
             }
         };
         let secs: u32 = secs_str.trim().parse().map_err(|_| {
-            format!("--sources の秒数 {secs_str:?} は正の整数である必要があります（例 mic:2）")
+            format!("the seconds {secs_str:?} in --sources must be a positive integer (e.g. mic:2)")
         })?;
         if secs == 0 {
             return Err(format!(
-                "--sources の秒数は 1 以上である必要があります（要素 {item:?}）"
+                "the seconds in --sources must be 1 or more (element {item:?})"
             ));
         }
         segments.push(Segment { kind, secs });
     }
     if segments.is_empty() {
-        return Err("--sources が空です（例: mic:2,system:2）".into());
+        return Err("--sources is empty (e.g.: mic:2,system:2)".into());
     }
     Ok(segments)
 }
 
-/// 指定 [`SourceKind`] と CLI の共有設定（output / pid / exclude_self）から
-/// [`StreamConfig`] を組み立てる。`--sources` の各セグメント config 生成に使う。
+/// Builds a [`StreamConfig`] from the given [`SourceKind`] and the CLI's shared settings
+/// (output / pid / exclude_self). Used to generate the config of each `--sources` segment.
 fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
     StreamConfig {
         kind,
         output: cli.output_format(),
         target_pid: cli.process_id,
-        // mode は process セグメントでのみ効く（mic/system では facade が無視）。
+        // mode only takes effect for process segments (the facade ignores it for mic/system).
         mode: cli.mode.into(),
-        // exclude_self は system セグメントでのみ効く（mic/process では無視）。
+        // exclude_self only takes effect for system segments (ignored for mic/process).
         exclude_self: cli.exclude_self,
-        // device_id は mic（入力）と system（出力エンドポイント）で効く（process では
-        // facade が無視）。全セグメントに一様に載せておけば該当セグメントが拾う。
+        // device_id takes effect for mic (input) and system (output endpoint) (the facade
+        // ignores it for process). Putting it uniformly on all segments lets the relevant
+        // segments pick it up.
         device_id: cli.device_id.clone(),
-        // gain は切替では変わらない（core が無視する）が、初期 config と揃えておく。
+        // gain does not change on a switch (core ignores it), but keep it in line with the
+        // initial config.
         gain: cli.gain,
-        // mix 専用（mix 以外のセグメントでは facade が無視する）。
+        // mix only (the facade ignores these for segments other than mix).
         mix_mic_device_id: cli.mic_device_id.clone(),
         mix_system_device_id: cli.system_device_id.clone(),
         mix_mic_gain: cli.mic_gain,
@@ -354,30 +367,33 @@ fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
     }
 }
 
-/// `--sources` のホットスワップスケジューラ。
+/// Hot-swap scheduler for `--sources`.
 ///
-/// 先頭セグメントは初期ソース（既に open/start 済み）。以降のセグメント境界（秒の累積）
-/// に達したら `stream.switch_source()` で次ソースへ差し替える。出力先（ファイル/パイプ）
-/// は呼び出し側が 1 本に保つので、切替は単一の連続チャンクストリームへ透過的に反映される
-/// （seq/PTS の連続は Stream 層が保証）。
+/// The first segment is the initial source (already opened/started). When a subsequent segment
+/// boundary (cumulative seconds) is reached, `stream.switch_source()` swaps to the next source.
+/// The caller keeps the destination (file/pipe) as a single one, so switches are reflected
+/// transparently in a single continuous chunk stream (the Stream layer guarantees seq/PTS
+/// continuity).
 ///
-/// 収集ループから毎周回 [`tick`](Self::tick) を呼ぶと、境界時刻を過ぎた切替をまとめて
-/// 実行する。切替失敗は `eprintln!` で警告して録音は継続する（旧ソースのまま）。境界で
-/// `[switch] -> <kind>` を stderr に出す。
+/// Calling [`tick`](Self::tick) on every iteration of the collection loop performs all switches
+/// whose boundary time has passed. A failed switch is warned about with `eprintln!` and
+/// recording continues (with the old source). At each boundary `[switch] -> <kind>` is printed
+/// to stderr.
 struct SwitchScheduler {
-    /// 次に切り替えるセグメント索引（1 始まり。先頭は初期ソースで切替対象外）。
+    /// Index of the next segment to switch to (1-based. The first is the initial source and is
+    /// not a switch target).
     next: usize,
-    /// 各境界の絶対時刻（`deadlines[i]` = セグメント `i+1` へ切り替える時刻）。
+    /// Absolute time of each boundary (`deadlines[i]` = the time to switch to segment `i+1`).
     deadlines: Vec<Instant>,
-    /// 切替先 config（`configs[i]` = `deadlines[i]` で切り替える config）。
+    /// Config to switch to (`configs[i]` = the config switched to at `deadlines[i]`).
     configs: Vec<StreamConfig>,
-    /// 表示ラベル（`labels[i]` = `configs[i]` の kind ラベル）。
+    /// Display labels (`labels[i]` = the kind label of `configs[i]`).
     labels: Vec<&'static str>,
 }
 
 impl SwitchScheduler {
-    /// セグメント計画から、`start` を基準にスケジューラを構築する。
-    /// 先頭セグメントは初期ソースなので切替対象に含めない。
+    /// Builds the scheduler from the segment plan, relative to `start`.
+    /// The first segment is the initial source, so it is not included as a switch target.
     fn new(cli: &Cli, segments: &[Segment], start: Instant) -> Self {
         let mut deadlines = Vec::new();
         let mut configs = Vec::new();
@@ -385,8 +401,8 @@ impl SwitchScheduler {
         let mut cumulative = 0u64;
         for (i, seg) in segments.iter().enumerate() {
             cumulative += seg.secs as u64;
-            // 最後のセグメントの終端は「総録音時間」であり切替境界ではない。
-            // セグメント i の終端 = セグメント i+1 への切替時刻（i+1 が存在する場合のみ）。
+            // The end of the last segment is the "total recording time", not a switch boundary.
+            // End of segment i = time to switch to segment i+1 (only if i+1 exists).
             if i + 1 < segments.len() {
                 deadlines.push(start + Duration::from_secs(cumulative));
                 let next_seg = segments[i + 1];
@@ -402,13 +418,15 @@ impl SwitchScheduler {
         }
     }
 
-    /// 総録音時間（全セグメント秒の総和）。収集ループの deadline に使う。
+    /// Total recording time (sum of all segment seconds). Used for the collection loop's
+    /// deadline.
     fn total_duration(segments: &[Segment]) -> Duration {
         let total: u64 = segments.iter().map(|s| s.secs as u64).sum();
         Duration::from_secs(total)
     }
 
-    /// `now` までに到達した境界の切替を全て実行する。失敗は警告し継続。
+    /// Performs all switches for boundaries reached by `now`. Failures are warned about and
+    /// execution continues.
     fn tick(&mut self, stream: &mut Stream, now: Instant) {
         while self.next < self.deadlines.len() && now >= self.deadlines[self.next] {
             let label = self.labels[self.next];
@@ -418,7 +436,9 @@ impl SwitchScheduler {
                     eprintln!("[switch] -> {label}");
                 }
                 Err(e) => {
-                    eprintln!("[switch] 警告: {label} への切替に失敗しました（録音は継続）: {e}");
+                    eprintln!(
+                        "[switch] warning: failed to switch to {label} (recording continues): {e}"
+                    );
                 }
             }
             self.next += 1;
@@ -428,47 +448,51 @@ impl SwitchScheduler {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    // main からのエラーは常に stderr へ出す（stdout ストリーミング時に stdout を汚さない）。
+    // Errors from main always go to stderr (so stdout is not polluted during stdout streaming).
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
-            eprintln!("エラー: {msg}");
+            eprintln!("error: {msg}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// 実処理本体。失敗は人間向けメッセージ（`String`）として返す。
+/// The actual processing. Failures are returned as a human-readable message (`String`).
 fn run(cli: &Cli) -> std::result::Result<(), String> {
-    // デバイス一覧モード（録音せず列挙して終了）。`--source` 等とは独立に先に処理する。
+    // Device list mode (enumerate without recording and exit). Handled first, independently of
+    // `--source` etc.
     if cli.list_devices {
         return list_devices();
     }
 
-    // プロセス一覧モード（録音せず列挙して終了）。これも `--source` 等とは独立。
+    // Process list mode (enumerate without recording and exit). Also independent of `--source`
+    // etc.
     if cli.list_processes {
         return list_processes();
     }
 
-    // デバイス着脱監視モード（録音せず監視し続ける）。これも `--source` 等とは独立。
+    // Device hotplug watch mode (keep watching without recording). Also independent of
+    // `--source` etc.
     if cli.watch_devices {
         return watch_devices_loop();
     }
 
     let stdout_stream = cli.is_stdout_stream();
 
-    // --split-seconds は WAV ファイル出力専用。stdout ストリーミング（--out -）には
-    // 「ファイル」の境界が無く分割できないので、ストリームを開く前にここで弾く。
+    // --split-seconds is for WAV file output only. stdout streaming (--out -) has no "file"
+    // boundaries and cannot be split, so reject it here before opening the stream.
     if stdout_stream && cli.split_seconds > 0 {
         return Err(
-            "--split-seconds（分割録音）は WAV ファイル出力専用です。--out -（stdout への \
-             raw PCM ストリーミング）とは併用できません。--out にファイルパスを指定してください。"
+            "--split-seconds (split recording) is for WAV file output only. It cannot be \
+             combined with --out - (raw PCM streaming to stdout). Specify a file path for --out."
                 .into(),
         );
     }
 
-    // ログ出力先の切り替え。stdout ストリーミング時は全ログを stderr へ（stdout は PCM
-    // 専用）、ファイル出力時は stdout サマリでよい。以降の println!/eprintln! はこれを通す。
+    // Switch the log destination. During stdout streaming all logs go to stderr (stdout is for
+    // PCM only); for file output a summary on stdout is fine. The println!/eprintln! below go
+    // through this.
     macro_rules! log {
         ($($arg:tt)*) => {
             if stdout_stream {
@@ -479,9 +503,10 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         };
     }
 
-    // --sources（ホットスワップスケジュール）の解決。指定時は --source / --seconds を
-    // 上書きし、先頭セグメントを初期ソースにする。process を含むなら --process-id 必須
-    // （switch_source 経由の build_backend が PID 欠落で失敗するので、ここで先に弾く）。
+    // Resolve --sources (hot-swap schedule). When given, it overrides --source / --seconds and
+    // the first segment becomes the initial source. If it contains process, --process-id is
+    // required (build_backend via switch_source would fail on the missing PID, so reject it
+    // here first).
     let segments: Option<Vec<Segment>> = match &cli.sources {
         None => None,
         Some(spec) => {
@@ -489,78 +514,83 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
             let needs_pid = segs.iter().any(|s| s.kind == SourceKind::ProcessLoopback);
             if needs_pid && cli.process_id.is_none() {
                 return Err(
-                    "--sources に process を含む場合は --process-id <PID> が必要です。".into(),
+                    "--process-id <PID> is required when --sources contains process.".into(),
                 );
             }
             Some(segs)
         }
     };
 
-    // ソース種別から SourceKind と表示ラベルを解決する。バックエンドの構築・選択は
-    // facade `flexaudio::open` が行う（Box<dyn CaptureBackend> を内部で選んで Stream を
-    // 返す）。CLI 側は SourceKind・表示ラベルの決定と、人間向けの事前チェック（process の
-    // PID 必須・非 Linux の system/process 拒否）だけを担う。--sources 指定時は先頭
-    // セグメントの kind を初期ソースに使う。
+    // Resolve the SourceKind and display label from the source kind. Building and selecting the
+    // backend is done by the facade `flexaudio::open` (it picks a Box<dyn CaptureBackend>
+    // internally and returns a Stream). The CLI side only decides the SourceKind and display
+    // label and does the human-oriented pre-checks (PID required for process, rejecting
+    // system/process on non-Linux). When --sources is given, the kind of the first segment is
+    // used as the initial source.
     let (kind, source_label): (SourceKind, &str) = if let Some(segs) = &segments {
         let first = segs[0].kind;
         let label = match first {
-            SourceKind::Mic => "mic（既定入力デバイス）",
-            SourceKind::SystemLoopback => "system（既定出力のループバック）",
-            SourceKind::ProcessLoopback => "process（指定 PID の出力）",
-            SourceKind::Mix => "mix（マイク + システム音声の合成）",
+            SourceKind::Mic => "mic (default input device)",
+            SourceKind::SystemLoopback => "system (loopback of the default output)",
+            SourceKind::ProcessLoopback => "process (output of the given PID)",
+            SourceKind::Mix => "mix (microphone + system audio mixed)",
         };
         (first, label)
     } else {
         match cli.source {
-            SourceArg::Mic => (SourceKind::Mic, "mic（既定入力デバイス）"),
+            SourceArg::Mic => (SourceKind::Mic, "mic (default input device)"),
             SourceArg::System => {
                 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
                 {
                     (
                         SourceKind::SystemLoopback,
-                        "system（既定出力のループバック）",
+                        "system (loopback of the default output)",
                     )
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
                 {
                     return Err(
-                    "--source system（システム出力ループバック）は現在 Linux / Windows / macOS のみ対応です。"
+                    "--source system (system output loopback) is currently supported only on Linux / Windows / macOS."
                         .into(),
                 );
                 }
             }
             SourceArg::Process => {
-                // process では PID 必須。無ければ分かりやすいエラーで止める（facade も
-                // InvalidArg を返すが、ここで人間向け文言で先に弾く）。このチェックは OS
-                // 非依存。
+                // process requires a PID. Without one, stop with a clear error (the facade also
+                // returns InvalidArg, but reject it here first with human-oriented wording).
+                // This check is OS-independent.
                 if cli.process_id.is_none() {
-                    return Err("--source process には --process-id <PID> が必要です。\
-                     （対象プロセスの PID を指定してください。例: \
-                     speaker-test を鳴らして得た PID）"
+                    return Err("--source process requires --process-id <PID>. \
+                     (Specify the PID of the target process, e.g. the PID obtained by \
+                     running speaker-test)"
                         .into());
                 }
                 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
                 {
-                    (SourceKind::ProcessLoopback, "process（指定 PID の出力）")
+                    (
+                        SourceKind::ProcessLoopback,
+                        "process (output of the given PID)",
+                    )
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
                 {
                     return Err(
-                    "--source process（プロセス出力ループバック）は現在 Linux / Windows / macOS のみ対応です。"
+                    "--source process (process output loopback) is currently supported only on Linux / Windows / macOS."
                         .into(),
                 );
                 }
             }
             SourceArg::Mix => {
-                // system 側のループバックが必要なので、対応 OS は system と同じ。
+                // The system-side loopback is required, so the supported OSes are the same as
+                // for system.
                 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
                 {
-                    (SourceKind::Mix, "mix（マイク + システム音声の合成）")
+                    (SourceKind::Mix, "mix (microphone + system audio mixed)")
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
                 {
                     return Err(
-                    "--source mix（マイク + システム音声のミックス）は現在 Linux / Windows / macOS のみ対応です。"
+                    "--source mix (mix of microphone + system audio) is currently supported only on Linux / Windows / macOS."
                         .into(),
                 );
                 }
@@ -568,34 +598,35 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         }
     };
 
-    // --- 出力フォーマット解決・検証 ---
+    // --- Resolve and validate the output format ---
     let output = cli.output_format();
     output.validate().map_err(|e| {
         format!(
-            "出力フォーマット {}Hz/{}ch は非対応です: {e}",
+            "output format {}Hz/{}ch is not supported: {e}",
             output.sample_rate, output.channels
         )
     })?;
     let out_rate = output.sample_rate;
     let out_ch = output.channels;
 
-    // ストリームを開く。open は config.kind に応じて Box<dyn CaptureBackend> を内部で
-    // 選んで返す。まだ start しない（二段方式）。native_format は開いた Stream から取る。
+    // Open the stream. open picks a Box<dyn CaptureBackend> internally according to
+    // config.kind and returns it. Not started yet (two-step scheme). native_format is taken from
+    // the opened Stream.
     let config = StreamConfig {
         kind,
         output,
         target_pid: cli.process_id,
-        // mode は process 専用。include 既定。
+        // mode is process only. include by default.
         mode: cli.mode.into(),
-        // exclude_self は system 専用の自ホスト除外。
+        // exclude_self is the system-only exclusion of the own host process.
         exclude_self: cli.exclude_self,
-        // device_id は mic（入力）と system（出力エンドポイント）の選択用（process では
-        // facade が無視する）。
+        // device_id selects mic (input) and system (output endpoint) (the facade ignores it
+        // for process).
         device_id: cli.device_id.clone(),
-        // 開始時の入力ゲイン（線形倍率）。不正値は open が InvalidArg で弾く。
+        // Input gain at start (linear multiplier). open rejects invalid values with InvalidArg.
         gain: cli.gain,
-        // mix 専用のデバイス選択と側別ゲイン（mix 以外では facade が無視する。
-        // 不正な側別ゲインは open が InvalidArg で弾く）。
+        // mix-only device selection and per-side gains (the facade ignores them for anything
+        // other than mix; open rejects invalid per-side gains with InvalidArg).
         mix_mic_device_id: cli.mic_device_id.clone(),
         mix_system_device_id: cli.system_device_id.clone(),
         mix_mic_gain: cli.mic_gain,
@@ -604,33 +635,34 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     };
     let mut stream = flexaudio::open(config).map_err(describe_error)?;
 
-    // --- ネイティブフォーマット表示 ---
+    // --- Show the native format ---
     let (native_rate, native_ch) = stream.native_format();
-    log!("ソース            : {source_label}");
-    // device_id 指定時は選択デバイスを明示（mic と system で有効。process / mix では無視）。
+    log!("Source             : {source_label}");
+    // When device_id is given, show the selected device explicitly (valid for mic and system;
+    // ignored for process / mix).
     if let Some(id) = &cli.device_id {
         match kind {
             SourceKind::ProcessLoopback => {
-                log!("デバイス ID        : {id}（注: process では無視されます）");
+                log!("Device ID          : {id} (note: ignored for process)");
             }
             SourceKind::Mix => {
                 log!(
-                    "デバイス ID        : {id}（注: mix では無視されます。\
-                     --mic-device-id / --system-device-id を使ってください）"
+                    "Device ID          : {id} (note: ignored for mix; \
+                     use --mic-device-id / --system-device-id)"
                 );
             }
-            _ => log!("デバイス ID        : {id}"),
+            _ => log!("Device ID          : {id}"),
         }
     }
-    log!("ネイティブフォーマット: {native_rate} Hz / {native_ch} ch");
+    log!("Native format      : {native_rate} Hz / {native_ch} ch");
     if stdout_stream {
         let enc = match cli.encoding {
             EncodingArg::F32 => "f32 LE",
             EncodingArg::S16 => "s16 LE",
         };
-        log!("出力フォーマット   : {out_rate} Hz / {out_ch} ch / {enc} raw PCM（stdout）");
+        log!("Output format      : {out_rate} Hz / {out_ch} ch / {enc} raw PCM (stdout)");
     } else {
-        log!("出力フォーマット   : {out_rate} Hz / {out_ch} ch / 16-bit PCM WAV");
+        log!("Output format      : {out_rate} Hz / {out_ch} ch / 16-bit PCM WAV");
     }
     if let Some(segs) = &segments {
         let plan: Vec<String> = segs
@@ -639,33 +671,34 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
             .collect();
         let total: u32 = segs.iter().map(|s| s.secs).sum();
         log!(
-            "スケジュール       : {}（計 {total} 秒・1 本の連続ストリーム）",
+            "Schedule           : {} ({total} s total, one continuous stream)",
             plan.join(" -> ")
         );
     } else if cli.seconds == 0 {
-        log!("キャプチャ秒数     : 無限（Ctrl-C / パイプ切れで停止）");
+        log!("Capture duration   : infinite (stopped by Ctrl-C / a broken pipe)");
     } else {
-        log!("キャプチャ秒数     : {} 秒", cli.seconds);
+        log!("Capture duration   : {} s", cli.seconds);
     }
     if stdout_stream {
-        log!("出力先             : stdout（raw PCM ストリーミング）");
+        log!("Output             : stdout (raw PCM streaming)");
     } else if cli.split_seconds > 0 {
-        // 分割録音時はベースパスそのままのファイルは作らないので、実際の連番名を見せる。
+        // With split recording no file is created at the base path itself, so show the actual
+        // numbered names.
         log!(
-            "出力パス           : {}, {}, ...（{} 秒毎に分割）",
+            "Output path        : {}, {}, ... (split every {} s)",
             split_file_path(&cli.out, 1).display(),
             split_file_path(&cli.out, 2).display(),
             cli.split_seconds
         );
     } else {
-        log!("出力パス           : {}", cli.out.display());
+        log!("Output path        : {}", cli.out.display());
     }
     log!("");
 
-    // --- キャプチャ開始（open 済みの Stream を start する二段方式） ---
+    // --- Start capture (two-step scheme: start the already opened Stream) ---
     stream.start().map_err(describe_error)?;
 
-    log!("キャプチャ中 ...");
+    log!("Capturing ...");
 
     if stdout_stream {
         run_stdout_stream(cli, &mut stream, segments.as_deref())
@@ -674,26 +707,26 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     }
 }
 
-/// `--list-devices`: `devices()` でデバイスを取得して表形式で表示する。
+/// `--list-devices`: gets the devices with `devices()` and prints them as a table.
 ///
-/// 列: SOURCE（mic/system/process）/ LOOPBACK / DEFAULT / RATE / CH / NAME / ID。
-/// id はデバイス名（cpal）または node.name（PipeWire）。デバイスが無い環境ではその旨を
-/// 表示する（エラーにはしない）。
+/// Columns: SOURCE (mic/system/process) / LOOPBACK / DEFAULT / RATE / CH / NAME / ID.
+/// id is the device name (cpal) or node.name (PipeWire). In environments without devices it
+/// says so (not an error).
 fn list_devices() -> std::result::Result<(), String> {
-    let devices = flexaudio::devices().map_err(|e| format!("デバイス列挙に失敗しました: {e}"))?;
+    let devices = flexaudio::devices().map_err(|e| format!("failed to enumerate devices: {e}"))?;
 
     if devices.is_empty() {
-        println!("利用可能なオーディオデバイスが見つかりませんでした。");
+        println!("No available audio devices were found.");
         println!(
-            "（オーディオデバイスのある環境で実行してください。\
-             Linux で system を列挙するには PipeWire セッションが必要です。）"
+            "(Run this in an environment with audio devices. \
+             Enumerating system on Linux requires a PipeWire session.)"
         );
         return Ok(());
     }
 
-    println!("利用可能なオーディオデバイス: {} 件", devices.len());
+    println!("Available audio devices: {}", devices.len());
     println!();
-    // ヘッダ。固定幅で揃える（可変長の id/name は末尾）。
+    // Header. Aligned with fixed widths (the variable-length id/name come last).
     println!(
         "{:<7} {:<8} {:<7} {:>6} {:>3}  {:<28} ID",
         "SOURCE", "LOOPBACK", "DEFAULT", "RATE", "CH", "NAME"
@@ -713,30 +746,38 @@ fn list_devices() -> std::result::Result<(), String> {
     }
     println!();
     println!(
-        "（DEFAULT の * は OS 既定デバイス。ID は `--device-id <ID>` でデバイスを選ぶのに\
-         使える安定キー。mic は入力デバイス、system は出力エンドポイント。process では無視。）"
+        "(A * in DEFAULT marks the OS default device. The ID is a stable key that can be used \
+         to select the device with `--device-id <ID>`. For mic it is the input device, for \
+         system the output endpoint. Ignored for process.)"
     );
     Ok(())
 }
 
-/// `--list-processes`: `processes()` で録れるプロセスを取得して表形式で表示する。
+/// `--list-processes`: gets the recordable processes with `processes()` and prints them as a
+/// table.
 ///
-/// 列: ACTIVE（出力中なら `*`、不明なら `?`）/ PID / NAME / EXECUTABLE / BUNDLE。
-/// PID は `--source process --process-id <PID>` に渡せる。候補が無い環境ではその旨を表示し、
-/// プロセス別キャプチャ自体が使えない環境ではエラーにする。
+/// Columns: ACTIVE (`*` if outputting, `?` if unknown) / PID / NAME / EXECUTABLE / BUNDLE.
+/// The PID can be passed to `--source process --process-id <PID>`. In environments with no
+/// candidates it says so, and in environments where per-process capture itself is unavailable
+/// it is an error.
 fn list_processes() -> std::result::Result<(), String> {
     let processes = flexaudio::processes().map_err(|e| {
-        format!("プロセス列挙に失敗しました（この環境ではプロセス別キャプチャを使えません）: {e}")
+        format!(
+            "failed to enumerate processes (per-process capture is not available in this \
+             environment): {e}"
+        )
     })?;
 
     if processes.is_empty() {
-        println!("音声出力のセッション（ストリーム）を持つプロセスは今ありません。");
-        println!("（プロセス別キャプチャはこの環境で使えます。一覧には停止中・Idle も載るので、");
-        println!("  空なのは「何も鳴っていない」ではなく、出力セッション自体が無い状態です。）");
+        println!("There are currently no processes with an audio output session (stream).");
+        println!("(Per-process capture is available here. The list includes stopped/Idle ones,");
+        println!(
+            "  so empty means there is no output session at all, not \"nothing is playing\".)"
+        );
         return Ok(());
     }
 
-    println!("録れるプロセス: {} 件", processes.len());
+    println!("Recordable processes: {}", processes.len());
     println!();
     println!(
         "{:<6} {:>7}  {:<28} {:<24} BUNDLE",
@@ -760,43 +801,45 @@ fn list_processes() -> std::result::Result<(), String> {
     }
     println!();
     println!(
-        "（ACTIVE の * は出力中、? は OS が状態を公開していないもの。PID は\
-         `--source process --process-id <PID>` に渡せる。）"
+        "(A * in ACTIVE means outputting; ? means the OS does not expose the state. The PID \
+         can be passed to `--source process --process-id <PID>`.)"
     );
     Ok(())
 }
 
-/// `--watch-devices`: `watch_devices()` でデバイスの着脱（ホットプラグ）を監視し、
-/// イベントを stderr へ表示し続ける（Ctrl-C で停止）。
+/// `--watch-devices`: watches device hotplug (attach/detach) with `watch_devices()` and keeps
+/// printing the events to stderr (stop with Ctrl-C).
 ///
-/// stdout は将来の機械可読出力用に空けておくので、ログ・イベントは全て stderr へ出す。
-/// 起動時に `devices()` で既存デバイスを数えて件数を表示する。
+/// stdout is kept free for future machine-readable output, so all logs and events go to
+/// stderr. At startup the existing devices are counted with `devices()` and the count is shown.
 ///
-/// 表示形式（いずれも stderr）:
-/// - `[+] ADDED   <source> <name> (<id>)` — デバイス追加
-/// - `[-] REMOVED <id>` — デバイス取り外し（id = node.name のみ）
-/// - `[*] DEFAULT <source> -> <id>` — 既定デバイス切替
+/// Display format (all on stderr):
+/// - `[+] ADDED   <source> <name> (<id>)` — device added
+/// - `[-] REMOVED <id>` — device removed (id = node.name only)
+/// - `[*] DEFAULT <source> -> <id>` — default device changed
 fn watch_devices_loop() -> std::result::Result<(), String> {
     use flexaudio::core::DeviceEvent;
 
-    // 起動時に既存デバイス数を数えて案内（stderr）。列挙失敗は致命的にしない。
+    // At startup, count the existing devices and report (stderr). An enumeration failure is not
+    // fatal.
     let existing = flexaudio::devices().map(|d| d.len()).unwrap_or(0);
-    eprintln!("デバイス着脱監視を開始しました（既存 {existing} 件）。Ctrl-C で停止します。");
+    eprintln!("Started watching device hotplug ({existing} existing). Press Ctrl-C to stop.");
     eprintln!();
 
-    // Ctrl-C(SIGINT) で停止フラグを倒す。
+    // Clear the running flag on Ctrl-C (SIGINT).
     let running = Arc::new(AtomicBool::new(true));
     {
         let r = running.clone();
         ctrlc::set_handler(move || {
             r.store(false, Ordering::SeqCst);
         })
-        .map_err(|e| format!("Ctrl-C ハンドラの登録に失敗しました: {e}"))?;
+        .map_err(|e| format!("failed to register the Ctrl-C handler: {e}"))?;
     }
 
-    // 監視開始。PipeWire 不在等でも縮退して Ok（着脱が来ないだけ）。
+    // Start watching. Even without PipeWire etc. it degrades to Ok (hotplug events just never
+    // come).
     let mut watcher =
-        flexaudio::watch_devices().map_err(|e| format!("デバイス監視の開始に失敗しました: {e}"))?;
+        flexaudio::watch_devices().map_err(|e| format!("failed to start watching devices: {e}"))?;
 
     while running.load(Ordering::SeqCst) {
         while let Some(ev) = watcher.poll_event() {
@@ -815,24 +858,25 @@ fn watch_devices_loop() -> std::result::Result<(), String> {
                 DeviceEvent::DefaultChanged { kind, id } => {
                     eprintln!("[*] DEFAULT {:<7} -> {}", source_kind_label(kind), id,);
                 }
-                // DeviceEvent は #[non_exhaustive]。将来のバリアント追加に備えて、未知
-                // 種別もデバッグ表現で表示する（握り潰さない）。
+                // DeviceEvent is #[non_exhaustive]. In preparation for future variants, unknown
+                // kinds are also printed with their debug representation (not swallowed).
                 other => {
                     eprintln!("[?] UNKNOWN  {other:?}");
                 }
             }
         }
-        // 着脱は低頻度。空転を避けて適度に眠る（応答性 100ms で十分）。
+        // Hotplug is infrequent. Sleep moderately to avoid spinning (100ms responsiveness is
+        // enough).
         thread::sleep(Duration::from_millis(100));
     }
 
     watcher.stop();
     eprintln!();
-    eprintln!("デバイス着脱監視を停止しました（Ctrl-C）。");
+    eprintln!("Stopped watching device hotplug (Ctrl-C).");
     Ok(())
 }
 
-/// [`SourceKind`] を CLI 表示用の短いラベルへ。
+/// Converts a [`SourceKind`] into a short label for CLI display.
 fn source_kind_label(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::Mic => "mic",
@@ -842,7 +886,7 @@ fn source_kind_label(kind: SourceKind) -> &'static str {
     }
 }
 
-/// 表示用に文字列を `max` 文字（char 単位）で切り詰める（超過分は `…`）。
+/// Truncates a string to `max` characters (in chars) for display (the excess becomes `…`).
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -854,22 +898,25 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// WAV 出力経路（従来挙動）。N 秒（>0）収集して 16-bit WAV を書き出し、stdout にサマリ表示。
-/// `output` は出力フォーマット（WAV ヘッダの rate/ch・録れた秒数の算出に使う）。
+/// WAV output path (the original behavior). Collects for N seconds (>0), writes a 16-bit WAV and
+/// prints a summary to stdout.
+/// `output` is the output format (used for the WAV header's rate/ch and for computing the
+/// seconds recorded).
 fn run_wav(
     cli: &Cli,
     stream: &mut Stream,
     output: OutputFormat,
     segments: Option<&[Segment]>,
 ) -> std::result::Result<(), String> {
-    // 総録音時間: --sources 指定時はセグメント総和、無ければ --seconds。
-    // WAV 経路で --seconds 0 は無限に貯め続けてしまうので拒否する（--sources の各 secs は
-    // parse_sources で 1 以上を強制済みなので 0 にはならない）。
+    // Total recording time: the sum of the segments when --sources is given, otherwise
+    // --seconds. On the WAV path --seconds 0 would keep accumulating forever, so it is rejected
+    // (each secs of --sources is already forced to be 1 or more by parse_sources, so it is
+    // never 0).
     if segments.is_none() && cli.seconds == 0 {
         stream.stop();
         return Err(
-            "--seconds 0（無限）は raw PCM ストリーミング（--out -）専用です。\
-             WAV 出力では 1 以上を指定してください。"
+            "--seconds 0 (infinite) is only for raw PCM streaming (--out -). \
+             For WAV output specify 1 or more."
                 .into(),
         );
     }
@@ -879,19 +926,22 @@ fn run_wav(
         Some(segs) => SwitchScheduler::total_duration(segs),
         None => Duration::from_secs(cli.seconds),
     };
-    // ホットスワップスケジューラ（--sources 指定時のみ・出力先は 1 本のまま）。
+    // Hot-swap scheduler (only when --sources is given; the destination stays a single one).
     let mut scheduler = segments.map(|segs| SwitchScheduler::new(cli, segs, start));
 
-    // WAV ライター。チャンクは貯め込まず到着次第書く（分割境界で即 finalize するため。
-    // 長時間録音でメモリも溜めない）。--split-seconds 0 なら従来どおり --out へ 1 ファイル、
-    // 1 以上なら連番ファイルへローテーションする。ピーク / RMS は録音全体で通算する。
+    // WAV writer. Chunks are written as they arrive instead of being accumulated (so a file can
+    // be finalized immediately at a split boundary; it also avoids piling up memory in long
+    // recordings). With --split-seconds 0 it writes a single file to --out as before; with 1 or
+    // more it rotates through numbered files. Peak / RMS are accumulated over the whole
+    // recording.
     let mut writer = RotatingWavWriter::new(&cli.out, output, cli.split_seconds);
     let mut chunk_count: u64 = 0;
 
-    // 総録音時間ぶん poll_chunk をループして全チャンクを書き切る。
+    // Loop poll_chunk for the total recording time and write out every chunk.
     let deadline = start + total;
     while Instant::now() < deadline {
-        // セグメント境界に達していればソースを切り替える（書く先のローテーションとは独立）。
+        // If a segment boundary has been reached, switch the source (independent of rotating
+        // the file being written).
         if let Some(sch) = scheduler.as_mut() {
             sch.tick(stream, Instant::now());
         }
@@ -905,12 +955,12 @@ fn run_wav(
                 return Err(e);
             }
         }
-        // poll_event は表示用に消化（イベントがあれば出す）。
+        // Drain poll_event for display (print any events).
         while let Some(ev) = stream.poll_event() {
-            println!("  イベント: {ev:?}");
+            println!("  event: {ev:?}");
         }
         if !got_any {
-            // チャンク 1 つ ≈ 20ms。空転を避けて適度に眠る。
+            // One chunk ≈ 20ms. Sleep moderately to avoid spinning.
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -918,26 +968,28 @@ fn run_wav(
     let dropped = stream.dropped_chunks();
     stream.stop();
 
-    // stop 後にもリングへ残ったチャンクを書き切る（取りこぼしゼロ）。
+    // Write out the chunks still left in the ring after stop too (zero drops).
     while let Some(chunk) = stream.poll_chunk() {
         chunk_count += 1;
         write_wav_chunk(&mut writer, &chunk)?;
     }
 
-    // チャンクが 1 つも来なくても録音自体は走ったので失敗にはしない。空の WAV を書き出して
-    // 警告だけ出す（ソースが無音・除外・選んだエンドポイントが非アクティブ等で起こる）。
+    // Even if no chunk arrived, the recording itself ran, so this is not a failure. Write an
+    // empty WAV and only print a warning (this happens when the source is silent or excluded,
+    // the selected endpoint is inactive, etc.).
     if chunk_count == 0 {
         eprintln!(
-            "警告: 音声を取得できませんでした（ソースが無音・除外・選んだエンドポイントが\
-             非アクティブ等の可能性）。空の WAV を書き出します。"
+            "warning: could not capture any audio (the source may be silent or excluded, or \
+             the selected endpoint may be inactive). Writing an empty WAV."
         );
     }
 
-    // 書き終わり。開いているファイルの WAV ヘッダを確定し、録音全体のピーク / RMS を得る。
-    // WAV は現状 s16 固定（f32 WAV が要るなら encoding を WAV 出力にも適用できる）。
+    // Done writing. Finalize the WAV header of the open file and get the peak / RMS of the
+    // whole recording. WAV is currently fixed to s16 (if an f32 WAV is needed, the encoding
+    // could also be applied to WAV output).
     let summary = writer
         .finish()
-        .map_err(|e| format!("WAV 書き出し失敗: {e}"))?;
+        .map_err(|e| format!("failed to write WAV: {e}"))?;
     let total_frames = summary.total_frames;
     let stats = summary.stats;
 
@@ -954,28 +1006,29 @@ fn run_wav(
     };
 
     println!();
-    println!("=== 結果 ===");
-    println!("取得チャンク数     : {chunk_count}");
-    println!("総フレーム数       : {total_frames}");
-    println!("録れた秒数         : {captured_secs:.3} 秒");
-    println!("ドロップチャンク数 : {dropped}");
+    println!("=== Result ===");
+    println!("Chunks received    : {chunk_count}");
+    println!("Total frames       : {total_frames}");
+    println!("Seconds captured   : {captured_secs:.3} s");
+    println!("Dropped chunks     : {dropped}");
     println!(
-        "ピーク             : {:.4}（{}）",
+        "Peak               : {:.4} ({})",
         stats.peak,
         fmt_dbfs(peak_dbfs)
     );
     println!(
-        "RMS                : {:.6}（{}）",
+        "RMS                : {:.6} ({})",
         stats.rms,
         fmt_dbfs(rms_dbfs)
     );
-    // 分割録音で複数ファイルになったときは先頭〜末尾の連番で示す（finish は最低 1 ファイル
-    // を保証するので files は非空）。1 ファイルなら従来どおりパスをそのまま出す。
+    // When split recording produced multiple files, show the first to last numbered names
+    // (finish guarantees at least 1 file, so files is non-empty). For a single file, print the
+    // path as before.
     if summary.files.len() == 1 {
-        println!("WAV 書き出し       : {}", summary.files[0].display());
+        println!("WAV written        : {}", summary.files[0].display());
     } else {
         println!(
-            "WAV 書き出し       : {} 〜 {}（{} ファイル・{} 秒毎に分割）",
+            "WAV written        : {} to {} ({} files, split every {} s)",
             summary.files[0].display(),
             summary.files[summary.files.len() - 1].display(),
             summary.files.len(),
@@ -983,54 +1036,59 @@ fn run_wav(
         );
     }
 
-    // チャンクは来たが中身がほぼ無音（peak/RMS がほぼ 0）なら、空 WAV のときと同じ趣旨で
-    // 警告する。OS 差で無音フレームが流れる場合（無音 WAV になる）にも「無音だった」と
-    // 分かるようにする。無音判定は録音全体（全ファイル通算）の統計で行う。
+    // If chunks arrived but their content is nearly silent (peak/RMS nearly 0), warn in the same
+    // spirit as for an empty WAV. This makes it clear that "it was silent" also when silent
+    // frames flow due to OS differences (resulting in a silent WAV). Silence is judged on the
+    // statistics of the whole recording (all files combined).
     if chunk_count > 0 && stats.peak < SILENCE_PEAK && stats.rms < SILENCE_RMS {
         eprintln!(
-            "警告: 音声を取得できませんでした（ソースが無音・除外・選んだエンドポイントが\
-             非アクティブ等の可能性）。録音はほぼ無音です。"
+            "warning: could not capture any audio (the source may be silent or excluded, or \
+             the selected endpoint may be inactive). The recording is nearly silent."
         );
     }
 
     Ok(())
 }
 
-/// 「ほぼ無音」と判定するピーク / RMS（線形）のしきい値。これ未満なら無音扱いで警告する。
-/// -60 dBFS 付近を目安にした緩いしきい値（厳密な値ではない）。
+/// Peak / RMS (linear) thresholds for judging "nearly silent". Below these it is treated as
+/// silence and a warning is printed. A loose threshold aimed at around -60 dBFS (not an exact
+/// value).
 const SILENCE_PEAK: f32 = 1.0e-3;
 const SILENCE_RMS: f64 = 1.0e-4;
 
-/// stdout raw PCM ストリーミング経路。
+/// stdout raw PCM streaming path.
 ///
-/// チャンク到着次第すぐ stdout へ書き、各回 flush して溜め込まない（低レイテンシ）。
-/// `--seconds 0` なら無限（Ctrl-C / パイプ切れ `BrokenPipe` で正常停止）、
-/// `--seconds N>0` なら N 秒で停止。どちらも stop 後にリング残チャンクを出し切る。
+/// Chunks are written to stdout as soon as they arrive and flushed each time, without
+/// accumulating (low latency). With `--seconds 0` it runs forever (stopped normally by Ctrl-C /
+/// a broken pipe `BrokenPipe`); with `--seconds N>0` it stops after N seconds. In both cases the
+/// chunks left in the ring are flushed out after stop.
 fn run_stdout_stream(
     cli: &Cli,
     stream: &mut Stream,
     segments: Option<&[Segment]>,
 ) -> std::result::Result<(), String> {
-    // --sources 指定時はセグメント総和ぶんの有限録音（--seconds は上書き）。
+    // When --sources is given, it is a finite recording of the sum of the segments (--seconds is
+    // overridden).
     let infinite = segments.is_none() && cli.seconds == 0;
 
-    // Ctrl-C(SIGINT) フラグ。無限時に押されたら停止する。ctrlc は重複登録で Err を返すので
-    // 無限時のみ登録する。
+    // Ctrl-C (SIGINT) flag. Stops when pressed in infinite mode. ctrlc returns Err on duplicate
+    // registration, so it is registered only in infinite mode.
     let running = Arc::new(AtomicBool::new(true));
     if infinite {
         let r = running.clone();
         ctrlc::set_handler(move || {
             r.store(false, Ordering::SeqCst);
         })
-        .map_err(|e| format!("Ctrl-C ハンドラの登録に失敗しました: {e}"))?;
+        .map_err(|e| format!("failed to register the Ctrl-C handler: {e}"))?;
     }
 
-    // stdout をロックして BufWriter で包む。チャンクごとに flush するので溜め込みは無い。
+    // Lock stdout and wrap it in a BufWriter. It is flushed per chunk, so nothing accumulates.
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
 
     let start = Instant::now();
-    // 有限録音の deadline: --sources 指定時はセグメント総和、無ければ --seconds。
+    // Deadline of a finite recording: the sum of the segments when --sources is given,
+    // otherwise --seconds.
     let deadline = if infinite {
         None
     } else {
@@ -1040,15 +1098,15 @@ fn run_stdout_stream(
         };
         Some(start + dur)
     };
-    // ホットスワップスケジューラ（--sources 指定時のみ・stdout は 1 パイプのまま）。
+    // Hot-swap scheduler (only when --sources is given; stdout stays a single pipe).
     let mut scheduler = segments.map(|segs| SwitchScheduler::new(cli, segs, start));
 
     let mut wrote_any = false;
     let mut broken_pipe = false;
 
-    // メインループ: ポーリングしてチャンクを stdout へ流す。
+    // Main loop: poll and stream chunks to stdout.
     'outer: loop {
-        // 停止条件チェック（無限時は Ctrl-C、有限時は deadline）。
+        // Check the stop condition (Ctrl-C in infinite mode, the deadline in finite mode).
         if infinite {
             if !running.load(Ordering::SeqCst) {
                 break;
@@ -1059,7 +1117,8 @@ fn run_stdout_stream(
             }
         }
 
-        // セグメント境界に達していればソースを切り替える（出力先は同じ 1 パイプ）。
+        // If a segment boundary has been reached, switch the source (the destination stays the
+        // same single pipe).
         if let Some(sch) = scheduler.as_mut() {
             sch.tick(stream, Instant::now());
         }
@@ -1070,21 +1129,21 @@ fn run_stdout_stream(
             match write_chunk(&mut out, &chunk, cli.encoding) {
                 Ok(()) => wrote_any = true,
                 Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                    // 受け手が閉じた（| head 等）。エラーにせず正常停止へ。
+                    // The receiver closed (| head etc.). Not an error; go to a normal stop.
                     broken_pipe = true;
                     break 'outer;
                 }
-                Err(e) => return Err(format!("stdout への書き込みに失敗しました: {e}")),
+                Err(e) => return Err(format!("failed to write to stdout: {e}")),
             }
         }
 
-        // イベントは stderr へ（stdout は PCM 専用）。
+        // Events go to stderr (stdout is for PCM only).
         while let Some(ev) = stream.poll_event() {
-            eprintln!("  イベント: {ev:?}");
+            eprintln!("  event: {ev:?}");
         }
 
         if !got_any {
-            // チャンク 1 つ ≈ 20ms。空転を避けて適度に眠る。
+            // One chunk ≈ 20ms. Sleep moderately to avoid spinning.
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -1092,7 +1151,7 @@ fn run_stdout_stream(
     let dropped = stream.dropped_chunks();
     stream.stop();
 
-    // stop 後にもリングへ残ったチャンクを出し切る（パイプ切れ後はスキップ）。
+    // Flush out the chunks still left in the ring after stop too (skipped after a broken pipe).
     if !broken_pipe {
         while let Some(chunk) = stream.poll_chunk() {
             match write_chunk(&mut out, &chunk, cli.encoding) {
@@ -1101,54 +1160,52 @@ fn run_stdout_stream(
                     broken_pipe = true;
                     break;
                 }
-                Err(e) => return Err(format!("stdout への書き込みに失敗しました: {e}")),
+                Err(e) => return Err(format!("failed to write to stdout: {e}")),
             }
         }
     }
 
-    // 最終 flush。パイプ切れはここでも正常扱い。
+    // Final flush. A broken pipe is treated as normal here too.
     if !broken_pipe {
         if let Err(e) = out.flush() {
             if e.kind() != io::ErrorKind::BrokenPipe {
-                return Err(format!("stdout の flush に失敗しました: {e}"));
+                return Err(format!("failed to flush stdout: {e}"));
             }
             broken_pipe = true;
         }
     }
 
-    // --- サマリ（stderr） ---
+    // --- Summary (stderr) ---
     eprintln!();
-    eprintln!("=== 結果（stderr） ===");
+    eprintln!("=== Result (stderr) ===");
     if broken_pipe {
-        eprintln!("停止理由           : 受け手がパイプを閉じました（正常終了）");
+        eprintln!("Stop reason        : the receiver closed the pipe (normal exit)");
     } else if infinite {
-        eprintln!("停止理由           : Ctrl-C（正常終了）");
+        eprintln!("Stop reason        : Ctrl-C (normal exit)");
     } else {
-        eprintln!("停止理由           : {} 秒経過", cli.seconds);
+        eprintln!("Stop reason        : {} s elapsed", cli.seconds);
     }
-    eprintln!("ドロップチャンク数 : {dropped}");
+    eprintln!("Dropped chunks     : {dropped}");
 
-    // パイプ切れ・Ctrl-C は「受け手都合の停止」なので、サンプル 0 でもエラーにしない。
-    // 有限秒指定で素直に終わったのに 1 サンプルも出ていない場合だけ警告する。
+    // A broken pipe or Ctrl-C is "a stop for the receiver's reasons", so zero samples is not an
+    // error. Warn only when a finite duration ended normally and not a single sample came out.
     if !wrote_any && !broken_pipe && !infinite {
-        return Err(
-            "チャンクを 1 つも取得できませんでした。\
-             デバイスは開けましたがサンプルが流れていません（ミュート/権限等を確認してください）。"
-                .into(),
-        );
+        return Err("could not get a single chunk. \
+             The device opened, but no samples are flowing (check mute/permissions etc.)."
+            .into());
     }
 
     Ok(())
 }
 
-/// 1 チャンクの interleaved f32 を指定 encoding で `out` へ書く（little-endian）。
+/// Writes one chunk of interleaved f32 to `out` in the given encoding (little-endian).
 ///
-/// サンプル単位の小書き込みを避けるため、チャンク分のバイト列をまとめてから 1 回の
-/// `write_all` で出す。書き込み後すぐ flush する（低レイテンシ・溜め込み無し）。
+/// To avoid small per-sample writes, the chunk's bytes are assembled first and emitted with a
+/// single `write_all`. It flushes right after writing (low latency, no accumulation).
 fn write_chunk<W: Write>(out: &mut W, chunk: &AudioChunk, encoding: EncodingArg) -> io::Result<()> {
     match encoding {
         EncodingArg::F32 => {
-            // f32 LE: 契約そのまま。1 サンプル 4 byte。
+            // f32 LE: the contract as is. 4 bytes per sample.
             let mut buf = Vec::with_capacity(chunk.data.len() * 4);
             for &x in &chunk.data {
                 buf.extend_from_slice(&x.to_le_bytes());
@@ -1156,8 +1213,9 @@ fn write_chunk<W: Write>(out: &mut W, chunk: &AudioChunk, encoding: EncodingArg)
             out.write_all(&buf)?;
         }
         EncodingArg::S16 => {
-            // s16 LE: 量子化は全層共通の正典 [`flexaudio::core::quantize_i16`]
-            // （scale 32768・round・clamp・NaN→0）。1 サンプル 2 byte。
+            // s16 LE: quantization is the canonical one shared by all layers,
+            // [`flexaudio::core::quantize_i16`] (scale 32768, round, clamp, NaN→0). 2 bytes per
+            // sample.
             let mut buf = Vec::with_capacity(chunk.data.len() * 2);
             for &x in &chunk.data {
                 let s = flexaudio::core::quantize_i16(x);
@@ -1166,23 +1224,24 @@ fn write_chunk<W: Write>(out: &mut W, chunk: &AudioChunk, encoding: EncodingArg)
             out.write_all(&buf)?;
         }
     }
-    // 届いたら即出す。BufWriter に溜め込まない。
+    // Emit as soon as it arrives. Do not accumulate in the BufWriter.
     out.flush()
 }
 
-/// WAV 書き出しと同時に計算する信号統計。
+/// Signal statistics computed while writing the WAV.
 struct Stats {
-    /// 全サンプルの絶対値の最大（線形 0.0..=1.0 目安）。
+    /// Maximum absolute value over all samples (linear, roughly 0.0..=1.0).
     peak: f32,
-    /// 全サンプルの二乗平均平方根（線形）。
+    /// Root mean square over all samples (linear).
     rms: f64,
 }
 
-/// 分割録音の `index` 番目（1 始まり）のファイルパスを作る（純関数）。
+/// Builds the file path of the `index`-th (1-based) file of a split recording (pure function).
 ///
-/// `rec.wav` なら `rec-001.wav, rec-002.wav, ...` のように拡張子の前へ 3 桁ゼロ詰め
-/// 連番を挟む。1000 ファイル目以降は桁が自然に増える（`rec-1000.wav`）。拡張子が無い
-/// パス（`rec`）は末尾に連番を足す（`rec-001`）。親ディレクトリは保たれる。
+/// For `rec.wav` it inserts a 3-digit zero-padded number before the extension, as in
+/// `rec-001.wav, rec-002.wav, ...`. From the 1000th file on the number simply gets more digits
+/// (`rec-1000.wav`). A path without an extension (`rec`) gets the number appended at the end
+/// (`rec-001`). The parent directory is preserved.
 fn split_file_path(base: &Path, index: u64) -> PathBuf {
     let stem = base
         .file_stem()
@@ -1195,56 +1254,61 @@ fn split_file_path(base: &Path, index: u64) -> PathBuf {
     base.with_file_name(name)
 }
 
-/// 録音終了時のまとめ（書き出したファイル一覧・総フレーム数・録音全体の統計）。
+/// Summary at the end of recording (list of written files, total frame count, statistics of the
+/// whole recording).
 struct WavSummary {
-    /// 書き出したファイルのパス（書いた順・最低 1 つ）。
+    /// Paths of the written files (in write order, at least 1).
     files: Vec<PathBuf>,
-    /// 全ファイル合計の総フレーム数。
+    /// Total frame count over all files.
     total_frames: u64,
-    /// 録音全体（全ファイル通算）のピーク / RMS。
+    /// Peak / RMS of the whole recording (all files combined).
     stats: Stats,
 }
 
-/// WAV 書き出しの分割（ローテーション）を担う小さなライター。
+/// Small writer responsible for splitting (rotating) WAV output.
 ///
-/// `--split-seconds 0`（分割なし）では `--out` のパスへ従来どおり 1 ファイルを書く。
-/// 1 以上では [`split_file_path`] の連番パスへ書き、書き込んだフレーム数が
-/// `split_seconds × 出力サンプルレート` に達するたびに現在のファイルを finalize
-/// （WAV ヘッダ確定）して閉じ、次のチャンクから次ファイルへ書く。境界はチャンク粒度
-/// （20ms）の「以上になったら次へ」なので、各ファイルは指定秒より最大 1 チャンク
-/// 長くなりうる（チャンクは分割せず、取りこぼしも無い）。
+/// With `--split-seconds 0` (no splitting) it writes a single file to the `--out` path as
+/// before. With 1 or more it writes to the numbered paths of [`split_file_path`], and each time
+/// the frames written reach `split_seconds × output sample rate` it finalizes (WAV header
+/// finalized) and closes the current file, then writes to the next file from the next chunk
+/// on. The boundary has chunk granularity (20ms), "move to the next file once reached or
+/// exceeded", so each file can be up to 1 chunk longer than specified (chunks are never split
+/// and nothing is dropped).
 ///
-/// ファイルは次のチャンクが来るまで開かない（遅延生成）ので、録音がちょうど境界で
-/// 終わっても空の末尾ファイルは残らない。ピーク / RMS は録音全体（全ファイル通算）で
-/// 集計する（従来の単一ファイル時と同じ意味の統計・無音警告を保つため）。
-/// 量子化は全層共通の正典 [`flexaudio::core::quantize_i16`]（scale 32768・round・clamp）の
-/// 16-bit PCM 固定。
+/// A file is not opened until the next chunk arrives (lazy creation), so even if the recording
+/// ends exactly on a boundary no empty trailing file is left behind. Peak / RMS are aggregated
+/// over the whole recording (all files combined) (to keep the statistics and the silence
+/// warning meaning the same as with the original single file).
+/// Quantization is fixed to 16-bit PCM using the canonical one shared by all layers,
+/// [`flexaudio::core::quantize_i16`] (scale 32768, round, clamp).
 struct RotatingWavWriter {
-    /// `--out` のベースパス（分割時は連番の元、分割なしはこのまま使う）。
+    /// Base path of `--out` (the basis of the numbered names when splitting; used as is when
+    /// not splitting).
     base: PathBuf,
-    /// WAV ヘッダ仕様（出力フォーマット追従・16-bit PCM 固定）。
+    /// WAV header spec (follows the output format, fixed to 16-bit PCM).
     spec: hound::WavSpec,
-    /// 1 ファイルあたりのフレーム数しきい値（split_seconds × rate）。0 = 分割なし。
+    /// Frame-count threshold per file (split_seconds × rate). 0 = no splitting.
     frames_per_file: u64,
-    /// 現在書き込み中のライター（遅延生成。ローテーション直後や書き込み前は None）。
+    /// Writer currently being written to (lazily created. None right after a rotation or
+    /// before anything is written).
     writer: Option<hound::WavWriter<BufWriter<File>>>,
-    /// 現在のファイルへ書き込んだフレーム数（ローテーションで 0 に戻る）。
+    /// Frames written to the current file (reset to 0 on rotation).
     frames_in_current: u64,
-    /// これまでに書き始めたファイルのパス（書いた順）。
+    /// Paths of the files started so far (in write order).
     files: Vec<PathBuf>,
-    /// 録音全体のピーク（線形絶対値の最大）。
+    /// Peak of the whole recording (maximum linear absolute value).
     peak: f32,
-    /// 録音全体の二乗和（RMS 計算用）。
+    /// Sum of squares over the whole recording (for computing RMS).
     sum_sq: f64,
-    /// 録音全体のサンプル数（RMS 計算用）。
+    /// Sample count over the whole recording (for computing RMS).
     samples: u64,
-    /// 全ファイル合計の総フレーム数。
+    /// Total frame count over all files.
     total_frames: u64,
 }
 
 impl RotatingWavWriter {
-    /// ベースパス・出力フォーマット・分割秒数（0 = 分割なし）からライターを作る。
-    /// この時点ではファイルを開かない（最初のチャンクで開く）。
+    /// Creates the writer from the base path, the output format and the split seconds (0 = no
+    /// splitting). No file is opened at this point (it is opened on the first chunk).
     fn new(out: &Path, output: OutputFormat, split_seconds: u64) -> Self {
         let spec = hound::WavSpec {
             channels: output.channels,
@@ -1266,12 +1330,13 @@ impl RotatingWavWriter {
         }
     }
 
-    /// 分割録音か（`--split-seconds` が 1 以上か）。
+    /// Whether this is a split recording (whether `--split-seconds` is 1 or more).
     fn is_split(&self) -> bool {
         self.frames_per_file > 0
     }
 
-    /// 次に開くファイルのパス。分割なしはベースパスそのまま、分割ありは 1 始まり連番。
+    /// Path of the next file to open. Without splitting it is the base path as is; with
+    /// splitting it is a 1-based number.
     fn next_path(&self) -> PathBuf {
         if self.is_split() {
             split_file_path(&self.base, self.files.len() as u64 + 1)
@@ -1280,20 +1345,21 @@ impl RotatingWavWriter {
         }
     }
 
-    /// 1 チャンクを書く。チャンクは丸ごと現在のファイルへ入れ（分割しない）、書き込み後に
-    /// フレーム数がしきい値以上ならその場で finalize して次ファイルへローテーションする
-    /// （次のチャンクが新しいファイルの先頭になる）。finalize したファイルのパスを返す
-    /// （ローテーションの進捗表示用。ローテーションしなければ None）。
+    /// Writes one chunk. The chunk goes into the current file whole (it is not split), and if
+    /// after writing the frame count has reached the threshold, the file is finalized right
+    /// away and rotation moves to the next file (the next chunk becomes the head of the new
+    /// file). Returns the path of the finalized file (for rotation progress display; None if no
+    /// rotation happened).
     fn write_chunk(&mut self, chunk: &AudioChunk) -> hound::Result<Option<PathBuf>> {
-        // ファイルはチャンクが来た時点で開く（遅延生成）。
+        // The file is opened when a chunk arrives (lazy creation).
         if self.writer.is_none() {
             let path = self.next_path();
             self.writer = Some(hound::WavWriter::create(&path, self.spec)?);
             self.files.push(path);
         }
-        let writer = self.writer.as_mut().expect("直前で開いている");
+        let writer = self.writer.as_mut().expect("opened just above");
         for &x in &chunk.data {
-            // 統計は録音全体（全ファイル通算）で集計する。
+            // Statistics are aggregated over the whole recording (all files combined).
             let a = x.abs();
             if a > self.peak {
                 self.peak = a;
@@ -1307,9 +1373,10 @@ impl RotatingWavWriter {
         self.frames_in_current += chunk.frames as u64;
         self.total_frames += chunk.frames as u64;
 
-        // 分割境界: しきい値「以上」に達したら即 finalize（±1 チャンクの誤差は仕様どおり）。
+        // Split boundary: finalize immediately once the threshold is "reached or exceeded"
+        // (the ±1 chunk error is as specified).
         if self.is_split() && self.frames_in_current >= self.frames_per_file {
-            let writer = self.writer.take().expect("上で書いたばかり");
+            let writer = self.writer.take().expect("just written above");
             writer.finalize()?;
             self.frames_in_current = 0;
             return Ok(self.files.last().cloned());
@@ -1317,14 +1384,15 @@ impl RotatingWavWriter {
         Ok(None)
     }
 
-    /// 録音終了。開いているファイルの WAV ヘッダを確定する。チャンクが 1 つも来なかった
-    /// 場合は従来どおり空 WAV を 1 つ書く（分割ありなら連番 1 番）ので、返る `files` は
-    /// 最低 1 つ。全体統計と総フレーム数も返す。
+    /// End of recording. Finalizes the WAV header of the open file. If no chunk arrived at all,
+    /// it writes one empty WAV as before (number 1 when splitting), so the returned `files` has
+    /// at least 1 entry. Also returns the overall statistics and the total frame count.
     fn finish(mut self) -> hound::Result<WavSummary> {
         if let Some(writer) = self.writer.take() {
             writer.finalize()?;
         } else if self.files.is_empty() {
-            // 1 チャンクも来なかった。録音自体は走った証跡として空 WAV を残す（従来挙動）。
+            // Not a single chunk arrived. Leave an empty WAV as evidence that the recording
+            // itself ran (the original behavior).
             let path = self.next_path();
             hound::WavWriter::create(&path, self.spec)?.finalize()?;
             self.files.push(path);
@@ -1345,8 +1413,8 @@ impl RotatingWavWriter {
     }
 }
 
-/// `run_wav` の 1 チャンク書き込み。ローテーションが起きたら `[switch]` と同じ調子で
-/// stderr に進捗を出し、書き込みエラーは人間向けメッセージへ変換する。
+/// Writes one chunk for `run_wav`. When a rotation happens it prints progress to stderr in the
+/// same style as `[switch]`, and converts write errors into human-readable messages.
 fn write_wav_chunk(
     writer: &mut RotatingWavWriter,
     chunk: &AudioChunk,
@@ -1354,40 +1422,43 @@ fn write_wav_chunk(
     match writer.write_chunk(chunk) {
         Ok(Some(done)) => {
             eprintln!(
-                "[split] {} を確定（次のチャンクから次ファイル）",
+                "[split] finalized {} (the next file starts with the next chunk)",
                 done.display()
             );
             Ok(())
         }
         Ok(None) => Ok(()),
-        Err(e) => Err(format!("WAV 書き出し失敗: {e}")),
+        Err(e) => Err(format!("failed to write WAV: {e}")),
     }
 }
 
-/// dBFS を読みやすく整形する（無音時は `-inf dBFS`）。
+/// Formats dBFS for readability (`-inf dBFS` when silent).
 fn fmt_dbfs(db: f64) -> String {
     if db.is_finite() {
         format!("{db:.1} dBFS")
     } else {
-        "-inf dBFS（無音）".into()
+        "-inf dBFS (silence)".into()
     }
 }
 
-/// `flexaudio` の [`Error`] を人間向けメッセージへ変換する。
+/// Converts a `flexaudio` [`Error`] into a human-readable message.
 ///
-/// デバイス不在（`DeviceNotFound`）は実機での実行を促す案内に置き換える。
+/// A missing device (`DeviceNotFound`) is replaced with guidance that prompts running on real
+/// hardware.
 fn describe_error(err: Error) -> String {
     match err {
         Error::DeviceNotFound => {
-            "指定したデバイス／エンドポイントが見つかりません。`--list-devices` の ID を\
-             確認してください。"
+            "The specified device/endpoint was not found. Check the ID shown by \
+             `--list-devices`."
                 .into()
         }
         Error::PermissionDenied => {
-            "マイクへのアクセス権限がありません。OS のマイク権限設定を確認してください。".into()
+            "No permission to access the microphone. Check the OS microphone permission \
+             settings."
+                .into()
         }
-        Error::DeviceLost => "キャプチャ中に入力デバイスが失われました（切断など）。".into(),
-        other => format!("ストリーム初期化に失敗しました: {other}"),
+        Error::DeviceLost => "The input device was lost during capture (e.g. disconnected).".into(),
+        other => format!("Failed to initialize the stream: {other}"),
     }
 }
 
@@ -1395,7 +1466,8 @@ fn describe_error(err: Error) -> String {
 mod tests {
     use super::*;
 
-    /// CLI 引数列から `Cli` を組む（clap 経由）。最低限 `flexaudio-cli` を先頭に置く。
+    /// Builds a `Cli` from a CLI argument list (via clap). `flexaudio-cli` is put first as the
+    /// minimum.
     fn cli_from(args: &[&str]) -> Cli {
         let mut full = vec!["flexaudio-cli"];
         full.extend_from_slice(args);
@@ -1404,7 +1476,7 @@ mod tests {
 
     // --- parse_sources ---
 
-    /// `mic:2,system:2,process:2` を 3 セグメント（kind + secs）へ正しくパースする。
+    /// `mic:2,system:2,process:2` is parsed correctly into 3 segments (kind + secs).
     #[test]
     fn parse_sources_three_segments() {
         let segs = parse_sources("mic:2,system:2,process:2").expect("valid spec");
@@ -1415,7 +1487,7 @@ mod tests {
         assert_eq!(segs[2].kind, SourceKind::ProcessLoopback);
     }
 
-    /// 空白や異なる秒数も許容し、trim される。
+    /// Whitespace and different seconds are accepted, and trimmed.
     #[test]
     fn parse_sources_trims_and_varies_secs() {
         let segs = parse_sources(" mic:1 , system:5 ").expect("valid spec");
@@ -1426,7 +1498,7 @@ mod tests {
         assert_eq!(segs[1].secs, 5);
     }
 
-    /// 単一セグメントも有効。
+    /// A single segment is also valid.
     #[test]
     fn parse_sources_single_segment() {
         let segs = parse_sources("mic:3").expect("valid");
@@ -1435,37 +1507,37 @@ mod tests {
         assert_eq!(segs[0].secs, 3);
     }
 
-    /// 空文字列はエラー（空 spec）。
+    /// An empty string is an error (empty spec).
     #[test]
     fn parse_sources_rejects_empty_string() {
         assert!(parse_sources("").is_err());
     }
 
-    /// 空セグメント（連続カンマ）はエラー。
+    /// An empty segment (consecutive commas) is an error.
     #[test]
     fn parse_sources_rejects_empty_segment() {
         assert!(parse_sources("mic:2,,system:2").is_err());
     }
 
-    /// `<src>:<secs>` 形式でない（コロン無し）はエラー。
+    /// Not in the `<src>:<secs>` form (no colon) is an error.
     #[test]
     fn parse_sources_rejects_missing_colon() {
         assert!(parse_sources("mic2").is_err());
     }
 
-    /// 未知のソース名はエラー。
+    /// An unknown source name is an error.
     #[test]
     fn parse_sources_rejects_unknown_source() {
         assert!(parse_sources("foo:2").is_err());
     }
 
-    /// 秒数が非数値はエラー。
+    /// Non-numeric seconds are an error.
     #[test]
     fn parse_sources_rejects_non_numeric_secs() {
         assert!(parse_sources("mic:abc").is_err());
     }
 
-    /// 秒数 0 はエラー（1 以上必須）。
+    /// Zero seconds is an error (1 or more required).
     #[test]
     fn parse_sources_rejects_zero_secs() {
         assert!(parse_sources("mic:0").is_err());
@@ -1473,8 +1545,8 @@ mod tests {
 
     // --- config_for_kind ---
 
-    /// `config_for_kind` が CLI 共有設定（output / pid / mode / exclude_self / device_id）を
-    /// StreamConfig へ正しく反映し、kind を引数で上書きする。
+    /// `config_for_kind` correctly reflects the CLI's shared settings (output / pid / mode /
+    /// exclude_self / device_id) in the StreamConfig, and overrides kind with the argument.
     #[test]
     fn config_for_kind_reflects_cli_settings() {
         let cli = cli_from(&[
@@ -1501,25 +1573,26 @@ mod tests {
         assert_eq!(cfg.output.channels, 1);
         assert_eq!(cfg.device_id.as_deref(), Some("my-mic"));
         assert_eq!(cfg.gain, 2.5);
-        // kind は引数で上書きされる（CLI の --source とは独立に指定できる）。
+        // kind is overridden by the argument (it can be given independently of the CLI's
+        // --source).
         let cfg_mic = config_for_kind(&cli, SourceKind::Mic);
         assert_eq!(cfg_mic.kind, SourceKind::Mic);
-        // 他の共有設定は据え置き。
+        // The other shared settings are left as they are.
         assert_eq!(cfg_mic.output.sample_rate, 16_000);
     }
 
-    /// `--exclude-self` が StreamConfig.exclude_self に反映される。
+    /// `--exclude-self` is reflected in StreamConfig.exclude_self.
     #[test]
     fn config_for_kind_reflects_exclude_self() {
         let cli = cli_from(&["--source", "system", "--exclude-self"]);
         let cfg = config_for_kind(&cli, SourceKind::SystemLoopback);
         assert!(cfg.exclude_self);
-        // 既定（未指定）は false。
+        // The default (not given) is false.
         let cli2 = cli_from(&["--source", "system"]);
         assert!(!config_for_kind(&cli2, SourceKind::SystemLoopback).exclude_self);
     }
 
-    /// 既定 CLI（引数最小）は output {48000,2} / mode Include / pid None になる。
+    /// The default CLI (minimal arguments) gives output {48000,2} / mode Include / pid None.
     #[test]
     fn config_for_kind_defaults() {
         let cli = cli_from(&[]);
@@ -1533,7 +1606,7 @@ mod tests {
         assert_eq!(cfg.gain, 1.0);
     }
 
-    /// `Cli::output_format` / `is_stdout_stream` の基本動作。
+    /// Basic behavior of `Cli::output_format` / `is_stdout_stream`.
     #[test]
     fn cli_output_format_and_stdout_detection() {
         let cli = cli_from(&["--output-rate", "8000", "--output-channels", "1"]);
@@ -1548,31 +1621,32 @@ mod tests {
 
     // --- describe_error ---
 
-    /// 主要な Error バリアントが人間向け文言へ変換される（種別ごとに分岐）。
+    /// The main Error variants are converted into human-readable wording (branching per kind).
     #[test]
     fn describe_error_maps_known_variants() {
-        assert!(describe_error(Error::DeviceNotFound).contains("見つかりません"));
-        assert!(describe_error(Error::PermissionDenied).contains("権限"));
-        assert!(describe_error(Error::DeviceLost).contains("失われました"));
-        // その他は汎用文言 + Display を含む。
+        assert!(describe_error(Error::DeviceNotFound).contains("not found"));
+        assert!(describe_error(Error::PermissionDenied).contains("permission"));
+        assert!(describe_error(Error::DeviceLost).contains("lost"));
+        // Everything else includes the generic wording + Display.
         let msg = describe_error(Error::Unsupported);
-        assert!(msg.contains("ストリーム初期化に失敗しました"));
+        assert!(msg.contains("Failed to initialize the stream"));
     }
 
-    /// DeviceNotFound の文言は source 非依存（mic 前提の語を含まない）。system や process で
-    /// 不正な device-id を指定したときにも適切な案内になる。
+    /// The DeviceNotFound wording is source-neutral (it contains no words that assume mic).
+    /// It is also appropriate guidance when an invalid device-id is given for system or
+    /// process.
     #[test]
     fn describe_error_device_not_found_is_source_neutral() {
         let msg = describe_error(Error::DeviceNotFound);
-        assert!(!msg.contains("マイク"));
-        assert!(!msg.contains("入力デバイス"));
-        // ID の確認を促す案内になっている。
+        assert!(!msg.contains("microphone"));
+        assert!(!msg.contains("input device"));
+        // It is guidance that prompts checking the ID.
         assert!(msg.contains("--list-devices"));
     }
 
     // --- source_kind_label / truncate ---
 
-    /// ラベルは短い英語識別子。
+    /// Labels are short English identifiers.
     #[test]
     fn source_kind_label_is_short() {
         assert_eq!(source_kind_label(SourceKind::Mic), "mic");
@@ -1581,8 +1655,8 @@ mod tests {
         assert_eq!(source_kind_label(SourceKind::Mix), "mix");
     }
 
-    /// mix 用フラグ（--mic-device-id / --system-device-id / --mic-gain / --system-gain）
-    /// が StreamConfig の mix_* フィールドへ反映される。既定は None / 1.0。
+    /// The mix flags (--mic-device-id / --system-device-id / --mic-gain / --system-gain)
+    /// are reflected in the mix_* fields of StreamConfig. The defaults are None / 1.0.
     #[test]
     fn config_for_kind_reflects_mix_settings() {
         let cli = cli_from(&[
@@ -1604,7 +1678,7 @@ mod tests {
         assert_eq!(cfg.mix_mic_gain, 0.5);
         assert_eq!(cfg.mix_system_gain, 2.0);
 
-        // 未指定なら既定（デバイス None・側別ゲイン 1.0）。
+        // If not given, the defaults (device None, per-side gain 1.0).
         let cli2 = cli_from(&["--source", "mix"]);
         let cfg2 = config_for_kind(&cli2, SourceKind::Mix);
         assert_eq!(cfg2.mix_mic_device_id, None);
@@ -1613,18 +1687,19 @@ mod tests {
         assert_eq!(cfg2.mix_system_gain, 1.0);
     }
 
-    /// `truncate` は max 文字以下ならそのまま、超過なら … 付きで max 文字に収める。
+    /// `truncate` returns the string as is if it has at most max chars; otherwise it fits it
+    /// into max chars with a trailing ….
     #[test]
     fn truncate_respects_char_boundary() {
         assert_eq!(truncate("abc", 5), "abc");
-        // ちょうど max はそのまま。
+        // Exactly max is left as is.
         assert_eq!(truncate("abcde", 5), "abcde");
-        // 超過は … 付きで max 文字（keep = max-1）。
+        // Excess becomes max chars with … (keep = max-1).
         let t = truncate("abcdefgh", 5);
         assert_eq!(t.chars().count(), 5);
         assert!(t.ends_with('…'));
         assert!(t.starts_with("abcd"));
-        // マルチバイト（日本語）でも char 単位で安全に切る（panic しない）。
+        // Multibyte (Japanese) text is also cut safely per char (no panic).
         let jp = truncate("あいうえおかきくけこ", 3);
         assert_eq!(jp.chars().count(), 3);
         assert!(jp.ends_with('…'));
@@ -1632,7 +1707,8 @@ mod tests {
 
     // --- split_file_path ---
 
-    /// 拡張子の前に 3 桁ゼロ詰め連番を挟み、1000 以降は桁が自然に増える。
+    /// Inserts a 3-digit zero-padded number before the extension; from 1000 on the number
+    /// simply gets more digits.
     #[test]
     fn split_file_path_inserts_padded_index() {
         assert_eq!(
@@ -1647,14 +1723,16 @@ mod tests {
             split_file_path(Path::new("rec.wav"), 999),
             PathBuf::from("rec-999.wav")
         );
-        // 1000 ファイル目以降はゼロ詰め幅を超えて桁が自然に増える。
+        // From the 1000th file on, the number exceeds the zero-padding width and simply gets
+        // more digits.
         assert_eq!(
             split_file_path(Path::new("rec.wav"), 1000),
             PathBuf::from("rec-1000.wav")
         );
     }
 
-    /// 親ディレクトリは保たれ、拡張子なしのパスは末尾に連番を足す。
+    /// The parent directory is preserved, and a path without an extension gets the number
+    /// appended at the end.
     #[test]
     fn split_file_path_keeps_parent_and_handles_no_extension() {
         assert_eq!(
@@ -1665,7 +1743,7 @@ mod tests {
             split_file_path(Path::new("rec"), 1),
             PathBuf::from("rec-001")
         );
-        // ドットを複数含む名前は最後の拡張子の前に挟む。
+        // A name with multiple dots gets the number inserted before the last extension.
         assert_eq!(
             split_file_path(Path::new("a.b.wav"), 2),
             PathBuf::from("a.b-002.wav")
@@ -1674,7 +1752,7 @@ mod tests {
 
     // --- RotatingWavWriter ---
 
-    /// テスト用チャンク（全サンプル同値・interleaved）を作る。
+    /// Builds a test chunk (all samples equal, interleaved).
     fn chunk_of(frames: usize, channels: usize, value: f32) -> AudioChunk {
         AudioChunk {
             data: vec![value; frames * channels],
@@ -1688,7 +1766,8 @@ mod tests {
         }
     }
 
-    /// テスト専用の空一時ディレクトリを作って返す（テスト名で分離・並列実行に安全）。
+    /// Creates and returns an empty test-only temporary directory (separated by test name, safe
+    /// for parallel runs).
     fn test_dir(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("flexaudio_cli_{}_{}", name, std::process::id()));
@@ -1697,14 +1776,15 @@ mod tests {
         dir
     }
 
-    /// WAV を読み戻してフレーム数（= サンプル数 / チャンネル数）を返す。
+    /// Reads a WAV back and returns its frame count (= sample count / channel count).
     fn wav_frames(path: &Path) -> u64 {
         let reader = hound::WavReader::open(path).expect("open wav");
         (reader.len() / reader.spec().channels as u32) as u64
     }
 
-    /// 分割なし（split 0）は従来どおりベースパスへ 1 ファイルを書き、ヘッダ
-    /// （rate/ch/16bit）と peak/rms を正しく出す。書いた WAV を hound で読み戻して検証。
+    /// Without splitting (split 0) it writes a single file to the base path as before and
+    /// produces the header (rate/ch/16bit) and peak/rms correctly. Verified by reading the
+    /// written WAV back with hound.
     #[test]
     fn rotating_writer_without_split_matches_legacy_single_file() {
         let output = OutputFormat {
@@ -1714,7 +1794,7 @@ mod tests {
         let dir = test_dir("nosplit");
         let path = dir.join("capture.wav");
 
-        // 振幅 0.5 / -0.5 の交互（peak=0.5, rms=0.5）。
+        // Alternating amplitude 0.5 / -0.5 (peak=0.5, rms=0.5).
         let data: Vec<f32> = (0..320)
             .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
             .collect();
@@ -1733,11 +1813,12 @@ mod tests {
         assert!(writer.write_chunk(&chunk).expect("write").is_none());
         let summary = writer.finish().expect("finish");
 
-        // 分割なしは連番を付けずベースパスそのまま 1 ファイル（完全互換）。
+        // Without splitting it is a single file at the base path as is, with no number (fully
+        // compatible).
         assert_eq!(summary.files, vec![path.clone()]);
         assert_eq!(summary.total_frames, 320);
 
-        // peak/rms は既知（全サンプル |0.5| なので peak=0.5, rms=0.5）。
+        // peak/rms are known (all samples are |0.5|, so peak=0.5, rms=0.5).
         assert!(
             (summary.stats.peak - 0.5).abs() < 1e-6,
             "peak: {}",
@@ -1749,7 +1830,7 @@ mod tests {
             summary.stats.rms
         );
 
-        // ヘッダを読み戻して rate/ch/bits を検証。
+        // Read the header back and verify rate/ch/bits.
         let reader = hound::WavReader::open(&path).expect("open wav");
         let spec = reader.spec();
         assert_eq!(spec.sample_rate, 16_000);
@@ -1761,9 +1842,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 分割境界の計算（フレーム数ベースの決定論）: 16kHz mono / split 1 秒（しきい値
-    /// 16000 フレーム）へ 20ms チャンク（320 フレーム）を 150 個書くと、ちょうど
-    /// 50 個ずつの 3 ファイルになり、合計フレーム数が一致する（欠落ゼロ）。
+    /// Computing the split boundary (deterministic, based on frame counts): writing 150 chunks
+    /// of 20ms (320 frames) at 16kHz mono / split 1 second (threshold 16000 frames) yields
+    /// exactly 3 files of 50 chunks each, and the total frame count matches (zero missing).
     #[test]
     fn rotating_writer_splits_exactly_on_multiple() {
         let output = OutputFormat {
@@ -1780,14 +1861,15 @@ mod tests {
                 rotations.push((i, done));
             }
         }
-        // 16000 / 320 = 50 なので 50・100・150 個目（0 始まりで 49・99・149）で確定する。
+        // 16000 / 320 = 50, so finalization happens at the 50th, 100th and 150th chunk (49, 99
+        // and 149 zero-based).
         assert_eq!(
             rotations.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
             vec![49, 99, 149]
         );
 
         let summary = writer.finish().expect("finish");
-        // ちょうど境界で書き終えたので空の 4 本目は作られない。
+        // Writing ended exactly on a boundary, so no empty 4th file is created.
         assert_eq!(summary.files.len(), 3);
         assert_eq!(
             summary.files,
@@ -1799,7 +1881,7 @@ mod tests {
         );
         assert_eq!(summary.total_frames, 150 * 320);
 
-        // 読み戻し: 各ファイルちょうど 1 秒分・合計 = 入力（取りこぼしゼロ）。
+        // Read back: each file is exactly 1 second, and the total = the input (zero drops).
         let mut read_total = 0u64;
         for f in &summary.files {
             let frames = wav_frames(f);
@@ -1811,13 +1893,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 境界はチャンク粒度の「以上になったら次へ」: しきい値がチャンクの倍数でないとき、
-    /// ファイルはしきい値を跨いだチャンクまで含む（最大 1 チャンクの超過）。チャンクは
-    /// 分割されず、次ファイルは次のチャンクから始まる。
+    /// The boundary is chunk-granular, "move to the next file once reached or exceeded": when
+    /// the threshold is not a multiple of the chunk size, a file includes the chunk that crosses
+    /// the threshold (an excess of at most 1 chunk). Chunks are never split, and the next file
+    /// starts with the next chunk.
     #[test]
     fn rotating_writer_rounds_boundary_up_to_chunk() {
-        // しきい値 1000 フレーム（1000Hz × 1 秒）・チャンク 320 フレーム。
-        // 4 チャンク目で 1280 >= 1000 となり確定（±1 チャンクの誤差は仕様）。
+        // Threshold 1000 frames (1000Hz × 1 second), chunks of 320 frames.
+        // At the 4th chunk 1280 >= 1000, so it is finalized (the ±1 chunk error is as
+        // specified).
         let output = OutputFormat {
             sample_rate: 1_000,
             channels: 1,
@@ -1826,7 +1910,8 @@ mod tests {
         let base = dir.join("rec.wav");
         let mut writer = RotatingWavWriter::new(&base, output, 1);
 
-        // 7 チャンク: 4 個で 1 本目確定、残り 3 個（960 < 1000）は finish で 2 本目に確定。
+        // 7 chunks: 4 finalize the 1st file; the remaining 3 (960 < 1000) are finalized into
+        // the 2nd file by finish.
         let mut rotated_at = Vec::new();
         for i in 0..7 {
             if writer
@@ -1841,7 +1926,8 @@ mod tests {
 
         let summary = writer.finish().expect("finish");
         assert_eq!(summary.files.len(), 2);
-        // 1 本目 = 4 チャンク（1280 フレーム・しきい値 1000 の切り上げ）、2 本目 = 残り全部。
+        // 1st file = 4 chunks (1280 frames, threshold 1000 rounded up); 2nd file = all the
+        // rest.
         assert_eq!(wav_frames(&summary.files[0]), 1280);
         assert_eq!(wav_frames(&summary.files[1]), 960);
         assert_eq!(summary.total_frames, 7 * 320);
@@ -1849,11 +1935,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ステレオでも境界は「フレーム数」で数える（サンプル数ではない）。
+    /// Even for stereo the boundary is counted in "frames" (not samples).
     #[test]
     fn rotating_writer_counts_frames_not_samples_for_stereo() {
-        // しきい値 640 フレーム・320 フレーム（640 サンプル）のステレオチャンク。
-        // サンプル数で数えると 1 チャンク目で誤ローテーションする。
+        // Threshold 640 frames, stereo chunks of 320 frames (640 samples).
+        // Counting in samples would rotate wrongly at the 1st chunk.
         let output = OutputFormat {
             sample_rate: 640,
             channels: 2,
@@ -1878,8 +1964,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// チャンクが 1 つも来なくても finish は空 WAV を 1 つ残す（従来挙動の維持）。
-    /// 分割なしはベースパス、分割ありは連番 1 番になる。
+    /// Even if no chunk arrives at all, finish leaves one empty WAV (keeping the original
+    /// behavior). Without splitting it is the base path; with splitting it is number 1.
     #[test]
     fn rotating_writer_finish_writes_empty_wav_when_no_chunks() {
         let output = OutputFormat {
@@ -1888,7 +1974,7 @@ mod tests {
         };
         let dir = test_dir("split_empty");
 
-        // 分割なし → capture.wav（従来どおり）。
+        // No splitting → capture.wav (as before).
         let base = dir.join("capture.wav");
         let summary = RotatingWavWriter::new(&base, output, 0)
             .finish()
@@ -1897,7 +1983,7 @@ mod tests {
         assert_eq!(summary.total_frames, 0);
         assert_eq!(wav_frames(&base), 0);
 
-        // 分割あり → rec-001.wav（空の 1 本目）。
+        // Splitting → rec-001.wav (an empty 1st file).
         let base2 = dir.join("rec.wav");
         let summary2 = RotatingWavWriter::new(&base2, output, 5)
             .finish()
@@ -1908,9 +1994,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// MockBackend で Stream を実駆動する統合テスト: 3 秒相当を split 1 秒で録ると
-    /// 3 ファイルでき、読み戻した合計フレーム数が書き込んだフレーム数と一致する
-    /// （欠落ゼロ）。停止条件は壁時計でなく「確定ファイル数」で数える決定論形。
+    /// Integration test that really drives a Stream with MockBackend: recording 3 seconds' worth
+    /// with split 1 second yields 3 files, and the total frame count read back matches the
+    /// frames written (zero missing). The stop condition is deterministic, counted in
+    /// "finalized files" rather than by the wall clock.
     #[test]
     fn rotating_writer_splits_three_seconds_from_mock_backend() {
         use flexaudio::MockBackend;
@@ -1924,7 +2011,8 @@ mod tests {
             output,
             ..Default::default()
         };
-        // 48kHz mono のサイン波ソース（実機不要）。Stream が出力 16k/mono へ変換する。
+        // 48kHz mono sine-wave source (no real hardware needed). The Stream converts it to the
+        // 16k/mono output.
         let backend = Box::new(MockBackend::new(48_000, 1, 440.0));
         let mut stream = Stream::open(config, backend).expect("open stream");
         stream.start().expect("start stream");
@@ -1933,9 +2021,10 @@ mod tests {
         let base = dir.join("rec.wav");
         let mut writer = RotatingWavWriter::new(&base, output, 1);
 
-        // 3 本目が確定する（= 3 秒相当を書き切る）までチャンクを流し込む。届いたチャンクは
-        // 全て書くので、書いたフレーム数（fed_frames）が正解値になる。安全弁として上限
-        // チャンク数だけ設ける（比率・経過時間のアサーションはしない）。
+        // Feed chunks until the 3rd file is finalized (= 3 seconds' worth has been written).
+        // Every chunk that arrives is written, so the frames written (fed_frames) are the
+        // expected value. As a safety valve only a maximum chunk count is set (no assertions on
+        // ratios or elapsed time).
         let mut fed_frames: u64 = 0;
         let mut max_chunk_frames: u64 = 0;
         let mut finalized = 0usize;
@@ -1954,13 +2043,14 @@ mod tests {
             }
             assert!(
                 polled_chunks < 2_000,
-                "3 ファイル確定前にチャンク上限へ到達（Stream が流れていない）"
+                "reached the chunk limit before 3 files were finalized (the Stream is not flowing)"
             );
         }
         stream.stop();
 
         let summary = writer.finish().expect("finish");
-        // ちょうど 3 本目の確定で止めたので、空の 4 本目は作られない。
+        // It stopped exactly at the finalization of the 3rd file, so no empty 4th file is
+        // created.
         assert_eq!(summary.files.len(), 3);
         assert_eq!(
             summary.files,
@@ -1972,42 +2062,45 @@ mod tests {
         );
         assert_eq!(summary.total_frames, fed_frames);
 
-        // 読み戻し: 合計 = 書き込み量（欠落ゼロ）・各ファイルは 1 秒分以上かつ超過は
-        // 1 チャンク未満（境界はチャンク粒度の切り上げ）。
+        // Read back: total = amount written (zero missing); each file is at least 1 second and
+        // exceeds it by less than 1 chunk (the boundary is rounded up to chunk granularity).
         let mut read_total = 0u64;
         for f in &summary.files {
             let frames = wav_frames(f);
-            assert!(frames >= 16_000, "各ファイルは split 秒分以上: {frames}");
+            assert!(
+                frames >= 16_000,
+                "each file is at least split seconds long: {frames}"
+            );
             assert!(
                 frames < 16_000 + max_chunk_frames,
-                "超過は 1 チャンク未満: {frames}"
+                "the excess is less than 1 chunk: {frames}"
             );
             read_total += frames;
         }
-        assert_eq!(read_total, fed_frames, "読み戻し合計 = 書き込みフレーム数");
+        assert_eq!(read_total, fed_frames, "total read back = frames written");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- run: --out - と --split-seconds の併用拒否 ---
+    // --- run: rejecting --out - combined with --split-seconds ---
 
-    /// stdout ストリーミング（--out -）と --split-seconds の併用は、ストリームを開く前に
-    /// 分かりやすい日本語エラーで拒否される（デバイス不要で検証できる）。
+    /// Combining stdout streaming (--out -) with --split-seconds is rejected with a clear error
+    /// before the stream is opened (verifiable without a device).
     #[test]
     fn run_rejects_split_seconds_with_stdout_stream() {
         let cli = cli_from(&["--out", "-", "--split-seconds", "5"]);
         let err = run(&cli).expect_err("must be rejected");
         assert!(err.contains("--split-seconds"), "err: {err}");
-        assert!(err.contains("併用できません"), "err: {err}");
+        assert!(err.contains("cannot be combined"), "err: {err}");
     }
 
-    /// `write_chunk` の s16 量子化: f32 → i16。全層共通の正典 `quantize_i16`
-    /// （scale 32768・round・clamp・NaN→0）に一本化済み。負側フルスケール `-1.0` は
-    /// `-32768`、範囲外は飽和。
+    /// s16 quantization in `write_chunk`: f32 → i16. Unified on the canonical `quantize_i16`
+    /// shared by all layers (scale 32768, round, clamp, NaN→0). Negative full scale `-1.0` is
+    /// `-32768`, and out-of-range values saturate.
     #[test]
     fn write_chunk_s16_quantizes_and_clamps() {
         let chunk = AudioChunk {
-            // 0.0 / 1.0 / -1.0 / 範囲外 2.0(→clamp 32767) / -2.0(→clamp -32768)。
+            // 0.0 / 1.0 / -1.0 / out of range 2.0(→clamp 32767) / -2.0(→clamp -32768).
             data: vec![0.0, 1.0, -1.0, 2.0, -2.0],
             frames: 5,
             pts_ns: 0,
@@ -2019,17 +2112,17 @@ mod tests {
         };
         let mut buf: Vec<u8> = Vec::new();
         write_chunk(&mut buf, &chunk, EncodingArg::S16).expect("write");
-        // s16 LE: 1 サンプル 2 byte × 5 = 10 byte。
+        // s16 LE: 2 bytes per sample × 5 = 10 bytes.
         assert_eq!(buf.len(), 10);
         let s = |i: usize| i16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]);
         assert_eq!(s(0), 0); // 0.0
         assert_eq!(s(1), 32767); // 1.0 → clamp 32767
-        assert_eq!(s(2), -32768); // -1.0 → 負側フルスケール -32768
+        assert_eq!(s(2), -32768); // -1.0 → negative full scale -32768
         assert_eq!(s(3), 32767); // 2.0 → clamp 32767
         assert_eq!(s(4), -32768); // -2.0 → clamp -32768
     }
 
-    /// `write_chunk` の f32 経路: バイト長 = サンプル数 × 4、LE 復元が一致する。
+    /// f32 path of `write_chunk`: byte length = sample count × 4, and the LE round trip matches.
     #[test]
     fn write_chunk_f32_roundtrips() {
         let chunk = AudioChunk {
@@ -2044,7 +2137,7 @@ mod tests {
         };
         let mut buf: Vec<u8> = Vec::new();
         write_chunk(&mut buf, &chunk, EncodingArg::F32).expect("write");
-        assert_eq!(buf.len(), 12); // 3 サンプル × 4 byte。
+        assert_eq!(buf.len(), 12); // 3 samples × 4 bytes.
         let f = |i: usize| {
             f32::from_le_bytes([buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2], buf[i * 4 + 3]])
         };
@@ -2053,10 +2146,10 @@ mod tests {
         assert_eq!(f(2), 0.75);
     }
 
-    /// `fmt_dbfs`: 有限値は dBFS 表記、無限は無音表記。
+    /// `fmt_dbfs`: finite values in dBFS notation, infinity in silence notation.
     #[test]
     fn fmt_dbfs_finite_and_infinite() {
         assert!(fmt_dbfs(-6.0).contains("dBFS"));
-        assert!(fmt_dbfs(f64::NEG_INFINITY).contains("無音"));
+        assert!(fmt_dbfs(f64::NEG_INFINITY).contains("silence"));
     }
 }

@@ -1,19 +1,20 @@
-//! mic + system を 1 本に合成する合成バックエンド [`CompositeBackend`]。
+//! Composite backend [`CompositeBackend`] that mixes mic + system into one stream.
 //!
-//! mic と system の 2 つの子バックエンドを内部に持ち、各子の音声を内部正規形
-//! （48kHz/stereo）へ揃えてから側別ゲインで加算合成し、[`Stream`](crate::Stream)
-//! からはただの 1 バックエンドに見せる。Stream 本体には手を入れないので、
-//! seq/PTS・ウォッチドッグ・pause・グローバル gain・switch_source がそのまま効く。
+//! It holds two child backends, mic and system, internally; it brings each child's audio to the
+//! internal canonical format (48kHz/stereo), then sums them with per-side gains, so that to
+//! [`Stream`](crate::Stream) it looks like just one backend. The Stream itself is not touched,
+//! so seq/PTS, the watchdog, pause, the global gain and switch_source all keep working as is.
 //!
-//! # スレッド構成
-//! - 子バックエンドの RT スレッド: それぞれ専用の子 RawRing へ push するだけ（既存
-//!   backend のまま・触らない）。
-//! - 合成スレッド（1 本・`flexaudio-mix`）: 子リングを pop → 子ごとの [`Normalizer`]
-//!   で 48k/stereo 化 → 両側の揃ったフレームを側別ゲインで加算合成（±1.0 クランプ）
-//!   → 実 sink へ push。mic と system は別々の水晶で動きレートが数〜数百 ppm ずれる
-//!   ので、system 側だけを微リサンプルするドリフト補正（[`LinearStitcher`] +
-//!   [`DriftController`]）で吸収する。RT ではないのでヒープ確保可（ただしループ内の
-//!   定常確保はスクラッチ再利用で避ける）。
+//! # Thread layout
+//! - Each child backend's RT thread: only pushes into its own dedicated child RawRing (the
+//!   existing backend as is, untouched).
+//! - Mix thread (one, `flexaudio-mix`): pops from the child rings → converts to 48k/stereo with a
+//!   per-child [`Normalizer`] → sums the aligned frames of both sides with per-side gains (±1.0
+//!   clamp) → pushes to the real sink. mic and system run on separate crystals, so their rates
+//!   drift apart by several to several hundred ppm; this is absorbed by drift correction that
+//!   slightly resamples only the system side ([`LinearStitcher`] + [`DriftController`]). It is
+//!   not RT, so heap allocation is allowed (but steady-state allocation inside the loop is
+//!   avoided by reusing scratch buffers).
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,69 +30,74 @@ use flexaudio_core::types::{Error, OutputFormat, Result, CHANNELS, SAMPLE_RATE};
 
 use crate::stream::RAW_RING_SAMPLES;
 
-/// 片側が供給ゼロのままこの時間を超えたら、不足分を無音（0.0）として合成を続行する。
-/// 根拠: 正規化は 20ms チャンク単位でしか出てこないので、2〜3 チャンク分の到着ゆらぎ
-/// までは正常とみなし、それを超えた途絶（例: システム側が何も再生していない時間帯）
-/// でも録音全体は流れ続けるようにする。
+/// When one side has supplied nothing for longer than this, mixing continues with the missing
+/// part treated as silence (0.0). Rationale: normalized output only arrives in 20ms chunks, so
+/// arrival jitter of up to 2-3 chunks is considered normal, and an outage beyond that (e.g. a
+/// period when nothing is playing on the system side) must not stop the recording as a whole.
 const STARVATION_FILL_THRESHOLD: Duration = Duration::from_millis(60);
 
-/// 片側の正規化済み FIFO の上限（f32 サンプル数）。約 500ms 分
-/// （48kHz × 2ch × 0.5s = 48_000）を超えたら古い方から捨てる安全弁。
-/// 子クロック間のレート差はドリフト補正（[`DriftController`]）が吸収するので、
-/// 補正が効いている限り通常ここには到達しない。補正の範囲（±500ppm）で追い
-/// つかない異常（片側の暴走供給など）に対する最後の砦として残す。
+/// Upper bound (in f32 samples) of one side's normalized FIFO. A safety valve that drops the
+/// oldest samples once roughly 500ms worth (48kHz × 2ch × 0.5s = 48_000) is exceeded.
+/// The rate difference between the child clocks is absorbed by drift correction
+/// ([`DriftController`]), so as long as the correction works this is normally never reached. It
+/// is kept as the last line of defense against anomalies the correction range (±500ppm) cannot
+/// keep up with (such as runaway supply on one side).
 const FIFO_MAX_SAMPLES: usize = 48_000;
 
-/// 両側とも合成する材料が無いときの待ち時間（stream.rs の取り込みスレッドと同じ流儀）。
+/// Wait time when neither side has material to mix (same approach as the ingest thread in
+/// stream.rs).
 const IDLE_SLEEP: Duration = Duration::from_millis(2);
 
-/// ドリフト補正で system 側の読み出し比率 r を動かせる幅（1.0 ± 500ppm）。
-/// 民生機の水晶の実ドリフトは通常数十〜百数十 ppm なのでこれで十分覆え、
-/// r がこの範囲なら線形補間による歪みは無視できる水準に収まる（補間点が常に
-/// 原サンプルのごく近傍に留まるため）。
+/// Range within which drift correction may move the system-side read ratio r (1.0 ± 500ppm).
+/// Real crystal drift in consumer hardware is usually tens to a little over a hundred ppm, so
+/// this covers it comfortably, and while r stays in this range the distortion from linear
+/// interpolation stays negligible (the interpolation point always stays very close to an
+/// original sample).
 const DRIFT_RATIO_LIMIT: f64 = 500e-6;
 
-/// 比率を見直す間隔（合成出力の f32 サンプル数）。合成 100ms 分ごとに 1 回。
-/// 正規化チャンク（20ms）5 個分で、到着粒度より粗く、ドリフトの時間スケール
-/// （分オーダー）より十分細かい。
+/// Interval (in mixed-output f32 samples) at which the ratio is revisited. Once per 100ms of
+/// mixed output. That is 5 normalized chunks (20ms), coarser than the arrival granularity and
+/// much finer than the time scale of drift (minutes).
 const DRIFT_UPDATE_INTERVAL_SAMPLES: usize = (SAMPLE_RATE as usize / 10) * CHANNELS as usize;
 
-/// 残量差 EMA の係数。更新間隔 100ms と合わせて時定数はおよそ 1 秒。チャンク
-/// 到着のゆらぎ（20ms 粒度のノコギリ状の残量変動）を均しつつ、ドリフトの変化
-/// には十分追従できる。
+/// EMA coefficient for the backlog difference. Together with the 100ms update interval the time
+/// constant is about 1 second. It smooths out chunk-arrival jitter (sawtooth backlog variation at
+/// 20ms granularity) while still following changes in drift closely enough.
 const DRIFT_EMA_ALPHA: f64 = 0.1;
 
-/// P 制御のゲイン。残量差 200ms 分（19_200 サンプル）でクランプ上限の 500ppm を
-/// 使い切る傾き。この穏やかさなら、実ドリフト（数十〜数百 ppm）に対する定常
-/// 残量差は数十〜百数十 ms 分（= ドリフト ÷ ゲイン）に落ち着き、500ms の安全弁
-/// には遠く及ばない。
+/// P-control gain. The slope at which a backlog difference of 200ms (19_200 samples) uses up the
+/// full 500ppm clamp limit. With this gentleness, the steady-state backlog difference for real
+/// drift (tens to hundreds of ppm) settles at tens to a little over a hundred ms (= drift ÷
+/// gain), far below the 500ms safety valve.
 const DRIFT_GAIN: f64 = DRIFT_RATIO_LIMIT / 19_200.0;
 
-/// 1 回の見直しで比率を動かせる上限（slew）。100ms あたり 20ppm＝クランプ幅の
-/// 端から端まででも 5 秒かける。残量差の測定ノイズで比率が急変してピッチが
-/// 揺れるのを防ぐ。
+/// Upper bound on how far one revision may move the ratio (slew). 20ppm per 100ms = even going
+/// from one end of the clamp range to the other takes 5 seconds. Prevents the ratio from jumping
+/// on measurement noise in the backlog difference and making the pitch wobble.
 const DRIFT_SLEW_PER_UPDATE: f64 = 20e-6;
 
-/// mic + system の 2 子バックエンドを内部正規形で加算合成する合成バックエンド。
+/// Composite backend that sums the two child backends, mic + system, in the internal canonical
+/// format.
 ///
-/// [`native_format`](CaptureBackend::native_format) は常に内部正規形 `(48000, 2)` を
-/// 返すので、Stream 側の第 1 段リサンプラは実質パススルーになる。子はコンストラクタ
-/// 注入（テストでは mock を渡せる）。実子の構築は facade の `build_backend` が担う。
+/// [`native_format`](CaptureBackend::native_format) always returns the internal canonical format
+/// `(48000, 2)`, so the Stream's first-stage resampler is effectively a passthrough. The children
+/// are injected through the constructor (tests can pass mocks). Building the real children is
+/// the job of the facade's `build_backend`.
 pub(crate) struct CompositeBackend {
     mic: Box<dyn CaptureBackend>,
     system: Box<dyn CaptureBackend>,
     mic_gain: f32,
     system_gain: f32,
-    /// 合成スレッドへの停止指示。start のたびに新しい Arc に差し替える
-    /// （旧スレッドの残骸と混線しない）。
+    /// Stop request to the mix thread. Replaced with a new Arc on every start
+    /// (so it never gets crossed with leftovers of an old thread).
     stopping: Arc<AtomicBool>,
-    /// 合成スレッドのハンドル。`Some` なら動作中。
+    /// Handle of the mix thread. `Some` means running.
     mixer: Option<JoinHandle<()>>,
 }
 
 impl CompositeBackend {
-    /// 子 2 つと側別ゲインを注入して作る。ゲインの検証（有限・0 以上）は呼び出し側
-    /// （facade の `build_backend`）が済ませていること。
+    /// Builds it by injecting the two children and the per-side gains. The gains must already
+    /// have been validated (finite, >= 0) by the caller (the facade's `build_backend`).
     pub(crate) fn new(
         mic: Box<dyn CaptureBackend>,
         system: Box<dyn CaptureBackend>,
@@ -111,18 +117,19 @@ impl CompositeBackend {
 
 impl CaptureBackend for CompositeBackend {
     fn native_format(&self) -> (u32, u16) {
-        // 合成は常に内部正規形で行う。Stream の第 1 段は実質パススルーになる。
+        // Mixing is always done in the internal canonical format. The Stream's first stage is
+        // effectively a passthrough.
         (SAMPLE_RATE, CHANNELS)
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
-        // 動作中の二重 start は no-op（CaptureBackend 契約）。
+        // A double start while running is a no-op (CaptureBackend contract).
         if self.mixer.is_some() {
             return Ok(());
         }
 
-        // mic の起動に失敗したら即 Err、system の起動に失敗したら mic を stop してから
-        // Err（片肺で起動成功にしない）。
+        // If mic fails to start, return Err immediately; if system fails to start, stop mic and
+        // then return Err (never report success with only one side running).
         let mic_lane = start_child(&mut self.mic)?;
         let system_lane = match start_child(&mut self.system) {
             Ok(lane) => lane,
@@ -132,8 +139,8 @@ impl CaptureBackend for CompositeBackend {
             }
         };
 
-        // 合成スレッドを起動する。停止フラグは start ごとに新調する（前回 stop の
-        // フラグを引きずらない）。
+        // Start the mix thread. The stop flag is renewed on every start (it must not carry over
+        // the flag from the previous stop).
         self.stopping = Arc::new(AtomicBool::new(false));
         let stopping = self.stopping.clone();
         let mic_gain = self.mic_gain;
@@ -150,7 +157,8 @@ impl CaptureBackend for CompositeBackend {
                 Ok(())
             }
             Err(e) => {
-                // スレッドが立たなければ子を止めて失敗を返す（片肺にしない）。
+                // If the thread cannot be spawned, stop the children and return the failure
+                // (never leave only one side running).
                 stop_child(&mut self.mic);
                 stop_child(&mut self.system);
                 Err(e)
@@ -159,8 +167,9 @@ impl CaptureBackend for CompositeBackend {
     }
 
     fn stop(&mut self) {
-        // 停止フラグ → 合成スレッド join → 子 2 つを stop。冪等（未起動なら子の stop
-        // だけが走るが、子側も冪等契約なので無害）。
+        // Stop flag → join the mix thread → stop both children. Idempotent (if never started,
+        // only the children's stop runs, which is harmless because the children are under the
+        // idempotency contract too).
         self.stopping.store(true, Ordering::SeqCst);
         if let Some(h) = self.mixer.take() {
             let _ = h.join();
@@ -172,35 +181,36 @@ impl CaptureBackend for CompositeBackend {
 
 impl Drop for CompositeBackend {
     fn drop(&mut self) {
-        // stop されずに捨てられても合成スレッドと子を残さない。
+        // Even when dropped without stop, do not leave the mix thread and children behind.
         self.stop();
     }
 }
 
-/// 片側の子の取り込み状態一式（子リング consumer + 正規化器 + 正規化済み FIFO）。
+/// Full ingest state of one side's child (child ring consumer + normalizer + normalized FIFO).
 struct ChildLane {
     consumer: RawConsumer,
-    /// 子ネイティブ → 内部正規形（48k/stereo）。出力を内部正規形に固定するので
-    /// 第 2 段はパススルー。
+    /// Child native → internal canonical format (48k/stereo). The output is fixed to the
+    /// internal canonical format, so the second stage is a passthrough.
     normalizer: Normalizer,
-    /// 正規化済みサンプル（48k/stereo interleaved）の FIFO。
+    /// FIFO of normalized samples (48k/stereo interleaved).
     fifo: Vec<f32>,
-    /// 最後にこの側が正規化済みサンプルを供給した時刻（飢餓判定用）。
+    /// Time at which this side last supplied normalized samples (for starvation detection).
     last_supply: Instant,
 }
 
 impl ChildLane {
-    /// 子リングから pop して正規化し、完成分を FIFO へ積む。
+    /// Pops from the child ring, normalizes, and appends the completed part to the FIFO.
     ///
-    /// FIFO が [`FIFO_MAX_SAMPLES`] を超えたら古い方から捨てる（無限成長の安全弁）。
-    /// rubato の処理失敗は `Err` で返す（呼び出し側が合成スレッドを終える）。
+    /// When the FIFO exceeds [`FIFO_MAX_SAMPLES`], the oldest samples are dropped (safety valve
+    /// against unbounded growth). A rubato processing failure is returned as `Err` (the caller
+    /// ends the mix thread).
     fn ingest(&mut self, scratch: &mut [f32]) -> Result<()> {
         let got = self.consumer.pop_slice(scratch);
         if got == 0 {
             return Ok(());
         }
-        // pts は sink 側では使われない（配線層が別途取り回す契約）が、正規化器の
-        // アンカー用に単調 now を渡しておく。
+        // pts is not used on the sink side (by contract the wiring layer handles it
+        // separately), but a monotonic now is passed as the normalizer's anchor.
         self.normalizer.push(&scratch[..got], monotonic_now_ns())?;
         let mut supplied = false;
         while let Some((chunk, _pts)) = self.normalizer.pop_chunk() {
@@ -217,19 +227,21 @@ impl ChildLane {
         Ok(())
     }
 
-    /// この側が [`STARVATION_FILL_THRESHOLD`] 以上供給ゼロのままか。
+    /// Whether this side has supplied nothing for [`STARVATION_FILL_THRESHOLD`] or longer.
     fn is_starved(&self, now: Instant) -> bool {
         now.duration_since(self.last_supply) >= STARVATION_FILL_THRESHOLD
     }
 }
 
-/// system レーン用の微リサンプラ（線形補間ステッチャ）。
+/// Fine resampler for the system lane (linear-interpolation stitcher).
 ///
-/// mic を基準クロックとし（録音の時間軸は人の声＝マイク側に合わせるのが自然）、
-/// system の FIFO だけを比率 r 倍の速度で線形補間しながら読み出して、子クロック間
-/// のレート差を吸収する。読み出し位置の小数部だけを状態として持つ。
+/// mic is taken as the reference clock (it is natural to align the recording's time axis to
+/// the human voice = the mic side), and only the system FIFO is read out at r times the speed
+/// with linear interpolation, absorbing the rate difference between the child clocks. Only the
+/// fractional part of the read position is kept as state.
 struct LinearStitcher {
-    /// FIFO 先頭フレームから見た読み出し位置の小数部（フレーム単位、[0, 1)）。
+    /// Fractional part of the read position, relative to the first FIFO frame (in frames,
+    /// [0, 1)).
     frac: f64,
 }
 
@@ -238,10 +250,11 @@ impl LinearStitcher {
         Self { frac: 0.0 }
     }
 
-    /// FIFO に `fifo_frames` フレームあるとき、比率 `ratio` で補間生成できる出力
-    /// フレーム数。k 番目（0 始まり）の出力は位置 `frac + k×ratio` の左右 2 フレーム
-    /// から作るので、位置が最終フレーム F-1 を超えない k までしか作れない
-    /// （最終フレームちょうどに乗る分は重み 0 なので作れる）。
+    /// Number of output frames that can be produced by interpolation at ratio `ratio` when the
+    /// FIFO holds `fifo_frames` frames. The k-th output (0-based) is built from the two frames
+    /// around position `frac + k×ratio`, so only k whose position does not go past the last
+    /// frame F-1 can be produced (one landing exactly on the last frame can, since its weight
+    /// is 0).
     fn producible(&self, fifo_frames: usize, ratio: f64) -> usize {
         if fifo_frames == 0 {
             return 0;
@@ -253,10 +266,11 @@ impl LinearStitcher {
         (span / ratio) as usize + 1
     }
 
-    /// system FIFO から `out_frames` フレームを `ratio` 倍速の線形補間で読み出し、
-    /// interleaved のまま `out` へ書き足す。読み終えたフレームは FIFO から捨て、
-    /// 端数位置は次回へ持ち越す（ブロック境界をまたいでも位相が連続する）。
-    /// 呼び出し側は `out_frames <= producible(...)` を保証すること。
+    /// Reads `out_frames` frames from the system FIFO with linear interpolation at `ratio` times
+    /// the speed and appends them, still interleaved, to `out`. Frames that have been fully read
+    /// are dropped from the FIFO and the fractional position is carried over to the next call
+    /// (the phase stays continuous across block boundaries).
+    /// The caller must guarantee `out_frames <= producible(...)`.
     fn pull(&mut self, fifo: &mut Vec<f32>, ratio: f64, out_frames: usize, out: &mut Vec<f32>) {
         let ch = CHANNELS as usize;
         let frames = fifo.len() / ch;
@@ -264,8 +278,8 @@ impl LinearStitcher {
         for k in 0..out_frames {
             let pos = self.frac + k as f64 * ratio;
             let left = pos as usize;
-            // 位置がちょうど最終フレームに乗ったときだけ右端をクランプ
-            // （そのとき重みは 0 なので補間結果は変わらない）。
+            // Clamp the right edge only when the position lands exactly on the last frame
+            // (the weight is 0 then, so the interpolated value does not change).
             let right = (left + 1).min(frames - 1);
             let w = (pos - left as f64) as f32;
             for c in 0..ch {
@@ -274,31 +288,36 @@ impl LinearStitcher {
                 out.push(a + w * (b - a));
             }
         }
-        // 次の読み出し位置。整数部のフレームは読み終わったので捨て、小数部だけ残す。
+        // Next read position. The whole frames have been fully read, so drop them and keep
+        // only the fractional part.
         let end = self.frac + out_frames as f64 * ratio;
         let consumed = (end as usize).min(frames);
         self.frac = end - consumed as f64;
         fifo.drain(..consumed * ch);
     }
 
-    /// 飢餓経路で system FIFO を丸ごと吐き出したときの位相の仕切り直し。
+    /// Resets the phase when the starvation path has flushed the whole system FIFO.
     fn reset(&mut self) {
         self.frac = 0.0;
     }
 }
 
-/// 残量差から読み出し比率 r を決めるフィードバック制御（EMA + P 制御 + slew）。
+/// Feedback control that sets the read ratio r from the backlog difference (EMA + P control +
+/// slew).
 ///
-/// 合成が [`DRIFT_UPDATE_INTERVAL_SAMPLES`] 進むごとに、消費後の FIFO 残量差
-/// （mic - system）の指数移動平均を取り、差が負（system 側が溜まる）なら r を
-/// 上げて速く消費し、正なら下げる。P 制御で足りるのは、残量差自体がレート差の
-/// 積分だから（比例で押し返せば残量差は有限のところで釣り合う）。
+/// Each time mixing advances by [`DRIFT_UPDATE_INTERVAL_SAMPLES`], it takes the exponential
+/// moving average of the post-consumption FIFO backlog difference (mic - system); if the
+/// difference is negative (the system side is accumulating) it raises r to consume faster, and
+/// if positive it lowers r. P control suffices because the backlog difference itself is the
+/// integral of the rate difference (pushing back proportionally balances the backlog difference
+/// at a finite value).
 struct DriftController {
-    /// 現在の読み出し比率 r（1.0 中心に ±[`DRIFT_RATIO_LIMIT`] でクランプ）。
+    /// Current read ratio r (clamped to 1.0 ± [`DRIFT_RATIO_LIMIT`]).
     ratio: f64,
-    /// 残量差 (mic_len - system_len) の指数移動平均（f32 サンプル数）。
+    /// Exponential moving average of the backlog difference (mic_len - system_len) (in f32
+    /// samples).
     ema_diff: f64,
-    /// 前回の見直しからの合成出力サンプル数。
+    /// Mixed-output samples since the last revision.
     pending_samples: usize,
 }
 
@@ -311,9 +330,9 @@ impl DriftController {
         }
     }
 
-    /// 合成出力が進んだ量を記録し、[`DRIFT_UPDATE_INTERVAL_SAMPLES`] に達したら
-    /// 比率を 1 回見直す。残量は消費後の値を渡すこと（消費前だと今回消費する分
-    /// まで差に見えてしまう）。
+    /// Records how far the mixed output has advanced and revisits the ratio once when it
+    /// reaches [`DRIFT_UPDATE_INTERVAL_SAMPLES`]. Pass the backlogs after consumption (before
+    /// consumption, the part consumed this time would also show up as a difference).
     fn on_output(&mut self, samples: usize, mic_len: usize, system_len: usize) {
         self.pending_samples += samples;
         if self.pending_samples >= DRIFT_UPDATE_INTERVAL_SAMPLES {
@@ -322,7 +341,8 @@ impl DriftController {
         }
     }
 
-    /// 残量差の EMA を更新し、P 制御 + slew で比率を 1 段階動かす。
+    /// Updates the EMA of the backlog difference and moves the ratio one step with P control +
+    /// slew.
     fn update(&mut self, mic_len: usize, system_len: usize) {
         let diff = mic_len as f64 - system_len as f64;
         self.ema_diff += DRIFT_EMA_ALPHA * (diff - self.ema_diff);
@@ -333,7 +353,7 @@ impl DriftController {
     }
 }
 
-/// ドリフト補正一式（ステッチャ + 比率コントローラ）。合成スレッドごとに 1 つ持つ。
+/// Full drift correction state (stitcher + ratio controller). One per mix thread.
 struct DriftCorrection {
     stitcher: LinearStitcher,
     controller: DriftController,
@@ -348,12 +368,12 @@ impl DriftCorrection {
     }
 }
 
-/// 子を 1 つ起動する: 専用の子 RawRing（stream.rs と同じ容量）を作り、子ネイティブ
-/// フォーマットの [`RawSink`] で `start` する。成功で [`ChildLane`] を返す。
+/// Starts one child: creates a dedicated child RawRing (same capacity as in stream.rs) and calls
+/// `start` with a [`RawSink`] in the child's native format. Returns a [`ChildLane`] on success.
 ///
-/// 子の `start` の panic は catch_unwind で [`Error::Backend`] へ変換する
-/// （stream.rs の start_backend_catching と同じ趣旨。合成スレッドや呼び出し側を
-/// 連鎖 panic させない）。
+/// A panic in the child's `start` is converted to [`Error::Backend`] with catch_unwind
+/// (same intent as start_backend_catching in stream.rs: do not cascade the panic into the mix
+/// thread or the caller).
 fn start_child(child: &mut Box<dyn CaptureBackend>) -> Result<ChildLane> {
     let (rate, channels) = child.native_format();
     if rate == 0 || channels == 0 {
@@ -368,8 +388,8 @@ fn start_child(child: &mut Box<dyn CaptureBackend>) -> Result<ChildLane> {
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err(Error::Backend("mix child panicked during start()".into())),
     }
-    // 子ネイティブ → 内部正規形（48k/stereo）。この Normalizer の出力を内部正規形に
-    // 固定するので、第 2 段は常にパススルー。
+    // Child native → internal canonical format (48k/stereo). This Normalizer's output is fixed
+    // to the internal canonical format, so the second stage is always a passthrough.
     let normalizer = Normalizer::new(
         rate,
         channels,
@@ -379,7 +399,8 @@ fn start_child(child: &mut Box<dyn CaptureBackend>) -> Result<ChildLane> {
         },
     )
     .inspect_err(|_| {
-        // 正規化器が作れないなら子を止めてから失敗を返す（起動済みの子を残さない）。
+        // If the normalizer cannot be created, stop the child before returning the failure (do
+        // not leave a started child behind).
         stop_child(child);
     })?;
     Ok(ChildLane {
@@ -390,22 +411,23 @@ fn start_child(child: &mut Box<dyn CaptureBackend>) -> Result<ChildLane> {
     })
 }
 
-/// 子の `stop` を catch_unwind で包んで呼ぶ（panic を巻き上げない。stream.rs の
-/// stop_backend_catching と同じ趣旨）。
+/// Calls the child's `stop` wrapped in catch_unwind (does not propagate a panic; same intent as
+/// stop_backend_catching in stream.rs).
 fn stop_child(child: &mut Box<dyn CaptureBackend>) {
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| child.stop()));
 }
 
-/// 合成スレッド本体。
+/// Body of the mix thread.
 ///
-/// まず [`prime_lanes`] で両側の最初の供給が揃うのを待ってから（上限は飢餓閾値）、
-/// 各子を取り込み（pop → 正規化 → FIFO）、両側の揃ったフレームを側別ゲインで加算
-/// 合成して実 sink へ push する。片側が [`STARVATION_FILL_THRESHOLD`] 以上供給ゼロ
-/// なら不足分を無音として続行する（システム側が無音の時間帯も録音は流れ続ける）。
-/// 両側とも材料が無ければ [`IDLE_SLEEP`] 眠る。
+/// It first waits in [`prime_lanes`] until the first supply from both sides has arrived (bounded
+/// by the starvation threshold), then ingests each child (pop → normalize → FIFO), sums the
+/// aligned frames of both sides with per-side gains and pushes them to the real sink. If one
+/// side has supplied nothing for [`STARVATION_FILL_THRESHOLD`] or longer, it continues with the
+/// missing part as silence (the recording keeps flowing even while the system side is silent).
+/// If neither side has material, it sleeps for [`IDLE_SLEEP`].
 ///
-/// 正規化の失敗（理論上の rubato 失敗）はループを終える。以降サンプルが流れなく
-/// なるので、Stream のウォッチドッグが失速を検知して backend を再オープンする。
+/// A normalization failure (a theoretical rubato failure) ends the loop. Samples stop flowing
+/// after that, so the Stream's watchdog detects the stall and reopens the backend.
 fn run_mixer(
     mut mic: ChildLane,
     mut system: ChildLane,
@@ -414,14 +436,16 @@ fn run_mixer(
     mut sink: RawSink,
     stopping: Arc<AtomicBool>,
 ) {
-    // pop 用スクラッチ（子リング容量ぶん）と合成出力スクラッチ。ループ内で再利用する。
+    // Scratch for pop (child ring capacity) and scratch for mixed output. Reused inside the loop.
     let mut scratch = vec![0.0f32; RAW_RING_SAMPLES];
     let mut mixed: Vec<f32> = Vec::with_capacity(FIFO_MAX_SAMPLES);
-    // 子クロック間ドリフト補正の状態（start ごとに新調＝前回録音の比率を引きずらない）。
+    // Drift correction state between the child clocks (renewed on every start = the ratio of
+    // the previous recording does not carry over).
     let mut drift = DriftCorrection::new();
 
-    // 起動直後は子スレッドの立ち上がりがバラつくため、両側が流れ始めるまで
-    // （上限は飢餓閾値）待ってから合成を始める＝録音の頭が片側だけになるのを防ぐ。
+    // Right after startup the child threads come up at uneven times, so wait until both sides
+    // start flowing (bounded by the starvation threshold) before mixing = prevents the head of
+    // the recording from containing only one side.
     if !prime_lanes(&mut mic, &mut system, &mut scratch, &stopping) {
         return;
     }
@@ -432,7 +456,7 @@ fn run_mixer(
         }
 
         if mic.ingest(&mut scratch).is_err() || system.ingest(&mut scratch).is_err() {
-            // 正規化が壊れたら合成を終える（ウォッチドッグの再オープンに委ねる）。
+            // If normalization breaks, end mixing (leave it to the watchdog's reopen).
             return;
         }
 
@@ -452,15 +476,15 @@ fn run_mixer(
     }
 }
 
-/// 合成開始前のプライミング。起動直後は子バックエンドのスレッド立ち上がりが
-/// バラつくため、両側の FIFO に最初の正規化済みサンプルが届くまで [`IDLE_SLEEP`]
-/// でポーリングして待ってから合成を始める。ここを飛ばすと、遅れた側のリングが
-/// 空のまま飢餓埋めが発動して録音の頭が片側だけの音になり得る。
+/// Priming before mixing starts. Right after startup the child backends' threads come up at
+/// uneven times, so it polls every [`IDLE_SLEEP`] until the first normalized samples arrive in
+/// both sides' FIFOs before mixing starts. If this is skipped, starvation fill can kick in while
+/// the late side's ring is still empty, and the head of the recording may contain only one side.
 ///
-/// 待ちの上限は [`STARVATION_FILL_THRESHOLD`]。片側が最初から供給ゼロ
-/// （例: システム側が何も再生していない）という正当なケースは、既存の飢餓と
-/// 同じ時間感覚で見切って合成を始める。停止指示が来たら待ちを打ち切る。
-/// 正規化の失敗は `false` を返し、呼び出し側が合成スレッドを終える。
+/// The wait is bounded by [`STARVATION_FILL_THRESHOLD`]. The legitimate case where one side
+/// supplies nothing from the start (e.g. nothing is playing on the system side) is cut off with
+/// the same time sense as the existing starvation handling, and mixing starts. A stop request
+/// aborts the wait. A normalization failure returns `false`, and the caller ends the mix thread.
 fn prime_lanes(
     mic: &mut ChildLane,
     system: &mut ChildLane,
@@ -482,18 +506,20 @@ fn prime_lanes(
     true
 }
 
-/// 両側の FIFO から合成できる分を取り出し、側別ゲインで加算合成（±1.0 クランプ）して
-/// sink へ push する。何か push したら `true`。
+/// Takes what can be mixed from both sides' FIFOs, sums it with per-side gains (±1.0 clamp) and
+/// pushes it to the sink. Returns `true` if anything was pushed.
 ///
-/// 取り出し量の決め方:
-/// - 両側にデータがある（定常経路）→ mic の在庫と system から補間で作れる量の min。
-///   mic は等速、system は [`LinearStitcher`] が比率 r 倍速の線形補間で読み出して
-///   子クロック間のドリフトを吸収する。r は消費後の残量差から [`DriftController`]
-///   が微調整する。
-/// - 片側だけデータがあり、もう片側が飢餓（60ms 以上供給ゼロ）→ ある側の全量を
-///   無音相手と合成（不足分 0.0 埋め）。補正はこの経路には掛けない（既存の飢餓
-///   セマンティクスのまま）。
-/// - それ以外（両側空・相手がまだ飢餓でない）→ 何もしない（揃うのを待つ）。
+/// How the amount taken is decided:
+/// - Both sides have data (steady path) → the min of the mic stock and the amount that can be
+///   produced from system by interpolation. mic is read at unit speed; system is read by
+///   [`LinearStitcher`] with linear interpolation at r times the speed, absorbing the drift
+///   between the child clocks. r is fine-tuned by [`DriftController`] from the
+///   post-consumption backlog difference.
+/// - Only one side has data and the other is starved (nothing supplied for 60ms or more) → mix
+///   the whole amount of the side that has data against silence (the missing part filled with
+///   0.0). No correction is applied on this path (existing starvation semantics as is).
+/// - Otherwise (both sides empty, or the other side not starved yet) → do nothing (wait for
+///   them to line up).
 fn mix_and_push(
     mic: &mut ChildLane,
     system: &mut ChildLane,
@@ -508,7 +534,8 @@ fn mix_and_push(
     let steady_frames =
         (mic.fifo.len() / ch).min(drift.stitcher.producible(system.fifo.len() / ch, ratio));
     if steady_frames > 0 {
-        // 定常経路: system 側だけを r 倍速の線形補間で読み出してから加算合成する。
+        // Steady path: read only the system side with linear interpolation at r times the
+        // speed, then sum.
         mixed.clear();
         drift
             .stitcher
@@ -521,16 +548,17 @@ fn mix_and_push(
         drift
             .controller
             .on_output(count, mic.fifo.len(), system.fifo.len());
-        // pts は stream.rs の取り込みと同様、単調 now でよい（sink 側では別途取り回す契約）。
+        // pts can be a monotonic now, as in the ingest of stream.rs (by contract the sink side
+        // handles it separately).
         sink.push(mixed, monotonic_now_ns());
         return true;
     }
 
-    // 飢餓経路（補正なし・既存セマンティクス）。
+    // Starvation path (no correction, existing semantics).
     let now = Instant::now();
     let (mic_take, system_take) = if !mic.fifo.is_empty() && system.is_starved(now) {
-        // system 途絶: mic 全量を出す。補間の右端が来ないまま残った端数
-        // （高々 1 フレーム）もここで吐き切り、位相は仕切り直す。
+        // system outage: emit the whole mic amount. The fractional remainder left without its
+        // right interpolation edge (at most 1 frame) is also flushed here, and the phase reset.
         drift.stitcher.reset();
         (mic.fifo.len(), system.fifo.len())
     } else if mic.fifo.is_empty() && !system.fifo.is_empty() && mic.is_starved(now) {
@@ -550,7 +578,8 @@ fn mix_and_push(
     mic.fifo.drain(..mic_take);
     system.fifo.drain(..system_take);
 
-    // pts は stream.rs の取り込みと同様、単調 now でよい（sink 側では別途取り回す契約）。
+    // pts can be a monotonic now, as in the ingest of stream.rs (by contract the sink side
+    // handles it separately).
     sink.push(mixed, monotonic_now_ns());
     true
 }
@@ -561,20 +590,22 @@ mod tests {
     use flexaudio_core::raw_ring::raw_ring;
     use std::sync::atomic::AtomicU32;
 
-    /// 定振幅（直流）のサンプルを飽和供給するテスト専用の子バックエンド。
+    /// Test-only child backend that supplies constant-amplitude (DC) samples at saturation.
     ///
-    /// 正弦波（MockBackend）だと 2 ソース合成時に位相の問題が出るため、合成結果を
-    /// 決定論的に検証できる直流信号を使う。`feed_for` を指定すると、その時間だけ給餌
-    /// してから push を止める（スレッドは生かしたまま）＝片側飢餓の再現用。
+    /// With a sine wave (MockBackend), mixing two sources raises phase issues, so a DC signal is
+    /// used, which lets the mix result be verified deterministically. If `feed_for` is set, it
+    /// feeds only for that long and then stops pushing (the thread stays alive) = for
+    /// reproducing one-side starvation.
     ///
-    /// 供給は実時間ペース（10ms sleep）ではなく飽和方式: 子リングが受け取れる限り
-    /// 即座に push し続け、満杯で入り切らなければ 1ms だけ譲って再試行する。実時間
-    /// ペースだと遅いテスト機の粗い sleep 粒度で供給が遅れ、ミキサーが起きた瞬間に
-    /// 片側の FIFO だけ空 → 飢餓埋めで片側だけのチャンクが混ざり、合成値の検証が
-    /// スケジューラ依存になってしまう。飽和供給なら両レーンの FIFO はミキサーが
-    /// いつ起きても非空で、検証対象を「合成の数学」だけに絞れる（スケジューリング
-    /// 耐性そのものは mix_survives_one_side_starvation が担う）。直流なので満杯時の
-    /// ドロップや途中までの書き込みは値に影響しない。
+    /// Supply is saturating rather than real-time paced (10ms sleep): it keeps pushing
+    /// immediately as long as the child ring accepts, and when the ring is full and the block
+    /// does not fit it yields for just 1ms and retries. With real-time pacing, supply lags on
+    /// slow test machines with coarse sleep granularity, and when the mixer wakes only one
+    /// side's FIFO is empty → starvation fill mixes in chunks with only one side, making the
+    /// verification of mixed values scheduler-dependent. With saturating supply both lanes'
+    /// FIFOs are non-empty whenever the mixer wakes, narrowing what is verified to "the math of
+    /// mixing" (scheduling tolerance itself is covered by mix_survives_one_side_starvation).
+    /// Since it is DC, drops when full or partial writes do not affect the values.
     struct ConstBackend {
         sample_rate: u32,
         channels: u16,
@@ -615,20 +646,22 @@ mod tests {
             let handle = thread::Builder::new()
                 .name("flexaudio-const-gen".into())
                 .spawn(move || {
-                    let frames_per_block = (sample_rate as usize / 100).max(1); // 10ms 相当
+                    let frames_per_block = (sample_rate as usize / 100).max(1); // 10ms worth
                     let block = vec![value; frames_per_block * channels];
                     let start = Instant::now();
                     while running.load(Ordering::SeqCst) {
                         let feeding = feed_for.is_none_or(|d| start.elapsed() < d);
                         if !feeding {
-                            // 給餌期間が終わったら以降は何も供給しない（片側飢餓の
-                            // 再現）。停止指示だけ見張って眠る。
+                            // After the feeding period ends, supply nothing more
+                            // (reproduces one-side starvation). Only watch for the stop
+                            // request and sleep.
                             thread::sleep(Duration::from_millis(5));
                             continue;
                         }
-                        // 飽和供給: 全量入ったら即座に次を push、満杯で入り切らな
-                        // かったら 1ms だけ譲って再試行（push は非ブロッキングで
-                        // 入り切らない分を落とす契約。直流なので欠けても無害）。
+                        // Saturating supply: once everything fits, push the next block
+                        // immediately; if the ring is full and it does not fit, yield for
+                        // 1ms and retry (by contract push is non-blocking and drops what
+                        // does not fit. It is DC, so gaps are harmless).
                         let accepted = sink.push(&block, start.elapsed().as_nanos() as i64);
                         if accepted < block.len() {
                             thread::sleep(Duration::from_millis(1));
@@ -654,7 +687,7 @@ mod tests {
         }
     }
 
-    /// `start` が常に Err を返すテスト専用バックエンド。
+    /// Test-only backend whose `start` always returns Err.
     struct FailingStartBackend;
 
     impl CaptureBackend for FailingStartBackend {
@@ -667,7 +700,7 @@ mod tests {
         fn stop(&mut self) {}
     }
 
-    /// start / stop の呼び出し回数を共有カウンタへ記録するテスト専用バックエンド。
+    /// Test-only backend that records the number of start / stop calls in shared counters.
     struct TrackingBackend {
         starts: Arc<AtomicU32>,
         stops: Arc<AtomicU32>,
@@ -686,7 +719,7 @@ mod tests {
         }
     }
 
-    /// composite を組んで start し、実 sink の consumer を返すヘルパ。
+    /// Helper that builds and starts a composite and returns the consumer of the real sink.
     fn start_composite(
         mic: Box<dyn CaptureBackend>,
         system: Box<dyn CaptureBackend>,
@@ -694,31 +727,36 @@ mod tests {
         system_gain: f32,
     ) -> (CompositeBackend, RawConsumer) {
         let mut be = CompositeBackend::new(mic, system, mic_gain, system_gain);
-        assert_eq!(be.native_format(), (48_000, 2), "内部正規形を名乗るはず");
+        assert_eq!(
+            be.native_format(),
+            (48_000, 2),
+            "should report the internal canonical format"
+        );
         let (producer, consumer) = raw_ring(RAW_RING_SAMPLES);
         let sink = RawSink::new(producer, 48_000, 2);
         be.start(sink).expect("composite start");
         (be, consumer)
     }
 
-    /// 値比較の許容誤差。直流 2 値の f32 加算の丸めを吸収できれば十分。
+    /// Tolerance for value comparison. Enough to absorb the f32 rounding of adding two DC values.
     const VALUE_TOL: f32 = 1e-4;
 
-    /// 「実際に出現した」と認める最低サンプル数 = 内部正規形 1 チャンク分
-    /// （960 frame × 2ch）。存在保証の床は全体比でなく絶対数で置く: 全体比（例:
-    /// 25%）だと、片側飢餓埋めの大きなバースト（FIFO 上限の 48k サンプルが一括で
-    /// 出得る）が混ざったときに分母だけ膨らんで割れる＝結局スケジューラ依存に
-    /// なってしまう。
+    /// Minimum number of samples accepted as "actually appeared" = one chunk of the internal
+    /// canonical format (960 frame × 2ch). The existence floor is an absolute count rather than a
+    /// fraction of the total: with a fraction (e.g. 25%), when a large one-side starvation-fill
+    /// burst gets mixed in (up to the FIFO limit of 48k samples can come out at once) only the
+    /// denominator grows and the check breaks = it ends up scheduler-dependent after all.
     const ONE_CHUNK_SAMPLES: usize = 1_920;
 
-    /// 条件を満たすまで consumer からサンプルを集めるヘルパ。
+    /// Helper that collects samples from the consumer until a condition is met.
     ///
-    /// `done` は新しく pop できたぶんだけを毎回受け取る（呼び出し側が件数などを
-    /// 加算して判定する）。true を返したら全収集分を返す。壁時計の固定窓（「500ms
-    /// で N サンプル」）は、負荷でスレッド群がデスケジュールされると窓内の生産量を
-    /// 保証できず原理的にフレークするため、「条件到達まで待つ」方式にする。
-    /// `max_wait` は極端な負荷でも走り続けないためのハング保険で、超過時は集まった
-    /// ぶんを返す（不足は呼び出し側のアサーションが検出する）。
+    /// `done` receives only the newly popped samples each time (the caller accumulates counts
+    /// etc. and decides). When it returns true, everything collected is returned. A fixed
+    /// wall-clock window ("N samples within 500ms") cannot guarantee production within the
+    /// window when threads get descheduled under load and is inherently flaky, so it "waits
+    /// until the condition is reached" instead. `max_wait` is a hang guard so that it does not
+    /// run forever even under extreme load; when exceeded it returns what has been collected
+    /// (any shortfall is detected by the caller's assertions).
     fn collect_until(
         consumer: &mut RawConsumer,
         max_wait: Duration,
@@ -737,11 +775,12 @@ mod tests {
         }
     }
 
-    /// [`collect_until`] の待ち上限。通常環境では条件到達で即抜けるので、これは
-    /// 「極端な負荷でスレッドがほとんど走れない」場合のハング防止でしかない。
+    /// Wait limit for [`collect_until`]. In a normal environment it exits as soon as the
+    /// condition is reached, so this is only a hang guard for the case where "threads can
+    /// barely run under extreme load".
     const COLLECT_MAX_WAIT: Duration = Duration::from_secs(30);
 
-    /// `v` に一致（誤差 [`VALUE_TOL`]）するサンプル数を数えるヘルパ。
+    /// Helper that counts the samples matching `v` (within [`VALUE_TOL`]).
     fn count_near(samples: &[f32], v: f32) -> usize {
         samples
             .iter()
@@ -749,17 +788,19 @@ mod tests {
             .count()
     }
 
-    /// 全サンプルが「理論上現れうる値の集合」のいずれかに一致することを検証し、
-    /// 合成値 `mixed` に一致した個数を返すヘルパ。
+    /// Helper that verifies every sample matches one of "the set of values that can
+    /// theoretically appear", and returns how many matched the mixed value `mixed`.
     ///
-    /// なぜ比率でなく集合判定か: 「定常部の 98% が合成値」のような比率アサーションは、
-    /// 負荷で producer / ミキサースレッドが飢餓閾値（60ms）超デスケジュールされると
-    /// 飢餓ゼロ埋めや片側値がどの区間にも混ざり得て、閾値をどこに置いてもいつか割れる
-    /// （比率は本質的に壁時計依存）。一方、直流ソース＋定数ゲインに対してミキサーが
-    /// 出せる値は mixed（両側合成）/ mic 単独（system 飢餓埋め）/ system 単独
-    /// （mic 飢餓埋め）/ 0.0（プライミング境界）の 4 つだけで、間違った和・ゲイン
-    /// 誤適用・クランプ漏れは必ずこの集合の外の値になる。スケジューラは値の分布を
-    /// 動かせても集合の外の値は作れないので、この判定はスケジューラ非依存。
+    /// Why a set check rather than a ratio: a ratio assertion such as "98% of the steady part is
+    /// the mixed value" breaks eventually wherever the threshold is placed, because when the
+    /// producer / mixer threads get descheduled beyond the starvation threshold (60ms) under
+    /// load, starvation zero fill or one-side values can get mixed into any interval (a ratio is
+    /// inherently wall-clock dependent). On the other hand, for DC sources + constant gains the
+    /// only values the mixer can output are these 4: mixed (both sides mixed) / mic alone
+    /// (system starvation fill) / system alone (mic starvation fill) / 0.0 (priming boundary);
+    /// a wrong sum, a misapplied gain or a missed clamp always yields a value outside this set.
+    /// The scheduler can shift the distribution of values but cannot produce a value outside
+    /// the set, so this check is scheduler-independent.
     fn assert_only_allowed_values(
         samples: &[f32],
         mixed: f32,
@@ -774,23 +815,25 @@ mod tests {
             } else {
                 assert!(
                     allowed.iter().any(|&a| (s - a).abs() < VALUE_TOL),
-                    "許容集合 {allowed:?} の外の値（合成の数学の誤り）: samples[{i}] = {s}"
+                    "value outside the allowed set {allowed:?} (error in the mixing math): \
+                     samples[{i}] = {s}"
                 );
             }
         }
         mixed_count
     }
 
-    /// 既知振幅の直流 2 ソース（0.2 と 0.3）を mic_gain=1.0 / system_gain=2.0 で合成
-    /// すると、出力は 0.2×1.0 + 0.3×2.0 = 0.8 になる（48k/stereo 子なので全段
-    /// パススルー・値は決定論的）。
+    /// Mixing two DC sources of known amplitude (0.2 and 0.3) with mic_gain=1.0 /
+    /// system_gain=2.0 yields 0.2×1.0 + 0.3×2.0 = 0.8 (the children are 48k/stereo, so every
+    /// stage is a passthrough and the value is deterministic).
     #[test]
     fn mix_sums_two_sources_with_gains() {
         let mic = Box::new(ConstBackend::new(0.2, None));
         let system = Box::new(ConstBackend::new(0.3, None));
         let (mut be, mut consumer) = start_composite(mic, system, 1.0, 2.0);
 
-        // 相応の量 + 合成値 1 チャンク分が出るまで集める（負荷で遅くても待つ）。
+        // Collect until a reasonable amount + one chunk of mixed values has come out (wait even
+        // if slow under load).
         let (mut total, mut mixed) = (0usize, 0usize);
         let samples = collect_until(&mut consumer, COLLECT_MAX_WAIT, |new| {
             total += new.len();
@@ -801,29 +844,31 @@ mod tests {
 
         assert!(
             samples.len() >= 10_000,
-            "相応のサンプルが出るはず: {}",
+            "a reasonable number of samples should come out: {}",
             samples.len()
         );
-        // 全域・全サンプルで集合判定: 現れてよいのは合成値 0.2*1.0 + 0.3*2.0 = 0.8、
-        // 飢餓ゼロ埋め時の片側値 0.2（mic 単独）/ 0.6（system 単独）、プライミング
-        // 境界の 0.0 だけ。1 サンプルでも集合外なら合成の数学が壊れている。
+        // Set check over the whole range and every sample: the only values allowed are the mixed
+        // value 0.2*1.0 + 0.3*2.0 = 0.8, the one-side values under starvation zero fill 0.2 (mic
+        // alone) / 0.6 (system alone), and 0.0 at the priming boundary. Even one sample outside
+        // the set means the mixing math is broken.
         let mixed_count = assert_only_allowed_values(&samples, 0.8, 0.2, 0.6);
-        // 存在保証: 合成が実際に起きていること（1 チャンク分の絶対数）。
+        // Existence guarantee: mixing actually happens (absolute count of one chunk).
         assert!(
             mixed_count >= ONE_CHUNK_SAMPLES,
-            "合成値 0.8 が相応に出現するはず: {mixed_count}/{}",
+            "the mixed value 0.8 should appear in reasonable numbers: {mixed_count}/{}",
             samples.len()
         );
     }
 
-    /// 合成が ±1.0 を超える組合せ（0.8 + 0.8 = 1.6）はクランプされて 1.0 になる。
+    /// A combination whose sum exceeds ±1.0 (0.8 + 0.8 = 1.6) is clamped to 1.0.
     #[test]
     fn mix_clamps_sum() {
         let mic = Box::new(ConstBackend::new(0.8, None));
         let system = Box::new(ConstBackend::new(0.8, None));
         let (mut be, mut consumer) = start_composite(mic, system, 1.0, 1.0);
 
-        // クランプされた合成値が 1 チャンク分出るまで集める（負荷で遅くても待つ）。
+        // Collect until one chunk of clamped mixed values has come out (wait even if slow
+        // under load).
         let mut clamped = 0usize;
         let samples = collect_until(&mut consumer, COLLECT_MAX_WAIT, |new| {
             clamped += count_near(new, 1.0);
@@ -831,38 +876,41 @@ mod tests {
         });
         be.stop();
 
-        // クランプの本質: どのサンプルも 1.0 を超えない。
+        // The essence of clamping: no sample exceeds 1.0.
         for (i, &s) in samples.iter().enumerate() {
             assert!(
                 s <= 1.0,
-                "クランプ後は 1.0 を超えないはず: samples[{i}] = {s}"
+                "should not exceed 1.0 after clamping: samples[{i}] = {s}"
             );
         }
-        // 全域・全サンプルで集合判定: 現れてよいのは clamp(0.8 + 0.8) = 1.0、
-        // 飢餓ゼロ埋め時の片側値 0.8、プライミング境界の 0.0 だけ（クランプ漏れの
-        // 1.6 などは集合外として即 FAIL）。
+        // Set check over the whole range and every sample: the only values allowed are
+        // clamp(0.8 + 0.8) = 1.0, the one-side value 0.8 under starvation zero fill, and 0.0 at
+        // the priming boundary (a missed clamp such as 1.6 is outside the set and FAILs
+        // immediately).
         let clamped_count = assert_only_allowed_values(&samples, 1.0, 0.8, 0.8);
-        // 存在保証: クランプされた合成値が実際に出現していること（1 チャンク分）。
+        // Existence guarantee: clamped mixed values actually appear (one chunk).
         assert!(
             clamped_count >= ONE_CHUNK_SAMPLES,
-            "クランプ値 1.0 が相応に出現するはず: {clamped_count}/{}",
+            "the clamped value 1.0 should appear in reasonable numbers: {clamped_count}/{}",
             samples.len()
         );
     }
 
-    /// 片側（system）が途中で供給を止めても出力は止まらず、飢餓側を無音 0.0 として
-    /// mic 側の音だけで合成が続く（mic 単独値 0.2 が流れ始める）。
+    /// Even if one side (system) stops supplying midway, output does not stop: the starved side
+    /// is treated as silence 0.0 and mixing continues with only the mic side's audio (the mic
+    /// alone value 0.2 starts flowing).
     #[test]
     fn mix_survives_one_side_starvation() {
         let mic = Box::new(ConstBackend::new(0.2, None));
-        // system は 150ms だけ給餌してから止まる（スレッドは生存）。
+        // system feeds for only 150ms and then stops (the thread stays alive).
         let system = Box::new(ConstBackend::new(0.3, Some(Duration::from_millis(150))));
         let (mut be, mut consumer) = start_composite(mic, system, 1.0, 1.0);
 
-        // system 停止（壁時計 150ms）→ バックログ消化 → 飢餓閾値経過の後、必ず
-        // mic 単独値 0.2 が流れ始める。「400ms 後の窓の大半が 0.2」のような壁時計窓
-        // の判定は、負荷でバックログ消化が遅れるだけで割れるので、「mic 単独値が
-        // 1 チャンク分出るまで待つ」存在保証に置く。
+        // After system stops (150ms of wall clock) → the backlog drains → the starvation
+        // threshold elapses, the mic alone value 0.2 always starts flowing. A wall-clock window
+        // check such as "most of the window after 400ms is 0.2" breaks merely because the
+        // backlog drains late under load, so this is an existence guarantee that "waits until
+        // one chunk of mic alone values has come out".
         let mut mic_only = 0usize;
         let samples = collect_until(&mut consumer, COLLECT_MAX_WAIT, |new| {
             mic_only += count_near(new, 0.2);
@@ -870,21 +918,21 @@ mod tests {
         });
         be.stop();
 
-        // 集合判定: 現れてよいのは合成値 0.5 / mic 単独 0.2 / system 単独 0.3 /
-        // プライミング境界の 0.0 だけ。
+        // Set check: the only values allowed are the mixed value 0.5 / mic alone 0.2 / system
+        // alone 0.3 / 0.0 at the priming boundary.
         assert_only_allowed_values(&samples, 0.5, 0.2, 0.3);
-        // 存在保証: system 停止後も出力は止まらず、飢餓側ゼロ埋めの mic 単独値が
-        // 実際に流れること。
+        // Existence guarantee: even after system stops, output does not stop, and the mic alone
+        // value from zero-filling the starved side actually flows.
         let mic_only_count = count_near(&samples, 0.2);
         assert!(
             mic_only_count >= ONE_CHUNK_SAMPLES,
-            "飢餓後は mic 単独の値 0.2 が流れ続けるはず: {mic_only_count}/{}",
+            "after starvation the mic alone value 0.2 should keep flowing: {mic_only_count}/{}",
             samples.len()
         );
     }
 
-    /// system 子の start が Err を返したら、先に起動した mic 子が stop され、全体も
-    /// Err になる（片肺で起動成功にしない）。
+    /// If the system child's start returns Err, the mic child started first is stopped and the
+    /// whole start is Err too (never report success with only one side running).
     #[test]
     fn mix_start_failure_cleans_up() {
         let starts = Arc::new(AtomicU32::new(0));
@@ -901,21 +949,21 @@ mod tests {
 
         let err = be
             .start(sink)
-            .expect_err("system 起動失敗で全体も Err のはず");
+            .expect_err("system start failure should make the whole start Err");
         assert!(
             matches!(err, Error::Backend(_)),
-            "system 子の Err が伝播するはず: {err:?}"
+            "the system child's Err should propagate: {err:?}"
         );
-        assert_eq!(starts.load(Ordering::SeqCst), 1, "mic は一度起動される");
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "mic is started once");
         assert_eq!(
             stops.load(Ordering::SeqCst),
             1,
-            "system 失敗時に mic が stop されるはず"
+            "mic should be stopped when system fails"
         );
     }
 
-    /// mic 子の start が Err なら system 子には触れず即 Err。stop は冪等で二重に
-    /// 呼べる。
+    /// If the mic child's start is Err, the system child is not touched and it is Err
+    /// immediately. stop is idempotent and can be called twice.
     #[test]
     fn mix_mic_start_failure_is_immediate() {
         let starts = Arc::new(AtomicU32::new(0));
@@ -929,21 +977,25 @@ mod tests {
         let mut be = CompositeBackend::new(mic, system, 1.0, 1.0);
         let (producer, _consumer) = raw_ring(RAW_RING_SAMPLES);
         let sink = RawSink::new(producer, 48_000, 2);
-        assert!(be.start(sink).is_err(), "mic 起動失敗で即 Err のはず");
+        assert!(
+            be.start(sink).is_err(),
+            "mic start failure should be Err immediately"
+        );
         assert_eq!(
             starts.load(Ordering::SeqCst),
             0,
-            "mic 失敗なら system は起動されない"
+            "system is not started when mic fails"
         );
 
-        // stop は未起動でも冪等（子の stop も冪等契約）。
+        // stop is idempotent even when never started (the children's stop is under the
+        // idempotency contract too).
         be.stop();
         be.stop();
     }
 
-    /// 合成バックエンドを実際の [`Stream`](crate::Stream) に載せた end-to-end。
-    /// 20ms/960frame のチャンクが流れ、data が合成値（0.2 + 0.3 = 0.5）になる。
-    /// Stream 本体無変更で seq・チャンク契約がそのまま効くことの裏取り。
+    /// End-to-end with the composite backend mounted on a real [`Stream`](crate::Stream).
+    /// 20ms/960frame chunks flow and the data is the mixed value (0.2 + 0.3 = 0.5).
+    /// Confirms that seq and the chunk contract keep working as is with the Stream unchanged.
     #[test]
     fn stream_delivers_mixed_chunks_end_to_end() {
         use flexaudio_core::types::StreamConfig;
@@ -954,8 +1006,8 @@ mod tests {
         let mut stream = crate::Stream::open(StreamConfig::default(), backend).expect("open");
         stream.start().expect("start");
 
-        // 合成値のサンプルが 1 チャンク分届くまでポーリングする（壁時計の固定窓は
-        // 負荷でフレークするため、条件到達までの待ち方式。上限はハング保険）。
+        // Poll until one chunk of mixed-value samples arrives (a fixed wall-clock window is
+        // flaky under load, so wait until the condition is reached. The limit is a hang guard).
         let mut chunks = Vec::new();
         let mut mixed = 0usize;
         let deadline = Instant::now() + COLLECT_MAX_WAIT;
@@ -968,32 +1020,33 @@ mod tests {
         }
         stream.stop();
 
-        assert!(!chunks.is_empty(), "チャンクが届くはず");
+        assert!(!chunks.is_empty(), "chunks should arrive");
         for (i, c) in chunks.iter().enumerate() {
             assert_eq!(c.frames, 960, "20ms@48k = 960 frame");
             assert_eq!(c.data.len(), 960 * 2, "stereo interleaved");
             if i > 0 {
-                assert!(c.seq > chunks[i - 1].seq, "seq は単調増加");
+                assert!(c.seq > chunks[i - 1].seq, "seq increases monotonically");
             }
         }
-        // 全チャンク・全サンプルで集合判定: 現れてよいのは合成値 0.2 + 0.3 = 0.5、
-        // 飢餓ゼロ埋め時の片側値 0.2（mic 単独）/ 0.3（system 単独）、プライミング
-        // 境界の 0.0 だけ。Stream の第 1 段は 48k/stereo でパススルー（gain 1.0 は
-        // バイト無変更）なので、ミキサー出力の値がそのまま届く。
+        // Set check over every chunk and every sample: the only values allowed are the mixed
+        // value 0.2 + 0.3 = 0.5, the one-side values under starvation zero fill 0.2 (mic alone)
+        // / 0.3 (system alone), and 0.0 at the priming boundary. The Stream's first stage is a
+        // passthrough at 48k/stereo (gain 1.0 leaves the bytes unchanged), so the mixer's output
+        // values arrive as is.
         let all: Vec<f32> = chunks.iter().flat_map(|c| c.data.iter().copied()).collect();
         let mixed_count = assert_only_allowed_values(&all, 0.5, 0.2, 0.3);
-        // 存在保証: 合成が実際に起きていること（1 チャンク分の絶対数）。
+        // Existence guarantee: mixing actually happens (absolute count of one chunk).
         assert!(
             mixed_count >= ONE_CHUNK_SAMPLES,
-            "合成値 0.5 が相応に出現するはず: {mixed_count}/{}",
+            "the mixed value 0.5 should appear in reasonable numbers: {mixed_count}/{}",
             all.len()
         );
     }
 
-    // ---- ドリフト補正のコンポーネント単体（純粋・決定論） ----
+    // ---- Drift correction components in isolation (pure, deterministic) ----
 
-    /// system 側が溜まる（mic - system が負）と r は 1.0 より上（速く消費する方向）
-    /// へ、mic 側が溜まると 1.0 より下へ動く。
+    /// When the system side accumulates (mic - system is negative) r moves above 1.0 (towards
+    /// consuming faster), and when the mic side accumulates it moves below 1.0.
     #[test]
     fn drift_controller_moves_toward_lagging_side() {
         let mut c = DriftController::new();
@@ -1002,7 +1055,7 @@ mod tests {
         }
         assert!(
             c.ratio > 1.0,
-            "system 側が溜まると r > 1.0 のはず: {}",
+            "r should be > 1.0 when the system side accumulates: {}",
             c.ratio
         );
 
@@ -1012,12 +1065,13 @@ mod tests {
         }
         assert!(
             c.ratio < 1.0,
-            "mic 側が溜まると r < 1.0 のはず: {}",
+            "r should be < 1.0 when the mic side accumulates: {}",
             c.ratio
         );
     }
 
-    /// どれだけ大きな残量差を与え続けても r は 1.0 ± 500ppm で頭打ちになる。
+    /// No matter how large a backlog difference keeps being applied, r tops out at
+    /// 1.0 ± 500ppm.
     #[test]
     fn drift_controller_clamps_at_ratio_limit() {
         let mut c = DriftController::new();
@@ -1026,7 +1080,7 @@ mod tests {
         }
         assert!(
             (c.ratio - (1.0 + DRIFT_RATIO_LIMIT)).abs() < 1e-12,
-            "上側クランプちょうどで止まるはず: {}",
+            "should stop exactly at the upper clamp: {}",
             c.ratio
         );
 
@@ -1036,25 +1090,26 @@ mod tests {
         }
         assert!(
             (c.ratio - (1.0 - DRIFT_RATIO_LIMIT)).abs() < 1e-12,
-            "下側クランプちょうどで止まるはず: {}",
+            "should stop exactly at the lower clamp: {}",
             c.ratio
         );
     }
 
-    /// 巨大な残量差を一撃で与えても、1 回の更新で動けるのは slew 幅まで。
+    /// Even when a huge backlog difference is applied in one shot, a single update can move
+    /// only up to the slew width.
     #[test]
     fn drift_controller_slew_limits_change_per_update() {
         let mut c = DriftController::new();
         c.update(0, 10_000_000);
         assert!(
             (c.ratio - (1.0 + DRIFT_SLEW_PER_UPDATE)).abs() < 1e-12,
-            "1 回目の更新は slew 幅ちょうどで頭打ちのはず: {}",
+            "the first update should top out exactly at the slew width: {}",
             c.ratio
         );
         c.update(0, 10_000_000);
         assert!(
             (c.ratio - (1.0 + 2.0 * DRIFT_SLEW_PER_UPDATE)).abs() < 1e-12,
-            "2 回目も 1 段階ずつ: {}",
+            "the second one also moves one step at a time: {}",
             c.ratio
         );
 
@@ -1062,27 +1117,32 @@ mod tests {
         c.update(10_000_000, 0);
         assert!(
             (c.ratio - (1.0 - DRIFT_SLEW_PER_UPDATE)).abs() < 1e-12,
-            "反対向きも slew 幅ちょうど: {}",
+            "the opposite direction is also exactly the slew width: {}",
             c.ratio
         );
     }
 
-    /// on_output は合成 100ms 分（更新間隔）たまるまでは比率を見直さない。
+    /// on_output does not revisit the ratio until 100ms of mixed output (the update interval)
+    /// has accumulated.
     #[test]
     fn drift_controller_updates_only_at_interval() {
         let mut c = DriftController::new();
         c.on_output(DRIFT_UPDATE_INTERVAL_SAMPLES - 1, 0, 10_000_000);
         assert!(
             (c.ratio - 1.0).abs() < 1e-15,
-            "間隔未満では動かないはず: {}",
+            "should not move below the interval: {}",
             c.ratio
         );
         c.on_output(1, 0, 10_000_000);
-        assert!(c.ratio > 1.0, "間隔に達したら見直すはず: {}", c.ratio);
+        assert!(
+            c.ratio > 1.0,
+            "should revisit once the interval is reached: {}",
+            c.ratio
+        );
     }
 
-    /// 等速（r = 1.0・位相 0）ならステッチャは完全なパススルー: 入力と同じ値が
-    /// そのまま出て、FIFO は全量消費され、位相も 0 のまま。
+    /// At unit speed (r = 1.0, phase 0) the stitcher is a perfect passthrough: the same values
+    /// as the input come out as is, the FIFO is fully consumed, and the phase stays 0.
     #[test]
     fn stitcher_unity_ratio_is_passthrough() {
         let mut st = LinearStitcher::new();
@@ -1091,18 +1151,22 @@ mod tests {
         assert_eq!(st.producible(10, 1.0), 10);
         let mut out = Vec::new();
         st.pull(&mut fifo, 1.0, 10, &mut out);
-        assert_eq!(out, src, "r=1.0 はパススルーのはず");
-        assert!(fifo.is_empty(), "全量消費されるはず: {} 残り", fifo.len());
-        assert!(st.frac.abs() < 1e-12, "位相は 0 のまま: {}", st.frac);
+        assert_eq!(out, src, "r=1.0 should be a passthrough");
+        assert!(
+            fifo.is_empty(),
+            "should be fully consumed: {} remaining",
+            fifo.len()
+        );
+        assert!(st.frac.abs() < 1e-12, "phase stays 0: {}", st.frac);
     }
 
-    /// ランプ（frame k の値 = k）を r = 1.25 で読むと、出力は位置 0 / 1.25 / 2.5 /
-    /// 3.75 の線形補間値そのものになる（両チャンネルとも・決定論）。
+    /// Reading a ramp (value of frame k = k) with r = 1.25 yields exactly the linear
+    /// interpolation values at positions 0 / 1.25 / 2.5 / 3.75 (both channels, deterministic).
     #[test]
     fn stitcher_interpolates_between_frames() {
         let mut st = LinearStitcher::new();
         let mut fifo: Vec<f32> = (0..5).flat_map(|f| [f as f32, f as f32 * 10.0]).collect();
-        // span = 4, floor(4 / 1.25) = 3 → 3 + 1 = 4 フレーム作れる。
+        // span = 4, floor(4 / 1.25) = 3 → 3 + 1 = 4 frames can be produced.
         assert_eq!(st.producible(5, 1.25), 4);
         let mut out = Vec::new();
         st.pull(&mut fifo, 1.25, 4, &mut out);
@@ -1110,24 +1174,28 @@ mod tests {
         for (k, &e) in expect.iter().enumerate() {
             assert!(
                 (out[k * 2] - e).abs() < 1e-6,
-                "位置 {e} の補間値: {}",
+                "interpolated value at position {e}: {}",
                 out[k * 2]
             );
             assert!(
                 (out[k * 2 + 1] - e * 10.0).abs() < 1e-5,
-                "ch2 も同じ位置で補間: {}",
+                "ch2 is interpolated at the same position: {}",
                 out[k * 2 + 1]
             );
         }
-        // floor(0 + 4×1.25) = 5 で全フレーム読み終わり、位相は 0 に戻る。
-        assert!(fifo.is_empty(), "全量消費されるはず: {} 残り", fifo.len());
-        assert!(st.frac.abs() < 1e-12, "位相: {}", st.frac);
+        // floor(0 + 4×1.25) = 5, so all frames have been read and the phase returns to 0.
+        assert!(
+            fifo.is_empty(),
+            "should be fully consumed: {} remaining",
+            fifo.len()
+        );
+        assert!(st.frac.abs() < 1e-12, "phase: {}", st.frac);
     }
 
-    // ---- スレッド無しの同期ドリフトシミュレーション（決定論） ----
+    // ---- Synchronous drift simulation without threads (deterministic) ----
 
-    /// スレッドを立てない同期シミュレーション用の ChildLane。リング・正規化器は
-    /// 形として持つだけで、供給はテストが [`sim_feed`] で FIFO へ直接行う。
+    /// ChildLane for the thread-free synchronous simulation. The ring and normalizer are only
+    /// held for form; the test supplies data directly into the FIFO with [`sim_feed`].
     fn sim_lane() -> ChildLane {
         let (_producer, consumer) = raw_ring(16);
         let normalizer = Normalizer::new(
@@ -1138,7 +1206,7 @@ mod tests {
                 channels: CHANNELS,
             },
         )
-        .expect("パススルー正規化器");
+        .expect("passthrough normalizer");
         ChildLane {
             consumer,
             normalizer,
@@ -1147,7 +1215,8 @@ mod tests {
         }
     }
 
-    /// ingest と同じ流儀（FIFO へ積む + 上限の安全弁）で直流フレームを直接供給する。
+    /// Supplies DC frames directly, in the same way as ingest (append to the FIFO + the limit
+    /// safety valve).
     fn sim_feed(lane: &mut ChildLane, value: f32, frames: usize) {
         let new_len = lane.fifo.len() + frames * CHANNELS as usize;
         lane.fifo.resize(new_len, value);
@@ -1158,27 +1227,28 @@ mod tests {
         lane.last_supply = Instant::now();
     }
 
-    /// 同期ドリフトシミュレーションの計測結果。
+    /// Measurement results of the synchronous drift simulation.
     struct DriftSimOutcome {
-        /// 1 シミュレーション秒ごとの消費後 FIFO 残量（f32 サンプル数）。
+        /// Post-consumption FIFO backlog (in f32 samples) at each simulated second.
         system_backlog: Vec<usize>,
         mic_backlog: Vec<usize>,
         final_ratio: f64,
     }
 
-    /// スレッドを立てない同期シミュレーション。20ms を 1 tick として、mic に等速
-    /// （960 frame/tick）、system に (1 + ppm×1e-6) 倍レートの直流を「時間の進みを
-    /// サンプル数で模擬」しながら供給し、mix_and_push を直接ループで駆動する。
-    /// スレッド・壁時計に依存しないので完全に決定論。
+    /// Synchronous simulation without threads. With 20ms as one tick, it supplies DC to mic at
+    /// unit rate (960 frame/tick) and to system at (1 + ppm×1e-6) times the rate, "simulating
+    /// the passage of time with sample counts", and drives mix_and_push directly in a loop.
+    /// It does not depend on threads or the wall clock, so it is fully deterministic.
     ///
-    /// `fixed_unity_ratio` はコントローラを毎 tick 1.0 に戻す「補正なし」相当のパス。
-    /// ドリフト問題（残量の単調増大）がこのシミュレーションで実際に再現できている
-    /// ことの自己検証に使う。
+    /// `fixed_unity_ratio` is a path equivalent to "no correction" that resets the controller to
+    /// 1.0 on every tick. Used to self-check that this simulation actually reproduces the drift
+    /// problem (monotonic growth of the backlog).
     ///
-    /// 出力値は毎 tick 全数検証する: 両側とも常に供給があるので、現れてよいのは
-    /// 合成値（0.2 + 0.3 = 0.5。直流の線形補間は同じ直流値）だけ。飢餓ゼロ埋めの
-    /// 0.0 や片側値が 1 サンプルでも出たら即 FAIL（「ゼロ埋めが定常発生しない」
-    /// ことの検証を兼ねる）。
+    /// Every output value is verified on every tick: both sides always have supply, so the only
+    /// value allowed is the mixed value (0.2 + 0.3 = 0.5; linear interpolation of DC is the same
+    /// DC value). If even one sample of starvation zero fill 0.0 or a one-side value appears it
+    /// FAILs immediately (this doubles as verifying that "zero fill does not occur in steady
+    /// state").
     fn run_drift_sim(ppm: f64, seconds: usize, fixed_unity_ratio: bool) -> DriftSimOutcome {
         const TICK_FRAMES: usize = 960; // 20ms @48k
         const TICKS_PER_SEC: usize = 50;
@@ -1191,7 +1261,8 @@ mod tests {
         let mut mixed: Vec<f32> = Vec::with_capacity(FIFO_MAX_SAMPLES);
         let mut scratch = vec![0.0f32; RAW_RING_SAMPLES];
 
-        // system 供給フレーム数の端数繰り越し（レート差をサンプル数で正確に模擬）。
+        // Carry-over of the fractional system supply frame count (simulates the rate
+        // difference exactly in sample counts).
         let mut system_carry = 0.0f64;
         let mut outcome = DriftSimOutcome {
             system_backlog: Vec::new(),
@@ -1224,8 +1295,8 @@ mod tests {
             for &s in &scratch[..got] {
                 assert!(
                     (s - 0.5).abs() < VALUE_TOL,
-                    "定常シミュレーションの出力は合成値 0.5 だけのはず（ゼロ埋め・片側値は \
-                     出ない）: {s}"
+                    "the steady-state simulation output should be only the mixed value 0.5 (no \
+                     zero fill or one-side values): {s}"
                 );
             }
 
@@ -1238,110 +1309,118 @@ mod tests {
         outcome
     }
 
-    /// +300ppm（system が速い）を 60 秒: 補正ありでは system FIFO 残量が安全弁に
-    /// 届かず、伸びが減速し、補正なし相当より小さく収まる。補正なし相当（r = 1.0
-    /// 固定）では同条件で残量が単調増大する＝テスト自体がドリフト問題を再現できて
-    /// いることの自己検証。
+    /// +300ppm (system is faster) for 60 seconds: with correction the system FIFO backlog does
+    /// not reach the safety valve, its growth slows down, and it stays smaller than the
+    /// no-correction equivalent. With the no-correction equivalent (r = 1.0 fixed) the backlog
+    /// grows monotonically under the same conditions = self-check that the test itself
+    /// reproduces the drift problem.
     #[test]
     fn mix_drift_sim_plus_300ppm_stays_bounded() {
         let corrected = run_drift_sim(300.0, 60, false);
         let uncorrected = run_drift_sim(300.0, 60, true);
 
-        // 自己検証: 補正なしでは system 残量が毎秒単調増大（+300ppm ≒ +28.8 サンプル/秒）。
+        // Self-check: without correction the system backlog grows monotonically every second
+        // (+300ppm ≒ +28.8 samples/s).
         for (i, w) in uncorrected.system_backlog.windows(2).enumerate() {
             assert!(
                 w[1] > w[0],
-                "補正なしでは残量が単調増大するはず: {i} 秒目 {} → {}",
+                "without correction the backlog should grow monotonically: second {i} {} → {}",
                 w[0],
                 w[1]
             );
         }
 
-        // 補正あり: 残量は安全弁（FIFO_MAX_SAMPLES = 500ms 分）に到達しない。
+        // With correction: the backlog does not reach the safety valve (FIFO_MAX_SAMPLES =
+        // 500ms worth).
         let max_corrected = corrected.system_backlog.iter().copied().max().unwrap();
         assert!(
             max_corrected < FIFO_MAX_SAMPLES,
-            "補正ありなら安全弁に届かないはず: 最大 {max_corrected}"
+            "with correction it should not reach the safety valve: max {max_corrected}"
         );
 
-        // 補正あり: 補正なしより小さく収まる（補正が実際に効いている）。
+        // With correction: it stays smaller than without correction (the correction actually
+        // works).
         let last_c = *corrected.system_backlog.last().unwrap();
         let last_u = *uncorrected.system_backlog.last().unwrap();
         assert!(
             last_c < last_u,
-            "補正ありの残量 {last_c} < 補正なし {last_u} のはず"
+            "backlog with correction {last_c} should be < without correction {last_u}"
         );
 
-        // 補正あり: 残量の伸びが減速している（最初の 9 秒間の増分 > 最後の 9 秒間の増分）。
+        // With correction: the growth of the backlog slows down (increase over the first 9
+        // seconds > increase over the last 9 seconds).
         let sb = &corrected.system_backlog;
         let early = sb[9] - sb[0];
         let late = sb[59] - sb[50];
         assert!(
             late < early,
-            "比率が追い付くにつれ伸びが減速するはず: 序盤 +{early} vs 終盤 +{late}"
+            "growth should slow down as the ratio catches up: early +{early} vs late +{late}"
         );
 
-        // 比率は「system を速く消費する」方向へ動き、クランプ内に収まる。
+        // The ratio moves towards "consuming system faster" and stays within the clamp.
         assert!(
             corrected.final_ratio > 1.0 + 2e-5,
-            "r は 1.0 より上へ動くはず: {}",
+            "r should move above 1.0: {}",
             corrected.final_ratio
         );
         assert!(
             corrected.final_ratio <= 1.0 + DRIFT_RATIO_LIMIT + 1e-12,
-            "r はクランプ内: {}",
+            "r is within the clamp: {}",
             corrected.final_ratio
         );
     }
 
-    /// -300ppm（system が遅い）を 60 秒: 飢餓ゼロ埋めは定常発生せず（出力値検証は
-    /// run_drift_sim 内で毎 tick 全数実施）、補正ありでは mic 側の残量が安全弁に
-    /// 届かず補正なし相当より小さく収まる。
+    /// -300ppm (system is slower) for 60 seconds: starvation zero fill does not occur in steady
+    /// state (output values are fully verified on every tick inside run_drift_sim), and with
+    /// correction the mic-side backlog does not reach the safety valve and stays smaller than
+    /// the no-correction equivalent.
     #[test]
     fn mix_drift_sim_minus_300ppm_no_steady_zero_fill() {
         let corrected = run_drift_sim(-300.0, 60, false);
         let uncorrected = run_drift_sim(-300.0, 60, true);
 
-        // 自己検証: 補正なしでは遅い system に合わせるぶん mic 側の残量が単調増大。
+        // Self-check: without correction the mic-side backlog grows monotonically, since it
+        // keeps pace with the slow system.
         for (i, w) in uncorrected.mic_backlog.windows(2).enumerate() {
             assert!(
                 w[1] > w[0],
-                "補正なしでは mic 残量が単調増大するはず: {i} 秒目 {} → {}",
+                "without correction the mic backlog should grow monotonically: second {i} {} → {}",
                 w[0],
                 w[1]
             );
         }
 
-        // 補正あり: mic 残量は安全弁に到達せず、補正なしより小さく収まる。
+        // With correction: the mic backlog does not reach the safety valve and stays smaller
+        // than without correction.
         let max_corrected = corrected.mic_backlog.iter().copied().max().unwrap();
         assert!(
             max_corrected < FIFO_MAX_SAMPLES,
-            "補正ありなら安全弁に届かないはず: 最大 {max_corrected}"
+            "with correction it should not reach the safety valve: max {max_corrected}"
         );
         let last_c = *corrected.mic_backlog.last().unwrap();
         let last_u = *uncorrected.mic_backlog.last().unwrap();
         assert!(
             last_c < last_u,
-            "補正ありの mic 残量 {last_c} < 補正なし {last_u} のはず"
+            "mic backlog with correction {last_c} should be < without correction {last_u}"
         );
 
-        // system 側は消費が供給に追随するので溜まらない（高々補間の端数 + 直近の
-        // 端数チャンク程度）。
+        // The system side does not accumulate, since consumption follows supply (at most the
+        // interpolation remainder + the most recent partial chunk).
         let max_sys = corrected.system_backlog.iter().copied().max().unwrap();
         assert!(
             max_sys < ONE_CHUNK_SAMPLES,
-            "system 側は溜まらないはず: 最大 {max_sys}"
+            "the system side should not accumulate: max {max_sys}"
         );
 
-        // 比率は「system をゆっくり消費する」方向へ動き、クランプ内に収まる。
+        // The ratio moves towards "consuming system more slowly" and stays within the clamp.
         assert!(
             corrected.final_ratio < 1.0 - 2e-5,
-            "r は 1.0 より下へ動くはず: {}",
+            "r should move below 1.0: {}",
             corrected.final_ratio
         );
         assert!(
             corrected.final_ratio >= 1.0 - DRIFT_RATIO_LIMIT - 1e-12,
-            "r はクランプ内: {}",
+            "r is within the clamp: {}",
             corrected.final_ratio
         );
     }
