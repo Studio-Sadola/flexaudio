@@ -62,14 +62,16 @@ PINNED_ACTION = "dtolnay/rust-toolchain"
 USES_RE = re.compile(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)\s*(?:#.*)?$")
 # A key directly under jobs: (indented by two spaces) = a job id.
 JOB_KEY_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
-# A job display name (indented by four spaces; a step name: is indented by six, so it does not match).
+# A job display name (indented by four spaces; a step name: is indented by six, so it does
+# not match).
 JOB_NAME_RE = re.compile(r"^    name:\s*(.+?)\s*$")
 JOBS_KEY_RE = re.compile(r"^jobs:\s*$")
 STEP_NAME_RE = re.compile(r"^\s*(?:-\s*)?name:")
 COMMENT_RE = re.compile(r"^\s*#")
 # Only numeric versions count as "pinned". @stable / @master / a commit SHA are not pins.
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)(?:\.(\d+))?$")
-# A cargo / rustc call that appears literally on a line (requires trailing whitespace to reduce false positives).
+# A cargo / rustc call that appears literally on a line (requires trailing whitespace to
+# reduce false positives).
 CARGO_CALL_RE = re.compile(r"(?:^|[\s;&|(){}])(?:cargo|rustc)\s")
 
 
@@ -80,7 +82,7 @@ class Pin:
 
 
 def normalize_version(raw: str) -> str | None:
-    """Normalize '1.98.1' / '1.91' to a comparable 'X.Y.Z'. Returns None for a non-numeric version."""
+    """Normalize '1.98.1' / '1.91' to a comparable 'X.Y.Z'. None for a non-numeric version."""
     match = VERSION_RE.match(raw.strip())
     if match is None:
         return None

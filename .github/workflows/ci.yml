@@ -145,8 +145,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
-          # Install those targets' std so the platform-exclusive crates can be checked
-          # cross (a cross `check` needs no linker, so it runs from Linux).
+          # Install those targets' std so the platform-exclusive crates can be checked by
+          # cross-compiling (a cross `check` needs no linker, so it runs from Linux).
           targets: aarch64-apple-darwin, x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies

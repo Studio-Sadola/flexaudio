@@ -187,9 +187,9 @@ fn uniquify_names<F: Fact, O>(nodes: &mut [Node<F, O>]) {
     }
 }
 
-/// tract 0.23.7 checks node-name uniqueness after `compact()` in debug builds. Only when
-/// silero's Scan expansion creates identically named temporary Consts, the already completed
-/// optimization result is accepted.
+/// tract 0.23.7 checks node-name uniqueness after `compact()` in debug builds. The already
+/// completed optimization result is accepted only when silero's Scan expansion creates
+/// identically named temporary Consts.
 fn accept_debug_duplicate_names(result: TractResult<()>) -> Result<(), VadError> {
     match result {
         Ok(()) => Ok(()),

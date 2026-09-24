@@ -25,7 +25,8 @@ repository = "https://github.com/Studio-Sadola/flexaudio"
 authors = ["tubome (Studio Sadola)"]
 
 [workspace.dependencies]
-# Pure-Rust dependencies required by flexaudio-core (no system libraries, no network access at runtime)
+# Pure-Rust dependencies required by flexaudio-core (no system libraries, no network access
+# at runtime)
 bitflags = "2"
 ringbuf = "0.4"
 rtrb = "0.3"
