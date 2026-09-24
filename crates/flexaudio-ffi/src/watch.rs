@@ -1,13 +1,15 @@
-//! デバイス着脱監視（ホットプラグ）の C ABI。
+//! C ABI for device hotplug watching.
 //!
-//! [`FlexWatcher`] は [`flexaudio::DeviceWatcher`] を包む不透明ハンドルで、デバイスの
-//! 接続・切断・既定変更を pull 型（[`flexaudio_watcher_poll`]）で配信する。capture stream
-//! 単位のイベント（`flexaudio_poll_event`）とは別系統で、デバイス単位の事象を扱う。
-//! これまで C ABI に無かったパリティ欠落を埋める（napi 側には既にある）。
+//! [`FlexWatcher`] is an opaque handle wrapping a [`flexaudio::DeviceWatcher`] and delivers
+//! device connects, disconnects, and default changes in a pull-based way
+//! ([`flexaudio_watcher_poll`]). It is a separate channel from per-capture-stream events
+//! (`flexaudio_poll_event`) and handles per-device occurrences. It fills a parity gap the C ABI
+//! had until now (the napi side already has it).
 //!
-//! 流儀はクレート全体と同じ（guard で panic を吸収・NULL 検査・失敗は last_error）。
-//! poll が埋める `FlexDeviceEvent` の文字列（`id`/`name`）は flexaudio 所有で、
-//! [`flexaudio_device_event_free`] で解放する（C の free は使わない）。
+//! Conventions are the same as the rest of the crate (guards absorb panics, NULL checks,
+//! failures go to last_error). The strings (`id`/`name`) of the `FlexDeviceEvent` filled by
+//! poll are owned by flexaudio and are freed with [`flexaudio_device_event_free`] (do not use
+//! C's free).
 
 use std::ffi::CString;
 use std::os::raw::c_char;
@@ -19,53 +21,54 @@ use crate::error::{clear_last_error, code, set_last_error};
 use crate::types::FlexSourceKind;
 use crate::{guard_i32, guard_ptr};
 
-/// デバイス着脱イベントの種別（[`flexaudio::DeviceEvent`] に対応）。
+/// Kind of device hotplug event (corresponds to [`flexaudio::DeviceEvent`]).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlexDeviceEventKind {
-    /// デバイスが追加された（`device`/`name` 等が埋まる）。
+    /// A device was added (`device`/`name` etc. are filled).
     Added = 0,
-    /// デバイスが取り外された（`id` のみ）。
+    /// A device was removed (`id` only).
     Removed = 1,
-    /// OS 既定デバイスが変わった（`id` と `source_kind`）。
+    /// The OS default device changed (`id` and `source_kind`).
     DefaultChanged = 2,
-    /// 既知のどれにも当たらないイベント（将来のバリアント追加に備える）。
+    /// An event that matches none of the known ones (in preparation for future variants).
     Unknown = 3,
 }
 
-/// 取得した 1 つのデバイスイベント。`flexaudio_watcher_poll` が埋める。
+/// One retrieved device event. Filled by `flexaudio_watcher_poll`.
 ///
-/// フィールドの有効範囲は `kind` による:
-/// - `Added`: `id`/`name` と `source_kind`/`sample_rate`/`channels`/`is_loopback`/`is_default`
-///   がすべて埋まる（追加されたデバイスの完全な情報）。
-/// - `Removed`: `id` のみ（`name` は NULL・数値は 0）。
-/// - `DefaultChanged`: `id` と `source_kind`（既定が切り替わった側）のみ。
+/// Which fields are valid depends on `kind`:
+/// - `Added`: `id`/`name` and `source_kind`/`sample_rate`/`channels`/`is_loopback`/`is_default`
+///   are all filled (complete information about the added device).
+/// - `Removed`: `id` only (`name` is NULL, numbers are 0).
+/// - `DefaultChanged`: only `id` and `source_kind` (the side whose default switched).
 ///
-/// `id`/`name` は flexaudio 所有の UTF-8 NUL 終端文字列で、[`flexaudio_device_event_free`]
-/// で解放する（C の free は使わない）。
+/// `id`/`name` are UTF-8 NUL-terminated strings owned by flexaudio and are freed with
+/// [`flexaudio_device_event_free`] (do not use C's free).
 #[repr(C)]
 pub struct FlexDeviceEvent {
-    /// イベント種別。
+    /// Event kind.
     pub kind: FlexDeviceEventKind,
-    /// 安定 ID（`Added`/`Removed`/`DefaultChanged` で有効・`flexaudio_device_event_free`
-    /// で解放）。`Unknown` では NULL。
+    /// Stable ID (valid for `Added`/`Removed`/`DefaultChanged`; freed by
+    /// `flexaudio_device_event_free`). NULL for `Unknown`.
     pub id: *mut c_char,
-    /// 表示名（`Added` のみ・`flexaudio_device_event_free` で解放）。他では NULL。
+    /// Display name (`Added` only; freed by `flexaudio_device_event_free`). NULL otherwise.
     pub name: *mut c_char,
-    /// `Added` では当該デバイスのソース種別、`DefaultChanged` では既定が切り替わった側
-    /// （`Mic` = 既定 source / `System` = 既定 sink）。他では未使用（`Mic`）。
+    /// For `Added`, the source kind of the device; for `DefaultChanged`, the side whose
+    /// default switched (`Mic` = default source / `System` = default sink). Unused otherwise
+    /// (`Mic`).
     pub source_kind: FlexSourceKind,
-    /// ネイティブサンプルレート（`Added` のみ・他では 0）。
+    /// Native sample rate (`Added` only; 0 otherwise).
     pub sample_rate: u32,
-    /// ネイティブチャンネル数（`Added` のみ・他では 0）。
+    /// Native channel count (`Added` only; 0 otherwise).
     pub channels: u16,
-    /// ループバック（`Added` のみ）。
+    /// Loopback (`Added` only).
     pub is_loopback: bool,
-    /// OS の既定デバイス（`Added` のみ）。
+    /// OS default device (`Added` only).
     pub is_default: bool,
 }
 
-/// [`DeviceEvent`] を `FlexDeviceEvent` に写す（`id`/`name` は C へ所有権を渡す）。
+/// Maps a [`DeviceEvent`] to a `FlexDeviceEvent` (ownership of `id`/`name` passes to C).
 fn device_event_to_c(ev: DeviceEvent) -> FlexDeviceEvent {
     match ev {
         DeviceEvent::Added(info) => FlexDeviceEvent {
@@ -98,7 +101,8 @@ fn device_event_to_c(ev: DeviceEvent) -> FlexDeviceEvent {
             is_loopback: false,
             is_default: false,
         },
-        // DeviceEvent は #[non_exhaustive]。未知種別は Unknown にして握り潰さない。
+        // DeviceEvent is #[non_exhaustive]. An unknown kind becomes Unknown rather than being
+        // swallowed.
         other => {
             set_last_error(format!("unknown device event: {other:?}"));
             FlexDeviceEvent {
@@ -115,17 +119,18 @@ fn device_event_to_c(ev: DeviceEvent) -> FlexDeviceEvent {
     }
 }
 
-/// デバイスの不透明ウォッチャハンドル。中身は [`flexaudio::DeviceWatcher`]。
-/// `flexaudio_watch_devices` で作り `flexaudio_watcher_free` で解放する。
+/// Opaque device watcher handle. It contains a [`flexaudio::DeviceWatcher`].
+/// Create it with `flexaudio_watch_devices` and free it with `flexaudio_watcher_free`.
 pub struct FlexWatcher {
     inner: DeviceWatcher,
 }
 
-/// デバイスの着脱・既定変更の監視を開始し、ウォッチャハンドルを返す。
+/// Starts watching device hotplug and default changes and returns a watcher handle.
 ///
-/// Linux は PipeWire レジストリを永続監視する。PipeWire 不在・非対応 OS では no-op へ
-/// 縮退して有効なハンドルを返す（着脱が来ないだけ・poll は常に 0）。失敗時のみ NULL +
-/// last_error。返ったハンドルは `flexaudio_watcher_free` で解放する。
+/// On Linux, the PipeWire registry is watched persistently. Without PipeWire or on an
+/// unsupported OS, it degrades to a no-op and returns a valid handle (hotplug events simply
+/// never arrive; poll always returns 0). NULL + last_error only on failure. Free the returned
+/// handle with `flexaudio_watcher_free`.
 #[no_mangle]
 pub extern "C" fn flexaudio_watch_devices() -> *mut FlexWatcher {
     guard_ptr(|| {
@@ -140,13 +145,13 @@ pub extern "C" fn flexaudio_watch_devices() -> *mut FlexWatcher {
     })
 }
 
-/// デバイスイベントを 1 つ取り出して `out` を埋める（非ブロッキング）。
+/// Takes out one device event and fills `out` (non-blocking).
 ///
-/// 戻り 1 = 取得して `out` を埋めた / 0 = 今は無し / 負 = エラー。埋めた `out` は使い
-/// 終わったら `flexaudio_device_event_free` で解放する。
+/// Returns 1 = got one and filled `out` / 0 = none right now / negative = error. Free the
+/// filled `out` with `flexaudio_device_event_free` when done.
 ///
 /// # Safety
-/// `w` は有効なハンドル、`out` は有効な `FlexDeviceEvent` の書き込み先でなければならない。
+/// `w` must be a valid handle and `out` must be a valid `FlexDeviceEvent` write target.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_watcher_poll(
     w: *mut FlexWatcher,
@@ -172,12 +177,11 @@ pub unsafe extern "C" fn flexaudio_watcher_poll(
     })
 }
 
-/// `flexaudio_watcher_poll` が埋めた `id`/`name` を解放し、NULL にする。NULL・二重解放
-/// とも安全。
+/// Frees the `id`/`name` filled by `flexaudio_watcher_poll` and sets them to NULL. Safe for
+/// both NULL and double free.
 ///
 /// # Safety
-/// `ev` は `flexaudio_watcher_poll` が埋めた `FlexDeviceEvent`（または NULL）を指して
-/// いなければならない。
+/// `ev` must point to a `FlexDeviceEvent` filled by `flexaudio_watcher_poll` (or be NULL).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_device_event_free(ev: *mut FlexDeviceEvent) {
     guard_i32(|| {
@@ -195,16 +199,16 @@ pub unsafe extern "C" fn flexaudio_device_event_free(ev: *mut FlexDeviceEvent) {
     });
 }
 
-/// ウォッチャを停止して解放する。NULL 安全。
+/// Stops and frees the watcher. NULL-safe.
 ///
 /// # Safety
-/// `w` は `flexaudio_watch_devices` が返したハンドル（または NULL）でなければならない。
-/// 解放後の `w` を使ってはならない。
+/// `w` must be a handle returned by `flexaudio_watch_devices` (or NULL).
+/// `w` must not be used after it is freed.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_watcher_free(w: *mut FlexWatcher) {
     guard_i32(|| {
         if !w.is_null() {
-            // DeviceWatcher の Drop が stop() を呼ぶ。
+            // DeviceWatcher's Drop calls stop().
             drop(Box::from_raw(w));
         }
         code::FLEX_OK
@@ -217,26 +221,26 @@ mod tests {
     use flexaudio::{DeviceInfo, SourceKind};
     use std::ffi::CStr;
 
-    /// watch → poll → free の一巡（PipeWire 不在でも縮退して安全）。
+    /// One full watch → poll → free cycle (safe via degradation even without PipeWire).
     #[test]
     fn watch_poll_free_smoke() {
         let w = flexaudio_watch_devices();
         assert!(
             !w.is_null(),
-            "watch_devices は縮退して常にハンドルを返す設計"
+            "watch_devices is designed to degrade and always return a handle"
         );
         let mut ev = std::mem::MaybeUninit::<FlexDeviceEvent>::uninit();
-        // 縮退時は 0（今は無し）。取れても負にはならない。
+        // When degraded, 0 (none right now). Even if one is obtained, it is never negative.
         let rc = unsafe { flexaudio_watcher_poll(w, ev.as_mut_ptr()) };
-        assert!(rc >= 0, "poll がエラーを返した: {rc}");
+        assert!(rc >= 0, "poll returned an error: {rc}");
         if rc == 1 {
-            // 取れた場合はイベントを解放する。
+            // If one was obtained, free the event.
             unsafe { flexaudio_device_event_free(ev.as_mut_ptr()) };
         }
         unsafe { flexaudio_watcher_free(w) };
     }
 
-    /// NULL ハンドル・NULL 出力先は InvalidArg。NULL free は安全。
+    /// A NULL handle or NULL output target is InvalidArg. Freeing NULL is safe.
     #[test]
     fn watcher_null_args() {
         let mut ev = std::mem::MaybeUninit::<FlexDeviceEvent>::uninit();
@@ -254,10 +258,10 @@ mod tests {
         unsafe { flexaudio_device_event_free(std::ptr::null_mut()) };
     }
 
-    /// 各 DeviceEvent バリアントの C 変換と文字列解放が整合する。
+    /// The C conversion and string freeing of each DeviceEvent variant are consistent.
     #[test]
     fn device_event_conversion_and_free() {
-        // Added: 全フィールドが埋まる。
+        // Added: all fields are filled.
         let added = device_event_to_c(DeviceEvent::Added(DeviceInfo {
             id: "node-1".to_string(),
             name: "Mic A".to_string(),
@@ -283,7 +287,7 @@ mod tests {
         unsafe { flexaudio_device_event_free(&mut added) };
         assert!(added.id.is_null() && added.name.is_null());
 
-        // Removed: id のみ・name は NULL。
+        // Removed: id only, name is NULL.
         let mut removed = device_event_to_c(DeviceEvent::Removed {
             id: "node-2".to_string(),
         });
@@ -295,7 +299,7 @@ mod tests {
         );
         unsafe { flexaudio_device_event_free(&mut removed) };
 
-        // DefaultChanged: id + source_kind。
+        // DefaultChanged: id + source_kind.
         let mut def = device_event_to_c(DeviceEvent::DefaultChanged {
             kind: SourceKind::SystemLoopback,
             id: "sink-3".to_string(),
@@ -307,7 +311,7 @@ mod tests {
             "sink-3"
         );
         unsafe { flexaudio_device_event_free(&mut def) };
-        // 二重解放は安全。
+        // A double free is safe.
         unsafe { flexaudio_device_event_free(&mut def) };
     }
 }

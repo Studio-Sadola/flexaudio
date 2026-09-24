@@ -1,13 +1,13 @@
-# cbindgen 設定。flexaudio-ffi の C ABI から include/flexaudio.h を生成する。
-# 生成コマンド: cbindgen --config cbindgen.toml --crate flexaudio-ffi --output include/flexaudio.h
+# cbindgen configuration. Generates include/flexaudio.h from the C ABI of flexaudio-ffi.
+# Generation command: cbindgen --config cbindgen.toml --crate flexaudio-ffi --output include/flexaudio.h
 
 language = "C"
 pragma_once = true
 include_guard = "FLEXAUDIO_H"
-# Rust の doc コメントを C のヘッダにも doc として出す。
+# Emit the Rust doc comments into the C header as docs too.
 documentation = true
 documentation_style = "c99"
-# 関数の前に空行を入れて読みやすくする。
+# Insert blank lines before functions for readability.
 line_length = 100
 tab_width = 4
 cpp_compat = false
@@ -25,7 +25,7 @@ header = """
 prefix = ""
 
 [enum]
-# C の enum を `enum { ... }` として出し、#[repr(C)] の判別値どおりにする。
+# Emit C enums as `enum { ... }`, matching the #[repr(C)] discriminant values.
 prefix_with_name = false
 rename_variants = "QualifiedScreamingSnakeCase"
 

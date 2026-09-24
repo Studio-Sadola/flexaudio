@@ -1,9 +1,10 @@
-//! C ABI 型と flexaudio 型の間の変換ヘルパ。
+//! Conversion helpers between C ABI types and flexaudio types.
 //!
-//! `FlexConfig` → [`StreamConfig`]、[`AudioChunk`] → `FlexChunk`、[`Event`] →
-//! `FlexEvent`、[`DeviceInfo`] → `FlexDeviceInfo` を小さな関数に分ける。napi の
-//! `build_config` / `chunk_to_js` / `event_to_js` と同じ方針（番兵で既定を入れ、
-//! ring_capacity_chunks は公開せず `StreamConfig::default()` の値を使う）。
+//! `FlexConfig` → [`StreamConfig`], [`AudioChunk`] → `FlexChunk`, [`Event`] →
+//! `FlexEvent`, and [`DeviceInfo`] → `FlexDeviceInfo` are split into small functions. Same
+//! policy as napi's `build_config` / `chunk_to_js` / `event_to_js` (sentinels fill in
+//! defaults; ring_capacity_chunks is not exposed and the `StreamConfig::default()` value is
+//! used).
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -21,16 +22,17 @@ use crate::types::{
     FlexProcessInfo, FlexProcessMode, FlexSourceKind, FlexVadConfig, FlexVadEvent,
 };
 
-// 番兵 0 を既定へ写すときの値（StreamConfig 既定と揃える）。
+// Values used when mapping the sentinel 0 to the default (aligned with the StreamConfig
+// defaults).
 pub(crate) const DEFAULT_OUTPUT_RATE: u32 = 48_000;
 pub(crate) const DEFAULT_OUTPUT_CHANNELS: u16 = 2;
 const DEFAULT_CHUNK_MS: u32 = 20;
 const DEFAULT_GAIN: f32 = 1.0;
 
-/// `FlexConfig` の出力フォーマットを番兵込みで解決する（0 → 既定）。
+/// Resolves the output format of a `FlexConfig`, including sentinels (0 → default).
 ///
-/// `build_config`（StreamConfig 構築）と `build_addons`（denoise の 48k 検証・
-/// Denoiser のチャンネル数）が同じ解決結果を共有するための小ヘルパ。
+/// Small helper so that `build_config` (StreamConfig construction) and `build_addons`
+/// (denoise's 48k check and the Denoiser's channel count) share the same resolved result.
 pub(crate) fn resolve_output(config: &FlexConfig) -> OutputFormat {
     OutputFormat {
         sample_rate: if config.output_rate == 0 {
@@ -46,7 +48,7 @@ pub(crate) fn resolve_output(config: &FlexConfig) -> OutputFormat {
     }
 }
 
-/// `FlexSourceKind` → [`SourceKind`]。
+/// `FlexSourceKind` → [`SourceKind`].
 fn source_kind_from_c(kind: FlexSourceKind) -> SourceKind {
     match kind {
         FlexSourceKind::Mic => SourceKind::Mic,
@@ -56,7 +58,7 @@ fn source_kind_from_c(kind: FlexSourceKind) -> SourceKind {
     }
 }
 
-/// [`SourceKind`] → `FlexSourceKind`。
+/// [`SourceKind`] → `FlexSourceKind`.
 pub(crate) fn source_kind_to_c(kind: SourceKind) -> FlexSourceKind {
     match kind {
         SourceKind::Mic => FlexSourceKind::Mic,
@@ -66,7 +68,7 @@ pub(crate) fn source_kind_to_c(kind: SourceKind) -> FlexSourceKind {
     }
 }
 
-/// `FlexProcessMode` → [`ProcessMode`]。
+/// `FlexProcessMode` → [`ProcessMode`].
 fn process_mode_from_c(mode: FlexProcessMode) -> ProcessMode {
     match mode {
         FlexProcessMode::Include => ProcessMode::Include,
@@ -74,14 +76,14 @@ fn process_mode_from_c(mode: FlexProcessMode) -> ProcessMode {
     }
 }
 
-/// NUL 終端 C 文字列を `Option<String>` にする。NULL は `None`。
+/// Converts a NUL-terminated C string into an `Option<String>`. NULL becomes `None`.
 ///
-/// UTF-8 として不正なら last_error に `field`（フィールド名）入りのメッセージを
-/// セットして `Err` を返す（呼び出し元は InvalidArg として扱う）。安全のため、
-/// 呼び出し側が有効な NUL 終端ポインタ（または NULL）を渡すことを前提にする。
+/// If it is not valid UTF-8, sets last_error to a message containing `field` (the field name)
+/// and returns `Err` (the caller treats it as InvalidArg). For safety, this assumes the caller
+/// passes a valid NUL-terminated pointer (or NULL).
 ///
 /// # Safety
-/// `ptr` は NULL か、有効な NUL 終端 C 文字列を指していなければならない。
+/// `ptr` must be NULL or point to a valid NUL-terminated C string.
 unsafe fn opt_string_from_c(ptr: *const c_char, field: &str) -> Result<Option<String>, ()> {
     if ptr.is_null() {
         return Ok(None);
@@ -95,7 +97,8 @@ unsafe fn opt_string_from_c(ptr: *const c_char, field: &str) -> Result<Option<St
     }
 }
 
-/// 番兵 0.0 を既定 1.0 に写すゲイン変換（`gain` / `mix_*_gain` 共通の流儀）。
+/// Gain conversion that maps the sentinel 0.0 to the default 1.0 (the convention shared by
+/// `gain` / `mix_*_gain`).
 fn gain_or_default(gain: f32) -> f32 {
     if gain == 0.0 {
         DEFAULT_GAIN
@@ -104,15 +107,16 @@ fn gain_or_default(gain: f32) -> f32 {
     }
 }
 
-/// `FlexConfig` から [`StreamConfig`] を組み立てる。napi の `build_config` と同じ方針で、
-/// `ring_capacity_chunks` は公開せず既定値を使う。番兵 0 のフィールドは既定へ写す。
+/// Builds a [`StreamConfig`] from a `FlexConfig`. Same policy as napi's `build_config`:
+/// `ring_capacity_chunks` is not exposed and the default is used. Fields with the sentinel 0
+/// are mapped to the default.
 ///
-/// `device_id` / `mix_mic_device_id` / `mix_system_device_id` が不正な UTF-8 なら
-/// last_error をセットして `Err`。
+/// If `device_id` / `mix_mic_device_id` / `mix_system_device_id` is invalid UTF-8, sets
+/// last_error and returns `Err`.
 ///
 /// # Safety
-/// `config` は有効な `FlexConfig` を指し、その文字列フィールドはいずれも NULL か
-/// 有効な NUL 終端 C 文字列でなければならない。
+/// `config` must point to a valid `FlexConfig`, and each of its string fields must be NULL or
+/// a valid NUL-terminated C string.
 pub unsafe fn build_config(config: &FlexConfig) -> Result<StreamConfig, ()> {
     let device_id = opt_string_from_c(config.device_id, "device_id")?;
     let mix_mic_device_id = opt_string_from_c(config.mix_mic_device_id, "mix_mic_device_id")?;
@@ -124,13 +128,14 @@ pub unsafe fn build_config(config: &FlexConfig) -> Result<StreamConfig, ()> {
     Ok(StreamConfig {
         kind: source_kind_from_c(config.kind),
         device_id,
-        // process_id 0 は「なし」を表す番兵。
+        // process_id 0 is the sentinel for "none".
         target_pid: if config.process_id == 0 {
             None
         } else {
             Some(config.process_id)
         },
-        // mode は process 専用 / exclude_self は system 専用。混ぜないのは facade 側が見る。
+        // mode is process-only / exclude_self is system-only. The facade checks that they are
+        // not mixed.
         mode: process_mode_from_c(config.mode),
         exclude_self: config.exclude_self,
         chunk_ms: if config.chunk_ms == 0 {
@@ -138,25 +143,26 @@ pub unsafe fn build_config(config: &FlexConfig) -> Result<StreamConfig, ()> {
         } else {
             config.chunk_ms
         },
-        // gain 0.0 は番兵＝既定 1.0（output_rate 0→48000 と同じ流儀）。実行時に無音へ
-        // したいときは flexaudio_set_gain(s, 0.0) を使う。mix の側別ゲインも同じ流儀
-        // （0.0 番兵 → 1.0。合成前に側だけ無音にする用途は現状想定しない）。
+        // gain 0.0 is the sentinel = default 1.0 (same convention as output_rate 0→48000). To
+        // silence at runtime, use flexaudio_set_gain(s, 0.0). The per-side mix gains follow the
+        // same convention (0.0 sentinel → 1.0; silencing only one side before mixing is not
+        // currently an intended use).
         gain: gain_or_default(config.gain),
         mix_mic_device_id,
         mix_system_device_id,
         mix_mic_gain: gain_or_default(config.mix_mic_gain),
         mix_system_gain: gain_or_default(config.mix_system_gain),
         output,
-        // ring_capacity_chunks は公開しない（StreamConfig 既定の値を使う）。
+        // ring_capacity_chunks is not exposed (the StreamConfig default value is used).
         ..Default::default()
     })
 }
 
-/// [`AudioChunk`] を `FlexChunk` に写す。
+/// Maps an [`AudioChunk`] to a `FlexChunk`.
 ///
-/// `data`（`Vec<f32>`）は `into_boxed_slice` → `Box::into_raw` で C へ所有権を渡す。
-/// ポインタと `len` を slice 由来で必ず一致させ、`flexaudio_chunk_free` が同じ `len`
-/// で `Box::from_raw` できるようにする。
+/// Ownership of `data` (`Vec<f32>`) is passed to C via `into_boxed_slice` → `Box::into_raw`.
+/// The pointer and `len` always come from the same slice so they match, and
+/// `flexaudio_chunk_free` can `Box::from_raw` with the same `len`.
 pub fn chunk_to_c(chunk: AudioChunk) -> FlexChunk {
     let frames = chunk.frames as u32;
     let flags = chunk.flags.bits();
@@ -166,8 +172,9 @@ pub fn chunk_to_c(chunk: AudioChunk) -> FlexChunk {
     let seq = chunk.seq;
     let dropped_before = chunk.dropped_before;
 
-    // Vec → boxed slice にして、ポインタと長さを取り出す。空でも null は返さず
-    // （Box::into_raw は dangling 非 null を返す）、len=0 と整合する。
+    // Turn the Vec into a boxed slice and take out the pointer and length. Even when empty it
+    // does not return null (Box::into_raw returns a dangling non-null pointer), consistent
+    // with len=0.
     let boxed: Box<[f32]> = chunk.data.into_boxed_slice();
     let len = boxed.len();
     let data = Box::into_raw(boxed) as *mut f32;
@@ -182,38 +189,38 @@ pub fn chunk_to_c(chunk: AudioChunk) -> FlexChunk {
         dropped_before,
         peak,
         rms,
-        // VAD イベントは呼び出し側（poll_processed）が有効時だけ後から差し込む。
-        // 既定は「無し」。
+        // VAD events are inserted later by the caller (poll_processed), only when enabled.
+        // The default is "none".
         vad_events: ptr::null_mut(),
         vad_events_len: 0,
     }
 }
 
-/// `flexaudio_chunk_free` の本体。`data`/`len` から boxed slice を再構成して drop し、
-/// 二重解放を防ぐためにフィールドをクリアする。
+/// Body of `flexaudio_chunk_free`. Reconstructs the boxed slice from `data`/`len` and drops
+/// it, then clears the fields to prevent a double free.
 ///
 /// # Safety
-/// `chunk` は有効な `FlexChunk` を指していなければならない。`data` は `chunk_to_c` が
-/// 確保したもの（または NULL）。
+/// `chunk` must point to a valid `FlexChunk`. `data` must be what `chunk_to_c` allocated
+/// (or NULL).
 pub unsafe fn free_chunk_data(chunk: &mut FlexChunk) {
     if !chunk.data.is_null() {
-        // chunk_to_c が確保したのと同じ len で boxed slice を復元して drop する。
+        // Restore the boxed slice with the same len chunk_to_c allocated, and drop it.
         let slice = slice::from_raw_parts_mut(chunk.data, chunk.len);
         drop(Box::from_raw(slice as *mut [f32]));
         chunk.data = ptr::null_mut();
         chunk.len = 0;
     }
-    // VAD イベント配列も同じチャンクの所有物なので一緒に解放する。
+    // The VAD event array is also owned by the same chunk, so free it together.
     free_vad_events(chunk.vad_events, chunk.vad_events_len);
     chunk.vad_events = ptr::null_mut();
     chunk.vad_events_len = 0;
 }
 
-/// `FlexVadConfig` を [`VadConfig`] に写す（番兵 0 は既定へ）。
+/// Maps a `FlexVadConfig` to a [`VadConfig`] (the sentinel 0 becomes the default).
 ///
-/// 既定値は [`VadConfig::default`] から採り、非 0 のフィールドだけ上書きする。
-/// `max_speech_ms` は 0 がそのまま「無制限」を意味するので番兵扱いしない。
-/// `neg_threshold` は 0 のとき `None`（silero 式で自動決定）にする。
+/// Defaults are taken from [`VadConfig::default`], and only non-zero fields override them.
+/// For `max_speech_ms`, 0 itself means "unlimited", so it is not treated as a sentinel.
+/// `neg_threshold` becomes `None` (determined automatically by the silero formula) when 0.
 pub fn vad_config_from_c(c: &FlexVadConfig) -> VadConfig {
     let d = VadConfig::default();
     VadConfig {
@@ -242,7 +249,7 @@ pub fn vad_config_from_c(c: &FlexVadConfig) -> VadConfig {
         } else {
             c.speech_pad_ms
         },
-        // 0 は「無制限」（既定）なのでそのまま通す。
+        // 0 means "unlimited" (the default), so pass it through as is.
         max_speech_ms: c.max_speech_ms,
         sample_rate: if c.sample_rate == 0 {
             d.sample_rate
@@ -252,7 +259,7 @@ pub fn vad_config_from_c(c: &FlexVadConfig) -> VadConfig {
     }
 }
 
-/// [`VadEvent`] を `FlexVadEvent` に写す（開始 = 0 / 終了 = 1）。
+/// Maps a [`VadEvent`] to a `FlexVadEvent` (start = 0 / end = 1).
 pub fn vad_event_to_c(ev: VadEvent) -> FlexVadEvent {
     match ev {
         VadEvent::SpeechStart { at_sample } => FlexVadEvent {
@@ -266,11 +273,13 @@ pub fn vad_event_to_c(ev: VadEvent) -> FlexVadEvent {
     }
 }
 
-/// [`VadEvent`] の列を C へ渡す配列（`*mut FlexVadEvent` + 要素数）にする。
+/// Turns a sequence of [`VadEvent`]s into an array to pass to C (`*mut FlexVadEvent` +
+/// element count).
 ///
-/// 空のときは確保せず `(NULL, 0)` を返す（C 側は NULL か len==0 で「無し」と判る）。
-/// 非空のときは `into_boxed_slice` で要素数ぴったりに確保し、`free_vad_events` が
-/// 同じ要素数で復元・解放できるようにする（`shrink_to_fit` は使わない）。
+/// When empty, nothing is allocated and `(NULL, 0)` is returned (the C side sees "none" from
+/// NULL or len==0). When non-empty, it is allocated with exactly the element count via
+/// `into_boxed_slice`, so `free_vad_events` can restore and free it with the same element
+/// count (`shrink_to_fit` is not used).
 pub fn vad_events_to_c(events: Vec<VadEvent>) -> (*mut FlexVadEvent, usize) {
     if events.is_empty() {
         return (ptr::null_mut(), 0);
@@ -281,22 +290,22 @@ pub fn vad_events_to_c(events: Vec<VadEvent>) -> (*mut FlexVadEvent, usize) {
     (data, len)
 }
 
-/// `vad_events_to_c` が確保した配列を復元して drop する。NULL / 0 は no-op。
+/// Restores and drops the array allocated by `vad_events_to_c`. NULL / 0 is a no-op.
 ///
 /// # Safety
-/// `ptr`/`len` は `vad_events_to_c` が返したもの（または NULL/0）でなければならない。
+/// `ptr`/`len` must be what `vad_events_to_c` returned (or NULL/0).
 pub unsafe fn free_vad_events(ptr: *mut FlexVadEvent, len: usize) {
     if ptr.is_null() {
         return;
     }
-    // FlexVadEvent は Copy でヒープ所有物を持たないので、boxed slice を復元して
-    // drop するだけでよい（要素ごとの後始末は不要）。
+    // FlexVadEvent is Copy and owns no heap data, so restoring the boxed slice and dropping
+    // it is enough (no per-element cleanup is needed).
     let slice = slice::from_raw_parts_mut(ptr, len);
     drop(Box::from_raw(slice as *mut [FlexVadEvent]));
 }
 
-/// [`Event`] を `FlexEvent` に写す。`Error` のメッセージは last_error に入れる
-/// （`FlexEvent` 自体は種別と count だけを運ぶ）。
+/// Maps an [`Event`] to a `FlexEvent`. The message of `Error` goes into last_error
+/// (`FlexEvent` itself carries only the kind and count).
 pub fn event_to_c(ev: Event) -> FlexEvent {
     match ev {
         Event::ChunkDropped { count } => FlexEvent {
@@ -326,8 +335,8 @@ pub fn event_to_c(ev: Event) -> FlexEvent {
                 count: 0,
             }
         }
-        // Event は #[non_exhaustive]。未知のバリアントは Unknown にし、デバッグ表現を
-        // last_error に残して握り潰さない。
+        // Event is #[non_exhaustive]. An unknown variant becomes Unknown, and its debug
+        // representation is left in last_error rather than being swallowed.
         other => {
             set_last_error(format!("unknown event: {other:?}"));
             FlexEvent {
@@ -338,15 +347,16 @@ pub fn event_to_c(ev: Event) -> FlexEvent {
     }
 }
 
-/// `String` を C へ渡す `*mut c_char` にする。内部 NUL があれば空文字列に差し替える
-/// （所有権は C 側へ渡り、対応する free 関数が解放する）。
+/// Turns a `String` into a `*mut c_char` to pass to C. If it contains an interior NUL, it is
+/// replaced with an empty string (ownership passes to the C side, and the matching free
+/// function frees it).
 pub(crate) fn string_to_c(s: String) -> *mut c_char {
     CString::new(s)
         .unwrap_or_else(|_| CString::new("").unwrap())
         .into_raw()
 }
 
-/// [`DeviceInfo`] を `FlexDeviceInfo` に写す。`id`/`name` は CString として C へ渡す。
+/// Maps a [`DeviceInfo`] to a `FlexDeviceInfo`. `id`/`name` are passed to C as CStrings.
 pub fn device_info_to_c(info: DeviceInfo) -> FlexDeviceInfo {
     FlexDeviceInfo {
         id: string_to_c(info.id),
@@ -359,17 +369,17 @@ pub fn device_info_to_c(info: DeviceInfo) -> FlexDeviceInfo {
     }
 }
 
-/// `flexaudio_devices_free` の本体。各 `id`/`name` の CString を復元して drop し、
-/// 配列自体も `Vec` として復元して drop する。
+/// Body of `flexaudio_devices_free`. Restores and drops the CString of each `id`/`name`, and
+/// also restores the array itself as a `Vec` and drops it.
 ///
 /// # Safety
-/// `arr`/`count` は `flexaudio_devices` が返したもの（または NULL/0）でなければならない。
+/// `arr`/`count` must be what `flexaudio_devices` returned (or NULL/0).
 pub unsafe fn free_device_array(arr: *mut FlexDeviceInfo, count: usize) {
     if arr.is_null() {
         return;
     }
-    // into_boxed_slice で要素数ぴったりに確保したものを Vec として復元する
-    // （確保サイズが count ぴったりなので capacity = count で健全）。
+    // Restore what was allocated with exactly the element count via into_boxed_slice as a
+    // Vec (the allocation size is exactly count, so capacity = count is sound).
     let infos = Vec::from_raw_parts(arr, count, count);
     for info in &infos {
         if !info.id.is_null() {
@@ -382,7 +392,7 @@ pub unsafe fn free_device_array(arr: *mut FlexDeviceInfo, count: usize) {
     drop(infos);
 }
 
-/// `Option<bool>`（出力中か・不明）を C の 3 値へ写す。
+/// Maps an `Option<bool>` (outputting or not / unknown) to the C three-state value.
 pub(crate) fn output_activity_to_c(active: Option<bool>) -> FlexOutputActivity {
     match active {
         None => FlexOutputActivity::Unknown,
@@ -391,22 +401,22 @@ pub(crate) fn output_activity_to_c(active: Option<bool>) -> FlexOutputActivity {
     }
 }
 
-/// `Option<String>` を C へ渡す。`None` は NULL。
+/// Passes an `Option<String>` to C. `None` becomes NULL.
 fn optional_string_to_c(s: Option<String>) -> *mut c_char {
     s.map(string_to_c).unwrap_or(std::ptr::null_mut())
 }
 
-/// C へ渡した文字列を回収して解放する（NULL なら何もしない）。
+/// Reclaims and frees a string passed to C (does nothing if NULL).
 ///
 /// # Safety
-/// `p` は [`string_to_c`] が返したもの（または NULL）で、まだ解放していないこと。
+/// `p` must be what [`string_to_c`] returned (or NULL) and must not have been freed yet.
 unsafe fn reclaim_c_string(p: *mut c_char) {
     if !p.is_null() {
         drop(CString::from_raw(p));
     }
 }
 
-/// [`ProcessInfo`] を `FlexProcessInfo` に写す。文字列は CString として C へ渡す。
+/// Maps a [`ProcessInfo`] to a `FlexProcessInfo`. Strings are passed to C as CStrings.
 pub fn process_info_to_c(info: ProcessInfo) -> FlexProcessInfo {
     FlexProcessInfo {
         pid: info.pid,
@@ -417,17 +427,19 @@ pub fn process_info_to_c(info: ProcessInfo) -> FlexProcessInfo {
     }
 }
 
-/// `flexaudio_processes_free` の本体。各文字列の CString を復元して drop し、配列自体も
-/// `Vec` として復元して drop する。同じポインタに対して **1 回だけ**呼ぶ。
+/// Body of `flexaudio_processes_free`. Restores and drops the CString of each string, and also
+/// restores the array itself as a `Vec` and drops it. Call it **exactly once** for the same
+/// pointer.
 ///
 /// # Safety
-/// `arr`/`count` は `flexaudio_processes` が返したもの（または NULL/0）でなければならず、
-/// この関数は同じ `arr` に対して 1 回だけ呼ぶ。
+/// `arr`/`count` must be what `flexaudio_processes` returned (or NULL/0), and this function
+/// is called exactly once for the same `arr`.
 pub unsafe fn free_process_array(arr: *mut FlexProcessInfo, count: usize) {
     if arr.is_null() {
         return;
     }
-    // Box<[T]> で要素数ぴったりに確保したものを Vec として復元する（capacity = count）。
+    // Restore what was allocated with exactly the element count via Box<[T]> as a Vec
+    // (capacity = count).
     let infos = Vec::from_raw_parts(arr, count, count);
     for info in &infos {
         reclaim_c_string(info.name);
@@ -442,7 +454,7 @@ mod tests {
     use super::*;
     use flexaudio::ChunkFlags;
 
-    // 全フィールド 0 = すべて既定を意味する FlexVadConfig。
+    // A FlexVadConfig with all fields 0 = everything at the default.
     fn zero_vad_config() -> FlexVadConfig {
         FlexVadConfig {
             threshold: 0.0,
@@ -455,7 +467,7 @@ mod tests {
         }
     }
 
-    // FlexConfig をテスト用に組み立てる（文字列は NULL = 既定、数値は 0 番兵）。
+    // Builds a FlexConfig for tests (strings are NULL = default, numbers are the 0 sentinel).
     fn make_config(kind: FlexSourceKind) -> FlexConfig {
         FlexConfig {
             kind,
@@ -482,7 +494,7 @@ mod tests {
         let c = make_config(FlexSourceKind::Mic);
         let cfg = unsafe { build_config(&c) }.unwrap();
         assert_eq!(cfg.kind, SourceKind::Mic);
-        // 0 番兵は既定へ。
+        // The 0 sentinel becomes the default.
         assert_eq!(cfg.output.sample_rate, 48_000);
         assert_eq!(cfg.output.channels, 2);
         assert_eq!(cfg.chunk_ms, 20);
@@ -490,14 +502,14 @@ mod tests {
         assert_eq!(cfg.device_id, None);
         assert_eq!(cfg.mode, ProcessMode::Include);
         assert!(!cfg.exclude_self);
-        // gain も 0 番兵 → 既定 1.0。
+        // gain too: 0 sentinel → default 1.0.
         assert_eq!(cfg.gain, 1.0);
-        // mix 専用フィールドも番兵から既定へ（NULL → None / 0.0 → 1.0）。
+        // The mix-only fields also go from sentinel to default (NULL → None / 0.0 → 1.0).
         assert_eq!(cfg.mix_mic_device_id, None);
         assert_eq!(cfg.mix_system_device_id, None);
         assert_eq!(cfg.mix_mic_gain, 1.0);
         assert_eq!(cfg.mix_system_gain, 1.0);
-        // 公開しない ring_capacity_chunks は StreamConfig 既定（50）。
+        // The unexposed ring_capacity_chunks is the StreamConfig default (50).
         assert_eq!(cfg.ring_capacity_chunks, 50);
     }
 
@@ -524,11 +536,11 @@ mod tests {
 
     #[test]
     fn build_config_maps_gain_sentinel_and_explicit() {
-        // 0.0 は番兵＝既定 1.0（output_rate 0→48000 と同じ流儀）。
+        // 0.0 is the sentinel = default 1.0 (same convention as output_rate 0→48000).
         let c = make_config(FlexSourceKind::Mic);
         let cfg = unsafe { build_config(&c) }.unwrap();
         assert_eq!(cfg.gain, 1.0);
-        // 明示値はそのまま通る。
+        // An explicit value passes through as is.
         let mut c2 = make_config(FlexSourceKind::Mic);
         c2.gain = 0.5;
         let cfg2 = unsafe { build_config(&c2) }.unwrap();
@@ -592,10 +604,10 @@ mod tests {
         assert_eq!(fc.flags, ChunkFlags::DISCONTINUITY.bits());
         assert_eq!(fc.dropped_before, 1);
         assert!(!fc.data.is_null());
-        // ポインタと len が一致しているので読み戻せる。
+        // The pointer and len match, so the data can be read back.
         let view = unsafe { slice::from_raw_parts(fc.data, fc.len) };
         assert_eq!(view, &[0.1, -0.2, 0.3, -0.4]);
-        // 解放後は NULL/0 になり二重解放安全。
+        // After freeing it becomes NULL/0 and a double free is safe.
         unsafe { free_chunk_data(&mut fc) };
         assert!(fc.data.is_null());
         assert_eq!(fc.len, 0);
@@ -641,7 +653,7 @@ mod tests {
             is_loopback: false,
             is_default: true,
         }];
-        // 本番の flexaudio_devices と同じく Box<[T]> へ集約して ptr/count を作る。
+        // Collect into Box<[T]> to make ptr/count, just like the real flexaudio_devices.
         let boxed: Box<[FlexDeviceInfo]> = infos.into_iter().map(device_info_to_c).collect();
         let count = boxed.len();
         let first = &boxed[0];
@@ -649,7 +661,7 @@ mod tests {
         assert!(first.is_default);
         let id = unsafe { CStr::from_ptr(first.id) }.to_str().unwrap();
         assert_eq!(id, "id-1");
-        // free が CString と配列を解放する（leak/二重解放しない）。
+        // free releases the CStrings and the array (no leak / double free).
         let ptr = Box::into_raw(boxed) as *mut FlexDeviceInfo;
         unsafe { free_device_array(ptr, count) };
     }
@@ -687,7 +699,7 @@ mod tests {
         assert_eq!(name, "pid 99");
         let ptr = Box::into_raw(boxed) as *mut FlexProcessInfo;
         unsafe { free_process_array(ptr, count) };
-        // NULL は何もしない。
+        // NULL does nothing.
         unsafe { free_process_array(std::ptr::null_mut(), 0) };
     }
 
@@ -703,7 +715,7 @@ mod tests {
 
     #[test]
     fn resolve_output_applies_sentinels() {
-        // 0 番兵は 48000 / 2 に写り、明示値はそのまま通る。
+        // The 0 sentinel maps to 48000 / 2, and explicit values pass through as is.
         let c = make_config(FlexSourceKind::Mic);
         let out = resolve_output(&c);
         assert_eq!(out.sample_rate, 48_000);
@@ -719,7 +731,7 @@ mod tests {
 
     #[test]
     fn vad_config_all_zero_is_default() {
-        // 全 0 の FlexVadConfig は VadConfig::default() と一致する。
+        // An all-zero FlexVadConfig equals VadConfig::default().
         let cfg = vad_config_from_c(&zero_vad_config());
         assert_eq!(cfg, VadConfig::default());
     }
@@ -747,7 +759,7 @@ mod tests {
 
     #[test]
     fn vad_config_max_speech_zero_stays_unlimited() {
-        // max_speech_ms は 0 が「無制限」なので番兵扱いしない（0 → 0）。
+        // For max_speech_ms, 0 means "unlimited", so it is not treated as a sentinel (0 → 0).
         let mut c = zero_vad_config();
         c.max_speech_ms = 0;
         assert_eq!(vad_config_from_c(&c).max_speech_ms, 0);
@@ -773,7 +785,7 @@ mod tests {
 
     #[test]
     fn vad_events_empty_is_null() {
-        // 空イベント列は確保せず (NULL, 0)。free は no-op。
+        // An empty event sequence allocates nothing: (NULL, 0). free is a no-op.
         let (ptr, len) = vad_events_to_c(Vec::new());
         assert!(ptr.is_null());
         assert_eq!(len, 0);
@@ -782,8 +794,9 @@ mod tests {
 
     #[test]
     fn vad_events_roundtrip_and_free() {
-        // 手組みのイベント列を into_boxed_slice で確保 → 読み戻し → free まで一巡
-        // （shrink_to_fit を使わず要素数ぴったりの確保・解放が整合することの検証）。
+        // One full cycle for a hand-built event sequence: allocate via into_boxed_slice → read
+        // back → free (verifies that allocation and free with exactly the element count, without
+        // shrink_to_fit, are consistent).
         let events = vec![
             VadEvent::SpeechStart { at_sample: 0 },
             VadEvent::SpeechEnd { at_sample: 512 },
@@ -804,8 +817,9 @@ mod tests {
 
     #[test]
     fn free_chunk_data_also_frees_vad_events() {
-        // chunk_to_c 由来の data と、後付けの vad_events を両方確保し、free_chunk_data が
-        // どちらも解放して NULL/0 に戻すことを確認（二重解放も安全）。
+        // Allocate both the data from chunk_to_c and vad_events attached afterwards, and check
+        // that free_chunk_data frees both and resets them to NULL/0 (a double free is also
+        // safe).
         let chunk = AudioChunk {
             data: vec![0.0, 0.1, 0.2, 0.3],
             frames: 2,
@@ -826,7 +840,7 @@ mod tests {
         assert_eq!(fc.len, 0);
         assert!(fc.vad_events.is_null());
         assert_eq!(fc.vad_events_len, 0);
-        // 二重解放しても安全。
+        // A double free is also safe.
         unsafe { free_chunk_data(&mut fc) };
     }
 }

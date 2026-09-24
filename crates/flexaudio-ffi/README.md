@@ -1,52 +1,54 @@
 # flexaudio-ffi
 
-flexaudio を C から使うための **C ABI バインディング**（プル型）。C アプリが
-flexaudio をインプロセスで叩く第三の経路（第一は CLI パイプ、第二は N-API addon）。
-呼び出し側が `flexaudio_poll_chunk` / `flexaudio_poll_event` を周期的に呼んでチャンク・
-イベントを取り出す。
+**C ABI bindings** for using flexaudio from C (pull-based). The third way for a C application
+to call flexaudio in-process (the first is the CLI pipe, the second is the N-API addon).
+The caller periodically calls `flexaudio_poll_chunk` / `flexaudio_poll_event` to take out
+chunks and events.
 
-キャプチャ本体に加えて、3 つのアドオンを C へ露出する:
+In addition to capture itself, three addons are exposed to C:
 
-- **VAD**（発話区間検出・silero VAD / ONNX）— `flexaudio_vad_*`
-- **FLAC**（録音チャンクの逐次可逆圧縮・ローテーション対応）— `flexaudio_flac_*`
-- **denoise**（RNNoise によるノイズ抑制）— `flexaudio_denoise_*`
+- **VAD** (speech segment detection, silero VAD / ONNX) — `flexaudio_vad_*`
+- **FLAC** (streaming lossless compression of recorded chunks, with rotation) — `flexaudio_flac_*`
+- **denoise** (noise suppression with RNNoise) — `flexaudio_denoise_*`
 
-VAD / denoise はストリームに組み込むこともできる（`FlexConfig` の `has_vad` / `denoise`）。
-デバイス着脱の監視（ホットプラグ）は `flexaudio_watch_devices` 系で取れる。
-プロセス別キャプチャの対象候補（音声出力のセッション／ストリームを持つプロセス・
-自プロセスを除く。停止中・Idle も含む）は `flexaudio_processes` で列挙し、
-`flexaudio_processes_free` で **1 回だけ** 解放する（各要素は `FlexProcessInfo`。
-`pid` を `FlexConfig::process_id` に渡す。`executable` / `bundle_id` は取れなければ
-NULL、`output_activity` は `FLEX_OUTPUT_ACTIVITY_UNKNOWN|INACTIVE|ACTIVE`）。
-0 件は成功（使えるが今は候補が無い）。プロセス別キャプチャ自体が使えない環境
-（Linux で PipeWire に届かない・macOS 14.4 未満・Windows が Windows build 20348
-or later (Windows 11 / Windows Server 2022) 未満・非対応 OS・権限拒否）、OS が
-3 秒以内に応答しなかった、または前の問い合わせがまだ終わっていないときは
-`FLEX_FAILURE`。
+VAD / denoise can also be built into a stream (`has_vad` / `denoise` in `FlexConfig`).
+Device hotplug watching is available through the `flexaudio_watch_devices` family.
+Candidate targets for per-process capture (processes that have an audio output
+session / stream, excluding the own process; stopped and Idle ones are included) are
+enumerated with `flexaudio_processes` and freed **exactly once** with
+`flexaudio_processes_free` (each element is a `FlexProcessInfo`; pass `pid` to
+`FlexConfig::process_id`; `executable` / `bundle_id` are NULL if they could not be obtained,
+and `output_activity` is `FLEX_OUTPUT_ACTIVITY_UNKNOWN|INACTIVE|ACTIVE`).
+0 entries is success (usable, but there are no candidates right now). It returns
+`FLEX_FAILURE` in an environment where per-process capture itself is not usable
+(PipeWire unreachable on Linux, macOS older than 14.4, Windows that is not Windows build 20348
+or later (Windows 11 / Windows Server 2022), unsupported OS, permission denied), when the OS
+did not respond within 3 seconds, or when a previous query has not finished yet.
 
-## ビルドとヘッダ生成
+## Building and generating the header
 
-`staticlib`（`.a`）と `cdylib`（`.so` / `.dll` / `.dylib`）の両方を生成する。
+Both a `staticlib` (`.a`) and a `cdylib` (`.so` / `.dll` / `.dylib`) are built.
 
 ```sh
 cargo build -p flexaudio-ffi --release
-# ヘッダを再生成（ABI を変えたら必ず）
+# Regenerate the header (always do this after changing the ABI)
 cbindgen --config cbindgen.toml --crate flexaudio-ffi --output include/flexaudio.h
 ```
 
-生成物を `include/flexaudio.h` と一緒にリンクする。全関数は FFI 境界で panic を巻き上げず
-（`catch_unwind`）、失敗時は負のコードを返して `flexaudio_last_error()` にメッセージを残す。
-C へ渡した確保物（`FlexChunk::data` / VAD イベント配列 / デバイス文字列など）は、対応する
-free 関数で必ず flexaudio 側に解放させる（C の `free` は使わない）。
+Link the build output together with `include/flexaudio.h`. No function lets a panic unwind
+across the FFI boundary (`catch_unwind`); on failure it returns a negative code and leaves a
+message in `flexaudio_last_error()`. Allocations handed to C (`FlexChunk::data` / VAD event
+arrays / device strings, etc.) must always be freed by flexaudio through the matching
+free function (do not use C's `free`).
 
-## 基本のキャプチャ
+## Basic capture
 
 ```c
 #include "flexaudio.h"
 #include <stdio.h>
 
 int main(void) {
-    FlexConfig cfg = {0};              // すべて 0 = 既定（mic / 48k / stereo / 20ms）
+    FlexConfig cfg = {0};              // all 0 = defaults (mic / 48k / stereo / 20ms)
     cfg.kind = FLEX_SOURCE_KIND_MIC;
 
     FlexStream *s = flexaudio_open(&cfg);
@@ -63,11 +65,11 @@ int main(void) {
     FlexChunk chunk;
     for (int i = 0; i < 100; i++) {
         int r = flexaudio_poll_chunk(s, &chunk);
-        if (r < 0) break;              // エラー（flexaudio_last_error）
-        if (r == 0) continue;          // 今は無し（少し待って再試行）
-        // chunk.data は interleaved f32（chunk.len 要素 = frames * channels）
+        if (r < 0) break;              // error (flexaudio_last_error)
+        if (r == 0) continue;          // none right now (wait a bit and retry)
+        // chunk.data is interleaved f32 (chunk.len elements = frames * channels)
         printf("frames=%u peak=%.3f\n", chunk.frames, chunk.peak);
-        flexaudio_chunk_free(&chunk);  // data を解放
+        flexaudio_chunk_free(&chunk);  // free data
     }
 
     flexaudio_free(s);
@@ -75,43 +77,44 @@ int main(void) {
 }
 ```
 
-## ストリームに denoise / VAD を組み込む
+## Building denoise / VAD into the stream
 
-`denoise` / `has_vad` を立てると、`flexaudio_poll_chunk` が返す直前にチャンクを
-**denoise → VAD** の順で通す。denoise は 48kHz 出力が前提（`output_rate` が 48000 以外だと
-`flexaudio_open` が NULL を返す）。VAD が確定したイベントは `FlexChunk::vad_events` に入り、
-`flexaudio_chunk_free` が `data` と一緒に解放する。
+When `denoise` / `has_vad` are set, each chunk is passed through **denoise → VAD** in that
+order right before `flexaudio_poll_chunk` returns it. denoise assumes 48kHz output
+(`flexaudio_open` returns NULL if `output_rate` is anything other than 48000). Events finalized
+by the VAD go into `FlexChunk::vad_events`, and `flexaudio_chunk_free` frees them together
+with `data`.
 
 ```c
 FlexConfig cfg = {0};
 cfg.kind = FLEX_SOURCE_KIND_MIC;
-cfg.denoise = true;      // 48k 出力が前提（output_rate=0 は 48000）
-cfg.has_vad = true;      // cfg.vad は全 0 = silero 既定（threshold 0.5 など）
+cfg.denoise = true;      // assumes 48k output (output_rate=0 is 48000)
+cfg.has_vad = true;      // cfg.vad all 0 = silero defaults (threshold 0.5, etc.)
 
 FlexStream *s = flexaudio_open(&cfg);
 /* ... start / poll ... */
 if (flexaudio_poll_chunk(s, &chunk) == 1) {
     for (size_t i = 0; i < chunk.vad_events_len; i++) {
-        FlexVadEvent ev = chunk.vad_events[i];   // kind: 0=開始 / 1=終了
+        FlexVadEvent ev = chunk.vad_events[i];   // kind: 0=start / 1=end
         printf("%s @ %lld\n", ev.kind == 0 ? "speech-start" : "speech-end",
                (long long)ev.at_sample);
     }
-    flexaudio_chunk_free(&chunk);    // data と vad_events を両方解放
+    flexaudio_chunk_free(&chunk);    // frees both data and vad_events
 }
 ```
 
-## 独立ハンドル（ストリームなしで使う）
+## Standalone handles (use without a stream)
 
 ### VAD
 
-手元の任意フォーマットの f32 サンプルを流し込める（内部で mono 化・VAD レートへ
-リサンプル）。イベント配列は `flexaudio_vad_events_free` で解放する。
+You can feed in f32 samples of any format you have at hand (internally downmixed to mono and
+resampled to the VAD rate). Free the event array with `flexaudio_vad_events_free`.
 
 ```c
-FlexVad *vad = flexaudio_vad_new(NULL);        // NULL = 既定設定
+FlexVad *vad = flexaudio_vad_new(NULL);        // NULL = default settings
 FlexVadEvent *events = NULL;
 size_t n = 0;
-// samples: 48k/stereo の interleaved f32（len 要素）
+// samples: 48k/stereo interleaved f32 (len elements)
 if (flexaudio_vad_process(vad, samples, len, 48000, 2, &events, &n) == FLEX_OK) {
     for (size_t i = 0; i < n; i++) { /* events[i].kind / at_sample */ }
     flexaudio_vad_events_free(events, n);
@@ -121,45 +124,46 @@ flexaudio_vad_free(vad);
 
 ### FLAC
 
-interleaved f32（flexaudio の正規形 48k/stereo をそのまま渡せる）を逐次可逆圧縮する。
-`split_seconds` に 1 以上を与えると、その秒数ごとに `rec-001.flac`, `rec-002.flac`, … と
-連番でローテーションする（0 なら単一ファイル）。
+Streams interleaved f32 (flexaudio's canonical 48k/stereo can be passed as is) through
+lossless compression. If `split_seconds` is 1 or more, it rotates to numbered files
+`rec-001.flac`, `rec-002.flac`, … every that many seconds (0 means a single file).
 
 ```c
-// 単一ファイル
+// Single file
 FlexFlac *flac = flexaudio_flac_create("rec.flac", 48000, 2, 0);
-flexaudio_flac_write(flac, samples, len);       // 何度でも追記
-flexaudio_flac_finalize(flac);                  // ヘッダ確定（以後 write は不可）
+flexaudio_flac_write(flac, samples, len);       // append as many times as needed
+flexaudio_flac_finalize(flac);                  // finalize the header (no writes afterwards)
 flexaudio_flac_free(flac);
 
-// 5 分ごとに分割 → rec-001.flac, rec-002.flac, ...
+// Split every 5 minutes → rec-001.flac, rec-002.flac, ...
 FlexFlac *split = flexaudio_flac_create("rec.flac", 48000, 2, 300);
 ```
 
 ### denoise
 
-interleaved f32（48kHz・±1.0 正規化）をインプレースでノイズ抑制する。出力は入力を
-480 サンプル/ch 遅らせた列で、先頭のその分は無音になる（ストリーミング遅延）。
+Applies noise suppression in place to interleaved f32 (48kHz, normalized to ±1.0). The output
+is the input delayed by 480 samples/ch, and that much at the start is silence (streaming
+latency).
 
 ```c
 FlexDenoiser *dn = flexaudio_denoise_new(1);    // 1 = mono / 2 = stereo
-flexaudio_denoise_process(dn, samples, len);    // インプレース（48kHz 前提）
+flexaudio_denoise_process(dn, samples, len);    // in place (assumes 48kHz)
 flexaudio_denoise_free(dn);
 ```
 
-## デバイス着脱の監視（ホットプラグ）
+## Device hotplug watching
 
-デバイスの接続・切断・既定変更を pull 型で取れる。`id` / `name` は
-`flexaudio_device_event_free` で解放する。
+Device connects, disconnects, and default changes can be retrieved in a pull-based way.
+Free `id` / `name` with `flexaudio_device_event_free`.
 
 ```c
-FlexWatcher *w = flexaudio_watch_devices();     // 非対応環境では no-op へ縮退
+FlexWatcher *w = flexaudio_watch_devices();     // degrades to a no-op on unsupported environments
 FlexDeviceEvent ev;
 int r = flexaudio_watcher_poll(w, &ev);
 if (r == 1) {
     switch (ev.kind) {
         case FLEX_DEVICE_EVENT_KIND_ADDED:          /* ev.id / ev.name / ... */ break;
-        case FLEX_DEVICE_EVENT_KIND_REMOVED:        /* ev.id のみ */ break;
+        case FLEX_DEVICE_EVENT_KIND_REMOVED:        /* ev.id only */ break;
         case FLEX_DEVICE_EVENT_KIND_DEFAULT_CHANGED:/* ev.id / ev.source_kind */ break;
         default: break;
     }
@@ -168,17 +172,18 @@ if (r == 1) {
 flexaudio_watcher_free(w);
 ```
 
-## ライセンスとサードパーティ
+## License and third-party components
 
-このクレート自体は MIT（ワークスペース全体と同じ・`LICENSE` を参照）。C ABI から露出する
-アドオンは、以下のオフライン処理ライブラリ／モデルに依存する。いずれも実行時の
-ネットワークもモデルファイル配布も要らない（重み・モデルはバイナリに埋め込む）。
+This crate itself is MIT (same as the whole workspace; see `LICENSE`). The addons exposed
+through the C ABI depend on the following offline processing libraries / models. None of them
+needs network access at runtime or a separately distributed model file (weights and models
+are embedded in the binary).
 
-| コンポーネント | 用途 | ライセンス |
+| Component | Purpose | License |
 | --- | --- | --- |
-| [flacenc](https://crates.io/crates/flacenc) | FLAC エンコード（`flexaudio-encode`） | Apache-2.0 |
-| [nnnoiseless](https://crates.io/crates/nnnoiseless)（RNNoise 移植） | ノイズ抑制（`flexaudio-denoise`） | BSD-3-Clause |
-| [tract-onnx](https://crates.io/crates/tract-onnx) | VAD の純 Rust 推論実行（`flexaudio-vad`） | MIT OR Apache-2.0 |
-| Silero VAD モデル | VAD のモデル重み（バイナリ埋め込み） | MIT |
+| [flacenc](https://crates.io/crates/flacenc) | FLAC encoding (`flexaudio-encode`) | Apache-2.0 |
+| [nnnoiseless](https://crates.io/crates/nnnoiseless) (RNNoise port) | Noise suppression (`flexaudio-denoise`) | BSD-3-Clause |
+| [tract-onnx](https://crates.io/crates/tract-onnx) | Pure-Rust inference runtime for VAD (`flexaudio-vad`) | MIT OR Apache-2.0 |
+| Silero VAD model | VAD model weights (embedded in the binary) | MIT |
 
-再配布時は上記の著作権表示・ライセンス条項を同梱すること。
+When redistributing, include the copyright notices and license terms above.

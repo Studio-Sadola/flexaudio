@@ -1,23 +1,23 @@
-//! flexaudio-ffi — C ABI 公開層（cbindgen → flexaudio.h）。プル型 API。
+//! flexaudio-ffi — C ABI layer (cbindgen → flexaudio.h). Pull-based API.
 //!
-//! C アプリが flexaudio をインプロセスで使うための第三の経路（第一は CLI パイプ、
-//! 第二は N-API addon）。napi のようにブリッジスレッド + コールバックは使わず、
-//! 呼び出し側が `flexaudio_poll_chunk` / `flexaudio_poll_event` を周期的に呼んで
-//! チャンク・イベントを取り出すプル型にする。
+//! The third way for a C application to use flexaudio in-process (the first is the CLI pipe,
+//! the second is the N-API addon). Unlike napi, it does not use a bridge thread + callbacks;
+//! it is pull-based: the caller periodically calls `flexaudio_poll_chunk` /
+//! `flexaudio_poll_event` to take out chunks and events.
 //!
-//! 設計（config 構築・チャンク/イベント/デバイスの変換・エラー処理）は
-//! `flexaudio-napi` を手本にする。違いはコールバックでなくポーリングである点だけ。
+//! The design (config construction, chunk/event/device conversion, error handling) follows
+//! `flexaudio-napi` as the model. The only difference is polling instead of callbacks.
 //!
-//! 約束:
-//! - 全関数は FFI 境界で panic を巻き上げない（`catch_unwind` で包み、panic 時は
-//!   エラーコード / NULL / false を返す）。
-//! - ポインタ引数は NULL をチェックする。
-//! - 失敗時は `i32` を負にして thread-local の last_error にメッセージを入れ、
-//!   `flexaudio_last_error` で取れるようにする。
-//! - C へ渡す確保物（チャンクの `data`・デバイス文字列と配列）は対応する free 関数で
-//!   必ず Rust 側が解放する（C の free は使わせない）。
+//! Guarantees:
+//! - No function lets a panic unwind across the FFI boundary (each is wrapped in
+//!   `catch_unwind`; on panic it returns an error code / NULL / false).
+//! - Pointer arguments are checked for NULL.
+//! - On failure, the `i32` is negative and a message is stored in the thread-local last_error,
+//!   retrievable with `flexaudio_last_error`.
+//! - Allocations handed to C (a chunk's `data`, device strings and arrays) are always freed
+//!   by the Rust side through the matching free function (C's free must not be used).
 //!
-//! ヘッダ `include/flexaudio.h` は cbindgen で再生成する（`cbindgen.toml` を使用）。
+//! The header `include/flexaudio.h` is regenerated with cbindgen (using `cbindgen.toml`).
 
 mod convert;
 mod denoise;
@@ -35,14 +35,15 @@ use error::{clear_last_error, code, last_error_ptr, set_last_error};
 use types::{FlexChunk, FlexConfig, FlexDeviceInfo, FlexEvent, FlexProcessInfo, FlexStream};
 
 // ---------------------------------------------------------------------------
-// panic ガード
+// Panic guards
 //
-// FFI 境界で Rust の panic を巻き上げると未定義動作になる。各関数本体を
-// catch_unwind で包み、panic を捕まえたら呼び出し側に値で返す。種類ごとに
-// 「失敗を表す値」が違う（i32 は PANIC コード / ポインタは NULL / bool は false）。
+// Letting a Rust panic unwind across the FFI boundary is undefined behavior. Each function
+// body is wrapped in catch_unwind, and a caught panic is returned to the caller as a value.
+// The "value that means failure" differs by type (i32 is the PANIC code / pointer is NULL /
+// bool is false).
 // ---------------------------------------------------------------------------
 
-/// `i32` を返す関数を panic ガードで包む。panic 時は last_error をセットして PANIC。
+/// Wraps a function returning `i32` in a panic guard. On panic, sets last_error and returns PANIC.
 pub(crate) fn guard_i32(f: impl FnOnce() -> i32) -> i32 {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(v) => v,
@@ -53,7 +54,8 @@ pub(crate) fn guard_i32(f: impl FnOnce() -> i32) -> i32 {
     }
 }
 
-/// ポインタを返す関数を panic ガードで包む。panic 時は last_error をセットして NULL。
+/// Wraps a function returning a pointer in a panic guard. On panic, sets last_error and returns
+/// NULL.
 pub(crate) fn guard_ptr<T>(f: impl FnOnce() -> *mut T) -> *mut T {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(v) => v,
@@ -64,30 +66,32 @@ pub(crate) fn guard_ptr<T>(f: impl FnOnce() -> *mut T) -> *mut T {
     }
 }
 
-/// `bool` を返す関数を panic ガードで包む。panic 時は false。
+/// Wraps a function returning `bool` in a panic guard. On panic, returns false.
 fn guard_bool(f: impl FnOnce() -> bool) -> bool {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(false)
 }
 
-/// `flexaudio::Error` を last_error に記録して FAILURE コードを返す小ヘルパ。
+/// Small helper that records a `flexaudio::Error` in last_error and returns the FAILURE code.
 fn fail(err: flexaudio::Error) -> i32 {
     set_last_error(err.to_string());
     code::FLEX_FAILURE
 }
 
 // ---------------------------------------------------------------------------
-// ストリームのライフサイクル
+// Stream lifecycle
 // ---------------------------------------------------------------------------
 
-/// 構成からストリームを開く（まだ start しない）。失敗で NULL を返し last_error をセット。
+/// Opens a stream from a config (does not start it yet). On failure returns NULL and sets
+/// last_error.
 ///
-/// `config.denoise` / `config.has_vad` が有効なら、対応するアドオン（ノイズ抑制 / VAD）を
-/// ここで構築してストリームに同居させる（`poll_chunk` が denoise → VAD の順で通す）。
-/// denoise 有効時は出力レートが 48000 でなければ失敗する（NULL + last_error。RNNoise は
-/// 48kHz 固定）。返ったハンドルは `flexaudio_free` で解放する。
+/// If `config.denoise` / `config.has_vad` are enabled, the corresponding addons (noise
+/// suppression / VAD) are built here and live alongside the stream (`poll_chunk` passes chunks
+/// through denoise → VAD in that order). With denoise enabled, this fails unless the output
+/// rate is 48000 (NULL + last_error; RNNoise is fixed at 48kHz). Free the returned handle
+/// with `flexaudio_free`.
 ///
 /// # Safety
-/// `config` は有効な `FlexConfig` を指していなければならない（NULL は失敗扱い）。
+/// `config` must point to a valid `FlexConfig` (NULL is treated as a failure).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_open(config: *const FlexConfig) -> *mut FlexStream {
     guard_ptr(|| {
@@ -98,11 +102,12 @@ pub unsafe extern "C" fn flexaudio_open(config: *const FlexConfig) -> *mut FlexS
         };
         let stream_config = match convert::build_config(config) {
             Ok(c) => c,
-            // build_config が last_error を既にセットしている。
+            // build_config has already set last_error.
             Err(()) => return std::ptr::null_mut(),
         };
-        // アドオン（denoise / VAD）を先に組み立てる。48k 制約違反やモデルロード失敗は
-        // ここで弾く（build_addons が last_error をセット済み）。デバイスに触る前に返す。
+        // Build the addons (denoise / VAD) first. A 48k constraint violation or a model load
+        // failure is rejected here (build_addons has already set last_error). Return before
+        // touching the device.
         let (denoiser, vad) = match integration::build_addons(config) {
             Ok(pair) => pair,
             Err(()) => return std::ptr::null_mut(),
@@ -121,14 +126,14 @@ pub unsafe extern "C" fn flexaudio_open(config: *const FlexConfig) -> *mut FlexS
     })
 }
 
-/// ストリームを停止してから解放する。NULL 安全。
+/// Stops the stream and then frees it. NULL-safe.
 ///
 /// # Safety
-/// `s` は `flexaudio_open` が返したハンドル（または NULL）でなければならない。
-/// 解放後の `s` を使ってはならない。
+/// `s` must be a handle returned by `flexaudio_open` (or NULL).
+/// `s` must not be used after it is freed.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_free(s: *mut FlexStream) {
-    // 戻り値を捨てる i32 ガードに乗せて panic を吸収する。
+    // Ride on the i32 guard, discarding the return value, to absorb panics.
     guard_i32(|| {
         if s.is_null() {
             return code::FLEX_OK;
@@ -140,10 +145,10 @@ pub unsafe extern "C" fn flexaudio_free(s: *mut FlexStream) {
     });
 }
 
-/// キャプチャを開始する。
+/// Starts capture.
 ///
 /// # Safety
-/// `s` は有効なハンドルでなければならない（NULL は InvalidArg）。
+/// `s` must be a valid handle (NULL is InvalidArg).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_start(s: *mut FlexStream) -> i32 {
     guard_i32(|| {
@@ -159,10 +164,10 @@ pub unsafe extern "C" fn flexaudio_start(s: *mut FlexStream) -> i32 {
     })
 }
 
-/// キャプチャを停止する。
+/// Stops capture.
 ///
 /// # Safety
-/// `s` は有効なハンドルでなければならない（NULL は InvalidArg）。
+/// `s` must be a valid handle (NULL is InvalidArg).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_stop(s: *mut FlexStream) -> i32 {
     guard_i32(|| {
@@ -176,10 +181,10 @@ pub unsafe extern "C" fn flexaudio_stop(s: *mut FlexStream) -> i32 {
     })
 }
 
-/// 配信を一時停止する（デバイスは動かしたまま）。
+/// Pauses delivery (the device keeps running).
 ///
 /// # Safety
-/// `s` は有効なハンドルでなければならない（NULL は InvalidArg）。
+/// `s` must be a valid handle (NULL is InvalidArg).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_pause(s: *mut FlexStream) -> i32 {
     guard_i32(|| {
@@ -193,10 +198,10 @@ pub unsafe extern "C" fn flexaudio_pause(s: *mut FlexStream) -> i32 {
     })
 }
 
-/// 一時停止を解除して配信を再開する。
+/// Clears the pause and resumes delivery.
 ///
 /// # Safety
-/// `s` は有効なハンドルでなければならない（NULL は InvalidArg）。
+/// `s` must be a valid handle (NULL is InvalidArg).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_resume(s: *mut FlexStream) -> i32 {
     guard_i32(|| {
@@ -210,10 +215,10 @@ pub unsafe extern "C" fn flexaudio_resume(s: *mut FlexStream) -> i32 {
     })
 }
 
-/// 一時停止中なら true を返す。NULL や panic では false。
+/// Returns true while paused. Returns false on NULL or panic.
 ///
 /// # Safety
-/// `s` は有効なハンドル（または NULL）でなければならない。
+/// `s` must be a valid handle (or NULL).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_is_paused(s: *const FlexStream) -> bool {
     guard_bool(|| match s.as_ref() {
@@ -222,12 +227,13 @@ pub unsafe extern "C" fn flexaudio_is_paused(s: *const FlexStream) -> bool {
     })
 }
 
-/// 入力ゲイン（線形倍率）を変更する。1.0 でそのまま、2.0 で約 +6dB、0.0 で無音。
-/// 録音中いつでも呼べて、次のチャンクから効く（20ms 粒度）。乗算後のサンプルは
-/// ±1.0 にクランプされる。有限かつ 0 以上でなければ FLEX_INVALID_ARG。
+/// Changes the input gain (linear multiplier). 1.0 leaves it unchanged, 2.0 is about +6dB, 0.0
+/// is silence. Can be called at any time during recording and takes effect from the next chunk
+/// (20ms granularity). Samples after multiplication are clamped to ±1.0. Returns
+/// FLEX_INVALID_ARG unless the value is finite and at least 0.
 ///
 /// # Safety
-/// `s` は有効なハンドルでなければならない（NULL は InvalidArg）。
+/// `s` must be a valid handle (NULL is InvalidArg).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_set_gain(s: *mut FlexStream, gain: f32) -> i32 {
     guard_i32(|| {
@@ -246,10 +252,10 @@ pub unsafe extern "C" fn flexaudio_set_gain(s: *mut FlexStream, gain: f32) -> i3
     })
 }
 
-/// 現在の入力ゲイン（線形倍率）を返す。NULL や panic では 1.0。
+/// Returns the current input gain (linear multiplier). Returns 1.0 on NULL or panic.
 ///
 /// # Safety
-/// `s` は有効なハンドル（または NULL）でなければならない。
+/// `s` must be a valid handle (or NULL).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_gain(s: *const FlexStream) -> f32 {
     catch_unwind(AssertUnwindSafe(|| match s.as_ref() {
@@ -259,13 +265,14 @@ pub unsafe extern "C" fn flexaudio_gain(s: *const FlexStream) -> f32 {
     .unwrap_or(1.0)
 }
 
-/// 現在の backend のネイティブフォーマット `(sample_rate, channels)` を `sr`/`ch` に書く。
+/// Writes the current backend's native format `(sample_rate, channels)` to `sr`/`ch`.
 ///
-/// open 時に backend から取得した値で、`flexaudio_switch_source` で更新される。表示・診断用
-/// （出力フォーマットは `config` で指定した値）。戻り 0 = 成功 / 負 = エラー。
+/// The value is obtained from the backend at open time and is updated by
+/// `flexaudio_switch_source`. For display and diagnostics (the output format is the value
+/// specified in `config`). Returns 0 = success / negative = error.
 ///
 /// # Safety
-/// `s` は有効なハンドル、`sr`/`ch` は有効な書き込み先でなければならない（NULL は InvalidArg）。
+/// `s` must be a valid handle and `sr`/`ch` must be valid write targets (NULL is InvalidArg).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_native_format(
     s: *const FlexStream,
@@ -289,10 +296,11 @@ pub unsafe extern "C" fn flexaudio_native_format(
     })
 }
 
-/// これまでにチャンクリングが DROP_OLDEST で捨てた累計チャンク数を返す。NULL や panic では 0。
+/// Returns the cumulative number of chunks the chunk ring has discarded so far via
+/// DROP_OLDEST. Returns 0 on NULL or panic.
 ///
 /// # Safety
-/// `s` は有効なハンドル（または NULL）でなければならない。
+/// `s` must be a valid handle (or NULL).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_dropped_chunks(s: *const FlexStream) -> u64 {
     catch_unwind(AssertUnwindSafe(|| match s.as_ref() {
@@ -303,20 +311,21 @@ pub unsafe extern "C" fn flexaudio_dropped_chunks(s: *const FlexStream) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// ポーリング（プル型 API の中心）
+// Polling (the core of the pull-based API)
 // ---------------------------------------------------------------------------
 
-/// チャンクを 1 つ取り出して `out` を埋める。
+/// Takes out one chunk and fills `out`.
 ///
-/// 戻り 1 = 取得して `out` を埋めた / 0 = 今は無し / 負 = エラー。`out.data` は
-/// flexaudio 所有で、使い終わったら `flexaudio_chunk_free` で解放する。
+/// Returns 1 = got one and filled `out` / 0 = none right now / negative = error. `out.data`
+/// is owned by flexaudio; free it with `flexaudio_chunk_free` when done.
 ///
-/// アドオンが有効なら、返す前にチャンクを denoise → VAD の順で通す。VAD 有効時は
-/// 確定したイベントが `out.vad_events`（要素数 `out.vad_events_len`）に入り、これも
-/// `flexaudio_chunk_free` が `data` と一緒に解放する（無効時・イベント無しは NULL/0）。
+/// If addons are enabled, the chunk is passed through denoise → VAD in that order before it
+/// is returned. With VAD enabled, the finalized events go into `out.vad_events` (element count
+/// `out.vad_events_len`), which `flexaudio_chunk_free` also frees together with `data`
+/// (NULL/0 when disabled or when there are no events).
 ///
 /// # Safety
-/// `s` は有効なハンドル、`out` は有効な `FlexChunk` の書き込み先でなければならない。
+/// `s` must be a valid handle and `out` must be a valid `FlexChunk` write target.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut FlexChunk) -> i32 {
     guard_i32(|| {
@@ -329,7 +338,8 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
             set_last_error("flexaudio_poll_chunk: out pointer is null");
             return code::FLEX_INVALID_ARG;
         }
-        // アドオン（denoise → VAD）を通した結果を書き込む。無効なら素通し。
+        // Write the result after passing through the addons (denoise → VAD). Pass-through if
+        // they are disabled.
         match stream.poll_processed() {
             Some(chunk) => {
                 out.write(chunk);
@@ -340,12 +350,11 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
     })
 }
 
-/// `flexaudio_poll_chunk` が埋めた `data` を解放し、`data=NULL` / `len=0` にする。
-/// NULL・二重解放とも安全。
+/// Frees the `data` filled by `flexaudio_poll_chunk` and sets `data=NULL` / `len=0`.
+/// Safe for both NULL and double free.
 ///
 /// # Safety
-/// `chunk` は `flexaudio_poll_chunk` が埋めた `FlexChunk`（または NULL）を指して
-/// いなければならない。
+/// `chunk` must point to a `FlexChunk` filled by `flexaudio_poll_chunk` (or be NULL).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_chunk_free(chunk: *mut FlexChunk) {
     guard_i32(|| {
@@ -356,13 +365,13 @@ pub unsafe extern "C" fn flexaudio_chunk_free(chunk: *mut FlexChunk) {
     });
 }
 
-/// イベントを 1 つ取り出して `out` を埋める。
+/// Takes out one event and fills `out`.
 ///
-/// 戻り 1 = 取得 / 0 = 今は無し / 負 = エラー。`Error` イベントのときは
-/// `out.kind = Error` にし、メッセージを last_error に入れる。
+/// Returns 1 = got one / 0 = none right now / negative = error. For an `Error` event,
+/// sets `out.kind = Error` and puts the message in last_error.
 ///
 /// # Safety
-/// `s` は有効なハンドル、`out` は有効な `FlexEvent` の書き込み先でなければならない。
+/// `s` must be a valid handle and `out` must be a valid `FlexEvent` write target.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_poll_event(s: *mut FlexStream, out: *mut FlexEvent) -> i32 {
     guard_i32(|| {
@@ -376,7 +385,7 @@ pub unsafe extern "C" fn flexaudio_poll_event(s: *mut FlexStream, out: *mut Flex
             return code::FLEX_INVALID_ARG;
         }
         match stream.inner.poll_event() {
-            // event_to_c が Error/Unknown のメッセージを last_error に入れる。
+            // event_to_c puts the Error/Unknown message in last_error.
             Some(ev) => {
                 out.write(convert::event_to_c(ev));
                 1
@@ -386,13 +395,14 @@ pub unsafe extern "C" fn flexaudio_poll_event(s: *mut FlexStream, out: *mut Flex
     })
 }
 
-/// 録音を止めずに入力ソースをホットスワップする。`config.gain` は無視される
-/// （ゲインはストリームの状態。変更は `flexaudio_set_gain`）。同様に `config.denoise` /
-/// `config.has_vad` / `config.vad` も無視される（アドオンは open 時に確定したものを保つ。
-/// 出力フォーマットは switch_source で変えられないので、48k 制約や VAD 設定は不変）。
+/// Hot-swaps the input source without stopping the recording. `config.gain` is ignored
+/// (gain is stream state; change it with `flexaudio_set_gain`). Likewise `config.denoise` /
+/// `config.has_vad` / `config.vad` are ignored (the addons keep what was fixed at open time;
+/// the output format cannot be changed by switch_source, so the 48k constraint and the VAD
+/// settings stay unchanged).
 ///
 /// # Safety
-/// `s` は有効なハンドル、`config` は有効な `FlexConfig` を指していなければならない。
+/// `s` must be a valid handle and `config` must point to a valid `FlexConfig`.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_switch_source(
     s: *mut FlexStream,
@@ -420,16 +430,16 @@ pub unsafe extern "C" fn flexaudio_switch_source(
 }
 
 // ---------------------------------------------------------------------------
-// デバイス列挙
+// Device enumeration
 // ---------------------------------------------------------------------------
 
-/// 利用可能なデバイスを列挙し、配列を確保して `out_array` / `out_count` にセットする。
+/// Enumerates the available devices, allocates an array, and sets `out_array` / `out_count`.
 ///
-/// 成功で 0。確保した配列は `flexaudio_devices_free` で解放する。ヘッドレス環境では
-/// 0 件（`out_array=NULL` / `out_count=0`）でも成功扱い。
+/// Returns 0 on success. Free the allocated array with `flexaudio_devices_free`. In a headless
+/// environment, 0 devices (`out_array=NULL` / `out_count=0`) is also treated as success.
 ///
 /// # Safety
-/// `out_array` / `out_count` は有効な書き込み先でなければならない（NULL は InvalidArg）。
+/// `out_array` / `out_count` must be valid write targets (NULL is InvalidArg).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_devices(
     out_array: *mut *mut FlexDeviceInfo,
@@ -454,14 +464,15 @@ pub unsafe extern "C" fn flexaudio_devices(
     })
 }
 
-/// 変換済みの配列を C へ渡す（`flexaudio_devices` / `flexaudio_processes` 共通）。
+/// Hands a converted array to C (shared by `flexaudio_devices` / `flexaudio_processes`).
 ///
-/// 空なら `out_array=NULL` / `out_count=0`（確保しない）。`Box<[T]>` へ集約すると確保
-/// サイズが要素数ぴったり（capacity == len）になり、free 側の
-/// `Vec::from_raw_parts(ptr, count, count)` と整合する。
+/// If empty, `out_array=NULL` / `out_count=0` (nothing is allocated). Collecting into a
+/// `Box<[T]>` makes the allocation size exactly the element count (capacity == len), which
+/// matches `Vec::from_raw_parts(ptr, count, count)` on the free side.
 ///
 /// # Safety
-/// `out_array` / `out_count` は NULL でない有効な書き込み先であること（呼び出し側で検査済み）。
+/// `out_array` / `out_count` must be non-NULL valid write targets (already checked by the
+/// caller).
 unsafe fn write_c_array<T>(items: Box<[T]>, out_array: *mut *mut T, out_count: *mut usize) {
     if items.is_empty() {
         out_array.write(std::ptr::null_mut());
@@ -473,10 +484,10 @@ unsafe fn write_c_array<T>(items: Box<[T]>, out_array: *mut *mut T, out_count: *
     out_count.write(count);
 }
 
-/// `flexaudio_devices` が確保した配列と各 `id`/`name` を解放する。NULL 安全。
+/// Frees the array allocated by `flexaudio_devices` and each `id`/`name`. NULL-safe.
 ///
 /// # Safety
-/// `arr`/`count` は `flexaudio_devices` が返したもの（または NULL/0）でなければならない。
+/// `arr`/`count` must be what `flexaudio_devices` returned (or NULL/0).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_devices_free(arr: *mut FlexDeviceInfo, count: usize) {
     guard_i32(|| {
@@ -486,24 +497,25 @@ pub unsafe extern "C" fn flexaudio_devices_free(arr: *mut FlexDeviceInfo, count:
 }
 
 // ---------------------------------------------------------------------------
-// プロセス列挙
+// Process enumeration
 // ---------------------------------------------------------------------------
 
-/// プロセス別キャプチャの対象にできる、音声出力のセッション（ストリーム）を持つ
-/// プロセスを列挙し、配列を確保して `out_array` / `out_count` にセットする。
-/// 呼び出し元プロセス自身は含まない。停止中・Idle も載る。今鳴っているかは
-/// `output_activity` で見る。
+/// Enumerates the processes that have an audio output session (stream) and can therefore be
+/// targeted by per-process capture, allocates an array, and sets `out_array` / `out_count`.
+/// The calling process itself is not included. Stopped and Idle ones are listed too. Whether
+/// one is playing right now is shown by `output_activity`.
 ///
-/// 成功で 0。候補が無ければ 0 件（`out_array=NULL` / `out_count=0`）で成功
-/// （プロセス別キャプチャは使えるが、そういうプロセスが今は無い）。確保した配列は
-/// `flexaudio_processes_free` で **1 回だけ** 解放する。この環境でプロセス別キャプチャが
-/// 使えない（Linux で PipeWire に届かない・macOS 14.4 未満・Windows build 20348
-/// 以上（Windows 11・Windows Server 2022）でない・非対応 OS・権限拒否）、OS が
-/// 3 秒以内に応答しなかった、または前の問い合わせが
-/// まだ終わっていないときは `FLEX_FAILURE`（理由は `flexaudio_last_error`）。
+/// Returns 0 on success. If there are no candidates, it succeeds with 0 entries
+/// (`out_array=NULL` / `out_count=0`) (per-process capture is usable, but no such process
+/// exists right now). Free the allocated array **exactly once** with
+/// `flexaudio_processes_free`. Returns `FLEX_FAILURE` (reason in `flexaudio_last_error`) when
+/// per-process capture is not usable in this environment (PipeWire unreachable on Linux,
+/// macOS older than 14.4, not Windows build 20348 or later (Windows 11 / Windows Server 2022),
+/// unsupported OS, permission denied), when the OS did not respond within 3 seconds, or when
+/// a previous query has not finished yet.
 ///
 /// # Safety
-/// `out_array` / `out_count` は有効な書き込み先でなければならない（NULL は InvalidArg）。
+/// `out_array` / `out_count` must be valid write targets (NULL is InvalidArg).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_processes(
     out_array: *mut *mut FlexProcessInfo,
@@ -528,12 +540,13 @@ pub unsafe extern "C" fn flexaudio_processes(
     })
 }
 
-/// `flexaudio_processes` が確保した配列と各文字列を解放する。NULL 安全。
-/// **1 回だけ**呼ぶこと（同じポインタへの二度呼びは二重解放＝未定義動作）。
+/// Frees the array allocated by `flexaudio_processes` and each string. NULL-safe.
+/// Call it **exactly once** (calling it twice on the same pointer is a double free =
+/// undefined behavior).
 ///
 /// # Safety
-/// `arr`/`count` は `flexaudio_processes` が返したもの（または NULL/0）でなければならず、
-/// この関数は同じ `arr` に対して 1 回だけ呼ぶ。
+/// `arr`/`count` must be what `flexaudio_processes` returned (or NULL/0), and this function
+/// is called exactly once for the same `arr`.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_processes_free(arr: *mut FlexProcessInfo, count: usize) {
     guard_i32(|| {
@@ -543,16 +556,16 @@ pub unsafe extern "C" fn flexaudio_processes_free(arr: *mut FlexProcessInfo, cou
 }
 
 // ---------------------------------------------------------------------------
-// エラー取得
+// Error retrieval
 // ---------------------------------------------------------------------------
 
-/// 現在のスレッドの直近エラーメッセージを返す。
+/// Returns the most recent error message for the current thread.
 ///
-/// 同一スレッドで次に last_error を更新する FFI 呼び出しまで有効。エラーが無ければ
-/// NULL。返るポインタは flexaudio 所有で、C 側で free してはならない。
+/// Valid until the next FFI call on the same thread that updates last_error. NULL if there is
+/// no error. The returned pointer is owned by flexaudio and must not be freed on the C side.
 #[no_mangle]
 pub extern "C" fn flexaudio_last_error() -> *const c_char {
-    // last_error_ptr 自体は panic しないが、念のためガードして NULL を返す。
+    // last_error_ptr itself does not panic, but guard it anyway and return NULL.
     match catch_unwind(last_error_ptr) {
         Ok(p) => p,
         Err(_) => std::ptr::null(),
