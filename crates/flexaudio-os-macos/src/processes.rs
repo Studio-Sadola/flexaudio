@@ -1,25 +1,27 @@
-//! 録れるプロセスの列挙（[`list_processes`]）— Core Audio のプロセスオブジェクトから。
+//! Enumeration of capturable processes ([`list_processes`]) — from Core Audio process objects.
 //!
-//! system object の `kAudioHardwarePropertyProcessObjectList` で Core Audio が把握している
-//! プロセスオブジェクトを取り、各オブジェクトの
-//! - `kAudioProcessPropertyPID`（pid_t）
-//! - `kAudioProcessPropertyBundleID`（CFString。無いこともある）
-//! - `kAudioProcessPropertyIsRunningOutput`（UInt32。出力 IO が動いているか）
+//! Gets the process objects known to Core Audio via the system object's
+//! `kAudioHardwarePropertyProcessObjectList`, and reads, for each object,
+//! - `kAudioProcessPropertyPID` (pid_t)
+//! - `kAudioProcessPropertyBundleID` (CFString; may be absent)
+//! - `kAudioProcessPropertyIsRunningOutput` (UInt32; whether output IO is running)
 //!
-//! を読む。実行ファイル名は `proc_pidpath`（libSystem）で取る。
+//! The executable name is obtained with `proc_pidpath` (libSystem).
 //!
-//! 載せる範囲は Linux / Windows と完全には揃わない。Core Audio のプロセスオブジェクト
-//! 属性（`kAudioProcessPropertyDevices` は「今使っているデバイス」、
-//! `IsRunningOutput` は「今出力 IO が動いているか」）では「出力を持ったことがない」
-//! プロセスだけを、停止中・Idle の出力プロセスを落とさずに判別できない。そのため
-//! 入力だけのプロセスも含め、Core Audio が把握しているプロセスをそのまま載せる。
+//! The set of listed processes does not fully match Linux / Windows. With the Core Audio
+//! process object attributes (`kAudioProcessPropertyDevices` is "the devices in use now",
+//! `IsRunningOutput` is "whether output IO is running now"), it is impossible to single out
+//! only the processes that "have never had output" without dropping stopped/idle output
+//! processes. Therefore the processes known to Core Audio are listed as is, including
+//! input-only processes.
 //!
-//! Process Tap と同じく macOS 14.4 以上が前提で、未満は [`Error::UnsupportedOsVersion`]
-//! （[`MacProcessBackend`](crate::MacProcessBackend) の `start` と同じゲート）。
-//! 列挙は読み取り専用で、tap を作らないので TCC（`kTCCServiceAudioCapture`）の
-//! プロンプトは出ない。
+//! Like Process Taps, this requires macOS 14.4 or later; below that it returns
+//! [`Error::UnsupportedOsVersion`] (the same gate as `start` of
+//! [`MacProcessBackend`](crate::MacProcessBackend)). Enumeration is read-only and creates no
+//! tap, so no TCC (`kTCCServiceAudioCapture`) prompt appears.
 //!
-//! 返すのは生リストで、重複統合・自プロセス除外・並べ替えは facade が行う。
+//! What is returned is a raw list; deduplication, own-process exclusion, and sorting are
+//! done by the facade.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -36,23 +38,24 @@ use flexaudio_core::types::{ProcessInfo, Result};
 
 use crate::common::{map_os_status, read_cfstring_property, read_system_object_list, NO_ERR};
 
-// libproc（libSystem に常在）。PID の実行ファイルの絶対パスを buffer へ書き、書いた
-// バイト数（NUL 除く）を返す。失敗時は 0 以下。
+// libproc (always present in libSystem). Writes the absolute path of the PID's executable
+// into buffer and returns the number of bytes written (excluding NUL). 0 or less on
+// failure.
 extern "C" {
     fn proc_pidpath(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
 }
 
-/// `proc_pidpath` のバッファ長（`PROC_PIDPATHINFO_MAXSIZE` = 4 * MAXPATHLEN）。
+/// Buffer length for `proc_pidpath` (`PROC_PIDPATHINFO_MAXSIZE` = 4 * MAXPATHLEN).
 const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
 
-/// Core Audio のプロセスオブジェクトを列挙する（生リスト）。
+/// Enumerates Core Audio process objects (raw list).
 ///
-/// 14.4 未満は [`Error::UnsupportedOsVersion`](flexaudio_core::types::Error)。プロセス
-/// オブジェクト一覧そのものを読めないときは `OSStatus` を型付きエラーへ写して返す
-/// （[`map_os_status`]）。個々のオブジェクトの PID が読めないものは飛ばす。
-/// 載せるのは Core Audio が把握しているプロセス（入力だけも含む）。出力を持ったことが
-/// ないプロセスだけを落とす属性は無い（`Devices` は今使っているデバイス、
-/// `IsRunningOutput` は今動いているか）。
+/// Below 14.4, returns [`Error::UnsupportedOsVersion`](flexaudio_core::types::Error). When
+/// the process object list itself cannot be read, maps the `OSStatus` to a typed error and
+/// returns it ([`map_os_status`]). Objects whose PID cannot be read are skipped.
+/// The processes known to Core Audio are listed (including input-only ones). There is no
+/// attribute that drops only the processes that have never had output (`Devices` is the
+/// devices in use now, `IsRunningOutput` is whether it is running now).
 pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     crate::version::ensure_process_tap_supported()?;
 
@@ -86,7 +89,7 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     Ok(out)
 }
 
-/// global scope / main element のプロパティアドレス。
+/// Property address for the global scope / main element.
 fn global_address(selector: u32) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress {
         mSelector: selector,
@@ -95,12 +98,12 @@ fn global_address(selector: u32) -> AudioObjectPropertyAddress {
     }
 }
 
-/// 4 バイトの数値プロパティを読む（`T` は `i32` か `u32`）。読めなければ `None`。
+/// Reads a 4-byte numeric property (`T` is `i32` or `u32`). `None` if it cannot be read.
 fn read_scalar_property<T: Copy + Default>(object: AudioObjectID, selector: u32) -> Option<T> {
     let addr = global_address(selector);
     let mut value: T = T::default();
     let mut size = core::mem::size_of::<T>() as u32;
-    // SAFETY: addr/size/value は有効なローカル。value は size バイトの書き込み先。
+    // SAFETY: addr/size/value are valid locals. value is the destination for size bytes.
     let status = unsafe {
         AudioObjectGetPropertyData(
             object,
@@ -117,20 +120,20 @@ fn read_scalar_property<T: Copy + Default>(object: AudioObjectID, selector: u32)
     Some(value)
 }
 
-/// `pid_t`（i32）プロパティを読む。
+/// Reads a `pid_t` (i32) property.
 fn read_i32_property(object: AudioObjectID, selector: u32) -> Option<i32> {
     read_scalar_property::<i32>(object, selector)
 }
 
-/// `UInt32` プロパティを読む。
+/// Reads a `UInt32` property.
 fn read_u32_property(object: AudioObjectID, selector: u32) -> Option<u32> {
     read_scalar_property::<u32>(object, selector)
 }
 
-/// PID の実行ファイルの絶対パス。読めなければ `None`。
+/// Absolute path of the PID's executable. `None` if it cannot be read.
 fn process_path(pid: i32) -> Option<String> {
     let mut buffer = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
-    // SAFETY: buffer は PROC_PIDPATHINFO_MAXSIZE バイトの書き込み可能領域。
+    // SAFETY: buffer is a writable region of PROC_PIDPATHINFO_MAXSIZE bytes.
     let written = unsafe {
         proc_pidpath(
             pid,
@@ -154,7 +157,7 @@ fn process_path(pid: i32) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// 14.4+ では `Ok`、未満では `UnsupportedOsVersion`。panic しないこと。
+    /// `Ok` on 14.4+, `UnsupportedOsVersion` below. Must not panic.
     #[test]
     fn list_processes_is_gated_and_well_formed() {
         match list_processes() {
@@ -168,7 +171,7 @@ mod tests {
         }
     }
 
-    /// 自プロセスの実行ファイルパスを読めること（proc_pidpath の配線確認）。
+    /// The own process's executable path can be read (checks the proc_pidpath wiring).
     #[test]
     fn own_process_path_is_readable() {
         let path = process_path(std::process::id() as i32).expect("own path");

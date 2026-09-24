@@ -1,38 +1,39 @@
-//! flexaudio-os-windows — Windows バックエンド: WASAPI ループバック / プロセス
-//! ループバック（windows-rs 0.54, Windows build 20348 or later）。
+//! flexaudio-os-windows — Windows backend: WASAPI loopback / process loopback
+//! (windows-rs 0.54, Windows build 20348 or later).
 //!
-//! 2 つの [`CaptureBackend`](flexaudio_core::backend::CaptureBackend) を提供する:
+//! Provides two [`CaptureBackend`](flexaudio_core::backend::CaptureBackend)s:
 //!
-//! - [`WasapiSystemBackend`] — render endpoint の古典 loopback
-//!   （`AUDCLNT_STREAMFLAGS_LOOPBACK`）でシステム音声出力（そのエンドポイントへ流れている
-//!   ミックス）を録る。`device_id` で出力エンドポイントを選べる（`None` で既定）。Linux の
-//!   [`PwSystemBackend`](../flexaudio_os_linux) 相当。出力エンドポイントの一覧は
-//!   [`list_output_devices`] で取れる。
-//! - [`WasapiProcessBackend`] — `ActivateAudioInterfaceAsync` + プロセスループバック
-//!   （`AUDIOCLIENT_ACTIVATION_PARAMS`）で特定 PID（そのプロセスツリー）の音声を録る。
-//!   `exclude_self` で「対象ツリーを除く全システム音」へ反転する。
+//! - [`WasapiSystemBackend`] — captures the system audio output (the mix flowing into that
+//!   endpoint) via classic loopback on a render endpoint (`AUDCLNT_STREAMFLAGS_LOOPBACK`).
+//!   `device_id` selects the output endpoint (`None` for the default). The counterpart of
+//!   Linux's [`PwSystemBackend`](../flexaudio_os_linux). The list of output endpoints is
+//!   available from [`list_output_devices`].
+//! - [`WasapiProcessBackend`] — captures the audio of a specific PID (its process tree) via
+//!   `ActivateAudioInterfaceAsync` + process loopback (`AUDIOCLIENT_ACTIVATION_PARAMS`).
+//!   `exclude_self` inverts this into "all system audio except the target tree".
 //!
-//! 録れるプロセスの候補（音声セッションを持つプロセス）は [`list_processes`] で取れる。
+//! Candidate processes to capture (processes that have an audio session) are available from
+//! [`list_processes`].
 //!
-//! # `!Send` 回避
+//! # Working around `!Send`
 //!
-//! WASAPI の `IAudioClient` 等の COM インターフェイスは `!Send` だが、コア契約
-//! [`CaptureBackend`] は `Send` を要求する。COM の初期化からキャプチャ、破棄までを専用
-//! スレッド 1 本の上で完結させ、バックエンド構造体が持つのは `Send` なものだけ（停止フラグ
-//! [`AtomicBool`] / [`JoinHandle`] / キャッシュ済みフォーマット）にする。COM インター
-//! フェイスはスレッド境界を跨がない。cpal / PipeWire backend と同じ作り。
+//! WASAPI COM interfaces such as `IAudioClient` are `!Send`, but the core contract
+//! [`CaptureBackend`] requires `Send`. Everything from COM initialization through capture to
+//! teardown happens on one dedicated thread, and the backend struct holds only `Send` things
+//! (the stop flag [`AtomicBool`] / [`JoinHandle`] / the cached format). COM interfaces never
+//! cross a thread boundary. Same design as the cpal / PipeWire backends.
 //!
-//! # 非 Windows
+//! # Non-Windows
 //!
-//! バックエンド本体は `#[cfg(target_os = "windows")]` で非 Windows では空コンパイルに
-//! なり、`windows` 依存も `Cargo.toml` の `target.'cfg(...windows)'` セクションでしか
-//! 引かれない。ビルド番号の判定（純粋関数）だけは非 Windows でもコンパイルし、単体
-//! テストする。
+//! The backend itself compiles to nothing on non-Windows targets via
+//! `#[cfg(target_os = "windows")]`, and the `windows` dependency is pulled in only by the
+//! `target.'cfg(...windows)'` section of `Cargo.toml`. Only the build-number check (a pure
+//! function) also compiles and is unit-tested on non-Windows targets.
 
 #![warn(missing_docs)]
 
-/// ビルド番号 → プロセスループバック可否。OS 呼び出しから切り離してあるので
-/// 非 Windows でも単体テストできる。
+/// Build number → whether process loopback is available. Decoupled from OS calls so it
+/// can be unit-tested on non-Windows targets.
 mod version;
 
 #[cfg(target_os = "windows")]

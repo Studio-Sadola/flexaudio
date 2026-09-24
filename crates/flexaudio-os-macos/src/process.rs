@@ -1,20 +1,22 @@
-//! [`MacProcessBackend`] — プロセス別 Process Tap loopback。
+//! [`MacProcessBackend`] — per-process Process Tap loopback.
 //!
-//! 対象 PID を `AudioObjectID` へ変換し、[`ProcessMode`] で INCLUDE / EXCLUDE を切り替える。
-//! - [`ProcessMode::Include`]（既定）→ `initStereoMixdownOfProcesses([objectID])`
-//!   （対象 PID だけ録る）。
+//! Translates the target PID into an `AudioObjectID` and switches between INCLUDE / EXCLUDE
+//! with [`ProcessMode`].
+//! - [`ProcessMode::Include`] (default) → `initStereoMixdownOfProcesses([objectID])`
+//!   (captures only the target PID).
 //! - [`ProcessMode::Exclude`] → `initStereoGlobalTapButExcludeProcesses([objectID])`
-//!   （対象 PID を除く全システム音）。
+//!   (all system audio except the target PID).
 //!
-//! `mode` は process ソース専用で、system ソースの `exclude_self` とは合成しない
-//! （process ソースは `exclude_self` を見ない）。
+//! `mode` is specific to the process source and is not combined with the system source's
+//! `exclude_self` (the process source does not look at `exclude_self`).
 //!
-//! Windows の [`WasapiProcessBackend`](../flexaudio_os_windows) / Linux の
-//! [`PwProcessBackend`](../flexaudio_os_linux) に相当する。
+//! The counterpart of Windows's [`WasapiProcessBackend`](../flexaudio_os_windows) / Linux's
+//! [`PwProcessBackend`](../flexaudio_os_linux).
 //!
-//! # スレッド / Send
-//! [`MacSystemBackend`](crate::MacSystemBackend) と同じ作り。`!Send` な ObjC（[`TapChain`]）は
-//! 専用スレッド内に閉じ込め、本体は `Send` なものだけ保持する。
+//! # Threads / Send
+//! Same design as [`MacSystemBackend`](crate::MacSystemBackend). `!Send` ObjC objects
+//! ([`TapChain`]) are confined to the dedicated thread, and the backend itself holds only
+//! `Send` things.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -28,31 +30,33 @@ use crate::common::{translate_pid_to_object, FALLBACK_FORMAT};
 use crate::system::run_tap_thread;
 use crate::tap::TapKind;
 
-/// プロセス別 Process Tap で特定 PID の音声をキャプチャする [`CaptureBackend`]。
+/// [`CaptureBackend`] that captures the audio of a specific PID with a per-process Process
+/// Tap.
 ///
-/// 専用スレッド上で PID→objectID 変換と tap チェーン構築を行い、IOProc の RT block から
-/// interleaved f32 を [`RawSink::push`] へ流す。対象が無音/不在で objectID が得られないときは
-/// panic せず [`start`](CaptureBackend::start) が [`Error::DeviceNotFound`] を返す。
+/// Performs the PID → objectID translation and builds the tap chain on a dedicated thread,
+/// and feeds interleaved f32 from the IOProc's RT block to [`RawSink::push`]. When the target
+/// is silent/absent and no objectID is available, it does not panic;
+/// [`start`](CaptureBackend::start) returns [`Error::DeviceNotFound`].
 ///
-/// `Send`。保持するのは `target_pid` / `mode` / 停止フラグ / [`JoinHandle`] / キャッシュ済み
-/// フォーマットだけで、`!Send` な ObjC は専用スレッド内に閉じ込める。
+/// `Send`. It holds only `target_pid` / `mode` / the stop flag / [`JoinHandle`] / the cached
+/// format; `!Send` ObjC objects are confined to the dedicated thread.
 pub struct MacProcessBackend {
-    /// キャプチャ対象プロセスの PID。
+    /// PID of the process to capture.
     target_pid: u32,
-    /// 録音モード。[`ProcessMode::Include`] で INCLUDE（対象 PID の音だけ）、
-    /// [`ProcessMode::Exclude`] で EXCLUDE（対象 PID を除く全システム音）。
+    /// Capture mode. [`ProcessMode::Include`] means INCLUDE (only the target PID's audio);
+    /// [`ProcessMode::Exclude`] means EXCLUDE (all system audio except the target PID).
     mode: ProcessMode,
-    /// 起動中フラグ（二重 start ガード / 停止指示 / drop 判定）。`Send`。
+    /// Running flag (double-start guard / stop request / drop check). `Send`.
     stop_flag: Arc<AtomicBool>,
-    /// tap チェーンを所有するスレッドのハンドル（start 後に `Some`）。
+    /// Handle of the thread that owns the tap chain (`Some` after start).
     handle: Option<JoinHandle<()>>,
-    /// ネイティブフォーマット `(rate, channels)`。フォールバックをキャッシュする
-    /// （実フォーマットは tap 作成時に決まる。[`MacSystemBackend`] と同じ方針）。
+    /// Native format `(rate, channels)`. Caches the fallback (the real format is determined
+    /// when the tap is created; same policy as [`MacSystemBackend`]).
     native: (u32, u16),
 }
 
 impl MacProcessBackend {
-    /// 対象 PID と [`ProcessMode`] からバックエンドを構築する（この時点では接続しない）。
+    /// Builds the backend from the target PID and [`ProcessMode`] (does not connect yet).
     pub fn new(target_pid: u32, mode: ProcessMode) -> Self {
         Self {
             target_pid,
@@ -63,12 +67,12 @@ impl MacProcessBackend {
         }
     }
 
-    /// キャプチャ対象の PID。
+    /// The PID to capture.
     pub fn target_pid(&self) -> u32 {
         self.target_pid
     }
 
-    /// 保持している録音モード。
+    /// The stored capture mode.
     pub fn mode(&self) -> ProcessMode {
         self.mode
     }
@@ -84,9 +88,9 @@ impl CaptureBackend for MacProcessBackend {
             return Ok(());
         }
 
-        // バージョンゲート。Process Tap は macOS 14.4 以上が必須。tap 生成へ進む前に OS バージョンを
-        // 確認し、満たさなければ raw OSStatus→Backend に化けさせず型付きの
-        // Error::UnsupportedOsVersion を返す。
+        // Version gate. Process Taps require macOS 14.4 or later. Check the OS version before
+        // proceeding to tap creation, and if it is not met, return the typed
+        // Error::UnsupportedOsVersion instead of letting it turn into raw OSStatus → Backend.
         crate::version::ensure_process_tap_supported()?;
 
         self.stop_flag.store(false, Ordering::SeqCst);
@@ -94,23 +98,24 @@ impl CaptureBackend for MacProcessBackend {
         let stop_flag = self.stop_flag.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let target_pid = self.target_pid;
-        // ProcessMode は Copy なのでそのままクロージャへ move できる。
+        // ProcessMode is Copy, so it can be moved into the closure as is.
         let mode = self.mode;
 
         let handle = thread::Builder::new()
             .name("flexaudio-macos-process".into())
             .spawn(move || {
-                // PID → AudioObjectID 変換は CoreAudio を叩くので所有スレッド内で行う。
+                // The PID → AudioObjectID translation calls CoreAudio, so do it on the owning
+                // thread.
                 let kind = match translate_pid_to_object(target_pid as i32) {
                     Ok(0) => {
-                        // 対象プロセスに対応するオーディオオブジェクトが無い（無音/不在）。
+                        // There is no audio object for the target process (silent/absent).
                         let _ = ready_tx.send(Err(Error::DeviceNotFound));
                         return;
                     }
                     Ok(object_id) => match mode {
-                        // INCLUDE（既定）: 対象 PID だけの mixdown。
+                        // INCLUDE (default): a mixdown of only the target PID.
                         ProcessMode::Include => TapKind::IncludeProcesses(vec![object_id]),
-                        // EXCLUDE: 対象 PID を除く全システム音。
+                        // EXCLUDE: all system audio except the target PID.
                         ProcessMode::Exclude => TapKind::ExcludeProcesses(vec![object_id]),
                     },
                     Err(e) => {
@@ -161,7 +166,7 @@ mod tests {
     use super::*;
     use flexaudio_core::raw_ring;
 
-    /// `new` + `native_format` は panic せず妥当な値を返す。
+    /// `new` + `native_format` do not panic and return sensible values.
     #[test]
     fn new_and_native_format_do_not_panic() {
         let backend = MacProcessBackend::new(1234, ProcessMode::Include);
@@ -172,8 +177,8 @@ mod tests {
         assert_eq!(backend.mode(), ProcessMode::Include);
     }
 
-    /// `start` → `stop` が対象 PID 有無を問わず panic しないこと。
-    /// 不在 PID / TCC 未承認では `Err` を許容（panic だけ不可）。
+    /// `start` → `stop` does not panic whether or not the target PID exists.
+    /// `Err` is allowed for an absent PID / unapproved TCC (only panics are not).
     #[test]
     fn start_then_stop_tolerates_missing_target() {
         let mut backend = MacProcessBackend::new(0xFFFF_FFFE, ProcessMode::Include);
@@ -187,7 +192,7 @@ mod tests {
                 backend.stop();
                 backend.stop();
             }
-            Err(_e) => { /* 不在 PID / TCC 未承認は許容 */ }
+            Err(_e) => { /* absent PID / unapproved TCC is allowed */ }
         }
     }
 }

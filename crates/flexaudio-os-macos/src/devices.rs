@@ -1,17 +1,20 @@
-//! 出力デバイスの列挙と名前→UID 解決。
+//! Output device enumeration and name → UID resolution.
 //!
-//! [`list_output_devices`] が出力（再生）デバイスを列挙して [`DeviceInfo`] のリストを返す。
-//! [`MacSystemBackend`](crate::MacSystemBackend) が特定デバイスを対象に tap を作るとき、
-//! 公開 ID（= デバイス名）から CoreAudio の device UID を引く [`uid_for_device_name`] を使う。
+//! [`list_output_devices`] enumerates the output (playback) devices and returns a list of
+//! [`DeviceInfo`]. When [`MacSystemBackend`](crate::MacSystemBackend) creates a tap targeting
+//! a specific device, it uses [`uid_for_device_name`] to look up the CoreAudio device UID
+//! from the public ID (= device name).
 //!
-//! 全 OS バックエンドの `DeviceInfo` 形に合わせる: `id` と `name` はどちらもデバイス名、
-//! `sample_rate`/`channels` はデバイスのフォーマット、`is_loopback` は常に `true`（出力の
-//! monitor）、`is_default` は既定出力デバイスと一致するとき `true`。
+//! Matches the `DeviceInfo` shape of all OS backends: `id` and `name` are both the device
+//! name, `sample_rate`/`channels` are the device format, `is_loopback` is always `true` (a
+//! monitor of the output), and `is_default` is `true` when it matches the default output
+//! device.
 //!
-//! # 名前を ID に使う理由
-//! 出力デバイスは安定キーとして UID を持つが、他 OS の `DeviceInfo.id` 表示と揃えるため
-//! 公開 ID にはデバイス名を使い、tap 直前に内部で UID へ解決する。同名デバイスが複数ある場合は
-//! 最初に一致したものを使う。
+//! # Why the name is used as the ID
+//! Output devices have a UID as a stable key, but to match how other OSes present
+//! `DeviceInfo.id`, the device name is used as the public ID and resolved to the UID
+//! internally just before the tap is created. If several devices share a name, the first
+//! match is used.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -32,7 +35,7 @@ use crate::common::{
     map_os_status, read_cfstring_property, read_system_object_list, FALLBACK_FORMAT,
 };
 
-/// プロパティアドレスを scope/element 指定で作る。
+/// Builds a property address for the given scope/element.
 fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress {
         mSelector: selector,
@@ -41,14 +44,16 @@ fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
     }
 }
 
-/// system object の `kAudioHardwarePropertyDevices` を読み、全 `AudioObjectID` を返す。
+/// Reads the system object's `kAudioHardwarePropertyDevices` and returns all
+/// `AudioObjectID`s.
 ///
-/// 取得に失敗したときは、[`map_os_status`] で統一した
-/// [`Error`](flexaudio_core::types::Error) を返す。読み取り本体はプロセス列挙と共有の
-/// [`read_system_object_list`]。
+/// On failure, returns an [`Error`](flexaudio_core::types::Error) unified through
+/// [`map_os_status`]. The actual read is [`read_system_object_list`], shared with process
+/// enumeration.
 ///
-/// reader を引数にしているのは、CoreAudio を呼ばずに「取得失敗」と「正常な空リスト」が別の
-/// 値であることを試験するため。本番の呼び出し元は常に [`read_system_object_list`] を渡す。
+/// The reader is a parameter so that tests can verify, without calling CoreAudio, that "read
+/// failed" and "a valid empty list" are different values. Production callers always pass
+/// [`read_system_object_list`].
 type SystemObjectListReader = fn(u32) -> std::result::Result<Vec<AudioObjectID>, i32>;
 
 fn all_device_ids(reader: SystemObjectListReader) -> Result<Vec<AudioObjectID>> {
@@ -56,7 +61,7 @@ fn all_device_ids(reader: SystemObjectListReader) -> Result<Vec<AudioObjectID>> 
         .map_err(|status| map_os_status("AudioObjectGetPropertyData(Devices)", status))
 }
 
-/// デバイスの `kAudioDevicePropertyNominalSampleRate`（output scope, Float64）を読む。
+/// Reads the device's `kAudioDevicePropertyNominalSampleRate` (output scope, Float64).
 fn device_sample_rate(device: AudioObjectID) -> Option<u32> {
     let addr = address(
         kAudioDevicePropertyNominalSampleRate,
@@ -64,7 +69,7 @@ fn device_sample_rate(device: AudioObjectID) -> Option<u32> {
     );
     let mut rate: f64 = 0.0;
     let mut size = core::mem::size_of::<f64>() as u32;
-    // SAFETY: addr/size/rate は有効なローカル。
+    // SAFETY: addr/size/rate are valid locals.
     let status = unsafe {
         AudioObjectGetPropertyData(
             device,
@@ -81,16 +86,18 @@ fn device_sample_rate(device: AudioObjectID) -> Option<u32> {
     Some(rate as u32)
 }
 
-/// デバイスの output scope のチャンネル数を `kAudioDevicePropertyStreamConfiguration` から数える。
+/// Counts the channels of the device's output scope from
+/// `kAudioDevicePropertyStreamConfiguration`.
 ///
-/// `AudioBufferList` の各 `AudioBuffer.mNumberChannels` を合計する。取得できなければ `None`。
+/// Sums `AudioBuffer.mNumberChannels` over the `AudioBufferList`. `None` if it cannot be
+/// obtained.
 fn device_channels(device: AudioObjectID) -> Option<u16> {
     let addr = address(
         kAudioDevicePropertyStreamConfiguration,
         kAudioObjectPropertyScopeOutput,
     );
     let mut size: u32 = 0;
-    // SAFETY: addr/size は有効なローカル。
+    // SAFETY: addr/size are valid locals.
     let status = unsafe {
         AudioObjectGetPropertyDataSize(
             device,
@@ -103,16 +110,19 @@ fn device_channels(device: AudioObjectID) -> Option<u16> {
     if status != 0 || size == 0 {
         return None;
     }
-    // AudioBufferList は可変長（mBuffers が末尾の flexible array）。報告サイズぶんのバッファを
-    // 確保して読み、先頭を AudioBufferList として解釈する。AudioBufferList は内部に *mut の
-    // フィールドを持つので 8 バイトアラインが要る。Vec<u8>（align 1）に置くと OS が書いた
-    // AudioBufferList を読むときミスアラインの参照外しになりうるので、AudioBufferList 自体の
-    // Vec で確保してアラインを保証する（その align で報告サイズを丸ごとカバーする要素数を取る）。
+    // AudioBufferList is variable-length (mBuffers is a trailing flexible array). Allocate a
+    // buffer of the reported size, read into it, and interpret the head as an
+    // AudioBufferList. AudioBufferList has *mut fields inside, so it needs 8-byte alignment.
+    // Placing it in a Vec<u8> (align 1) could cause a misaligned dereference when reading the
+    // AudioBufferList the OS wrote, so allocate a Vec of AudioBufferList itself to guarantee
+    // alignment (taking enough elements at that alignment to cover the whole reported
+    // size).
     let elem = core::mem::size_of::<AudioBufferList>();
     let count = (size as usize).div_ceil(elem).max(1);
-    // SAFETY: AudioBufferList は数値/ポインタだけの #[repr(C)] POD なのでゼロ初期化が有効。
+    // SAFETY: AudioBufferList is a #[repr(C)] POD of numbers/pointers only, so
+    // zero-initialization is valid.
     let mut storage: Vec<AudioBufferList> = vec![unsafe { core::mem::zeroed() }; count];
-    // SAFETY: storage は size バイト以上を 8 バイトアラインで確保済み。
+    // SAFETY: storage has at least size bytes allocated with 8-byte alignment.
     let status = unsafe {
         AudioObjectGetPropertyData(
             device,
@@ -126,14 +136,14 @@ fn device_channels(device: AudioObjectID) -> Option<u16> {
     if status != 0 {
         return None;
     }
-    // SAFETY: storage 先頭は OS が書いた AudioBufferList（適正アライン）。mNumberBuffers ぶんの
-    // AudioBuffer が続く。
+    // SAFETY: The head of storage is the AudioBufferList the OS wrote (properly aligned),
+    // followed by mNumberBuffers AudioBuffers.
     let list = storage.as_ptr();
     let num_buffers = unsafe { (*list).mNumberBuffers } as usize;
     if num_buffers == 0 {
         return None;
     }
-    // SAFETY: mBuffers は num_buffers 本の AudioBuffer の先頭。報告サイズ内に収まっている。
+    // SAFETY: mBuffers is the start of num_buffers AudioBuffers, within the reported size.
     let buffers = unsafe { std::slice::from_raw_parts((*list).mBuffers.as_ptr(), num_buffers) };
     let total: u32 = buffers.iter().map(|b| b.mNumberChannels).sum();
     if total == 0 {
@@ -142,11 +152,12 @@ fn device_channels(device: AudioObjectID) -> Option<u16> {
     Some(total.min(u16::MAX as u32) as u16)
 }
 
-/// デバイスが出力（再生）デバイスかどうか。output scope に stream が 1 本以上あれば出力とみなす。
+/// Whether the device is an output (playback) device. It is considered an output if its
+/// output scope has at least one stream.
 fn is_output_device(device: AudioObjectID) -> bool {
     let addr = address(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput);
     let mut size: u32 = 0;
-    // SAFETY: addr/size は有効なローカル。
+    // SAFETY: addr/size are valid locals.
     let status = unsafe {
         AudioObjectGetPropertyDataSize(
             device,
@@ -159,7 +170,7 @@ fn is_output_device(device: AudioObjectID) -> bool {
     status == 0 && size > 0
 }
 
-/// 既定出力デバイスの `AudioObjectID`。取得できなければ `0`。
+/// `AudioObjectID` of the default output device. `0` if it cannot be obtained.
 fn default_output_device() -> AudioObjectID {
     let addr = address(
         kAudioHardwarePropertyDefaultOutputDevice,
@@ -167,7 +178,7 @@ fn default_output_device() -> AudioObjectID {
     );
     let mut device: AudioObjectID = 0;
     let mut size = core::mem::size_of::<AudioObjectID>() as u32;
-    // SAFETY: addr/size/device は有効なローカル。
+    // SAFETY: addr/size/device are valid locals.
     let status = unsafe {
         AudioObjectGetPropertyData(
             kAudioObjectSystemObject as AudioObjectID,
@@ -184,7 +195,7 @@ fn default_output_device() -> AudioObjectID {
     device
 }
 
-/// デバイスの名前（`kAudioObjectPropertyName`）を読む。取得できなければ `None`。
+/// Reads the device's name (`kAudioObjectPropertyName`). `None` if it cannot be obtained.
 fn device_name(device: AudioObjectID) -> Option<String> {
     read_cfstring_property(
         device,
@@ -193,7 +204,8 @@ fn device_name(device: AudioObjectID) -> Option<String> {
     )
 }
 
-/// デバイスの UID（`kAudioDevicePropertyDeviceUID`）を読む。取得できなければ `None`。
+/// Reads the device's UID (`kAudioDevicePropertyDeviceUID`). `None` if it cannot be
+/// obtained.
 fn device_uid(device: AudioObjectID) -> Option<String> {
     read_cfstring_property(
         device,
@@ -202,17 +214,18 @@ fn device_uid(device: AudioObjectID) -> Option<String> {
     )
 }
 
-/// 出力（再生）デバイスを列挙する。
+/// Enumerates the output (playback) devices.
 ///
-/// 各 [`DeviceInfo`]:
-/// - `id` / `name`: デバイス名（`kAudioObjectPropertyName`）。
-/// - `source_kind`: [`SourceKind::SystemLoopback`]。
-/// - `sample_rate` / `channels`: デバイスの output フォーマット（取れなければ
-///   [`FALLBACK_FORMAT`]）。
-/// - `is_loopback`: 常に `true`（出力 monitor）。
-/// - `is_default`: 既定出力デバイスと一致すれば `true`。
+/// Each [`DeviceInfo`]:
+/// - `id` / `name`: the device name (`kAudioObjectPropertyName`).
+/// - `source_kind`: [`SourceKind::SystemLoopback`].
+/// - `sample_rate` / `channels`: the device's output format ([`FALLBACK_FORMAT`] if
+///   unavailable).
+/// - `is_loopback`: always `true` (output monitor).
+/// - `is_default`: `true` if it matches the default output device.
 ///
-/// 列挙だけなので TCC は要らない。名前を取れないデバイスは飛ばす。
+/// Enumeration only, so TCC is not required. Devices whose name cannot be read are
+/// skipped.
 pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
     let default_id = default_output_device();
     let mut out: Vec<DeviceInfo> = Vec::new();
@@ -237,12 +250,13 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
     Ok(out)
 }
 
-/// 出力デバイス名から CoreAudio の device UID を引く。
+/// Looks up the CoreAudio device UID from an output device name.
 ///
-/// [`list_output_devices`] の `id`（= デバイス名）で受けた指定を、tap が要求する UID へ変換する。
-/// 同名が複数あれば最初の一致を使う。一致するデバイスが無ければ `Ok(None)`（呼び出し側が
-/// [`Error::DeviceNotFound`](flexaudio_core::types::Error) を返す）。一覧を取得できなければ
-/// [`map_os_status`] で対応づけた `Err` を返す。
+/// Converts a selection given as an `id` (= device name) from [`list_output_devices`] into
+/// the UID the tap requires. If several devices share the name, the first match is used.
+/// Returns `Ok(None)` if no device matches (the caller returns
+/// [`Error::DeviceNotFound`](flexaudio_core::types::Error)). If the list cannot be obtained,
+/// returns an `Err` mapped through [`map_os_status`].
 pub(crate) fn uid_for_device_name(name: &str) -> Result<Option<String>> {
     for id in all_device_ids(read_system_object_list)? {
         if !is_output_device(id) {
@@ -261,8 +275,9 @@ mod tests {
 
     use flexaudio_core::types::Error;
 
-    /// 列挙が panic せず `Ok` を返すこと（headless/CI でも出力デバイスは 0 個以上）。
-    /// 各 DeviceInfo は契約どおり loopback=true / SystemLoopback で、妥当な rate/channels を持つ。
+    /// Enumeration does not panic and returns `Ok` (zero or more output devices even on
+    /// headless/CI). Each DeviceInfo is loopback=true / SystemLoopback per the contract and
+    /// has a sensible rate/channels.
     #[test]
     fn list_output_devices_is_well_formed() {
         let devices = list_output_devices().expect("list_output_devices should not error");
@@ -276,10 +291,11 @@ mod tests {
         }
     }
 
-    /// CoreAudio の取得失敗と、正常にデバイスが 0 台だった場合は別の値である。
+    /// A CoreAudio read failure and a valid result of zero devices are different values.
     ///
-    /// この試験は `all_device_ids` 本体へ reader を注入するので、失敗を空 vec に戻すと
-    /// `failure` が `Err` ではなく `Ok(Vec::new())` になり必ず失敗する。
+    /// This test injects a reader into `all_device_ids` itself, so if failures were turned
+    /// back into an empty vec, `failure` would be `Ok(Vec::new())` instead of `Err` and the
+    /// test would always fail.
     #[test]
     fn all_device_ids_distinguishes_failure_from_empty_list() {
         fn empty_reader(_: u32) -> std::result::Result<Vec<AudioObjectID>, i32> {
@@ -310,7 +326,7 @@ mod tests {
         ));
     }
 
-    /// 存在しない名前の UID 解決は `None`。
+    /// Resolving the UID of a nonexistent name yields `None`.
     #[test]
     fn uid_for_unknown_device_is_none() {
         assert!(matches!(

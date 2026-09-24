@@ -1,11 +1,12 @@
-//! Windows バックエンド共通ヘルパ: COM 初期化ガード・WAVEFORMATEX 解析・
-//! HRESULT から [`Error`] への変換・WASAPI キャプチャループ。
+//! Shared helpers for the Windows backends: COM initialization guard, WAVEFORMATEX parsing,
+//! HRESULT-to-[`Error`] conversion, and the WASAPI capture loop.
 //!
-//! [`WasapiSystemBackend`](crate::WasapiSystemBackend) と
-//! [`WasapiProcessBackend`](crate::WasapiProcessBackend) は専用スレッド上で同じキャプチャ
-//! ループ（[`capture_loop`]）を回す。両者で違うのは `IAudioClient` の取得経路（古典
-//! loopback か プロセスループバック activation か）とフォーマットの決め方（`GetMixFormat`
-//! か 固定 WAVEFORMATEX か）だけで、Initialize〜GetService〜Start〜キャプチャ〜Stop は共通。
+//! [`WasapiSystemBackend`](crate::WasapiSystemBackend) and
+//! [`WasapiProcessBackend`](crate::WasapiProcessBackend) run the same capture loop
+//! ([`capture_loop`]) on a dedicated thread. The only differences between them are how the
+//! `IAudioClient` is obtained (classic loopback vs. process loopback activation) and how the
+//! format is chosen (`GetMixFormat` vs. a fixed WAVEFORMATEX); Initialize → GetService →
+//! Start → capture → Stop is shared.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,26 +28,30 @@ use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FO
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-/// アクセス拒否系・デバイス不在系の HRESULT を型付き [`Error`] バリアントへ分類する。
+/// Classifies access-denied and device-missing HRESULTs into typed [`Error`] variants.
 ///
-/// WASAPI/COM の代表的な HRESULT を OS 横断のエラー型へ寄せる:
-/// - アクセス拒否 → [`Error::PermissionDenied`]: `E_ACCESSDENIED`（マイク/音声
-///   キャプチャのプライバシー拒否で来る）・`AUDCLNT_E_DEVICE_IN_USE`（排他使用中で
-///   開けない）・`AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED`（排他不可）。
-/// - デバイス不在/失効 → [`Error::DeviceNotFound`]: `AUDCLNT_E_DEVICE_INVALIDATED`
-///   （対象エンドポイント/デバイスが消えた・失効）・`E_NOTFOUND`（要素/エンドポイント不在）。
+/// Maps the common WASAPI/COM HRESULTs onto the cross-OS error type:
+/// - Access denied → [`Error::PermissionDenied`]: `E_ACCESSDENIED` (returned when the
+///   microphone/audio capture privacy setting denies access), `AUDCLNT_E_DEVICE_IN_USE`
+///   (cannot open because it is in exclusive use), `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED`
+///   (exclusive mode not allowed).
+/// - Device missing/invalidated → [`Error::DeviceNotFound`]: `AUDCLNT_E_DEVICE_INVALIDATED`
+///   (the target endpoint/device disappeared or was invalidated), `E_NOTFOUND` (element/
+///   endpoint not found).
 ///
-/// それ以外は分類できないので `None` を返し、[`map_hr`] が文脈付き [`Error::Backend`] へ
-/// フォールバックする。定数 import は `windows` crate の版差で揺れるので、ここでは値が安定
-/// している生の i32 で比較する（16 進は下のコメントに併記）。
+/// Anything else cannot be classified, so this returns `None` and [`map_hr`] falls back to a
+/// [`Error::Backend`] with context. Constant imports shift between `windows` crate versions,
+/// so this compares against raw i32 values, which are stable (hex values noted alongside
+/// below).
 pub(crate) fn classify_hr(code: i32) -> Option<Error> {
-    // アクセス拒否系 → PermissionDenied
+    // Access denied → PermissionDenied
     const E_ACCESSDENIED: i32 = 0x80070005u32 as i32;
     const AUDCLNT_E_DEVICE_IN_USE: i32 = 0x8889000Au32 as i32;
     const AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED: i32 = 0x8889000Eu32 as i32;
-    // デバイス不在/失効系 → DeviceNotFound
+    // Device missing/invalidated → DeviceNotFound
     const AUDCLNT_E_DEVICE_INVALIDATED: i32 = 0x88890004u32 as i32;
-    // E_NOTFOUND（ERROR_NOT_FOUND を HRESULT 化した 0x80070490）。指定エンドポイント/要素不在。
+    // E_NOTFOUND (0x80070490, ERROR_NOT_FOUND as an HRESULT). The given endpoint/element is
+    // not found.
     const E_NOTFOUND: i32 = 0x80070490u32 as i32;
 
     match code {
@@ -58,11 +63,11 @@ pub(crate) fn classify_hr(code: i32) -> Option<Error> {
     }
 }
 
-/// HRESULT を文脈文字列付きで [`Error`] へ変換する。
+/// Converts an HRESULT into an [`Error`] with a context string.
 ///
-/// アクセス拒否系/デバイス不在系は [`classify_hr`] で型付きバリアント
-/// （[`Error::PermissionDenied`] / [`Error::DeviceNotFound`]）へ寄せ、分類できないものは
-/// 文脈付き [`Error::Backend`] にフォールバックする。
+/// Access-denied and device-missing codes are mapped by [`classify_hr`] to typed variants
+/// ([`Error::PermissionDenied`] / [`Error::DeviceNotFound`]); anything that cannot be
+/// classified falls back to a [`Error::Backend`] with context.
 pub(crate) fn map_hr(ctx: &str, e: windows::core::Error) -> Error {
     if let Some(mapped) = classify_hr(e.code().0) {
         return mapped;
@@ -70,30 +75,33 @@ pub(crate) fn map_hr(ctx: &str, e: windows::core::Error) -> Error {
     Error::Backend(format!("{ctx}: {e}"))
 }
 
-/// 単調クロック（ns）。コア [`monotonic_now_ns`] をそのまま使う。下流の
-/// `ClockNormalizer` が初回原点を取るため、到着時刻の単調近似で足りる。
+/// Monotonic clock (ns). Uses the core [`monotonic_now_ns`] as is. The downstream
+/// `ClockNormalizer` takes the origin on first use, so a monotonic approximation of the
+/// arrival time is sufficient.
 pub(crate) fn now_ns() -> i64 {
     monotonic_now_ns()
 }
 
-/// COM 初期化ガード。`new` で `CoInitializeEx(MULTITHREADED)` し、`Drop` で
-/// `CoUninitialize` する（同一スレッド上で対称に呼ぶ）。
+/// COM initialization guard. `new` calls `CoInitializeEx(MULTITHREADED)` and `Drop` calls
+/// `CoUninitialize` (called symmetrically on the same thread).
 ///
-/// 既に別モードで初期化済み（`RPC_E_CHANGED_MODE`）でも失敗扱いにしない。他所が STA で
-/// 初期化していても WASAPI 呼び出しは通るからで、その場合は `uninit_on_drop=false` にして
-/// 他所の初期化に対して `CoUninitialize` を呼ばないようにする。
+/// Already being initialized in a different mode (`RPC_E_CHANGED_MODE`) is not treated as a
+/// failure, because WASAPI calls still work even if someone else initialized the thread as
+/// STA. In that case `uninit_on_drop=false`, so `CoUninitialize` is not called against
+/// someone else's initialization.
 pub(crate) struct ComThread {
     uninit_on_drop: bool,
 }
 
 impl ComThread {
-    /// このスレッドで COM を初期化する。panic しない。
+    /// Initializes COM on this thread. Does not panic.
     pub(crate) fn new() -> Self {
-        // CoInitializeEx は 0.54 では HRESULT を返す（Result ではない）。
-        // S_OK / S_FALSE は成功、RPC_E_CHANGED_MODE は「既に別モードで初期化済み」。
+        // In 0.54, CoInitializeEx returns an HRESULT (not a Result).
+        // S_OK / S_FALSE mean success; RPC_E_CHANGED_MODE means "already initialized in a
+        // different mode".
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        // 成功（S_OK=0 / S_FALSE=1）なら自分が初期化したので drop で uninit する。
-        // RPC_E_CHANGED_MODE 等は他所が初期化済み → uninit しない。
+        // On success (S_OK=0 / S_FALSE=1) we initialized it, so uninit on drop.
+        // RPC_E_CHANGED_MODE etc. means someone else initialized it → do not uninit.
         let uninit_on_drop = hr.is_ok();
         Self { uninit_on_drop }
     }
@@ -107,34 +115,37 @@ impl Drop for ComThread {
     }
 }
 
-/// `WAVEFORMATEX`（必要なら `WAVEFORMATEXTENSIBLE`）を解析し、サブフォーマットが
-/// IEEE float なら `Ok((rate, channels))` を返す。PCM 系（int）は非対応で
-/// [`Error::Backend`]。共有モードの MixFormat は実機では float が常態。
+/// Parses a `WAVEFORMATEX` (or `WAVEFORMATEXTENSIBLE` when applicable) and returns
+/// `Ok((rate, channels))` if the subformat is IEEE float. PCM (int) formats are unsupported
+/// and return [`Error::Backend`]. On real hardware the shared-mode MixFormat is normally
+/// float.
 ///
-/// `WAVEFORMATEX` / `WAVEFORMATEXTENSIBLE` は `#[repr(C, packed(1))]` なので、packed
-/// フィールドへの参照生成は UB。参照を取らず `addr_of!` + `read_unaligned` で値コピーする。
+/// `WAVEFORMATEX` / `WAVEFORMATEXTENSIBLE` are `#[repr(C, packed(1))]`, so creating a
+/// reference to a packed field is UB. Values are copied with `addr_of!` + `read_unaligned`
+/// without taking references.
 ///
 /// # Safety
-/// `pwfx` は有効な `WAVEFORMATEX` を指していること（`GetMixFormat` の戻り値）。
+/// `pwfx` must point to a valid `WAVEFORMATEX` (the return value of `GetMixFormat`).
 pub(crate) unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32, u16), Error> {
     use core::ptr::addr_of;
 
     if pwfx.is_null() {
         return Err(Error::Backend("GetMixFormat returned null format".into()));
     }
-    // packed フィールドは値コピーで読む。
+    // Read packed fields by value copy.
     let format_tag = addr_of!((*pwfx).wFormatTag).read_unaligned();
     let rate = addr_of!((*pwfx).nSamplesPerSec).read_unaligned();
     let channels = addr_of!((*pwfx).nChannels).read_unaligned();
     let bits = addr_of!((*pwfx).wBitsPerSample).read_unaligned();
     let cb_size = addr_of!((*pwfx).cbSize).read_unaligned();
 
-    // 定数は u32。match パターンに識別子を置くと束縛と誤解されるため `==` 比較で判定する。
+    // The constants are u32. An identifier in a match pattern would be taken as a binding,
+    // so compare with `==`.
     let tag = format_tag as u32;
     let is_float = if tag == WAVE_FORMAT_IEEE_FLOAT {
         true
     } else if tag == WAVE_FORMAT_EXTENSIBLE {
-        // cbSize が EXTENSIBLE 拡張ぶん（22）以上あるなら EXTENSIBLE として読む。
+        // If cbSize covers at least the EXTENSIBLE extension (22), read it as EXTENSIBLE.
         if (cb_size as usize) >= 22 {
             let sub = addr_of!((*(pwfx as *const WAVEFORMATEXTENSIBLE)).SubFormat).read_unaligned();
             sub == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
@@ -153,20 +164,21 @@ pub(crate) unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32,
     Ok((rate, channels))
 }
 
-/// イベント駆動 WASAPI キャプチャループ（専用スレッド上で実行）。
+/// Event-driven WASAPI capture loop (runs on the dedicated thread).
 ///
-/// 既に Initialize 済みの `client`（共有モード・LOOPBACK|EVENTCALLBACK で初期化済み）と
-/// その capture サービス・イベントハンドル・チャンネル数を受け取り、`stop_flag` が
-/// 立つまでパケットを取り出して [`RawSink::push`] へ流す。終了時に `client.Stop()` し、
-/// イベントハンドルを閉じる。
+/// Takes an already-Initialized `client` (initialized in shared mode with
+/// LOOPBACK|EVENTCALLBACK), its capture service, the event handle, and the channel count,
+/// and pulls packets and feeds them to [`RawSink::push`] until `stop_flag` is set. On exit
+/// it calls `client.Stop()` and closes the event handle.
 ///
-/// パケットは f32 interleaved（`channels` ch）として読む。WASAPI のバッファは 8 バイト
-/// 境界以上で確保されるので `*const f32` キャストは安全。無音フラグ
-/// （`AUDCLNT_BUFFERFLAGS_SILENT`）時は 0 を `frames*channels` 個 push する（DC 化防止）。
+/// Packets are read as interleaved f32 (`channels` ch). WASAPI buffers are allocated on at
+/// least an 8-byte boundary, so the `*const f32` cast is safe. When the silent flag
+/// (`AUDCLNT_BUFFERFLAGS_SILENT`) is set, `frames*channels` zeros are pushed (to avoid a DC
+/// offset).
 ///
 /// # Safety
-/// `client` / `capture` / `event` は同一スレッドで Initialize 済みかつ有効な COM
-/// オブジェクト/ハンドルであること。`channels >= 1`。
+/// `client` / `capture` / `event` must be valid COM objects/handles Initialized on the same
+/// thread. `channels >= 1`.
 pub(crate) unsafe fn capture_loop(
     client: &IAudioClient,
     capture: &IAudioCaptureClient,
@@ -176,11 +188,12 @@ pub(crate) unsafe fn capture_loop(
     stop_flag: &Arc<AtomicBool>,
 ) {
     let channels = channels.max(1) as usize;
-    // 無音フラグ時に 0 を流すための再利用バッファ。RT ループに入る前（Start 前）に最大
-    // 想定長で確保しておき、ループ内でアロケートしないようにする。1 パケットの最大フレーム
-    // 数はエンジンのバッファサイズ（`GetBufferSize`）が上限なので、`buffer_frames * channels`
-    // ぶん取っておけばループ内の `resize` は容量内 no-op で済む。`GetBufferSize` が失敗した
-    // ときだけ空のままで、その場合はループ内初回の resize にフォールバックする。
+    // Reusable buffer for pushing zeros when the silent flag is set. It is allocated at the
+    // maximum expected length before entering the RT loop (before Start) so the loop does not
+    // allocate. The maximum frame count of one packet is bounded by the engine buffer size
+    // (`GetBufferSize`), so reserving `buffer_frames * channels` makes the in-loop `resize` an
+    // in-capacity no-op. Only when `GetBufferSize` fails does it stay empty, in which case it
+    // falls back to a resize on the first iteration of the loop.
     let mut silence: Vec<f32> = Vec::new();
     if let Ok(buffer_frames) = client.GetBufferSize() {
         let max_silence = (buffer_frames as usize).saturating_mul(channels);
@@ -188,13 +201,15 @@ pub(crate) unsafe fn capture_loop(
     }
 
     if client.Start().is_err() {
-        // Start に失敗したら何もせず戻る（setup 側で既に Start 済みのため通常来ない）。
+        // If Start fails, return without doing anything (normally unreachable because the
+        // setup side has already started it).
         let _ = CloseHandle(event);
         return;
     }
 
     while !stop_flag.load(Ordering::SeqCst) {
-        // 100ms 経過かイベント発火で起きる。タイムアウト付きにして停止指示を取りこぼさない。
+        // Wakes after 100 ms or when the event fires. The timeout ensures a stop request is
+        // never missed.
         let _ = WaitForSingleObject(event, 100);
         if stop_flag.load(Ordering::SeqCst) {
             break;
@@ -204,7 +219,8 @@ pub(crate) unsafe fn capture_loop(
             let packet = match capture.GetNextPacketSize() {
                 Ok(p) => p,
                 Err(_e) => {
-                    // 対象 PID 終了等で DEVICE_INVALIDATED になり得る。ループを抜けて停止。
+                    // Can become DEVICE_INVALIDATED, e.g. when the target PID exits. Leave
+                    // the loop and stop.
                     stop_flag.store(true, Ordering::SeqCst);
                     break;
                 }
@@ -225,12 +241,14 @@ pub(crate) unsafe fn capture_loop(
             }
 
             let n = frames as usize * channels;
-            // push を catch_unwind で包む。ここは自前スレッドで FFI 境界ではないが、万一
-            // `RawSink::push` 等が panic しても、下の `ReleaseBuffer` / `client.Stop()` /
-            // `CloseHandle` のクリーンアップを飛ばさないため。捕捉しても処理は続行する。
+            // Wrap push in catch_unwind. This is our own thread, not an FFI boundary, but if
+            // `RawSink::push` or similar ever panics, the `ReleaseBuffer` / `client.Stop()` /
+            // `CloseHandle` cleanup below must not be skipped. Processing continues after a
+            // caught panic.
             let _ = catch_unwind(AssertUnwindSafe(|| {
                 if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
-                    // 無音: 0 を n 個 push（下流のギャップ判定/DC 化防止のため）。
+                    // Silence: push n zeros (for downstream gap detection / to avoid a DC
+                    // offset).
                     if silence.len() < n {
                         silence.resize(n, 0.0);
                     }
@@ -243,7 +261,8 @@ pub(crate) unsafe fn capture_loop(
                 }
             }));
 
-            // 取得した frames を必ず解放する（成功/失敗を問わず frames を渡す）。
+            // Always release the acquired frames (pass frames regardless of success or
+            // failure).
             let _ = capture.ReleaseBuffer(frames);
         }
     }
@@ -252,20 +271,20 @@ pub(crate) unsafe fn capture_loop(
     let _ = CloseHandle(event);
 }
 
-/// 共有モード・LOOPBACK|EVENTCALLBACK で `client` を Initialize し、イベントハンドルを
-/// 結び付けて capture サービスを取り出す共通シーケンス。成功時に
-/// `(IAudioCaptureClient, event_handle)` を返す。
+/// Shared sequence that Initializes `client` in shared mode with LOOPBACK|EVENTCALLBACK,
+/// attaches an event handle, and retrieves the capture service. Returns
+/// `(IAudioCaptureClient, event_handle)` on success.
 ///
-/// `pwfx` は Initialize に渡すフォーマット（System は `GetMixFormat` の生ポインタ、
-/// Process は自前固定 WAVEFORMATEX のポインタ）。
-/// `AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK` は常に付ける。
-/// `extra_streamflags` はそれに足す旗（プロセスループバックは公式
-/// ApplicationLoopback サンプルと同じ `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`、
-/// 古典 loopback は `0`）。
+/// `pwfx` is the format passed to Initialize (for System, the raw pointer from
+/// `GetMixFormat`; for Process, a pointer to our own fixed WAVEFORMATEX).
+/// `AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK` is always set.
+/// `extra_streamflags` are flags added on top (for process loopback,
+/// `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`, as in the official ApplicationLoopback sample; for
+/// classic loopback, `0`).
 ///
 /// # Safety
-/// `client` は同一スレッドで Activate 済みの有効な COM オブジェクト。`pwfx` は有効な
-/// `WAVEFORMATEX` を指すこと。
+/// `client` must be a valid COM object Activated on the same thread. `pwfx` must point to a
+/// valid `WAVEFORMATEX`.
 pub(crate) unsafe fn init_loopback_capture(
     client: &IAudioClient,
     pwfx: *const WAVEFORMATEX,
@@ -275,14 +294,14 @@ pub(crate) unsafe fn init_loopback_capture(
         .Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | extra_streamflags,
-            0, // hnsBufferDuration: 0 = エンジン既定
-            0, // hnsPeriodicity: 共有モードは 0
+            0, // hnsBufferDuration: 0 = engine default
+            0, // hnsPeriodicity: 0 in shared mode
             pwfx,
             None,
         )
         .map_err(|e| map_hr("IAudioClient::Initialize", e))?;
 
-    // 手動リセット=false / 初期非シグナル / 無名イベント。
+    // Manual reset = false / initially non-signaled / unnamed event.
     let event =
         CreateEventW(None, false, false, PCWSTR::null()).map_err(|e| map_hr("CreateEventW", e))?;
 
@@ -302,8 +321,8 @@ pub(crate) unsafe fn init_loopback_capture(
     Ok((capture, event))
 }
 
-/// `WaitForSingleObject` の戻り値がシグナル（`WAIT_OBJECT_0`）かどうか。
-/// process backend の activation 完了待ちで使う。
+/// Whether the return value of `WaitForSingleObject` is signaled (`WAIT_OBJECT_0`).
+/// Used by the process backend to wait for activation to complete.
 pub(crate) fn wait_event_signaled(handle: HANDLE, timeout_ms: u32) -> bool {
     let r = unsafe { WaitForSingleObject(handle, timeout_ms) };
     r == WAIT_OBJECT_0
@@ -313,7 +332,7 @@ pub(crate) fn wait_event_signaled(handle: HANDLE, timeout_ms: u32) -> bool {
 mod tests {
     use super::*;
 
-    /// アクセス拒否系の HRESULT は PermissionDenied に分類される（監査 P1-2）。
+    /// Access-denied HRESULTs are classified as PermissionDenied (audit P1-2).
     #[test]
     fn classify_hr_maps_access_denied_to_permission_denied() {
         // E_ACCESSDENIED
@@ -333,7 +352,7 @@ mod tests {
         ));
     }
 
-    /// デバイス不在/失効系の HRESULT は DeviceNotFound に分類される（監査 P1-4）。
+    /// Device-missing/invalidated HRESULTs are classified as DeviceNotFound (audit P1-4).
     #[test]
     fn classify_hr_maps_device_codes_to_device_not_found() {
         // AUDCLNT_E_DEVICE_INVALIDATED
@@ -348,14 +367,14 @@ mod tests {
         ));
     }
 
-    /// 分類できない HRESULT は None（map_hr が Backend にフォールバックする）。
+    /// HRESULTs that cannot be classified yield None (map_hr falls back to Backend).
     #[test]
     fn classify_hr_unknown_is_none() {
-        // E_FAIL（汎用失敗）は分類対象外。
+        // E_FAIL (generic failure) is not classified.
         assert!(classify_hr(0x80004005u32 as i32).is_none());
-        // S_OK は失敗ですらないので当然 None。
+        // S_OK is not even a failure, so naturally None.
         assert!(classify_hr(0).is_none());
-        // AUDCLNT_E_UNSUPPORTED_FORMAT は本質的 Backend（フォーマット非対応）。
+        // AUDCLNT_E_UNSUPPORTED_FORMAT is inherently Backend (unsupported format).
         assert!(classify_hr(0x88890008u32 as i32).is_none());
     }
 }

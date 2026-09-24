@@ -1,17 +1,19 @@
-//! macOS バージョンゲート。Process Tap は macOS 14.4 以上が必須。
+//! macOS version gate. Process Taps require macOS 14.4 or later.
 //!
-//! `MacSystemBackend` / `MacProcessBackend` の `start` が tap 生成へ進む前にこのチェックを
-//! 通し、14.4 未満なら [`Error::UnsupportedOsVersion`] を返す。これが無いと古い OS では
-//! `AudioHardwareCreateProcessTap` が raw な `OSStatus` を返し、
-//! [`map_os_status`](crate::common::map_os_status) 経由で `Error::Backend` に化けてしまい、
-//! 他 OS の `UnsupportedOsVersion` 経路と非対称になる。型でゲートして error 種別を揃える。
+//! `start` of `MacSystemBackend` / `MacProcessBackend` passes this check before proceeding to
+//! tap creation and returns [`Error::UnsupportedOsVersion`] below 14.4. Without it, on older
+//! OSes `AudioHardwareCreateProcessTap` returns a raw `OSStatus` that turns into
+//! `Error::Backend` via [`map_os_status`](crate::common::map_os_status), which is asymmetric
+//! with the `UnsupportedOsVersion` path of the other OSes. Gating by type keeps the error
+//! kinds consistent.
 //!
-//! # 取得方法
-//! `objc2-foundation` の `NSProcessInfo` フィーチャを増やさずに済ませるため、Foundation の
-//! `[[NSProcessInfo processInfo] operatingSystemVersion]` を `objc2` の `class!` /
-//! `msg_send!` で直接呼ぶ。返る `NSOperatingSystemVersion`（major/minor/patch の
-//! `NSInteger` 3 連）はレイアウト一致のローカルミラー [`NSOperatingSystemVersion`] で受ける
-//! （`Encode`/`RefEncode` を実装して構造体戻り値に対応する）。
+//! # How the version is obtained
+//! To avoid enabling the `NSProcessInfo` feature of `objc2-foundation`, Foundation's
+//! `[[NSProcessInfo processInfo] operatingSystemVersion]` is called directly with `objc2`'s
+//! `class!` / `msg_send!`. The returned `NSOperatingSystemVersion` (three `NSInteger`s:
+//! major/minor/patch) is received into a layout-identical local mirror
+//! [`NSOperatingSystemVersion`] (which implements `Encode`/`RefEncode` to support a struct
+//! return value).
 
 use objc2::encode::{Encode, Encoding, RefEncode};
 use objc2::ffi::NSInteger;
@@ -20,16 +22,17 @@ use objc2::{class, msg_send};
 
 use flexaudio_core::types::{Error, Result};
 
-/// Process Tap に必要な最小 macOS バージョンの major。
+/// Major of the minimum macOS version required for Process Taps.
 const MIN_MAJOR: i64 = 14;
-/// Process Tap に必要な最小 macOS バージョンの minor（14.4）。
+/// Minor of the minimum macOS version required for Process Taps (14.4).
 const MIN_MINOR: i64 = 4;
 
-/// Foundation の `NSOperatingSystemVersion` とレイアウトを合わせたローカルミラー。
+/// Local mirror whose layout matches Foundation's `NSOperatingSystemVersion`.
 ///
-/// 3 つの `NSInteger`（64bit ターゲットでは `i64`）から成る `#[repr(C)]` 構造体。`msg_send!`
-/// で `operatingSystemVersion` の構造体戻り値を受けるため `Encode`/`RefEncode` を実装する
-/// （Foundation 側の `NSOperatingSystemVersion` と同じく無名 struct としてエンコードされる）。
+/// A `#[repr(C)]` struct of three `NSInteger`s (`i64` on 64-bit targets). Implements
+/// `Encode`/`RefEncode` so that `msg_send!` can receive the struct return value of
+/// `operatingSystemVersion` (encoded as an anonymous struct, like Foundation's
+/// `NSOperatingSystemVersion`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NSOperatingSystemVersion {
@@ -38,8 +41,8 @@ struct NSOperatingSystemVersion {
     patch: NSInteger,
 }
 
-// SAFETY: 3 つの NSInteger から成る `#[repr(C)]` 構造体で、Foundation の
-// `NSOperatingSystemVersion` と同一レイアウト。エンコードも同じく無名 struct（"?"）。
+// SAFETY: A `#[repr(C)]` struct of three NSIntegers with the same layout as Foundation's
+// `NSOperatingSystemVersion`. The encoding is likewise an anonymous struct ("?").
 unsafe impl Encode for NSOperatingSystemVersion {
     const ENCODING: Encoding = Encoding::Struct(
         "?",
@@ -51,28 +54,29 @@ unsafe impl Encode for NSOperatingSystemVersion {
     );
 }
 
-// SAFETY: 上記 `Encode` を持つ型への参照エンコード。
+// SAFETY: Reference encoding for a type with the `Encode` above.
 unsafe impl RefEncode for NSOperatingSystemVersion {
     const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
 }
 
-/// `(major, minor)` が Process Tap の最小要件（14.4）を満たすか。
+/// Whether `(major, minor)` meets the minimum requirement for Process Taps (14.4).
 ///
-/// patch は見ない（Apple は 14.4 で導入と告知しており 14.4.x はすべて OK）。テストできるよう
-/// OS 呼び出しから切り離した純関数にしてある。
+/// patch is not checked (Apple announced the feature as introduced in 14.4, so every 14.4.x
+/// is OK). It is a pure function decoupled from OS calls so it can be tested.
 fn meets_min_version(major: i64, minor: i64) -> bool {
     major > MIN_MAJOR || (major == MIN_MAJOR && minor >= MIN_MINOR)
 }
 
-/// 実行中の macOS バージョンを `(major, minor)` で取得する。
+/// Gets the running macOS version as `(major, minor)`.
 ///
-/// `[[NSProcessInfo processInfo] operatingSystemVersion]` を直接送って読む。Foundation は常に
-/// リンクされており `NSProcessInfo` クラスは実行時に必ず存在する。
+/// Reads it by sending `[[NSProcessInfo processInfo] operatingSystemVersion]` directly.
+/// Foundation is always linked, and the `NSProcessInfo` class always exists at runtime.
 fn current_os_version() -> (i64, i64) {
-    // SAFETY: `NSProcessInfo` クラスは Foundation に常在する。`processInfo` は autoreleased な
-    // シングルトンを返すが、ここでは即座に operatingSystemVersion を送るだけなので保持は要らない。
-    // `operatingSystemVersion` は NSOperatingSystemVersion を返すゼロ引数セレクタで、レイアウトを
-    // 合わせたローカルミラーで受ける。
+    // SAFETY: The `NSProcessInfo` class is always present in Foundation. `processInfo` returns
+    // an autoreleased singleton, but here we only send operatingSystemVersion to it right
+    // away, so there is no need to retain it. `operatingSystemVersion` is a zero-argument
+    // selector returning NSOperatingSystemVersion, received into the layout-matched local
+    // mirror.
     unsafe {
         let cls = class!(NSProcessInfo);
         let process_info: *mut AnyObject = msg_send![cls, processInfo];
@@ -81,11 +85,12 @@ fn current_os_version() -> (i64, i64) {
     }
 }
 
-/// Process Tap がこの OS で使えるか確認する。14.4 未満なら
-/// [`Error::UnsupportedOsVersion`]、満たせば `Ok(())`。
+/// Checks whether Process Taps are available on this OS. Returns
+/// [`Error::UnsupportedOsVersion`] below 14.4, and `Ok(())` otherwise.
 ///
-/// 各バックエンドの `start` が tap 生成（CoreAudio 呼び出し）へ進む前に呼ぶ。これで古い OS の
-/// 失敗が raw `OSStatus`→`Error::Backend` ではなく型付きの `UnsupportedOsVersion` になる。
+/// Each backend's `start` calls this before proceeding to tap creation (CoreAudio calls).
+/// This makes a failure on an older OS the typed `UnsupportedOsVersion` rather than a raw
+/// `OSStatus` → `Error::Backend`.
 pub(crate) fn ensure_process_tap_supported() -> Result<()> {
     let (major, minor) = current_os_version();
     if meets_min_version(major, minor) {
@@ -99,7 +104,7 @@ pub(crate) fn ensure_process_tap_supported() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// 14.3 は要件未満（Unsupported 相当）。
+    /// 14.3 is below the requirement (i.e. Unsupported).
     #[test]
     fn version_14_3_is_unsupported() {
         assert!(!meets_min_version(14, 3));
@@ -107,13 +112,13 @@ mod tests {
         assert!(!meets_min_version(13, 9));
     }
 
-    /// 14.4 ちょうどは要件を満たす（境界）。
+    /// Exactly 14.4 meets the requirement (boundary).
     #[test]
     fn version_14_4_is_supported() {
         assert!(meets_min_version(14, 4));
     }
 
-    /// 14.5 / 15.x / 26.x など以降は満たす。
+    /// Later versions such as 14.5 / 15.x / 26.x meet it.
     #[test]
     fn newer_versions_are_supported() {
         assert!(meets_min_version(14, 5));
@@ -121,15 +126,16 @@ mod tests {
         assert!(meets_min_version(26, 6));
     }
 
-    /// メジャーが上なら minor が小さくても満たす（15.0 > 14.4）。
+    /// A higher major meets it even with a smaller minor (15.0 > 14.4).
     #[test]
     fn higher_major_with_low_minor_is_supported() {
         assert!(meets_min_version(15, 0));
         assert!(meets_min_version(99, 0));
     }
 
-    /// 実行中の OS バージョン取得が panic せず妥当な値（major >= 10）を返すこと。
-    /// CI/実機いずれでも macOS なら macOS 10 以降なので major は 2 桁台に入る。
+    /// Getting the running OS version does not panic and returns a sane value
+    /// (major >= 10). On macOS, both CI and real hardware are macOS 10 or later, so major has
+    /// two digits.
     #[test]
     fn current_os_version_is_sane() {
         let (major, minor) = current_os_version();
