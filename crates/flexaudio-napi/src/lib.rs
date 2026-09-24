@@ -1,19 +1,19 @@
-//! flexaudio-napi — Node.js (N-API) addon。
+//! flexaudio-napi — Node.js (N-API) addon.
 //!
-//! Node.js アプリが flexaudio をインプロセスで使うためのバインディング。低レイテンシの
-//! ストリーミング録音をコールバック経由で Node へ届ける。
+//! Bindings that let Node.js apps use flexaudio in-process. Low-latency streaming capture is
+//! delivered to Node through callbacks.
 //!
-//! 設計:
-//! - 公開関数は camelCase（`#[napi]` が JS 名へ変換）。
-//! - チャンク/イベントは `ThreadsafeFunction`（ErrorStrategy::Fatal）で JS コールバックへ送る。
-//! - `FlexStream` 構築時に bridge スレッドを spawn し、`stream.start()` 後に
-//!   `poll_chunk` / `poll_event` を 1ms 間隔でポーリングして TSFN へ NonBlocking で渡す。
-//! - 停止は `stop(): Promise<void>`。join は JS スレッドでは行わず、最後の PCM と
-//!   `frames:0` の締めを同じ TSFN に積んだあと「終わりの合図」を 1 つ積み、その合図が
-//!   JS で処理されたときに Promise を resolve する。Drop（GC）は JS を止めず reaper
-//!   スレッドで join する。
+//! Design:
+//! - Public functions are camelCase (`#[napi]` converts them to JS names).
+//! - Chunks/events are sent to JS callbacks via `ThreadsafeFunction` (ErrorStrategy::Fatal).
+//! - Constructing a `FlexStream` spawns a bridge thread; after `stream.start()` it polls
+//!   `poll_chunk` / `poll_event` every 1ms and hands the results to the TSFN as NonBlocking.
+//! - Stop is `stop(): Promise<void>`. The join is never done on the JS thread: after the last
+//!   PCM and the `frames:0` terminator are queued on the same TSFN, one "end signal" is
+//!   queued, and the Promise resolves when JS processes that signal. Drop (GC) does not block
+//!   JS; the join happens on a reaper thread.
 //!
-//! 実行時にネットワーク通信はしない（napi は N-API ブリッジのみ）。
+//! No network access at runtime (napi is only the N-API bridge).
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -41,15 +41,17 @@ use flexaudio::{
     SecondaryChunk, SourceKind, StreamConfig,
 };
 
-// アドオン 3 種のコア型。`#[napi]` ラッパ（Vad / Denoiser）と同名なので別名で取り込む。
+// Core types of the three add-ons. They share names with the `#[napi]` wrappers (Vad /
+// Denoiser), so they are imported under aliases.
 use flexaudio_denoise::{DenoiseError, Denoiser as CoreDenoiser};
 use flexaudio_encode::{EncodeError, FlacWriter};
 use flexaudio_vad::{Vad as CoreVad, VadConfig, VadError, VadEvent};
 
-/// 副タップのペア合成の pts 窓（60ms = 3 チャンク）。副は主に対し 20〜60ms 遅れるので、
-/// この窓なら最大 3 チャンク遅れても時刻対応が取れる。
+/// pts window for pairing secondary-tap chunks (60ms = 3 chunks). The secondary lags the
+/// primary by 20-60ms, so this window keeps the timing correspondence even when it is up to
+/// 3 chunks behind.
 const PAIR_WINDOW_NS: i64 = 60_000_000;
-/// 20ms チャンクの ns 幅。
+/// Width of a 20ms chunk in ns.
 const CHUNK_SPAN_NS: i64 = 20_000_000;
 
 /// Default `max_speech_ms` for the integrated VAD path (`openStream`), used only
@@ -61,46 +63,48 @@ const CHUNK_SPAN_NS: i64 = 20_000_000;
 /// An explicit `maxSpeechMs` (including `0`) always wins.
 const INTEGRATED_VAD_MAX_SPEECH_MS_DEFAULT: u32 = 30_000;
 
-/// どのタップで統合 VAD を走らせるか。
+/// Which tap the integrated VAD runs on.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VadTap {
     Primary,
     Secondary,
 }
 
-/// 副タップのサンプルエンコーディング（core は常に f32・エンコードはバインディング境界）。
+/// Sample encoding of the secondary tap (core is always f32; encoding happens at the binding
+/// boundary).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SecEncoding {
     F32,
     S16,
 }
 
-// bridge スレッドのポーリング間隔。20ms チャンクに対し十分小さく、空転も避ける。
+// Polling interval of the bridge thread. Small enough relative to 20ms chunks while avoiding
+// busy-spinning.
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
-// デバイス着脱は低頻度。応答性 100ms で十分。
+// Device hotplug is infrequent. 100ms responsiveness is enough.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-// ErrorStrategy::Fatal の TSFN 別名。`.call(value, mode)` が値を直接取れる
-// （CalleeHandled だと `.call(Result<T>, mode)` になり Result ラップが要る）。
+// TSFN aliases with ErrorStrategy::Fatal. `.call(value, mode)` takes the value directly
+// (with CalleeHandled it becomes `.call(Result<T>, mode)` and needs a Result wrapper).
 type ChunkTsfn = ThreadsafeFunction<ChunkEmit, ErrorStrategy::Fatal>;
 type SettleTsfn = ThreadsafeFunction<(), ErrorStrategy::Fatal>;
 type EventTsfn = ThreadsafeFunction<JsStreamEvent, ErrorStrategy::Fatal>;
 type DeviceTsfn = ThreadsafeFunction<JsDeviceEvent, ErrorStrategy::Fatal>;
 
-/// onChunk TSFN に積む値。チャンクはユーザーの `onChunk` へ渡し、`StopFlushed` は
-/// 同じ列の「終わりの合図」（JS の onChunk には出さない）。
+/// Value queued on the onChunk TSFN. Chunks are passed to the user's `onChunk`; `StopFlushed`
+/// is the "end signal" on the same queue (not surfaced to the JS onChunk).
 enum ChunkEmit {
     Chunk(Box<JsAudioChunk>),
     StopFlushed,
 }
 
-/// `napi_deferred` は生ポインタ。JS スレッドで作って TSFN で resolve する。
+/// `napi_deferred` is a raw pointer. It is created on the JS thread and resolved via a TSFN.
 #[derive(Clone, Copy)]
 struct SendDeferred(sys::napi_deferred);
 unsafe impl Send for SendDeferred {}
 unsafe impl Sync for SendDeferred {}
 
-/// `stop()` の完了待ち合わせ。Waiters は `napi_create_promise` の deferred。
+/// Rendezvous for `stop()` completion. Waiters are deferreds from `napi_create_promise`.
 enum StopPhase {
     Running,
     Stopping { waiters: Vec<SendDeferred> },
@@ -112,12 +116,13 @@ struct StreamInner {
     cmd_tx: Option<mpsc::Sender<BridgeCmd>>,
 }
 
-/// JS の onChunk を TSFN の寿命まで保持する。`FunctionRef<JsAudioChunk, _>` は
-/// PhantomData 経由で Send にならないことがあるので生の `napi_ref` にする。
+/// Holds the JS onChunk for the lifetime of the TSFN. `FunctionRef<JsAudioChunk, _>` can fail
+/// to be Send because of its PhantomData, so a raw `napi_ref` is used.
 ///
-/// `napi_delete_reference` は JS スレッド限定。StopFlushed / 決着用コールバック
-/// （どちらも TSFN＝JS スレッド）で明示解放し、TSFN finalize の Drop は二回目
-/// no-op。これで `stop()` 後に TSFN 本体が残っても onChunk のクロージャは落ちる。
+/// `napi_delete_reference` is JS-thread only. It is released explicitly in the StopFlushed /
+/// settle callbacks (both TSFN = JS thread), and the Drop at TSFN finalize is then a second,
+/// no-op call. This way the onChunk closure is dropped after `stop()` even if the TSFN itself
+/// remains.
 struct UserChunkCb {
     env: sys::napi_env,
     refer: AtomicPtr<c_void>,
@@ -138,7 +143,7 @@ impl UserChunkCb {
         self.refer.load(Ordering::SeqCst).cast()
     }
 
-    /// JS スレッド限定。二回目は no-op。
+    /// JS-thread only. A second call is a no-op.
     fn release(&self) {
         let refer: sys::napi_ref = self.refer.swap(ptr::null_mut(), Ordering::SeqCst).cast();
         if !self.env.is_null() && !refer.is_null() {
@@ -153,7 +158,7 @@ impl Drop for UserChunkCb {
     }
 }
 
-/// flexaudio::Error → napi::Error。メッセージを文字列化して GenericFailure にする。
+/// flexaudio::Error → napi::Error. Stringifies the message into a GenericFailure.
 fn to_napi_err(err: flexaudio::Error) -> NapiError {
     NapiError::new(Status::GenericFailure, err.to_string())
 }
@@ -188,16 +193,16 @@ fn take_stop_waiters(phase: &Mutex<StopPhase>) -> Vec<SendDeferred> {
     }
 }
 
-/// chunk TSFN への Weak。`StopFlushed` / 決着用が resolve のあと unref するために使う
-/// （作成時点では TSFN がまだ無いので後から差し込む）。
+/// Weak reference to the chunk TSFN. Used by `StopFlushed` / the settle callback to unref it
+/// after resolving (it is filled in later, because the TSFN does not exist yet at creation).
 ///
-/// Strong をコールバックが持つと、napi-rs 2.16 の `ThreadsafeFunction::clone` が
-/// Handle の Arc を複製するだけなので「TSFN → コールバック → slot → TSFN」の輪になり、
-/// finalize（と onChunk の `napi_ref` 解放）が来ない。
+/// If the callback held a Strong reference, napi-rs 2.16's `ThreadsafeFunction::clone` only
+/// clones the Arc of the Handle, forming a "TSFN → callback → slot → TSFN" cycle, and finalize
+/// (and the release of onChunk's `napi_ref`) never comes.
 type ChunkTsfnWeakCell = Arc<OnceLock<Weak<ChunkTsfn>>>;
 
-/// 配送 TSFN のイベントループ保持を外す。`stop()` 決着のあと、ストリーム参照が
-/// 残っていても Node が自分で終われるようにする。idempotent（二回目は no-op）。
+/// Drops the delivery TSFN's hold on the event loop. After `stop()` settles, Node can exit on
+/// its own even if a stream reference remains. Idempotent (a second call is a no-op).
 fn unref_chunk_tsfn(tsfn: &ChunkTsfn, env: &Env) {
     if tsfn.aborted() {
         return;
@@ -225,9 +230,9 @@ fn make_user_chunk_cb(
     Ok(UserChunkCb::new(env.raw(), refer))
 }
 
-/// ユーザーの `onChunk` を呼ぶ TSFN。チャンクはユーザーへ渡し、`StopFlushed` は同じ列で
-/// deferred を resolve する（ユーザーの onChunk は呼ばない）。ポンプ関数は no-op。
-/// resolve のあと chunk TSFN を unref し、onChunk の `napi_ref` を外す。
+/// TSFN that calls the user's `onChunk`. Chunks are passed to the user; `StopFlushed` resolves
+/// the deferreds on the same queue (without calling the user's onChunk). The pump function is
+/// a no-op. After resolving, it unrefs the chunk TSFN and drops onChunk's `napi_ref`.
 fn make_chunk_tsfn(
     env: &Env,
     stop_phase: Arc<Mutex<StopPhase>>,
@@ -259,7 +264,8 @@ fn make_chunk_tsfn(
                     for deferred in take_stop_waiters(&stop_phase) {
                         resolve_undefined(ctx.env.raw(), deferred);
                     }
-                    // 締めと resolve が終わってからループ保持を外す（順番の契約）。
+                    // Drop the loop hold only after the terminator and resolve are done
+                    // (ordering contract).
                     unref_chunk_weak(&chunk_weak, &ctx.env);
                     user.release();
                     Ok(Vec::<Unknown>::new())
@@ -271,12 +277,12 @@ fn make_chunk_tsfn(
     Ok(tsfn)
 }
 
-/// JS スレッドへ戻って stop() の Promise を決着させる専用 TSFN。
-/// chunk TSFN が Closing のとき（届けるべき onChunk はもう無い）に使う。
+/// Dedicated TSFN that returns to the JS thread to settle the stop() Promise.
+/// Used when the chunk TSFN is Closing (there is no onChunk left to deliver to).
 ///
-/// 作成時から unref。生存中は chunk TSFN がループを保持するので決着コールバックは落ちない。
-/// ここへ来たとき（chunk がもう使えない）も resolve のあと chunk 側を unref し、
-/// onChunk の `napi_ref` を外す。
+/// Unref'd from creation. While alive, the chunk TSFN holds the loop, so the settle callback
+/// is not lost. When we get here (the chunk TSFN is no longer usable), it also unrefs the
+/// chunk side after resolving and drops onChunk's `napi_ref`.
 fn make_settle_tsfn(
     env: &Env,
     stop_phase: Arc<Mutex<StopPhase>>,
@@ -299,12 +305,14 @@ fn make_settle_tsfn(
     Ok(tsfn)
 }
 
-/// chunk TSFN に StopFlushed を積む。失敗（Closing / QueueFull など）なら決着用 TSFN へ。
-/// 決着用も失敗なら、JS スレッドへ戻れないので deferred を捨てる。
+/// Queues StopFlushed on the chunk TSFN. On failure (Closing / QueueFull etc.) it falls back
+/// to the settle TSFN. If that fails too, we cannot get back to the JS thread, so the deferreds
+/// are discarded.
 ///
-/// chunk TSFN は `max_queue_size=0`（無制限）なので QueueFull は通常来ない。万一起きた
-/// 場合、決着用は別列なので onChunk より先に resolve し得る。同じ列へ Blocking で
-/// 乗せ直して順番を守ってから、それでも失敗したときだけ決着用へ倒す。
+/// The chunk TSFN has `max_queue_size=0` (unbounded), so QueueFull normally never happens. If
+/// it ever does, the settle TSFN is a separate queue and could resolve before onChunk. So we
+/// first retry on the same queue with Blocking to preserve ordering, and fall back to the
+/// settle TSFN only if that still fails.
 fn post_stop_flushed(chunk: &ChunkTsfn, settle: &SettleTsfn, phase: &Mutex<StopPhase>) {
     let st = chunk.call(
         ChunkEmit::StopFlushed,
@@ -314,7 +322,8 @@ fn post_stop_flushed(chunk: &ChunkTsfn, settle: &SettleTsfn, phase: &Mutex<StopP
         return;
     }
     if st != Status::Closing {
-        // QueueFull 等: 同じ TSFN 列へ Blocking で乗せ、積済み onChunk の後ろに付ける。
+        // QueueFull etc.: put it on the same TSFN queue with Blocking, behind the queued
+        // onChunk calls.
         let st_block = chunk.call(ChunkEmit::StopFlushed, ThreadsafeFunctionCallMode::Blocking);
         if st_block == Status::Ok {
             return;
@@ -330,13 +339,13 @@ fn post_stop_flushed(chunk: &ChunkTsfn, settle: &SettleTsfn, phase: &Mutex<StopP
             return;
         }
     }
-    // 決着用 TSFN まで失敗 = JS イベントループがもう動かない（Node 終了中）。
-    // この時だけ unresolved deferred を捨ててよい。JS が生きている限りは
-    // settle TSFN が JS スレッドで resolve_undefined する。
+    // Even the settle TSFN failed = the JS event loop no longer runs (Node is exiting).
+    // Only in this case may unresolved deferreds be discarded. As long as JS is alive, the
+    // settle TSFN calls resolve_undefined on the JS thread.
     let _ = take_stop_waiters(phase);
 }
 
-/// libuv スレッドプールで `flexaudio::processes()` を実行する。
+/// Runs `flexaudio::processes()` on the libuv thread pool.
 pub struct ProcessesTask;
 
 impl Task for ProcessesTask {
@@ -352,8 +361,8 @@ impl Task for ProcessesTask {
     }
 }
 
-/// VadError → napi::Error。設定不正は呼び出し側のミスなので InvalidArg、
-/// モデルロード/推論失敗は環境要因なので GenericFailure に振り分ける。
+/// VadError → napi::Error. An invalid config is a caller mistake, so InvalidArg; model
+/// load/inference failures are environmental, so GenericFailure.
 fn vad_err(err: VadError) -> NapiError {
     let status = match err {
         VadError::InvalidConfig(_) => Status::InvalidArg,
@@ -362,13 +371,13 @@ fn vad_err(err: VadError) -> NapiError {
     NapiError::new(status, err.to_string())
 }
 
-/// DenoiseError → napi::Error。どちらのバリアントも引数不正なので InvalidArg。
+/// DenoiseError → napi::Error. Both variants are invalid arguments, so InvalidArg.
 fn denoise_err(err: DenoiseError) -> NapiError {
     NapiError::new(Status::InvalidArg, err.to_string())
 }
 
-/// EncodeError → napi::Error。非対応パラメータは InvalidArg、IO/エンコーダ内部は
-/// GenericFailure。`#[non_exhaustive]` なので `_` で将来バリアントも受ける。
+/// EncodeError → napi::Error. Unsupported parameters are InvalidArg; IO/encoder internals are
+/// GenericFailure. It is `#[non_exhaustive]`, so `_` also catches future variants.
 fn encode_err(err: EncodeError) -> NapiError {
     let status = match err {
         EncodeError::Unsupported(_) => Status::InvalidArg,
@@ -378,10 +387,10 @@ fn encode_err(err: EncodeError) -> NapiError {
 }
 
 // ---------------------------------------------------------------------------
-// JS 向けデータ型（`#[napi(object)]` でプレーンオブジェクトとして JS と相互変換）
+// JS-facing data types (converted to/from JS as plain objects via `#[napi(object)]`)
 // ---------------------------------------------------------------------------
 
-/// JS 側 DeviceInfo。`sourceKind` は文字列（"mic"|"system"|"process"）。
+/// JS-side DeviceInfo. `sourceKind` is a string ("mic"|"system"|"process").
 #[napi(object)]
 pub struct JsDeviceInfo {
     pub id: String,
@@ -393,37 +402,41 @@ pub struct JsDeviceInfo {
     pub is_default: bool,
 }
 
-/// JS 側 ProcessInfo（`processes()` の要素）。プロセス別キャプチャの対象候補。
+/// JS-side ProcessInfo (element of `processes()`). A candidate target for per-process capture.
 ///
-/// `pid` を `openStream({ kind: 'process', processId: pid })` に渡すとそのプロセスを録れる。
-/// `name` / `executable` / `bundleId` は表示用（アプリ自身が名乗る値を含む）で、同一性の
-/// キーは `pid`。
+/// Passing `pid` to `openStream({ kind: 'process', processId: pid })` captures that process.
+/// `name` / `executable` / `bundleId` are for display (they include values the app claims for
+/// itself); the identity key is `pid`.
 #[napi(object)]
 pub struct JsProcessInfo {
-    /// OS のプロセス ID（0 以外）。`openStream` の `processId` に渡す。
+    /// OS process ID (non-zero). Pass it as `processId` to `openStream`.
     pub pid: u32,
-    /// 表示名（常に非空）。OS が名乗る名前 → 実行ファイル名 → bundle ID → `"pid <N>"`。
+    /// Display name (never empty). OS-reported name → executable name → bundle ID →
+    /// `"pid <N>"`.
     pub name: String,
-    /// 実行ファイルのベース名（例 `firefox` / `chrome.exe`）。取れたときだけ。
+    /// Base name of the executable (e.g. `firefox` / `chrome.exe`). Only when available.
     pub executable: Option<String>,
-    /// macOS の bundle ID（例 `com.apple.Music`）。macOS で取れたときだけ。
+    /// macOS bundle ID (e.g. `com.apple.Music`). Only when available on macOS.
     pub bundle_id: Option<String>,
-    /// 今まさに音声を出力中か。OS が公開しているときだけ（Linux=ノードが Running /
-    /// Windows=セッションが Active / macOS=IsRunningOutput）。`undefined` は不明。
+    /// Whether it is outputting audio right now. Only when the OS exposes it (Linux = node is
+    /// Running / Windows = session is Active / macOS = IsRunningOutput). `undefined` means
+    /// unknown.
     pub is_output_active: Option<bool>,
 }
 
-/// JS 側 AudioChunk。`data` は interleaved f32（len = frames * channels）。
-/// `seq`(u64) は精度欠落を避けて BigInt。`flags` は ChunkFlags のビット(u32)。
+/// JS-side AudioChunk. `data` is interleaved f32 (len = frames * channels).
+/// `seq` (u64) is a BigInt to avoid precision loss. `flags` is the ChunkFlags bits (u32).
 ///
-/// 配送の形（0.3.0）: `openStream(options, onChunk)` の `onChunk` は **引数 1 つ**
-/// （この主チャンク）で呼ばれる。副タップ（`secondaryOutput`）のチャンクは第 2 引数では
-/// なく、この主チャンクの `secondary` プロパティに入って届く。VAD の確定イベントも別
-/// コールバックではなく、`vadTap` で選んだタップのチャンクの `vadEvents` に載る
-/// （'primary' なら `chunk.vadEvents`、'secondary' なら `chunk.secondary?.vadEvents`）。
+/// Delivery shape (0.3.0): the `onChunk` of `openStream(options, onChunk)` is called with
+/// **one argument** (this primary chunk). The secondary-tap (`secondaryOutput`) chunk is not a
+/// second argument; it arrives in this primary chunk's `secondary` property. Finalized VAD
+/// events likewise have no separate callback; they ride on the `vadEvents` of the chunk of the
+/// tap selected by `vadTap` (`chunk.vadEvents` for 'primary', `chunk.secondary?.vadEvents` for
+/// 'secondary').
 ///
-/// `vadEvents` は `openStream` に `vad` を指定したときだけ埋まる。VAD 無効時は未設定
-/// （`undefined`）。有効でもそのチャンクで確定イベントが無ければ空配列になる。
+/// `vadEvents` is filled only when `vad` is passed to `openStream`. With VAD disabled it is
+/// unset (`undefined`). With VAD enabled it is an empty array when the chunk finalized no
+/// events.
 #[napi(object)]
 pub struct JsAudioChunk {
     pub data: Float32Array,
@@ -434,93 +447,99 @@ pub struct JsAudioChunk {
     pub dropped_before: u32,
     pub peak: f64,
     pub rms: f64,
-    /// このチャンクで確定した VAD イベント（`vadTap` が 'primary' のときのみ）。
+    /// VAD events finalized in this chunk (only when `vadTap` is 'primary').
     pub vad_events: Option<Vec<JsVadEvent>>,
-    /// 時刻対応する副タップチャンク（`secondaryOutput` 設定時のみ）。同一コールバックで
-    /// ペア配送する（`onChunk(primary)` の `primary.secondary`。第 2 引数ではない）。副が
-    /// 未達の周回は `undefined`。主↔副の対応は `ptsNs`（時刻）で取ること（`seq` は各タップ
-    /// 独立）。
+    /// The time-matched secondary-tap chunk (only when `secondaryOutput` is set). Delivered as
+    /// a pair in the same callback (`primary.secondary` of `onChunk(primary)`, not a second
+    /// argument). `undefined` on rounds where the secondary has not arrived yet. Match
+    /// primary↔secondary by `ptsNs` (time) (`seq` is independent per tap).
     pub secondary: Option<JsSecondaryChunk>,
 }
 
-/// JS 側の副タップチャンク（`secondaryOutput` 設定時のみ）。
+/// JS-side secondary-tap chunk (only when `secondaryOutput` is set).
 ///
-/// `data` は `encoding` に一致する typed array（`'s16'` なら `Int16Array`、`'f32'` なら
-/// `Float32Array`）。サンプル値はホストのネイティブエンディアン。s16le の wire 形式へ
-/// 直列化するのは受け手（消費側）の責務。`ptsNs` は主と同じ録音 0 起点時計に乗るが、値は
-/// 主とは独立で、副 Stage2 のリサンプラ群遅延ぶん主より 20〜60ms 遅れる。
+/// `data` is the typed array matching `encoding` (`Int16Array` for `'s16'`, `Float32Array` for
+/// `'f32'`). Sample values are in the host's native endianness. Serializing to the s16le wire
+/// format is the receiver's (consumer's) responsibility. `ptsNs` is on the same
+/// recording-start-zero clock as the primary, but its values are independent of the primary
+/// and lag it by 20-60ms due to the group delay of the secondary Stage2 resampler.
 #[napi(object)]
 pub struct JsSecondaryChunk {
     pub data: Either<Int16Array, Float32Array>,
-    /// 'f32' | 's16'（`data` の型を絞り込むための判別子）。
+    /// 'f32' | 's16' (discriminant for narrowing the type of `data`).
     pub encoding: String,
     pub frames: u32,
     pub pts_ns: i64,
     pub seq: BigInt,
     pub flags: u32,
     pub dropped_before: u32,
-    /// 量子化前 f32 で算出（s16 でもメーター精度を落とさない）。
+    /// Computed on the pre-quantization f32 (no loss of meter precision even for s16).
     pub peak: f64,
     pub rms: f64,
-    /// このチャンクで確定した VAD イベント（`vadTap` が 'secondary' のときのみ）。
+    /// VAD events finalized in this chunk (only when `vadTap` is 'secondary').
     pub vad_events: Option<Vec<JsVadEvent>>,
 }
 
-/// JS 側 VAD イベント（発話区間の開始/終了）。
+/// JS-side VAD event (start/end of a speech segment).
 ///
-/// `type` は `'speechStart' | 'speechEnd'` の 2 値のみ（他イベントの `type` と統一）。
+/// `type` takes only the two values `'speechStart' | 'speechEnd'` (consistent with the `type`
+/// of other events).
 ///
-/// `atSample` は **VAD の内部レート（`sampleRate`＝8000 か 16000、既定 16000）基準**の
-/// 絶対サンプル位置で、入力チャンクのサンプル基準ではない（silero 生値・単体/デバッグ用）。
-/// 秒に直すなら `atSample / sampleRate`、入力サンプル位置の目安は
-/// `atSample * inputSampleRate / sampleRate` で近似できる。
+/// `atSample` is an absolute sample position **in the VAD's internal rate (`sampleRate` = 8000
+/// or 16000, default 16000)**, not in input-chunk samples (raw silero value; for standalone /
+/// debug use). To convert to seconds use `atSample / sampleRate`; the input sample position can
+/// be approximated as `atSample * inputSampleRate / sampleRate`.
 #[napi(object)]
 pub struct JsVadEvent {
-    /// 'speechStart' | 'speechEnd'（発話区間の開始/終了）。
+    /// 'speechStart' | 'speechEnd' (start/end of a speech segment).
     #[napi(js_name = "type", ts_type = "'speechStart' | 'speechEnd'")]
     pub kind: String,
     pub at_sample: i64,
-    /// 録音 0 起点の絶対ナノ秒（`number`＝f64）。統合 VAD（`openStream` の `vad`）経由でのみ
-    /// 埋まる（チャンクの `ptsNs` と、VAD 内部レートでのチャンク内オフセットから算出）。同一
-    /// チャンクで配送され、チャンクをまたいで単調非減少。`flushVad` の最終イベントも同じ
-    /// `vadEvents` 配列に載る。単体 `Vad` クラス（`process`/`flush`）は pts 文脈が無いため
-    /// `undefined`。（時刻は録音長で有界なので `number`。生 u64 カウンタの `seq` のみ `bigint`。）
+    /// Absolute nanoseconds from recording start (`number` = f64). Filled only via the
+    /// integrated VAD (`vad` of `openStream`) (computed from the chunk's `ptsNs` and the
+    /// in-chunk offset at the VAD internal rate). Delivered in the same chunk and monotonically
+    /// non-decreasing across chunks. The final events of `flushVad` ride on the same
+    /// `vadEvents` array. `undefined` for the standalone `Vad` class (`process`/`flush`), which
+    /// has no pts context. (Time is bounded by the recording length, hence `number`; only
+    /// `seq`, a raw u64 counter, is `bigint`.)
     pub at_ns: Option<i64>,
 }
 
-/// JS 側ネイティブフォーマット（`FlexStream.nativeFormat` の戻り）。
+/// JS-side native format (return value of `FlexStream.nativeFormat`).
 #[napi(object)]
 pub struct JsNativeFormat {
     pub sample_rate: u32,
     pub channels: u16,
 }
 
-/// 統合 VAD の設定（`OpenOptions.vad` と `Vad` コンストラクタが共有）。
+/// Integrated VAD settings (shared by `OpenOptions.vad` and the `Vad` constructor).
 ///
-/// 各フィールドは省略可で、省略時は silero 準拠の既定値（`VadConfig::default`）。
+/// Every field is optional; omitted fields take the silero-compliant defaults
+/// (`VadConfig::default`).
 #[napi(object)]
 pub struct VadOptions {
-    /// 発話開始とみなす確率しきい値 (>=)。既定 0.5。
+    /// Probability threshold for treating it as speech start (>=). Default 0.5.
     pub threshold: Option<f64>,
-    /// 無音開始とみなす負側しきい値 (<)。省略時は `max(threshold - 0.15, 0.01)`。
+    /// Negative threshold for treating it as silence start (<). Defaults to
+    /// `max(threshold - 0.15, 0.01)`.
     pub neg_threshold: Option<f64>,
-    /// 採用する発話の最小長 (ms)。既定 250。
+    /// Minimum length of an accepted speech segment (ms). Default 250.
     pub min_speech_ms: Option<u32>,
-    /// 発話終了の確定に必要な無音長 (ms)。既定 100。
+    /// Silence length required to finalize speech end (ms). Default 100.
     pub min_silence_ms: Option<u32>,
-    /// セグメント境界を前後に広げるパディング (ms)。既定 30。
+    /// Padding that widens segment boundaries on both sides (ms). Default 30.
     pub speech_pad_ms: Option<u32>,
-    /// 1 セグメントの最大長 (ms)。0 = 無制限。超過時は強制分割。
+    /// Maximum length of one segment (ms). 0 = unbounded. Force-split when exceeded.
     ///
-    /// 単体 `Vad` クラスは silero 忠実で既定 0（無制限）。**統合 VAD（`openStream` の `vad`）は
-    /// 省略時 30000ms（長広舌を有界化して RT 遅延を抑える）**。明示指定（`0` を含む）があれば
-    /// それが勝つ。
+    /// The standalone `Vad` class is silero-faithful with default 0 (unbounded). **The
+    /// integrated VAD (`vad` of `openStream`) defaults to 30000ms when omitted (bounding
+    /// monologues to keep real-time latency down)**. An explicit value (including `0`) wins.
     pub max_speech_ms: Option<u32>,
-    /// VAD の内部サンプルレート。8000 または 16000 のみ。既定 16000。
+    /// Internal sample rate of the VAD. Only 8000 or 16000. Default 16000.
     pub sample_rate: Option<u32>,
 }
 
-/// JS 側ストリームイベント。`type` で種別、`count`/`message` は任意。
+/// JS-side stream event. `type` is the kind; `count`/`message` are optional.
 #[napi(object)]
 pub struct JsStreamEvent {
     #[napi(js_name = "type")]
@@ -529,7 +548,7 @@ pub struct JsStreamEvent {
     pub message: Option<String>,
 }
 
-/// JS 側デバイスイベント。`type` で種別、device/id/sourceKind は任意。
+/// JS-side device event. `type` is the kind; device/id/sourceKind are optional.
 #[napi(object)]
 pub struct JsDeviceEvent {
     #[napi(js_name = "type")]
@@ -539,71 +558,79 @@ pub struct JsDeviceEvent {
     pub source_kind: Option<String>,
 }
 
-/// 副出力タップの指定（`OpenOptions.secondaryOutput`）。
+/// Secondary output tap specification (`OpenOptions.secondaryOutput`).
 ///
-/// 主出力（`outputRate`/`outputChannels`）と同じキャプチャを別フォーマットで同時に返す。
-/// 保存 48k/stereo + 認識 16k/mono/s16 のようなペア取得に使う。
+/// Returns the same capture as the primary output (`outputRate`/`outputChannels`) in a
+/// different format at the same time. Used for paired capture such as 48k/stereo for storage
+/// + 16k/mono/s16 for recognition.
 #[napi(object)]
 pub struct SecondaryOutputOptions {
-    /// 副出力サンプルレート（Hz）。例 16000。
+    /// Secondary output sample rate (Hz). E.g. 16000.
     pub rate: u32,
-    /// 副出力チャンネル数（1=mono / 2=stereo）。例 1。
+    /// Secondary output channel count (1=mono / 2=stereo). E.g. 1.
     pub channels: u16,
-    /// 副チャンクのサンプルエンコーディング。'f32'（既定）| 's16'。s16 は VAD の後に
-    /// 量子化して `Int16Array` で返す（値はネイティブエンディアン）。
+    /// Sample encoding of secondary chunks. 'f32' (default) | 's16'. s16 is quantized after
+    /// the VAD and returned as an `Int16Array` (values in native endianness).
     pub encoding: Option<String>,
 }
 
-/// openStream / __openMockStream のオプション。
+/// Options for openStream / __openMockStream.
 #[napi(object)]
 pub struct OpenOptions {
     /// "mic" | "system" | "process" | "mix"
     pub kind: String,
     pub device_id: Option<String>,
     pub process_id: Option<u32>,
-    /// process の対象 PID の扱い（process 専用）。"include"（既定）| "exclude"。
-    /// include=対象 PID だけ録る / exclude=対象 PID 以外の全システム音（process_id 必須）。
-    /// mic / system では無視。Linux / Windows / macOS の 3 OS とも対応。
+    /// How the target PID of process is treated (process only). "include" (default) |
+    /// "exclude". include = capture only the target PID / exclude = all system audio except
+    /// the target PID (process_id required). Ignored for mic / system. Supported on all three
+    /// OSes: Linux / Windows / macOS.
     pub mode: Option<String>,
-    /// システム音から自ホスト（自プロセス）の音を除くか（system 専用。mix では
-    /// system 側に適用）。既定 false。mic / process では無視。
-    /// Linux / Windows / macOS の 3 OS とも対応。
+    /// Whether to exclude the host's own (own process) audio from system audio (system only;
+    /// for mix it applies to the system side). Default false. Ignored for mic / process.
+    /// Supported on all three OSes: Linux / Windows / macOS.
     pub exclude_self: Option<bool>,
-    /// 既定 48000
+    /// Default 48000
     pub output_rate: Option<u32>,
-    /// 既定 2
+    /// Default 2
     pub output_channels: Option<u16>,
-    /// 既定 20
+    /// Default 20
     pub chunk_ms: Option<u32>,
-    /// 開始時の入力ゲイン（線形倍率）。既定 1.0。1.0=そのまま、2.0=約+6dB、0.0=無音。
-    /// 実行時変更は `setGain`。
+    /// Initial input gain (linear factor). Default 1.0. 1.0 = unchanged, 2.0 = about +6dB,
+    /// 0.0 = silence. Change it at runtime with `setGain`.
     pub gain: Option<f64>,
-    /// mix の mic 側で選ぶ入力デバイス ID（mix 専用）。未指定なら既定入力。
+    /// Input device ID selected for the mic side of mix (mix only). Default input if unset.
     pub mic_device_id: Option<String>,
-    /// mix の system 側で選ぶ出力エンドポイント ID（mix 専用）。未指定なら既定出力。
+    /// Output endpoint ID selected for the system side of mix (mix only). Default output if
+    /// unset.
     pub system_device_id: Option<String>,
-    /// mix の mic 側の合成前倍率（線形・mix 専用）。既定 1.0。合成後に `gain` が掛かる。
+    /// Pre-mix factor for the mic side of mix (linear, mix only). Default 1.0. `gain` is applied
+    /// after mixing.
     pub mic_gain: Option<f64>,
-    /// mix の system 側の合成前倍率（線形・mix 専用）。既定 1.0。
+    /// Pre-mix factor for the system side of mix (linear, mix only). Default 1.0.
     pub system_gain: Option<f64>,
-    /// 統合 VAD の設定。指定すると `vadTap` で選んだタップを VAD に通し、確定イベントを
-    /// そのタップのチャンクの `vadEvents` に添える（音声自体は加工しない）。省略時は VAD 無効。
+    /// Integrated VAD settings. When set, the tap selected by `vadTap` is fed to the VAD and
+    /// finalized events are attached to that tap's chunk `vadEvents` (the audio itself is not
+    /// modified). VAD is disabled when omitted.
     pub vad: Option<VadOptions>,
-    /// VAD を走らせるタップ。'primary'（既定）| 'secondary'。'secondary' は
-    /// `secondaryOutput` 設定時のみ有効で、副が 16k/mono ならリサンプル省略で効率的。
+    /// Tap the VAD runs on. 'primary' (default) | 'secondary'. 'secondary' is valid only when
+    /// `secondaryOutput` is set, and is efficient when the secondary is 16k/mono since
+    /// resampling is skipped.
     pub vad_tap: Option<String>,
-    /// true で録音時ノイズ抑制を有効化。**出力が 48000 Hz のときだけ使える**
-    /// （RNNoise は 48kHz 固定）。有効時は 48kHz/stereo の内部正規形へ 1 度だけ適用され、
-    /// 主・副の両タップが除去済み音声を受ける（+10ms の固定遅延）。48kHz 以外で true に
-    /// すると `openStream` が InvalidArg を投げる。省略/false でノイズ抑制なし。
+    /// true enables capture-time noise suppression. **Usable only when the output is 48000 Hz**
+    /// (RNNoise is fixed at 48kHz). When enabled it is applied once to the 48kHz/stereo
+    /// internal canonical form, and both the primary and secondary taps receive denoised audio
+    /// (+10ms fixed latency). Setting it to true with a rate other than 48kHz makes
+    /// `openStream` throw InvalidArg. Omitted/false means no noise suppression.
     pub denoise: Option<bool>,
-    /// 副出力タップ。指定すると主とペアで別フォーマットのチャンクを同時に返す
-    /// （`onChunk` の `primary.secondary`）。省略時は副タップなし＝従来どおり。
+    /// Secondary output tap. When set, chunks in a different format are returned paired with
+    /// the primary at the same time (`primary.secondary` of `onChunk`). When omitted there is
+    /// no secondary tap = same as before.
     pub secondary_output: Option<SecondaryOutputOptions>,
 }
 
 // ---------------------------------------------------------------------------
-// 変換ヘルパ
+// Conversion helpers
 // ---------------------------------------------------------------------------
 
 fn source_kind_str(k: SourceKind) -> String {
@@ -629,7 +656,8 @@ fn parse_source_kind(s: &str) -> napi::Result<SourceKind> {
     }
 }
 
-/// "include" | "exclude" を [`ProcessMode`] へ（process 専用）。`None`/未指定は既定 Include。
+/// "include" | "exclude" to [`ProcessMode`] (process only). `None`/unset is the default
+/// Include.
 fn parse_process_mode(s: Option<&str>) -> napi::Result<ProcessMode> {
     match s {
         None | Some("include") => Ok(ProcessMode::Include),
@@ -666,7 +694,7 @@ fn process_info_to_js(info: ProcessInfo) -> JsProcessInfo {
 fn chunk_to_js(chunk: AudioChunk) -> JsAudioChunk {
     let frames = chunk.frames as u32;
     JsAudioChunk {
-        // Vec<f32> を Float32Array 化（所有権をスレッド側に残さない）。
+        // Turn the Vec<f32> into a Float32Array (no ownership left on the thread side).
         data: Float32Array::new(chunk.data),
         frames,
         pts_ns: chunk.pts_ns,
@@ -675,9 +703,11 @@ fn chunk_to_js(chunk: AudioChunk) -> JsAudioChunk {
         dropped_before: chunk.dropped_before,
         peak: chunk.peak as f64,
         rms: chunk.rms as f64,
-        // 既定は未設定。統合 VAD 有効時（primary タップ）は bridge が上書きする。
+        // Unset by default. With the integrated VAD enabled (primary tap), the bridge
+        // overwrites it.
         vad_events: None,
-        // ペア合成で bridge が時刻対応する副チャンクを差し込む（無ければ undefined）。
+        // The bridge inserts the time-matched secondary chunk during pairing (undefined if
+        // none).
         secondary: None,
     }
 }
@@ -686,8 +716,9 @@ fn vad_event_to_js(ev: VadEvent) -> JsVadEvent {
     vad_event_to_js_abs(ev, None)
 }
 
-/// [`VadEvent`] を JS へ写す。`at_ns` は録音 0 起点の絶対時刻（統合 VAD 経由のみ・単体
-/// `Vad` クラスは `None`）。`at_sample` は VAD 内部レート基準の生の累積位置。
+/// Maps a [`VadEvent`] to JS. `at_ns` is the absolute time from recording start (only via
+/// the integrated VAD; `None` for the standalone `Vad` class). `at_sample` is the raw
+/// cumulative position at the VAD internal rate.
 fn vad_event_to_js_abs(ev: VadEvent, at_ns: Option<i64>) -> JsVadEvent {
     let (kind, at_sample) = match ev {
         VadEvent::SpeechStart { at_sample } => ("speechStart", at_sample as i64),
@@ -700,7 +731,7 @@ fn vad_event_to_js_abs(ev: VadEvent, at_ns: Option<i64>) -> JsVadEvent {
     }
 }
 
-/// 'primary' | 'secondary' を [`VadTap`] へ。`None`/未指定は既定 Primary。
+/// 'primary' | 'secondary' to [`VadTap`]. `None`/unset is the default Primary.
 fn parse_vad_tap(s: Option<&str>) -> napi::Result<VadTap> {
     match s {
         None | Some("primary") => Ok(VadTap::Primary),
@@ -712,7 +743,7 @@ fn parse_vad_tap(s: Option<&str>) -> napi::Result<VadTap> {
     }
 }
 
-/// 'f32' | 's16' を [`SecEncoding`] へ。`None`/未指定は既定 F32。
+/// 'f32' | 's16' to [`SecEncoding`]. `None`/unset is the default F32.
 fn parse_sec_encoding(s: Option<&str>) -> napi::Result<SecEncoding> {
     match s {
         None | Some("f32") => Ok(SecEncoding::F32),
@@ -724,8 +755,9 @@ fn parse_sec_encoding(s: Option<&str>) -> napi::Result<SecEncoding> {
     }
 }
 
-/// [`VadOptions`] → [`VadConfig`]。省略フィールドは silero 準拠の既定へ倒す。
-/// `neg_threshold` の省略は `None` のまま（`VadConfig` 側の既定式が効く）。
+/// [`VadOptions`] → [`VadConfig`]. Omitted fields fall back to the silero-compliant defaults.
+/// An omitted `neg_threshold` stays `None` (the default formula on the `VadConfig` side
+/// applies).
 fn build_vad_config(o: &VadOptions) -> VadConfig {
     let d = VadConfig::default();
     VadConfig {
@@ -754,28 +786,30 @@ fn build_integrated_vad_config(o: &VadOptions) -> VadConfig {
     cfg
 }
 
-/// 統合 denoise の 48kHz 前提を検証する（純関数・テスト用に分離）。
+/// Validates the 48kHz precondition of the integrated denoise (pure function, split out for
+/// tests).
 ///
-/// RNNoise は 48kHz 固定なので、`enabled` かつ出力レートが 48000 でなければ
-/// InvalidArg を返す。`open_stream` はストリームを開く前にこれで弾く。
+/// RNNoise is fixed at 48kHz, so if `enabled` and the output rate is not 48000 it returns
+/// InvalidArg. `open_stream` rejects with this before opening the stream.
 fn check_denoise_rate(enabled: bool, output_rate: u32) -> napi::Result<()> {
     if enabled && output_rate != 48_000 {
         return Err(NapiError::new(
             Status::InvalidArg,
             format!(
-                "denoise は 48000 Hz 出力のみ対応（RNNoise は 48kHz 固定）。\
-                 outputRate={output_rate} では使えません"
+                "denoise supports only 48000 Hz output (RNNoise is fixed at 48kHz); \
+                 it cannot be used with outputRate={output_rate}"
             ),
         ));
     }
     Ok(())
 }
 
-/// FLAC ローテーションの `index` 番目（1 始まり）のパスを作る（純関数）。
+/// Builds the path for the `index`-th (1-based) FLAC rotation file (pure function).
 ///
-/// CLI の `split_file_path` と同じ流儀: `rec.flac` なら `rec-001.flac, rec-002.flac, …`
-/// と拡張子の前へ 3 桁ゼロ詰め連番を挟む。1000 以降は桁が自然に増える。拡張子が無い
-/// パスは末尾に連番を足す。親ディレクトリは保たれる。
+/// Same convention as the CLI's `split_file_path`: for `rec.flac` it inserts a 3-digit
+/// zero-padded sequence number before the extension, giving `rec-001.flac, rec-002.flac, …`.
+/// From 1000 on the digits simply grow. For a path without an extension the number is
+/// appended at the end. The parent directory is preserved.
 fn split_flac_path(base: &Path, index: u64) -> PathBuf {
     let stem = base
         .file_stem()
@@ -820,8 +854,8 @@ fn event_to_js(ev: Event) -> JsStreamEvent {
             count: None,
             message: Some(msg),
         },
-        // Event は #[non_exhaustive]。将来のバリアント追加に備えて、未知種別は "error"
-        // + デバッグ表現で JS へ通知する（握り潰さない）。
+        // Event is #[non_exhaustive]. To prepare for future variants, unknown kinds are
+        // reported to JS as "error" + their debug representation (not swallowed).
         other => JsStreamEvent {
             kind: "error".to_string(),
             count: None,
@@ -850,8 +884,8 @@ fn device_event_to_js(ev: DeviceEvent) -> JsDeviceEvent {
             id: Some(id),
             source_kind: Some(source_kind_str(kind)),
         },
-        // DeviceEvent は #[non_exhaustive]。将来のバリアント追加に備えて、未知種別は
-        // "unknown" として JS へ渡す（握り潰さない）。
+        // DeviceEvent is #[non_exhaustive]. To prepare for future variants, unknown kinds are
+        // passed to JS as "unknown" (not swallowed).
         _ => JsDeviceEvent {
             kind: "unknown".to_string(),
             device: None,
@@ -868,8 +902,8 @@ fn build_config(options: &OpenOptions) -> napi::Result<StreamConfig> {
         sample_rate: options.output_rate.unwrap_or(48_000),
         channels: options.output_channels.unwrap_or(2),
     };
-    // 副タップ（設定時のみ）。encoding はバインディング層のマーシャルで解釈するので、
-    // core の StreamConfig にはレート/チャンネルだけを載せる（core は常に f32）。
+    // Secondary tap (only when set). The encoding is interpreted by the binding layer's
+    // marshalling, so only rate/channels go into core's StreamConfig (core is always f32).
     let secondary_output = options.secondary_output.as_ref().map(|s| OutputFormat {
         sample_rate: s.rate,
         channels: s.channels,
@@ -880,11 +914,13 @@ fn build_config(options: &OpenOptions) -> napi::Result<StreamConfig> {
         secondary_output,
         device_id: options.device_id.clone(),
         target_pid: options.process_id,
-        // mode は process 専用 / exclude_self は system 専用。混ぜないのは facade 側が見る。
+        // mode is process-only / exclude_self is system-only. The facade enforces not mixing
+        // them.
         mode,
         exclude_self: options.exclude_self.unwrap_or(false),
         gain: options.gain.unwrap_or(1.0) as f32,
-        // mix 専用（mic/system/process では facade が無視する）。側別ゲインは未指定 1.0。
+        // mix only (the facade ignores these for mic/system/process). Per-side gains default
+        // to 1.0 when unset.
         mix_mic_device_id: options.mic_device_id.clone(),
         mix_system_device_id: options.system_device_id.clone(),
         mix_mic_gain: options.mic_gain.unwrap_or(1.0) as f32,
@@ -898,29 +934,29 @@ fn build_config(options: &OpenOptions) -> napi::Result<StreamConfig> {
 }
 
 // ---------------------------------------------------------------------------
-// FlexStream（class）。bridge スレッドの所有・停止を担う。
+// FlexStream (class). Owns and stops the bridge thread.
 // ---------------------------------------------------------------------------
 
-/// bridge スレッドへソース切替を依頼するコマンド。
+/// Command asking the bridge thread to switch sources.
 ///
-/// Stream は bridge スレッドが所有しているので `switch_source` を直接呼べない。JS から
-/// 来た切替要求をこのコマンドで bridge スレッドへ送り、`result_tx` で結果を同期的に
-/// 受け取る（JS 側は同期返却を期待する）。
+/// The bridge thread owns the Stream, so `switch_source` cannot be called directly. A switch
+/// request from JS is sent to the bridge thread with this command and the result is received
+/// synchronously via `result_tx` (the JS side expects a synchronous return).
 struct SwitchCmd {
     config: StreamConfig,
     result_tx: mpsc::Sender<std::result::Result<(), String>>,
 }
 
-/// bridge スレッドへストリームの現在値の読み出しを依頼するコマンド。
+/// Command asking the bridge thread to read the stream's current values.
 ///
-/// `is_paused` / `gain` / `native_format` / `dropped_chunks` はいずれも Stream 上の
-/// メソッドで、Stream は bridge スレッドが所有しているため直接は読めない。1 回の問い合わせで
-/// まとめて [`StreamSnapshot`] を受け取り、各ゲッタが必要なフィールドだけ取り出す。
+/// `is_paused` / `gain` / `native_format` / `dropped_chunks` are all methods on the Stream,
+/// and the bridge thread owns the Stream, so they cannot be read directly. A single query
+/// returns a [`StreamSnapshot`] with all of them, and each getter picks the field it needs.
 struct QueryCmd {
     result_tx: mpsc::Sender<StreamSnapshot>,
 }
 
-/// bridge スレッドが読み取ったストリームの現在値のスナップショット。
+/// Snapshot of the stream's current values as read by the bridge thread.
 struct StreamSnapshot {
     is_paused: bool,
     gain: f32,
@@ -929,26 +965,28 @@ struct StreamSnapshot {
     dropped_chunks: u64,
 }
 
-/// bridge スレッドへ送るコマンド。Stream を触るのは bridge スレッドだけなので、JS から
-/// の操作はすべてこのチャネル経由で依頼する。
+/// Commands sent to the bridge thread. Only the bridge thread touches the Stream, so every
+/// operation from JS is requested through this channel.
 enum BridgeCmd {
-    /// 入力ソースのホットスワップ（結果を同期で返す）。
+    /// Hot-swap of the input source (returns the result synchronously).
     Switch(SwitchCmd),
-    /// 配信を一時停止する。
+    /// Pauses delivery.
     Pause,
-    /// 配信を再開する。
+    /// Resumes delivery.
     Resume,
-    /// 入力ゲイン（線形倍率）を変更する。値は送信前に napi 側で検証済み。
+    /// Changes the input gain (linear factor). The value is validated on the napi side before
+    /// sending.
     SetGain(f32),
-    /// 現在値のスナップショットを同期で返す（ゲッタ用）。
+    /// Returns a snapshot of the current values synchronously (for getters).
     Query(QueryCmd),
-    /// 統合 VAD の開いている発話を強制確定する（`flushVad`）。runtime 操作で config は
-    /// 変更しない（`secondaryOutput` / encoding は open 時に固定）。音の
-    /// stop-flush とは別物で、最終 speechEnd を次に届くタップのチャンクへ載せる。
+    /// Force-finalizes the integrated VAD's open speech segment (`flushVad`). A runtime
+    /// operation that does not change the config (`secondaryOutput` / encoding are fixed at
+    /// open). Distinct from the audio stop-flush: the final speechEnd rides on the next chunk
+    /// that arrives on the tap.
     FlushVad,
 }
 
-/// 副タップのマーシャル設定（レート/チャンネル/エンコーディング）。
+/// Marshalling settings of the secondary tap (rate/channels/encoding).
 #[derive(Clone, Copy)]
 struct SecondaryTapCfg {
     rate: u32,
@@ -956,48 +994,55 @@ struct SecondaryTapCfg {
     encoding: SecEncoding,
 }
 
-/// bridge スレッドの emit 状態。主/副チャンクを JS 化し、統合 VAD を選択タップへかけ、
-/// pts 窓（60ms）でペア合成して `onChunk` へ届ける。
+/// Emit state of the bridge thread. Converts primary/secondary chunks to JS, applies the
+/// integrated VAD to the selected tap, pairs them within the pts window (60ms), and delivers
+/// them to `onChunk`.
 ///
-/// denoise は core（内部正規形）へ移設済みでここには無い。VAD は単一インスタンスを単一
-/// タップに束縛し（`vad_tap`）、量子化前の f32 を Rust 内で食う。副 s16 化は VAD の後。
+/// denoise has moved into core (internal canonical form) and is not here. The VAD binds a
+/// single instance to a single tap (`vad_tap`) and consumes the pre-quantization f32 inside
+/// Rust. Secondary s16 conversion happens after the VAD.
 struct PairingBridge {
     on_chunk: ChunkTsfn,
     stop_phase: Arc<Mutex<StopPhase>>,
-    /// 統合 VAD（設定時のみ）。単一インスタンス・単一タップ。
+    /// Integrated VAD (only when set). Single instance, single tap.
     vad: Option<CoreVad>,
     vad_tap: VadTap,
-    /// VAD 内部レート（絶対時刻式の分母・8000/16000）。
+    /// VAD internal rate (denominator of the absolute-time formula, 8000/16000).
     vad_rate: i64,
-    /// VAD 内部レートでの累計投入サンプル数（`reset` で 0 に戻す）。絶対時刻の基準点。
+    /// Cumulative samples fed at the VAD internal rate (reset to 0 on `reset`). Reference
+    /// point for absolute time.
     vad_samples_fed: i64,
-    /// VAD タップの前チャンクの `dropped_before`（欠落差分の検知用）。
+    /// `dropped_before` of the previous chunk on the VAD tap (for detecting drop deltas).
     vad_last_dropped: u32,
-    /// 直近に VAD へ食わせたチャンクの基準点（`(vad_sample_base, pts_base)`）。`flushVad`
-    /// が生成する最終イベントの絶対時刻を、その周回で処理する新チャンクが無くても
-    /// 算出できるように保持する。
+    /// Reference point of the chunk most recently fed to the VAD (`(vad_sample_base,
+    /// pts_base)`). Kept so the absolute time of the final events generated by `flushVad` can
+    /// be computed even when there is no new chunk to process in that round.
     vad_anchor_sample: i64,
     vad_anchor_pts: i64,
-    /// 実行中 `flushVad` で確定したが、まだ載せるチャンクが届いていない VAD イベント。
-    /// 次に FIFO へ積まれる VAD タップのチャンクの `vadEvents` 先頭へ差し込む。
+    /// VAD events finalized by a runtime `flushVad` for which no carrying chunk has arrived
+    /// yet. They are inserted at the front of the `vadEvents` of the next VAD-tap chunk pushed
+    /// onto the FIFO.
     pending_flush_events: Vec<JsVadEvent>,
-    /// 主タップの出力フォーマット（VAD が primary のとき `process_pcm` へ渡す）。
+    /// Output format of the primary tap (passed to `process_pcm` when the VAD is on primary).
     output_rate: u32,
     output_channels: u16,
-    /// 副タップのフォーマット・エンコーディング（設定時のみ）。
+    /// Format and encoding of the secondary tap (only when set).
     secondary: Option<SecondaryTapCfg>,
-    /// ペア合成用 FIFO。主・副とも毎周回すべてドレインしてから pts 窓で突き合わせる。
+    /// FIFOs for pairing. Both primary and secondary are fully drained every round and then
+    /// matched within the pts window.
     primary_fifo: VecDeque<JsAudioChunk>,
     secondary_fifo: VecDeque<JsSecondaryChunk>,
-    /// 最後に `onChunk` へ配送した主チャンクの `ptsNs`。stop 時の最終 flush キャリアの pts を
-    /// これ以上へクランプし、主 pts の非減少契約を保つ。
+    /// `ptsNs` of the primary chunk last delivered to `onChunk`. The pts of the final flush
+    /// carrier at stop is clamped to at least this, preserving the primary pts non-decreasing
+    /// contract.
     last_emitted_primary_pts: i64,
 }
 
 impl PairingBridge {
-    /// 束縛タップの量子化前 f32 を VAD に食わせ、確定イベントを録音 0 起点の絶対時刻付きで
-    /// 返す。不連続フラグ・`dropped_before` 増分でリセット + 再基準化する。
-    /// VAD 未設定なら `None`。
+    /// Feeds the bound tap's pre-quantization f32 to the VAD and returns finalized events with
+    /// absolute time from recording start. Resets and re-anchors on the discontinuity flag or
+    /// a `dropped_before` increase.
+    /// `None` if no VAD is configured.
     fn run_vad(
         &mut self,
         samples: &[f32],
@@ -1008,7 +1053,8 @@ impl PairingBridge {
         dropped_before: u32,
     ) -> Option<Vec<JsVadEvent>> {
         self.vad.as_ref()?;
-        // 不連続 or ChunkRing 欠落増分で内部状態をリセットし、累積位置を 0 へ張り直す。
+        // On discontinuity or a ChunkRing drop increase, reset the internal state and re-anchor
+        // the cumulative position at 0.
         let dropped_jump = dropped_before > self.vad_last_dropped;
         self.vad_last_dropped = dropped_before;
         let vad_rate = self.vad_rate;
@@ -1016,8 +1062,9 @@ impl PairingBridge {
             self.vad.as_mut().unwrap().reset();
             self.vad_samples_fed = 0;
         }
-        // このチャンク先頭に対応する (vad_sample_base, pts_base) を控える。以後 flushVad が
-        // 新チャンク無しで最終イベントの絶対時刻を算出できるよう self にも保持する。
+        // Record the (vad_sample_base, pts_base) for the start of this chunk. Also keep it in
+        // self so that a later flushVad can compute the absolute time of the final events
+        // without a new chunk.
         let vad_sample_base = self.vad_samples_fed;
         let pts_base = pts_ns;
         self.vad_anchor_sample = vad_sample_base;
@@ -1027,7 +1074,8 @@ impl PairingBridge {
             .as_mut()
             .unwrap()
             .process_pcm(samples, in_rate, in_channels);
-        // このチャンクで投入した VAD 内部レートサンプル数（近似）を累積へ加える。
+        // Add the (approximate) number of VAD-internal-rate samples fed in this chunk to the
+        // running total.
         let frames = samples.len() / (in_channels.max(1) as usize);
         self.vad_samples_fed += (frames as i64 * vad_rate) / (in_rate.max(1) as i64);
 
@@ -1038,7 +1086,8 @@ impl PairingBridge {
                     VadEvent::SpeechStart { at_sample } => at_sample,
                     VadEvent::SpeechEnd { at_sample } => at_sample,
                 } as i64;
-                // 絶対時刻 = pts_base + (at_sample - チャンク先頭の VAD 位置) / vad_rate。
+                // Absolute time = pts_base + (at_sample - VAD position at chunk start) /
+                // vad_rate.
                 let abs_ns = pts_base + (at_sample - vad_sample_base) * 1_000_000_000 / vad_rate;
                 vad_event_to_js_abs(ev, Some(abs_ns))
             })
@@ -1046,9 +1095,9 @@ impl PairingBridge {
         Some(js)
     }
 
-    /// 保留中の flushVad イベントを取り出し、このチャンクの VAD イベント（あれば）の前へ
-    /// 連結して返す。flush イベントは前の発話の確定＝新チャンクの新規イベントより時刻が
-    /// 前なので先頭へ置く。
+    /// Takes the deferred flushVad events and returns them concatenated in front of this
+    /// chunk's VAD events (if any). Flush events finalize the previous speech segment = they
+    /// are earlier in time than the new chunk's new events, so they go first.
     fn take_pending_prepended(&mut self, own: Option<Vec<JsVadEvent>>) -> Vec<JsVadEvent> {
         let mut merged = std::mem::take(&mut self.pending_flush_events);
         if let Some(ev) = own {
@@ -1057,15 +1106,16 @@ impl PairingBridge {
         merged
     }
 
-    /// 統合 VAD の開いている発話を強制確定し、確定イベントを JS 向けに（直近アンカー基準の
-    /// 絶対時刻で `atNs` を付けて）返す。`flush()` は VAD を reset するので累積カウンタ
-    /// を 0 へ張り直す。開いた発話が無ければ空。
+    /// Force-finalizes the integrated VAD's open speech segment and returns the finalized
+    /// events for JS (with `atNs` set to the absolute time relative to the latest anchor).
+    /// `flush()` resets the VAD, so the cumulative counter is re-anchored at 0. Empty if no
+    /// speech segment is open.
     fn flush_vad_events(&mut self) -> Vec<JsVadEvent> {
         let Some(vad) = self.vad.as_mut() else {
             return Vec::new();
         };
         let events = vad.flush();
-        // flush() が VAD を reset した＝累積位置は 0 起点へ戻る。
+        // flush() reset the VAD = the cumulative position returns to a zero origin.
         self.vad_samples_fed = 0;
         let vad_rate = self.vad_rate;
         let anchor_sample = self.vad_anchor_sample;
@@ -1077,16 +1127,17 @@ impl PairingBridge {
                     VadEvent::SpeechStart { at_sample } => at_sample,
                     VadEvent::SpeechEnd { at_sample } => at_sample,
                 } as i64;
-                // 絶対時刻 = anchor_pts + (at_sample - anchor_sample) / vad_rate。
+                // Absolute time = anchor_pts + (at_sample - anchor_sample) / vad_rate.
                 let abs_ns = anchor_pts + (at_sample - anchor_sample) * 1_000_000_000 / vad_rate;
                 vad_event_to_js_abs(ev, Some(abs_ns))
             })
             .collect()
     }
 
-    /// 実行中の `flushVad`（`FlexStream.flushVad`）。開いている発話を確定し、最終イベントを
-    /// 次に届く VAD タップのチャンクの `vadEvents` 先頭へ差し込む（pending）。常時タップなら
-    /// 20ms 毎にチャンクが流れるので遅延 ≤ 1 チャンク。
+    /// Runtime `flushVad` (`FlexStream.flushVad`). Finalizes the open speech segment and
+    /// inserts the final events at the front of the `vadEvents` of the next chunk arriving on
+    /// the VAD tap (pending). On an always-flowing tap a chunk arrives every 20ms, so the delay
+    /// is ≤ 1 chunk.
     fn flush_vad(&mut self) {
         let js = self.flush_vad_events();
         if !js.is_empty() {
@@ -1094,15 +1145,16 @@ impl PairingBridge {
         }
     }
 
-    /// stop 時の最終 flush。開いている発話を確定し、専用の末尾キャリアチャンク
-    /// （`frames:0`）で**必ず**配送する。VAD イベントが無くても締めの `frames:0` は出す
-    /// （`stop()` の resolve より前に onChunk へ届ける契約）。
+    /// Final flush at stop. Finalizes the open speech segment and **always** delivers it in a
+    /// dedicated trailing carrier chunk (`frames:0`). The `frames:0` terminator is emitted even
+    /// without VAD events (contract: it reaches onChunk before `stop()` resolves).
     fn flush_vad_final(&mut self) {
         let js = self.flush_vad_events();
-        // 実行中に溜まった pending があれば先頭へ（時刻順）。
+        // Pending events accumulated at runtime, if any, go first (time order).
         let mut events = std::mem::take(&mut self.pending_flush_events);
         events.extend(js);
-        // 主 pts の非減少契約を保つよう、キャリア pts は直近アンカーと最終配送 pts の大きい方。
+        // To keep the primary pts non-decreasing contract, the carrier pts is the larger of
+        // the latest anchor and the last delivered pts.
         let pts = self.vad_anchor_pts.max(self.last_emitted_primary_pts);
         let mut carrier = JsAudioChunk {
             data: Float32Array::new(Vec::new()),
@@ -1119,8 +1171,8 @@ impl PairingBridge {
         match self.vad_tap {
             VadTap::Primary => carrier.vad_events = Some(events),
             VadTap::Secondary => {
-                // 副タップのイベントは副チャンクに載せる（consumer は `primary.secondary`
-                // 経由で読む）。エンコーディングは設定に合わせる（サンプルは空）。
+                // Secondary-tap events ride on the secondary chunk (the consumer reads them via
+                // `primary.secondary`). The encoding follows the setting (samples are empty).
                 let (data, encoding) = match self.secondary.map(|c| c.encoding) {
                     Some(SecEncoding::S16) => (Either::A(Int16Array::new(Vec::new())), "s16"),
                     _ => (Either::B(Float32Array::new(Vec::new())), "f32"),
@@ -1145,7 +1197,8 @@ impl PairingBridge {
         );
     }
 
-    /// 主チャンクを取り込む。VAD が primary なら通し、JS 化して FIFO へ積む。
+    /// Ingests a primary chunk. Runs it through the VAD if the VAD is on primary, converts it
+    /// to JS, and pushes it onto the FIFO.
     fn on_primary(&mut self, chunk: AudioChunk) {
         let (rate, ch) = (self.output_rate, self.output_channels);
         let mut vad_events = if self.vad_tap == VadTap::Primary {
@@ -1161,7 +1214,8 @@ impl PairingBridge {
         } else {
             None
         };
-        // 保留中の flushVad イベント（前の発話の最終 speechEnd 等）を先頭へ差し込む。
+        // Insert the deferred flushVad events (e.g. the previous segment's final speechEnd)
+        // at the front.
         if self.vad_tap == VadTap::Primary && !self.pending_flush_events.is_empty() {
             vad_events = Some(self.take_pending_prepended(vad_events));
         }
@@ -1170,11 +1224,12 @@ impl PairingBridge {
         self.primary_fifo.push_back(js);
     }
 
-    /// 副チャンクを取り込む。VAD が secondary なら量子化前 f32 を通し、その後 encoding に
-    /// 応じて `Int16Array`/`Float32Array` へマーシャルして FIFO へ積む。
+    /// Ingests a secondary chunk. If the VAD is on secondary, feeds it the pre-quantization
+    /// f32, then marshals to `Int16Array`/`Float32Array` according to the encoding and pushes
+    /// it onto the FIFO.
     fn on_secondary(&mut self, chunk: SecondaryChunk) {
         let Some(cfg) = self.secondary else {
-            return; // 副タップ設定が無ければ何もしない（防御）。
+            return; // Do nothing without a secondary-tap setting (defensive).
         };
         let mut vad_events = if self.vad_tap == VadTap::Secondary {
             let disc = chunk.flags.contains(ChunkFlags::DISCONTINUITY);
@@ -1189,21 +1244,23 @@ impl PairingBridge {
         } else {
             None
         };
-        // 保留中の flushVad イベントを先頭へ差し込む（VAD タップが secondary のときのみ）。
+        // Insert the deferred flushVad events at the front (only when the VAD tap is
+        // secondary).
         if self.vad_tap == VadTap::Secondary && !self.pending_flush_events.is_empty() {
             vad_events = Some(self.take_pending_prepended(vad_events));
         }
-        // samples を消費する前にメタを控える。
+        // Record the metadata before consuming samples.
         let frames = chunk.frames as u32;
         let pts_ns = chunk.pts_ns;
         let seq = BigInt::from(chunk.seq);
         let flags = chunk.flags.bits();
         let dropped_before = chunk.dropped_before;
-        let peak = chunk.peak as f64; // 量子化前 f32 で core が算出済み。
+        let peak = chunk.peak as f64; // Already computed by core on the pre-quantization f32.
         let rms = chunk.rms as f64;
         let (data, encoding) = match cfg.encoding {
             SecEncoding::S16 => {
-                // VAD の後に s16 量子化（全層共通の正典 quantize_i16・ネイティブエンディアン）。
+                // s16 quantization after the VAD (the canonical quantize_i16 shared by all
+                // layers, native endianness).
                 let q: Vec<i16> = chunk
                     .samples
                     .iter()
@@ -1231,11 +1288,14 @@ impl PairingBridge {
         self.secondary_fifo.push_back(js);
     }
 
-    /// pts 窓で主↔副を突き合わせ、`onChunk(primary)`（`primary.secondary` 付き）を呼ぶ。
+    /// Matches primary↔secondary within the pts window and calls `onChunk(primary)` (with
+    /// `primary.secondary`).
     ///
-    /// 規則: 主 `P` に対し副 FIFO 先頭 `S` を見て —— 古すぎる副は破棄（orphan）、窓内
-    /// なら pop してペア、まだ来ていない/窓より新しいなら `secondary=undefined` で主だけ配送
-    /// （副は残し次の主で対応）。pts 窓なので恒久ズレしない（1:1 zip の欠陥を回避）。
+    /// Rule: for primary `P`, look at the head `S` of the secondary FIFO — a secondary that is
+    /// too old is discarded (orphan); one within the window is popped and paired; if it has not
+    /// arrived yet / is newer than the window, only the primary is delivered with
+    /// `secondary=undefined` (the secondary stays for the next primary). Because it uses a pts
+    /// window, it never drifts permanently (avoiding the flaw of a 1:1 zip).
     fn drain_pairs(&mut self) {
         while let Some(front) = self.primary_fifo.front() {
             let p_pts = front.pts_ns;
@@ -1244,14 +1304,16 @@ impl PairingBridge {
                     None => break None,
                     Some(s) => {
                         if s.pts_ns < p_pts - PAIR_WINDOW_NS / 2 {
-                            // 副が古すぎ（主が捨てられた等）→ orphan 破棄して次の副へ。
+                            // Secondary too old (e.g. the primary was dropped) → discard
+                            // the orphan and move to the next secondary.
                             self.secondary_fifo.pop_front();
                             continue;
                         } else if s.pts_ns < p_pts + CHUNK_SPAN_NS + PAIR_WINDOW_NS / 2 {
-                            // 窓内 → 対応。
+                            // Within the window → pair.
                             break self.secondary_fifo.pop_front();
                         } else {
-                            // 副がまだ来ていない（窓より新しい）→ 主だけ配送・副は残す。
+                            // Secondary not here yet (newer than the window) → deliver only
+                            // the primary; keep the secondary.
                             break None;
                         }
                     }
@@ -1268,8 +1330,8 @@ impl PairingBridge {
     }
 }
 
-/// 録音ストリームのハンドル。内部で bridge スレッドが `flexaudio::Stream` を
-/// 所有・ポーリングし、チャンク/イベントを TSFN 経由で JS へ送る。
+/// Handle to a capture stream. Internally a bridge thread owns and polls the
+/// `flexaudio::Stream` and sends chunks/events to JS via TSFNs.
 #[napi]
 pub struct FlexStream {
     stop_flag: Arc<AtomicBool>,
@@ -1280,9 +1342,10 @@ pub struct FlexStream {
 }
 
 impl FlexStream {
-    /// 既に `start()` 済みの Stream と、emit を担う [`PairingBridge`] を受け取り、bridge
-    /// スレッドを spawn する。Stream は Send なのでスレッドへ move する（poll_* が
-    /// &mut self なので所有はスレッド側に置く）。統合 VAD / 副タップ設定は bridge が持つ。
+    /// Takes an already `start()`ed Stream and the [`PairingBridge`] responsible for emitting,
+    /// and spawns the bridge thread. The Stream is Send, so it is moved into the thread
+    /// (poll_* take &mut self, so ownership lives on the thread side). The integrated VAD /
+    /// secondary-tap settings are held by the bridge.
     fn spawn(
         mut stream: flexaudio::Stream,
         mut bridge: PairingBridge,
@@ -1301,19 +1364,21 @@ impl FlexStream {
                 if thread_stop.load(Ordering::SeqCst) {
                     break;
                 }
-                // コマンドを poll と同じ周回でまとめて処理する。
+                // Process commands in a batch in the same round as the poll.
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
                         BridgeCmd::Switch(sw) => {
                             let r = stream.switch_source(sw.config).map_err(|e| e.to_string());
-                            // 受け手（switch_source 呼び出し元）が drop していても無視。
+                            // Ignore if the receiver (the switch_source caller) has
+                            // dropped.
                             let _ = sw.result_tx.send(r);
                         }
                         BridgeCmd::Pause => stream.pause(),
                         BridgeCmd::Resume => stream.resume(),
                         BridgeCmd::SetGain(g) => {
-                            // 送信前に napi 側で検証済みなので Err は起きない前提。
-                            // 万一の Err もイベントにはしない（結果は捨てる）。
+                            // Validated on the napi side before sending, so Err is assumed
+                            // not to happen. Even if it does, it is not turned into an event
+                            // (the result is discarded).
                             let _ = stream.set_gain(g);
                         }
                         BridgeCmd::Query(q) => {
@@ -1325,16 +1390,17 @@ impl FlexStream {
                                 native_channels,
                                 dropped_chunks: stream.dropped_chunks(),
                             };
-                            // 受け手が drop していても無視。
+                            // Ignore if the receiver has dropped.
                             let _ = q.result_tx.send(snap);
                         }
-                        // 実行中の flushVad: 開いている発話を確定し、最終イベントを次に届く
-                        // VAD タップのチャンクへ載せる（pending）。
+                        // Runtime flushVad: finalize the open speech segment and put the
+                        // final events on the next chunk arriving on the VAD tap (pending).
                         BridgeCmd::FlushVad => bridge.flush_vad(),
                     }
                 }
-                // 主・副とも到着し次第すべてドレインして bridge へ。VAD/量子化を通し、pts 窓で
-                // ペア合成して onChunk へ届ける。
+                // Drain both primary and secondary into the bridge as soon as they arrive. They
+                // go through VAD/quantization, get paired within the pts window, and are
+                // delivered to onChunk.
                 while let Some(chunk) = stream.poll_chunk() {
                     bridge.on_primary(chunk);
                 }
@@ -1342,7 +1408,7 @@ impl FlexStream {
                     bridge.on_secondary(chunk);
                 }
                 bridge.drain_pairs();
-                // イベントも消化。
+                // Consume events too.
                 while let Some(ev) = stream.poll_event() {
                     if let Some(cb) = &on_event {
                         cb.call(event_to_js(ev), ThreadsafeFunctionCallMode::NonBlocking);
@@ -1350,7 +1416,7 @@ impl FlexStream {
                 }
                 thread::sleep(POLL_INTERVAL);
             }
-            // 停止前にリングへ残ったチャンクを取り切ってからペア配送。
+            // Before stopping, take every chunk left in the ring and deliver the pairs.
             while let Some(chunk) = stream.poll_chunk() {
                 bridge.on_primary(chunk);
             }
@@ -1358,26 +1424,31 @@ impl FlexStream {
                 bridge.on_secondary(chunk);
             }
             bridge.drain_pairs();
-            // stop() の順序（追補2-2）:
-            //   ① 音の stop-flush: core 側 flush で末尾テール（denoise 遅延線 + リサンプラ
-            //      残余）をリングへ積む。
-            //   ② その末尾テールを VAD へ通しつつ FIFO へ積み、通常のペア配送で音を届ける。
-            //   ③ flushVad: 開いている発話を強制確定し、最終 speechEnd を専用の末尾キャリアで
-            //      確実に配送する（ペア合成に依存しない＝主テールが無くても落とさない）。
-            // これで録音末尾の音（②）と最終 speechEnd（③）の両方が届く。音の stop-flush と
-            // flushVad は別物（前者は音サンプル、後者は VAD イベント）。
+            // Order of stop() (addendum 2-2):
+            //   ① Audio stop-flush: the core-side flush pushes the trailing tail (denoise delay
+            //      line + resampler residue) into the ring.
+            //   ② That tail is fed through the VAD while being pushed onto the FIFO, and the
+            //      audio is delivered by the normal pair delivery.
+            //   ③ flushVad: force-finalize the open speech segment and reliably deliver the
+            //      final speechEnd in a dedicated trailing carrier (independent of pairing =
+            //      not lost even if there is no primary tail).
+            // This way both the audio at the end of the recording (②) and the final speechEnd
+            // (③) arrive. The audio stop-flush and flushVad are different things (the former
+            // is audio samples, the latter VAD events).
             stream.stop(); // ①
             while let Some(chunk) = stream.poll_chunk() {
-                bridge.on_primary(chunk); // ②（primary タップの VAD もここで末尾を食う）
+                bridge.on_primary(chunk); // ② (the primary-tap VAD also eats the tail here)
             }
             while let Some(chunk) = stream.poll_secondary() {
-                bridge.on_secondary(chunk); // ②（secondary タップの VAD もここで末尾を食う）
+                bridge.on_secondary(chunk); // ② (the secondary-tap VAD also eats the tail here)
             }
-            bridge.drain_pairs(); // ② 末尾テールの音を配送
-            bridge.flush_vad_final(); // ③ 最終イベント + frames:0 の締め
-                                      // ④ 同じ TSFN 列の終わりの合図。これが JS で処理されたとき stop() の Promise が
-                                      // resolve する（AsyncTask / 別 TSFN だと onChunk より先に resolve し得る）。
-                                      // chunk TSFN が失敗（Closing / QueueFull など）なら決着用 TSFN へ。
+            bridge.drain_pairs(); // ② deliver the audio of the trailing tail
+            bridge.flush_vad_final(); // ③ final events + the frames:0 terminator
+                                      // ④ End signal on the same TSFN queue. The stop() Promise
+                                      // resolves when JS processes it (with an AsyncTask / separate
+                                      // TSFN it could resolve before onChunk). If the chunk TSFN
+                                      // fails (Closing / QueueFull etc.), fall back to the settle
+                                      // TSFN.
             post_stop_flushed(&bridge.on_chunk, &settle_for_bridge, &bridge.stop_phase);
         });
 
@@ -1407,7 +1478,7 @@ impl FlexStream {
             .name("flexaudio-napi-stop".into())
             .spawn(move || {
                 let _ = h.join();
-                // bridge が panic などで合図を積めなかったときだけフォールバック。
+                // Fallback only when the bridge could not queue the signal (e.g. it panicked).
                 let needs_flush = {
                     let g = phase.lock().unwrap_or_else(lock_poisoned);
                     matches!(*g, StopPhase::Stopping { .. })
@@ -1418,9 +1489,9 @@ impl FlexStream {
             });
     }
 
-    /// bridge スレッドへ Query を送り、ストリームの現在値スナップショットを同期受信する。
-    /// 各ゲッタ（`is_paused`/`gain`/`native_format`/`dropped_chunks`）の実体。既に
-    /// `stop()` 済みなら例外。
+    /// Sends a Query to the bridge thread and synchronously receives a snapshot of the stream's
+    /// current values. The implementation behind each getter (`is_paused`/`gain`/
+    /// `native_format`/`dropped_chunks`). Throws if already `stop()`ped.
     fn query_snapshot(&self) -> napi::Result<StreamSnapshot> {
         let cmd_tx = {
             let g = self.inner.lock().unwrap_or_else(lock_poisoned);
@@ -1448,15 +1519,16 @@ impl FlexStream {
 
 #[napi]
 impl FlexStream {
-    /// 録音を停止する。Promise が resolve した時点で、stop の前に TSFN へ積まれた
-    /// `onChunk`（最後の PCM と `frames:0` の締め）はすべて JS に渡し終わっている。
-    /// 二重呼び出しは同じ完了を待つ／済みなら即 resolve。`onChunk` の中から呼んでも
-    /// JS スレッドで join しないので固まらない。
+    /// Stops the capture. By the time the Promise resolves, every `onChunk` queued on the TSFN
+    /// before the stop (the last PCM and the `frames:0` terminator) has been handed to JS.
+    /// A second call waits for the same completion / resolves immediately if already done.
+    /// Calling it from inside `onChunk` does not hang, because there is no join on the JS
+    /// thread.
     #[napi(ts_return_type = "Promise<void>")]
     pub fn stop(&self, env: Env) -> napi::Result<JsObject> {
         let (deferred, promise) = create_js_promise(&env)?;
-        // ここは JS スレッド。TSFN が既に閉じている・join handle が無い・phase が
-        // Stopped なら、napi_resolve_deferred をこの場で呼んでよい。
+        // This is the JS thread. If the TSFN is already closed, there is no join handle, or the
+        // phase is Stopped, napi_resolve_deferred may be called right here.
         let chunk_closed = self.chunk_tsfn.aborted();
         let mut phase = self.stop_phase.lock().unwrap_or_else(lock_poisoned);
         match &mut *phase {
@@ -1481,23 +1553,26 @@ impl FlexStream {
         self.stop_flag.store(true, Ordering::SeqCst);
         match self.take_join_handle() {
             None => {
-                // join handle が無い（Drop の reaper が持っていった等）。届けるべき
-                // callback は別経路で掃除中／もう無い。JS スレッドで即 resolve。
+                // No join handle (e.g. the Drop reaper took it). The callbacks to deliver are
+                // being cleaned up on another path / are already gone. Resolve immediately on
+                // the JS thread.
                 for d in take_stop_waiters(&self.stop_phase) {
                     resolve_undefined(env.raw(), d);
                 }
                 unref_chunk_tsfn(self.chunk_tsfn.as_ref(), &env);
             }
             Some(h) if chunk_closed => {
-                // chunk_tsfn.aborted() は napi-rs 2.16 では Rust 側フラグで、次のときだけ
-                // true になる:
-                //   - `abort()`（`napi_tsfn_abort`＝列の未処理アイテムを破棄して即破壊）
-                //   - TSFN の finalize（release 後。release モードでは未処理アイテムを
-                //     処理し終えてから finalize が走る）
-                // 「Closing だが列に onChunk が残っている」状態ではない。ここへ来た時点で
-                // 届けるべき onChunk はもう無い（破棄済み or 渡し済み）ので、順番の契約は
-                // 空に成立する。JS が生きているこのスレッドで即 resolve してよい。
-                // join は JS を止めないよう reaper に渡す。
+                // In napi-rs 2.16, chunk_tsfn.aborted() is a Rust-side flag that becomes true
+                // only in these cases:
+                //   - `abort()` (`napi_tsfn_abort` = discard the queue's pending items and
+                //     destroy immediately)
+                //   - TSFN finalize (after release; in release mode, finalize runs only after
+                //     the pending items have been processed)
+                // It is not the "Closing but onChunk still left in the queue" state. By the
+                // time we get here there is no onChunk left to deliver (discarded or already
+                // handed over), so the ordering contract holds vacuously. It is fine to resolve
+                // immediately on this thread, where JS is alive.
+                // The join is handed to a reaper so JS is not blocked.
                 let _ = thread::Builder::new()
                     .name("flexaudio-napi-reaper".into())
                     .spawn(move || {
@@ -1513,22 +1588,23 @@ impl FlexStream {
         Ok(promise)
     }
 
-    /// 録音を止めずに入力ソース（mic/system/process）をホットスワップする。
+    /// Hot-swaps the input source (mic/system/process) without stopping the capture.
     ///
-    /// `options` から構築した `StreamConfig` への切替を bridge スレッドへ依頼し、結果を
-    /// 同期的に返す（成功で `Ok`、失敗で例外）。出力フォーマット（`outputRate`/
-    /// `outputChannels`）は切替では変えられない（連続ストリームの frames が変わるため）。
-    /// 変更を要求すると `switch_source` が InvalidArg を返し、ここで例外になる。切替前後で
-    /// チャンクの `seq` は連続し、切替後最初のチャンクには DISCONTINUITY フラグが立つ。
-    /// `options.gain` は無視される（ゲインはストリームの状態。変更は `setGain`）。
+    /// Asks the bridge thread to switch to the `StreamConfig` built from `options` and returns
+    /// the result synchronously (`Ok` on success, an exception on failure). The output format
+    /// (`outputRate`/`outputChannels`) cannot be changed by a switch (it would change the
+    /// frames of the continuous stream). Requesting a change makes `switch_source` return
+    /// InvalidArg, which becomes an exception here. The chunk `seq` is continuous across the
+    /// switch, and the first chunk after the switch has the DISCONTINUITY flag set.
+    /// `options.gain` is ignored (gain is stream state; change it with `setGain`).
     ///
-    /// 既に `stop()` 済み（bridge スレッド停止後）なら例外を返す。
+    /// Throws if already `stop()`ped (after the bridge thread has stopped).
     #[napi]
     pub fn switch_source(&self, options: OpenOptions) -> napi::Result<()> {
-        // openStream と同じく build_config で options → StreamConfig。
+        // options → StreamConfig via build_config, same as openStream.
         let config = build_config(&options)?;
 
-        // bridge スレッドへコマンドを送り、結果を同期受信する。
+        // Send the command to the bridge thread and receive the result synchronously.
         let cmd_tx = {
             let g = self.inner.lock().unwrap_or_else(lock_poisoned);
             g.cmd_tx.clone().ok_or_else(|| {
@@ -1544,7 +1620,8 @@ impl FlexStream {
                     "bridge thread is not running".to_string(),
                 )
             })?;
-        // bridge スレッドが switch_source を実行して結果を返すのを待つ（同期）。
+        // Wait for the bridge thread to run switch_source and return the result
+        // (synchronous).
         match result_rx.recv() {
             Ok(Ok(())) => Ok(()),
             Ok(Err(msg)) => Err(NapiError::new(Status::GenericFailure, msg)),
@@ -1555,8 +1632,9 @@ impl FlexStream {
         }
     }
 
-    /// 録音を一時停止する。デバイスは動かしたまま配信だけ止める。`resume` で再開し、
-    /// 再開後の最初のチャンクに DISCONTINUITY が立つ。既に `stop()` 済みなら例外。
+    /// Pauses the capture. The device keeps running; only delivery stops. Resume with
+    /// `resume`; the first chunk after resuming has DISCONTINUITY set. Throws if already
+    /// `stop()`ped.
     #[napi]
     pub fn pause(&self) -> napi::Result<()> {
         let cmd_tx = {
@@ -1574,7 +1652,7 @@ impl FlexStream {
         Ok(())
     }
 
-    /// 一時停止を解除して配信を再開する。既に `stop()` 済みなら例外。
+    /// Clears the pause and resumes delivery. Throws if already `stop()`ped.
     #[napi]
     pub fn resume(&self) -> napi::Result<()> {
         let cmd_tx = {
@@ -1592,18 +1670,22 @@ impl FlexStream {
         Ok(())
     }
 
-    /// 統合 VAD の「今開いている発話」を強制的に確定する（runtime 操作）。
+    /// Force-finalizes the integrated VAD's "currently open speech segment" (runtime
+    /// operation).
     ///
-    /// silero は無音が来ない限り `speechEnd` を出さないので、認識を一時停止する・録音末尾で
-    /// 最後の発話を確定したいときにこれを呼ぶ。開いている発話があれば最終 `speechEnd`（と対の
-    /// `speechStart`）が、次に届くタップのチャンクの `vadEvents`（録音 0 起点 `atNs` 付き）
-    /// 先頭に載る（20ms 毎にチャンクが流れるので遅延 ≤ 1 チャンク）。呼び出し後 VAD は
-    /// リセットされ、次の発話は新しい文脈で拾う。
+    /// silero emits no `speechEnd` until silence arrives, so call this when pausing
+    /// recognition or when you want to finalize the last speech segment at the end of a
+    /// recording. If a speech segment is open, the final `speechEnd` (and its paired
+    /// `speechStart`) ride at the front of the `vadEvents` (with `atNs` from recording start)
+    /// of the next chunk arriving on the tap (a chunk flows every 20ms, so the delay is ≤ 1
+    /// chunk). After the call the VAD is reset, and the next speech is picked up in a fresh
+    /// context.
     ///
-    /// これは **config を変えない**（`secondaryOutput`/encoding の open 時固定＝`switchSource`
-    /// で変更不可、とは無関係）。また音の stop-flush とは別物で、音サンプルは加工しない。VAD
-    /// 未設定なら何もしない。`stop()` は音の stop-flush の後にこれを自動実行する。既に `stop()`
-    /// 済みなら例外。
+    /// This **does not change the config** (unrelated to `secondaryOutput`/encoding being
+    /// fixed at open = not changeable by `switchSource`). It is also distinct from the audio
+    /// stop-flush and does not modify audio samples. Does nothing if no VAD is configured.
+    /// `stop()` runs this automatically after the audio stop-flush. Throws if already
+    /// `stop()`ped.
     #[napi]
     pub fn flush_vad(&self) -> napi::Result<()> {
         let cmd_tx = {
@@ -1621,12 +1703,14 @@ impl FlexStream {
         Ok(())
     }
 
-    /// 入力ゲイン（線形倍率）を変更する。1.0=そのまま、2.0=約+6dB、0.0=無音。録音中
-    /// いつでも呼べて、次のチャンクから効く（20ms 粒度）。乗算後のサンプルは ±1.0 に
-    /// クランプされる。有限かつ 0 以上でなければ例外。既に `stop()` 済みなら例外。
+    /// Changes the input gain (linear factor). 1.0 = unchanged, 2.0 = about +6dB, 0.0 =
+    /// silence. Can be called at any time during capture and takes effect from the next chunk
+    /// (20ms granularity). Samples after multiplication are clamped to ±1.0. Throws unless it
+    /// is finite and >= 0. Throws if already `stop()`ped.
     #[napi]
     pub fn set_gain(&self, gain: f64) -> napi::Result<()> {
-        // f64→f32 変換後の値で検証する（f32 で表せない巨大値が無限大になるのも弾く）。
+        // Validate the value after the f64→f32 conversion (this also rejects huge values that
+        // f32 cannot represent and that become infinity).
         let gain = gain as f32;
         if !gain.is_finite() || gain < 0.0 {
             return Err(NapiError::new(
@@ -1649,22 +1733,22 @@ impl FlexStream {
         Ok(())
     }
 
-    /// 現在ポーズ中かどうか。既に `stop()` 済みなら例外。
+    /// Whether it is currently paused. Throws if already `stop()`ped.
     #[napi]
     pub fn is_paused(&self) -> napi::Result<bool> {
         Ok(self.query_snapshot()?.is_paused)
     }
 
-    /// 現在の入力ゲイン（線形倍率）。既に `stop()` 済みなら例外。
+    /// Current input gain (linear factor). Throws if already `stop()`ped.
     #[napi]
     pub fn gain(&self) -> napi::Result<f64> {
         Ok(self.query_snapshot()?.gain as f64)
     }
 
-    /// 現在の backend のネイティブフォーマット `{ sampleRate, channels }`。表示・診断用
-    /// （実際に配信されるチャンクは出力フォーマット `outputRate`/`outputChannels`）。
-    /// `switchSource` でソースを変えると新 backend の値に更新される。既に `stop()` 済み
-    /// なら例外。
+    /// Native format `{ sampleRate, channels }` of the current backend. For display and
+    /// diagnostics (the chunks actually delivered use the output format
+    /// `outputRate`/`outputChannels`). Changing the source with `switchSource` updates it to
+    /// the new backend's values. Throws if already `stop()`ped.
     #[napi]
     pub fn native_format(&self) -> napi::Result<JsNativeFormat> {
         let s = self.query_snapshot()?;
@@ -1674,8 +1758,8 @@ impl FlexStream {
         })
     }
 
-    /// チャンクリングが DROP_OLDEST で捨てた累計チャンク数（BigInt）。既に `stop()` 済み
-    /// なら例外。
+    /// Cumulative number of chunks the chunk ring discarded with DROP_OLDEST (BigInt). Throws
+    /// if already `stop()`ped.
     #[napi]
     pub fn dropped_chunks(&self) -> napi::Result<BigInt> {
         Ok(BigInt::from(self.query_snapshot()?.dropped_chunks))
@@ -1684,9 +1768,9 @@ impl FlexStream {
 
 impl Drop for FlexStream {
     fn drop(&mut self) {
-        // GC 経路。JS スレッド（GC）を join で止めない。stop_flag を立てて handle を
-        // reaper スレッドで join する。資源（bridge・TSFN・キャプチャ）は bridge 終了時に
-        // 破棄される。Promise の待ち手は居ない（明示 stop していない）。
+        // GC path. Do not block the JS thread (GC) with a join. Set stop_flag and join the
+        // handle on a reaper thread. Resources (bridge, TSFNs, capture) are released when the
+        // bridge ends. There are no Promise waiters (no explicit stop was made).
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(h) = self.take_join_handle() {
             let _ = thread::Builder::new()
@@ -1699,10 +1783,10 @@ impl Drop for FlexStream {
 }
 
 // ---------------------------------------------------------------------------
-// DeviceWatcherHandle（class）
+// DeviceWatcherHandle (class)
 // ---------------------------------------------------------------------------
 
-/// デバイス着脱監視のハンドル。bridge スレッドが `DeviceWatcher` を poll する。
+/// Handle to the device hotplug watch. A bridge thread polls the `DeviceWatcher`.
 #[napi]
 pub struct DeviceWatcherHandle {
     stop_flag: Arc<AtomicBool>,
@@ -1720,7 +1804,7 @@ impl DeviceWatcherHandle {
 
 #[napi]
 impl DeviceWatcherHandle {
-    /// 監視を停止し bridge スレッドを join する。二重呼び出し安全。
+    /// Stops the watch and joins the bridge thread. Safe to call twice.
     #[napi]
     pub fn stop(&mut self) {
         self.shutdown();
@@ -1734,50 +1818,57 @@ impl Drop for DeviceWatcherHandle {
 }
 
 // ---------------------------------------------------------------------------
-// 公開関数
+// Public functions
 // ---------------------------------------------------------------------------
 
-/// 利用可能なデバイスを列挙する。ヘッドレス環境では空配列でも throw しない。
+/// Enumerates the available devices. In a headless environment it does not throw, even if
+/// the array is empty.
 #[napi]
 pub fn devices() -> napi::Result<Vec<JsDeviceInfo>> {
     let list = flexaudio::devices().map_err(to_napi_err)?;
     Ok(list.into_iter().map(device_info_to_js).collect())
 }
 
-/// プロセス別キャプチャ（`openStream({ kind: 'process', processId })`）の対象にできる、
-/// 音声出力のセッション（ストリーム）を持つプロセスを列挙する。呼び出し元プロセス自身は
-/// 含まない。停止中・Idle も載る。今鳴っているかは `isOutputActive` で見る。
+/// Enumerates the processes that have an audio output session (stream) and can therefore be
+/// targeted by per-process capture (`openStream({ kind: 'process', processId })`). The
+/// calling process itself is not included. Stopped / Idle ones are listed too. Check
+/// `isOutputActive` to see whether one is playing right now.
 ///
-/// 並びは「出力中（`isOutputActive: true`）が先頭 → 表示名 → pid」で、同じ pid は 1 件に
-/// まとめてある。読み取り専用で権限プロンプトは出さない。OS の応答が無くても最大 3 秒で
-/// 戻る。libuv スレッドプールで実行するので JS のイベントループは塞がない。
+/// Ordering is "outputting (`isOutputActive: true`) first → display name → pid", and entries
+/// with the same pid are merged into one. Read-only; it shows no permission prompt. It
+/// returns within at most 3 seconds even if the OS does not respond. It runs on the libuv
+/// thread pool, so it does not block the JS event loop.
 ///
-/// - Linux（PipeWire）: `Stream/Output/Audio` ノードを持つクライアント。`executable` は
-///   `/proc/<pid>/exe`、読めなければ `/proc/<pid>/comm`。
-/// - Windows: 有効な出力デバイスの音声セッションを持つプロセス。列挙も録音も
-///   Windows build 20348 or later (Windows 11 / Windows Server 2022) が必要。
-/// - macOS 14.4+: Core Audio が把握しているプロセスオブジェクト（`bundleId` 付き。
-///   入力だけのプロセスも含む）。
+/// - Linux (PipeWire): clients that have a `Stream/Output/Audio` node. `executable` is from
+///   `/proc/<pid>/exe`, or `/proc/<pid>/comm` if that cannot be read.
+/// - Windows: processes that have an audio session on an active output device. Both
+///   enumeration and capture require Windows build 20348 or later (Windows 11 / Windows
+///   Server 2022).
+/// - macOS 14.4+: process objects known to Core Audio (with `bundleId`; input-only processes
+///   are included too).
 ///
-/// 戻り値の読み方: 空配列＝プロセス別キャプチャは使えるが、そういうプロセスが今は無い
-/// （「何も鳴っていない」ではない）。reject＝この環境ではプロセス別キャプチャが使えない
-/// （Linux で PipeWire に届かない・macOS 14.4 未満 / Windows build 20348 未満は
-/// `unsupported OS version`・その他 OS は `unsupported`・権限拒否）、OS が時間内に
-/// 応答しなかった、または前の問い合わせがまだ終わっていない（同期時代と同じ `Error`
-/// 型・文言）。
+/// How to read the result: an empty array = per-process capture is available but no such
+/// process exists right now (not "nothing is playing"). A rejection = per-process capture is
+/// unavailable in this environment (PipeWire unreachable on Linux; `unsupported OS version`
+/// below macOS 14.4 / Windows build 20348; `unsupported` on other OSes; permission denied),
+/// the OS did not respond in time, or the previous query has not finished yet (same `Error`
+/// type and wording as in the synchronous era).
 #[napi(ts_return_type = "Promise<Array<JsProcessInfo>>")]
 pub fn processes() -> AsyncTask<ProcessesTask> {
     AsyncTask::new(ProcessesTask)
 }
 
-/// ストリームを開いて開始し、チャンク/イベントをコールバックへ送る `FlexStream` を返す。
+/// Opens and starts a stream and returns a `FlexStream` that sends chunks/events to the
+/// callbacks.
 ///
-/// `options.denoise` を指定すると core（内部正規形）でノイズ抑制が有効になり、主・副の
-/// 両タップが除去済み音声を受ける。`options.vad` を指定すると `vadTap` で選んだタップを
-/// VAD に通し、確定イベントをそのタップのチャンクの `vadEvents`（録音 0 起点の絶対時刻
-/// `atNs` 付き）に添える。`options.secondaryOutput` を指定すると副タップが有効になり、主と
-/// ペアで別フォーマットのチャンクを返す（`onChunk` の `primary.secondary`）。denoise の
-/// 48kHz 前提や VAD 設定の不正は、ここでストリームを開く前に検証して弾く。
+/// Setting `options.denoise` enables noise suppression in core (internal canonical form), and
+/// both the primary and secondary taps receive denoised audio. Setting `options.vad` feeds the
+/// tap selected by `vadTap` to the VAD and attaches finalized events to that tap's chunk
+/// `vadEvents` (with `atNs`, the absolute time from recording start). Setting
+/// `options.secondaryOutput` enables the secondary tap, which returns chunks in a different
+/// format paired with the primary (`primary.secondary` of `onChunk`). The denoise 48kHz
+/// precondition and invalid VAD settings are validated and rejected here, before the stream
+/// is opened.
 ///
 /// Standard operation enables the secondary tap and VAD for the entire
 /// recording. Toggle transcription by keeping or discarding the delivered
@@ -1812,12 +1903,13 @@ pub fn open_stream(
     let output_rate = config.output.sample_rate;
     let output_channels = config.output.channels;
 
-    // 統合 denoise: 公開契約の 48kHz 前提を先に検証（据え置き）。有効なら core へ委譲する
-    // （facade の set_denoise。denoise 自体は内部正規形 48k/stereo に適用される）。
+    // Integrated denoise: validate the public contract's 48kHz precondition first (kept as
+    // is). If enabled, delegate to core (the facade's set_denoise; denoise itself is applied
+    // to the internal canonical form 48k/stereo).
     let denoise_enabled = options.denoise.unwrap_or(false);
     check_denoise_rate(denoise_enabled, output_rate)?;
 
-    // 副タップのエンコーディング / VAD タップを解釈する。
+    // Interpret the secondary-tap encoding / VAD tap.
     let secondary = match &options.secondary_output {
         Some(s) => Some(SecondaryTapCfg {
             rate: s.rate,
@@ -1834,9 +1926,10 @@ pub fn open_stream(
         ));
     }
 
-    // 統合 VAD: 指定時に構築（モデルロード・設定不正はここで例外化）。VAD 内部レートは
-    // 絶対時刻式の分母に使う。統合経路は maxSpeechMs 未指定時に 30s 既定を適用する（単体
-    // Vad は silero 忠実の 0＝無制限のまま）。
+    // Integrated VAD: built when specified (model load and invalid settings become exceptions
+    // here). The VAD internal rate is the denominator of the absolute-time formula. The
+    // integrated path applies the 30s default when maxSpeechMs is unset (the standalone Vad
+    // stays silero-faithful at 0 = unbounded).
     let (vad, vad_rate) = match &options.vad {
         Some(o) => {
             let cfg = build_integrated_vad_config(o);
@@ -1884,7 +1977,8 @@ pub fn open_stream(
     ))
 }
 
-/// デバイス着脱を監視し、イベントをコールバックへ送る `DeviceWatcherHandle` を返す。
+/// Watches device hotplug and returns a `DeviceWatcherHandle` that sends events to the
+/// callback.
 #[napi]
 pub fn watch_devices(
     #[napi(ts_arg_type = "(event: JsDeviceEvent) => void")] on_event: DeviceTsfn,
@@ -1915,23 +2009,27 @@ pub fn watch_devices(
     })
 }
 
-/// テスト専用・公開 API 外。
+/// Test-only; not part of the public API.
 ///
-/// 低レベル `Stream::open` に `MockBackend` を渡してストリームを作り、`open_stream` と
-/// 同じ bridge / TSFN 経路で回す。実音なしで marshaling 全経路（Float32Array・BigInt・
-/// peak/rms・frames）を end-to-end 検証する。本番コードからは使わないこと。
+/// Creates a stream by passing a `MockBackend` to the low-level `Stream::open` and runs it
+/// through the same bridge / TSFN path as `open_stream`. Verifies the whole marshaling path
+/// (Float32Array, BigInt, peak/rms, frames) end-to-end without real audio. Do not use it from
+/// production code.
 ///
-/// `secondaryRate` を渡すと副タップ（`secondaryChannels`＝既定 1・`secondaryEncoding`＝
-/// 'f32'|'s16'、既定 'f32'）を有効化し、ペア合成・s16 量子化・`Int16Array` マーシャルまで
-/// 実音なしで検証できる（実キャプチャ不要）。
+/// Passing `secondaryRate` enables the secondary tap (`secondaryChannels` = default 1,
+/// `secondaryEncoding` = 'f32'|'s16', default 'f32'), so pairing, s16 quantization, and
+/// `Int16Array` marshalling can be verified without real audio (no real capture needed).
 ///
-/// `vadThreshold` を渡すと統合 VAD を有効化し（`vadTap`＝'primary'|'secondary'、既定
-/// 'primary'）、`flushVad`・`vadEvents` の `atNs`・`stop()` の自動 flush を実音なしで検証
-/// できる。テスト用に `minSpeechMs=0` で構築するので、閾値 0 なら開いた発話を `flushVad` が
-/// 確実に確定できる（無音が来ない合成波でも RT 末尾確定を検証できる）。
+/// Passing `vadThreshold` enables the integrated VAD (`vadTap` = 'primary'|'secondary',
+/// default 'primary'), so `flushVad`, the `atNs` of `vadEvents`, and the automatic flush of
+/// `stop()` can be verified without real audio. For testing it is built with
+/// `minSpeechMs=0`, so with threshold 0 `flushVad` reliably finalizes the open speech segment
+/// (real-time end-of-recording finalization can be verified even with a synthetic wave that
+/// never goes silent).
 ///
-/// JS 名は `__openMockStream`。先頭 `__` で公開 API 外を示す。napi の既定変換は先頭
-/// アンダースコアを落として `openMockStream` にしてしまうので `js_name` で固定する。
+/// The JS name is `__openMockStream`. The leading `__` marks it as outside the public API.
+/// napi's default conversion would drop the leading underscores and turn it into
+/// `openMockStream`, so it is pinned with `js_name`.
 #[napi(js_name = "__openMockStream")]
 #[allow(clippy::too_many_arguments)]
 pub fn open_mock_stream(
@@ -1949,7 +2047,8 @@ pub fn open_mock_stream(
     vad_threshold: Option<f64>,
     vad_tap: Option<String>,
 ) -> napi::Result<FlexStream> {
-    // 副タップ（設定時のみ）。エンコーディングを検証してマーシャル設定を作る。
+    // Secondary tap (only when set). Validate the encoding and build the marshalling
+    // settings.
     let secondary_cfg = match secondary_rate {
         Some(rate) => {
             let ch = secondary_channels.unwrap_or(1);
@@ -1973,8 +2072,9 @@ pub fn open_mock_stream(
         }),
         ..Default::default()
     };
-    // 統合 VAD（テスト用・`vadThreshold` 指定時のみ）。min_speech=0 で構築するので短い開いた
-    // 発話でも flushVad が確実に確定できる。VAD 内部レートは固定 16000。
+    // Integrated VAD (for tests, only when `vadThreshold` is given). Built with
+    // min_speech=0, so flushVad reliably finalizes even a short open speech segment. The VAD
+    // internal rate is fixed at 16000.
     let vad_tap = parse_vad_tap(vad_tap.as_deref())?;
     if vad_tap == VadTap::Secondary && secondary_cfg.is_none() {
         return Err(NapiError::new(
@@ -2005,8 +2105,9 @@ pub fn open_mock_stream(
     ));
     let mut stream = flexaudio::Stream::open(config, backend).map_err(to_napi_err)?;
     stream.start().map_err(to_napi_err)?;
-    // モック経路は統合 denoise を通さない。VAD は `vadThreshold` 指定時のみ通す（flushVad・
-    // vadEvents・ペア合成経路の検証が目的）。
+    // The mock path does not go through the integrated denoise. The VAD is applied only when
+    // `vadThreshold` is given (the purpose is to verify flushVad, vadEvents, and the pairing
+    // path).
     let stop_phase = Arc::new(Mutex::new(StopPhase::Running));
     let user = make_user_chunk_cb(&env, &on_chunk)?;
     let chunk_weak: ChunkTsfnWeakCell = Arc::new(OnceLock::new());
@@ -2040,15 +2141,16 @@ pub fn open_mock_stream(
 }
 
 // ---------------------------------------------------------------------------
-// 独立アドオン 1: Vad（silero-VAD をストリーミング実行する小さなラッパ）
+// Standalone add-on 1: Vad (a small wrapper that runs silero-VAD in streaming mode)
 // ---------------------------------------------------------------------------
 
-/// オフライン VAD（silero-VAD on ONNX、モデル埋め込み）のハンドル。
+/// Handle to an offline VAD (silero-VAD on ONNX, model embedded).
 ///
-/// 1 インスタンスが ONNX セッションを 1 つ持つ。任意フォーマット（`inputSampleRate` /
-/// `inputChannels` の interleaved f32）を [`Vad::process`] に流すと、内部で VAD レートの
-/// mono に変換してから発話区間を検出し、確定した [`JsVadEvent`] を返す。`openStream` の
-/// 統合 VAD を使わず、任意のサンプル列を自前で判定したいときに使う。
+/// One instance holds one ONNX session. Feeding any format (interleaved f32 at
+/// `inputSampleRate` / `inputChannels`) to [`Vad::process`] converts it internally to mono at
+/// the VAD rate, detects speech segments, and returns the finalized [`JsVadEvent`]s. Use it
+/// when you want to classify an arbitrary sample sequence yourself instead of using the
+/// integrated VAD of `openStream`.
 #[napi]
 pub struct Vad {
     inner: CoreVad,
@@ -2056,19 +2158,19 @@ pub struct Vad {
 
 #[napi]
 impl Vad {
-    /// 設定オブジェクトから VAD を構築する（埋め込みモデルをロードする）。設定が不正
-    /// （sampleRate が 8000/16000 以外、threshold が `[0,1]` 外など）なら InvalidArg、
-    /// モデルロード失敗なら GenericFailure。
+    /// Builds a VAD from an options object (loads the embedded model). InvalidArg if the
+    /// settings are invalid (sampleRate other than 8000/16000, threshold outside `[0,1]`,
+    /// etc.); GenericFailure if the model fails to load.
     #[napi(constructor)]
     pub fn new(options: VadOptions) -> napi::Result<Self> {
         let inner = CoreVad::new(build_vad_config(&options)).map_err(vad_err)?;
         Ok(Vad { inner })
     }
 
-    /// 任意フォーマットの interleaved f32 を処理し、確定した [`JsVadEvent`] を返す。
+    /// Processes interleaved f32 in any format and returns the finalized [`JsVadEvent`]s.
     ///
-    /// 端数フレームは内部に持ち越すので任意の位置で分割して渡してよい。`atSample` は
-    /// VAD 内部レート基準（[`JsVadEvent`] を参照）。
+    /// Partial frames are carried over internally, so the input may be split at any position.
+    /// `atSample` is in the VAD internal rate (see [`JsVadEvent`]).
     #[napi]
     pub fn process(
         &mut self,
@@ -2083,12 +2185,14 @@ impl Vad {
             .collect()
     }
 
-    /// 今開いている発話を強制的に確定し、確定した [`JsVadEvent`] を返す（入力終端に達した
-    /// のと同じ挙動）。呼び出し後は内部状態がリセットされ、次の `process` は新しい文脈から
-    /// 始まる。モデル推論は走らないので軽量・決定的。
+    /// Force-finalizes the currently open speech segment and returns the finalized
+    /// [`JsVadEvent`]s (same behavior as reaching the end of input). After the call the
+    /// internal state is reset, and the next `process` starts from a fresh context. No model
+    /// inference runs, so it is lightweight and deterministic.
     ///
-    /// 単体 `Vad` は pts 文脈を持たないので `atNs` は `undefined`（`atSample` は VAD 内部
-    /// レート基準の生の累積位置）。無発話中は空配列を返す。
+    /// The standalone `Vad` has no pts context, so `atNs` is `undefined` (`atSample` is the raw
+    /// cumulative position at the VAD internal rate). Returns an empty array when no speech is
+    /// in progress.
     #[napi]
     pub fn flush(&mut self) -> Vec<JsVadEvent> {
         self.inner
@@ -2098,7 +2202,8 @@ impl Vad {
             .collect()
     }
 
-    /// 内部状態（state / context / 状態機械 / サンプル位置 / リサンプラ）を初期化する。
+    /// Initializes the internal state (state / context / state machine / sample position /
+    /// resampler).
     #[napi]
     pub fn reset(&mut self) {
         self.inner.reset();
@@ -2106,38 +2211,42 @@ impl Vad {
 }
 
 // ---------------------------------------------------------------------------
-// 独立アドオン 2: FlacEncoder（逐次 FLAC 書き出し + 秒数ローテーション）
+// Standalone add-on 2: FlacEncoder (incremental FLAC writing + rotation by seconds)
 // ---------------------------------------------------------------------------
 
-/// 録音チャンクを逐次 FLAC ファイルへ可逆圧縮保存するライター。
+/// Writer that incrementally saves capture chunks losslessly to FLAC files.
 ///
-/// `splitSeconds` を 1 以上にすると、書き込みフレーム数が `splitSeconds × sampleRate` に
-/// 達するたびに現在のファイルを閉じ、`name-001.flac, name-002.flac, …` と 3 桁連番で
-/// 次ファイルへローテーションする（CLI の WAV 分割と同じ流儀）。境界はチャンク粒度の
-/// 「以上で次へ」なので、各ファイルは指定秒より最大 1 チャンク長くなりうるが、チャンクは
-/// 分割されず取りこぼしも無い。`splitSeconds` 省略/0 なら単一ファイル。
+/// With `splitSeconds` of 1 or more, each time the number of written frames reaches
+/// `splitSeconds × sampleRate` the current file is closed and it rotates to the next file with
+/// a 3-digit sequence number, `name-001.flac, name-002.flac, …` (same convention as the CLI's
+/// WAV splitting). The boundary is "move on once reached or exceeded" at chunk granularity, so
+/// each file can be up to one chunk longer than the specified seconds, but chunks are never
+/// split and nothing is dropped. With `splitSeconds` omitted/0 it is a single file.
 #[napi]
 pub struct FlacEncoder {
-    /// 出力ベースパス（分割時は連番の元、単一時はこのまま使う）。
+    /// Output base path (the base for sequence numbers when splitting; used as is for a
+    /// single file).
     base: PathBuf,
     sample_rate: u32,
     channels: u16,
-    /// 1 ファイルあたりのフレーム数しきい値（splitSeconds × sampleRate）。0 = 単一。
+    /// Frame-count threshold per file (splitSeconds × sampleRate). 0 = single file.
     frames_per_file: u64,
-    /// 現在書き込み中のライター。ローテーション直後は None（次チャンクで遅延生成）。
+    /// Writer currently being written to. None right after a rotation (lazily created on the
+    /// next chunk).
     writer: Option<FlacWriter>,
-    /// 現在のファイルへ書いたフレーム数（ローテーションで 0 に戻る）。
+    /// Frames written to the current file (reset to 0 on rotation).
     frames_in_current: u64,
-    /// 次に開くファイルの連番（1 始まり・分割時のみ意味を持つ）。
+    /// Sequence number of the next file to open (1-based; meaningful only when splitting).
     file_index: u64,
 }
 
 #[napi]
 impl FlacEncoder {
-    /// FLAC ライターを作る。`splitSeconds` 省略/0 で単一ファイル、1 以上で秒数ローテ。
+    /// Creates a FLAC writer. `splitSeconds` omitted/0 gives a single file; 1 or more rotates
+    /// by seconds.
     ///
-    /// `channels` は 1..=2、`sampleRate` は 1..=96000 Hz（範囲外は InvalidArg）。分割時は
-    /// 最初のファイル（`name-001.flac`）を即作成する。
+    /// `channels` is 1..=2, `sampleRate` is 1..=96000 Hz (InvalidArg when out of range). When
+    /// splitting, the first file (`name-001.flac`) is created immediately.
     #[napi(factory)]
     pub fn create(
         path: String,
@@ -2148,7 +2257,7 @@ impl FlacEncoder {
         let base = PathBuf::from(path);
         let frames_per_file = u64::from(split_seconds.unwrap_or(0)) * u64::from(sample_rate);
         let file_index = 1;
-        // 単一なら base、分割なら name-001.ext を最初のファイルとして開く。
+        // Open base for a single file, or name-001.ext as the first file when splitting.
         let first_path = if frames_per_file > 0 {
             split_flac_path(&base, file_index)
         } else {
@@ -2166,7 +2275,7 @@ impl FlacEncoder {
         })
     }
 
-    /// 分割時に次に開くファイルのパス。
+    /// Path of the next file to open when splitting.
     fn next_path(&self) -> PathBuf {
         if self.frames_per_file > 0 {
             split_flac_path(&self.base, self.file_index)
@@ -2175,29 +2284,33 @@ impl FlacEncoder {
         }
     }
 
-    /// interleaved f32（長さは `channels` の倍数）を追記する。倍数でなければ InvalidArg。
+    /// Appends interleaved f32 (length a multiple of `channels`). InvalidArg if it is not a
+    /// multiple.
     ///
-    /// 書き込み後、現在のファイルのフレーム数がしきい値以上なら即 finalize して次ファイルへ
-    /// ローテーションする（次の `writeChunk` が新ファイルの先頭になる）。
+    /// After writing, if the current file's frame count is at or above the threshold, it is
+    /// finalized immediately and rotation moves to the next file (the next `writeChunk` becomes
+    /// the start of the new file).
     #[napi]
     pub fn write_chunk(&mut self, samples: Float32Array) -> napi::Result<()> {
-        // ローテーション直後は writer=None。次ファイルをここで開く（遅延生成）。
+        // Right after a rotation writer=None. Open the next file here (lazy creation).
         if self.writer.is_none() {
             let path = self.next_path();
             self.writer = Some(
                 FlacWriter::create(&path, self.sample_rate, self.channels).map_err(encode_err)?,
             );
         }
-        let writer = self.writer.as_mut().expect("直前で開いている");
+        let writer = self.writer.as_mut().expect("opened just above");
         writer.write_chunk(&samples[..]).map_err(encode_err)?;
 
-        // フレーム数 = サンプル数 / チャンネル数。write_chunk が倍数を検証済みで割り切れる。
+        // Frames = samples / channels. write_chunk has verified it is a multiple, so it
+        // divides evenly.
         let frames = samples.len() as u64 / u64::from(self.channels);
         self.frames_in_current += frames;
 
         if self.frames_per_file > 0 && self.frames_in_current >= self.frames_per_file {
-            // しきい値到達。現ファイルを確定し、次チャンクから次ファイルへ。
-            let done = self.writer.take().expect("直前で書いた");
+            // Threshold reached. Finalize the current file; the next chunk goes to the next
+            // file.
+            let done = self.writer.take().expect("written just above");
             done.finalize().map_err(encode_err)?;
             self.file_index += 1;
             self.frames_in_current = 0;
@@ -2205,9 +2318,10 @@ impl FlacEncoder {
         Ok(())
     }
 
-    /// 端数を書き切ってヘッダを確定し、開いているファイルを閉じる。二重呼び出し安全
-    /// （2 回目以降は no-op）。呼ばずに捨てても `FlacWriter` の Drop がベストエフォートで
-    /// 閉じるが、書き込みエラーを検知したいならこれを呼ぶこと。
+    /// Writes out the remainder, finalizes the header, and closes the open file. Safe to call
+    /// twice (the second and later calls are no-ops). Discarding it without calling this still
+    /// closes the file best-effort via `FlacWriter`'s Drop, but call this if you want to detect
+    /// write errors.
     #[napi]
     pub fn finalize(&mut self) -> napi::Result<()> {
         if let Some(writer) = self.writer.take() {
@@ -2218,15 +2332,16 @@ impl FlacEncoder {
 }
 
 // ---------------------------------------------------------------------------
-// 独立アドオン 3: Denoiser（RNNoise によるオフラインノイズ抑制）
+// Standalone add-on 3: Denoiser (offline noise suppression with RNNoise)
 // ---------------------------------------------------------------------------
 
-/// オフラインのノイズ抑制器（RNNoise via nnnoiseless、重み埋め込み）。**48kHz 前提**で、
-/// マイク録音の定常ノイズ（ファン・空調・打鍵など）の低減を想定する。
+/// Offline noise suppressor (RNNoise via nnnoiseless, weights embedded). **Assumes 48kHz**
+/// and is intended to reduce stationary noise in microphone recordings (fans, air
+/// conditioning, typing, etc.).
 ///
-/// [`FRAME_SIZE`](flexaudio_denoise::FRAME_SIZE)（48kHz で 10ms）固定の遅延があり、出力は
-/// 入力を 1 フレーム分遅らせた列になる。ストリーム先頭の 1 フレームは無音の詰め物で、
-/// 末尾に残る 1 フレーム分は [`Denoiser::flush`] で取り出す。
+/// It has a fixed latency of [`FRAME_SIZE`](flexaudio_denoise::FRAME_SIZE) (10ms at 48kHz);
+/// the output is the input delayed by one frame. The first frame of the stream is silent
+/// padding, and the one frame left at the end is retrieved with [`Denoiser::flush`].
 #[napi]
 pub struct Denoiser {
     inner: CoreDenoiser,
@@ -2234,17 +2349,17 @@ pub struct Denoiser {
 
 #[napi]
 impl Denoiser {
-    /// チャンネル数（1 = mono, 2 = stereo interleaved）を指定して構築する。範囲外は
-    /// InvalidArg。
+    /// Builds it for the given channel count (1 = mono, 2 = stereo interleaved). InvalidArg
+    /// when out of range.
     #[napi(constructor)]
     pub fn new(channels: u16) -> napi::Result<Self> {
         let inner = CoreDenoiser::new(channels).map_err(denoise_err)?;
         Ok(Denoiser { inner })
     }
 
-    /// 任意長の interleaved f32（±1.0 正規化・48kHz・長さは channels の倍数）を
-    /// ノイズ抑制して**新しい配列**で返す（napi ではインプレースが扱いにくいのでコピー）。
-    /// 長さが channels の倍数でなければ InvalidArg。
+    /// Noise-suppresses interleaved f32 of any length (normalized to ±1.0, 48kHz, length a
+    /// multiple of channels) and returns it as a **new array** (a copy, since in-place is
+    /// awkward in napi). InvalidArg if the length is not a multiple of channels.
     #[napi]
     pub fn process(&mut self, samples: Float32Array) -> napi::Result<Float32Array> {
         let mut buf = samples.to_vec();
@@ -2252,14 +2367,15 @@ impl Denoiser {
         Ok(Float32Array::new(buf))
     }
 
-    /// 持ち越し中の端数を処理して末尾の遅延分（1 フレーム/ch）を返し、ストリームを閉じる。
-    /// 呼び出し後は生成直後と同じ状態に戻り、続けて別ストリームを処理できる。
+    /// Processes the carried-over remainder, returns the trailing delayed portion (1
+    /// frame/ch), and closes the stream. After the call it is back in the freshly-created
+    /// state and can go on to process another stream.
     #[napi]
     pub fn flush(&mut self) -> Float32Array {
         Float32Array::new(self.inner.flush())
     }
 
-    /// RNN 状態・持ち越し・遅延線をすべて初期化する。
+    /// Initializes the RNN state, the carry-over, and the delay line.
     #[napi]
     pub fn reset(&mut self) {
         self.inner.reset();
@@ -2268,22 +2384,24 @@ impl Denoiser {
 
 #[cfg(test)]
 mod tests {
-    //! marshalling の純粋部分を JS ランタイム無しで検証する。
+    //! Verifies the pure parts of the marshalling without a JS runtime.
     //!
-    //! ここで見るのは「Rust 値 → JS 向け中間表現」の純粋変換だけ:
-    //! - `parse_source_kind` / `source_kind_str`（往復）
-    //! - `parse_process_mode`（既定/明示/未知）
-    //! - `build_config`（OpenOptions → StreamConfig の既定・反映）
-    //! - `to_napi_err`（flexaudio::Error → napi 文字列・Status）
-    //! - `event_to_js` / `device_event_to_js`（種別文字列・payload）
-    //! - `chunk_to_js`（seq u64 → BigInt・data・frames・peak/rms）
+    //! Only the pure "Rust value → JS-facing intermediate representation" conversions are
+    //! checked here:
+    //! - `parse_source_kind` / `source_kind_str` (round trip)
+    //! - `parse_process_mode` (default/explicit/unknown)
+    //! - `build_config` (OpenOptions → StreamConfig defaults and propagation)
+    //! - `to_napi_err` (flexaudio::Error → napi string, Status)
+    //! - `event_to_js` / `device_event_to_js` (kind strings, payload)
+    //! - `chunk_to_js` (seq u64 → BigInt, data, frames, peak/rms)
     //!
-    //! `Float32Array::new(Vec)` と `BigInt::from(u64)` は純 Rust フィールドへ値を入れ、
-    //! `Deref<[f32]>` / `get_u64()` で JS ランタイム無しに読み戻せる（napi 2.16）。
+    //! `Float32Array::new(Vec)` and `BigInt::from(u64)` store values in plain Rust fields,
+    //! which can be read back without a JS runtime via `Deref<[f32]>` / `get_u64()`
+    //! (napi 2.16).
 
     use super::*;
 
-    // --- source kind 往復 ---
+    // --- source kind round trip ---
 
     #[test]
     fn source_kind_roundtrips() {
@@ -2308,13 +2426,13 @@ mod tests {
 
     #[test]
     fn parse_process_mode_defaults_and_explicit() {
-        // None / "include" は既定 Include。
+        // None / "include" is the default Include.
         assert_eq!(parse_process_mode(None).unwrap(), ProcessMode::Include);
         assert_eq!(
             parse_process_mode(Some("include")).unwrap(),
             ProcessMode::Include
         );
-        // "exclude" は Exclude。
+        // "exclude" is Exclude.
         assert_eq!(
             parse_process_mode(Some("exclude")).unwrap(),
             ProcessMode::Exclude
@@ -2329,7 +2447,7 @@ mod tests {
 
     // --- build_config ---
 
-    /// OpenOptions を全フィールド未指定（kind のみ）で作るヘルパ。
+    /// Helper that builds OpenOptions with every field unset (kind only).
     fn options_with_kind(kind: &str) -> OpenOptions {
         OpenOptions {
             kind: kind.to_string(),
@@ -2357,18 +2475,18 @@ mod tests {
         let opts = options_with_kind("mic");
         let cfg = build_config(&opts).unwrap();
         assert_eq!(cfg.kind, SourceKind::Mic);
-        // 既定 output {48000, 2}。
+        // Default output {48000, 2}.
         assert_eq!(cfg.output.sample_rate, 48_000);
         assert_eq!(cfg.output.channels, 2);
         assert_eq!(cfg.mode, ProcessMode::Include);
         assert!(!cfg.exclude_self);
         assert_eq!(cfg.target_pid, None);
         assert_eq!(cfg.device_id, None);
-        // chunk_ms 未指定なら StreamConfig 既定（20）。
+        // chunk_ms unset gives the StreamConfig default (20).
         assert_eq!(cfg.chunk_ms, 20);
-        // gain 未指定なら既定 1.0。
+        // gain unset gives the default 1.0.
         assert_eq!(cfg.gain, 1.0);
-        // mix 専用フィールドの既定（デバイス未指定・側別ゲイン 1.0）。
+        // Defaults of the mix-only fields (no device specified, per-side gain 1.0).
         assert_eq!(cfg.mix_mic_device_id, None);
         assert_eq!(cfg.mix_system_device_id, None);
         assert_eq!(cfg.mix_mic_gain, 1.0);
@@ -2436,7 +2554,7 @@ mod tests {
     fn to_napi_err_carries_message_and_status() {
         let err = to_napi_err(flexaudio::Error::DeviceNotFound);
         assert_eq!(err.status, Status::GenericFailure);
-        // Display 文字列が reason に入る。
+        // The Display string goes into reason.
         assert_eq!(err.reason, flexaudio::Error::DeviceNotFound.to_string());
         assert!(err.reason.contains("device not found"));
     }
@@ -2498,27 +2616,31 @@ mod tests {
         assert_eq!(changed.source_kind.as_deref(), Some("system"));
     }
 
-    // seq u64 → BigInt の変換（marshalling の純粋部分）。
+    // seq u64 → BigInt conversion (the pure part of the marshalling).
     //
-    // `chunk_to_js` 全体は `Float32Array` を生成するのでここではテストできない。napi
-    // 2.16 の `Float32Array` は `Drop` が `napi_call_threadsafe_function` を無条件参照
-    // するため、cdylib のユニットテストバイナリ（Node ホスト不在）ではリンクできず
-    // `cargo test -p flexaudio-napi` が壊れる。そこで JS ランタイムに依存しない
-    // seq→BigInt 変換だけを同じロジック（`BigInt::from(u64)` + `get_u64`）で見る。
-    // data/Float32Array 経路は Node 側の E2E（`__openMockStream`）でカバーする。
+    // `chunk_to_js` as a whole creates a `Float32Array`, so it cannot be tested here. In napi
+    // 2.16, the `Drop` of `Float32Array` unconditionally references
+    // `napi_call_threadsafe_function`, so the cdylib unit test binary (no Node host) cannot
+    // link and `cargo test -p flexaudio-napi` breaks. So only the seq→BigInt conversion, which
+    // does not depend on a JS runtime, is checked with the same logic (`BigInt::from(u64)` +
+    // `get_u64`). The data/Float32Array path is covered by the Node-side E2E
+    // (`__openMockStream`).
 
     #[test]
     fn seq_u64_to_bigint_is_lossless() {
-        // chunk_to_js は `BigInt::from(chunk.seq)` で seq を BigInt 化する。
-        // 2^53+1（f64 では表せない大きさ）でも無損失で往復することを確認する。
-        let seq: u64 = 9_007_199_254_740_993; // 2^53 + 1。
+        // chunk_to_js turns seq into a BigInt with `BigInt::from(chunk.seq)`.
+        // Check that even 2^53+1 (a magnitude f64 cannot represent) round-trips losslessly.
+        let seq: u64 = 9_007_199_254_740_993; // 2^53 + 1.
         let big = BigInt::from(seq);
         let (sign, value, lossless) = big.get_u64();
-        assert!(!sign, "seq は非負");
-        assert_eq!(value, seq, "seq 値が無損失で保持される（f64 では落ちる桁）");
-        assert!(lossless, "u64 1 ワードなので lossless");
+        assert!(!sign, "seq is non-negative");
+        assert_eq!(
+            value, seq,
+            "seq value is kept losslessly (digits that f64 would lose)"
+        );
+        assert!(lossless, "a single u64 word, so lossless");
 
-        // u64::MAX 境界でも無損失。
+        // Lossless even at the u64::MAX boundary.
         let (_, max_val, max_lossless) = BigInt::from(u64::MAX).get_u64();
         assert_eq!(max_val, u64::MAX);
         assert!(max_lossless);
@@ -2545,12 +2667,13 @@ mod tests {
         assert!(!js.is_default);
     }
 
-    // --- 統合オプション: OpenOptions に vad/denoise が乗る ---
+    // --- Integrated options: OpenOptions carries vad/denoise ---
 
     #[test]
     fn open_options_carries_vad_and_denoise() {
-        // vad/denoise は StreamConfig ではなく open_stream 側で解釈するので、build_config は
-        // これらに影響されず通ること（＝録音本体の設定と直交している）を確認する。
+        // vad/denoise are interpreted by open_stream, not in StreamConfig, so check that
+        // build_config passes unaffected by them (= orthogonal to the capture settings
+        // themselves).
         let mut opts = options_with_kind("mic");
         opts.denoise = Some(true);
         opts.vad = Some(VadOptions {
@@ -2567,9 +2690,9 @@ mod tests {
         assert_eq!(cfg.output.sample_rate, 48_000);
     }
 
-    // --- build_vad_config（VadOptions → VadConfig） ---
+    // --- build_vad_config (VadOptions → VadConfig) ---
 
-    /// 全フィールド未指定の VadOptions。
+    /// VadOptions with every field unset.
     fn empty_vad_options() -> VadOptions {
         VadOptions {
             threshold: None,
@@ -2587,7 +2710,8 @@ mod tests {
         let cfg = build_vad_config(&empty_vad_options());
         let d = VadConfig::default();
         assert_eq!(cfg.threshold, d.threshold);
-        // 未指定の negThreshold は None のまま（VadConfig 側の既定式が効く）。
+        // An unset negThreshold stays None (the default formula on the VadConfig side
+        // applies).
         assert_eq!(cfg.neg_threshold, None);
         assert_eq!(cfg.min_speech_ms, d.min_speech_ms);
         assert_eq!(cfg.min_silence_ms, d.min_silence_ms);
@@ -2617,15 +2741,15 @@ mod tests {
         assert_eq!(cfg.sample_rate, 8000);
     }
 
-    // --- build_integrated_vad_config（統合経路の maxSpeechMs 既定 30s・追補2-3） ---
+    // --- build_integrated_vad_config (integrated-path maxSpeechMs default 30s, addendum 2-3) ---
 
     #[test]
     fn integrated_vad_config_defaults_max_speech_to_30s() {
-        // 統合経路は maxSpeechMs 未指定なら 30_000 を入れる（長広舌の有界化）。
+        // The integrated path sets 30_000 when maxSpeechMs is unset (bounding monologues).
         let cfg = build_integrated_vad_config(&empty_vad_options());
         assert_eq!(cfg.max_speech_ms, INTEGRATED_VAD_MAX_SPEECH_MS_DEFAULT);
         assert_eq!(cfg.max_speech_ms, 30_000);
-        // 他フィールドは build_vad_config（silero 既定）と一致する。
+        // The other fields match build_vad_config (silero defaults).
         let d = VadConfig::default();
         assert_eq!(cfg.threshold, d.threshold);
         assert_eq!(cfg.neg_threshold, None);
@@ -2637,40 +2761,42 @@ mod tests {
 
     #[test]
     fn integrated_vad_config_respects_explicit_max_speech() {
-        // 明示値は尊重される。
+        // An explicit value is respected.
         let mut o = empty_vad_options();
         o.max_speech_ms = Some(5_000);
         assert_eq!(build_integrated_vad_config(&o).max_speech_ms, 5_000);
-        // 0（無制限）を明示すれば silero 既定へ戻せる（既定上書きより明示が勝つ）。
+        // Explicitly passing 0 (unbounded) restores the silero default (explicit wins over the
+        // default override).
         o.max_speech_ms = Some(0);
         assert_eq!(build_integrated_vad_config(&o).max_speech_ms, 0);
     }
 
     #[test]
     fn standalone_vad_config_keeps_silero_max_speech() {
-        // 単体 Vad 経路（build_vad_config）は silero 忠実＝既定 0（無制限）のまま。
+        // The standalone Vad path (build_vad_config) stays silero-faithful = default 0
+        // (unbounded).
         assert_eq!(build_vad_config(&empty_vad_options()).max_speech_ms, 0);
     }
 
-    // --- check_denoise_rate（denoise の 48kHz 前提） ---
+    // --- check_denoise_rate (denoise 48kHz precondition) ---
 
     #[test]
     fn denoise_requires_48k() {
-        // 有効 + 48000 は OK。
+        // Enabled + 48000 is OK.
         assert!(check_denoise_rate(true, 48_000).is_ok());
-        // 有効 + 48000 以外は InvalidArg。
+        // Enabled + anything other than 48000 is InvalidArg.
         let err = check_denoise_rate(true, 16_000).unwrap_err();
         assert_eq!(err.status, Status::InvalidArg);
-        // 無効ならレートに関係なく OK（検証しない）。
+        // Disabled is OK regardless of rate (not validated).
         assert!(check_denoise_rate(false, 16_000).is_ok());
         assert!(check_denoise_rate(false, 48_000).is_ok());
     }
 
-    // --- split_flac_path（連番命名・CLI と同じ流儀） ---
+    // --- split_flac_path (sequential naming, same convention as the CLI) ---
 
     #[test]
     fn split_flac_path_numbering() {
-        // 拡張子ありは拡張子の前へ 3 桁ゼロ詰め連番。
+        // With an extension: 3-digit zero-padded sequence number before the extension.
         assert_eq!(
             split_flac_path(Path::new("rec.flac"), 1),
             PathBuf::from("rec-001.flac")
@@ -2679,52 +2805,52 @@ mod tests {
             split_flac_path(Path::new("rec.flac"), 12),
             PathBuf::from("rec-012.flac")
         );
-        // 1000 以降は桁が自然に増える。
+        // From 1000 on the digits simply grow.
         assert_eq!(
             split_flac_path(Path::new("rec.flac"), 1000),
             PathBuf::from("rec-1000.flac")
         );
-        // 拡張子なしは末尾に連番。
+        // Without an extension: sequence number at the end.
         assert_eq!(
             split_flac_path(Path::new("rec"), 3),
             PathBuf::from("rec-003")
         );
-        // 親ディレクトリは保たれる。
+        // The parent directory is preserved.
         assert_eq!(
             split_flac_path(Path::new("/tmp/out/meeting.flac"), 2),
             PathBuf::from("/tmp/out/meeting-002.flac")
         );
     }
 
-    // --- 各アドオンのエラー写像 ---
+    // --- Error mapping of each add-on ---
 
     #[test]
     fn error_mappers_carry_status() {
-        // denoise: チャンネル不正は InvalidArg。
+        // denoise: invalid channels is InvalidArg.
         let e = denoise_err(DenoiseError::InvalidChannels(3));
         assert_eq!(e.status, Status::InvalidArg);
-        // encode: 非対応パラメータは InvalidArg。
+        // encode: unsupported parameters are InvalidArg.
         let e = encode_err(EncodeError::Unsupported("bad".to_string()));
         assert_eq!(e.status, Status::InvalidArg);
-        // encode: エンコーダ内部は GenericFailure。
+        // encode: encoder internals are GenericFailure.
         let e = encode_err(EncodeError::Encoder("boom".to_string()));
         assert_eq!(e.status, Status::GenericFailure);
-        // vad: 設定不正は InvalidArg。
+        // vad: invalid config is InvalidArg.
         let e = vad_err(VadError::InvalidConfig("nope".to_string()));
         assert_eq!(e.status, Status::InvalidArg);
-        // vad: モデルロード失敗は GenericFailure。
+        // vad: model load failure is GenericFailure.
         let e = vad_err(VadError::ModelLoad("x".to_string()));
         assert_eq!(e.status, Status::GenericFailure);
     }
 
-    // --- vad_event_to_js（種別文字列・atSample） ---
+    // --- vad_event_to_js (kind string, atSample) ---
 
     #[test]
     fn vad_event_to_js_maps_variants() {
         let start = vad_event_to_js(VadEvent::SpeechStart { at_sample: 512 });
         assert_eq!(start.kind, "speechStart");
         assert_eq!(start.at_sample, 512);
-        // 単体経路（絶対時刻文脈なし）は atNs = undefined。
+        // The standalone path (no absolute-time context) has atNs = undefined.
         assert_eq!(start.at_ns, None);
         let end = vad_event_to_js(VadEvent::SpeechEnd { at_sample: 4096 });
         assert_eq!(end.kind, "speechEnd");
@@ -2734,7 +2860,8 @@ mod tests {
 
     #[test]
     fn vad_event_to_js_abs_carries_recording_time() {
-        // 統合経路は録音 0 起点の絶対時刻 atNs を持つ（atSample は生の内部レート位置のまま）。
+        // The integrated path carries atNs, the absolute time from recording start (atSample
+        // stays the raw internal-rate position).
         let ev = vad_event_to_js_abs(VadEvent::SpeechEnd { at_sample: 8000 }, Some(1_500_000_000));
         assert_eq!(ev.kind, "speechEnd");
         assert_eq!(ev.at_sample, 8000);

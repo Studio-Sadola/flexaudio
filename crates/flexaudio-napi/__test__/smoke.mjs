@@ -1,14 +1,14 @@
-// flexaudio-napi スモークテスト（実音不要・ヘッドレス環境 で end-to-end）。
+// flexaudio-napi smoke test (no real audio needed; end-to-end in a headless environment).
 //
-// 前提: `cargo build -p flexaudio-napi` で生成された cdylib を、この同じディレクトリに
-// `flexaudio.node` という名前でコピー/リネームしてあること（run-smoke.sh が行う）。
+// Prerequisite: the cdylib built by `cargo build -p flexaudio-napi` has been copied/renamed
+// into this same directory as `flexaudio.node` (run-smoke.sh does this).
 //
-// 検証内容:
-//  1. devices() が配列を返す（空でも throw しないこと）。
-//  2. __openMockStream(48000, 2, 440.0, onChunk) で 440Hz サインのチャンクを受信。
-//     - 各 chunk で data.length === frames*channels、peak > 0 を assert。
-//     - 受信数 > 0 を確認。
-//  3. stop() 後にプロセスがハングせず綺麗に終わる。
+// What is verified:
+//  1. devices() returns an array (must not throw even if empty).
+//  2. __openMockStream(48000, 2, 440.0, onChunk) receives chunks of a 440Hz sine.
+//     - For each chunk, assert data.length === frames*channels and peak > 0.
+//     - Check that received count > 0.
+//  3. After stop() the process exits cleanly without hanging.
 
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -62,7 +62,7 @@ async function main() {
     if (chunk.peak > peakSeen) peakSeen = chunk.peak;
   });
 
-  // 一定時間チャンクを受信。
+  // Receive chunks for a fixed period.
   await new Promise((r) => setTimeout(r, 500));
 
   await stream.stop();
@@ -70,7 +70,7 @@ async function main() {
   console.log(`[2] received ${received} chunk(s)`);
   assert(received > 0, 'expected received > 0 chunks');
   assert(badChunk === null, `chunk length mismatch: ${badChunk}`);
-  // 440Hz サイン波なので peak は非ゼロのはず。
+  // It is a 440Hz sine wave, so peak should be non-zero.
   assert(peakSeen > 0, `expected peak > 0, got ${peakSeen}`);
   assert(firstChunk.data instanceof Object || true, 'data present');
 
@@ -89,7 +89,7 @@ async function main() {
 
 main().then(
   () => {
-    // 明示的に exit（ぶら下がりハンドルが無いことを確認するため、ハングしたら CI が落ちる）。
+    // Exit explicitly (to confirm there are no dangling handles; if it hangs, CI fails).
     process.exit(0);
   },
   (e) => {

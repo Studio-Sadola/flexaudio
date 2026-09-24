@@ -1,4 +1,4 @@
-// N-API cdylib のためのビルド設定（シンボルエクスポート等）。ビルド時のみ実行。
+// Build setup for the N-API cdylib (symbol exports etc.). Runs at build time only.
 fn main() {
     napi_build::setup();
 }

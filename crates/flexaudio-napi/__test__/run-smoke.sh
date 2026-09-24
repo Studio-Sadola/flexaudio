@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# flexaudio-napi のビルド + Node スモークテスト（実音不要）。
-# napi CLI を使わず cargo build + 手動リネームで .node を用意（ネット最小化）。
+# Build flexaudio-napi + Node smoke test (no real audio needed).
+# Prepares the .node with cargo build + a manual rename instead of the napi CLI (minimizes
+# network use).
 set -euo pipefail
 
 if [[ -f "$HOME/.cargo/env" ]]; then
@@ -8,13 +9,13 @@ if [[ -f "$HOME/.cargo/env" ]]; then
   . "$HOME/.cargo/env"
 fi
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"   # flexaudio ルート
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"   # flexaudio root
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "== cargo build -p flexaudio-napi (release) =="
 cargo build -p flexaudio-napi --release --manifest-path "$ROOT/Cargo.toml"
 
-# cdylib の生成物を探す（package 名 flexaudio-napi -> プラットフォーム別ファイル名）。
+# Locate the built cdylib (package name flexaudio-napi -> platform-specific file name).
 RELEASE_DIR="$ROOT/target/release"
 
 cdylib_basenames_for_platform() {

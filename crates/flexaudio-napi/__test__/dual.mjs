@@ -1,18 +1,21 @@
-// flexaudio-napi デュアル出力 + flushVad E2E（実音不要・ヘッドレス）。
+// flexaudio-napi dual output + flushVad E2E (no real audio needed; headless).
 //
-// 前提: `cargo build -p flexaudio-napi` の cdylib を同じディレクトリに `flexaudio.node`
-// としてコピー/リネームしてあること（run-smoke.sh 系が行う）。
+// Prerequisite: the cdylib from `cargo build -p flexaudio-napi` has been copied/renamed into
+// the same directory as `flexaudio.node` (the run-smoke.sh family does this).
 //
-// __openMockStream の拡張引数で副タップ / 統合 VAD を有効化し、実キャプチャ無しで検証する:
-//  [A] デュアル出力:
-//   1. 主チャンクに時刻対応する副チャンク（primary.secondary）がペアで届く。
-//   2. 副 s16 は Int16Array・16k/mono は 320 sample・encoding=='s16'。
-//   3. 録音クロックは 0 起点（最初に届く主チャンクの ptsNs === 0）。
-//   4. 主・副の pts は非減少。ペアの pts 差は 60ms 窓内。
-//  [B] flushVad（追補2-2）:
-//   5. 開いた発話 → flushVad → 次チャンクの vadEvents に speechEnd が載る。
-//   6. vadEvents の atNs は録音 0 起点（>= 0）で単調非減少。
-//   7. stop() が音の stop-flush の後に flushVad を自動実行し、最終 speechEnd が届く。
+// Enables the secondary tap / integrated VAD via the extended arguments of __openMockStream
+// and verifies without real capture:
+//  [A] Dual output:
+//   1. The time-matched secondary chunk (primary.secondary) arrives paired with the primary.
+//   2. Secondary s16 is Int16Array, 16k/mono is 320 samples, encoding=='s16'.
+//   3. The recording clock starts at zero (ptsNs === 0 for the first primary chunk).
+//   4. Primary and secondary pts are non-decreasing. The pts difference within a pair is
+//      within the 60ms window.
+//  [B] flushVad (addendum 2-2):
+//   5. Open speech segment → flushVad → speechEnd rides on the next chunk's vadEvents.
+//   6. atNs of vadEvents is recording-start-based (>= 0) and monotonically non-decreasing.
+//   7. stop() auto-runs flushVad after the audio stop-flush, and the final speechEnd
+//      arrives.
 
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -31,14 +34,14 @@ function assert(cond, msg) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// [A] デュアル出力（副タップ・s16・0 起点クロック・ペア窓）。
+// [A] Dual output (secondary tap, s16, zero-based clock, pair window).
 async function dualOutput() {
   const chunks = []; // { pts, secPts, secLen }
   let firstPrimaryPts = null;
   let pairedCount = 0;
   let secShapeBad = null;
 
-  // 主 48k/stereo + 副 16k/mono/s16。
+  // Primary 48k/stereo + secondary 16k/mono/s16.
   const stream = native.__openMockStream(48000, 2, 440.0, (primary) => {
     if (firstPrimaryPts === null) firstPrimaryPts = primary.ptsNs;
     const rec = { pts: primary.ptsNs, secPts: null, secLen: null };
@@ -66,15 +69,15 @@ async function dualOutput() {
   assert(pairedCount > 0, 'expected at least one primary paired with a secondary');
   assert(secShapeBad === null, `secondary shape: ${secShapeBad}`);
 
-  // 3. 録音 0 起点。
+  // 3. Recording starts at zero.
   console.log(`[A2] first primary ptsNs = ${firstPrimaryPts}`);
   assert(firstPrimaryPts === 0, `first primary ptsNs must be 0, got ${firstPrimaryPts}`);
 
-  // 4. 主 pts 非減少。
+  // 4. Primary pts non-decreasing.
   for (let i = 1; i < chunks.length; i++) {
     assert(chunks[i].pts >= chunks[i - 1].pts, `primary pts must be non-decreasing at ${i}`);
   }
-  // ペアの pts 差は 60ms 窓内。
+  // The pts difference within a pair is within the 60ms window.
   const WINDOW_NS = 60_000_000;
   for (const c of chunks) {
     if (c.secPts !== null) {
@@ -85,7 +88,7 @@ async function dualOutput() {
   console.log('[A] DUAL OK');
 }
 
-// vadEvents 配列の atNs 検証（録音 0 起点・単調非減少）を共通化する。
+// Shared check of atNs in a vadEvents array (recording-start-based, monotonically non-decreasing).
 function checkVadEvents(events) {
   let last = -1;
   for (const ev of events) {
@@ -97,31 +100,31 @@ function checkVadEvents(events) {
   }
 }
 
-// 主・副どちらのタップに VAD が乗っていても vadEvents を拾えるよう、両方から収集する。
+// Collect from both taps so vadEvents are picked up whichever tap (primary or secondary) the VAD is on.
 function collectEvents(primary, sink) {
   if (primary.vadEvents) for (const ev of primary.vadEvents) sink.push(ev);
   const s = primary.secondary;
   if (s && s.vadEvents) for (const ev of s.vadEvents) sink.push(ev);
 }
 
-// [B] flushVad: 実行中の強制確定で最終 speechEnd が次チャンクに載る（vadTap='primary'）。
+// [B] flushVad: a runtime force-finalize puts the final speechEnd on the next chunk (vadTap='primary').
 async function flushVadMidStream() {
   const events = [];
-  // vadTap primary・threshold 0 → 全フレームが発話扱い＝無音が来ないのでセグメントは
-  // 開いたまま。process では確定しない。
+  // vadTap primary, threshold 0 → every frame counts as speech = no silence ever comes, so the
+  // segment stays open. process does not finalize it.
   const stream = native.__openMockStream(
     48000, 2, 440.0,
     (primary) => collectEvents(primary, events),
-    undefined, undefined, undefined, // 副タップ無し
+    undefined, undefined, undefined, // no secondary tap
     0.0, 'primary',                  // vadThreshold=0, vadTap='primary'
   );
 
   await sleep(300);
-  // 無音が来ないので flushVad 前は発話イベントが確定しない。
+  // No silence comes, so no speech events are finalized before flushVad.
   assert(events.length === 0, `expected no vad events before flushVad, got ${events.length}`);
 
   stream.flushVad();
-  await sleep(150); // 次チャンクが flush イベントを運ぶ。
+  await sleep(150); // The next chunk carries the flush events.
 
   const ends = events.filter((e) => e.type === 'speechEnd');
   const starts = events.filter((e) => e.type === 'speechStart');
@@ -132,27 +135,28 @@ async function flushVadMidStream() {
   console.log('[B2] atNs recording-0-based & monotonic OK');
 
   await stream.stop();
-  checkVadEvents(events); // stop 自動 flush 後も単調非減少。
+  checkVadEvents(events); // Still monotonically non-decreasing after the stop auto-flush.
   console.log('[B] FLUSHVAD MID-STREAM OK');
 }
 
-// [C] stop() の自動 flushVad: flushVad を明示的に呼ばず、開いた発話のまま stop する。
-// 無音が来ない合成波では発話は silence では閉じないので、speechEnd が届くのは stop() が
-// 音の stop-flush の後に flushVad を自動実行したことの証明になる。標準運用（追補2-1）の
-// vadTap='secondary' で検証する（副 16k リサンプラの残余で stop-flush テールが必ず出る）。
+// [C] Automatic flushVad in stop(): stop with the speech segment still open, without calling
+// flushVad explicitly. With a synthetic wave that never goes silent, the segment is never
+// closed by silence, so a speechEnd arriving proves that stop() auto-ran flushVad after the
+// audio stop-flush. Verified with vadTap='secondary' as in standard operation (addendum 2-1)
+// (the residue of the secondary 16k resampler always produces a stop-flush tail).
 async function flushVadOnStop() {
   const events = [];
   const stream = native.__openMockStream(
     48000, 2, 440.0,
     (primary) => collectEvents(primary, events),
-    16000, 1, 's16',   // 副タップ 16k/mono/s16（標準運用）
+    16000, 1, 's16',   // secondary tap 16k/mono/s16 (standard operation)
     0.0, 'secondary',  // vadThreshold=0, vadTap='secondary'
   );
 
   await sleep(300);
   assert(events.length === 0, `expected no vad events before stop, got ${events.length}`);
 
-  await stream.stop();      // flushVad は呼ばない。stop が自動実行するはず。
+  await stream.stop();      // Do not call flushVad. stop should run it automatically.
 
   const ends = events.filter((e) => e.type === 'speechEnd');
   console.log(`[C1] speechEnd delivered via stop auto-flush: ${ends.length}`);

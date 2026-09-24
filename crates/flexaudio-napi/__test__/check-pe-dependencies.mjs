@@ -1,34 +1,36 @@
-// Windows の PE（.node / .exe / .dll）が読み込む依存 DLL を、外部ツールに頼らず
-// PE ヘッダを直接読んで検査する。release-npm.yml の
-// 「Verify native addon dependencies (Windows)」ステップが使う。
+// Inspects the dependency DLLs loaded by a Windows PE (.node / .exe / .dll) by reading the PE
+// headers directly, without relying on external tools. Used by the
+// "Verify native addon dependencies (Windows)" step of release-npm.yml.
 //
-// なぜ dumpbin を使わないか: dumpbin は MSVC 同梱で、vcvars（開発者コマンドプロンプト）
-// の環境を読まないと PATH に載らない。GitHub ランナーの既定 PATH では
-// 「The term 'dumpbin' is not recognized ...」で検査だけが落ちる＝**検査の成否が
-// 成果物ではなくランナーの道具の有無で決まってしまう**（実測: run 35509560651。
-// ビルド自体は成功していたのに、この検査の失敗で成果物のアップロードがスキップされた）。
-// ここは Node の標準機能だけで完結させ、環境非依存にする。
+// Why not dumpbin: dumpbin ships with MSVC and is not on PATH unless the vcvars (Developer
+// Command Prompt) environment is loaded. With the GitHub runner's default PATH only the check
+// fails with "The term 'dumpbin' is not recognized ..." = **whether the check passes is
+// decided by the tools on the runner, not by the artifact** (observed: run 35509560651; the
+// build itself succeeded, but the failure of this check skipped the artifact upload).
+// So this is done entirely with Node's standard features, independent of the environment.
 //
-// 使い方:
+// Usage:
 //   node check-pe-dependencies.mjs <pe-file> [more-pe-files ...]
 //
-// 終了コード:
-//   0 = 全ての入力を読めて、依存が全て pe-dependency-policy.mjs の許可集合に入っている
-//   1 = 禁止の依存・許可集合に無い依存があった / 読めなかった（PE でない・壊れている・
-//       ファイルが無い・引数が 0 個）。**「読めないから合格」は絶対にしない（fail-closed）**。
-//       読めない検査は、依存が増えた事実を静かに見逃す＝無いより悪い。
+// Exit codes:
+//   0 = every input could be read and every dependency is in the allowed set of
+//       pe-dependency-policy.mjs
+//   1 = a forbidden dependency or one not in the allowed set was found / an input could not be
+//       read (not a PE, corrupt, missing file, zero arguments). **Never "pass because it could
+//       not be read" (fail-closed)**. A check that cannot read silently misses the fact that a
+//       dependency was added = worse than no check.
 //
-// 読み取り対象（両方を必ず見る）:
-//   - 通常の Import ディレクトリ        (IMAGE_DIRECTORY_ENTRY_IMPORT = 1)
-//   - Delay-Import ディレクトリ         (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT = 13)
-//   遅延インポートは「実際にその関数を呼ぶまでロードされない」だけで、配布物に
-//   同梱が要る依存であることに変わりはない。片方だけ見る検査は穴になる。
+// What is read (both are always examined):
+//   - the regular Import directory      (IMAGE_DIRECTORY_ENTRY_IMPORT = 1)
+//   - the Delay-Import directory        (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT = 13)
+//   A delay import is merely "not loaded until that function is actually called"; it is still a
+//   dependency that must ship with the distribution. A check that looks at only one is a hole.
 
 import { readFileSync } from 'node:fs';
 import { isReadableDllName } from './pe-dll-name.mjs';
 import { judgeDependencies } from './pe-dependency-policy.mjs';
 
-/** COFF ヘッダの Machine 値。 */
+/** Machine values of the COFF header. */
 const MACHINE_TYPES = new Map([
   [0x014c, 'I386'],
   [0x8664, 'AMD64'],
@@ -39,25 +41,25 @@ const MACHINE_TYPES = new Map([
   [0xa64e, 'ARM64X'],
 ]);
 
-// データディレクトリの添字（IMAGE_DIRECTORY_ENTRY_*）。
+// Data directory indices (IMAGE_DIRECTORY_ENTRY_*).
 const DIR_IMPORT = 1;
 const DIR_DELAY_IMPORT = 13;
 
 const PE32_MAGIC = 0x10b;
 const PE32_PLUS_MAGIC = 0x20b;
 
-// dlattrRva: Delay-Import テーブル内のアドレスが VA ではなく RVA であることを示すビット。
+// dlattrRva: bit indicating that addresses in the Delay-Import table are RVAs, not VAs.
 const DLATTR_RVA = 0x1;
 
 const IMPORT_DESCRIPTOR_SIZE = 20; // IMAGE_IMPORT_DESCRIPTOR
 const DELAY_DESCRIPTOR_SIZE = 32; // IMAGE_DELAYLOAD_DESCRIPTOR
-// 終端（全フィールド 0）が来ないまま延々と歩かないための上限。
+// Upper bound so we do not walk forever when the terminator (all fields 0) never comes.
 const MAX_IMPORT_DESCRIPTORS = 4096;
 const MAX_DELAY_DESCRIPTORS = 4096;
-// DLL 名は短い。これを超えて NUL が来ない物は名前ではない。
+// DLL names are short. Anything with no NUL within this length is not a name.
 const MAX_DLL_NAME_BYTES = 260;
 
-/** PE として読めなかったことを表す。呼び出し側が非 0 終了に変換する。 */
+/** Signals that the input could not be read as a PE. The caller turns it into a non-zero exit. */
 class PeError extends Error {}
 
 function need(buf, offset, length, what) {
@@ -85,20 +87,20 @@ function isZeroRange(buf, offset, length) {
   return true;
 }
 
-/** RVA をファイル内オフセットへ写す。写せなければ null（例外にしない＝VA 再試行の余地を残す）。 */
+/** Maps an RVA to a file offset. null if it cannot be mapped (no exception = leaves room for a VA retry). */
 function rvaToOffset(image, rva) {
   if (!Number.isInteger(rva) || rva <= 0) return null;
   for (const section of image.sections) {
     const span = Math.max(section.virtualSize, section.sizeOfRawData);
     if (rva >= section.virtualAddress && rva < section.virtualAddress + span) {
       const delta = rva - section.virtualAddress;
-      // SizeOfRawData を超えた先はファイルに実体が無い（ロード時に 0 埋めされる領域）。
+      // Beyond SizeOfRawData there is nothing in the file (a region zero-filled at load time).
       if (delta >= section.sizeOfRawData) return null;
       const offset = section.pointerToRawData + delta;
       return offset < image.buf.length ? offset : null;
     }
   }
-  // 最初のセクションより前＝ヘッダ領域は、RVA とファイル位置が一致する。
+  // Before the first section = the header region, where the RVA equals the file position.
   if (image.sections.length > 0 && rva < image.sections[0].virtualAddress && rva < image.buf.length) {
     return rva;
   }
@@ -112,7 +114,7 @@ function dataDirectory(image, index) {
   return { rva: u32(image.buf, offset), size: u32(image.buf, offset + 4) };
 }
 
-/** 与えられたオフセットから NUL 終端の DLL 名を読む。名前として妥当でなければ null。 */
+/** Reads a NUL-terminated DLL name at the given offset. null if it is not a valid name. */
 function readDllNameAt(image, offset) {
   if (offset === null) return null;
   const end = Math.min(image.buf.length, offset + MAX_DLL_NAME_BYTES);
@@ -120,21 +122,22 @@ function readDllNameAt(image, offset) {
   for (let i = offset; i < end; i += 1) {
     const byte = image.buf[i];
     if (byte === 0) return isReadableDllName(text) ? text : null;
-    // 印字可能 ASCII 以外が混ざる＝そこは名前ではない。
+    // Contains something other than printable ASCII = this is not a name.
     if (byte < 0x20 || byte > 0x7e) return null;
     text += String.fromCharCode(byte);
   }
-  return null; // NUL で終わらない。
+  return null; // Not NUL-terminated.
 }
 
 /**
- * アドレス値を DLL 名へ解決する。
+ * Resolves an address value to a DLL name.
  *
- * 古い形式の Delay-Import テーブルは、DLL 名を RVA ではなく **VA**（ImageBase 込みの
- * 絶対アドレス）で指す。本来は dlattrRva ビットで判別できる建前だが、実物には
- * フラグが当てにならない物がある。そこで「意図した解釈を先に試し、解決できなければ
- * もう一方の解釈（VA なら ImageBase を引いた値を RVA として）で再試行する」。
- * 片方しか実装しないと、静かに 0 件を返して検査が素通りする＝最悪の壊れ方になる。
+ * Old-format Delay-Import tables point to the DLL name by **VA** (an absolute address that
+ * includes ImageBase) instead of an RVA. In principle the dlattrRva bit tells them apart, but
+ * in real binaries the flag cannot always be trusted. So "try the intended interpretation first,
+ * and if it does not resolve, retry with the other interpretation (for a VA, the value minus
+ * ImageBase as an RVA)". Implementing only one silently returns zero entries and the check
+ * passes through = the worst way to break.
  */
 function resolveDllName(image, value, preferVa) {
   const candidates = preferVa ? [value - image.imageBase, value] : [value, value - image.imageBase];
@@ -158,7 +161,7 @@ function readImportNames(image) {
   for (let i = 0; i < MAX_IMPORT_DESCRIPTORS; i += 1) {
     const offset = base + i * IMPORT_DESCRIPTOR_SIZE;
     need(image.buf, offset, IMPORT_DESCRIPTOR_SIZE, 'import descriptor');
-    // 全フィールド 0 の記述子が終端。
+    // A descriptor with all fields 0 is the terminator.
     if (isZeroRange(image.buf, offset, IMPORT_DESCRIPTOR_SIZE)) return names;
 
     const nameRva = u32(image.buf, offset + 12);
@@ -194,8 +197,8 @@ function readDelayImportNames(image) {
       throw new PeError(`delay-import descriptor #${i} has a null DLL name address`);
     }
 
-    // dlattrRva が立っていなければ旧形式＝フィールドは VA。ただしフラグを鵜呑みにせず、
-    // 解決に失敗したら resolveDllName がもう一方の解釈で再試行する。
+    // Without dlattrRva it is the old format = the fields are VAs. But the flag is not taken at
+    // face value: if resolution fails, resolveDllName retries with the other interpretation.
     const preferVa = (attributes & DLATTR_RVA) === 0;
     const name = resolveDllName(image, nameField, preferVa);
     if (name === null) {
@@ -209,7 +212,7 @@ function readDelayImportNames(image) {
   throw new PeError(`delay-import table is not terminated within ${MAX_DELAY_DESCRIPTORS} entries`);
 }
 
-/** 画像 1 つ分のヘッダを読む（DOS → PE → COFF → optional header → セクション表）。 */
+/** Reads the headers of one image (DOS → PE → COFF → optional header → section table). */
 function parseImage(buf) {
   need(buf, 0, 0x40, 'DOS header');
   if (u16(buf, 0) !== 0x5a4d) throw new PeError('missing "MZ" signature (not a PE image)');
@@ -257,7 +260,7 @@ function parseImage(buf) {
     machine,
     imageBase,
     sections,
-    // 宣言数と実際に置かれている領域の小さい方だけを見る。
+    // Look only at the smaller of the declared count and the area actually present.
     numberOfRvaAndSizes: Math.min(declaredDirs, availableDirs),
     dataDirectoriesOffset: optional + dirsRelative,
   };
@@ -269,7 +272,7 @@ function describeMachine(machine) {
   return name === undefined ? `UNKNOWN (${hex})` : `${name} (${hex})`;
 }
 
-/** 同じ DLL を 2 回並べない（大小文字は無視。表示のためだけの整形）。 */
+/** Does not list the same DLL twice (case-insensitive; formatting for display only). */
 function dedupe(names) {
   const seen = new Set();
   const unique = [];
@@ -297,7 +300,7 @@ function printReport(image, imported, delayed) {
   printList('delayed DLLs (delay-import directory)', delayed);
 }
 
-/** 1 ファイルを検査する。失敗は例外で返し、呼び出し側が非 0 終了に変換する。 */
+/** Inspects one file. Failures are thrown; the caller turns them into a non-zero exit. */
 function inspect(file) {
   const buf = readFileSync(file);
   const image = parseImage(buf);
@@ -321,7 +324,7 @@ function main(argv) {
   };
 
   for (const file of argv) {
-    // 依存の一覧は、通っても落ちても必ず出す（何を見て判定したかがログに残るように）。
+    // Always print the dependency list, pass or fail (so the log shows what the verdict was based on).
     console.log(`== ${file}`);
     try {
       const { image, imported, delayed } = inspect(file);
@@ -340,8 +343,8 @@ function main(argv) {
         );
       }
       if (all.length === 0) {
-        // パースは通ったのに 1 件も読めなかった＝インポート表を読み違えている疑い。
-        // ここで通すと「常に合格する壊れた検査」になる。
+        // Parsing succeeded but not a single entry could be read = the import table is likely
+        // being misread. Passing here would make it "a broken check that always passes".
         fail(`${file}: parsed as PE but no DLL dependency could be read (refusing to pass)`);
       } else if (forbidden.length === 0 && unexpected.length === 0) {
         console.log('   OK: all dependencies are allowed');

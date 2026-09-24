@@ -1,9 +1,11 @@
-// 依存ポリシー: 許可集合へ足せるのは、Windows 自身が提供する根拠がある DLL だけ。
-// 根拠つきの一覧は tranext の build/check-win-pe-imports.mjs にある OS_RESOLVED_DLL_NAMES。
-// 報告を黙らせるために許可集合を広げない。禁止の柄は許可より強く、誤って許可集合へ
-// 足しても先に止める。
+// Dependency policy: only DLLs with evidence that Windows itself provides them may be added to
+// the allowed set. The list with evidence is OS_RESOLVED_DLL_NAMES in tranext's
+// build/check-win-pe-imports.mjs.
+// Do not widen the allowed set to silence a report. Forbidden patterns are stronger than the
+// allow list and stop a DLL first, even if it is mistakenly added to the allowed set.
 
-// 以下の英語の理由の文は tranext の build/check-win-pe-imports.mjs（2c6cf74）から逐語。
+// The English rationale sentences below are verbatim from tranext's
+// build/check-win-pe-imports.mjs (2c6cf74).
 // DLLs Windows itself always resolves: importing one of these is never a missing dependency.
 export const ALLOWED_DLL_NAMES = Object.freeze([
   // Win32 base + core COM/OLE: loaded into (or reachable from) every process.
@@ -26,19 +28,20 @@ export const ALLOWED_DLL_NAMES = Object.freeze([
 export const API_SET_NAME_PREFIX = 'api-ms-win-';
 
 /**
- * 禁止の柄。見つかったら非 0 で終了する。
+ * Forbidden patterns. Exits non-zero if one is found.
  *
- *  - msvcp / vcruntime / vcomp: MSVC のランタイム。静的 CRT で組んである前提なので、
- *    これが import に現れる＝配布先に VC++ 再頒布可能パッケージが要る状態。
- *  - directml / onnxruntime: 推論ランタイム。実行時に同梱/配置が要る＝自己完結でない。
+ *  - msvcp / vcruntime / vcomp: the MSVC runtime. The build assumes a static CRT, so this
+ *    appearing in the imports = the target machine needs the VC++ Redistributable.
+ *  - directml / onnxruntime: inference runtimes. They must be bundled/deployed at runtime =
+ *    not self-contained.
  *
- * 部分一致・大小文字無視で判定する（MSVCP140.dll / msvcp140.dll / MSVCP140_1.dll など）。
+ * Matched by substring, case-insensitively (MSVCP140.dll / msvcp140.dll / MSVCP140_1.dll, etc.).
  */
 export const FORBIDDEN_PATTERNS = ['msvcp', 'vcruntime', 'vcomp', 'directml', 'onnxruntime'];
 
 const ALLOWED_DLL_NAME_SET = new Set(ALLOWED_DLL_NAMES);
 
-/** 読み取った依存を禁止・未許可に分類する。禁止は未許可より優先する。 */
+/** Classifies the read dependencies as forbidden / not allowed. Forbidden takes precedence. */
 export function judgeDependencies(names) {
   const forbidden = [];
   const unexpected = [];

@@ -3,37 +3,38 @@ name = "flexaudio-napi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-# napi-build / napi-derive に加え、flexaudio-vad（tract-onnx 0.23.7）が rustc 1.91 を
-# 要求するので、workspace の 1.85 をここだけ上書きする。
+# Besides napi-build / napi-derive, flexaudio-vad (tract-onnx 0.23.7) requires rustc 1.91, so
+# the workspace's 1.85 is overridden here only.
 rust-version = "1.91"
 authors.workspace = true
 repository.workspace = true
 description = "Node.js (N-API) addon for flexaudio. Distributed via npm, not crates.io."
-# cdylib は crates.io ではライブラリとして消費できない（npm 配布）。
+# A cdylib cannot be consumed as a library from crates.io (distributed via npm).
 publish = false
 
-# Node.js (N-API) addon。TS/Electron アプリが flexaudio をインプロセスで叩く第二の
-# 経路（第一は CLI パイプ）。cdylib を .node にリネームして読み込む。
+# Node.js (N-API) addon. The second path for TS/Electron apps to call flexaudio in-process
+# (the first is the CLI pipe). The cdylib is renamed to .node and loaded.
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
 flexaudio = { path = "../flexaudio" }
 
-# アドオン 3 種を Node へ露出する。いずれも純 Rust（モデルは埋め込み）で、
-# 実行時のモデルファイルもネットワークも要らない。バージョンは workspace の各クレートに
-# 追従する（path 依存）。vad が rustc 1.91 を要求するのは上の rust-version で許容済み。
+# Exposes the three add-ons to Node. All are pure Rust (models embedded) and need neither
+# model files nor network at runtime. Versions follow each workspace crate (path
+# dependencies). vad requiring rustc 1.91 is already allowed by the rust-version above.
 flexaudio-vad = { path = "../flexaudio-vad" }
 flexaudio-encode = { path = "../flexaudio-encode" }
 flexaudio-denoise = { path = "../flexaudio-denoise" }
 
-# napi-rs 2.x 系の安定最新（2.16.17）。
-# - napi6: BigInt を JS へ渡すのに必要（AudioChunk.seq:u64 を BigInt 化する）。
-# - tokio_rt: ThreadsafeFunction を使う最小構成として有効化（napi の TSFN 経路で必要）。
-# runtime にネットワークは無い（napi は N-API ブリッジのみ。通信なし）。
+# Latest stable of the napi-rs 2.x line (2.16.17).
+# - napi6: needed to pass BigInt to JS (AudioChunk.seq: u64 becomes a BigInt).
+# - tokio_rt: enabled as the minimal setup for using ThreadsafeFunction (needed by napi's
+#   TSFN path).
+# No network at runtime (napi is only the N-API bridge; no communication).
 napi = { version = "2.16", default-features = false, features = ["napi6", "tokio_rt"] }
 napi-derive = "2.16"
 
 [build-dependencies]
-# build.rs で napi_build::setup() を呼ぶ（cdylib のシンボル設定等）。ビルド時のみ。
+# build.rs calls napi_build::setup() (cdylib symbol setup etc.). Build time only.
 napi-build = "2"

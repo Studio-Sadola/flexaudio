@@ -1,17 +1,18 @@
-// flexaudio-napi 実音 end-to-end 手動検証テスト（実機 / PipeWire セッション必須）。
+// flexaudio-napi manual end-to-end verification test with real audio (real hardware /
+// PipeWire session required).
 //
-// smoke.mjs が MockBackend で marshaling 経路を検証するのに対し、こちらは
-// 実際の音声デバイスから napi 経由でキャプチャできることを確かめる。CI 不可
-// （実音・再生プロセス・対応バックエンドが要る）＝手動実行用。
+// Whereas smoke.mjs verifies the marshaling path with MockBackend, this one checks that
+// capture works from a real audio device through napi. Not runnable in CI
+// (needs real audio, a playing process, and a supported backend) = for manual runs.
 //
-// 使い方（例。XDG_RUNTIME_DIR が要る環境では設定すること）:
-//   # 既知振幅のサインを鳴らすプロセスを用意（例: pw-cat にサインをパイプ）し PID を控える
-//   TARGET_PID=<pid> KIND=process node realtest.mjs   # 特定プロセス出力をキャプチャ
-//   KIND=system            node realtest.mjs           # システムループバック
-//   KIND=mic               node realtest.mjs           # マイク
+// Usage (examples; set XDG_RUNTIME_DIR in environments that need it):
+//   # Prepare a process playing a sine of known amplitude (e.g. pipe a sine into pw-cat) and note its PID
+//   TARGET_PID=<pid> KIND=process node realtest.mjs   # capture a specific process's output
+//   KIND=system            node realtest.mjs           # system loopback
+//   KIND=mic               node realtest.mjs           # microphone
 //
-// 期待: chunks>0・firstLen === firstFrames*channels・既知振幅の音源なら maxPeak が
-// その振幅に一致（例 0.3）・クリーン終了（ハング/ゾンビなし）。
+// Expected: chunks>0, firstLen === firstFrames*channels, maxPeak matching the amplitude for a
+// source of known amplitude (e.g. 0.3), clean exit (no hang/zombie).
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const flex = require('./flexaudio.node');
@@ -19,7 +20,7 @@ const flex = require('./flexaudio.node');
 const pid = parseInt(process.env.TARGET_PID, 10);
 const kind = process.env.KIND || 'process';
 if (kind === 'process' && !pid) {
-  console.error('process キャプチャには TARGET_PID=<pid> が必要');
+  console.error('process capture requires TARGET_PID=<pid>');
   process.exit(2);
 }
 

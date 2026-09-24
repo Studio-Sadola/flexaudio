@@ -1,15 +1,15 @@
-// N-API 0.3.0 契約: processes() と FlexStream.stop() は Promise。
-// 実音不要。前提は smoke.mjs と同じ（同じディレクトリの flexaudio.node）。
+// N-API 0.3.0 contract: processes() and FlexStream.stop() are Promises.
+// No real audio needed. Same prerequisites as smoke.mjs (flexaudio.node in the same directory).
 //
-// (a) processes() は Promise を返し、配列か型のあるエラーで終わる
-// (b) stop() の resolve より前に frames:0 の締めが届く。stop() の後に frames>0
-//     が来たならそれも resolve より前（来なければこの確かめは飛ばす）。
-//     resolve の後に onChunk は来ない。
-// (c) onChunk の中から stop() を呼んでも resolve まで行く（固まらない）
-// (d) stop() を 2 回呼んでも両方 resolve
-// (e) 既に止まった後の stop() は JS スレッドで即 resolve（P1 の経路 a）
-//     TSFN の Closing は mock では作れない（napi TSFN の Closing は
-//     環境＝Node 終了中の状態）。Stopped 後の即 resolve で代わる。
+// (a) processes() returns a Promise that ends with an array or a typed error
+// (b) the frames:0 terminator arrives before stop() resolves. If frames>0 arrives after
+//     stop(), it also comes before the resolve (this check is skipped if none arrives).
+//     No onChunk comes after the resolve.
+// (c) calling stop() from inside onChunk still reaches resolve (does not hang)
+// (d) calling stop() twice resolves both
+// (e) stop() after already stopped resolves immediately on the JS thread (P1 path a)
+//     TSFN Closing cannot be produced with the mock (napi TSFN Closing is an
+//     environment state = Node is exiting). The immediate resolve after Stopped stands in.
 
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -116,9 +116,9 @@ async function testStopTwice() {
 }
 
 async function testStopAfterAlreadyStoppedResolvesImmediately() {
-  // P1 経路 (a): phase が既に Stopped なら、TSFN 往復を待たず JS スレッドで
-  // resolve_undefined する。TSFN の Closing は mock では作れない（napi の
-  // Closing は Node 終了中の環境状態）。
+  // P1 path (a): if the phase is already Stopped, resolve_undefined runs on the JS thread
+  // without waiting for a TSFN round trip. TSFN Closing cannot be produced with the mock
+  // (napi's Closing is an environment state while Node is exiting).
   const stream = native.__openMockStream(48000, 2, 440.0, () => {});
   await new Promise((r) => setTimeout(r, 50));
   await withTimeout(stream.stop(), 5000, 'first stop()');
