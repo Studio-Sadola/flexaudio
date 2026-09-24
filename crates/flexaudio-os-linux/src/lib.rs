@@ -328,10 +328,11 @@ impl Drop for PwSystemBackend {
 ///
 /// Our own stream connects with `stream.connect(Direction::Input, None, ...)` but without
 /// `AUTOCONNECT` (preventing auto-linking to the microphone so only explicit links exist). This
-/// creates the input ports (input_FL/FR), and no data arrives until they are linked. Once the
-/// target output ports and our own input ports are all present,
+/// creates the input ports (input_FL/FR), and no data arrives until they are linked. As the
+/// target output ports and our own input ports appear,
 /// `core.create_object::<Link>("link-factory", ...)` with `LINK_OUTPUT_NODE/PORT` and
-/// `LINK_INPUT_NODE/PORT` creates the channel-matched links.
+/// `LINK_INPUT_NODE/PORT` creates the channel-matched links, re-planning them on each later
+/// port arrival so the plan is never fixed while ports are still arriving.
 ///
 /// # Handling `!Send`
 ///
@@ -344,8 +345,8 @@ impl Drop for PwSystemBackend {
 ///
 /// The target PID's node not existing yet / appearing later is the normal case. Once connected
 /// to the PipeWire daemon and the registry has been obtained, [`start`](CaptureBackend::start)
-/// is treated as successful and waits; the moment the target output ports and our own input
-/// ports are all present via the registry's `global`, it links them with link-factory. When
+/// is treated as successful and waits; as the target output ports and our own input ports
+/// arrive via the registry's `global`, it links them with link-factory. When
 /// `global_remove` detects that the target disappeared, it drops the links and waits again (it
 /// can relink idempotently). Only when the PipeWire daemon is absent or getting the registry
 /// fails does it return [`Error::Backend`] immediately (no panic).
@@ -464,7 +465,7 @@ impl CaptureBackend for PwProcessBackend {
             Ok(Ok(())) => {
                 // Setup succeeded (from connection through registry listener registration).
                 // From here the thread waits until the target PID appears, and creates the
-                // link-factory links once the output ports / own input ports are all present.
+                // link-factory links as the output ports / own input ports arrive.
                 self.stop_tx = Some(stop_tx);
                 self.handle = Some(handle);
                 Ok(())
@@ -525,8 +526,8 @@ impl Drop for PwProcessBackend {
 /// Creates, runs, and destroys `MainLoop`/`Context`/`Core`/`Registry`/`Stream` (all `!Send`)
 /// only inside this function. Reports setup completion/failure to the caller via `ready_tx`,
 /// and on success spins in `main_loop.run()` until the stop instruction ([`Terminate`]). It
-/// waits for the target PID's node in the registry, and creates the link-factory links once the
-/// target output ports and our own input ports are all present.
+/// waits for the target PID's node in the registry, and creates the link-factory links as the
+/// target output ports and our own input ports arrive.
 /// `select` switches between Include (record only the target PID) and Exclude (record everything
 /// but the target PID).
 fn run_pw_process_loop(
@@ -578,8 +579,8 @@ fn run_pw_process_loop(
 /// - `RegistryRc`: the registry proxy itself.
 /// - `Registry Listener`: global/global_remove listener (removed on drop).
 /// - `links`: map grouping the [`pw::link::Link`] proxies created by link-factory by the
-///   registry global id of the linked output node. Dropping them cuts the links, so they are
-///   kept alive on the loop thread. The registry callback inserts / removes / clears here, so it
+///   registry global id of the linked output node ([`NodeLinks`], keyed by port pair). Dropping
+///   them cuts the links, so they are kept alive on the loop thread. The registry callback inserts / removes / clears here, so it
 ///   is shared as `Rc<RefCell<…>>`. Include has at most 1 entry, Exclude has many (dropping the
 ///   whole map cuts every link).
 #[allow(clippy::type_complexity)]
@@ -588,7 +589,7 @@ struct ProcessKeep {
     _listener: pw::stream::StreamListener<UserData>,
     _registry: pw::registry::RegistryRc,
     _registry_listener: pw::registry::Listener,
-    _links: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, Vec<pw::link::Link>>>>,
+    _links: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, NodeLinks>>>,
     _core: pw::core::CoreRc,
 }
 
@@ -688,6 +689,43 @@ fn pair_ports(out_ports: &[(u32, String)], in_ports: &[(u32, String)]) -> Vec<(u
     pairs
 }
 
+/// Links one linked output node currently holds, keyed by the `(out_port_id, in_port_id)` pair
+/// each one connects. Dropping a [`pw::link::Link`] cuts that link.
+type NodeLinks = std::collections::HashMap<(u32, u32), pw::link::Link>;
+
+/// The difference between the links a node has and the links its current port plan wants
+/// ([`plan_link_changes`]).
+#[derive(Debug, PartialEq, Eq)]
+struct LinkChanges {
+    /// Pairs that are linked but no longer in the plan (cut them).
+    remove: Vec<(u32, u32)>,
+    /// Pairs that are in the plan but not linked yet (create them), in plan order.
+    add: Vec<(u32, u32)>,
+}
+
+/// Reconciles the pairs a node is linked with (`current`) against the pairs [`pair_ports`]
+/// wants now (`wanted`) (PipeWire-independent, arrival-order-independent).
+///
+/// Ports reach the registry one global at a time, so the first plan for a node can be partial:
+/// our own input may have only FL yet (FL→FL alone, FR never linked), or the target may have
+/// only FL yet (mono duplication FL→FL/FR). Re-planning on every arrival and applying only this
+/// difference converges on the full plan while leaving the links that are already right in
+/// place (no gap in the audio).
+fn plan_link_changes(current: &[(u32, u32)], wanted: &[(u32, u32)]) -> LinkChanges {
+    let mut remove: Vec<(u32, u32)> = current
+        .iter()
+        .filter(|pair| !wanted.contains(pair))
+        .copied()
+        .collect();
+    remove.sort_unstable();
+    let add = wanted
+        .iter()
+        .filter(|pair| !current.contains(pair))
+        .copied()
+        .collect();
+    LinkChanges { remove, add }
+}
+
 /// Resolves a node's PID (PipeWire-independent, arrival-order-independent).
 ///
 /// If the node itself has a PID, uses it; otherwise looks up the owning Client via `client.id`
@@ -756,11 +794,13 @@ impl PidSelect {
 /// - The `select` ([`PidSelect`]) predicate decides which nodes to link. Include: the one
 ///   Stream/Output/Audio node belonging to the target PID; Exclude: every Stream/Output/Audio
 ///   node with a resolved PID other than the excluded PID (nodes with an unresolved PID are
-///   deferred until their Client arrives). Once each target node's output ports and our own
-///   node's input ports are all present, the registry callback (running on the loop thread)
-///   creates channel-matched links ([`pair_ports`]: FL→FL/FR→FR, mono duplicated) with
-///   `core.create_object::<pw::link::Link>("link-factory", ...)`. Links are kept per node in
-///   the `linked` (node_id → Links) map.
+///   deferred until their Client arrives). Once a target node has an output port and our own
+///   node has an input port, the registry callback (running on the loop thread) creates
+///   channel-matched links ([`pair_ports`]: FL→FL/FR→FR, mono duplicated) with
+///   `core.create_object::<pw::link::Link>("link-factory", ...)`. Ports arrive one global at a
+///   time, so every later arrival re-plans the linked nodes too and applies only the difference
+///   ([`plan_link_changes`]); a first plan made from part of the ports is never latched. Links
+///   are kept per node in the `linked` (node_id → [`NodeLinks`]) map.
 /// - When `global_remove` detects that an individually linked node / its output port
 ///   disappeared, only that node's entry is dropped (under Exclude, the other nodes' links are
 ///   kept); when our own node / own input port / the target Client disappears, all entries are
@@ -865,19 +905,20 @@ fn setup_pw_process(
     // proxies created for that node. Dropping them cuts the links, so they are kept for the
     // whole run. Include has at most 1 entry, Exclude has many. Links can be cut individually by
     // removing an entry, or all at once by clearing the map.
-    let linked: Rc<RefCell<HashMap<u32, Vec<pw::link::Link>>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+    let linked: Rc<RefCell<HashMap<u32, NodeLinks>>> = Rc::new(RefCell::new(HashMap::new()));
 
-    // Each time the state is updated, re-evaluate the not-yet-linked nodes among the output nodes
-    // that should be linked, and if the target output ports and our own input ports are all
-    // present, create channel-matched links with link-factory.
+    // Each time the state is updated, re-plan the output nodes that should be linked and bring
+    // each one's links in line with the plan: channel-matched links from the output ports and
+    // our own input ports present right now, created with link-factory.
     // The `select` predicate decides the set of target nodes:
-    // - Include(pid): nodes whose resolved PID == pid (only one representative node; if
-    //   `linked` is already non-empty, does nothing, i.e. stays a single node).
+    // - Include(pid): nodes whose resolved PID == pid (only one representative node; once one
+    //   is linked, only that node is re-planned, i.e. it stays a single node).
     // - Exclude(pid): every `Stream/Output/Audio` node whose resolved PID != pid. Nodes whose PID
     //   is unresolved (None) are not linked yet (wait until the Client arrives and resolves the
     //   PID, so the excluded process is never mistaken).
-    // Nodes already present as keys of `linked` are never double-linked.
+    // A node that is already linked is re-planned rather than linked again: only the difference
+    // from its current links is applied ([`plan_link_changes`]), so a plan made while ports were
+    // still arriving grows into the full one and a pair is never linked twice.
     // Called on the loop thread (the `!Send` core/stream may be touched).
     #[allow(clippy::too_many_arguments)]
     fn try_link(
@@ -888,15 +929,8 @@ fn setup_pw_process(
         nodes: &RefCell<HashMap<u32, NodeEntry>>,
         client_pid: &RefCell<HashMap<u32, u32>>,
         ports: &RefCell<HashMap<u32, PortEntry>>,
-        linked: &RefCell<HashMap<u32, Vec<pw::link::Link>>>,
+        linked: &RefCell<HashMap<u32, NodeLinks>>,
     ) {
-        // Include uses only one representative node. If already linked, do nothing.
-        if let PidSelect::Include(_) = select {
-            if !linked.borrow().is_empty() {
-                return;
-            }
-        }
-
         // Re-read our own node id from the stream (it may be unset right after connect).
         // When unset, SPA_ID_INVALID(=ID_ANY=u32::MAX) or 0 is returned.
         let sid = stream.node_id();
@@ -907,29 +941,26 @@ fn setup_pw_process(
             return;
         };
 
-        // Decide the set of output node ids to link with the predicate.
-        // - Include: exactly one node whose resolved PID == pid.
-        // - Exclude: every node with a resolved PID (!= pid) (unresolved PIDs excluded).
+        // Decide the set of output node ids to plan with the predicate.
+        // - Include: exactly one node — the linked one if there is one, otherwise one whose
+        //   resolved PID == pid.
+        // - Exclude: every node with a resolved PID (!= pid) (unresolved PIDs excluded), linked
+        //   or not.
         let targets: Vec<u32> = {
             let nodes = nodes.borrow();
             let client_pid = client_pid.borrow();
             let linked = linked.borrow();
             match select {
+                PidSelect::Include(_) if !linked.is_empty() => linked.keys().copied().collect(),
                 PidSelect::Include(pid) => nodes
                     .iter()
-                    .find(|(id, entry)| {
-                        !linked.contains_key(id)
-                            && resolve_node_pid(entry, &client_pid) == Some(pid)
-                    })
+                    .find(|(_id, entry)| resolve_node_pid(entry, &client_pid) == Some(pid))
                     .map(|(&node_id, _)| node_id)
                     .into_iter()
                     .collect(),
                 PidSelect::Exclude(pid) => nodes
                     .iter()
-                    .filter(|(id, entry)| {
-                        if linked.contains_key(id) {
-                            return false;
-                        }
+                    .filter(|(_id, entry)| {
                         // Target only when resolved and not the excluded PID. Unresolved (None)
                         // is deferred until the Client arrives (never mistake the excluded
                         // process).
@@ -979,11 +1010,25 @@ fn setup_pw_process(
             if pairs.is_empty() {
                 continue;
             }
-            let want = pairs.len();
 
-            // Link each pair with link-factory.
-            let mut created: Vec<pw::link::Link> = Vec::with_capacity(want);
-            for (out_port_id, in_port_id) in pairs {
+            // Take this node's current links out of the map (empty if not linked yet), so no
+            // borrow of `linked` is held while creating links.
+            let mut node_links = linked
+                .borrow_mut()
+                .remove(&target_node_id)
+                .unwrap_or_default();
+            let current: Vec<(u32, u32)> = node_links.keys().copied().collect();
+            let changes = plan_link_changes(&current, &pairs);
+
+            // Cut the links the plan no longer wants (e.g. a mono duplication FL→FR made before
+            // the target's FR port appeared).
+            for pair in &changes.remove {
+                node_links.remove(pair);
+            }
+
+            // Link each missing pair with link-factory.
+            let mut all_created = true;
+            for &(out_port_id, in_port_id) in &changes.add {
                 let link_props = properties! {
                     *pw::keys::LINK_OUTPUT_NODE => target_node_id.to_string(),
                     *pw::keys::LINK_OUTPUT_PORT => out_port_id.to_string(),
@@ -991,28 +1036,26 @@ fn setup_pw_process(
                     *pw::keys::LINK_INPUT_PORT => in_port_id.to_string(),
                 };
                 match core.create_object::<pw::link::Link>("link-factory", &link_props) {
-                    Ok(link) => created.push(link),
+                    Ok(link) => {
+                        node_links.insert((out_port_id, in_port_id), link);
+                    }
                     Err(_e) => {
                         // Creating this pair's link failed. Skip the rest to avoid a partial link.
+                        all_created = false;
                         break;
                     }
                 }
             }
 
-            // Treat the link as established only when every pair was created. Treating a partial
-            // link where only one channel succeeded (e.g. FL connected, FR dropped) as
-            // established would effectively lock the target to mono. If not all pairs are in
-            // place, drop the Links created here, leave this node unlinked, and re-evaluate on the
-            // next global arrival (this retries when the remaining ports appear later / a link
-            // dropped temporarily). Processing of the other target nodes continues.
-            if created.len() != want {
-                // Drop created so no links remain (never settle on a partial link).
-                drop(created);
-                continue;
+            // Keep the node linked only when its links match the whole plan. Keeping a partial
+            // link where only one channel succeeded (e.g. FL connected, FR dropped) would
+            // effectively lock the target to mono. If a pair failed, drop every Link of this
+            // node (node_links goes out of scope), leave it unlinked, and re-evaluate on the next
+            // global arrival (this retries when a link dropped temporarily). Processing of the
+            // other target nodes continues.
+            if all_created {
+                linked.borrow_mut().insert(target_node_id, node_links);
             }
-
-            // All pairs established. Keep the Link proxies per node.
-            linked.borrow_mut().insert(target_node_id, created);
         }
     }
 
@@ -2754,6 +2797,81 @@ mod tests {
             vec![(70, 80)],
             "a single output port is duplicated to the remaining inputs"
         );
+    }
+
+    /// `(port_id, channel)` ports of one side, as [`pair_ports`] takes them.
+    type Ports = Vec<(u32, String)>;
+
+    /// Replays one arrival order of ports (each step: the target's output ports and our own
+    /// input ports present at that moment) through the same re-planning `try_link` does
+    /// ([`pair_ports`] → [`plan_link_changes`] → apply) and returns the settled pairs.
+    fn replay_arrivals(steps: &[(Ports, Ports)]) -> Vec<(u32, u32)> {
+        let mut linked: Vec<(u32, u32)> = Vec::new();
+        for (out, inp) in steps {
+            let changes = plan_link_changes(&linked, &pair_ports(out, inp));
+            linked.retain(|pair| !changes.remove.contains(pair));
+            linked.extend(changes.add);
+        }
+        linked.sort_unstable();
+        linked
+    }
+
+    #[test]
+    fn plan_link_changes_reports_only_the_difference() {
+        // Already matching: nothing to do.
+        let changes = plan_link_changes(&[(10, 20), (11, 21)], &[(11, 21), (10, 20)]);
+        assert!(changes.remove.is_empty() && changes.add.is_empty());
+
+        // Not linked yet: every wanted pair is added, in plan order.
+        let changes = plan_link_changes(&[], &[(10, 20), (11, 21)]);
+        assert_eq!(changes.add, vec![(10, 20), (11, 21)]);
+        assert!(changes.remove.is_empty());
+
+        // A pair the plan no longer wants is removed, and the kept one is not recreated.
+        let changes = plan_link_changes(&[(10, 20), (10, 21)], &[(10, 20), (11, 21)]);
+        assert_eq!(changes.remove, vec![(10, 21)]);
+        assert_eq!(changes.add, vec![(11, 21)]);
+    }
+
+    #[test]
+    fn late_own_input_port_is_linked_instead_of_leaving_fr_silent() {
+        // Our own input_FR arrives after the first plan was made from input_FL alone. Linking
+        // FL→FL and latching it left FR silent (stereo at half level, measured on PipeWire).
+        let out = vec![(10u32, "FL".to_string()), (11u32, "FR".to_string())];
+        let settled = replay_arrivals(&[
+            (out.clone(), vec![(20u32, "FL".to_string())]),
+            (
+                out,
+                vec![(20u32, "FL".to_string()), (21u32, "FR".to_string())],
+            ),
+        ]);
+        assert_eq!(settled, vec![(10, 20), (11, 21)], "FL→FL / FR→FR");
+    }
+
+    #[test]
+    fn late_target_output_port_replaces_the_mono_duplication() {
+        // The target's output_FR arrives after the first plan was made from output_FL alone,
+        // which duplicated FL to both inputs as if it were mono. The duplication FL→FR is cut
+        // and FR→FR takes its place.
+        let inp = vec![(20u32, "FL".to_string()), (21u32, "FR".to_string())];
+        let settled = replay_arrivals(&[
+            (vec![(10u32, "FL".to_string())], inp.clone()),
+            (
+                vec![(10u32, "FL".to_string()), (11u32, "FR".to_string())],
+                inp,
+            ),
+        ]);
+        assert_eq!(settled, vec![(10, 20), (11, 21)], "FL→FL / FR→FR");
+    }
+
+    #[test]
+    fn a_real_mono_target_stays_duplicated() {
+        // A target that only ever has one output port keeps the mono duplication.
+        let settled = replay_arrivals(&[(
+            vec![(30u32, "MONO".to_string())],
+            vec![(40u32, "FL".to_string()), (41u32, "FR".to_string())],
+        )]);
+        assert_eq!(settled, vec![(30, 40), (30, 41)]);
     }
 
     /// Smoke test: in a headless environment where PipeWire is absent / getting the registry

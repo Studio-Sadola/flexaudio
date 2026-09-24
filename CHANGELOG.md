@@ -75,6 +75,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not block synchronously inside `onChunk`, or terminator delivery and
   `stop()` resolution can stall.
 
+### Fixed
+- **Linux per-process / exclude-self capture lost a stereo channel.** Ports
+  reach the PipeWire registry one at a time, and the first link plan for a
+  node was latched even when it was made from part of the ports. Depending on
+  the arrival order, the right channel was either silent (our own `input_FR`
+  arrived after `FL→FL` was linked) or a copy of the left (the target's
+  `output_FR` arrived after `FL` had been duplicated to both inputs as if it
+  were mono). Linked nodes are now re-planned on every port arrival and only
+  the difference is applied, so the links converge on `FL→FL` / `FR→FR`
+  without cutting the ones already right. Reproduced and verified on
+  PipeWire 1.0.5 with `pw-play`, in `include`, `exclude` and `--exclude-self`
+  capture.
+
 ### Migration from 0.2
 - **Rust `StreamConfig` literals:** the struct gained `secondary_output`. A
   literal that lists every field without `..Default::default()` no longer
