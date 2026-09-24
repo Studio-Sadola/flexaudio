@@ -1,27 +1,29 @@
-//! 録れるプロセスの列挙（[`list_processes`]）— PipeWire レジストリから。
+//! Enumeration of capturable processes ([`list_processes`]), from the PipeWire registry.
 //!
-//! 短命の `MainLoop` を 1 本回してレジストリを 1 往復ぶん読み、
-//! - Client global → `pipewire.sec.pid`（デーモンがソケット資格情報から付与＝詐称不可）と
-//!   `application.name`
-//! - `media.class == "Stream/Output/Audio"` の Node global → `client.id` と
-//!   `application.name`（Node を bind して状態 Running/Idle も受ける）
+//! Runs one short-lived `MainLoop`, reads one registry round trip, and collects
+//! - Client globals → `pipewire.sec.pid` (set by the daemon from the socket credentials, so it
+//!   cannot be spoofed) and `application.name`
+//! - Node globals with `media.class == "Stream/Output/Audio"` → `client.id` and
+//!   `application.name` (the Node is bound so that its Running/Idle state is received too)
 //!
-//! を集める。PID の解決はプロセス別キャプチャ（[`PwProcessBackend`](crate::PwProcessBackend)）
-//! と同じ [`resolve_node_pid`](crate::resolve_node_pid)（node → client.id → Client の PID）
-//! を使うので、ここに出た PID はそのまま `target_pid` に渡して録れる。
+//! PID resolution uses the same [`resolve_node_pid`](crate::resolve_node_pid) (node → client.id
+//! → the Client's PID) as per-process capture ([`PwProcessBackend`](crate::PwProcessBackend)),
+//! so any PID listed here can be passed as-is to `target_pid` and captured.
 //!
-//! 実行ファイル名は PipeWire の自己申告でなくカーネルの `/proc/<pid>/exe`
-//! （読めなければ `/proc/<pid>/comm`）から取る。
+//! The executable name comes from the kernel's `/proc/<pid>/exe` (or `/proc/<pid>/comm` if that
+//! is unreadable), not from PipeWire's self-reported properties.
 //!
-//! # 上限時間
-//! 接続（`connect`）からレジストリ往復まで同じ期限（[`LIST_DEADLINE`]）の内側。
-//! 応答が無くても必ず戻る。期限切れでも出力ノードが 1 件でも集まっていればその分を
-//! `Ok` で返す（出力中か分からないものは `None`）。期限切れで出力ノードが 0 件なら
-//! `Err`（Client だけ集まった空リストを「使えるが今は無い」にしない）。期限内に完了して
-//! 本当に 0 件なら `Ok([])`。
+//! # Time limit
+//! Everything from the connection (`connect`) to the registry round trip is inside the same
+//! deadline ([`LIST_DEADLINE`]). It always returns even without a response. If the deadline
+//! expires but at least one output node has been collected, those are returned as `Ok` (with
+//! `None` for nodes whose output activity is unknown). If the deadline expires with zero output
+//! nodes, it returns `Err` (an empty list with only Clients collected is not reported as "usable
+//! but nothing right now"). If it completes within the deadline with genuinely zero nodes, it
+//! returns `Ok([])`.
 //!
-//! 返すのは生リスト（同じ PID のノードが複数あれば重複する）で、重複統合・自プロセス
-//! 除外・並べ替えは facade が行う。
+//! It returns the raw list (duplicated if several nodes share a PID); deduplication, own-process
+//! exclusion, and sorting are done by the facade.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -36,50 +38,54 @@ use pipewire as pw;
 
 use crate::{pw_init_once, resolve_node_pid, NodeEntry};
 
-/// 接続＋レジストリ往復の期限。これを過ぎても集めた分があれば `Ok`、空なら `Err`。
+/// Deadline for connect + registry round trip. Past it, whatever was collected is `Ok`; empty is
+/// `Err`.
 const LIST_DEADLINE: Duration = Duration::from_millis(2_000);
 
-/// プロセス別キャプチャがリンク対象にするアプリ出力ノードの `media.class`。
+/// `media.class` of the app output nodes that per-process capture links to.
 const OUTPUT_STREAM_CLASS: &str = "Stream/Output/Audio";
 
-/// レジストリから集めたアプリ出力ノード 1 件。
+/// One app output node collected from the registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OutputNode {
-    /// PID 解決用（プロセス別キャプチャと同じ形）。
+    /// For PID resolution (same shape as per-process capture).
     entry: NodeEntry,
-    /// ノードの `application.name`（アプリの自己申告・表示用）。
+    /// The node's `application.name` (self-reported by the app; for display).
     app_name: Option<String>,
-    /// ノード状態が Running か（bind したノードの info が届いたときだけ `Some`）。
+    /// Whether the node state is Running (`Some` only once the bound node's info has arrived).
     running: Option<bool>,
 }
 
-/// レジストリ 1 往復ぶんの収集結果（PipeWire 非依存・テストで組み立てられる）。
+/// Result of one registry round trip (PipeWire-independent; tests can build it by hand).
 #[derive(Debug, Default)]
 struct RegistrySnapshot {
-    /// Client global id → その Client の `pipewire.sec.pid`。
+    /// Client global id → that Client's `pipewire.sec.pid`.
     client_pid: HashMap<u32, u32>,
-    /// Client global id → その Client の `application.name`。
+    /// Client global id → that Client's `application.name`.
     client_name: HashMap<u32, String>,
-    /// Node global id → アプリ出力ノード。
+    /// Node global id → app output node.
     nodes: HashMap<u32, OutputNode>,
 }
 
-/// 音声出力ストリーム（`Stream/Output/Audio`）を持つプロセスを列挙する（生リスト）。
+/// Lists processes that have an audio output stream (`Stream/Output/Audio`) (raw list).
 ///
-/// PipeWire に接続できない（デーモン不在・`XDG_RUNTIME_DIR` 未設定など）ときや、
-/// 期限内に出力ノードが 1 件も集まらなかったときは [`Error::Backend`]。期限切れでも
-/// 出力ノードが 1 件でもあればその分を `Ok` で返す（出力中か分からないものは `None`）。
-/// 期限内に完了して本当に 0 件なら `Ok([])`。プロセス別キャプチャも同じ環境では
-/// 使えないので、空の `Err` は「この環境ではプロセス別キャプチャ不可」の合図になる。
+/// Returns [`Error::Backend`] when PipeWire is unreachable (no daemon, `XDG_RUNTIME_DIR` unset,
+/// etc.) or when no output node was collected within the deadline. If the deadline expires but
+/// at least one output node exists, those are returned as `Ok` (with `None` for nodes whose
+/// output activity is unknown). If it completes within the deadline with genuinely zero nodes,
+/// it returns `Ok([])`. Per-process capture is also unavailable in the same environments, so an
+/// empty `Err` signals "per-process capture is not possible in this environment".
 pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     let snapshot = collect_snapshot().map_err(Error::Backend)?;
     Ok(build_process_list(&snapshot, read_executable))
 }
 
-/// 収集結果を [`ProcessInfo`] の生リストへ写す。PID を解決できないノードは飛ばす。
+/// Maps the collected result to a raw list of [`ProcessInfo`]. Nodes whose PID cannot be
+/// resolved are skipped.
 ///
-/// 表示名はノードの `application.name` → Client の `application.name` の順（どちらも
-/// 無ければ空。facade が実行ファイル名などで補う）。並びはノード id 順で決定的。
+/// The display name is the node's `application.name`, then the Client's `application.name`
+/// (empty if neither exists; the facade fills it in from the executable name etc.). The order is
+/// deterministic, by node id.
 fn build_process_list(
     snapshot: &RegistrySnapshot,
     executable_of: impl Fn(u32) -> Option<String>,
@@ -108,8 +114,8 @@ fn build_process_list(
     out
 }
 
-/// `/proc/<pid>/exe` のベース名（置き換え済みバイナリの ` (deleted)` は落とす）。
-/// 読めなければ（他ユーザーのプロセス等）`/proc/<pid>/comm`。どちらも駄目なら `None`。
+/// Base name of `/proc/<pid>/exe` (the ` (deleted)` suffix of a replaced binary is dropped).
+/// If unreadable (another user's process, etc.), `/proc/<pid>/comm`. `None` if both fail.
 fn read_executable(pid: u32) -> Option<String> {
     let from_exe = std::fs::read_link(format!("/proc/{pid}/exe"))
         .ok()
@@ -122,13 +128,13 @@ fn read_executable(pid: u32) -> Option<String> {
     })
 }
 
-/// `/proc/<pid>/exe` のリンク先からベース名を取る。
+/// Takes the base name from the `/proc/<pid>/exe` link target.
 fn clean_exe_path(path: &str) -> Option<String> {
     let path = path.strip_suffix(" (deleted)").unwrap_or(path);
     executable_basename(path)
 }
 
-/// 空でない props 値だけを `String` にする。
+/// Converts a props value to `String` only if it is non-empty.
 fn non_empty(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -136,13 +142,14 @@ fn non_empty(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// PipeWire レジストリを 1 往復ぶん読む本体。失敗は `Err(String)`（panic しない）。
+/// The core that reads one PipeWire registry round trip. Failures are `Err(String)` (no panic).
 ///
-/// `MainLoop`/`Context`/`Core`/`Registry`/`Node` プロキシ（いずれも `!Send`）は
-/// この関数内だけで生成・実行・破棄する。facade が専用スレッドから呼ぶ。
+/// The `MainLoop`/`Context`/`Core`/`Registry`/`Node` proxies (all `!Send`) are created, run, and
+/// destroyed only inside this function. The facade calls it from a dedicated thread.
 ///
-/// 完了は `enumerate_pw` と同じ二段 sync→done バリアで待つ（1 段目で global が出揃い、
-/// 2 段目で bind したノードの info＝状態が届く）。加えて期限タイマーでループを必ず抜ける。
+/// Completion is awaited with the same two-stage sync→done barrier as `enumerate_pw` (stage 1:
+/// all globals have arrived; stage 2: the bound nodes' info, i.e. their state, has arrived). In
+/// addition, a deadline timer guarantees the loop exits.
 fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
     pw_init_once();
     let started = std::time::Instant::now();
@@ -151,9 +158,9 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
         .map_err(|e| format!("create pipewire main loop failed: {e}"))?;
     let context = pw::context::ContextRc::new(&main_loop, None)
         .map_err(|e| format!("create pipewire context failed: {e}"))?;
-    // 接続も期限の内側。connect 自体は中断できないので、戻ってきた時点で期限を過ぎて
-    // いればレジストリ待ちに入らず打ち切る。ハングした場合は facade の 3 秒上限
-    // （single-flight）が呼び出し側を解放する。
+    // The connection is also inside the deadline. connect itself cannot be interrupted, so if
+    // the deadline has passed when it returns, give up without waiting on the registry. If it
+    // hangs, the facade's 3-second limit (single-flight) releases the caller.
     let core = context
         .connect_rc(None)
         .map_err(|e| format!("connect to pipewire daemon failed (is PipeWire running?): {e}"))?;
@@ -168,7 +175,8 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
         .map_err(|e| format!("get pipewire registry failed: {e}"))?;
 
     let snapshot = Rc::new(RefCell::new(RegistrySnapshot::default()));
-    // bind したノードのプロキシとリスナの保管庫（drop すると info の購読が切れる）。
+    // Storage for the bound nodes' proxies and listeners (dropping them ends the info
+    // subscription).
     type BoundNode = (pw::node::Node, pw::node::NodeListener);
     let bound_nodes: Rc<RefCell<Vec<BoundNode>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -178,7 +186,7 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
     let _registry_listener = registry
         .add_listener_local()
         .global(move |global| {
-            // FFI 越えの panic は UB なので本体を catch_unwind で包む。
+            // A panic across FFI is UB, so wrap the body in catch_unwind.
             let _ = catch_unwind(AssertUnwindSafe(|| {
                 let Some(props) = global.props else {
                     return;
@@ -218,8 +226,9 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                             },
                         );
 
-                        // 状態（Running/Idle/Suspended）は global props に無いので、ノードを
-                        // bind して info を受ける。bind できなくても列挙自体は続ける（不明扱い）。
+                        // The state (Running/Idle/Suspended) is not in the global props, so bind
+                        // the node and receive its info. Enumeration continues even if bind fails
+                        // (treated as unknown).
                         let node: pw::node::Node = match registry_for_global.bind(global) {
                             Ok(node) => node,
                             Err(_) => return,
@@ -229,8 +238,8 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                         let listener = node
                             .add_listener_local()
                             .info(move |info| {
-                                // info コールバックも FFI 越え。state() は不正な UTF-8 の
-                                // エラー文字列で panic し得るので必ず包む。
+                                // The info callback also crosses FFI. state() can panic on an
+                                // error string with invalid UTF-8, so always wrap it.
                                 let _ = catch_unwind(AssertUnwindSafe(|| {
                                     let running =
                                         matches!(info.state(), pw::node::NodeState::Running);
@@ -250,7 +259,7 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
         })
         .register();
 
-    // 二段 sync→done バリア（enumerate_pw と同じ）。
+    // Two-stage sync→done barrier (same as enumerate_pw).
     let done = Rc::new(Cell::new(false));
     let stage = Rc::new(Cell::new(0u8));
     let pending = core
@@ -272,13 +281,14 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
             let seq = seq.seq();
             match stage_for_cb.get() {
                 0 if seq == pending_for_cb.get() => {
-                    // 1 段目完了（global が出揃った）→ bind したノードの info を待つ 2 段目。
+                    // Stage 1 done (all globals arrived) → stage 2 waits for the bound nodes' info.
                     stage_for_cb.set(1);
                     let second = core_weak.upgrade().map(|core| core.sync(0));
                     match second {
                         Some(Ok(p)) => pending_for_cb.set(p.seq()),
                         _ => {
-                            // 2 段目を打てない: 状態は不明のまま、集めた分で終える。
+                            // Cannot issue stage 2: finish with what was collected, leaving the
+                            // state unknown.
                             done_for_cb.set(true);
                             loop_for_cb.quit();
                         }
@@ -293,8 +303,8 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
         })
         .register();
 
-    // 期限タイマー。接続に使った分を引いた残り時間。レジストリが応答しなくても
-    // ループを必ず抜ける。タイマーは run() 中ずっと生存させる。
+    // Deadline timer, set to the time remaining after the connection. Guarantees the loop exits
+    // even if the registry does not respond. The timer stays alive for the whole run().
     let remaining = LIST_DEADLINE.saturating_sub(started.elapsed());
     let timed_out = Rc::new(Cell::new(remaining.is_zero()));
     let _deadline = if remaining.is_zero() {
@@ -320,9 +330,10 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
     finish_snapshot(done.get(), snapshot.take())
 }
 
-/// レジストリ収集の締め。`complete` は PipeWire の done が期限内に来たとき true。
-/// 期限切れで出力ノード 0 件なら Err（Client だけ集まった空リストを「使えるが今は無い」
-/// の `Ok([])` にしない）。期限内に完了して本当に 0 件なら `Ok` の空スナップショット。
+/// Finalizes registry collection. `complete` is true when PipeWire's done arrived within the
+/// deadline. If the deadline expired with zero output nodes, returns Err (an empty list with only
+/// Clients collected is not reported as the "usable but nothing right now" `Ok([])`). If it
+/// completed within the deadline with genuinely zero nodes, returns an empty snapshot as `Ok`.
 fn finish_snapshot(
     complete: bool,
     collected: RegistrySnapshot,
@@ -357,7 +368,7 @@ mod tests {
         snap.client_pid.insert(40, 1234);
         snap.client_name.insert(40, "Firefox".into());
         snap.client_pid.insert(41, 5678);
-        // client 40 のノード（ノード名あり・Running）。
+        // Node of client 40 (has a node name, Running).
         snap.nodes.insert(
             100,
             OutputNode {
@@ -365,12 +376,12 @@ mod tests {
                 ..node(Some(40), None, Some("Firefox Audio"))
             },
         );
-        // client 41 のノード（名前はノードに無く Client にも無い）。
+        // Node of client 41 (no name on the node nor on the Client).
         snap.nodes.insert(101, node(Some(41), None, None));
-        // ノード自身に PID が載る構成（Client 不要）。
+        // Setup where the node itself carries the PID (no Client needed).
         snap.nodes
             .insert(102, node(None, Some(999), Some("direct")));
-        // PID を解決できないノード（Client 不明）は飛ばす。
+        // A node whose PID cannot be resolved (unknown Client) is skipped.
         snap.nodes.insert(103, node(Some(77), None, Some("orphan")));
 
         let list = build_process_list(&snap, |pid| Some(format!("exe-{pid}")));
@@ -452,7 +463,8 @@ mod tests {
         assert!(!exe.is_empty());
     }
 
-    /// PipeWire の有無にかかわらず panic せず、`Ok` か `Err(Backend)` のどちらかで戻る。
+    /// Never panics regardless of whether PipeWire is present; returns either `Ok` or
+    /// `Err(Backend)`.
     #[test]
     fn list_processes_is_graceful() {
         let started = std::time::Instant::now();
