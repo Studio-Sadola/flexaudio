@@ -134,6 +134,39 @@ jobs:
       - name: N-API smoke / dual / async-api (mock only)
         run: bash crates/flexaudio-napi/__test__/run-smoke.sh
 
+  smoke-linux-pipewire:
+    name: Self-exclusion smoke (Linux / real PipeWire)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install PipeWire (dev headers + a runnable session)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev \
+            pipewire pipewire-pulse pipewire-bin wireplumber pulseaudio-utils dbus dbus-x11
+      - name: Start a headless PipeWire session
+        run: |
+          export XDG_RUNTIME_DIR=/tmp/xdg-smoke
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          eval "$(dbus-launch --sh-syntax)"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+          pipewire & sleep 1
+          wireplumber & sleep 1
+          pipewire-pulse & sleep 1
+          pw-cli info 0
+      - name: Build the addon
+        run: |
+          cargo build -p flexaudio-napi --release
+          cp target/release/libflexaudio_napi.so crates/flexaudio-napi/__test__/flexaudio.node
+      - name: Self-exclusion smoke test
+        run: node crates/flexaudio-napi/__test__/exclude-smoke.mjs
+
   msrv:
     name: MSRV 1.85 (all crates declaring 1.85)
     runs-on: ubuntu-latest

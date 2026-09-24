@@ -193,6 +193,13 @@ export interface OpenOptions {
    * Linux / Windows / macOS の 3 OS とも対応。
    */
   excludeSelf?: boolean
+  /**
+   * Pids whose playback is excluded from a `system` capture (also the system
+   * side of `mix`), in addition to `excludeSelf`. An Electron host passes its
+   * whole process tree (`app.getAppMetrics()` pids). Ignored by mic/process.
+   * Windows honours one process tree: `excludeSelf` wins, else the first pid.
+   */
+  excludePids?: Array<number>
   /** 既定 48000 */
   outputRate?: number
   /** 既定 2 */

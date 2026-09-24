@@ -208,9 +208,11 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
         // システム出力ループバックは Linux / Windows / macOS 対応。
         // exclude_self（自ホスト除外）と device_id（出力エンドポイント選択）を backend へ
         // 渡す。mode は見ない。device_id=None で既定出力。
-        SourceKind::SystemLoopback => {
-            build_system_backend(config.exclude_self, config.device_id.clone())?
-        }
+        SourceKind::SystemLoopback => build_system_backend(
+            config.exclude_self,
+            config.exclude_pids.clone(),
+            config.device_id.clone(),
+        )?,
 
         // プロセス出力ループバックは Linux / Windows / macOS 対応・target_pid 必須。
         // mode（Include/Exclude）を backend へ渡す。exclude_self は見ない。
@@ -262,8 +264,11 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
             ));
             // exclude_self は Mix では system 側に適用する（フィードバック防止の意図は
             // system 単独と同じ）。非対応 OS はここで Unsupported になる。
-            let system =
-                build_system_backend(config.exclude_self, config.mix_system_device_id.clone())?;
+            let system = build_system_backend(
+                config.exclude_self,
+                config.exclude_pids.clone(),
+                config.mix_system_device_id.clone(),
+            )?;
             Box::new(mix::CompositeBackend::new(
                 mic,
                 system,
@@ -282,34 +287,37 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
 /// 使う共通ヘルパ（OS 分岐を二重化しない）。`exclude_self` は自ホスト除外、
 /// `device_id` は出力エンドポイント選択（`None` で既定出力）。
 /// Linux / Windows / macOS 以外は [`Error::Unsupported`]。
+/// `exclude_pids` are extra pids excluded alongside `exclude_self`
+/// (see [`StreamConfig::exclude_pids`]); empty = exclusion is `exclude_self` alone.
 fn build_system_backend(
     exclude_self: bool,
+    exclude_pids: Vec<u32>,
     device_id: Option<String>,
 ) -> Result<Box<dyn CaptureBackend>> {
     #[cfg(target_os = "linux")]
     {
-        Ok(Box::new(flexaudio_os_linux::PwSystemBackend::new(
-            exclude_self,
-            device_id,
-        )))
+        Ok(Box::new(
+            flexaudio_os_linux::PwSystemBackend::new(exclude_self, device_id)
+                .with_exclude_pids(exclude_pids),
+        ))
     }
     #[cfg(target_os = "windows")]
     {
-        Ok(Box::new(flexaudio_os_windows::WasapiSystemBackend::new(
-            exclude_self,
-            device_id,
-        )))
+        Ok(Box::new(
+            flexaudio_os_windows::WasapiSystemBackend::new(exclude_self, device_id)
+                .with_exclude_pids(exclude_pids),
+        ))
     }
     #[cfg(target_os = "macos")]
     {
-        Ok(Box::new(flexaudio_os_macos::MacSystemBackend::new(
-            exclude_self,
-            device_id,
-        )))
+        Ok(Box::new(
+            flexaudio_os_macos::MacSystemBackend::new(exclude_self, device_id)
+                .with_exclude_pids(exclude_pids),
+        ))
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
-        let _ = (exclude_self, device_id);
+        let _ = (exclude_self, exclude_pids, device_id);
         Err(flexaudio_core::types::Error::Unsupported)
     }
 }

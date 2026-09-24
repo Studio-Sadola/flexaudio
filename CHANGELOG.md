@@ -12,6 +12,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`StreamConfig::exclude_pids` / N-API `excludePids`.** System-loopback
+  capture can exclude a set of pids in addition to `exclude_self`. Electron
+  hosts render audio from a helper process, so excluding the addon's own pid
+  was not enough on Linux and macOS. Linux: fan-in over every app output whose
+  pid is outside the set. macOS: every pid is added to the tap's exclude list,
+  resolved to its Core Audio process object once at capture start — a helper
+  that has not yet rendered audio has no object and is not excluded, so open
+  the capture while the app is already playing or reopen it when a helper
+  appears. Windows: one process tree — `exclude_self` wins, otherwise the first
+  pid.
+
+### Fixed
+- **Linux: fan-in capture no longer latches a half-linked node.** `try_link`
+  now commits a target only once the capture stream's own input ports have all
+  arrived, the target has every output port its node info declares (or, when
+  the node has not declared a count, its currently visible ports are fully
+  paired), and each channel the capture can take is paired; a `try_link` fired by the first
+  input-port global used to link FL alone and never revisit the node, so stereo
+  sources came through at half level with one channel missing.
+- **Linux: libpulse clients now resolve to their own pid.** Stream nodes are
+  bound and `application.process.id` is read from their info props (the
+  registry `global` event omits it); `pipewire.sec.pid` remains the fallback.
+  For every client speaking the PulseAudio protocol (Electron/Chromium, Zoom,
+  …) `pipewire.sec.pid` is pipewire-pulse's pid, so those apps were listed as
+  one process by `processes()` and could not be excluded individually.
+
 ## [0.3.0] - not yet released
 
 ### Added

@@ -34,7 +34,7 @@ use flexaudio_core::types::{Error, ProcessInfo, Result};
 
 use pipewire as pw;
 
-use crate::{pw_init_once, resolve_node_pid, NodeEntry};
+use crate::{pid_from_props, pw_init_once, resolve_node_pid, NodeEntry};
 
 /// 接続＋レジストリ往復の期限。これを過ぎても集めた分があれば `Ok`、空なら `Err`。
 const LIST_DEADLINE: Duration = Duration::from_millis(2_000);
@@ -185,10 +185,10 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                 };
                 match global.type_ {
                     pw::types::ObjectType::Client => {
-                        let Some(pid) = props
-                            .get(*pw::keys::SEC_PID)
-                            .and_then(|s| s.parse::<u32>().ok())
-                        else {
+                        let Some(pid) = pid_from_props(
+                            props.get(*pw::keys::APP_PROCESS_ID),
+                            props.get(*pw::keys::SEC_PID),
+                        ) else {
                             return;
                         };
                         let mut snap = snapshot_for_global.borrow_mut();
@@ -205,9 +205,15 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                             owning_client_id: props
                                 .get(*pw::keys::CLIENT_ID)
                                 .and_then(|s| s.parse::<u32>().ok()),
-                            app_pid: props
-                                .get(*pw::keys::SEC_PID)
-                                .and_then(|s| s.parse::<u32>().ok()),
+                            app_pid: pid_from_props(props.get(*pw::keys::APP_PROCESS_ID), None),
+                            // Not read by anything in this file — `exclude_decidable`
+                            // and Include/Exclude linking are `setup_pw_process`'s
+                            // concern only. `NodeEntry` is shared, so this file just
+                            // needs a value.
+                            info_seen: false,
+                            // Same: the declared output-port count is only read by
+                            // `setup_pw_process`'s link planner.
+                            n_output_ports: None,
                         };
                         snapshot_for_global.borrow_mut().nodes.insert(
                             global.id,
@@ -234,10 +240,16 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                                 let _ = catch_unwind(AssertUnwindSafe(|| {
                                     let running =
                                         matches!(info.state(), pw::node::NodeState::Running);
+                                    let pid = info.props().and_then(|p| {
+                                        pid_from_props(p.get(*pw::keys::APP_PROCESS_ID), None)
+                                    });
                                     if let Some(entry) =
                                         snapshot_for_info.borrow_mut().nodes.get_mut(&node_id)
                                     {
                                         entry.running = Some(running);
+                                        if pid.is_some() {
+                                            entry.entry.app_pid = pid;
+                                        }
                                     }
                                 }));
                             })
@@ -345,6 +357,8 @@ mod tests {
             entry: NodeEntry {
                 owning_client_id: client,
                 app_pid,
+                info_seen: false,
+                n_output_ports: None,
             },
             app_name: name.map(str::to_string),
             running: None,

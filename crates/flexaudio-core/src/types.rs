@@ -208,6 +208,8 @@ pub enum SourceKind {
 ///
 /// process ソースはこの `mode` だけを見て [`StreamConfig::exclude_self`] を無視し、
 /// system ソースは `exclude_self` だけを見て `mode` を無視する（mic は両方無関係）。
+/// Since `exclude_pids` was added, the system source reads it alongside
+/// `exclude_self`; it still ignores `mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProcessMode {
     /// 対象 `target_pid`（そのプロセスツリー）だけを録る（既定）。
@@ -279,13 +281,15 @@ impl Default for OutputFormat {
 /// 1 ストリームを開くための構成。
 ///
 /// [`Default`] は `chunk_ms = 20`, `ring_capacity_chunks = 50`, `mode = Include`,
-/// `exclude_self = false`, `kind = Mic`, `output = {48000, 2}`, `gain = 1.0`,
+/// `exclude_self = false`, `exclude_pids = []`, `kind = Mic`, `output = {48000, 2}`, `gain = 1.0`,
 /// `mix_mic_device_id = None`, `mix_system_device_id = None`, `mix_mic_gain = 1.0`,
 /// `mix_system_gain = 1.0` を返す。
 ///
 /// process ソースの対象 PID 扱いは [`mode`](Self::mode) だけ、system ソースの自ホスト
 /// 除外は [`exclude_self`](Self::exclude_self) だけが決める。process ソースは
 /// `exclude_self` を、system ソースは `mode` を無視する（mic は両方無関係）。
+/// Since `exclude_pids` was added, the system source's exclusion set is
+/// `exclude_pids ∪ {self if exclude_self}`, not `exclude_self` alone.
 /// `mix_*` の 4 フィールドは [`SourceKind::Mix`] 専用で、それ以外のソースでは無視される。
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamConfig {
@@ -313,6 +317,15 @@ pub struct StreamConfig {
     /// する。[`SourceKind::Mix`] では system 側の子キャプチャに適用される。
     /// それ以外のソースでは無視される。
     pub exclude_self: bool,
+    /// Additional pids whose playback is excluded from a system-loopback
+    /// capture (system source only; ignored by mic/process, applied to the
+    /// system side of `Mix`). Combined with [`exclude_self`](Self::exclude_self):
+    /// the effective exclusion set is `exclude_pids ∪ {self if exclude_self}`.
+    /// An Electron host passes its whole helper-process tree here, because the
+    /// process that renders audio is a helper, not the pid the addon runs in.
+    /// Windows honours one process *tree*: `exclude_self` wins, else the first
+    /// entry's tree (see `flexaudio-os-windows::WasapiSystemBackend`).
+    pub exclude_pids: Vec<u32>,
     /// 出力チャンクのフォーマット。既定 `{48000, 2}`（パススルー）。
     pub output: OutputFormat,
     /// 副出力タップのフォーマット（省略 = 副タップなし）。
@@ -355,6 +368,7 @@ impl Default for StreamConfig {
             target_pid: None,
             mode: ProcessMode::Include,
             exclude_self: false,
+            exclude_pids: Vec::new(),
             output: OutputFormat::default(),
             secondary_output: None,
             gain: 1.0,
@@ -438,6 +452,7 @@ mod tests {
         assert_eq!(c.ring_capacity_chunks, 50);
         assert_eq!(c.mode, ProcessMode::Include);
         assert!(!c.exclude_self);
+        assert!(c.exclude_pids.is_empty(), "no pids excluded by default");
         assert_eq!(c.kind, SourceKind::Mic);
         assert_eq!(c.device_id, None);
         assert_eq!(c.target_pid, None);

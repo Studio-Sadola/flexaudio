@@ -783,7 +783,7 @@ impl Stream {
     /// [`Error::InvalidArg`] で弾く。
     ///
     /// 成功時、`config` の可変項目（`kind` / `device_id` / `target_pid` / `mode`
-    /// / `exclude_self`）だけを新しい値へ更新する。`output` / `chunk_ms`
+    /// / `exclude_self` / `exclude_pids`）だけを新しい値へ更新する。`output` / `chunk_ms`
     /// / `ring_capacity_chunks` は据え置く。`new_config.gain` も無視する（ゲインは
     /// ストリームの状態であり、切替では変わらない。変更は [`set_gain`](Self::set_gain)）。
     ///
@@ -822,6 +822,7 @@ impl Stream {
             target_pid: new_config.target_pid,
             mode: new_config.mode,
             exclude_self: new_config.exclude_self,
+            exclude_pids: new_config.exclude_pids,
             ..self.config.clone()
         };
         Ok(())
