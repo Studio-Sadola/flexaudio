@@ -1,34 +1,35 @@
-//! デバイス着脱監視（ホットプラグ通知）の facade。
+//! Facade for device hotplug watching (hotplug notifications).
 //!
-//! [`DeviceWatcher`] は OS のデバイス着脱・既定変更を [`DeviceEvent`] として
-//! pull 型（[`poll_event`](DeviceWatcher::poll_event)）で配信する。capture
-//! stream 単位の [`Event`](crate::core::Event) とは別系統で、デバイス単位の事象を扱う。
+//! [`DeviceWatcher`] delivers OS device hotplug and default-device changes as [`DeviceEvent`]s
+//! in a pull model ([`poll_event`](DeviceWatcher::poll_event)). It is a separate channel from
+//! the per-capture-stream [`Event`](crate::core::Event) and handles per-device occurrences.
 //!
-//! OS バックエンドの差異は private trait `DeviceWatchBackend` で吸収する:
-//! - Linux: PipeWire レジストリを永続監視する `PwDeviceWatcher`（`flexaudio-os-linux`）。
-//! - その他 OS / 縮退: 常に `None` を返す `NoopWatcher`。
+//! OS backend differences are absorbed by the private trait `DeviceWatchBackend`:
+//! - Linux: `PwDeviceWatcher` (`flexaudio-os-linux`), which persistently watches the PipeWire
+//!   registry.
+//! - Other OSes / degraded: `NoopWatcher`, which always returns `None`.
 //!
-//! [`crate::watch_devices`] が cfg と縮退判断を行い、適切な実装を `Box` で包んで
-//! [`DeviceWatcher`] を返す。
+//! [`crate::watch_devices`] makes the cfg and degradation decisions, wraps the appropriate
+//! implementation in a `Box`, and returns a [`DeviceWatcher`].
 
 use flexaudio_core::types::DeviceEvent;
 
-/// OS バックエンドが満たす着脱監視インターフェース（facade 内 private）。
+/// Hotplug watch interface that OS backends satisfy (private to the facade).
 ///
-/// [`DeviceWatcher`] をスレッド間で渡せるように `Send` を要求する。PipeWire のような
-/// `!Send` 実装は内部で専用スレッドへ閉じ込め、本体は `Send` なハンドルだけ持つ
-/// （`PwDeviceWatcher` がそうしている）。
+/// Requires `Send` so that a [`DeviceWatcher`] can be handed across threads. A `!Send`
+/// implementation such as PipeWire confines itself to a dedicated thread internally, and the
+/// main object only holds a `Send` handle (this is what `PwDeviceWatcher` does).
 trait DeviceWatchBackend: Send {
-    /// 次のホットプラグイベントを 1 つ取り出す（無ければ `None`）。非ブロッキング。
+    /// Takes the next hotplug event (`None` if there is none). Non-blocking.
     fn poll_event(&mut self) -> Option<DeviceEvent>;
-    /// 監視を停止する（二重 stop / 未 start 後の stop に安全であること）。
+    /// Stops watching (must be safe for a double stop / a stop without a prior start).
     fn stop(&mut self);
 }
 
-/// デバイスの着脱・既定変更を pull 型で配信するウォッチャ。
+/// Watcher that delivers device hotplug and default-device changes in a pull model.
 ///
-/// [`crate::watch_devices`] で生成する。[`poll_event`](Self::poll_event) を周期的に
-/// 呼んで [`DeviceEvent`] を取り出す。drop 時に自動で停止する。
+/// Created with [`crate::watch_devices`]. Call [`poll_event`](Self::poll_event) periodically
+/// to take [`DeviceEvent`]s. Stops automatically on drop.
 ///
 /// ```no_run
 /// let mut watcher = flexaudio::watch_devices()?;
@@ -38,18 +39,19 @@ trait DeviceWatchBackend: Send {
 /// # Ok::<(), flexaudio::core::Error>(())
 /// ```
 pub struct DeviceWatcher {
-    /// OS 別の監視実装（Linux=PipeWire 永続監視 / それ以外=Noop）。
+    /// Per-OS watch implementation (Linux = persistent PipeWire watch / otherwise = Noop).
     inner: Box<dyn DeviceWatchBackend>,
 }
 
 impl DeviceWatcher {
-    /// 次のホットプラグイベントを 1 つ取り出す（無ければ `None`）。非ブロッキング。
+    /// Takes the next hotplug event (`None` if there is none). Non-blocking.
     pub fn poll_event(&mut self) -> Option<DeviceEvent> {
         self.inner.poll_event()
     }
 
-    /// 監視を停止する（以後 [`poll_event`](Self::poll_event) は `None`）。
-    /// 二重 stop / 未配信での stop に安全。drop でも自動的に呼ばれる。
+    /// Stops watching (afterwards [`poll_event`](Self::poll_event) returns `None`).
+    /// Safe for a double stop / a stop with nothing delivered. Also called automatically on
+    /// drop.
     pub fn stop(&mut self) {
         self.inner.stop();
     }
@@ -61,11 +63,12 @@ impl Drop for DeviceWatcher {
     }
 }
 
-/// 非 Linux / 縮退時に使う何もしないウォッチャ（常に `None`）。
+/// No-op watcher used on non-Linux / when degraded (always `None`).
 ///
-/// PipeWire 不在で `PwDeviceWatcher::start()` が `Err` のときも、`watch_devices()`
-/// はこれへ縮退して `Ok` を返す（着脱が来なければ何も配信しなくてよい。`devices()`
-/// がデーモン不在を空リストに握るのと同じ扱い）。
+/// Even when `PwDeviceWatcher::start()` returns `Err` because PipeWire is absent,
+/// `watch_devices()` degrades to this and returns `Ok` (if no hotplug arrives, nothing needs
+/// to be delivered; the same treatment as `devices()` swallowing an absent daemon into an
+/// empty list).
 struct NoopWatcher;
 
 impl DeviceWatchBackend for NoopWatcher {
@@ -75,10 +78,10 @@ impl DeviceWatchBackend for NoopWatcher {
     fn stop(&mut self) {}
 }
 
-// Linux: PipeWire 永続監視を DeviceWatchBackend に適合させる。
-// trait はこのクレート所有なので、型が flexaudio-os-linux 側でも孤児ルールに触れず
-// impl できる。os-linux は core にしか依存しない（facade の trait を知らない）まま、
-// ここで橋渡しする。
+// Linux: adapt the persistent PipeWire watch to DeviceWatchBackend.
+// Because this crate owns the trait, it can be implemented without violating the orphan rule
+// even though the type lives in flexaudio-os-linux. os-linux keeps depending only on core
+// (it does not know the facade's trait), and the bridging happens here.
 #[cfg(target_os = "linux")]
 impl DeviceWatchBackend for flexaudio_os_linux::PwDeviceWatcher {
     fn poll_event(&mut self) -> Option<DeviceEvent> {
@@ -89,19 +92,19 @@ impl DeviceWatchBackend for flexaudio_os_linux::PwDeviceWatcher {
     }
 }
 
-/// OS のデバイス着脱監視を開始し、[`DeviceWatcher`] を返す。
+/// Starts watching OS device hotplug and returns a [`DeviceWatcher`].
 ///
-/// - Linux: `PwDeviceWatcher::start()`（PipeWire 永続監視）を試み、成功すればそれを
-///   包む。失敗（PipeWire 不在等）なら [`NoopWatcher`] へ縮退して `Ok` を返す
-///   （`devices()` がデーモン不在を空に握るのと同じ扱い）。
-/// - その他 OS: 常に [`NoopWatcher`]。
+/// - Linux: tries `PwDeviceWatcher::start()` (persistent PipeWire watch) and wraps it on
+///   success. On failure (PipeWire absent, etc.) degrades to [`NoopWatcher`] and returns `Ok`
+///   (the same treatment as `devices()` swallowing an absent daemon into an empty list).
+/// - Other OSes: always [`NoopWatcher`].
 pub(crate) fn watch_devices() -> flexaudio_core::types::Result<DeviceWatcher> {
     #[cfg(target_os = "linux")]
     {
         let inner: Box<dyn DeviceWatchBackend> = match flexaudio_os_linux::PwDeviceWatcher::start()
         {
             Ok(w) => Box::new(w),
-            // PipeWire 不在/接続失敗は no-op 縮退（着脱が来ないだけ）。
+            // PipeWire absent / connection failure degrades to no-op (hotplug just never arrives).
             Err(_) => Box::new(NoopWatcher),
         };
         Ok(DeviceWatcher { inner })
@@ -118,14 +121,14 @@ pub(crate) fn watch_devices() -> flexaudio_core::types::Result<DeviceWatcher> {
 mod tests {
     use super::*;
 
-    /// [`DeviceWatcher`] が `Send` であること（スレッド間で渡せる）。
+    /// [`DeviceWatcher`] is `Send` (can be handed across threads).
     #[test]
     fn watcher_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<DeviceWatcher>();
     }
 
-    /// [`NoopWatcher`] は常に `None` を返し、stop は安全（panic しない）。
+    /// [`NoopWatcher`] always returns `None`, and stop is safe (does not panic).
     #[test]
     fn noop_watcher_yields_nothing() {
         let mut w = DeviceWatcher {
@@ -138,13 +141,15 @@ mod tests {
         assert!(w.poll_event().is_none());
     }
 
-    /// `watch_devices()` は PipeWire 不在の環境でも panic せず
-    /// `Ok(DeviceWatcher)` を返す（縮退して Noop になるだけ）。返ったウォッチャは
-    /// 即 poll しても安全で、stop まで一巡できる。
+    /// `watch_devices()` does not panic even in an environment without PipeWire and returns
+    /// `Ok(DeviceWatcher)` (it just degrades to Noop). The returned watcher is safe to poll
+    /// immediately and can go all the way through to stop.
     #[test]
     fn watch_devices_is_graceful_without_pipewire() {
-        let mut w = watch_devices().expect("watch_devices は縮退して常に Ok を返す設計");
-        // 縮退時は None、PipeWire ありでも初期スキャン抑制済みで即 None になり得る。
+        let mut w =
+            watch_devices().expect("watch_devices is designed to degrade and always return Ok");
+        // When degraded this is None; even with PipeWire the initial scan is suppressed, so it
+        // may be None immediately.
         let _ = w.poll_event();
         w.stop();
     }

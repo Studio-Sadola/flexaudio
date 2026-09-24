@@ -1,8 +1,9 @@
-//! 録れるプロセスの列挙（[`processes`]）。
+//! Enumeration of capturable processes ([`processes`]).
 //!
-//! OS 別バックエンドの生リストを、上限時間つきの専用スレッドで取り、
-//! [`normalize_process_list`] で全 OS 共通の形（重複統合・自プロセス除外・表示名補完・
-//! 安定ソート）に揃える。列挙の本体は OS ごとに 1 か所ずつで、この関数が唯一の入口。
+//! Takes each OS backend's raw list on a dedicated thread with a time limit, and brings it
+//! into a shape common to all OSes with [`normalize_process_list`] (duplicate merging, own
+//! process exclusion, display-name completion, stable sort). There is exactly one enumeration
+//! implementation per OS, and this function is the only entry point.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,54 +15,56 @@ use std::time::Duration;
 use flexaudio_core::process_list::normalize_process_list;
 use flexaudio_core::types::{Error, ProcessInfo, Result};
 
-/// 列挙全体の上限時間。OS の問い合わせ（PipeWire の往復・COM・coreaudiod への IPC）が
-/// 応答しなくても、呼び出し側はこの時間で必ず戻る。Linux バックエンドは内部でさらに短い
-/// 期限（2 秒）を持つので、通常はそちらが先に効く。
+/// Time limit for the whole enumeration. Even if the OS query (PipeWire round trip, COM, IPC
+/// to coreaudiod) does not respond, the caller always returns within this time. The Linux
+/// backend internally has an even shorter deadline (2 seconds), so that one normally kicks in
+/// first.
 pub(crate) const PROCESS_ENUM_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// 今プロセス別キャプチャ（[`SourceKind::ProcessLoopback`](crate::SourceKind)）の対象に
-/// できる、音声出力のセッション（ストリーム）を持つプロセスを列挙する。呼び出し元
-/// プロセス自身は含めない。
+/// Enumerates the processes that have an audio output session (stream) and can currently be
+/// the target of per-process capture ([`SourceKind::ProcessLoopback`](crate::SourceKind)).
+/// The calling process itself is not included.
 ///
-/// 返った [`ProcessInfo::pid`] を [`StreamConfig::target_pid`](crate::StreamConfig) に
-/// 渡せばそのプロセスを録れる。並びは「出力中が先頭 → 表示名 → PID」で、同じ PID は
-/// 1 件にまとめてある。読み取り専用で、権限プロンプトを新たに出すことはない。
+/// Passing a returned [`ProcessInfo::pid`] to [`StreamConfig::target_pid`](crate::StreamConfig)
+/// captures that process. The order is "outputting first -> display name -> PID", and entries
+/// with the same PID are merged into one. It is read-only and never raises a new permission
+/// prompt.
 ///
-/// OS への問い合わせは同時に 1 本だけ（single-flight）。前の問い合わせがまだ終わって
-/// いないときに呼ぶと、新しいスレッドは立てず [`Error::Backend`]（「まだ終わっていない」）
-/// を即座に返す。
+/// Only one OS query runs at a time (single-flight). Calling while the previous query has not
+/// finished yet does not start a new thread and immediately returns [`Error::Backend`] ("still
+/// not finished").
 ///
-/// # OS ごとの挙動
-/// - **Linux（PipeWire）**: レジストリの `Stream/Output/Audio` ノードを持つ Client を
-///   列挙する（PID は Client の `pipewire.sec.pid`＝プロセス別キャプチャと同じ解決経路）。
-///   表示名はノード／Client の `application.name`。実行ファイル名は `/proc/<pid>/exe`
-///   のベース名で、読めなければ `/proc/<pid>/comm`。`is_output_active` はノードの状態が
-///   Running かどうか。
-/// - **Windows（WASAPI）**: 有効な全 render エンドポイントの音声セッション
-///   （`IAudioSessionManager2` → `IAudioSessionEnumerator` → `IAudioSessionControl2`）を
-///   列挙する。システム音セッションと期限切れセッションは除く。表示名はプロセスの
-///   イメージ名（拡張子なし）、`is_output_active` はセッションが Active かどうか。
-///   列挙も録音も Windows build 20348 or later (Windows 11 / Windows Server 2022) が
-///   必要で、未満は [`Error::UnsupportedOsVersion`]。
-/// - **macOS（Core Audio, 14.4+）**: `kAudioHardwarePropertyProcessObjectList` の
-///   プロセスオブジェクトを列挙する（Core Audio が把握しているプロセス。入力だけの
-///   プロセスも含む）。`bundle_id` と `is_output_active`
-///   （`kAudioProcessPropertyIsRunningOutput`）が付く。14.4 未満は
-///   [`Error::UnsupportedOsVersion`]（プロセス別キャプチャと同じ条件）。
+/// # Per-OS behavior
+/// - **Linux (PipeWire)**: enumerates Clients that own a `Stream/Output/Audio` node in the
+///   registry (the PID is the Client's `pipewire.sec.pid` = the same resolution path as
+///   per-process capture). The display name is the node's / Client's `application.name`. The
+///   executable name is the base name of `/proc/<pid>/exe`, or `/proc/<pid>/comm` if that is
+///   unreadable. `is_output_active` is whether the node's state is Running.
+/// - **Windows (WASAPI)**: enumerates the audio sessions of all active render endpoints
+///   (`IAudioSessionManager2` -> `IAudioSessionEnumerator` -> `IAudioSessionControl2`).
+///   System sound sessions and expired sessions are excluded. The display name is the
+///   process's image name (without extension), and `is_output_active` is whether the session
+///   is Active. Both enumeration and capture require Windows build 20348 or later (Windows 11 /
+///   Windows Server 2022); older builds get [`Error::UnsupportedOsVersion`].
+/// - **macOS (Core Audio, 14.4+)**: enumerates the process objects of
+///   `kAudioHardwarePropertyProcessObjectList` (the processes Core Audio knows about;
+///   input-only processes are included too). `bundle_id` and `is_output_active`
+///   (`kAudioProcessPropertyIsRunningOutput`) are filled in. Below 14.4 it returns
+///   [`Error::UnsupportedOsVersion`] (the same condition as per-process capture).
 ///
-/// # 戻り値の意味（能力の判定にも使える）
-/// - `Ok(空でないリスト)`: プロセス別キャプチャが使え、音声出力のセッション（ストリーム）
-///   を持つプロセスがある。停止中・Idle も載る。今鳴っているかは
-///   [`ProcessInfo::is_output_active`] で見る。
-/// - `Ok(空)`: プロセス別キャプチャは使えるが、そういうプロセスが今は無い
-///   （「何も鳴っていない」ではない）。
-/// - `Err(_)`: この環境ではプロセス別キャプチャができない（Linux: PipeWire に届かない
-///   ＝[`Error::Backend`] / macOS 14.4 未満・Windows build 20348 未満＝
-///   [`Error::UnsupportedOsVersion`] / 上記以外の OS＝[`Error::Unsupported`]）、
-///   権限が無い（[`Error::PermissionDenied`]）、または OS が上限時間内に応答しなかった
-///   ／前の問い合わせがまだ終わっていない（[`Error::Backend`]）。
+/// # Meaning of the return value (also usable as a capability check)
+/// - `Ok(non-empty list)`: per-process capture is available and there are processes with an
+///   audio output session (stream). Stopped and Idle ones are listed too. Whether one is
+///   playing right now is seen via [`ProcessInfo::is_output_active`].
+/// - `Ok(empty)`: per-process capture is available, but no such process exists right now
+///   (this is not "nothing is playing").
+/// - `Err(_)`: per-process capture is not possible in this environment (Linux: PipeWire is
+///   unreachable = [`Error::Backend`] / macOS below 14.4, Windows below build 20348 =
+///   [`Error::UnsupportedOsVersion`] / any other OS = [`Error::Unsupported`]), permission is
+///   missing ([`Error::PermissionDenied`]), or the OS did not respond within the time limit /
+///   the previous query has not finished yet ([`Error::Backend`]).
 ///
-/// # 例
+/// # Example
 /// ```no_run
 /// use flexaudio::{open, processes, SourceKind, StreamConfig};
 ///
@@ -82,7 +85,7 @@ pub fn processes() -> Result<Vec<ProcessInfo>> {
     Ok(normalize_process_list(raw, Some(std::process::id())))
 }
 
-/// OS 別バックエンドの生リスト（重複・空名を含み得る）。
+/// Raw list from the OS backend (may contain duplicates and empty names).
 fn list_raw_processes() -> Result<Vec<ProcessInfo>> {
     #[cfg(target_os = "linux")]
     {
@@ -102,8 +105,8 @@ fn list_raw_processes() -> Result<Vec<ProcessInfo>> {
     }
 }
 
-/// OS 問い合わせの同時実行スロット。期限切れ後もワーカーが終わるまで占有し、
-/// 新しい呼び出しはスレッドを足さず [`Error::Backend`] を即座に返す。
+/// Concurrency slot for OS queries. It stays occupied until the worker finishes, even after
+/// the deadline; new calls do not add a thread and immediately return [`Error::Backend`].
 struct EnumFlight {
     busy: AtomicBool,
 }
@@ -131,9 +134,9 @@ impl EnumFlight {
     }
 }
 
-/// ワーカーが終わるまで flight を占有し、panic でも必ず印を下ろす。
-/// `send` より前に drop して、呼び出し側が結果を受け取った直後の次の `processes()` が
-/// 偽の「まだ終わっていない」にならないようにする。
+/// Occupies the flight until the worker finishes, and always lowers the mark even on panic.
+/// Dropped before `send` so that the next `processes()` right after the caller receives the
+/// result does not get a spurious "still not finished".
 struct FlightGuard {
     flight: &'static EnumFlight,
 }
@@ -149,19 +152,21 @@ fn enum_flight() -> &'static EnumFlight {
     FLIGHT.get_or_init(EnumFlight::new)
 }
 
-/// テストが「時間切れのあとスレッドが増えない」ことを数えるための spawn 回数。
+/// Spawn count used by tests to verify that "no threads are added after a timeout".
 #[cfg(test)]
 static ENUM_SPAWN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// `job` を専用スレッドで走らせ、`timeout` 以内に結果が来なければ [`Error::Backend`] を返す。
+/// Runs `job` on a dedicated thread and returns [`Error::Backend`] if no result arrives within
+/// `timeout`.
 ///
-/// OS の問い合わせは呼び出し側から中断できない。同時に走る問い合わせは 1 本だけ
-/// （single-flight）。期限切れのスレッドは切り離して終わらせるが、スロットはワーカーが
-/// 終わるまで占有する。そのあいだの新しい呼び出しは待たず、
-/// 「前の問い合わせがまだ終わっていない」という [`Error::Backend`] を即座に返す
-/// （ハングした COM / PipeWire / coreaudiod 待ちを 1 回につき 1 本足さないため。
-/// 待たせると 2 人目も上限時間ぶんブロックするので、即エラーの方が fail-closed）。
-/// `job` が panic した場合も [`Error::Backend`] になり、スロットは必ず空ける。
+/// An OS query cannot be interrupted from the caller side. Only one query runs at a time
+/// (single-flight). A timed-out thread is detached and left to finish, but the slot stays
+/// occupied until the worker finishes. New calls in the meantime do not wait and immediately
+/// return an [`Error::Backend`] saying "the previous query is still in progress" (so that
+/// each call does not add another thread waiting on a hung COM / PipeWire / coreaudiod.
+/// Making it wait would block the second caller for the full time limit too, so an immediate
+/// error is the fail-closed choice). If `job` panics it also becomes [`Error::Backend`], and
+/// the slot is always released.
 pub(crate) fn run_bounded<T, F>(timeout: Duration, job: F) -> Result<T>
 where
     T: Send + 'static,
@@ -174,8 +179,8 @@ where
         ));
     }
 
-    // 容量 1 の同期チャネル。受け手が期限切れで居なくなっても送信側は詰まらない
-    // （容量ぶんは受け手無しでも積める）。
+    // Sync channel with capacity 1. Even if the receiver is gone after the deadline, the
+    // sender does not get stuck (up to the capacity can be queued without a receiver).
     let (tx, rx) = mpsc::sync_channel::<Result<T>>(1);
     let spawn = thread::Builder::new()
         .name("flexaudio-processes".into())
@@ -185,8 +190,8 @@ where
                 Ok(r) => r,
                 Err(_) => Err(Error::Backend("process enumeration thread panicked".into())),
             };
-            // 印を下ろしてから結果を送る。recv 側が戻った直後の次の呼び出しが
-            // まだ busy に見えないようにする。
+            // Lower the mark before sending the result, so that the next call right after
+            // the recv side returns does not still see busy.
             drop(guard);
             let _ = tx.send(result);
         });
@@ -205,8 +210,8 @@ where
             "process enumeration timed out after {} ms",
             timeout.as_millis()
         ))),
-        // ワーカーの FlightGuard が既に印を下ろしている。ここで end() すると、
-        // そのあいだに始まった別の flight の印を消してしまう。
+        // The worker's FlightGuard has already lowered the mark. Calling end() here would
+        // erase the mark of another flight that started in the meantime.
         Err(RecvTimeoutError::Disconnected) => Err(Error::Backend(
             "process enumeration thread exited without a result".into(),
         )),
@@ -218,7 +223,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    /// 単体テスト同士が同じ single-flight スロットを奪い合わないように直列化する。
+    /// Serializes the unit tests so they do not compete for the same single-flight slot.
     static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
     fn wait_until_idle() {
@@ -239,8 +244,8 @@ mod tests {
         result
     }
 
-    /// 合図するまで終わらない仕事。呼び出し側が完了を待ってしまう不具合でも、
-    /// 2 秒の見張りと Drop が解放するのでテストは永久に止まらない。
+    /// A job that does not finish until signaled. Even with a bug where the caller waits for
+    /// completion, the 2-second watchdog and Drop release it, so the test never hangs forever.
     struct StuckJob {
         finished: Arc<AtomicBool>,
         release_tx: mpsc::Sender<()>,
@@ -391,8 +396,9 @@ mod tests {
         });
     }
 
-    /// 実 OS での列挙は環境次第（PipeWire 無し等）で `Err` もあり得るが、panic せず、
-    /// 返ったリストは契約（自プロセス無し・pid 非 0・表示名非空・PID 重複無し）を満たす。
+    /// Enumeration on the real OS may return `Err` depending on the environment (no PipeWire,
+    /// etc.), but it does not panic, and a returned list satisfies the contract (no own
+    /// process, non-zero pid, non-empty display name, no duplicate PIDs).
     #[test]
     fn processes_is_well_formed_on_this_host() {
         with_enum_lock(|| match processes() {

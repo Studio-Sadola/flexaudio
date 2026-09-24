@@ -1,8 +1,8 @@
-//! ハード不要のテスト/検証用キャプチャバックエンド。
+//! Hardware-free capture backends for testing / verification.
 //!
-//! [`MockBackend`] は実 OS デバイスの代わりにサイン波を生成し、概ねリアルタイムの
-//! ペースで [`RawSink`] へ push する。これにより
-//! [`Stream`](crate::Stream) を実機なしで end-to-end 駆動できる。
+//! [`MockBackend`] generates a sine wave instead of a real OS device and pushes it to the
+//! [`RawSink`] at roughly real-time pace. This lets
+//! [`Stream`](crate::Stream) be driven end-to-end without real hardware.
 
 use std::f32::consts::PI;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -13,42 +13,44 @@ use std::time::{Duration, Instant};
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::types::Result;
 
-/// 1 回の push でまとめて生成する時間長（ミリ秒）。
+/// Duration generated per push (milliseconds).
 const BLOCK_MS: u32 = 10;
 
-/// サイン波を生成してネイティブフォーマットで [`RawSink`] へ流す擬似バックエンド。
+/// Pseudo backend that generates a sine wave and streams it to the [`RawSink`] in the native
+/// format.
 ///
-/// `native_format` は `new` で渡した `(sample_rate, channels)` をそのまま返す。
-/// [`start`](Self::start) で生成スレッドを起動し、`BLOCK_MS`（既定 10ms）分の
-/// interleaved `f32` サンプルを実時間ペースで push し続ける。[`stop`](Self::stop)
-/// で生成スレッドを停止・join する。
+/// `native_format` returns the `(sample_rate, channels)` passed to `new` as-is.
+/// [`start`](Self::start) launches the generator thread, which keeps pushing `BLOCK_MS`
+/// (default 10ms) worth of interleaved `f32` samples at real-time pace. [`stop`](Self::stop)
+/// stops and joins the generator thread.
 ///
 /// ```no_run
 /// use flexaudio::mock::MockBackend;
 /// use flexaudio::Stream;
 /// use flexaudio_core::types::StreamConfig;
 ///
-/// // 44.1kHz / mono のマイクを模した擬似ソース。
+/// // Pseudo source imitating a 44.1kHz / mono microphone.
 /// let backend = Box::new(MockBackend::new(44_100, 1, 440.0));
 /// let mut stream = Stream::open(StreamConfig::default(), backend).unwrap();
 /// stream.start().unwrap();
-/// // ... stream.poll_chunk() でチャンクを取り出す ...
+/// // ... take chunks with stream.poll_chunk() ...
 /// stream.stop();
 /// ```
 pub struct MockBackend {
     sample_rate: u32,
     channels: u16,
     freq_hz: f32,
-    /// 生成スレッドへの停止指示。
+    /// Stop signal to the generator thread.
     running: Arc<AtomicBool>,
-    /// 生成スレッドのハンドル（start 後に Some）。
+    /// Handle of the generator thread (Some after start).
     handle: Option<JoinHandle<()>>,
 }
 
 impl MockBackend {
-    /// ネイティブ `(sample_rate, channels)` と生成するサイン波の周波数を指定して作る。
+    /// Creates one with the native `(sample_rate, channels)` and the frequency of the sine
+    /// wave to generate.
     ///
-    /// 周波数 `0.0` 以下を渡した場合は実質無音（DC 0）を生成する。
+    /// A frequency of `0.0` or below generates effectively silence (DC 0).
     pub fn new(sample_rate: u32, channels: u16, freq_hz: f32) -> Self {
         Self {
             sample_rate: sample_rate.max(1),
@@ -66,7 +68,7 @@ impl CaptureBackend for MockBackend {
     }
 
     fn start(&mut self, mut sink: RawSink) -> Result<()> {
-        // 既に動作中なら何もしない（二重 start に安全）。
+        // Do nothing if already running (safe against a double start).
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -85,9 +87,9 @@ impl CaptureBackend for MockBackend {
                 let block_dur = Duration::from_millis(BLOCK_MS as u64);
                 let two_pi_f_over_sr = 2.0 * PI * freq / sample_rate as f32;
 
-                // 連続位相のためのグローバルフレーム索引（位相の不連続を避ける）。
+                // Global frame index for continuous phase (avoids phase discontinuities).
                 let mut phase_frame: u64 = 0;
-                // device PTS（ns）— ネイティブ SR を基準にした単調なタイムスタンプ。
+                // device PTS (ns) — a monotonic timestamp based on the native SR.
                 let start = Instant::now();
 
                 let mut scratch: Vec<f32> = Vec::with_capacity(frames_per_block * channels);
@@ -100,18 +102,19 @@ impl CaptureBackend for MockBackend {
                         } else {
                             0.0
                         };
-                        // interleaved: 全チャンネルに同じサンプル（モノラル相当の中身）。
+                        // interleaved: the same sample on every channel (mono-equivalent content).
                         for _ in 0..channels {
                             scratch.push(s);
                         }
                         phase_frame = phase_frame.wrapping_add(1);
                     }
 
-                    // この block 先頭フレームの device PTS（ns）= 経過時間ベース近似。
+                    // device PTS (ns) of this block's first frame = approximation based on elapsed
+                    // time.
                     let pts_ns = start.elapsed().as_nanos() as i64;
                     sink.push(&scratch, pts_ns);
 
-                    // 概ねリアルタイムのペースで眠る。
+                    // Sleep at roughly real-time pace.
                     thread::sleep(block_dur);
                 }
             })
@@ -126,7 +129,7 @@ impl CaptureBackend for MockBackend {
     fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
-            // 生成スレッドの join。sleep 中でも次ループ頭で停止する。
+            // Join the generator thread. Even while sleeping, it stops at the top of the next loop.
             let _ = h.join();
         }
     }
@@ -138,35 +141,37 @@ impl Drop for MockBackend {
     }
 }
 
-/// 失速（stall）を起こせるテスト専用バックエンド。
+/// Test-only backend that can stall.
 ///
-/// 通常の [`MockBackend`] は正弦を途切れず push し続けるため、ウォッチドッグの
-/// 失速検知 → 再オープン → [`ChunkFlags::RECOVERED`](flexaudio_core::types::ChunkFlags::RECOVERED)
-/// 経路をテストできない。これは最初の `start()` セッションだけを `stall_after` 経過後に
-/// 給餌停止（=stall）し、ウォッチドッグが `stop()`→`start()` で再オープンした 2 回目
-/// 以降のセッションは正常給餌に戻る。stall → 自動復帰 → 復帰チャンクに RECOVERED を
-/// 実機なしで再現できる。
+/// The regular [`MockBackend`] keeps pushing the sine wave without interruption, so the
+/// watchdog path of stall detection -> reopen ->
+/// [`ChunkFlags::RECOVERED`](flexaudio_core::types::ChunkFlags::RECOVERED) cannot be tested
+/// with it. This backend stops feeding (= stall) only in the first `start()` session once
+/// `stall_after` has elapsed, and the second and later sessions, reopened by the watchdog via
+/// `stop()` -> `start()`, return to normal feeding. It reproduces stall -> automatic recovery
+/// -> RECOVERED on the recovery chunk without real hardware.
 ///
-/// `start()` 呼び出し回数を共有 [`AtomicU32`] で数え、世代 0（初回）でのみ stall する。
-/// テスト用途のみ（公開 API ではない）。
+/// The number of `start()` calls is counted with a shared [`AtomicU32`], and it stalls only in
+/// generation 0 (the first). Test use only (not a public API).
 #[doc(hidden)]
 pub struct StallableMockBackend {
     sample_rate: u32,
     channels: u16,
     freq_hz: f32,
-    /// 初回セッションで給餌を止めるまでの経過時間。
+    /// Elapsed time until feeding stops in the first session.
     stall_after: Duration,
-    /// 生成スレッドへの停止指示。
+    /// Stop signal to the generator thread.
     running: Arc<AtomicBool>,
-    /// これまでの `start()` 呼び出し回数（=セッション世代）。共有して生成スレッドが読む。
+    /// Number of `start()` calls so far (= session generation). Shared and read by the
+    /// generator thread.
     start_count: Arc<AtomicU32>,
-    /// 生成スレッドのハンドル。
+    /// Handle of the generator thread.
     handle: Option<JoinHandle<()>>,
 }
 
 impl StallableMockBackend {
-    /// ネイティブ `(sample_rate, channels)` と周波数、初回セッションで失速するまでの
-    /// 経過時間を指定して作る。
+    /// Creates one with the native `(sample_rate, channels)`, the frequency, and the elapsed
+    /// time until the first session stalls.
     pub fn new(sample_rate: u32, channels: u16, freq_hz: f32, stall_after: Duration) -> Self {
         Self {
             sample_rate: sample_rate.max(1),
@@ -179,7 +184,7 @@ impl StallableMockBackend {
         }
     }
 
-    /// これまでの `start()` 呼び出し回数（=再オープン回数 + 1）。テストの観測用。
+    /// Number of `start()` calls so far (= number of reopens + 1). For observation in tests.
     pub fn start_count(&self) -> u32 {
         self.start_count.load(Ordering::SeqCst)
     }
@@ -196,7 +201,7 @@ impl CaptureBackend for StallableMockBackend {
         }
         self.running.store(true, Ordering::SeqCst);
 
-        // このセッションの世代（0 始まり）。世代 0 でのみ stall する。
+        // Generation of this session (0-based). Stalls only in generation 0.
         let generation = self.start_count.fetch_add(1, Ordering::SeqCst);
 
         let running = self.running.clone();
@@ -218,9 +223,9 @@ impl CaptureBackend for StallableMockBackend {
                 let mut scratch: Vec<f32> = Vec::with_capacity(frames_per_block * channels);
 
                 while running.load(Ordering::SeqCst) {
-                    // 世代 0 かつ stall_after を超えたら給餌停止（=失速）。
-                    // スレッドは生かしたまま push だけ止めるので、ウォッチドッグが
-                    // last_sample_ns の停滞を STALL_THRESHOLD 後に検知する。
+                    // Stop feeding (= stall) in generation 0 once stall_after is exceeded.
+                    // The thread stays alive and only the push stops, so the watchdog detects
+                    // the stagnation of last_sample_ns after STALL_THRESHOLD.
                     let stalled = generation == 0 && session_start.elapsed() >= stall_after;
 
                     if !stalled {
@@ -265,48 +270,48 @@ impl Drop for StallableMockBackend {
     }
 }
 
-/// `start()` または `stop()` で panic するテスト専用バックエンド。
+/// Test-only backend that panics in `start()` or `stop()`.
 ///
-/// OS バックエンドの start/stop は flexaudio から見れば外部コードで、契約違反として
-/// panic しうる。その panic が `SharedState.backend`（start/stop を跨いでロックされる
-/// `Mutex`）を poison させ、取り込み/ウォッチドッグスレッドが次にそのロックを取った
-/// 瞬間に連鎖 panic で無言死する——その回帰を突くためのバックエンド。
-/// [`Stream`](crate::Stream) はこの panic を
+/// OS backends' start/stop is external code from flexaudio's point of view and may panic as a
+/// contract violation. That panic poisons `SharedState.backend` (a `Mutex` locked across
+/// start/stop), and the ingest/watchdog thread dies silently in a cascading panic the moment
+/// it next takes that lock — this backend exercises that regression.
+/// [`Stream`](crate::Stream) surfaces this panic as
 /// [`Error::Backend`](flexaudio_core::types::Error::Backend) /
-/// [`Event::Error`](flexaudio_core::types::Event::Error) として表に出し、他スレッドを
-/// 連鎖 panic させない（`stream.rs` の panic 回帰テスト参照）。
+/// [`Event::Error`](flexaudio_core::types::Event::Error) and does not make other threads
+/// panic in cascade (see the panic regression tests in `stream.rs`).
 ///
-/// - [`PanicMode::Start`]: 最初の `start()` で panic する。
-/// - [`PanicMode::Stop`]: `stop()` で panic する（start は成功し、給餌も行う）。
+/// - [`PanicMode::Start`]: panics on the first `start()`.
+/// - [`PanicMode::Stop`]: panics on `stop()` (start succeeds and feeding happens too).
 ///
-/// テスト用途のみ（公開 API ではない）。
+/// Test use only (not a public API).
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanicMode {
-    /// `start()` 呼び出しで panic する。
+    /// Panics on a `start()` call.
     Start,
-    /// `stop()` 呼び出しで panic する。
+    /// Panics on a `stop()` call.
     Stop,
 }
 
-/// 指定タイミングで panic する擬似バックエンド（[`PanicMode`] 参照）。
+/// Pseudo backend that panics at the specified timing (see [`PanicMode`]).
 ///
-/// `PanicMode::Stop` の場合は [`MockBackend`] 同様にサイン波を給餌してから、`stop()`
-/// で panic する。`PanicMode::Start` の場合は給餌スレッドを立てる前に `start()` 内で
-/// panic する。テスト用途のみ（公開 API ではない）。
+/// With `PanicMode::Stop`, it feeds a sine wave like [`MockBackend`] and then panics in
+/// `stop()`. With `PanicMode::Start`, it panics inside `start()` before starting the feeder
+/// thread. Test use only (not a public API).
 #[doc(hidden)]
 pub struct PanickingMockBackend {
     sample_rate: u32,
     channels: u16,
     freq_hz: f32,
     mode: PanicMode,
-    /// 給餌スレッド（`PanicMode::Stop` で start に成功した場合のみ Some）。
+    /// Feeder thread (Some only when start succeeded with `PanicMode::Stop`).
     running: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl PanickingMockBackend {
-    /// ネイティブ `(sample_rate, channels)`・周波数・panic タイミングを指定して作る。
+    /// Creates one with the native `(sample_rate, channels)`, frequency, and panic timing.
     pub fn new(sample_rate: u32, channels: u16, freq_hz: f32, mode: PanicMode) -> Self {
         Self {
             sample_rate: sample_rate.max(1),
@@ -326,11 +331,11 @@ impl CaptureBackend for PanickingMockBackend {
 
     fn start(&mut self, mut sink: RawSink) -> Result<()> {
         if self.mode == PanicMode::Start {
-            // start で panic させる（任意 backend の契約違反を模す）。
+            // Panic in start (imitates an arbitrary backend's contract violation).
             panic!("PanickingMockBackend: intentional panic in start()");
         }
 
-        // PanicMode::Stop: 通常どおり給餌スレッドを立てる（stop で panic する）。
+        // PanicMode::Stop: start the feeder thread as usual (it panics in stop).
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -380,13 +385,13 @@ impl CaptureBackend for PanickingMockBackend {
     }
 
     fn stop(&mut self) {
-        // 給餌スレッドはまず確実に止めて join する（リーク・hang 防止）。
+        // First reliably stop and join the feeder thread (prevents leaks / hangs).
         self.running.store(false, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
         if self.mode == PanicMode::Stop {
-            // stop で panic させる（任意 backend の契約違反を模す）。
+            // Panic in stop (imitates an arbitrary backend's contract violation).
             panic!("PanickingMockBackend: intentional panic in stop()");
         }
     }
@@ -394,8 +399,8 @@ impl CaptureBackend for PanickingMockBackend {
 
 impl Drop for PanickingMockBackend {
     fn drop(&mut self) {
-        // Drop からは panic させない（二重 panic→abort を避ける）。給餌スレッドだけ
-        // 確実に止める。PanicMode::Stop の panic は明示 `stop()` 呼び出しでのみ起きる。
+        // Do not panic from Drop (avoids double panic -> abort). Only reliably stop the
+        // feeder thread. The PanicMode::Stop panic happens only on an explicit `stop()` call.
         self.running.store(false, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -403,17 +408,18 @@ impl Drop for PanickingMockBackend {
     }
 }
 
-/// 初回 `start()` は成功して給餌し、`stall_after` 経過で給餌停止（=失速）し、
-/// ウォッチドッグによる再オープン（2 回目以降の `start()`）で panic するテスト
-/// 専用バックエンド。
+/// Test-only backend whose first `start()` succeeds and feeds, which stops feeding (= stall)
+/// once `stall_after` has elapsed, and which panics on the watchdog's reopen (the second and
+/// later `start()`).
 ///
-/// ウォッチドッグスレッド内で backend が panic しても、`SharedState.backend` mutex を
-/// poison させて取り込み/ウォッチドッグスレッドを連鎖無言死させず、
-/// [`Event::Error`](flexaudio_core::types::Event::Error)（"reopen failed: ..."）として
-/// 表に出すことを検証する回帰用。[`StallableMockBackend`] の失速機構と
-/// [`PanickingMockBackend`] の panic を組み合わせたもの。
+/// A regression backend that verifies that even if the backend panics inside the watchdog
+/// thread, it does not poison the `SharedState.backend` mutex and make the ingest/watchdog
+/// threads die silently in cascade, but is surfaced as
+/// [`Event::Error`](flexaudio_core::types::Event::Error) ("reopen failed: ..."). It combines
+/// the stall mechanism of [`StallableMockBackend`] with the panic of
+/// [`PanickingMockBackend`].
 ///
-/// テスト用途のみ（公開 API ではない）。
+/// Test use only (not a public API).
 #[doc(hidden)]
 pub struct StallThenPanicOnReopenBackend {
     sample_rate: u32,
@@ -421,13 +427,15 @@ pub struct StallThenPanicOnReopenBackend {
     freq_hz: f32,
     stall_after: Duration,
     running: Arc<AtomicBool>,
-    /// `start()` 呼び出し回数。世代 0（初回）でのみ成功・給餌し、世代 1 以降で panic。
+    /// Number of `start()` calls. Succeeds and feeds only in generation 0 (the first); panics
+    /// in generation 1 and later.
     start_count: Arc<AtomicU32>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl StallThenPanicOnReopenBackend {
-    /// ネイティブ `(sample_rate, channels)`・周波数・初回失速までの経過時間を指定して作る。
+    /// Creates one with the native `(sample_rate, channels)`, frequency, and elapsed time
+    /// until the first stall.
     pub fn new(sample_rate: u32, channels: u16, freq_hz: f32, stall_after: Duration) -> Self {
         Self {
             sample_rate: sample_rate.max(1),
@@ -450,14 +458,14 @@ impl CaptureBackend for StallThenPanicOnReopenBackend {
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
-        // 世代を確定（0 始まり）。世代 1 以降＝ウォッチドッグ再オープンで panic する。
+        // Fix the generation (0-based). Generation 1 and later = watchdog reopen, which panics.
         let generation = self.start_count.fetch_add(1, Ordering::SeqCst);
         if generation >= 1 {
-            // ウォッチドッグスレッドからの再オープン。ここで panic させる。
+            // Reopen from the watchdog thread. Panic here.
             panic!("StallThenPanicOnReopenBackend: intentional panic on reopen start()");
         }
 
-        // 世代 0: 通常給餌（stall_after で給餌停止する＝失速）。
+        // Generation 0: normal feeding (stops feeding at stall_after = stall).
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let sample_rate = self.sample_rate;
