@@ -148,8 +148,6 @@ pub fn watch_devices() -> Result<DeviceWatcher> {
 /// itself without exclusion.
 ///
 /// # Example
-///
-/// # Example
 /// ```no_run
 /// use flexaudio::{open, StreamConfig, SourceKind};
 ///

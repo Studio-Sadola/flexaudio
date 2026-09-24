@@ -1130,7 +1130,7 @@ mod tests {
         c.on_output(DRIFT_UPDATE_INTERVAL_SAMPLES - 1, 0, 10_000_000);
         assert!(
             (c.ratio - 1.0).abs() < 1e-15,
-            "should not move below the interval: {}",
+            "should not move before the interval is reached: {}",
             c.ratio
         );
         c.on_output(1, 0, 10_000_000);
@@ -1379,8 +1379,8 @@ mod tests {
         let corrected = run_drift_sim(-300.0, 60, false);
         let uncorrected = run_drift_sim(-300.0, 60, true);
 
-        // Self-check: without correction the mic-side backlog grows monotonically, since it
-        // keeps pace with the slow system.
+        // Self-check: without correction the mic-side backlog grows monotonically, since mixing
+        // is paced by the slow system.
         for (i, w) in uncorrected.mic_backlog.windows(2).enumerate() {
             assert!(
                 w[1] > w[0],

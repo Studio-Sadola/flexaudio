@@ -335,7 +335,7 @@ fn parse_sources(spec: &str) -> std::result::Result<Vec<Segment>, String> {
         segments.push(Segment { kind, secs });
     }
     if segments.is_empty() {
-        return Err("--sources is empty (e.g.: mic:2,system:2)".into());
+        return Err("--sources is empty (e.g. mic:2,system:2)".into());
     }
     Ok(segments)
 }
@@ -561,8 +561,8 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
                 // This check is OS-independent.
                 if cli.process_id.is_none() {
                     return Err("--source process requires --process-id <PID>. \
-                     (Specify the PID of the target process, e.g. the PID obtained by \
-                     running speaker-test)"
+                     Specify the PID of the target process (e.g. the PID of a running \
+                     speaker-test)."
                         .into());
                 }
                 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
