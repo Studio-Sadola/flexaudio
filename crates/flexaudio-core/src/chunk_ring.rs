@@ -1,14 +1,14 @@
-//! 完成 [`AudioChunk`] の SPSC リング（ringbuf バック）。
+//! SPSC ring of finished [`AudioChunk`]s (backed by ringbuf).
 //!
-//! 満杯時は最古を pop して新規を push する（DROP_OLDEST）。ドロップ数を
-//! [`AtomicU64`] で数えて次チャンクの `dropped_before` に反映する。consumer は
-//! `try_pop()`。
+//! When full, it pops the oldest and pushes the new one (DROP_OLDEST). The drop count is counted
+//! with an [`AtomicU64`] and reflected in the next chunk's `dropped_before`. The consumer calls
+//! `try_pop()`.
 //!
-//! ringbuf の overwrite（`push_overwrite`）は producer が最古を pop する必要があり、
-//! これは consumer 側のインデックスにも触れるので SPSC のロックフリー前提を満たさない
-//! （overwrite を並行に行うにはロックが要る）。このリングの producer は RT スレッド
-//! ではなく取り込み/加工スレッド（通常優先度）なので、リング本体を短い [`Mutex`]
-//! で保護する。RT 経路（[`mod@crate::raw_ring`]）はこのロックに触れない。
+//! ringbuf's overwrite (`push_overwrite`) requires the producer to pop the oldest element, which
+//! also touches the consumer-side index and so breaks the lock-free SPSC assumption (concurrent
+//! overwrite requires a lock). The producer of this ring is not an RT thread but the
+//! ingest/processing thread (normal priority), so the ring itself is protected by a short-held
+//! [`Mutex`]. The RT path ([`mod@crate::raw_ring`]) never touches this lock.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,11 +20,11 @@ use crate::types::AudioChunk;
 
 type Shared = Arc<Mutex<HeapRb<AudioChunk>>>;
 
-/// 容量 `capacity_chunks` のチャンクリングを作る。
+/// Creates a chunk ring with capacity `capacity_chunks`.
 ///
-/// producer は加工スレッドへ、consumer は poll スレッドへ渡す。`dropped` カウンタは
-/// DROP_OLDEST で捨てたチャンク数を数え、次に push されるチャンクの `dropped_before`
-/// に反映される。
+/// The producer goes to the processing thread and the consumer to the poll thread. The `dropped`
+/// counter counts chunks discarded by DROP_OLDEST and is reflected in the `dropped_before` of the
+/// next pushed chunk.
 pub fn chunk_ring(capacity_chunks: usize) -> (ChunkProducer, ChunkConsumer) {
     let cap = capacity_chunks.max(1);
     let rb: Shared = Arc::new(Mutex::new(HeapRb::<AudioChunk>::new(cap)));
@@ -38,33 +38,34 @@ pub fn chunk_ring(capacity_chunks: usize) -> (ChunkProducer, ChunkConsumer) {
     )
 }
 
-/// 加工スレッド側のハンドル。DROP_OLDEST 方針で push する。
+/// Processing-thread-side handle. Pushes with the DROP_OLDEST policy.
 pub struct ChunkProducer {
     rb: Shared,
     dropped: Arc<AtomicU64>,
 }
 
 impl ChunkProducer {
-    /// チャンクを push する。満杯なら最古を捨て（DROP_OLDEST）、捨てた数を数える。
+    /// Pushes a chunk. If full, discards the oldest (DROP_OLDEST) and counts the discards.
     ///
-    /// `dropped_before` には、このチャンクが入るまでに累計で捨てたチャンク数
-    /// （このチャンクのための追い出し 1 件を含む）を入れる。消費側は連続チャンクの
-    /// `dropped_before` の差分で直前の欠落数を、絶対値で累計欠落数を知れる。
+    /// `dropped_before` is set to the cumulative number of chunks discarded up to the point this
+    /// chunk enters (including the one eviction made for this chunk). The consumer can learn the
+    /// number of chunks just missed from the difference in `dropped_before` between consecutive
+    /// chunks, and the cumulative number missed from its absolute value.
     ///
-    /// この push でドロップが起きたら `Some(累計ドロップ数)` を返す
-    /// （[`crate::types::Event::ChunkDropped`] の発火判断に使える）。起きなければ `None`。
+    /// Returns `Some(cumulative drop count)` if this push caused a drop (usable to decide whether
+    /// to fire [`crate::types::Event::ChunkDropped`]). Otherwise returns `None`.
     pub fn push(&mut self, mut chunk: AudioChunk) -> Option<u64> {
-        // poison（別スレッドがロック保持中に panic）でもリング本体は壊れないので、連鎖
-        // panic させず内部値を回収して続ける。
+        // Even on poison (another thread panicked while holding the lock) the ring itself is
+        // not corrupted, so recover the inner value and continue instead of cascading the panic.
         let mut rb = self.rb.lock().unwrap_or_else(|e| e.into_inner());
 
-        // この push が最古を追い出す（満杯）か先に見ておく。
+        // Check up front whether this push evicts the oldest (full).
         let will_evict = rb.is_full();
 
         if will_evict {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
-        // この push の追い出し分を含めた累計ドロップ数を載せる。
+        // Record the cumulative drop count, including this push's eviction.
         let total = self.dropped.load(Ordering::Relaxed);
         chunk.dropped_before = u32::try_from(total).unwrap_or(u32::MAX);
 
@@ -80,41 +81,41 @@ impl ChunkProducer {
         }
     }
 
-    /// これまでに DROP_OLDEST で捨てた累計チャンク数。
+    /// Cumulative number of chunks discarded by DROP_OLDEST so far.
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 }
 
-/// poll スレッド側のハンドル。`try_pop` で消費する。
+/// Poll-thread-side handle. Consumes with `try_pop`.
 pub struct ChunkConsumer {
     rb: Shared,
     dropped: Arc<AtomicU64>,
 }
 
 impl ChunkConsumer {
-    /// 最古のチャンクを 1 つ取り出す。無ければ `None`（非ブロッキング）。
+    /// Takes out the oldest chunk. Returns `None` if there is none (non-blocking).
     pub fn try_pop(&mut self) -> Option<AudioChunk> {
-        // poison でもリングは壊れないので回収して続ける。
+        // The ring is not corrupted even on poison, so recover and continue.
         let mut rb = self.rb.lock().unwrap_or_else(|e| e.into_inner());
         rb.try_pop()
     }
 
-    /// 現在リングに溜まっているチャンク数。
+    /// Number of chunks currently held in the ring.
     pub fn len(&self) -> usize {
-        // poison でもリングは壊れないので回収して続ける。
+        // The ring is not corrupted even on poison, so recover and continue.
         self.rb
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .occupied_len()
     }
 
-    /// リングが空か。
+    /// Whether the ring is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// これまでに DROP_OLDEST で捨てた累計チャンク数。
+    /// Cumulative number of chunks discarded by DROP_OLDEST so far.
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -155,30 +156,30 @@ mod tests {
     #[test]
     fn drop_oldest_when_full_and_counts() {
         let (mut p, mut c) = chunk_ring(2);
-        // 容量 2 を埋める。
+        // Fill capacity 2.
         assert_eq!(p.push(chunk(0)), None);
         assert_eq!(p.push(chunk(1)), None);
         assert_eq!(p.dropped_count(), 0);
 
-        // 満杯 → 最古(seq0)を捨てて seq2 を入れる。
+        // Full -> discard the oldest (seq0) and insert seq2.
         let dropped_total = p.push(chunk(2));
         assert_eq!(dropped_total, Some(1));
         assert_eq!(p.dropped_count(), 1);
 
-        // 次の push でさらにもう 1 件ドロップ。
+        // The next push drops one more.
         let dropped_total = p.push(chunk(3));
         assert_eq!(dropped_total, Some(2));
         assert_eq!(p.dropped_count(), 2);
 
-        // 残っているのは最新 2 件 seq2, seq3。
+        // What remains is the newest 2: seq2, seq3.
         let first = c.try_pop().unwrap();
         assert_eq!(first.seq, 2);
-        // seq2 が入るまでの累計ドロップ = 1（seq0 を捨てた）。
+        // Cumulative drops up to seq2 entering = 1 (seq0 was discarded).
         assert_eq!(first.dropped_before, 1);
 
         let second = c.try_pop().unwrap();
         assert_eq!(second.seq, 3);
-        // seq3 が入るまでの累計ドロップ = 2（seq0, seq1 を捨てた）。
+        // Cumulative drops up to seq3 entering = 2 (seq0 and seq1 were discarded).
         assert_eq!(second.dropped_before, 2);
 
         assert!(c.try_pop().is_none());
@@ -187,33 +188,33 @@ mod tests {
     #[test]
     fn dropped_before_is_cumulative() {
         let (mut p, mut c) = chunk_ring(1);
-        p.push(chunk(0)); // 入る（dropped_before=0）
-                          // 容量1で満杯 → 毎回ドロップ。
-        p.push(chunk(1)); // seq0 捨て、累計ドロップ=1
-        c.try_pop(); // seq1 取り出し → 空く
-        let r = p.push(chunk(2)); // 空いているので入る、ドロップ無し
+        p.push(chunk(0)); // enters (dropped_before=0)
+                          // Capacity 1 and full -> drops every time.
+        p.push(chunk(1)); // seq0 discarded, cumulative drops=1
+        c.try_pop(); // take seq1 -> ring becomes empty
+        let r = p.push(chunk(2)); // there is room, so it enters with no drop
         assert_eq!(r, None);
         let got = c.try_pop().unwrap();
         assert_eq!(got.seq, 2);
-        // ドロップは増えていないが累計は 1 のまま保持される。
+        // No new drop, but the cumulative count is kept at 1.
         assert_eq!(got.dropped_before, 1);
         assert_eq!(p.dropped_count(), 1);
     }
 
-    /// 容量 0 は `max(1)` へ丸められ、容量 1 のリングとして機能する（panic しない）。
+    /// Capacity 0 is rounded up by `max(1)` and works as a capacity-1 ring (no panic).
     #[test]
     fn zero_capacity_is_clamped_to_one() {
         let (mut p, mut c) = chunk_ring(0);
         assert!(c.is_empty());
-        assert_eq!(p.push(chunk(0)), None); // 1 件入る。
+        assert_eq!(p.push(chunk(0)), None); // one enters.
         assert_eq!(c.len(), 1);
-        // 満杯 → 次は最古を捨てる。
+        // Full -> the next one discards the oldest.
         assert_eq!(p.push(chunk(1)), Some(1));
         let got = c.try_pop().unwrap();
         assert_eq!(got.seq, 1);
     }
 
-    /// `len` / `is_empty` が push/pop に追従し、容量を超えない（off-by-one 防止）。
+    /// `len` / `is_empty` track push/pop and never exceed capacity (off-by-one guard).
     #[test]
     fn len_tracks_occupancy_and_is_capped() {
         let (mut p, mut c) = chunk_ring(3);
@@ -223,11 +224,11 @@ mod tests {
         }
         assert_eq!(c.len(), 3);
         assert!(!c.is_empty());
-        // 満杯後にさらに 2 件 → 容量は 3 のまま（最古を捨てて入れ替え）。
+        // 2 more after full -> capacity stays 3 (the oldest is discarded and replaced).
         p.push(chunk(3));
         p.push(chunk(4));
-        assert_eq!(c.len(), 3, "占有数は容量 3 を超えない");
-        // 残るのは最新 3 件 seq2,3,4。
+        assert_eq!(c.len(), 3, "occupancy does not exceed capacity 3");
+        // What remains is the newest 3: seq2,3,4.
         assert_eq!(c.try_pop().unwrap().seq, 2);
         assert_eq!(c.try_pop().unwrap().seq, 3);
         assert_eq!(c.try_pop().unwrap().seq, 4);
@@ -235,17 +236,21 @@ mod tests {
         assert!(c.is_empty());
     }
 
-    /// 空リングからの `try_pop` は None（非ブロッキング）。producer/consumer は
-    /// dropped カウンタを共有する。
+    /// `try_pop` on an empty ring returns None (non-blocking). The producer and consumer share
+    /// the dropped counter.
     #[test]
     fn empty_pop_is_none_and_dropped_is_shared() {
         let (mut p, mut c) = chunk_ring(2);
         assert!(c.try_pop().is_none());
-        // 容量 2 → 1 件ドロップさせる。
+        // Capacity 2 -> cause one drop.
         p.push(chunk(0));
         p.push(chunk(1));
-        p.push(chunk(2)); // seq0 を捨てる。
+        p.push(chunk(2)); // discards seq0.
         assert_eq!(p.dropped_count(), 1);
-        assert_eq!(c.dropped_count(), 1, "consumer 側も同じ dropped を観測する");
+        assert_eq!(
+            c.dropped_count(),
+            1,
+            "the consumer side observes the same dropped count"
+        );
     }
 }

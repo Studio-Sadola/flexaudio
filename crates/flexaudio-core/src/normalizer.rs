@@ -1,31 +1,32 @@
-//! 任意のデバイスフレーム（任意 SR / 任意 ch / interleaved f32）を 2 段で
-//! 正規化・再変換する。
+//! Normalizes and re-converts arbitrary device frames (any SR / any ch / interleaved f32) in
+//! two stages.
 //!
 //! ```text
-//! 入力(任意 SR/ch)
-//!   │  第 1 段（内部正規化・不変）
-//!   │   ・チャンネル mix（→stereo）
-//!   │   ・SR 変換（rubato, →48000）
+//! Input (any SR/ch)
+//!   │  Stage 1 (internal normalization, invariant)
+//!   │   - channel mix (→stereo)
+//!   │   - SR conversion (rubato, →48000)
 //!   ▼
-//! 内部正規形: f32 / 48000 Hz / stereo / 20ms = 960 frame
-//!   │  第 2 段（出口・新規）
-//!   │   ・チャンネル変換（stereo→mono 平均 / mono→stereo 複製 / そのまま）
-//!   │   ・SR 変換（rubato, 48000→output.sample_rate。等しければパススルー）
+//! Internal canonical form: f32 / 48000 Hz / stereo / 20ms = 960 frame
+//!   │  Stage 2 (exit, new)
+//!   │   - channel conversion (stereo→mono average / mono→stereo duplicate / as-is)
+//!   │   - SR conversion (rubato, 48000→output.sample_rate; passthrough if equal)
 //!   ▼
-//! 出力: f32 / output.sample_rate / output.channels / 時間ベース 20ms 固定
-//!        （48k=960 / 16k=320 / 8k=160 frame）
+//! Output: f32 / output.sample_rate / output.channels / fixed 20ms in time
+//!        (48k=960 / 16k=320 / 8k=160 frame)
 //! ```
 //!
-//! 既定の出力 `{48000, 2}` なら第 2 段は丸ごとパススルー（内部正規形がそのまま出る）。
-//! 第 1 段の SR 変換は `in_sample_rate == 48000` で、第 2 段の SR 変換は
-//! `output.sample_rate == 48000` でそれぞれパススルーになる。
+//! With the default output `{48000, 2}`, stage 2 is an entire passthrough (the internal
+//! canonical form comes out as-is). Stage 1's SR conversion is a passthrough when
+//! `in_sample_rate == 48000`, and stage 2's SR conversion when `output.sample_rate == 48000`.
 //!
-//! どちらの rubato リサンプラも `FixedAsync::Input`（固定入力チャンク）で、生成された
-//! 可変長出力を内部 accumulator に集約し、20ms 相当の境界で切り出す。端数はリサンプラ
-//! 内部と accumulator が次へ持ち越す。
+//! Both rubato resamplers use `FixedAsync::Input` (fixed input chunks); the variable-length
+//! output they produce is gathered into an internal accumulator and sliced at 20ms-equivalent
+//! boundaries. Remainders are carried over to the next round by the resampler internals and the
+//! accumulator.
 //!
-//! PTS は出力チャンク先頭サンプルに対応する device_pts を、入力→出力サンプルオフセット
-//! の比で追跡して割り当てる。seq はストリーム層が付与する。
+//! PTS is assigned by tracking the device_pts corresponding to each output chunk's first sample
+//! via the ratio of input→output sample offsets. seq is assigned by the stream layer.
 
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
@@ -35,10 +36,11 @@ use rubato::{
 
 use crate::types::{Error, OutputFormat, Result, CHANNELS, SAMPLE_RATE};
 
-/// 内部正規形 1 チャンクのフレーム数（20ms @ 48kHz）。第 1 段の切り出し境界。
+/// Frames in one chunk of the internal canonical form (20ms @ 48kHz). Stage 1's slicing
+/// boundary.
 pub const CHUNK_FRAMES: usize = 960;
 
-/// 内部正規形のチャンネル数（stereo）。
+/// Channel count of the internal canonical form (stereo).
 const INNER_CH: usize = CHANNELS as usize; // 2
 
 /// A processor applied to the internal normalized form (48kHz / stereo /
@@ -63,112 +65,121 @@ pub trait InnerProcessor: Send {
     fn flush(&mut self) -> Vec<f32>;
 }
 
-/// 入力デバイスフレームを内部正規形（48k/stereo/960frame）へ正規化し、さらに
-/// 1 つ以上の出力タップ（主 + 任意で副）へ再変換するステートフルな 2 段変換器。
+/// Stateful two-stage converter that normalizes input device frames to the internal canonical
+/// form (48k/stereo/960frame) and further re-converts them into one or more output taps
+/// (primary + optionally secondary).
 ///
-/// 第 1 段（内部正規化）は 1 度だけ実行し、生成した内部正規形を主・副の各第 2 段へ
-/// 供給する。任意の [`InnerProcessor`] を注入すると、第 2 段への分岐前に内部正規形へ
-/// 1 度だけ適用される（両タップが同じ加工済み音を受ける）。
+/// Stage 1 (internal normalization) runs only once, and the internal canonical form it produces
+/// is supplied to each of the primary and secondary stage 2s. An injected [`InnerProcessor`] is
+/// applied to the internal canonical form exactly once before branching into stage 2 (both taps
+/// receive the same processed audio).
 ///
-/// `push` で interleaved サンプルを蓄積し、`pop_chunk`（主）/ `pop_secondary`（副）で
-/// 完成済みの出力チャンクを 1 つずつ取り出す。
+/// `push` accumulates interleaved samples, and `pop_chunk` (primary) / `pop_secondary`
+/// (secondary) take out finished output chunks one at a time.
 pub struct Normalizer {
     in_sample_rate: u32,
     in_channels: usize,
 
-    // --- 第 1 段（内部正規化: → 48k/stereo・全出力タップで共有） ---
-    /// 48000 入力ならパススルー（リサンプラ無し）。
+    // --- Stage 1 (internal normalization: → 48k/stereo, shared by all output taps) ---
+    /// Passthrough (no resampler) for 48000 input.
     stage1_resampler: Option<ResamplerState>,
-    /// この push で第 1 段が生成した内部正規形（48k/stereo interleaved）の一時バッファ。
-    /// 加工（[`InnerProcessor`]）してから各出力タップへ配る。容量は再利用する。
+    /// Temporary buffer holding the internal canonical form (48k/stereo interleaved) produced
+    /// by stage 1 in this push. It is processed ([`InnerProcessor`]) and then distributed to
+    /// each output tap. Its capacity is reused.
     inner_scratch: Vec<f32>,
-    /// これまでに第 1 段が生成した累計内部 48k フレーム数（PTS アンカー計算用）。
+    /// Cumulative internal 48k frames produced by stage 1 so far (for PTS anchor calculation).
     total_inner_frames: u64,
 
-    /// 内部正規形へ第 2 段分岐前に 1 度だけ適用する任意プロセッサ（例: ノイズ抑制）。
+    /// Optional processor (e.g. noise suppression) applied once to the internal canonical form
+    /// before branching into stage 2.
     inner_processor: Option<Box<dyn InnerProcessor>>,
 
-    // --- 出力タップ（各自が第 2 段・出力バッファ・PTS 状態を持つ） ---
-    /// 主出力タップ（[`OutputFormat`] は `output`）。
+    // --- Output taps (each owns its own stage 2, output buffer, and PTS state) ---
+    /// Primary output tap ([`OutputFormat`] is `output`).
     primary: OutputTap,
-    /// 副出力タップ（設定時のみ）。主とは独立の第 2 段・PTS 状態を持つ。
+    /// Secondary output tap (only when configured). Has its own stage 2 and PTS state,
+    /// independent of the primary.
     secondary: Option<OutputTap>,
 }
 
-/// 1 つの出力タップ。共有の内部正規形（48k/stereo）を受け、チャンネル変換 + SR 変換で
-/// 自身の [`OutputFormat`] へ再変換し、20ms 固定チャンクを切り出す。各タップは独立の
-/// PTS アンカー・出力バッファを持つ（主副で PTS が数十msズレる理由）。
+/// One output tap. It receives the shared internal canonical form (48k/stereo), re-converts it
+/// to its own [`OutputFormat`] via channel conversion + SR conversion, and slices fixed 20ms
+/// chunks. Each tap has its own PTS anchor and output buffer (which is why the primary and
+/// secondary PTS differ by tens of ms).
 struct OutputTap {
     output: OutputFormat,
-    /// 出口段。`output == {48000, 2}`（内部正規形と同一）なら `None`（完全パススルー）。
+    /// Exit stage. `None` (full passthrough) when `output == {48000, 2}` (identical to the
+    /// internal canonical form).
     stage2: Option<OutputStage>,
-    /// 完成待ちの出力（output.channels の interleaved）。`pop` がここから切る。
+    /// Output awaiting completion (interleaved with output.channels). `pop` slices from here.
     out_buf: Vec<f32>,
-    /// 出力 1 チャンクのフレーム数（`output.chunk_frames()`）。
+    /// Frames in one output chunk (`output.chunk_frames()`).
     out_chunk_frames: usize,
-    /// 出力チャンネル数。
+    /// Output channel count.
     out_channels: usize,
-    /// `out_buf` 先頭（まだ pop していない最古サンプル）に対応する出力フレーム索引。
+    /// Output frame index corresponding to the start of `out_buf` (the oldest sample not yet
+    /// popped).
     out_frame_origin: u64,
-    /// PTS アンカー: ある出力フレーム索引に device_pts(ns) を結び付ける。
+    /// PTS anchor: binds a device_pts (ns) to a given output frame index.
     pts_anchor: Option<PtsAnchor>,
 }
 
 #[derive(Clone, Copy)]
 struct PtsAnchor {
-    /// 出力フレーム索引（出力レート基準）。
+    /// Output frame index (in the output rate).
     out_frame: u64,
-    /// その出力フレームに対応する device_pts(ns)。
+    /// device_pts (ns) corresponding to that output frame.
     pts_ns: i64,
 }
 
-/// rubato `Async`（`FixedAsync::Input`）を 1 段ぶん束ねた SR 変換器。
+/// SR converter wrapping one stage of rubato `Async` (`FixedAsync::Input`).
 ///
-/// 固定入力チャンク `chunk_in_frames` ごとに `process` し、可変長出力を
-/// `out_buf`（呼び出し側 accumulator）へ追記する。`channels` は段によって
-/// 異なる（第 1 段は常に stereo=2、第 2 段は出力チャンネル数）。
+/// It calls `process` for each fixed input chunk of `chunk_in_frames` and appends the
+/// variable-length output to `out_buf` (the caller's accumulator). `channels` differs per stage
+/// (always stereo=2 for stage 1, the output channel count for stage 2).
 struct ResamplerState {
     inner: Async<f32>,
     channels: usize,
-    /// rubato が要求する 1 回分の入力フレーム数（`FixedAsync::Input` で固定）。
+    /// Input frames rubato requires per call (fixed by `FixedAsync::Input`).
     chunk_in_frames: usize,
-    /// 1 回の `process` が生成しうる最大出力フレーム数。
+    /// Maximum output frames a single `process` can produce.
     max_out_frames: usize,
-    /// 未処理の入力（interleaved・`channels` ch）。
+    /// Unprocessed input (interleaved, `channels` ch).
     in_accum: Vec<f32>,
-    /// rubato への出力スクラッチ（再利用してアロケートを避ける）。
+    /// Output scratch for rubato (reused to avoid allocation).
     out_scratch: Vec<f32>,
 }
 
-/// 第 2 段（出口）。内部正規形 48k/stereo の 960frame チャンクを受け、
-/// チャンネル変換 → SR 変換して出力フォーマットの interleaved を生成する。
+/// Stage 2 (exit). Receives 960frame chunks of the internal canonical form 48k/stereo, and
+/// produces interleaved output in the output format via channel conversion → SR conversion.
 struct OutputStage {
     out_channels: usize,
-    /// 48000 → output.sample_rate のリサンプラ。`output.sample_rate == 48000`
-    /// なら `None`（SR パススルー）。チャンネル変換後のサンプルに適用する。
+    /// Resampler for 48000 → output.sample_rate. `None` (SR passthrough) when
+    /// `output.sample_rate == 48000`. Applied to the samples after channel conversion.
     resampler: Option<ResamplerState>,
-    /// チャンネル変換後・SR 変換前のスクラッチ（48k / out_channels interleaved）。
+    /// Scratch after channel conversion and before SR conversion (48k / out_channels
+    /// interleaved).
     ch_scratch: Vec<f32>,
 }
 
 impl Normalizer {
-    /// 入力 SR / 入力チャンネル数 / 出力フォーマットを指定して正規化器を作る。
+    /// Creates a normalizer given the input SR / input channel count / output format.
     ///
-    /// 第 1 段は入力を 48k/stereo へ正規化する（`in_sample_rate == 48000` なら SR
-    /// パススルー、`in_channels` が 1 なら mono→stereo 複製、2 はそのまま、3 以上は
-    /// フロント 2ch を採る）。第 2 段は内部正規形を `output` へ再変換する
-    /// （`output == {48000, 2}` ならパススルー）。
+    /// Stage 1 normalizes the input to 48k/stereo (SR passthrough when `in_sample_rate ==
+    /// 48000`; for `in_channels` 1 it duplicates mono→stereo, 2 is kept as-is, and 3 or more
+    /// takes the front 2ch). Stage 2 re-converts the internal canonical form to `output`
+    /// (passthrough when `output == {48000, 2}`).
     ///
-    /// `output` は呼び出し側で [`OutputFormat::validate`] 済みであることを期待する
-    /// （ここでは妥当域へ丸めない）。
+    /// `output` is expected to have been checked with [`OutputFormat::validate`] by the caller
+    /// (it is not clamped into the valid range here).
     ///
-    /// rubato リサンプラの構築は極端なレート比などで失敗し得る。panic させると非 RT
-    /// の取り込みスレッドが無言で止まるため、失敗時は [`Error::Backend`] を返して
-    /// 呼び出し側に伝播させる。
+    /// Building a rubato resampler can fail, e.g. for extreme rate ratios. A panic would silently
+    /// stop the non-RT ingest thread, so on failure this returns [`Error::Backend`] and lets the
+    /// caller propagate it.
     pub fn new(in_sample_rate: u32, in_channels: u16, output: OutputFormat) -> Result<Self> {
         let in_channels = in_channels.max(1) as usize;
 
-        // 第 1 段リサンプラ（→48000）。全出力タップで 1 度だけ実行する。
+        // Stage 1 resampler (→48000). Runs only once for all output taps.
         let stage1_resampler = if in_sample_rate == SAMPLE_RATE {
             None
         } else {
@@ -187,59 +198,62 @@ impl Normalizer {
         })
     }
 
-    /// 副出力タップを追加する（[`OutputFormat::validate`] 済みであることを期待する）。
+    /// Adds a secondary output tap (expected to have been checked with
+    /// [`OutputFormat::validate`]).
     ///
-    /// 内部正規形（48k/stereo）は 1 度だけ生成して主・副の両第 2 段へ供給する。副タップは
-    /// 独立の第 2 段・PTS 状態を持ち、主とは別に 20ms 固定チャンクを生成する。rubato 構築
-    /// 失敗時は [`Error::Backend`]。
+    /// The internal canonical form (48k/stereo) is produced only once and supplied to both the
+    /// primary and secondary stage 2s. The secondary tap has its own stage 2 and PTS state and
+    /// produces fixed 20ms chunks separately from the primary. Returns [`Error::Backend`] if
+    /// building rubato fails.
     pub fn with_secondary(mut self, secondary: OutputFormat) -> Result<Self> {
         self.secondary = Some(OutputTap::new(secondary)?);
         Ok(self)
     }
 
-    /// 内部正規形（48k/stereo）へ第 2 段分岐前に 1 度だけ適用するプロセッサを注入する。
+    /// Injects a processor applied once to the internal canonical form (48k/stereo) before
+    /// branching into stage 2.
     pub fn with_inner_processor(mut self, processor: Box<dyn InnerProcessor>) -> Self {
         self.inner_processor = Some(processor);
         self
     }
 
-    /// 入力サンプルレート（Hz）。
+    /// Input sample rate (Hz).
     pub fn in_sample_rate(&self) -> u32 {
         self.in_sample_rate
     }
 
-    /// 主出力フォーマット。
+    /// Primary output format.
     pub fn output(&self) -> OutputFormat {
         self.primary.output
     }
 
-    /// 副出力フォーマット（副タップ設定時のみ）。
+    /// Secondary output format (only when a secondary tap is configured).
     pub fn secondary_output(&self) -> Option<OutputFormat> {
         self.secondary.as_ref().map(|t| t.output)
     }
 
-    /// 副タップが有効か。
+    /// Whether the secondary tap is enabled.
     pub fn has_secondary(&self) -> bool {
         self.secondary.is_some()
     }
 
-    /// 第 1 段 SR 変換がパススルー（in == 48000）か。
+    /// Whether stage 1's SR conversion is a passthrough (in == 48000).
     pub fn is_passthrough(&self) -> bool {
         self.stage1_resampler.is_none()
     }
 
-    /// 主出力の第 2 段が完全パススルー（output == {48000, 2}）か。
+    /// Whether the primary output's stage 2 is a full passthrough (output == {48000, 2}).
     pub fn is_output_passthrough(&self) -> bool {
         self.primary.stage2.is_none()
     }
 
-    /// interleaved 入力サンプルを蓄積する。
+    /// Accumulates interleaved input samples.
     ///
-    /// `interleaved` の長さは `in_channels` の倍数であること。`device_pts_ns` は
-    /// この push の先頭フレームに対応するデバイス由来 PTS。
+    /// The length of `interleaved` must be a multiple of `in_channels`. `device_pts_ns` is the
+    /// device-derived PTS corresponding to the first frame of this push.
     ///
-    /// rubato の `process` が失敗したら [`Error::Backend`] を返す（panic させて取り込み
-    /// スレッドを無言で止めない。呼び出し側がストリームを明示停止できる）。
+    /// Returns [`Error::Backend`] if rubato's `process` fails (instead of panicking and silently
+    /// stopping the ingest thread; the caller can stop the stream explicitly).
     pub fn push(&mut self, interleaved: &[f32], device_pts_ns: i64) -> Result<()> {
         if interleaved.is_empty() {
             return Ok(());
@@ -249,22 +263,23 @@ impl Normalizer {
             return Ok(());
         }
 
-        // この push 先頭が将来現れる出力フレーム位置を比で近似して各タップの PTS アンカーを
-        // 更新する（リサンプラ内部の保持端数があるため近似）。主副はそれぞれ独立に張る。
+        // Update each tap's PTS anchor by approximating, via the ratio, the output frame position
+        // at which the start of this push will appear (approximate because of remainders held
+        // inside the resampler). The primary and secondary each set theirs independently.
         self.primary
             .update_pts_anchor(self.total_inner_frames, device_pts_ns);
         if let Some(sec) = self.secondary.as_mut() {
             sec.update_pts_anchor(self.total_inner_frames, device_pts_ns);
         }
 
-        // 第 1 段: チャンネル mix → stereo interleaved → 48k 正規化。この push の生成分を
-        // inner_scratch に集める。
+        // Stage 1: channel mix → stereo interleaved → 48k normalization. Gather what this push
+        // produces into inner_scratch.
         self.inner_scratch.clear();
         let mut stereo = Vec::with_capacity(in_frames * INNER_CH);
         Self::mix_to_stereo(interleaved, self.in_channels, in_frames, &mut stereo);
         match &mut self.stage1_resampler {
             None => {
-                // SR パススルー。そのまま内部正規形へ。
+                // SR passthrough. Straight into the internal canonical form.
                 self.total_inner_frames += in_frames as u64;
                 self.inner_scratch.extend_from_slice(&stereo);
             }
@@ -275,36 +290,41 @@ impl Normalizer {
             }
         }
 
-        // 第 2 段分岐前に内部正規形へプロセッサ（例: denoise）を 1 度だけ適用する。
+        // Apply the processor (e.g. denoise) once to the internal canonical form before
+        // branching into stage 2.
         if let Some(proc) = self.inner_processor.as_mut() {
             proc.process(&mut self.inner_scratch);
         }
 
-        // 加工済み内部正規形を主・副の各第 2 段へ配る。
+        // Distribute the processed internal canonical form to each of the primary and secondary
+        // stage 2s.
         self.distribute_inner()
     }
 
-    /// 完成済みの主出力チャンクを 1 つ取り出す。
+    /// Takes out one finished primary output chunk.
     ///
-    /// 返り値は `(output.channels interleaved の `out_chunk_frames` frame, 先頭サンプル
-    /// の device_pts(ns))`。1 チャンク分溜まっていなければ `None`。
+    /// Returns `(`out_chunk_frames` frames of output.channels interleaved, device_pts (ns) of
+    /// the first sample)`. Returns `None` if one chunk's worth has not accumulated.
     pub fn pop_chunk(&mut self) -> Option<(Vec<f32>, i64)> {
         self.primary.pop()
     }
 
-    /// 完成済みの副出力チャンクを 1 つ取り出す（副タップ未設定なら常に `None`）。
+    /// Takes out one finished secondary output chunk (always `None` if no secondary tap is
+    /// configured).
     pub fn pop_secondary(&mut self) -> Option<(Vec<f32>, i64)> {
         self.secondary.as_mut().and_then(OutputTap::pop)
     }
 
-    /// 停止時のフラッシュ。プロセッサ（denoise 等）の末尾テールを流し込み、各タップの
-    /// 第 2 段リサンプラ残余を吐き切り、末尾の端数チャンクは無音でパディングして 20ms
-    /// 固定境界に揃える（`pop_chunk` / `pop_secondary` で取り切れるようにする）。
+    /// Flush at stop. Feeds in the processor's (denoise, etc.) trailing tail, drains the
+    /// remainder of each tap's stage 2 resampler, and pads the final partial chunk with silence
+    /// to align to the fixed 20ms boundary (so everything can be taken with `pop_chunk` /
+    /// `pop_secondary`).
     ///
-    /// リサンプラのフラッシュが失敗しても停止経路を止めないよう、ベストエフォートで
-    /// 続ける（末尾数 ms の欠落に留まる）。
+    /// Continues best-effort even if a resampler flush fails, so the stop path is not halted
+    /// (the loss is limited to the last few ms).
     pub fn flush(&mut self) {
-        // 1. プロセッサの末尾テール（例: denoise の遅延線）を内部正規形として流し込む。
+        // 1. Feed the processor's trailing tail (e.g. denoise's delay line) in as internal
+        //    canonical form.
         if let Some(proc) = self.inner_processor.as_mut() {
             let tail = proc.flush();
             if !tail.is_empty() {
@@ -313,22 +333,23 @@ impl Normalizer {
                 let _ = self.distribute_inner();
             }
         }
-        // 2. 各タップの第 2 段リサンプラ残余を吐き出し、端数チャンクを無音パディング。
+        // 2. Drain each tap's stage 2 resampler remainder and pad the partial chunk with silence.
         self.primary.flush();
         if let Some(sec) = self.secondary.as_mut() {
             sec.flush();
         }
     }
 
-    /// 現在 `out_buf`（主タップ）に溜まっている未取り出し出力フレーム数。
+    /// Number of not-yet-taken output frames currently held in `out_buf` (primary tap).
     pub fn buffered_out_frames(&self) -> usize {
         self.primary.buffered_out_frames()
     }
 
-    // --- 内部ヘルパ ---
+    // --- Internal helpers ---
 
-    /// `inner_scratch` の内部正規形を主・副の各第 2 段へ配る（借用衝突を避けるため一時的に
-    /// バッファを取り出してから配り、容量を戻す）。
+    /// Distributes the internal canonical form in `inner_scratch` to each of the primary and
+    /// secondary stage 2s (to avoid a borrow conflict, the buffer is taken out temporarily,
+    /// distributed, and its capacity returned).
     fn distribute_inner(&mut self) -> Result<()> {
         if self.inner_scratch.is_empty() {
             return Ok(());
@@ -340,29 +361,29 @@ impl Normalizer {
             .as_mut()
             .map(|sec| sec.feed_inner(&inner))
             .unwrap_or(Ok(()));
-        // 容量を再利用するためバッファを戻す。
+        // Put the buffer back to reuse its capacity.
         self.inner_scratch = inner;
         self.inner_scratch.clear();
         r_primary.and(r_secondary)
     }
 
-    /// 任意 ch interleaved を stereo interleaved へ mix して `dst` に push する。
+    /// Mixes any-ch interleaved into stereo interleaved and pushes it into `dst`.
     fn mix_to_stereo(src: &[f32], in_ch: usize, in_frames: usize, dst: &mut Vec<f32>) {
         match in_ch {
             1 => {
-                // mono → stereo（L=R 複製）
+                // mono → stereo (duplicate L=R)
                 for &s in &src[..in_frames] {
                     dst.push(s);
                     dst.push(s);
                 }
             }
             2 => {
-                // 2ch はそのまま（必要分のみ）
+                // 2ch as-is (only the needed part)
                 dst.extend_from_slice(&src[..in_frames * 2]);
             }
             _ => {
-                // >2ch は当面フロント 2ch を採る。
-                // TODO(BS.775): 5.1 等の正式なダウンミックス係数を適用する。
+                // >2ch takes the front 2ch for now.
+                // TODO(BS.775): apply proper downmix coefficients for 5.1 etc.
                 for f in 0..in_frames {
                     let base = f * in_ch;
                     dst.push(src[base]);
@@ -374,12 +395,13 @@ impl Normalizer {
 }
 
 impl OutputTap {
-    /// 出力フォーマットから出力タップを作る（`output` は検証済みを期待する）。
+    /// Creates an output tap from an output format (`output` is expected to be validated).
     fn new(output: OutputFormat) -> Result<Self> {
         let out_channels = (output.channels.max(1)) as usize;
         let out_chunk_frames = output.chunk_frames().max(1);
 
-        // 出力が内部正規形と完全一致なら第 2 段は不要（パススルー）。
+        // If the output exactly matches the internal canonical form, stage 2 is unnecessary
+        // (passthrough).
         let stage2 = if output.sample_rate == SAMPLE_RATE && out_channels == INNER_CH {
             None
         } else {
@@ -397,15 +419,15 @@ impl OutputTap {
         })
     }
 
-    /// 加工済み内部正規形（48k/stereo interleaved・任意長）を第 2 段へ通し、生成された
-    /// 出力フレームを `out_buf` へ追記する。
+    /// Passes the processed internal canonical form (48k/stereo interleaved, any length)
+    /// through stage 2 and appends the produced output frames to `out_buf`.
     fn feed_inner(&mut self, inner_stereo: &[f32]) -> Result<()> {
         if inner_stereo.is_empty() {
             return Ok(());
         }
         match &mut self.stage2 {
             None => {
-                // 第 2 段パススルー（output == {48000, 2}）。そのまま追記。
+                // Stage 2 passthrough (output == {48000, 2}). Append as-is.
                 self.out_buf.extend_from_slice(inner_stereo);
             }
             Some(stage) => stage.process_inner(inner_stereo, &mut self.out_buf)?,
@@ -413,7 +435,7 @@ impl OutputTap {
         Ok(())
     }
 
-    /// 完成済み出力チャンクを 1 つ取り出す。1 チャンク分溜まっていなければ `None`。
+    /// Takes out one finished output chunk. `None` if one chunk's worth has not accumulated.
     fn pop(&mut self) -> Option<(Vec<f32>, i64)> {
         let need = self.out_chunk_frames * self.out_channels;
         if self.out_buf.len() < need {
@@ -425,11 +447,11 @@ impl OutputTap {
         Some((chunk, pts))
     }
 
-    /// 停止時フラッシュ。第 2 段リサンプラの残余を吐き出し、末尾の端数チャンクを無音で
-    /// パディングして 20ms 固定境界へ揃える（`pop` で取り切れるようにする）。
+    /// Flush at stop. Drains stage 2's resampler remainder and pads the final partial chunk
+    /// with silence to align to the fixed 20ms boundary (so everything can be taken with `pop`).
     fn flush(&mut self) {
         if let Some(stage) = self.stage2.as_mut() {
-            // リサンプラのフラッシュ失敗はベストエフォートで無視（末尾数 ms の欠落のみ）。
+            // A resampler flush failure is ignored best-effort (only the last few ms are lost).
             let _ = stage.flush_into(&mut self.out_buf);
         }
         let need = self.out_chunk_frames * self.out_channels;
@@ -440,16 +462,17 @@ impl OutputTap {
         }
     }
 
-    /// 現在 `out_buf` に溜まっている未取り出し出力フレーム数。
+    /// Number of not-yet-taken output frames currently held in `out_buf`.
     fn buffered_out_frames(&self) -> usize {
         self.out_buf.len() / self.out_channels
     }
 
-    /// この push 先頭に対応する出力フレーム位置へ PTS アンカーを張る。
+    /// Sets a PTS anchor at the output frame position corresponding to the start of this push.
     ///
-    /// 出力フレーム位置は累計内部フレーム数を出力レートへ写像した近似値（リサンプラ内部の
-    /// 保持端数があるため厳密ではない）。`in_sample_rate` は約分で消えるので出力レートと
-    /// 内部レートだけで求まる。
+    /// The output frame position is an approximation obtained by mapping the cumulative internal
+    /// frame count to the output rate (not exact because of remainders held inside the
+    /// resampler). `in_sample_rate` cancels out, so only the output rate and the internal rate
+    /// are needed.
     fn update_pts_anchor(&mut self, total_inner_frames: u64, device_pts_ns: i64) {
         let projected_out_frame = (total_inner_frames as f64 * self.output.sample_rate as f64
             / SAMPLE_RATE as f64) as u64;
@@ -459,8 +482,8 @@ impl OutputTap {
         });
     }
 
-    /// 出力フレーム索引 `out_frame` に対応する device_pts(ns) を、アンカーから出力レート比で
-    /// 外挿して求める。
+    /// Computes the device_pts (ns) corresponding to output frame index `out_frame` by
+    /// extrapolating from the anchor using the output rate ratio.
     fn pts_for_out_frame(&self, out_frame: u64) -> i64 {
         match self.pts_anchor {
             None => crate::clock::monotonic_now_ns(),
@@ -474,13 +497,14 @@ impl OutputTap {
 }
 
 impl ResamplerState {
-    /// `in_sr` → `out_sr` の固定比リサンプラを `channels` ch で作る。
+    /// Creates a fixed-ratio `in_sr` → `out_sr` resampler with `channels` ch.
     ///
-    /// rubato の構築失敗時は [`Error::Backend`] を返す（panic させてスレッドを無言で
-    /// 止めない）。
+    /// Returns [`Error::Backend`] if building rubato fails (instead of panicking and silently
+    /// stopping the thread).
     fn new(in_sr: u32, out_sr: u32, channels: usize) -> Result<Self> {
         let ratio = out_sr as f64 / in_sr as f64;
-        // 固定入力チャンクは 20ms 相当の入力フレーム（端数は rubato が内部に保持する）。
+        // The fixed input chunk is 20ms worth of input frames (rubato keeps remainders
+        // internally).
         let chunk_in_frames = (in_sr as usize / 50).max(64);
 
         let params = SincInterpolationParameters {
@@ -493,7 +517,7 @@ impl ResamplerState {
 
         let inner = Async::<f32>::new_sinc(
             ratio,
-            1.0, // 比は固定（可変リサンプルは不要）
+            1.0, // fixed ratio (no variable resampling needed)
             &params,
             chunk_in_frames,
             channels,
@@ -513,11 +537,12 @@ impl ResamplerState {
         })
     }
 
-    /// `in_accum` に溜まった分を chunk_in_frames 単位で可能な限りリサンプルし、生成した
-    /// interleaved を `out_buf` へ追記する。生成した出力フレーム数を返す。
+    /// Resamples as much of what has accumulated in `in_accum` as possible in units of
+    /// chunk_in_frames and appends the produced interleaved samples to `out_buf`. Returns the
+    /// number of output frames produced.
     ///
-    /// rubato の adapter 構築・`process_into_buffer` が失敗したら [`Error::Backend`]
-    /// を返す（panic させて取り込みスレッドを無言で止めない）。
+    /// Returns [`Error::Backend`] if building the rubato adapter or `process_into_buffer` fails
+    /// (instead of panicking and silently stopping the ingest thread).
     fn drain_into(&mut self, out_buf: &mut Vec<f32>) -> Result<u64> {
         let step = self.chunk_in_frames * self.channels;
         let mut produced = 0u64;
@@ -554,23 +579,26 @@ impl ResamplerState {
             out_buf.extend_from_slice(&self.out_scratch[..n_samples]);
             produced += out_written as u64;
 
-            // 消費した入力を取り除く（FixedAsync::Input なので消費は chunk_in_frames 固定）。
+            // Remove the consumed input (with FixedAsync::Input the consumption is fixed at
+            // chunk_in_frames).
             self.in_accum.drain(..step);
         }
         Ok(produced)
     }
 
-    /// 停止時、`in_accum` に残った 1 入力チャンク未満の端数を `partial_len` で最後に流し、
-    /// 生成した interleaved を `out_buf` へ追記する。生成した出力フレーム数を返す。
+    /// At stop, finally feeds the remainder left in `in_accum` (less than one input chunk) with
+    /// `partial_len` and appends the produced interleaved samples to `out_buf`. Returns the
+    /// number of output frames produced.
     ///
-    /// これで丸め残りの入力（最大 20ms 弱）を吐き切る。呼び出し後 `in_accum` は空になる。
-    /// リサンプラ内部のフィルタ群遅延（数 ms）まではフラッシュしない。
+    /// This drains the rounding leftover input (up to just under 20ms). `in_accum` is empty
+    /// after the call. It does not flush the resampler's internal filter-bank delay (a few ms).
     fn flush_into(&mut self, out_buf: &mut Vec<f32>) -> Result<u64> {
         let remaining = self.in_accum.len() / self.channels;
         if remaining == 0 {
             return Ok(0);
         }
-        // 入力を 1 チャンク分まで無音でパディングし、有効長だけ `partial_len` で伝える。
+        // Pad the input with silence up to one chunk and report only the valid length via
+        // `partial_len`.
         self.in_accum
             .resize(self.chunk_in_frames * self.channels, 0.0);
 
@@ -608,15 +636,16 @@ impl ResamplerState {
 }
 
 impl OutputStage {
-    /// 出力レート / 出力チャンネル数を指定して出口段を作る。
+    /// Creates the exit stage given the output rate / output channel count.
     ///
-    /// `out_sample_rate == 48000` なら SR 変換はパススルー（チャンネル変換のみ）。
-    /// rubato 構築失敗は [`Error::Backend`] として伝播する。
+    /// When `out_sample_rate == 48000`, SR conversion is a passthrough (channel conversion
+    /// only). A rubato build failure is propagated as [`Error::Backend`].
     fn new(out_sample_rate: u32, out_channels: usize) -> Result<Self> {
         let resampler = if out_sample_rate == SAMPLE_RATE {
             None
         } else {
-            // 内部正規形 48000 から out_sample_rate へ、out_channels ch で変換する。
+            // Convert from the internal canonical form 48000 to out_sample_rate with
+            // out_channels ch.
             Some(ResamplerState::new(
                 SAMPLE_RATE,
                 out_sample_rate,
@@ -630,19 +659,20 @@ impl OutputStage {
         })
     }
 
-    /// 内部正規形（48k/stereo interleaved・任意長）を処理して、出力フォーマットの
-    /// interleaved を `out_buf` へ追記する。長さは `INNER_CH`（stereo）の倍数であること。
+    /// Processes the internal canonical form (48k/stereo interleaved, any length) and appends
+    /// interleaved samples in the output format to `out_buf`. The length must be a multiple of
+    /// `INNER_CH` (stereo).
     fn process_inner(&mut self, inner_stereo: &[f32], out_buf: &mut Vec<f32>) -> Result<()> {
         let frames = inner_stereo.len() / INNER_CH;
         if frames == 0 {
             return Ok(());
         }
 
-        // チャンネル変換: stereo → out_channels。
+        // Channel conversion: stereo → out_channels.
         self.ch_scratch.clear();
         match self.out_channels {
             1 => {
-                // stereo → mono（L/R 平均）。
+                // stereo → mono (L/R average).
                 for f in 0..frames {
                     let l = inner_stereo[f * 2];
                     let r = inner_stereo[f * 2 + 1];
@@ -654,7 +684,8 @@ impl OutputStage {
                     .extend_from_slice(&inner_stereo[..frames * 2]);
             }
             _ => {
-                // validate で 1/2 に絞られているはず。届いても L 複製で凌ぐ。
+                // validate should have restricted this to 1/2. If it arrives anyway, get by
+                // duplicating L.
                 for f in 0..frames {
                     let l = inner_stereo[f * 2];
                     for _ in 0..self.out_channels {
@@ -664,7 +695,8 @@ impl OutputStage {
             }
         }
 
-        // SR 変換: 48000 → out_sample_rate。パススルーなら ch_scratch をそのまま出力へ。
+        // SR conversion: 48000 → out_sample_rate. On passthrough, ch_scratch goes straight to
+        // the output.
         match &mut self.resampler {
             None => {
                 out_buf.extend_from_slice(&self.ch_scratch);
@@ -677,8 +709,8 @@ impl OutputStage {
         Ok(())
     }
 
-    /// 停止時、SR リサンプラの端数残余を吐き出して `out_buf` へ追記する（パススルー段は
-    /// 残余を持たないので no-op）。
+    /// At stop, drains the SR resampler's remainder and appends it to `out_buf` (a no-op for a
+    /// passthrough stage, which holds no remainder).
     fn flush_into(&mut self, out_buf: &mut Vec<f32>) -> Result<()> {
         if let Some(rs) = self.resampler.as_mut() {
             rs.flush_into(out_buf)?;
@@ -692,7 +724,7 @@ mod tests {
     use super::*;
     use std::f32::consts::PI;
 
-    /// 既定出力（{48000, 2}）のヘルパ。
+    /// Helper for the default output ({48000, 2}).
     fn default_out() -> OutputFormat {
         OutputFormat::default()
     }
@@ -702,12 +734,12 @@ mod tests {
         let mut n = Normalizer::new(48_000, 1, default_out()).expect("normalizer");
         assert!(n.is_passthrough());
         assert!(n.is_output_passthrough());
-        // 960 フレーム分の mono 入力（パススルーなので 1 チャンクちょうど）。
+        // 960 frames of mono input (passthrough, so exactly one chunk).
         let mono: Vec<f32> = (0..CHUNK_FRAMES).map(|i| (i as f32) * 0.001).collect();
         n.push(&mono, 0).expect("push");
         let (chunk, _pts) = n.pop_chunk().expect("one chunk");
         assert_eq!(chunk.len(), CHUNK_FRAMES * 2);
-        // L == R がフレーム毎に成立。
+        // L == R holds for every frame.
         for f in 0..CHUNK_FRAMES {
             assert_eq!(chunk[f * 2], chunk[f * 2 + 1], "L==R at frame {f}");
             assert_eq!(chunk[f * 2], mono[f]);
@@ -719,7 +751,7 @@ mod tests {
         let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
         assert!(n.is_passthrough());
         assert!(n.is_output_passthrough());
-        // 2 チャンク分 + 端数。
+        // 2 chunks + a remainder.
         let frames = CHUNK_FRAMES * 2 + 100;
         let stereo: Vec<f32> = (0..frames * 2).map(|i| (i as f32) * 1e-4).collect();
         n.push(&stereo, 0).expect("push");
@@ -729,7 +761,7 @@ mod tests {
             assert_eq!(c.len(), CHUNK_FRAMES * 2);
             got_frames += CHUNK_FRAMES;
         }
-        // ちょうど 2 チャンク取り出せ、端数 100 frame は残る。
+        // Exactly 2 chunks can be taken, and the 100 frame remainder stays.
         assert_eq!(got_frames, CHUNK_FRAMES * 2);
         assert_eq!(n.buffered_out_frames(), 100);
     }
@@ -739,7 +771,7 @@ mod tests {
         let mut n = Normalizer::new(44_100, 2, default_out()).expect("normalizer");
         assert!(!n.is_passthrough());
 
-        // 1 秒分の 44100Hz ステレオ サイン波。
+        // 1 second of a 44100Hz stereo sine wave.
         let in_frames = 44_100;
         let freq = 440.0_f32;
         let mut interleaved = Vec::with_capacity(in_frames * 2);
@@ -749,7 +781,8 @@ mod tests {
             interleaved.push(s); // R
         }
 
-        // 細切れ push（実機の小バッファ到着を模す）でも panic しないこと。
+        // Must not panic even with fragmented pushes (simulating small buffer arrivals on real
+        // hardware).
         let mut pts = 0i64;
         for block in interleaved.chunks(441 * 2) {
             n.push(block, pts).expect("push");
@@ -784,9 +817,9 @@ mod tests {
         assert_eq!(count, 3);
     }
 
-    // --- 第 2 段（出口）の検証 ---
+    // --- Stage 2 (exit) verification ---
 
-    /// 48k/stereo 入力 + 出力 {16000, 1} → 320 frame の mono チャンク。
+    /// 48k/stereo input + output {16000, 1} → 320 frame mono chunks.
     #[test]
     fn output_16k_mono_yields_320_frame_mono_chunks() {
         let out = OutputFormat {
@@ -794,10 +827,10 @@ mod tests {
             channels: 1,
         };
         let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
-        assert!(n.is_passthrough()); // 第 1 段は SR パススルー（48k 入力）。
-        assert!(!n.is_output_passthrough()); // 第 2 段は有効。
+        assert!(n.is_passthrough()); // stage 1 is an SR passthrough (48k input).
+        assert!(!n.is_output_passthrough()); // stage 2 is active.
 
-        // 1 秒分の 48k stereo サイン波（細切れ push）。
+        // 1 second of a 48k stereo sine wave (fragmented pushes).
         let in_frames = 48_000;
         let freq = 440.0_f32;
         let mut pts = 0i64;
@@ -818,14 +851,14 @@ mod tests {
             assert_eq!(c.len(), 320, "16k mono 20ms = 320 sample (mono)");
             chunks += 1;
         }
-        // 16000/320 = 50 チャンク/秒。リサンプラ遅延で約 50。
+        // 16000/320 = 50 chunks/second. About 50 because of resampler latency.
         assert!(
             (47..=50).contains(&chunks),
             "expected ~50 chunks, got {chunks}"
         );
     }
 
-    /// 出力 {16000, 2} → 320 frame・640 sample（stereo）。
+    /// Output {16000, 2} → 320 frame, 640 sample (stereo).
     #[test]
     fn output_16k_stereo_yields_320_frame_640_sample_chunks() {
         let out = OutputFormat {
@@ -851,7 +884,7 @@ mod tests {
         );
     }
 
-    /// 出力 {8000, 2} → 160 frame・320 sample。
+    /// Output {8000, 2} → 160 frame, 320 sample.
     #[test]
     fn output_8k_stereo_yields_160_frame_chunks() {
         let out = OutputFormat {
@@ -876,16 +909,16 @@ mod tests {
         );
     }
 
-    /// stereo→mono は L/R 平均（L=+a, R=-a の逆相は 0 に近づく）。
+    /// stereo→mono is the L/R average (antiphase L=+a, R=-a approaches 0).
     #[test]
     fn stereo_to_mono_is_lr_average() {
-        // 出力 48000/mono にして SR パススルー・チャンネル変換のみを検証する。
+        // Use output 48000/mono to verify only the channel conversion with SR passthrough.
         let out = OutputFormat {
             sample_rate: 48_000,
             channels: 1,
         };
         let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
-        // 完全逆相（L=+0.5, R=-0.5）→ 平均 0。
+        // Fully antiphase (L=+0.5, R=-0.5) → average 0.
         let mut stereo = Vec::with_capacity(CHUNK_FRAMES * 2);
         for _ in 0..CHUNK_FRAMES {
             stereo.push(0.5);
@@ -893,15 +926,18 @@ mod tests {
         }
         n.push(&stereo, 0).expect("push");
         let (chunk, _) = n.pop_chunk().expect("one mono chunk");
-        assert_eq!(chunk.len(), CHUNK_FRAMES); // mono 960 sample。
+        assert_eq!(chunk.len(), CHUNK_FRAMES); // mono 960 sample.
         for &s in &chunk {
-            assert!(s.abs() < 1e-6, "逆相の平均は 0 付近のはず: {s}");
+            assert!(
+                s.abs() < 1e-6,
+                "the antiphase average should be near 0: {s}"
+            );
         }
     }
 
-    // --- 値検証ヘルパ（振幅・周波数の保存を確認する） ---
+    // --- Value verification helpers (confirm amplitude and frequency are preserved) ---
 
-    /// サンプル列の RMS（線形）。正弦波なら振幅 A に対し A/√2 になる。
+    /// RMS (linear) of a sample sequence. For a sine wave of amplitude A it is A/√2.
     fn rms(samples: &[f32]) -> f32 {
         if samples.is_empty() {
             return 0.0;
@@ -910,12 +946,13 @@ mod tests {
         (sum_sq / samples.len() as f64).sqrt() as f32
     }
 
-    /// 正→負 / 負→正 のゼロ交差回数を数える。1 周期で 2 回交差するので、
-    /// 推定周波数 = (交差数 / 2) / 秒数。先頭/末尾の過渡を避けて中央を渡すこと。
+    /// Counts positive→negative / negative→positive zero crossings. A period crosses twice, so
+    /// the estimated frequency = (crossings / 2) / seconds. Pass the middle to avoid the
+    /// start/end transients.
     fn zero_crossings(samples: &[f32]) -> usize {
         let mut crossings = 0;
         for w in samples.windows(2) {
-            // 厳密な符号反転のみ（0 ちょうどは無視）。
+            // Only strict sign changes (exactly 0 is ignored).
             if (w[0] < 0.0 && w[1] >= 0.0) || (w[0] >= 0.0 && w[1] < 0.0) {
                 crossings += 1;
             }
@@ -923,16 +960,16 @@ mod tests {
         crossings
     }
 
-    /// 44.1kHz/mono 440Hz 正弦を 48kHz/stereo へリサンプルしても、振幅（RMS）と
-    /// 周波数（ゼロ交差推定）が保存される。リサンプラのリンギングを避けるため
-    /// 1 秒ぶん流して中央のチャンク群だけで測る。
+    /// Resampling a 44.1kHz/mono 440Hz sine to 48kHz/stereo preserves the amplitude (RMS) and
+    /// frequency (zero-crossing estimate). To avoid resampler ringing, it streams 1 second and
+    /// measures only the middle chunks.
     #[test]
     fn resample_44100_to_48000_preserves_amplitude_and_frequency() {
         let mut n = Normalizer::new(44_100, 1, default_out()).expect("normalizer");
         let freq = 440.0_f32;
         let amp = 0.5_f32;
         let in_rate = 44_100usize;
-        // 2 秒ぶん流して十分なチャンクを得る（過渡を捨てる余裕を持つ）。
+        // Stream 2 seconds to get enough chunks (with room to discard transients).
         let total_frames = in_rate * 2;
         let mut pts = 0i64;
         for blk in 0..(total_frames / 441) {
@@ -945,43 +982,49 @@ mod tests {
             pts += 441 * 1_000_000_000 / in_rate as i64;
         }
 
-        // 全チャンクを連結（出力は 48k/stereo/960frame）。
+        // Concatenate all chunks (the output is 48k/stereo/960frame).
         let mut left: Vec<f32> = Vec::new();
         while let Some((c, _)) = n.pop_chunk() {
             assert_eq!(c.len(), CHUNK_FRAMES * 2);
-            // L チャンネルだけ取り出す（mono→stereo 複製なので L==R）。
+            // Take only the L channel (mono→stereo duplication, so L==R).
             for f in 0..CHUNK_FRAMES {
-                assert_eq!(c[f * 2], c[f * 2 + 1], "mono 入力なので L==R");
+                assert_eq!(c[f * 2], c[f * 2 + 1], "mono input, so L==R");
                 left.push(c[f * 2]);
             }
         }
-        assert!(left.len() >= 48_000, "1 秒以上の出力が必要: {}", left.len());
+        assert!(
+            left.len() >= 48_000,
+            "at least 1 second of output is required: {}",
+            left.len()
+        );
 
-        // 過渡（先頭・末尾各 0.25 秒 = 12000 sample）を捨てて中央 1 秒で測る。
+        // Discard the transients (0.25 seconds each at start and end = 12000 sample) and
+        // measure the middle 1 second.
         let start = 12_000;
         let mid = &left[start..start + 48_000];
 
-        // 振幅: 正弦の RMS は amp/√2 ≈ 0.3536。リサンプラ通過で ±5% 以内。
+        // Amplitude: the sine's RMS is amp/√2 ≈ 0.3536. Within ±5% after the resampler.
         let got_rms = rms(mid);
         let expect_rms = amp / std::f32::consts::SQRT_2;
         let rms_err = ((got_rms - expect_rms) / expect_rms).abs();
         assert!(
             rms_err < 0.05,
-            "RMS 保存誤差が大きい: got={got_rms} expect={expect_rms} err={rms_err}"
+            "RMS preservation error too large: got={got_rms} expect={expect_rms} err={rms_err}"
         );
 
-        // 周波数: 中央 1 秒（48000 sample）のゼロ交差 ≈ 2*440 = 880。±2% 以内。
+        // Frequency: zero crossings in the middle 1 second (48000 sample) ≈ 2*440 = 880.
+        // Within ±2%.
         let crossings = zero_crossings(mid);
-        let est_freq = crossings as f32 / 2.0; // 1 秒なので交差数/2 = Hz。
+        let est_freq = crossings as f32 / 2.0; // 1 second, so crossings/2 = Hz.
         let freq_err = ((est_freq - freq) / freq).abs();
         assert!(
             freq_err < 0.02,
-            "周波数 保存誤差が大きい: 交差={crossings} 推定={est_freq}Hz err={freq_err}"
+            "frequency not preserved: crossings={crossings} estimate={est_freq}Hz err={freq_err}"
         );
     }
 
-    /// 16k/mono 出力の実チャンネル数とサンプル値: 48k/stereo 440Hz 入力を
-    /// 16k/mono へ落としても 1ch・320sample で振幅/周波数が保存される。
+    /// Actual channel count and sample values of 16k/mono output: downsampling a 48k/stereo
+    /// 440Hz input to 16k/mono preserves amplitude/frequency with 1ch, 320sample.
     #[test]
     fn output_16k_mono_preserves_values() {
         let out = OutputFormat {
@@ -1008,40 +1051,46 @@ mod tests {
 
         let mut mono: Vec<f32> = Vec::new();
         while let Some((c, _)) = n.pop_chunk() {
-            assert_eq!(c.len(), 320, "16k/mono 20ms = 320 sample（1ch）");
+            assert_eq!(c.len(), 320, "16k/mono 20ms = 320 sample (1ch)");
             mono.extend_from_slice(&c);
         }
-        assert!(mono.len() >= 16_000, "1 秒以上必要: {}", mono.len());
+        assert!(
+            mono.len() >= 16_000,
+            "at least 1 second is required: {}",
+            mono.len()
+        );
 
-        // 過渡を捨てて中央 1 秒（16000 sample）で測る。
+        // Discard the transients and measure the middle 1 second (16000 sample).
         let start = 4_000;
         let mid = &mono[start..start + 16_000];
 
-        // L==R の同相信号を平均してもレベル不変 → RMS ≈ amp/√2。
+        // Averaging an in-phase L==R signal leaves the level unchanged → RMS ≈ amp/√2.
         let got_rms = rms(mid);
         let expect_rms = amp / std::f32::consts::SQRT_2;
         let rms_err = ((got_rms - expect_rms) / expect_rms).abs();
         assert!(
             rms_err < 0.05,
-            "16k/mono RMS 保存誤差: got={got_rms} expect={expect_rms} err={rms_err}"
+            "16k/mono RMS preservation error: got={got_rms} expect={expect_rms} err={rms_err}"
         );
 
-        // 周波数: 16000 sample の中央 1 秒で交差 ≈ 880。±2% 以内。
+        // Frequency: crossings over the middle 1 second of 16000 sample ≈ 880. Within ±2%.
         let est_freq = zero_crossings(mid) as f32 / 2.0;
         let freq_err = ((est_freq - freq) / freq).abs();
         assert!(
             freq_err < 0.02,
-            "16k/mono 周波数 保存誤差: 推定={est_freq}Hz err={freq_err}"
+            "16k/mono frequency preservation error: estimate={est_freq}Hz err={freq_err}"
         );
     }
 
-    /// PTS は単調増加し、隣接チャンク間の delta が ~20ms（1e7 ns ±許容）になる。
-    /// 48k パススルー経路で PTS アンカーが正しく外挿されることを値で確認する。
+    /// PTS increases monotonically, and the delta between adjacent chunks is ~20ms (1e7 ns ±
+    /// tolerance). Confirms by value that the PTS anchor is extrapolated correctly on the 48k
+    /// passthrough path.
     #[test]
     fn pts_delta_is_about_20ms_between_chunks() {
         let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
-        // 480 frame（10ms）ずつ pts 付きで push（実機の小バッファ到着を模す）。
-        let mut device_pts = 1_000_000_000i64; // 任意の原点。
+        // Push 480 frame (10ms) at a time with pts (simulating small buffer arrivals on real
+        // hardware).
+        let mut device_pts = 1_000_000_000i64; // arbitrary origin.
         let block_frames = 480usize;
         for _ in 0..20 {
             let stereo = vec![0.1f32; block_frames * 2];
@@ -1055,47 +1104,55 @@ mod tests {
         }
         assert!(
             pts_list.len() >= 5,
-            "十分なチャンク数が必要: {}",
+            "enough chunks are required: {}",
             pts_list.len()
         );
 
-        // 20ms = 20_000_000 ns。許容 ±5%（1e6 ns）。
+        // 20ms = 20_000_000 ns. Tolerance ±5% (1e6 ns).
         for w in pts_list.windows(2) {
             let delta = w[1] - w[0];
-            assert!(delta > 0, "PTS は厳密に増加: {} -> {}", w[0], w[1]);
+            assert!(delta > 0, "PTS strictly increases: {} -> {}", w[0], w[1]);
             assert!(
                 (delta - 20_000_000).abs() <= 1_000_000,
-                "隣接 PTS delta が ~20ms でない: {delta} ns"
+                "adjacent PTS delta is not ~20ms: {delta} ns"
             );
         }
     }
 
-    /// 入力サンプルが空 / 端数（in_channels の倍数未満）でも panic せず Ok を返し、
-    /// チャンクは生成されない（境界・防御）。
+    /// Even when the input samples are empty / a fraction (less than a multiple of
+    /// in_channels), it returns Ok without panicking and no chunk is produced (boundary /
+    /// defensive).
     #[test]
     fn push_empty_and_subframe_are_noops() {
         let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
-        // 空。
+        // Empty.
         n.push(&[], 0).expect("empty push ok");
-        // stereo(2ch) なのに 1 サンプルだけ → in_frames=0 で早期 return。
+        // stereo (2ch) but only 1 sample → in_frames=0, early return.
         n.push(&[0.5], 0).expect("subframe push ok");
-        assert!(n.pop_chunk().is_none(), "端数だけでは 1 チャンクも出ない");
+        assert!(
+            n.pop_chunk().is_none(),
+            "a fraction alone produces no chunk"
+        );
         assert_eq!(n.buffered_out_frames(), 0);
     }
 
-    /// 周波数 0（無音 DC）入力は出力も全 0（peak/rms 0 経路の裏取り）。
+    /// Frequency-0 (silent DC) input yields all-zero output too (confirms the peak/rms 0 path).
     #[test]
     fn silence_input_yields_zero_output() {
         let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
         let stereo = vec![0.0f32; CHUNK_FRAMES * 2];
         n.push(&stereo, 0).expect("push");
         let (chunk, _) = n.pop_chunk().expect("one chunk");
-        assert!(chunk.iter().all(|&s| s == 0.0), "無音入力は無音出力");
+        assert!(
+            chunk.iter().all(|&s| s == 0.0),
+            "silent input gives silent output"
+        );
     }
 
-    // --- 副タップ（デュアル出力）の検証 ---
+    // --- Secondary tap (dual output) verification ---
 
-    /// 副タップ未設定なら `pop_secondary` は常に `None`・`has_secondary` は false。
+    /// Without a secondary tap, `pop_secondary` always returns `None` and `has_secondary` is
+    /// false.
     #[test]
     fn no_secondary_tap_by_default() {
         let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
@@ -1103,11 +1160,11 @@ mod tests {
         assert_eq!(n.secondary_output(), None);
         let stereo = vec![0.1f32; CHUNK_FRAMES * 2];
         n.push(&stereo, 0).expect("push");
-        assert!(n.pop_secondary().is_none(), "副タップ無しなら None");
+        assert!(n.pop_secondary().is_none(), "None without a secondary tap");
     }
 
-    /// 主 48k/stereo + 副 16k/mono を 1 度の第 1 段から両立して生成する。主は 960frame/
-    /// stereo、副は 320frame/mono を出す。両者はほぼ 50 チャンク/秒。
+    /// Produces both primary 48k/stereo + secondary 16k/mono from a single stage 1. The primary
+    /// emits 960frame/stereo and the secondary 320frame/mono. Both are about 50 chunks/second.
     #[test]
     fn dual_output_primary_and_secondary_shapes() {
         let secondary = OutputFormat {
@@ -1121,7 +1178,7 @@ mod tests {
         assert!(n.has_secondary());
         assert_eq!(n.secondary_output(), Some(secondary));
 
-        // 1 秒分の 48k/stereo を 480 frame ずつ push。
+        // Push 1 second of 48k/stereo, 480 frame at a time.
         let mut pts = 0i64;
         for _ in 0..100 {
             let block = vec![0.2f32; 480 * 2];
@@ -1131,26 +1188,31 @@ mod tests {
 
         let mut primary_chunks = 0usize;
         while let Some((c, _)) = n.pop_chunk() {
-            assert_eq!(c.len(), CHUNK_FRAMES * 2, "主は 48k/stereo = 1920 sample");
+            assert_eq!(
+                c.len(),
+                CHUNK_FRAMES * 2,
+                "primary is 48k/stereo = 1920 sample"
+            );
             primary_chunks += 1;
         }
         let mut secondary_chunks = 0usize;
         while let Some((c, _)) = n.pop_secondary() {
-            assert_eq!(c.len(), 320, "副は 16k/mono = 320 sample");
+            assert_eq!(c.len(), 320, "secondary is 16k/mono = 320 sample");
             secondary_chunks += 1;
         }
         assert!(
             (47..=50).contains(&primary_chunks),
-            "主 ~50 チャンク: {primary_chunks}"
+            "primary ~50 chunks: {primary_chunks}"
         );
         assert!(
             (47..=50).contains(&secondary_chunks),
-            "副 ~50 チャンク: {secondary_chunks}"
+            "secondary ~50 chunks: {secondary_chunks}"
         );
     }
 
-    /// 主副タップとも同じ push 由来の PTS 軸に乗り、それぞれ隣接 20ms で単調増加する
-    /// （各タップは独立の PTS アンカーを持つ）。
+    /// Both the primary and secondary taps are on the PTS axis derived from the same pushes, and
+    /// each increases monotonically by 20ms between adjacent chunks (each tap has its own
+    /// independent PTS anchor).
     #[test]
     fn dual_output_taps_share_pts_axis() {
         let secondary = OutputFormat {
@@ -1184,18 +1246,18 @@ mod tests {
         for w in secondary_pts.windows(2) {
             assert!((w[1] - w[0] - 20_000_000).abs() <= 1_000_000);
         }
-        // 両タップの先頭 PTS は同じ push 原点近傍から始まる（数十ms 以内）。
+        // The first PTS of both taps starts near the same push origin (within tens of ms).
         assert!(
             (primary_pts[0] - secondary_pts[0]).abs() < 100_000_000,
-            "主副の開始 PTS は近接するはず: {} vs {}",
+            "primary and secondary start PTS should be close: {} vs {}",
             primary_pts[0],
             secondary_pts[0]
         );
     }
 
-    // --- InnerProcessor（denoise フック相当）と stop flush ---
+    // --- InnerProcessor (equivalent to the denoise hook) and stop flush ---
 
-    /// テスト用プロセッサ: 全サンプルを 2 倍する（末尾テールは持たない）。
+    /// Test processor: doubles every sample (holds no trailing tail).
     struct DoubleProcessor;
     impl InnerProcessor for DoubleProcessor {
         fn process(&mut self, s: &mut [f32]) {
@@ -1208,9 +1270,9 @@ mod tests {
         }
     }
 
-    /// テスト用プロセッサ: `hold` サンプルの固定遅延線（denoise の遅延線を模す）。
-    /// 出力は入力を `hold` サンプル遅らせた列（先頭 `hold` は無音）。`flush` で末尾
-    /// `hold` サンプルを返す。
+    /// Test processor: a fixed delay line of `hold` samples (simulating denoise's delay line).
+    /// The output is the input delayed by `hold` samples (the first `hold` are silence).
+    /// `flush` returns the last `hold` samples.
     struct DelayProcessor {
         held: Vec<f32>,
     }
@@ -1233,8 +1295,8 @@ mod tests {
         }
     }
 
-    /// InnerProcessor は内部正規形へ第 2 段分岐前に適用される（主 48k/stereo パススルー
-    /// では出力がそのまま 2 倍になる）。
+    /// The InnerProcessor is applied to the internal canonical form before branching into stage
+    /// 2 (with the primary 48k/stereo passthrough, the output is simply doubled).
     #[test]
     fn inner_processor_applies_before_stage2() {
         let mut n = Normalizer::new(48_000, 2, default_out())
@@ -1251,14 +1313,16 @@ mod tests {
         }
     }
 
-    /// InnerProcessor は主・副の両タップへ効く（副 16k/mono も 2 倍になる）。
+    /// The InnerProcessor affects both the primary and secondary taps (the secondary 16k/mono
+    /// is doubled too).
     #[test]
     fn inner_processor_affects_both_taps() {
         let secondary = OutputFormat {
             sample_rate: 48_000,
             channels: 2,
         };
-        // 副も 48k/stereo（パススルー）にして、2 倍が素通しで観測できるようにする。
+        // Make the secondary 48k/stereo (passthrough) too, so the doubling is observable
+        // unaltered.
         let mut n = Normalizer::new(48_000, 2, default_out())
             .expect("normalizer")
             .with_secondary(secondary)
@@ -1268,52 +1332,60 @@ mod tests {
         n.push(&stereo, 0).expect("push");
         let (p, _) = n.pop_chunk().expect("primary chunk");
         let (s, _) = n.pop_secondary().expect("secondary chunk");
-        assert!(p.iter().all(|&x| (x - 0.5).abs() < 1e-6), "主が 2 倍");
-        assert!(s.iter().all(|&x| (x - 0.5).abs() < 1e-6), "副も 2 倍");
+        assert!(
+            p.iter().all(|&x| (x - 0.5).abs() < 1e-6),
+            "primary is doubled"
+        );
+        assert!(
+            s.iter().all(|&x| (x - 0.5).abs() < 1e-6),
+            "secondary is doubled too"
+        );
     }
 
-    /// stop flush はプロセッサの末尾テールを流し込み、末尾チャンクとして取り出せる。
-    /// 遅延線プロセッサの held 分が flush 後の追加チャンクに現れる。
+    /// The stop flush feeds in the processor's trailing tail, which can be taken out as a final
+    /// chunk. The held part of the delay-line processor appears in an extra chunk after flush.
     #[test]
     fn stop_flush_emits_processor_tail() {
-        // hold = 4 sample（2 stereo frame）の遅延線。
+        // Delay line with hold = 4 sample (2 stereo frame).
         let mut n = Normalizer::new(48_000, 2, default_out())
             .expect("normalizer")
             .with_inner_processor(Box::new(DelayProcessor::new(4)));
-        // 非ゼロの識別可能な入力を 1 チャンク push。
+        // Push 1 chunk of non-zero, identifiable input.
         let stereo: Vec<f32> = (0..CHUNK_FRAMES * 2)
             .map(|i| (i as f32 + 1.0) * 1e-4)
             .collect();
         n.push(&stereo, 0).expect("push");
 
-        // flush 前: 1 チャンク（先頭 4 sample は遅延の無音）。
+        // Before flush: 1 chunk (the first 4 sample are the delay's silence).
         let (c0, _) = n.pop_chunk().expect("first chunk");
         assert_eq!(c0.len(), CHUNK_FRAMES * 2);
         assert!(
             c0[..4].iter().all(|&x| x == 0.0),
-            "先頭 4 sample は遅延の無音"
+            "the first 4 sample are the delay's silence"
         );
-        assert!(n.pop_chunk().is_none(), "flush 前は 1 チャンクだけ");
+        assert!(n.pop_chunk().is_none(), "only 1 chunk before flush");
 
-        // flush: 遅延線の末尾 4 sample が追加チャンク（無音パディング付き）で出る。
+        // flush: the delay line's last 4 sample come out as an extra chunk (with silence
+        // padding).
         n.flush();
         let (c1, _) = n.pop_chunk().expect("flushed tail chunk");
         assert_eq!(
             c1.len(),
             CHUNK_FRAMES * 2,
-            "末尾チャンクは 20ms へパディング"
+            "the final chunk is padded to 20ms"
         );
-        // 末尾 4 sample = 入力の最後の 4 sample。
+        // The last 4 sample = the last 4 sample of the input.
         let last4 = &stereo[stereo.len() - 4..];
         for (i, &x) in c1[..4].iter().enumerate() {
             assert!(
                 (x - last4[i]).abs() < 1e-6,
-                "flush テールが入力末尾に一致するはず"
+                "the flush tail should match the end of the input"
             );
         }
     }
 
-    /// stop flush は副タップの第 2 段リサンプラ残余も吐き出す（16k/mono でも末尾が届く）。
+    /// The stop flush also drains the secondary tap's stage 2 resampler remainder (the tail
+    /// arrives even for 16k/mono).
     #[test]
     fn stop_flush_drains_secondary_resampler() {
         let secondary = OutputFormat {
@@ -1324,23 +1396,27 @@ mod tests {
             .expect("normalizer")
             .with_secondary(secondary)
             .expect("secondary");
-        // ちょうど 1 チャンク未満に近い量を push（リサンプラに端数が残る）。
+        // Push an amount close to just under 1 chunk (a remainder stays in the resampler).
         let stereo = vec![0.3f32; CHUNK_FRAMES * 2];
         n.push(&stereo, 0).expect("push");
 
-        // flush 前に取れる副チャンク数を数える。
+        // Count the secondary chunks available before flush.
         let mut before = 0usize;
         while n.pop_secondary().is_some() {
             before += 1;
         }
         n.flush();
-        // flush 後に末尾チャンクが 1 つ以上追加される（残余の吐き出し）。
+        // After flush, one or more final chunks are added (the remainder is drained).
         let mut after = 0usize;
         while let Some((c, _)) = n.pop_secondary() {
-            assert_eq!(c.len(), 320, "副は 20ms 固定境界へ揃う");
+            assert_eq!(
+                c.len(),
+                320,
+                "secondary is aligned to the fixed 20ms boundary"
+            );
             after += 1;
         }
-        assert!(after >= 1, "flush で副タップの末尾が吐き出されるはず");
+        assert!(after >= 1, "flush should drain the secondary tap's tail");
         let _ = before;
     }
 }

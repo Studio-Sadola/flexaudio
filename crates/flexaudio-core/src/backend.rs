@@ -1,18 +1,18 @@
-//! OS バックエンドが実装する [`CaptureBackend`] トレイトと、バックエンドが
-//! 生フレームをコアへ渡すための [`RawSink`] ハンドル。
+//! The [`CaptureBackend`] trait implemented by OS backends, and the [`RawSink`] handle that
+//! backends use to hand raw frames to the core.
 //!
-//! 配線（backend → [`RawRing`](mod@crate::raw_ring) → [`Normalizer`](crate::normalizer)
-//! → [`ChunkRing`](mod@crate::chunk_ring)）は facade 層が後で行う。ここではバックエンド
-//! 契約の型のみを定義する。
+//! The wiring (backend → [`RawRing`](mod@crate::raw_ring) → [`Normalizer`](crate::normalizer)
+//! → [`ChunkRing`](mod@crate::chunk_ring)) is done later by the facade layer. This module only
+//! defines the types of the backend contract.
 
 use crate::raw_ring::RawProducer;
 use crate::types::Result;
 
-/// バックエンドが生 interleaved f32 フレームをコアへ渡すためのシンク。
+/// Sink through which a backend hands raw interleaved f32 frames to the core.
 ///
-/// 内部に [`RawProducer`] を持ち、[`push`](Self::push) は RT 安全な非ブロッキング
-/// 書き込み（満杯時 DROP）を行う。SPSC の producer 側で、バックエンドの RT
-/// コールバックスレッドからのみ `push` する想定。
+/// It holds a [`RawProducer`] internally, and [`push`](Self::push) performs an RT-safe,
+/// non-blocking write (DROP when full). This is the producer side of an SPSC ring, and `push` is
+/// expected to be called only from the backend's RT callback thread.
 pub struct RawSink {
     producer: RawProducer,
     native_rate: u32,
@@ -20,7 +20,7 @@ pub struct RawSink {
 }
 
 impl RawSink {
-    /// バックエンドのネイティブフォーマットと共に生フレームシンクを作る。
+    /// Creates a raw frame sink together with the backend's native format.
     pub fn new(producer: RawProducer, native_rate: u32, native_channels: u16) -> Self {
         Self {
             producer,
@@ -29,62 +29,62 @@ impl RawSink {
         }
     }
 
-    /// 生 interleaved f32 フレームを非ブロッキングに渡す。
+    /// Hands over raw interleaved f32 frames without blocking.
     ///
-    /// `pts_ns` はデバイス由来のプレゼンテーションタイムスタンプ。決してブロックせず、
-    /// 満杯時は内部 overflow カウンタを増やしてドロップする。
+    /// `pts_ns` is the device-derived presentation timestamp. This never blocks; when full, it
+    /// increments the internal overflow counter and drops.
     ///
-    /// PTS の正規化と 20ms チャンク化は取り込みスレッドの責務で、ここでは生フレーム
-    /// だけを渡す。生リングはサンプルしか運ばないため `pts_ns` は配線層が別途取り回す
-    /// （将来フレームへ対応付ける用途で、用意できる backend は渡しておく）。
+    /// PTS normalization and 20ms chunking are the ingest thread's responsibility; this only
+    /// hands over raw frames. Because the raw ring carries only samples, the wiring layer routes
+    /// `pts_ns` separately (it is meant for mapping to frames in the future, so backends that can
+    /// provide it should pass it).
     ///
-    /// `push` は backend の RT コールバックから呼ばれる想定。独自 backend では、push
-    /// を呼ぶ経路でヒープ確保・ロック・ブロッキング・システムコールをしないこと。
+    /// `push` is expected to be called from the backend's RT callback. In a custom backend, the
+    /// path that calls push must not allocate on the heap, take locks, block, or make system
+    /// calls.
     pub fn push(&mut self, interleaved: &[f32], pts_ns: i64) -> usize {
         let _ = pts_ns;
         self.producer.push_slice(interleaved)
     }
 
-    /// バックエンドのネイティブサンプルレート（Hz）。
+    /// The backend's native sample rate (Hz).
     pub fn native_rate(&self) -> u32 {
         self.native_rate
     }
 
-    /// バックエンドのネイティブチャンネル数。
+    /// The backend's native channel count.
     pub fn native_channels(&self) -> u16 {
         self.native_channels
     }
 
-    /// これまでに（満杯で）ドロップした累計サンプル数。
+    /// Cumulative number of samples dropped so far (because the ring was full).
     pub fn overflow_count(&self) -> u64 {
         self.producer.overflow_count()
     }
 }
 
-/// OS 固有キャプチャバックエンドが実装するトレイト。
+/// Trait implemented by OS-specific capture backends.
 ///
-/// facade は [`native_format`](Self::native_format) でネイティブフォーマットを
-/// 取得して [`Normalizer`](crate::normalizer) を構成し、[`start`](Self::start) に
-/// [`RawSink`] を渡してキャプチャを開始する。バックエンドは自身の RT コールバック
-/// 内で `sink.push(...)` を呼ぶ。
+/// The facade obtains the native format via [`native_format`](Self::native_format), configures
+/// the [`Normalizer`](crate::normalizer), and starts capture by passing a [`RawSink`] to
+/// [`start`](Self::start). The backend calls `sink.push(...)` inside its own RT callback.
 ///
-/// `Stream::open` に `Box<dyn CaptureBackend>` を渡せば独自 backend を差し込める。
+/// A custom backend can be plugged in by passing a `Box<dyn CaptureBackend>` to `Stream::open`.
 ///
-/// 独自 backend を実装するときに守ること:
-/// - キャプチャスレッド / RT コールバックで panic させない（panic するとキャプチャが
-///   静かに止まりうる）。
-/// - RT コールバックからの [`RawSink::push`] は RT 安全に呼ぶ（ヒープ確保・ロック・
-///   ブロッキング・システムコールなし。詳細は [`RawSink::push`] を参照）。
-/// - `start` / `stop` を冪等にする（動作中の二重 `start` は no-op で `Ok`、未起動の
-///   `stop` も no-op）。
+/// Rules to follow when implementing a custom backend:
+/// - Do not panic on the capture thread / RT callback (a panic can silently stop capture).
+/// - Call [`RawSink::push`] from the RT callback in an RT-safe way (no heap allocation, locks,
+///   blocking, or system calls; see [`RawSink::push`] for details).
+/// - Make `start` / `stop` idempotent (a second `start` while running is a no-op returning `Ok`,
+///   and `stop` when not started is also a no-op).
 pub trait CaptureBackend: Send {
-    /// バックエンドのネイティブフォーマット `(sample_rate, channels)`。
+    /// The backend's native format `(sample_rate, channels)`.
     fn native_format(&self) -> (u32, u16);
 
-    /// 指定シンクへ生フレームを流し始める。
+    /// Starts streaming raw frames into the given sink.
     fn start(&mut self, sink: RawSink) -> Result<()>;
 
-    /// キャプチャを停止する。
+    /// Stops capture.
     fn stop(&mut self);
 }
 
@@ -93,7 +93,7 @@ mod tests {
     use super::*;
     use crate::raw_ring::raw_ring;
 
-    /// テスト用の極小バックエンド。`start` で 1 ブロック push する。
+    /// Minimal backend for tests. Pushes one block in `start`.
     struct DummyBackend {
         sink: Option<RawSink>,
     }

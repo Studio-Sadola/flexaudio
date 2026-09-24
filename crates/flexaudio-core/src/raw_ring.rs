@@ -1,18 +1,18 @@
-//! 生 interleaved f32 デバイスフレーム用の SPSC・RT 安全リング（rtrb バック）。
+//! SPSC, RT-safe ring for raw interleaved f32 device frames (backed by rtrb).
 //!
-//! producer（RT コールバック）は slice を非ブロッキングに push する。満杯時は overflow
-//! カウンタ（[`AtomicU64`]）を増やして該当分をドロップし、RT スレッドはブロックしない。
-//! consumer は取り込みスレッド側で pop する。
+//! The producer (RT callback) pushes slices without blocking. When full, it increments the
+//! overflow counter ([`AtomicU64`]) and drops the excess, so the RT thread never blocks.
+//! The consumer pops on the ingest thread side.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
-/// 生フレームリングを作る。`capacity_samples` は f32 サンプル数での容量。
+/// Creates a raw frame ring. `capacity_samples` is the capacity in f32 samples.
 ///
-/// 返り値の producer は RT コールバックスレッドへ、consumer は取り込みスレッドへ渡す
-/// （SPSC）。`overflow` カウンタは両者で共有し、ドロップ済みサンプル数を数える。
+/// The returned producer goes to the RT callback thread and the consumer to the ingest thread
+/// (SPSC). The `overflow` counter is shared by both and counts dropped samples.
 pub fn raw_ring(capacity_samples: usize) -> (RawProducer, RawConsumer) {
     let cap = capacity_samples.max(1);
     let (prod, cons) = RingBuffer::<f32>::new(cap);
@@ -29,17 +29,17 @@ pub fn raw_ring(capacity_samples: usize) -> (RawProducer, RawConsumer) {
     )
 }
 
-/// RT コールバック側のハンドル。非ブロッキング push のみを行う。
+/// RT-callback-side handle. Performs only non-blocking pushes.
 pub struct RawProducer {
     inner: Producer<f32>,
     overflow: Arc<AtomicU64>,
 }
 
 impl RawProducer {
-    /// interleaved サンプル slice を非ブロッキングに push する。
+    /// Pushes an interleaved sample slice without blocking.
     ///
-    /// 書ける分だけ書き、入り切らなかった残りはドロップして overflow カウンタに加算
-    /// する。返り値は実際に書き込めたサンプル数。決してブロックしない。
+    /// Writes as much as fits, drops the remainder that does not fit, and adds it to the overflow
+    /// counter. Returns the number of samples actually written. Never blocks.
     pub fn push_slice(&mut self, samples: &[f32]) -> usize {
         if samples.is_empty() {
             return 0;
@@ -48,7 +48,7 @@ impl RawProducer {
         let writable = free.min(samples.len());
 
         if writable > 0 {
-            // write_chunk_uninit でアロケート無しにまとめて書く。
+            // Write in one go without allocation via write_chunk_uninit.
             if let Ok(mut chunk) = self.inner.write_chunk_uninit(writable) {
                 let (a, b) = chunk.as_mut_slices();
                 let (head, tail) = samples.split_at(a.len().min(samples.len()));
@@ -59,7 +59,7 @@ impl RawProducer {
                 for (dst, &src) in b.iter_mut().zip(tail.iter()) {
                     dst.write(src);
                 }
-                // SAFETY: writable 個の MaybeUninit を確かに初期化した。
+                // SAFETY: exactly `writable` MaybeUninit slots were initialized.
                 unsafe { chunk.commit_all() };
             }
         }
@@ -71,20 +71,20 @@ impl RawProducer {
         writable
     }
 
-    /// これまでにドロップした累計サンプル数。
+    /// Cumulative number of samples dropped so far.
     pub fn overflow_count(&self) -> u64 {
         self.overflow.load(Ordering::Relaxed)
     }
 }
 
-/// 取り込みスレッド側のハンドル。pop する。
+/// Ingest-thread-side handle. Pops.
 pub struct RawConsumer {
     inner: Consumer<f32>,
     overflow: Arc<AtomicU64>,
 }
 
 impl RawConsumer {
-    /// 利用可能なサンプルを最大 `dst.len()` 個まで `dst` へ取り出す。返り値は取り出し数。
+    /// Takes up to `dst.len()` available samples into `dst`. Returns the number taken.
     pub fn pop_slice(&mut self, dst: &mut [f32]) -> usize {
         let avail = self.inner.slots();
         let n = avail.min(dst.len());
@@ -103,17 +103,17 @@ impl RawConsumer {
         }
     }
 
-    /// 1 サンプル取り出す（無ければ `None`）。
+    /// Takes one sample (`None` if there is none).
     pub fn pop(&mut self) -> Option<f32> {
         self.inner.pop().ok()
     }
 
-    /// 取り出し可能なサンプル数。
+    /// Number of samples available to take.
     pub fn available(&self) -> usize {
         self.inner.slots()
     }
 
-    /// これまでに producer 側がドロップした累計サンプル数。
+    /// Cumulative number of samples dropped by the producer side so far.
     pub fn overflow_count(&self) -> u64 {
         self.overflow.load(Ordering::Relaxed)
     }
@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn overflow_counts_dropped_and_never_blocks() {
         let (mut p, mut c) = raw_ring(4);
-        // 容量 4 に 6 サンプル push → 4 書けて 2 ドロップ。
+        // Push 6 samples into capacity 4 -> 4 written, 2 dropped.
         let written = p.push_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(written, 4);
         assert_eq!(p.overflow_count(), 2);
@@ -155,9 +155,9 @@ mod tests {
         let (mut p, mut c) = raw_ring(4);
         p.push_slice(&[1.0, 2.0, 3.0]);
         let mut out = [0.0f32; 2];
-        c.pop_slice(&mut out); // 2 消費 → read 索引前進
+        c.pop_slice(&mut out); // consume 2 -> read index advances
         assert_eq!(out, [1.0, 2.0]);
-        // 残 1 + 新 3 = 4 で満杯。折り返し書き込みを検証。
+        // 1 remaining + 3 new = 4, full. Verifies the wrap-around write.
         let w = p.push_slice(&[4.0, 5.0, 6.0]);
         assert_eq!(w, 3);
         let mut out2 = [0.0f32; 4];
@@ -166,7 +166,7 @@ mod tests {
         assert_eq!(out2, [3.0, 4.0, 5.0, 6.0]);
     }
 
-    /// 空 slice の push は 0 を返し overflow を増やさない（早期 return 経路）。
+    /// Pushing an empty slice returns 0 and does not increase overflow (early-return path).
     #[test]
     fn push_empty_is_noop() {
         let (mut p, _c) = raw_ring(4);
@@ -174,62 +174,63 @@ mod tests {
         assert_eq!(p.overflow_count(), 0);
     }
 
-    /// 満杯のリングへさらに push すると全量ドロップ（writable=0）し、
-    /// overflow がそのサンプル数ぶん増える。RT 経路がブロックしないことの裏取り。
+    /// Pushing further into a full ring drops the whole push (writable=0), and overflow grows by
+    /// that many samples. Confirms that the RT path does not block.
     #[test]
     fn full_ring_drops_entire_push() {
         let (mut p, _c) = raw_ring(4);
-        assert_eq!(p.push_slice(&[1.0, 2.0, 3.0, 4.0]), 4); // 満杯。
-                                                            // もう入らない → 5 サンプル全ドロップ。
+        assert_eq!(p.push_slice(&[1.0, 2.0, 3.0, 4.0]), 4); // full.
+                                                            // No room -> all 5 samples dropped.
         let w = p.push_slice(&[5.0; 5]);
-        assert_eq!(w, 0, "満杯なら 1 つも書けない");
+        assert_eq!(w, 0, "when full, not a single sample can be written");
         assert_eq!(
             p.overflow_count(),
             5,
-            "全 5 サンプルが overflow に計上される"
+            "all 5 samples are counted as overflow"
         );
     }
 
-    /// `pop_slice` は dst が available より大きくても available 個だけ取り出す（off-by-one 防止）。
-    /// 残量より大きい dst・空リングからの pop=0 を確認。
+    /// `pop_slice` takes only `available` samples even if dst is larger than available
+    /// (off-by-one guard). Checks a dst larger than what remains, and pop=0 from an empty ring.
     #[test]
     fn pop_slice_respects_available_and_dst_len() {
         let (mut p, mut c) = raw_ring(8);
         p.push_slice(&[1.0, 2.0, 3.0]);
         assert_eq!(c.available(), 3);
-        // dst が大きくても available(3) だけ取れる。
+        // Even with a large dst, only available(3) are taken.
         let mut big = [0.0f32; 16];
         assert_eq!(c.pop_slice(&mut big), 3);
         assert_eq!(&big[..3], &[1.0, 2.0, 3.0]);
-        // 空になったので次は 0。
+        // Now empty, so the next is 0.
         assert_eq!(c.available(), 0);
         assert_eq!(c.pop_slice(&mut big), 0);
     }
 
-    /// 連続ドロップで overflow カウンタが u32::MAX を超えても飽和せず u64 で増え続ける
-    /// （overflow は AtomicU64・dropped_before の u32 飽和とは別経路）。
+    /// With consecutive drops, the overflow counter keeps growing as u64 past u32::MAX without
+    /// saturating (overflow is an AtomicU64, a separate path from the u32 saturation of
+    /// dropped_before).
     #[test]
     fn overflow_counter_exceeds_u32_max() {
         let (mut p, _c) = raw_ring(1);
-        // 1 サンプルだけ書いて満杯にし、以降は全ドロップにする。
+        // Write just 1 sample to make it full, so everything after is dropped.
         assert_eq!(p.push_slice(&[0.0]), 1);
-        // u32::MAX を跨ぐ量をドロップさせる。大 slice を 1 回 push すれば一気に積める。
+        // Drop an amount that crosses u32::MAX. Pushing a large slice accumulates quickly.
         let big = vec![0.0f32; 1000];
         let over_u32 = u64::from(u32::MAX) + 2_000;
         let mut total_dropped = 0u64;
         while total_dropped < over_u32 {
             let w = p.push_slice(&big);
-            assert_eq!(w, 0, "満杯なので 1 つも書けない");
+            assert_eq!(w, 0, "full, so not a single sample can be written");
             total_dropped += big.len() as u64;
         }
         assert!(
             p.overflow_count() > u64::from(u32::MAX),
-            "overflow は u32::MAX を超えて積み上がる: {}",
+            "overflow accumulates past u32::MAX: {}",
             p.overflow_count()
         );
     }
 
-    /// 単発 `pop()` は 1 サンプルずつ FIFO で返し、空なら None。
+    /// A single `pop()` returns one sample at a time in FIFO order, then None when empty.
     #[test]
     fn single_pop_is_fifo_then_none() {
         let (mut p, mut c) = raw_ring(4);
@@ -239,29 +240,29 @@ mod tests {
         assert_eq!(c.pop(), None);
     }
 
-    /// 容量 0 指定でも `max(1)` で最低 1 を確保し、push/pop が成立する（panic しない）。
+    /// Even with capacity 0, `max(1)` guarantees at least 1 and push/pop work (no panic).
     #[test]
     fn zero_capacity_is_clamped_to_one() {
         let (mut p, mut c) = raw_ring(0);
         assert_eq!(
             p.push_slice(&[7.0, 8.0]),
             1,
-            "容量 1 に丸められ 1 サンプルだけ入る"
+            "rounded to capacity 1, so only 1 sample enters"
         );
         assert_eq!(p.overflow_count(), 1);
         assert_eq!(c.pop(), Some(7.0));
     }
 
-    /// producer/consumer は overflow カウンタを共有する（同じ Arc）。
+    /// The producer and consumer share the overflow counter (the same Arc).
     #[test]
     fn overflow_count_is_shared_between_ends() {
         let (mut p, c) = raw_ring(2);
-        p.push_slice(&[1.0, 2.0, 3.0, 4.0]); // 2 書けて 2 ドロップ。
+        p.push_slice(&[1.0, 2.0, 3.0, 4.0]); // 2 written, 2 dropped.
         assert_eq!(p.overflow_count(), 2);
         assert_eq!(
             c.overflow_count(),
             2,
-            "consumer 側も同じ overflow を観測する"
+            "the consumer side observes the same overflow"
         );
     }
 }
