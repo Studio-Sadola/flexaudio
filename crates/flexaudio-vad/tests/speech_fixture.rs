@@ -1,10 +1,10 @@
-//! 実音声フィクスチャによる推論の守り。
+//! Guards inference with a real-speech fixture.
 //!
-//! 16 kHz の期待値は、推論器を `ort` から `tract-onnx` に替える直前の
-//! `flexaudio-vad`（git `593a047dcca29708653199c554ff5576a0979a6c`、
-//! `ort` 2.0.0-rc.12、当時の `assets/silero_vad.onnx`＝上流 Silero VAD v6.2.1）
-//! が同じ WAV に対して出したフレームごとの発話確率。差 1e-4 以内、しきい値 0.5 の
-//! 判定が全フレーム一致すること。
+//! The 16 kHz expected values are the per-frame speech probabilities that `flexaudio-vad`
+//! produced on the same WAV just before the inference engine was switched from `ort` to
+//! `tract-onnx` (git `593a047dcca29708653199c554ff5576a0979a6c`, `ort` 2.0.0-rc.12, with the
+//! `assets/silero_vad.onnx` of that time = upstream Silero VAD v6.2.1). The difference must be
+//! within 1e-4, and the threshold-0.5 decision must match on every frame.
 
 use flexaudio_vad::{get_speech_timestamps, Vad, VadConfig};
 use std::fs::File;
@@ -20,7 +20,7 @@ fn fixture_path(rel: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
-/// PCM s16le mono WAV（canonical RIFF）を f32 [-1,1] にする。
+/// Converts a PCM s16le mono WAV (canonical RIFF) to f32 [-1,1].
 fn load_pcm16_mono_wav(path: &Path) -> (u32, Vec<f32>) {
     let mut f = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let mut hdr = [0u8; 12];
@@ -80,8 +80,8 @@ fn load_expected_probs(path: &Path) -> Vec<f32> {
         .collect()
 }
 
-/// 切り出し手順: 16 kHz mono PCM16 の `jp_2spk_FF.wav` 先頭 4 秒。
-/// `ffmpeg -t 4 -ac 1 -ar 16000 -c:a pcm_s16le`。
+/// How it was cut: the first 4 seconds of `jp_2spk_FF.wav` as 16 kHz mono PCM16.
+/// `ffmpeg -t 4 -ac 1 -ar 16000 -c:a pcm_s16le`.
 #[test]
 fn tract_matches_ort_frame_probs_on_speech_fixture() {
     let wav = fixture_path(FIXTURE_WAV);
@@ -124,12 +124,14 @@ fn tract_matches_ort_frame_probs_on_speech_fixture() {
     );
 }
 
-/// 8 kHz 入力は落ちずに、入力レート基準のフレーム数と発話イベントを出す。
+/// 8 kHz input does not fail, and yields frame counts and speech events in terms of the input
+/// rate.
 #[test]
 fn eight_khz_input_emits_events_in_input_rate_units() {
     let (rate, samples16) = load_pcm16_mono_wav(&fixture_path(FIXTURE_WAV));
     assert_eq!(rate, 16_000);
-    // 整数 1/2: 偶数番サンプルだけ取る。4 s × 8 kHz = 32000。フレーム 256 → 125 個。
+    // Integer 1/2: take only the even-numbered samples. 4 s × 8 kHz = 32000. Frames of 256 →
+    // 125 of them.
     let samples8: Vec<f32> = samples16.iter().step_by(2).copied().collect();
     assert_eq!(samples8.len(), 32_000);
 
@@ -143,7 +145,7 @@ fn eight_khz_input_emits_events_in_input_rate_units() {
     assert_eq!(
         probs.len(),
         32_000 / 256,
-        "8 kHz のフレーム数は入力レート基準（256 サンプル/フレーム）"
+        "8 kHz frame count is in terms of the input rate (256 samples/frame)"
     );
     for &p in probs {
         assert!((0.0..=1.0).contains(&p), "prob {p} out of [0,1]");
@@ -156,11 +158,11 @@ fn eight_khz_input_emits_events_in_input_rate_units() {
         events
             .iter()
             .any(|e| matches!(e, flexaudio_vad::VadEvent::SpeechStart { .. })),
-        "8 kHz 実音声で発話イベントが出る: {events:?}"
+        "real 8 kHz speech produces speech events: {events:?}"
     );
 
     let segs = get_speech_timestamps(&samples8, &cfg).expect("batch 8 kHz");
-    assert!(!segs.is_empty(), "8 kHz batch でもセグメントが出る");
+    assert!(!segs.is_empty(), "8 kHz batch also produces segments");
     let input_len = samples8.len() as u64;
     let pad = cfg.sample_rate as u64 * u64::from(cfg.speech_pad_ms) / 1000;
     for s in &segs {

@@ -1,32 +1,32 @@
-//! flexaudio-denoise — RNNoise (nnnoiseless) によるオフラインのノイズ抑制アドオン。
+//! flexaudio-denoise — an offline noise-suppression add-on based on RNNoise (nnnoiseless).
 //!
-//! `flexaudio-core` には依存せず、±1.0 正規化・48kHz interleaved の `&[f32]` だけを
-//! 受け取る。モデル重みは nnnoiseless クレート (BSD-3-Clause) に埋め込まれているので、
-//! 実行時のモデルファイルもネットワークも要らない。マイク録音の定常ノイズ
-//! (ファン・空調・キーボード打鍵など) の低減を想定している。
+//! It does not depend on `flexaudio-core` and takes only ±1.0-normalized, 48kHz interleaved
+//! `&[f32]`. The model weights are embedded in the nnnoiseless crate (BSD-3-Clause), so
+//! neither a model file nor a network is needed at runtime. It is intended to reduce
+//! stationary noise in microphone recordings (fans, air conditioning, keyboard typing, etc.).
 //!
-//! # 遅延と持ち越しのセマンティクス
+//! # Latency and carry-over semantics
 //!
-//! RNNoise は 480 サンプル (48kHz で 10ms) 固定のフレームでしか処理できないため、
-//! [`Denoiser::process`] は内部でフレームに切り、端数を次回呼び出しへ持ち越す。
-//! 呼び出し粒度に依存しない固定遅延の設計で、出力は常に「入力をちょうど
-//! [`FRAME_SIZE`] サンプル/ch 遅らせた列」になる:
+//! RNNoise can only process fixed frames of 480 samples (10ms at 48kHz), so
+//! [`Denoiser::process`] splits the input into frames internally and carries the remainder
+//! over to the next call. The design has a fixed latency independent of call granularity,
+//! and the output is always "the input delayed by exactly [`FRAME_SIZE`] samples/ch":
 //!
-//! - `process` は渡されたバッファと同じ長さをインプレースで返す。ストリーム先頭の
-//!   [`FRAME_SIZE`] サンプル/ch は遅延の詰め物 (無音 0.0)。
-//! - [`Denoiser::flush`] が末尾の [`FRAME_SIZE`] サンプル/ch を返してストリームを
-//!   閉じる。つまり総出力 = 総入力 + [`FRAME_SIZE`] サンプル/ch。
+//! - `process` returns the same length as the given buffer, in place. The first
+//!   [`FRAME_SIZE`] samples/ch of the stream are delay padding (silence, 0.0).
+//! - [`Denoiser::flush`] returns the trailing [`FRAME_SIZE`] samples/ch and closes the
+//!   stream. So total output = total input + [`FRAME_SIZE`] samples/ch.
 //!
-//! チャンクの切り方を変えても出力列はビット単位で一致する。
+//! The output is bit-identical however the input is chunked.
 //!
-//! # 例
+//! # Example
 //! ```
 //! use flexaudio_denoise::{Denoiser, FRAME_SIZE};
 //!
 //! let mut dn = Denoiser::new(1).unwrap();
-//! let mut chunk = vec![0.0f32; 1000]; // ±1.0 正規化 mono 48kHz
-//! dn.process(&mut chunk).unwrap();    // インプレース (先頭 480 サンプルは遅延の無音)
-//! let tail = dn.flush();              // 残りの 480 サンプル/ch
+//! let mut chunk = vec![0.0f32; 1000]; // ±1.0-normalized mono 48kHz
+//! dn.process(&mut chunk).unwrap();    // in place (the first 480 samples are latency silence)
+//! let tail = dn.flush();              // the remaining 480 samples/ch
 //! assert_eq!(tail.len(), FRAME_SIZE);
 //! ```
 
@@ -36,23 +36,24 @@ use std::collections::VecDeque;
 
 use nnnoiseless::DenoiseState;
 
-/// RNNoise の 1 フレームのサンプル数/ch (48kHz で 10ms)。処理遅延もこの固定値。
+/// Samples per channel in one RNNoise frame (10ms at 48kHz). The processing latency is this
+/// fixed value too.
 pub const FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
 
-/// nnnoiseless は i16 レンジ (±32768) スケールの f32 を想定するので、flexaudio の
-/// ±1.0 正規化とはこの係数で相互変換する。
+/// nnnoiseless expects f32 scaled to the i16 range (±32768), so this factor converts to and
+/// from flexaudio's ±1.0 normalization.
 const I16_SCALE: f32 = 32768.0;
 
-/// ノイズ抑制のエラー型。
+/// Error type for noise suppression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenoiseError {
-    /// チャンネル数が範囲外 (1..=2 のみ対応)。
+    /// Channel count out of range (only 1..=2 is supported).
     InvalidChannels(u16),
-    /// interleaved 長がチャンネル数の倍数でない。
+    /// The interleaved length is not a multiple of the channel count.
     InvalidLength {
-        /// 渡されたスライス長。
+        /// The length of the given slice.
         len: usize,
-        /// 構築時のチャンネル数。
+        /// The channel count at construction.
         channels: u16,
     },
 }
@@ -75,28 +76,28 @@ impl std::fmt::Display for DenoiseError {
 
 impl std::error::Error for DenoiseError {}
 
-/// ストリーミングのノイズ抑制器。ステレオはチャンネル独立に 2 インスタンスの
-/// RNNoise 状態で処理する (チャンネル間のクロストークなし)。
+/// Streaming noise suppressor. Stereo is processed with 2 independent RNNoise state
+/// instances, one per channel (no crosstalk between channels).
 ///
-/// 遅延と持ち越しの詳細は [crate レベルのドキュメント](crate) を参照。
+/// See the [crate-level documentation](crate) for details on latency and carry-over.
 pub struct Denoiser {
     channels: usize,
-    /// チャンネルごとの RNNoise 状態。nnnoiseless に reset が無いので、リセットは
-    /// インスタンスの作り直しで行う (モデルはデフォルト埋め込み・決定論)。
+    /// Per-channel RNNoise state. nnnoiseless has no reset, so resetting is done by
+    /// recreating the instance (the model is the default embedded one; deterministic).
     states: Vec<Box<DenoiseState<'static>>>,
-    /// チャンネル別の未処理入力 (±1.0 スケールのまま保持)。構築時に FRAME_SIZE 分の
-    /// 無音を先詰めしておくことで、遅延線が常に入力と同数を排出できる。
+    /// Per-channel unprocessed input (kept at ±1.0 scale). Pre-filling FRAME_SIZE of silence
+    /// at construction lets the delay line always emit as many samples as it receives.
     in_buf: Vec<Vec<f32>>,
-    /// 処理済み・未排出の interleaved 出力 (±1.0 スケール・クランプ済み)。
+    /// Processed but not yet emitted interleaved output (±1.0 scale, clamped).
     out_buf: VecDeque<f32>,
-    /// フレーム処理の入力スクラッチ (i16 スケール・480 サンプル)。
+    /// Input scratch for frame processing (i16 scale, 480 samples).
     frame_in: Vec<f32>,
-    /// フレーム処理の出力スクラッチ (チャンネル別・480 サンプル)。
+    /// Output scratch for frame processing (per channel, 480 samples).
     frame_out: Vec<Vec<f32>>,
 }
 
 impl Denoiser {
-    /// チャンネル数 (1 = mono, 2 = stereo interleaved) を指定して構築する。
+    /// Constructs with the given channel count (1 = mono, 2 = stereo interleaved).
     pub fn new(channels: u16) -> Result<Denoiser, DenoiseError> {
         if !(1..=2).contains(&channels) {
             return Err(DenoiseError::InvalidChannels(channels));
@@ -114,13 +115,14 @@ impl Denoiser {
         Ok(dn)
     }
 
-    /// 任意長の interleaved (±1.0 正規化・48kHz) サンプルをインプレースで
-    /// ノイズ抑制する。長さはチャンネル数の倍数であること (空スライスは no-op)。
+    /// Noise-suppresses interleaved samples of any length (±1.0-normalized, 48kHz) in place.
+    /// The length must be a multiple of the channel count (an empty slice is a no-op).
     ///
-    /// 内部で [`FRAME_SIZE`] サンプル/ch のフレームに切って処理し、端数は次回へ
-    /// 持ち越す。出力は入力を [`FRAME_SIZE`] サンプル/ch 遅らせた列で、ストリーム
-    /// 先頭の遅延分は無音 (0.0)。呼び出しの切り方を変えても出力列は変わらない。
-    /// 出力サンプルは ±1.0 にクランプされる。
+    /// Internally the input is split into frames of [`FRAME_SIZE`] samples/ch and processed,
+    /// and the remainder is carried over to the next call. The output is the input delayed by
+    /// [`FRAME_SIZE`] samples/ch, and the latency at the start of the stream is silence (0.0).
+    /// The output does not change however the calls are split. Output samples are clamped to
+    /// ±1.0.
     pub fn process(&mut self, interleaved: &mut [f32]) -> Result<(), DenoiseError> {
         if interleaved.len() % self.channels != 0 {
             return Err(DenoiseError::InvalidLength {
@@ -129,7 +131,7 @@ impl Denoiser {
             });
         }
 
-        // deinterleave して持ち越しバッファへ積む。
+        // Deinterleave and push into the carry-over buffers.
         for frame in interleaved.chunks_exact(self.channels) {
             for (ch, &s) in frame.iter().enumerate() {
                 self.in_buf[ch].push(s);
@@ -138,8 +140,9 @@ impl Denoiser {
 
         self.process_ready_frames();
 
-        // 遅延線から入力と同数を排出する。先詰めした FRAME_SIZE 分の無音のおかげで
-        // 「処理済み ≥ 排出済み + 今回分」が常に成り立つ (先頭無音が遅延になる)。
+        // Emit as many samples as were input from the delay line. Thanks to the FRAME_SIZE
+        // of pre-filled silence, "processed ≥ emitted + this call's amount" always holds (the
+        // leading silence becomes the latency).
         for s in interleaved.iter_mut() {
             *s = self
                 .out_buf
@@ -149,12 +152,12 @@ impl Denoiser {
         Ok(())
     }
 
-    /// 持ち越し中の端数をゼロ詰めで 1 フレームに整えて処理し、遅延分の末尾
-    /// [`FRAME_SIZE`] サンプル/ch を interleaved で返してストリームを閉じる。
+    /// Zero-pads the carried-over remainder into one frame and processes it, returns the
+    /// trailing [`FRAME_SIZE`] samples/ch of latency as interleaved, and closes the stream.
     ///
-    /// これで総出力 = 総入力 + [`FRAME_SIZE`] サンプル/ch (先頭の無音詰め物) になる。
-    /// 呼び出し後は [`Denoiser::reset`] と同じ初期状態に戻るので、続けて新しい
-    /// ストリームを処理できる。
+    /// This makes total output = total input + [`FRAME_SIZE`] samples/ch (the leading silence
+    /// padding). Afterwards it is back in the same initial state as after
+    /// [`Denoiser::reset`], so a new stream can be processed right away.
     pub fn flush(&mut self) -> Vec<f32> {
         if !self.in_buf[0].is_empty() {
             for buf in &mut self.in_buf {
@@ -165,16 +168,18 @@ impl Denoiser {
         let take = FRAME_SIZE * self.channels;
         let mut out = Vec::with_capacity(take);
         for _ in 0..take {
-            // 上記のゼロ詰め処理後、遅延線には必ず take 以上が残っている。
+            // After the zero-padded processing above, the delay line always holds at least
+            // take samples.
             out.push(self.out_buf.pop_front().unwrap_or(0.0));
         }
         self.reset();
         out
     }
 
-    /// RNN 状態・持ち越しバッファ・遅延線をすべて初期化する。
+    /// Resets the RNN state, the carry-over buffers, and the delay line.
     ///
-    /// reset 後は生成直後と同じ状態で、同一入力からは同一出力が得られる。
+    /// After reset the state is the same as right after construction, and the same input
+    /// yields the same output.
     pub fn reset(&mut self) {
         for st in &mut self.states {
             *st = DenoiseState::new();
@@ -186,33 +191,33 @@ impl Denoiser {
         self.prime_delay();
     }
 
-    /// 構築時に指定したチャンネル数。
+    /// The channel count given at construction.
     pub fn channels(&self) -> u16 {
         self.channels as u16
     }
 
-    /// 遅延線の先詰め。各チャンネルの入力バッファに FRAME_SIZE 分の無音を積む。
-    /// この無音フレームの処理結果は厳密に 0.0 なので、出力ストリームの先頭
-    /// FRAME_SIZE サンプル/ch が「無音の詰め物」になる。
+    /// Pre-fills the delay line. Pushes FRAME_SIZE of silence into each channel's input
+    /// buffer. Processing this silent frame yields exactly 0.0, so the first FRAME_SIZE
+    /// samples/ch of the output stream become "silence padding".
     fn prime_delay(&mut self) {
         for buf in &mut self.in_buf {
             buf.resize(FRAME_SIZE, 0.0);
         }
     }
 
-    /// 揃っている分のフレームをすべて処理して遅延線 (out_buf) に積む。
+    /// Processes every complete frame and pushes the result into the delay line (out_buf).
     fn process_ready_frames(&mut self) {
-        // 全チャンネル同数積まれているので先頭チャンネルの長さだけ見ればよい。
+        // Every channel holds the same count, so checking the first channel's length suffices.
         while self.in_buf[0].len() >= FRAME_SIZE {
             for ch in 0..self.channels {
-                // ±1.0 → i16 レンジへ拡大して 1 フレーム処理。
+                // Scale ±1.0 up to the i16 range and process one frame.
                 for (dst, &src) in self.frame_in.iter_mut().zip(&self.in_buf[ch][..FRAME_SIZE]) {
                     *dst = src * I16_SCALE;
                 }
                 self.states[ch].process_frame(&mut self.frame_out[ch], &self.frame_in);
                 self.in_buf[ch].drain(..FRAME_SIZE);
             }
-            // i16 レンジ → ±1.0 に戻し、interleave して排出待ちに積む。
+            // Scale the i16 range back to ±1.0, interleave, and queue for emission.
             for i in 0..FRAME_SIZE {
                 for out_ch in &self.frame_out {
                     self.out_buf
@@ -227,11 +232,12 @@ impl Denoiser {
 mod tests {
     use super::*;
 
-    /// 決定論の擬似乱数 (LCG・Knuth の MMIX 定数)。rand 依存を避ける。
+    /// Deterministic pseudo-random numbers (LCG, Knuth's MMIX constants). Avoids depending on
+    /// rand.
     struct Lcg(u64);
 
     impl Lcg {
-        /// [0, 1) の一様乱数。上位 24bit を使う。
+        /// Uniform random number in [0, 1). Uses the upper 24 bits.
         fn next_unit(&mut self) -> f32 {
             self.0 = self
                 .0
@@ -241,7 +247,7 @@ mod tests {
         }
     }
 
-    /// 振幅 ±amp の一様ホワイトノイズ (シード固定・決定論)。
+    /// Uniform white noise of amplitude ±amp (fixed seed, deterministic).
     fn white_noise(n: usize, amp: f32) -> Vec<f32> {
         let mut lcg = Lcg(0x5EED_1234_5678_9ABC);
         (0..n)
@@ -249,8 +255,9 @@ mod tests {
             .collect()
     }
 
-    /// 一次 IIR ローパス (y += a * (x - y))。ファン・空調のような低域寄りの定常ノイズを
-    /// 模すために使う (a=0.1 でカットオフ ~800Hz 相当・決定論)。
+    /// First-order IIR low-pass (y += a * (x - y)). Used to mimic low-frequency-heavy
+    /// stationary noise such as fans and air conditioning (a=0.1 corresponds to a cutoff of
+    /// ~800Hz; deterministic).
     fn lowpass(xs: &[f32], a: f32) -> Vec<f32> {
         let mut y = 0.0f32;
         xs.iter()
@@ -272,18 +279,19 @@ mod tests {
         (sum / xs.len() as f64).sqrt()
     }
 
-    /// 一括処理して「遅延分を除いて入力に整列した」出力列 (入力と同じ長さ) を返す。
+    /// Processes in one shot and returns the output "aligned to the input with the latency
+    /// removed" (the same length as the input).
     fn run_aligned(channels: u16, input: &[f32]) -> Vec<f32> {
         let mut dn = Denoiser::new(channels).unwrap();
         let mut buf = input.to_vec();
         dn.process(&mut buf).unwrap();
         buf.extend_from_slice(&dn.flush());
-        // 先頭 FRAME_SIZE サンプル/ch (interleaved で FRAME_SIZE*ch) が遅延の無音。
+        // The first FRAME_SIZE samples/ch (FRAME_SIZE*ch interleaved) are latency silence.
         buf.split_off(FRAME_SIZE * channels as usize)
     }
 
-    /// 閾値決めの実測用 (通常は走らせない): 各テスト信号の RMS 比を出力する。
-    /// `cargo test -p flexaudio-denoise -- --ignored --nocapture measure` で実行。
+    /// For measuring to decide thresholds (not normally run): prints the RMS ratio of each
+    /// test signal. Run with `cargo test -p flexaudio-denoise -- --ignored --nocapture measure`.
     #[test]
     #[ignore]
     fn measure_rms_ratios() {
@@ -307,10 +315,11 @@ mod tests {
 
     #[test]
     fn stationary_noise_rms_strongly_reduced() {
-        // 2 秒 @48k mono の低域寄り定常ノイズ (LCG ホワイトノイズの一次ローパス)。
-        // ファン・空調に近い、このクレートの本来の対象。measure_rms_ratios の実測で
-        // ratio = 0.0556 (in_rms 0.0399 → out_rms 0.0022、後半 1 秒に限れば 0.006)。
-        // 実測の約 4.5 倍のマージンを取って閾値 25% とする。
+        // 2 seconds @48k mono of low-frequency-heavy stationary noise (first-order low-pass of
+        // LCG white noise). Close to fans / air conditioning, the intended target of this
+        // crate. Measured by measure_rms_ratios: ratio = 0.0556 (in_rms 0.0399 → out_rms
+        // 0.0022; 0.006 for the last 1 second alone). The threshold is 25%, a margin of about
+        // 4.5x over the measurement.
         let input = lowpass(&white_noise(96_000, 0.3), 0.1);
         let output = run_aligned(1, &input);
         let (in_rms, out_rms) = (rms(&input), rms(&output));
@@ -323,10 +332,11 @@ mod tests {
 
     #[test]
     fn white_noise_rms_reduced() {
-        // 2 秒 @48k mono のフルバンドホワイトノイズ (振幅 ±0.3)。学習分布から遠い
-        // 合成ノイズなので RNNoise の抑制は弱く、実測 ratio = 0.7883 に留まる
-        // (定常ノイズへの実効性は stationary_noise_rms_strongly_reduced が担う)。
-        // ここでは「増幅せず一定の低減はある」ことだけを実測 + 余裕の 90% で確認する。
+        // 2 seconds @48k mono of full-band white noise (amplitude ±0.3). Synthetic noise far
+        // from the training distribution, so RNNoise suppresses it only weakly: measured
+        // ratio = 0.7883 (effectiveness on stationary noise is covered by
+        // stationary_noise_rms_strongly_reduced). Here we only check "not amplified, with some
+        // reduction", at 90% = the measurement plus headroom.
         let input = white_noise(96_000, 0.3);
         let output = run_aligned(1, &input);
         let (in_rms, out_rms) = (rms(&input), rms(&output));
@@ -338,10 +348,10 @@ mod tests {
 
     #[test]
     fn sine_output_sane() {
-        // 440Hz 正弦 (振幅 0.5) 2 秒。実測では ratio = 0.9999 とほぼ素通し
-        // (RNNoise は周期信号を有声とみなす)。とはいえ純音の扱いはモデル依存なので、
-        // アサーションは健全性 (NaN なし・±1.0 内) と「消えないこと」= 実測の半分の
-        // 50% 床に留める。
+        // 440Hz sine (amplitude 0.5), 2 seconds. Measured ratio = 0.9999, nearly passthrough
+        // (RNNoise treats periodic signals as voiced). Still, how pure tones are handled
+        // depends on the model, so the assertions are limited to sanity (no NaN, within ±1.0)
+        // and "does not vanish" = a 50% floor, half the measurement.
         let input = sine(96_000, 440.0, 0.5);
         let output = run_aligned(1, &input);
         assert!(
@@ -361,7 +371,8 @@ mod tests {
 
     #[test]
     fn first_delay_block_is_silence() {
-        // 出力ストリームの先頭 FRAME_SIZE サンプル/ch は遅延の詰め物で厳密に 0.0。
+        // The first FRAME_SIZE samples/ch of the output stream are latency padding and exactly
+        // 0.0.
         let mut dn = Denoiser::new(1).unwrap();
         let mut buf = white_noise(FRAME_SIZE * 2, 0.3);
         dn.process(&mut buf).unwrap();
@@ -373,8 +384,9 @@ mod tests {
 
     #[test]
     fn chunked_equals_oneshot() {
-        // 480 の倍数でない 1000 サンプル刻みで流しても、一括処理と出力がビット単位で
-        // 一致する (呼び出し粒度非依存の検証)。総サンプル数の整合も同時に確認。
+        // Feeding in 1000-sample steps (not a multiple of 480) yields output bit-identical to
+        // one-shot processing (verifies independence from call granularity). Also checks that
+        // the total sample counts are consistent.
         let input = white_noise(96_000, 0.3);
 
         let mut oneshot = input.clone();
@@ -415,10 +427,10 @@ mod tests {
 
     #[test]
     fn stereo_keeps_channels_independent_and_interleaved() {
-        // L = ノイズ, R = 無音の interleaved ステレオ。R 出力は厳密に 0 のまま、
-        // L 出力は同じ信号を mono で処理した結果とビット単位で一致する
-        // (interleave の維持とチャンネル独立性の両方を検証)。
-        let n = 48_000; // 1 秒/ch。1000 サンプル刻み (=500/ch, 480 の倍数でない) で流す。
+        // Interleaved stereo with L = noise, R = silence. The R output stays exactly 0, and the
+        // L output is bit-identical to processing the same signal as mono (verifies both that
+        // interleaving is preserved and that channels are independent).
+        let n = 48_000; // 1 second/ch. Fed in 1000-sample steps (=500/ch, not a multiple of 480).
         let left = white_noise(n, 0.3);
         let mut stereo = Vec::with_capacity(n * 2);
         for &l in &left {
@@ -460,7 +472,8 @@ mod tests {
 
     #[test]
     fn reset_restores_initial_state() {
-        // reset 後に同一入力を流すと同一出力 (ビット単位)。flush の自動リセットも同様。
+        // Feeding the same input after reset yields the same output (bit for bit). The same
+        // holds for flush's automatic reset.
         let input = white_noise(10_000, 0.3);
 
         let mut dn = Denoiser::new(1).unwrap();
@@ -472,7 +485,7 @@ mod tests {
         dn.process(&mut second).unwrap();
         assert_eq!(first, second, "reset must restore the initial state");
 
-        // flush はストリームを閉じたあと reset と同じ初期状態に戻す。
+        // flush closes the stream and then returns to the same initial state as reset.
         dn.flush();
         let mut third = input.clone();
         dn.process(&mut third).unwrap();
@@ -494,7 +507,7 @@ mod tests {
     #[test]
     fn rejects_misaligned_length() {
         let mut dn = Denoiser::new(2).unwrap();
-        let mut buf = vec![0.0f32; 999]; // 2ch の倍数でない
+        let mut buf = vec![0.0f32; 999]; // not a multiple of 2ch
         let err = dn.process(&mut buf).unwrap_err();
         assert_eq!(
             err,
@@ -503,7 +516,7 @@ mod tests {
                 channels: 2
             }
         );
-        // エラー時はバッファに触れない。
+        // On error the buffer is not touched.
         assert!(buf.iter().all(|&x| x == 0.0));
     }
 
@@ -511,10 +524,10 @@ mod tests {
     fn empty_process_and_bare_flush() {
         let mut dn = Denoiser::new(1).unwrap();
         let mut empty: [f32; 0] = [];
-        dn.process(&mut empty).unwrap(); // 空は no-op
+        dn.process(&mut empty).unwrap(); // empty is a no-op
         assert_eq!(dn.channels(), 1);
 
-        // 入力ゼロのまま flush しても遅延分 (無音) がちょうど返る。
+        // Flushing with zero input still returns exactly the latency amount (silence).
         let tail = dn.flush();
         assert_eq!(tail.len(), FRAME_SIZE);
         assert!(tail.iter().all(|&x| x == 0.0));

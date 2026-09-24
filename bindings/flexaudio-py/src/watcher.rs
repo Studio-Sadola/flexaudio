@@ -1,9 +1,10 @@
-//! デバイス着脱監視 [`DeviceWatcher`] と入口 `watch_devices()`。
+//! Device hotplug watch [`DeviceWatcher`] and the entry point `watch_devices()`.
 //!
-//! OS のデバイス着脱・既定変更（ホットプラグ）を pull/poll 型で配信する。capture stream
-//! 単位の [`StreamEvent`](crate::marshal::PyStreamEvent) とは別系統で、デバイス単位の事象を
-//! 扱う。napi 版は bridge スレッド + コールバックだが、Python は他の poll 系（`poll_chunk` /
-//! `poll_event`）と揃えて pull 型にする（利用側が `poll_event` を周期的に呼ぶ）。
+//! Delivers OS device hotplug and default changes pull/poll-style. This is a separate channel
+//! from the per-capture-stream [`StreamEvent`](crate::marshal::PyStreamEvent) and handles
+//! per-device events. The napi version uses a bridge thread + callback, but Python is made
+//! pull-style to match the other poll APIs (`poll_chunk` / `poll_event`) (the caller calls
+//! `poll_event` periodically).
 
 use pyo3::prelude::*;
 
@@ -12,15 +13,15 @@ use ::flexaudio as fa;
 use crate::marshal::{device_event_to_py, PyDeviceEvent};
 use crate::to_py_err;
 
-/// デバイス着脱・既定変更を pull 型で配信するウォッチャ。
+/// Watcher that delivers device hotplug and default changes pull-style.
 ///
-/// [`watch_devices`] で生成する。[`poll_event`](DeviceWatcher::poll_event) を周期的に呼んで
-/// [`DeviceEvent`](PyDeviceEvent) を取り出す。`stop()` で停止（drop でも自動停止）。
-/// context manager（`with`）にも対応する。
+/// Created by [`watch_devices`]. Call [`poll_event`](DeviceWatcher::poll_event) periodically
+/// to take out [`DeviceEvent`](PyDeviceEvent)s. `stop()` stops it (it also stops automatically
+/// on drop). It also supports the context manager protocol (`with`).
 ///
-/// 内部の `flexaudio::DeviceWatcher`（`Box<dyn DeviceWatchBackend>`）が Send だが !Sync な
-/// ので、pyclass の Send+Sync 既定を満たせない。poll 型の単一スレッド利用が前提なので
-/// unsendable にして生成スレッドに固定する。
+/// The inner `flexaudio::DeviceWatcher` (`Box<dyn DeviceWatchBackend>`) is Send but !Sync, so
+/// the pyclass default of Send+Sync cannot be met. Usage is assumed to be poll-style and
+/// single-threaded, so the class is made unsendable and pinned to the thread that created it.
 #[pyclass(module = "flexaudio", name = "DeviceWatcher", unsendable)]
 pub struct DeviceWatcher {
     inner: fa::DeviceWatcher,
@@ -28,22 +29,22 @@ pub struct DeviceWatcher {
 
 #[pymethods]
 impl DeviceWatcher {
-    /// 次のホットプラグイベントを 1 つ取り出す。無ければ `None`（非ブロッキング）。
+    /// Takes out the next hotplug event. `None` if there is none (non-blocking).
     fn poll_event(&mut self) -> Option<PyDeviceEvent> {
         self.inner.poll_event().map(device_event_to_py)
     }
 
-    /// 監視を停止する（以後 `poll_event` は `None`）。二重呼び出し安全。
+    /// Stops watching (after this, `poll_event` returns `None`). Safe to call twice.
     fn stop(&mut self) {
         self.inner.stop();
     }
 
-    /// context manager 対応。`with flexaudio.watch_devices() as w:` で使える。
+    /// Context manager support. Usable as `with flexaudio.watch_devices() as w:`.
     fn __enter__(slf: Py<Self>) -> Py<Self> {
         slf
     }
 
-    /// `with` ブロックを抜けるとき stop する。例外は握り潰さない（False を返す）。
+    /// Stops when leaving the `with` block. Exceptions are not swallowed (returns False).
     fn __exit__(
         &mut self,
         _exc_type: Option<Bound<'_, PyAny>>,
@@ -55,10 +56,11 @@ impl DeviceWatcher {
     }
 }
 
-/// デバイスの着脱・既定変更（ホットプラグ）の監視を開始し、[`DeviceWatcher`] を返す。
+/// Starts watching device hotplug and default changes, and returns a [`DeviceWatcher`].
 ///
-/// Linux は PipeWire レジストリを永続監視する。PipeWire 不在・その他 OS では縮退して常に
-/// `None` を配信するウォッチャを返す（着脱が来ないだけで、panic も例外もしない）。
+/// On Linux it persistently watches the PipeWire registry. When PipeWire is absent, and on
+/// other OSes, it degrades to a watcher that always delivers `None` (hotplug events simply
+/// never arrive; it neither panics nor raises).
 #[pyfunction]
 pub fn watch_devices() -> PyResult<DeviceWatcher> {
     let inner = fa::watch_devices().map_err(to_py_err)?;

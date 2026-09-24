@@ -1,29 +1,31 @@
-//! VAD 設定。既定値は silero-VAD 原典 (`get_speech_timestamps`) のデフォルトに揃える。
+//! VAD configuration. The defaults match those of the original silero-VAD
+//! (`get_speech_timestamps`).
 
-/// VAD の挙動を制御する設定。
+/// Settings that control VAD behavior.
 ///
-/// デフォルト値は silero-VAD の `get_speech_timestamps` に揃えてある。
+/// The default values match silero-VAD's `get_speech_timestamps`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VadConfig {
-    /// 発話開始とみなす確率しきい値 (>=)。既定 0.5。
+    /// Probability threshold (>=) for treating as speech start. Default 0.5.
     pub threshold: f32,
-    /// 無音開始とみなす負側しきい値 (<)。`None` なら
-    /// `max(threshold - 0.15, 0.01)`（silero 準拠）。
+    /// Negative-side threshold (<) for treating as silence start. `None` means
+    /// `max(threshold - 0.15, 0.01)` (following silero).
     pub neg_threshold: Option<f32>,
-    /// 採用する発話の最小長 (ms)。これ未満のセグメントは破棄。既定 250。
+    /// Minimum length (ms) of accepted speech. Shorter segments are discarded. Default 250.
     pub min_speech_ms: u32,
-    /// 発話終了の確定に必要な無音長 (ms)。既定 100（silero）。
+    /// Silence length (ms) required to finalize speech end. Default 100 (silero).
     pub min_silence_ms: u32,
-    /// セグメント境界を前後に広げるパディング (ms)。既定 30（silero）。
+    /// Padding (ms) that widens segment boundaries on both sides. Default 30 (silero).
     pub speech_pad_ms: u32,
-    /// 1 セグメントの最大長 (ms)。0 = 無制限。超過時は強制分割。既定 0。
+    /// Maximum length (ms) of one segment. 0 = unlimited. Exceeding it forces a split.
+    /// Default 0.
     pub max_speech_ms: u32,
-    /// サンプルレート。8000 または 16000 のみ。既定 16000。
+    /// Sample rate. Only 8000 or 16000. Default 16000.
     pub sample_rate: u32,
 }
 
 impl Default for VadConfig {
-    /// silero のデフォルト（[`VadConfig::balanced`] と同じ）。
+    /// The silero defaults (same as [`VadConfig::balanced`]).
     fn default() -> Self {
         VadConfig {
             threshold: 0.5,
@@ -38,9 +40,9 @@ impl Default for VadConfig {
 }
 
 impl VadConfig {
-    /// 取りこぼしを減らす感度高めのプリセット。
+    /// Higher-sensitivity preset that reduces misses.
     ///
-    /// しきい値を下げ、短い無音でも発話を継続しやすくする。
+    /// Lowers the threshold and makes speech more likely to continue through short silences.
     pub fn aggressive() -> Self {
         VadConfig {
             threshold: 0.35,
@@ -53,14 +55,14 @@ impl VadConfig {
         }
     }
 
-    /// バランス型プリセット。silero のデフォルト（[`VadConfig::default`]）と同じ。
+    /// Balanced preset. Same as the silero defaults ([`VadConfig::default`]).
     pub fn balanced() -> Self {
         VadConfig::default()
     }
 
-    /// 誤検出を減らす保守的なプリセット。
+    /// Conservative preset that reduces false positives.
     ///
-    /// しきい値を上げ、より長い無音で発話を切る。
+    /// Raises the threshold and ends speech after longer silences.
     pub fn conservative() -> Self {
         VadConfig {
             threshold: 0.6,
@@ -73,9 +75,9 @@ impl VadConfig {
         }
     }
 
-    /// 実効的な負側しきい値を返す。
+    /// Returns the effective negative-side threshold.
     ///
-    /// 明示指定があればそれを、なければ `max(threshold - 0.15, 0.01)`（silero 準拠）。
+    /// The explicit value if given, otherwise `max(threshold - 0.15, 0.01)` (following silero).
     pub fn resolved_neg_threshold(&self) -> f32 {
         match self.neg_threshold {
             Some(v) => v,
@@ -83,7 +85,7 @@ impl VadConfig {
         }
     }
 
-    /// 16k なら 512、8k なら 256。silero のフレーム長。
+    /// 512 for 16k, 256 for 8k. The silero frame length.
     pub(crate) fn frame_size(&self) -> usize {
         if self.sample_rate == 8000 {
             256
@@ -92,7 +94,7 @@ impl VadConfig {
         }
     }
 
-    /// 16k なら 64、8k なら 32。silero の前置コンテキスト長。
+    /// 64 for 16k, 32 for 8k. The silero leading context length.
     pub(crate) fn context_size(&self) -> usize {
         if self.sample_rate == 8000 {
             32
@@ -101,12 +103,12 @@ impl VadConfig {
         }
     }
 
-    /// ms をサンプル数に変換 (現在の `sample_rate` 基準)。
+    /// Converts ms to a sample count (based on the current `sample_rate`).
     pub(crate) fn ms_to_samples(&self, ms: u32) -> u64 {
         (u64::from(ms) * u64::from(self.sample_rate)) / 1000
     }
 
-    /// 設定の妥当性を検証する。
+    /// Validates the settings.
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.sample_rate != 8000 && self.sample_rate != 16000 {
             return Err(format!(

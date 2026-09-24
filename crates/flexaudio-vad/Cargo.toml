@@ -3,7 +3,7 @@ name = "flexaudio-vad"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-# tract-onnx 0.23.7 の rust-version が 1.91 なので、workspace の 1.85 をここだけ上書きする。
+# tract-onnx 0.23.7 has rust-version 1.91, so override the workspace's 1.85 for this crate only.
 rust-version = "1.91"
 authors.workspace = true
 repository.workspace = true
@@ -14,13 +14,13 @@ readme = "README.md"
 documentation = "https://docs.rs/flexaudio-vad"
 
 [dependencies]
-# silero-VAD を純 Rust の ONNX 推論器 tract-onnx でオフライン実行する。C/C++ ランタイム
-# も onnxruntime の DLL も要らない（単一の自己完結バイナリ）。計画は起動時に一度
-# `into_optimized` し、フレームごとに使い回す。
+# Runs silero-VAD offline on tract-onnx, a pure-Rust ONNX inference engine. Neither a C/C++
+# runtime nor the onnxruntime DLL is needed (a single self-contained binary). The plan is
+# `into_optimized` once at startup and reused for every frame.
 tract-onnx = "=0.23.7"
 
-# process_pcm の前段リサンプル（任意 SR → VAD レート）に使う。アンチエイリアス込みの
-# sinc リサンプラで、flexaudio-core と同じメジャーバージョンに揃える。
+# Used for process_pcm's front-end resampling (any SR → VAD rate). A sinc resampler with
+# anti-aliasing, kept on the same major version as flexaudio-core.
 rubato = { workspace = true }
 
 [[example]]

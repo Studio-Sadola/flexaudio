@@ -13,8 +13,8 @@ readme = "README.md"
 documentation = "https://docs.rs/flexaudio-denoise"
 
 [dependencies]
-# RNNoise の純 Rust 移植 (BSD-3-Clause)。モデル重みはクレート内に埋め込み済みで、
-# 実行時のモデルファイルもネットワークも不要。default features は CLI (`bin` =
-# clap/hound 等) と dasp 連携を引き込むので無効化し、ライブラリ本体
-# (easyfft + once_cell のみ) だけを使う。
+# Pure-Rust port of RNNoise (BSD-3-Clause). The model weights are embedded in the crate, so
+# neither a model file nor a network is needed at runtime. The default features pull in the
+# CLI (`bin` = clap/hound etc.) and dasp integration, so they are disabled and only the
+# library itself (easyfft + once_cell only) is used.
 nnnoiseless = { version = "0.5", default-features = false }

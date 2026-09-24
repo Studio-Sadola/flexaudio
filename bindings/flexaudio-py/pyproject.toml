@@ -21,14 +21,17 @@ classifiers = [
 [project.urls]
 Repository = "https://github.com/Studio-Sadola/flexaudio"
 
-# extension-module を有効にしてビルド（libpython を直接リンクしない）。crate feature
-# 経由なので cargo test では無効のまま（テストバイナリが libpython をリンクできない罠を
-# 避ける）。abi3 設定は Cargo.toml の pyo3 features（abi3-py38）が決める。
+# Build with extension-module enabled (do not link libpython directly). Because it goes
+# through a crate feature, it stays disabled under cargo test (avoiding the trap where the
+# test binary cannot link libpython). The abi3 setting is decided by the pyo3 features in
+# Cargo.toml (abi3-py38).
 [tool.maturin]
 features = ["extension-module"]
-# import 名を `flexaudio` に固定する（[lib] name と一致）。
+# Pin the import name to `flexaudio` (matches the [lib] name).
 module-name = "flexaudio"
-# 第三者ライセンス表記を wheel と sdist の両方へ同梱する。VAD 経由で pure-Rust tract と
-# Silero VAD モデル（埋め込み）を再配布するため、その notices を配布物に必ず含める必要がある。LICENSE 本体は上の `license = { file = "LICENSE" }` が
-# .dist-info へ格納する。include のプレーンな文字列は sdist・wheel の両方に入る。
+# Bundle the third-party license notices into both the wheel and the sdist. Because the
+# pure-Rust tract and the (embedded) Silero VAD model are redistributed via VAD, their notices
+# must be included in the distribution. The LICENSE itself is placed in .dist-info by
+# `license = { file = "LICENSE" }` above. Plain strings in include go into both the sdist and
+# the wheel.
 include = ["THIRD_PARTY_NOTICES.md"]

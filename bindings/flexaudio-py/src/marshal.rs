@@ -1,8 +1,9 @@
-//! Python へ渡すデータ型と、その変換。
+//! Data types passed to Python, and their conversions.
 //!
-//! ここに集めるのは「値を運ぶだけ」の frozen な pyclass 群（DeviceInfo / AudioChunk /
-//! StreamEvent / VadEvent / DeviceEvent）と、コア型からそれらへの変換関数。挙動を持つ
-//! クラス（Stream / Vad / Denoiser / FlacEncoder / DeviceWatcher）は別モジュールにある。
+//! Collected here are the frozen "value carrier only" pyclasses (DeviceInfo / AudioChunk /
+//! StreamEvent / VadEvent / DeviceEvent) and the functions converting core types into them.
+//! Classes with behavior (Stream / Vad / Denoiser / FlacEncoder / DeviceWatcher) live in
+//! other modules.
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -13,10 +14,11 @@ use fa::{AudioChunk, DeviceEvent, DeviceInfo, Event, ProcessInfo};
 use crate::{bool_repr, source_kind_str};
 
 // ---------------------------------------------------------------------------
-// DeviceInfo（pyclass・getter）
+// DeviceInfo (pyclass, getters)
 // ---------------------------------------------------------------------------
 
-/// `devices()` が返すデバイス情報。`source_kind` は文字列（"mic"|"system"|"process"）。
+/// Device information returned by `devices()`. `source_kind` is a string
+/// ("mic"|"system"|"process").
 #[pyclass(module = "flexaudio", name = "DeviceInfo", frozen)]
 pub struct PyDeviceInfo {
     #[pyo3(get)]
@@ -64,14 +66,14 @@ pub(crate) fn device_info_to_py(info: DeviceInfo) -> PyDeviceInfo {
 }
 
 // ---------------------------------------------------------------------------
-// ProcessInfo（pyclass・getter）
+// ProcessInfo (pyclass, getters)
 // ---------------------------------------------------------------------------
 
-/// `processes()` が返すプロセス情報（プロセス別キャプチャの対象候補）。
+/// Process information returned by `processes()` (candidate targets for per-process capture).
 ///
-/// `pid` を `open("process", process_id=pid)` に渡すとそのプロセスを録れる。
-/// `executable` / `bundle_id` は取れなければ `None`、`is_output_active` は OS が状態を
-/// 公開しないとき `None`。
+/// Passing `pid` to `open("process", process_id=pid)` records that process.
+/// `executable` / `bundle_id` are `None` when unavailable, and `is_output_active` is `None`
+/// when the OS does not expose the state.
 #[pyclass(module = "flexaudio", name = "ProcessInfo", frozen)]
 pub struct PyProcessInfo {
     #[pyo3(get)]
@@ -86,7 +88,7 @@ pub struct PyProcessInfo {
     is_output_active: Option<bool>,
 }
 
-/// Python の repr 風に `Option<String>` を書く（`None` か `'...'`）。
+/// Writes an `Option<String>` in Python repr style (`None` or `'...'`).
 fn optional_str_repr(value: &Option<String>) -> String {
     match value {
         Some(v) => format!("{v:?}"),
@@ -94,7 +96,7 @@ fn optional_str_repr(value: &Option<String>) -> String {
     }
 }
 
-/// Python の repr 風に `Option<bool>` を書く（`None` / `True` / `False`）。
+/// Writes an `Option<bool>` in Python repr style (`None` / `True` / `False`).
 fn optional_bool_repr(value: Option<bool>) -> &'static str {
     match value {
         Some(b) => bool_repr(b),
@@ -127,25 +129,28 @@ pub(crate) fn process_info_to_py(info: ProcessInfo) -> PyProcessInfo {
 }
 
 // ---------------------------------------------------------------------------
-// AudioChunk（pyclass・getter）
+// AudioChunk (pyclass, getters)
 // ---------------------------------------------------------------------------
 
-/// 1 チャンク分の録音データ。`data` は interleaved f32 のリトルエンディアン生バイト
-/// （len = frames * channels * 4）。numpy では `np.frombuffer(chunk.data, dtype=np.float32)`。
+/// One chunk of recorded data. `data` is interleaved f32 as raw little-endian bytes
+/// (len = frames * channels * 4). With numpy: `np.frombuffer(chunk.data, dtype=np.float32)`.
 ///
-/// `vad_events` は統合 VAD（`open(..., vad=...)`）が有効なときにこのチャンクで確定した
-/// [`VadEvent`](PyVadEvent) のリスト（無効時・イベント無しなら空リスト）。denoise 有効時は
-/// `data` が既にノイズ抑制後の音声になっている（順序は denoise → VAD）。
+/// `vad_events` is the list of [`VadEvent`](PyVadEvent)s finalized in this chunk when the
+/// integrated VAD (`open(..., vad=...)`) is enabled (an empty list when disabled or when there
+/// are no events). With denoise enabled, `data` is already the noise-suppressed audio (the
+/// order is denoise → VAD).
 ///
-/// 補足: `peak` / `rms` はコアが算出した **denoise 前** の値。denoise 有効時は `data` の
-/// 実信号（denoise 後）とは一致しないことがある（コアの統計をそのまま運ぶ）。
+/// Note: `peak` / `rms` are the values computed by the core **before denoise**. With denoise
+/// enabled they may not match the actual signal in `data` (after denoise) (the core's
+/// statistics are carried as-is).
 #[pyclass(module = "flexaudio", name = "AudioChunk", frozen)]
 pub struct PyAudioChunk {
-    // interleaved f32 サンプル。生バイトは `data` getter でリトルエンディアン化して渡す。
-    // 統合 denoise が有効なときは poll 内でノイズ抑制後の列に上書きされている。
+    // Interleaved f32 samples. The `data` getter converts them to raw little-endian bytes.
+    // When the integrated denoise is enabled, they have been overwritten in poll with the
+    // noise-suppressed samples.
     samples: Vec<f32>,
-    // 統合 VAD が確定したイベント（種別が開始か・絶対サンプル位置）。getter で
-    // PyVadEvent 化する。無効時は空。
+    // Events finalized by the integrated VAD (whether the kind is start, absolute sample
+    // position). The getter turns them into PyVadEvent. Empty when disabled.
     vad_events: Vec<(bool, u64)>,
     #[pyo3(get)]
     frames: usize,
@@ -165,10 +170,10 @@ pub struct PyAudioChunk {
 
 #[pymethods]
 impl PyAudioChunk {
-    /// interleaved f32 サンプルをリトルエンディアン生バイトで返す。
+    /// Returns the interleaved f32 samples as raw little-endian bytes.
     #[getter]
     fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        // f32 をリトルエンディアン 4 バイトずつ並べる（bytemuck を使わず安全に書く）。
+        // Lay out each f32 as 4 little-endian bytes (written safely, without bytemuck).
         let mut buf = Vec::with_capacity(self.samples.len() * 4);
         for s in &self.samples {
             buf.extend_from_slice(&s.to_le_bytes());
@@ -176,7 +181,8 @@ impl PyAudioChunk {
         PyBytes::new(py, &buf)
     }
 
-    /// このチャンクで確定した統合 VAD イベントのリスト。VAD 無効時は空リスト。
+    /// List of integrated VAD events finalized in this chunk. An empty list when VAD is
+    /// disabled.
     #[getter]
     fn vad_events(&self) -> Vec<PyVadEvent> {
         self.vad_events
@@ -201,17 +207,18 @@ impl PyAudioChunk {
 }
 
 impl PyAudioChunk {
-    /// denoise が in-place 加工するためのサンプル可変参照（poll 内から使う）。
+    /// Mutable reference to the samples for in-place processing by denoise (used from poll).
     pub(crate) fn samples_mut(&mut self) -> &mut [f32] {
         &mut self.samples
     }
 
-    /// VAD が読むためのサンプル参照（poll 内から使う）。
+    /// Reference to the samples for VAD to read (used from poll).
     pub(crate) fn samples(&self) -> &[f32] {
         &self.samples
     }
 
-    /// 統合 VAD が確定したイベント（開始フラグ・絶対サンプル位置）を差し込む。
+    /// Inserts the events finalized by the integrated VAD (start flag, absolute sample
+    /// position).
     pub(crate) fn set_vad_events(&mut self, events: Vec<(bool, u64)>) {
         self.vad_events = events;
     }
@@ -232,10 +239,11 @@ pub(crate) fn chunk_to_py(chunk: AudioChunk) -> PyAudioChunk {
 }
 
 // ---------------------------------------------------------------------------
-// StreamEvent（pyclass・getter）
+// StreamEvent (pyclass, getters)
 // ---------------------------------------------------------------------------
 
-/// ストリーム実行中のイベント。`type` で種別、`count`/`message` は種別により任意。
+/// An event during stream execution. `type` gives the kind; `count`/`message` are optional
+/// depending on the kind.
 #[pyclass(module = "flexaudio", name = "StreamEvent", frozen)]
 pub struct PyStreamEvent {
     #[pyo3(get, name = "type")]
@@ -288,8 +296,8 @@ pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
             count: None,
             message: Some(msg),
         },
-        // Event は #[non_exhaustive]。将来のバリアント追加に備えて、未知種別は "unknown"
-        // + デバッグ表現で Python へ渡す（握り潰さない）。
+        // Event is #[non_exhaustive]. To prepare for variants added in the future, unknown
+        // kinds are passed to Python as "unknown" + the debug representation (not swallowed).
         other => PyStreamEvent {
             kind: "unknown".to_string(),
             count: None,
@@ -299,14 +307,14 @@ pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
 }
 
 // ---------------------------------------------------------------------------
-// VadEvent（pyclass・getter）
+// VadEvent (pyclass, getters)
 // ---------------------------------------------------------------------------
 
-/// VAD が確定した発話境界イベント。`type` は "speech_start" か "speech_end"。
+/// A speech boundary event finalized by the VAD. `type` is "speech_start" or "speech_end".
 ///
-/// `at_sample` は **VAD 内部レート（16000 か 8000）基準** の絶対サンプル位置で、入力
-/// サンプル基準ではない（`Vad.process` / 統合 VAD いずれも同じ）。秒に直すなら
-/// `at_sample / sample_rate`。
+/// `at_sample` is an absolute sample position **in terms of the VAD's internal rate (16000 or
+/// 8000)**, not in terms of the input samples (the same for both `Vad.process` and the
+/// integrated VAD). To convert to seconds: `at_sample / sample_rate`.
 #[pyclass(module = "flexaudio", name = "VadEvent", frozen)]
 pub struct PyVadEvent {
     #[pyo3(get, name = "type")]
@@ -326,7 +334,7 @@ impl PyVadEvent {
 }
 
 impl PyVadEvent {
-    /// 開始フラグと絶対サンプル位置から作る（`true`=speech_start）。
+    /// Builds from a start flag and an absolute sample position (`true`=speech_start).
     pub(crate) fn new(is_start: bool, at_sample: u64) -> PyVadEvent {
         PyVadEvent {
             kind: if is_start {
@@ -348,20 +356,22 @@ pub(crate) fn vad_event_to_py(ev: flexaudio_vad::VadEvent) -> PyVadEvent {
 }
 
 // ---------------------------------------------------------------------------
-// DeviceEvent（pyclass・getter）
+// DeviceEvent (pyclass, getters)
 // ---------------------------------------------------------------------------
 
-/// デバイス着脱・既定変更のイベント（`DeviceWatcher.poll_event` が返す）。
+/// A device hotplug / default change event (returned by `DeviceWatcher.poll_event`).
 ///
-/// `type` は "added" | "removed" | "defaultChanged"。種別により以下が付く:
-/// - added: `device`（[`DeviceInfo`](PyDeviceInfo)）。
-/// - removed: `id`（取り外されたデバイスの安定 ID）。
-/// - defaultChanged: `id`（新しい既定デバイスの ID）と `source_kind`（"mic"|"system"）。
+/// `type` is "added" | "removed" | "defaultChanged". Depending on the kind, the following are
+/// attached:
+/// - added: `device` ([`DeviceInfo`](PyDeviceInfo)).
+/// - removed: `id` (the stable ID of the removed device).
+/// - defaultChanged: `id` (the ID of the new default device) and `source_kind`
+///   ("mic"|"system").
 #[pyclass(module = "flexaudio", name = "DeviceEvent", frozen)]
 pub struct PyDeviceEvent {
     #[pyo3(get, name = "type")]
     kind: String,
-    // added のときだけ Some。getter で PyDeviceInfo 化する（コア型のまま保持する）。
+    // Some only for added. The getter turns it into PyDeviceInfo (kept as the core type).
     device: Option<DeviceInfo>,
     #[pyo3(get)]
     id: Option<String>,
@@ -371,7 +381,7 @@ pub struct PyDeviceEvent {
 
 #[pymethods]
 impl PyDeviceEvent {
-    /// added イベントのデバイス情報（それ以外は `None`）。
+    /// Device information of an added event (`None` otherwise).
     #[getter]
     fn device(&self) -> Option<PyDeviceInfo> {
         self.device.clone().map(device_info_to_py)
@@ -412,8 +422,8 @@ pub(crate) fn device_event_to_py(ev: DeviceEvent) -> PyDeviceEvent {
             id: Some(id),
             source_kind: Some(source_kind_str(kind).to_string()),
         },
-        // DeviceEvent は #[non_exhaustive]。将来のバリアント追加に備えて、未知種別は
-        // "unknown" で渡す（握り潰さない）。
+        // DeviceEvent is #[non_exhaustive]. To prepare for variants added in the future,
+        // unknown kinds are passed as "unknown" (not swallowed).
         other => PyDeviceEvent {
             kind: "unknown".to_string(),
             device: None,
@@ -425,7 +435,8 @@ pub(crate) fn device_event_to_py(ev: DeviceEvent) -> PyDeviceEvent {
 
 #[cfg(test)]
 mod tests {
-    //! Python ランタイム非依存の純変換だけを見る（pyclass 生成の PyBytes 経路は除く）。
+    //! Checks only the pure conversions that do not depend on a Python runtime (excluding the
+    //! PyBytes path that creates pyclasses).
 
     use super::*;
     use fa::SourceKind;
@@ -453,7 +464,7 @@ mod tests {
             data: vec![0.0, 1.0, -1.0, 0.5],
             frames: 2,
             pts_ns: 123,
-            seq: 9_007_199_254_740_993, // 2^53 + 1（f64 では落ちる桁）。
+            seq: 9_007_199_254_740_993, // 2^53 + 1 (a digit lost in f64).
             flags: fa::ChunkFlags::empty(),
             dropped_before: 3,
             peak: 1.0,
@@ -465,7 +476,7 @@ mod tests {
         assert_eq!(py.seq, 9_007_199_254_740_993);
         assert_eq!(py.dropped_before, 3);
         assert_eq!(py.samples, vec![0.0, 1.0, -1.0, 0.5]);
-        // 既定では統合 VAD イベントは空。
+        // By default, the integrated VAD events are empty.
         assert!(py.vad_events.is_empty());
     }
 

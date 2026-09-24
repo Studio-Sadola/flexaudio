@@ -1,8 +1,8 @@
-//! 録音ストリーム [`Stream`] と入口 `open()`、VAD / denoise の統合。
+//! The recording stream [`Stream`], the entry point `open()`, and VAD / denoise integration.
 //!
-//! Python の [`Stream`] は pull/poll 型。napi のような bridge スレッドは持たず、利用側が
-//! `poll_chunk` / `poll_event` を周期的に呼ぶ。統合 VAD / denoise の加工も poll_chunk が
-//! 呼ばれたその場（GIL 下）で行う（呼ばれた時に処理する）。
+//! The Python [`Stream`] is pull/poll-style. It has no bridge thread as in napi; the caller
+//! calls `poll_chunk` / `poll_event` periodically. The integrated VAD / denoise processing
+//! also runs on the spot where poll_chunk is called (under the GIL) (processed when called).
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -15,36 +15,41 @@ use crate::config::{build_config, vad_config_from_dict, validate_denoise};
 use crate::marshal::{chunk_to_py, event_to_py, PyAudioChunk, PyStreamEvent};
 use crate::{denoise_err_to_py, to_py_err, vad_err_to_py};
 
-/// 録音ストリームのハンドル。内部の `flexaudio::Stream` を直接 poll する。
+/// Handle to a recording stream. Polls the inner `flexaudio::Stream` directly.
 ///
-/// `open(...)` が `start()` まで済ませて返す。利用側は `poll_chunk` / `poll_event` を
-/// 周期的に呼ぶ。`stop()` で停止し、context manager（`with`）では `__exit__` で stop する。
+/// `open(...)` returns it after going through `start()`. The caller calls `poll_chunk` /
+/// `poll_event` periodically. `stop()` stops it, and as a context manager (`with`) it stops in
+/// `__exit__`.
 ///
-/// 統合アドオン:
-/// - `denoise=True` で開くと、`poll_chunk` が返す前にチャンクの音声を RNNoise で上書きする
-///   （48kHz 出力専用。先頭 480 サンプル/ch は denoise の遅延で無音になる）。
-/// - `vad={...}` で開くと、各チャンクの音声を VAD にかけ、確定した発話境界を
-///   `chunk.vad_events` に添える。加工順は denoise → VAD。
+/// Integrated add-ons:
+/// - Opened with `denoise=True`, the chunk audio is overwritten via RNNoise before
+///   `poll_chunk` returns it (48kHz output only; the first 480 samples/ch are silent due to
+///   the denoise latency).
+/// - Opened with `vad={...}`, each chunk's audio is run through the VAD and the finalized
+///   speech boundaries are attached to `chunk.vad_events`. The processing order is
+///   denoise → VAD.
 ///
-/// 統合 VAD が持つ rubato リサンプラが !Sync なので pyclass の Send+Sync 既定を満たせない。
-/// Python は poll 型の単一スレッド利用（GIL 下）が前提なので unsendable にして生成スレッドに
-/// 固定する（VAD を使わない場合も一律 unsendable）。
+/// The rubato resampler held by the integrated VAD is !Sync, so the pyclass default of
+/// Send+Sync cannot be met. Python usage is assumed to be poll-style and single-threaded
+/// (under the GIL), so the class is made unsendable and pinned to the thread that created it
+/// (uniformly unsendable, even when VAD is not used).
 #[pyclass(module = "flexaudio", unsendable)]
 pub struct Stream {
     inner: fa::Stream,
-    // 統合 denoise（48kHz 前提）。無効なら None。
+    // Integrated denoise (assumes 48kHz). None when disabled.
     denoiser: Option<CoreDenoiser>,
-    // 統合 VAD。無効なら None。
+    // Integrated VAD. None when disabled.
     vad: Option<CoreVad>,
-    // 出力フォーマット。VAD の process_pcm に渡し、denoise の 48kHz 前提判定にも使う。
-    // switch_source では出力フォーマットを変えられないので、開いたときの値のまま。
+    // Output format. Passed to the VAD's process_pcm and also used for denoise's 48kHz
+    // precondition check. switch_source cannot change the output format, so these keep the
+    // values from open.
     output_rate: u32,
     output_channels: u16,
 }
 
 impl Stream {
-    /// アドオン状態（VAD / denoise）を Python 引数から組む。denoise の 48kHz 前提と
-    /// Denoiser / Vad の構築失敗をここで検証・変換する。
+    /// Builds the add-on state (VAD / denoise) from Python arguments. The denoise 48kHz
+    /// precondition and Denoiser / Vad construction failures are validated and converted here.
     fn build_addons(
         vad: Option<&Bound<'_, PyDict>>,
         denoise: bool,
@@ -67,67 +72,73 @@ impl Stream {
 
 #[pymethods]
 impl Stream {
-    /// 録音を停止する。二重呼び出し安全（flexaudio 側が冪等）。
+    /// Stops recording. Safe to call twice (idempotent on the flexaudio side).
     fn stop(&mut self) {
         self.inner.stop();
     }
 
-    /// 録音を止めずに配信だけ一時停止する。`resume` で再開。
+    /// Pauses delivery only, without stopping recording. `resume` resumes it.
     fn pause(&self) {
         self.inner.pause();
     }
 
-    /// 一時停止を解除して配信を再開する。
+    /// Clears the pause and resumes delivery.
     fn resume(&self) {
         self.inner.resume();
     }
 
-    /// 一時停止中かどうかを返す。
+    /// Returns whether delivery is paused.
     fn is_paused(&self) -> bool {
         self.inner.is_paused()
     }
 
-    /// 入力ゲイン（線形倍率）を変更する。1.0 でそのまま、2.0 で約 +6dB、0.0 で無音。
-    /// 録音中いつでも呼べて、次のチャンクから効く（20ms 粒度）。乗算後のサンプルは
-    /// ±1.0 にクランプされる。有限かつ 0 以上でなければ `ValueError`。
+    /// Changes the input gain (linear multiplier). 1.0 leaves it unchanged, 2.0 is about +6dB,
+    /// 0.0 is silence. Can be called at any time while recording and takes effect from the
+    /// next chunk (20ms granularity). Samples after multiplication are clamped to ±1.0. Raises
+    /// `ValueError` unless finite and 0 or greater.
     fn set_gain(&self, gain: f32) -> PyResult<()> {
         self.inner.set_gain(gain).map_err(to_py_err)
     }
 
-    /// 現在の入力ゲイン（線形倍率）を返す。
+    /// Returns the current input gain (linear multiplier).
     fn gain(&self) -> f32 {
         self.inner.gain()
     }
 
-    /// ソースのネイティブフォーマット `(sample_rate, channels)` を返す（第 1 段リサンプル
-    /// 前の実入力の形）。ソース切替後は切替先の値になる。
+    /// Returns the source's native format `(sample_rate, channels)` (the shape of the actual
+    /// input before the first resampling stage). After a source switch it reflects the new
+    /// source.
     fn native_format(&self) -> (u32, u16) {
         self.inner.native_format()
     }
 
-    /// リングが溢れて捨てたチャンクの累計数を返す（開始からの通算）。
+    /// Returns the cumulative number of chunks discarded because the ring overflowed (total
+    /// since start).
     fn dropped_chunks(&self) -> u64 {
         self.inner.dropped_chunks()
     }
 
-    /// 取り出せるチャンクがあれば返す。無ければ `None`（非ブロッキング）。
+    /// Returns a chunk if one is available. `None` if there is none (non-blocking).
     ///
-    /// 統合アドオンが有効なら、返す前にここで加工する（順序は denoise → VAD）。denoise は
-    /// チャンクの音声を in-place で上書きし、VAD は加工後の音声で発話境界を判定して
-    /// `chunk.vad_events` に添える。どちらも無効なら素通し。
+    /// If integrated add-ons are enabled, the chunk is processed here before being returned
+    /// (the order is denoise → VAD). denoise overwrites the chunk audio in place, and VAD
+    /// detects speech boundaries on the processed audio and attaches them to
+    /// `chunk.vad_events`. With both disabled, the chunk passes through unchanged.
     fn poll_chunk(&mut self) -> Option<PyAudioChunk> {
         let chunk = self.inner.poll_chunk()?;
         let mut py_chunk = chunk_to_py(chunk);
 
-        // 1) denoise: チャンクの音声を in-place で上書き。長さは出力チャンネルの倍数
-        //    （frames * channels）で必ず割り切れるのでエラーにはならないが、万一の失敗
-        //    （長さ不整合）は best-effort で素通しに倒す（poll を止めない）。
+        // 1) denoise: overwrite the chunk audio in place. The length is a multiple of the
+        //    output channels (frames * channels) and always divides evenly, so no error occurs,
+        //    but an unexpected failure (length mismatch) falls back best-effort to passing
+        //    through (poll is not stopped).
         if let Some(dn) = self.denoiser.as_mut() {
             let _ = dn.process(py_chunk.samples_mut());
         }
 
-        // 2) VAD: 加工後の音声で発話境界を判定して添える。process_pcm が内部で mono 化・
-        //    VAD レートへのリサンプルを行うので、出力フォーマットのまま渡してよい。
+        // 2) VAD: detect speech boundaries on the processed audio and attach them.
+        //    process_pcm downmixes to mono and resamples to the VAD rate internally, so the
+        //    output format can be passed as-is.
         if let Some(vad) = self.vad.as_mut() {
             let events: Vec<(bool, u64)> = vad
                 .process_pcm(py_chunk.samples(), self.output_rate, self.output_channels)
@@ -143,22 +154,23 @@ impl Stream {
         Some(py_chunk)
     }
 
-    /// 取り出せるイベントがあれば返す。無ければ `None`（非ブロッキング）。
+    /// Returns an event if one is available. `None` if there is none (non-blocking).
     fn poll_event(&mut self) -> Option<PyStreamEvent> {
         self.inner.poll_event().map(event_to_py)
     }
 
-    /// 録音を止めずに入力ソース（mic/system/process/mix）をホットスワップする。
+    /// Hot-swaps the input source (mic/system/process/mix) without stopping recording.
     ///
-    /// 出力フォーマット（output_rate/output_channels）は切替では変えられない。変更を
-    /// 要求すると `switch_source` がエラーを返し、ここで例外になる。
-    /// `gain` も受けるがコアが無視する（ゲインはストリームの状態。変更は `set_gain`）。
-    /// `mic_device_id`/`system_device_id`/`mic_gain`/`system_gain` は mix 専用
-    /// （他ソースでは無視される）。
+    /// The output format (output_rate/output_channels) cannot be changed by a switch.
+    /// Requesting a change makes `switch_source` return an error, which is raised here.
+    /// `gain` is accepted too but the core ignores it (gain is stream state; change it with
+    /// `set_gain`). `mic_device_id`/`system_device_id`/`mic_gain`/`system_gain` are mix-only
+    /// (ignored for other sources).
     ///
-    /// `vad` / `denoise` は統合アドオンを再指定する。ソースが変わると音声が不連続になるので、
-    /// 指定に応じてアドオンを作り直す（内部状態はリセット）。省略すると既定（`vad=None` /
-    /// `denoise=False`）＝アドオン無効になる（open と同じ流儀で、切替のたびに明示する）。
+    /// `vad` / `denoise` re-specify the integrated add-ons. Changing the source makes the audio
+    /// discontinuous, so the add-ons are rebuilt as specified (internal state is reset).
+    /// Omitting them means the defaults (`vad=None` / `denoise=False`) = add-ons disabled
+    /// (same convention as open; specify them explicitly on every switch).
     #[pyo3(signature = (
         kind,
         *,
@@ -196,9 +208,9 @@ impl Stream {
         vad: Option<Bound<'_, PyDict>>,
         denoise: bool,
     ) -> PyResult<()> {
-        // アドオンは出力フォーマットに依存する。切替では出力フォーマットは変わらないので、
-        // 開いたときの output_rate/output_channels を使って検証・構築する（引数の
-        // output_rate は core の switch_source が形の一致確認に使う）。
+        // The add-ons depend on the output format. A switch does not change the output format,
+        // so validate and build them using the output_rate/output_channels from open (the
+        // output_rate argument is used by the core's switch_source to check the shape matches).
         let (new_vad, new_denoiser) = Self::build_addons(
             vad.as_ref(),
             denoise,
@@ -223,18 +235,19 @@ impl Stream {
         )?;
         self.inner.switch_source(config).map_err(to_py_err)?;
 
-        // 切替が成功してからアドオンを差し替える（失敗時は旧アドオンを保つ）。
+        // Replace the add-ons only after the switch succeeds (on failure the old add-ons are
+        // kept).
         self.vad = new_vad;
         self.denoiser = new_denoiser;
         Ok(())
     }
 
-    /// context manager 対応。`with flexaudio.open("mic") as s:` で使える。
+    /// Context manager support. Usable as `with flexaudio.open("mic") as s:`.
     fn __enter__(slf: Py<Self>) -> Py<Self> {
         slf
     }
 
-    /// `with` ブロックを抜けるとき stop する。例外は握り潰さない（False を返す）。
+    /// Stops when leaving the `with` block. Exceptions are not swallowed (returns False).
     fn __exit__(
         &mut self,
         _exc_type: Option<Bound<'_, PyAny>>,
@@ -246,22 +259,22 @@ impl Stream {
     }
 }
 
-/// ストリームを開いて `start()` まで済ませ、[`Stream`] を返す。
+/// Opens a stream, goes through `start()`, and returns a [`Stream`].
 ///
-/// `kind` は "mic"|"system"|"process"|"mix"。不正値は `ValueError`。デバイスが無い
-/// 環境では open / start が flexaudio のエラーを上げる（`RuntimeError` 等に変換される）。
-/// `mic_device_id`/`system_device_id`/`mic_gain`/`system_gain` は mix 専用で、mix の
-/// mic 側 / system 側のデバイス選択と合成前倍率を決める（他ソースでは無視される。
-/// 合成後にグローバル `gain` が掛かる）。
+/// `kind` is "mic"|"system"|"process"|"mix". Invalid values raise `ValueError`. In an
+/// environment without devices, open / start raise flexaudio's error (converted to
+/// `RuntimeError` etc.). `mic_device_id`/`system_device_id`/`mic_gain`/`system_gain` are
+/// mix-only and determine the device selection and pre-mix multiplier for mix's mic side /
+/// system side (ignored for other sources; the global `gain` is applied after mixing).
 ///
-/// 統合アドオン:
-/// - `vad`（dict・既定 None）: 指定すると統合 VAD が有効になる。キーは独立 `Vad` の引数と
-///   同じ（`threshold` / `min_speech_ms` / `min_silence_ms` / `speech_pad_ms` /
-///   `max_speech_ms` / `sample_rate` / `neg_threshold`）。各チャンクの `vad_events` に
-///   発話境界が入る。
-/// - `denoise`（bool・既定 False）: True で RNNoise によるノイズ抑制を有効化する。48kHz
-///   出力専用で、`denoise=True` かつ `output_rate!=48000` は `ValueError`。加工順は
-///   denoise → VAD。
+/// Integrated add-ons:
+/// - `vad` (dict, default None): when given, the integrated VAD is enabled. The keys are the
+///   same as the arguments of the standalone `Vad` (`threshold` / `min_speech_ms` /
+///   `min_silence_ms` / `speech_pad_ms` / `max_speech_ms` / `sample_rate` /
+///   `neg_threshold`). Speech boundaries go into each chunk's `vad_events`.
+/// - `denoise` (bool, default False): True enables RNNoise noise suppression. 48kHz output
+///   only; `denoise=True` with `output_rate!=48000` raises `ValueError`. The processing order
+///   is denoise → VAD.
 #[pyfunction]
 #[pyo3(signature = (
     kind,
@@ -299,8 +312,8 @@ pub fn open(
     vad: Option<Bound<'_, PyDict>>,
     denoise: bool,
 ) -> PyResult<Stream> {
-    // アドオンの検証・構築を先に済ませる（denoise の 48kHz 前提・VAD 設定不正はここで弾く。
-    // デバイスを掴む前に失敗させたい）。
+    // Validate and build the add-ons first (the denoise 48kHz precondition and invalid VAD
+    // settings are rejected here; we want to fail before grabbing the device).
     let (vad_state, denoiser) =
         Stream::build_addons(vad.as_ref(), denoise, output_rate, output_channels)?;
 

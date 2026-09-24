@@ -1,17 +1,17 @@
-//! 決定的入力に対する確率プローブ。推論器の数値を stdout に出して外部ツールと
-//! 突き合わせられる。
+//! Probability probe on a deterministic input. Prints the inference engine's numbers to stdout
+//! so they can be cross-checked against external tools.
 //!
-//! 入力: 16000 サンプルの 440Hz サイン波・振幅 0.5 (f32)。
+//! Input: 16000 samples of a 440Hz sine wave, amplitude 0.5 (f32).
 //!   x[i] = 0.5 * sin(2*pi*440*i/16000)
 //!
-//! 出力: 最初の 10 フレームの生発話確率を改行区切りで stdout へ。
+//! Output: the raw speech probabilities of the first 10 frames, newline-separated, to stdout.
 //!
-//! 実行: `cargo run -p flexaudio-vad --example probe`
+//! Run: `cargo run -p flexaudio-vad --example probe`
 
 use flexaudio_vad::{Vad, VadConfig};
 
 fn main() {
-    // 決定的入力: 440Hz サイン振幅 0.5。
+    // Deterministic input: 440Hz sine, amplitude 0.5.
     let n = 16000usize;
     let mut samples = Vec::with_capacity(n);
     for i in 0..n {
@@ -20,7 +20,8 @@ fn main() {
     }
 
     let mut vad = Vad::new(VadConfig::default()).expect("model load");
-    // 一括投入。内部で 512 窓に束ねて推論し、生確率を取り出す。
+    // Feed everything at once. Internally it is grouped into 512 windows for inference, and
+    // the raw probabilities are taken out.
     vad.process(&samples);
     let probs = vad.last_frame_probabilities();
 

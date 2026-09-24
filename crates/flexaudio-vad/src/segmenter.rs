@@ -1,44 +1,46 @@
-//! セグメント化状態機械（ONNX 非依存）。
+//! Segmentation state machine (independent of ONNX).
 //!
-//! silero-VAD 原典 `utils_vad.py::get_speech_timestamps` の判定ロジックを再現する。
-//! frame ごとの発話確率を逐次食わせると、min_speech / min_silence / max_speech / pad /
-//! neg_threshold を適用したセグメント（開始/終了サンプル位置）を確定順に返す。
+//! Reproduces the decision logic of the original silero-VAD
+//! `utils_vad.py::get_speech_timestamps`. Feeding it per-frame speech probabilities one by one
+//! returns segments (start/end sample positions) with min_speech / min_silence / max_speech /
+//! pad / neg_threshold applied, in the order they are finalized.
 //!
-//! streaming ([`crate::Vad::process`]) と batch ([`crate::get_speech_timestamps`]) が
-//! この同じロジックを使う。サンプル位置は frame index でなく絶対サンプル位置（累積）。
+//! Streaming ([`crate::Vad::process`]) and batch ([`crate::get_speech_timestamps`]) use this
+//! same logic. Sample positions are absolute sample positions (cumulative), not frame indices.
 
 use crate::config::VadConfig;
 
-/// 確定した発話セグメント（パディング適用後・絶対サンプル位置）。
+/// A finalized speech segment (after padding, absolute sample positions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Segment {
-    /// 発話開始サンプル位置（パディング適用後）。
+    /// Speech start sample position (after padding).
     pub start_sample: u64,
-    /// 発話終了サンプル位置（パディング適用後・排他的。この位置の手前まで）。
+    /// Speech end sample position (after padding, exclusive: up to just before this position).
     pub end_sample: u64,
 }
 
 impl Segment {
-    /// 開始位置を ms に変換（指定サンプルレート基準）。
+    /// Converts the start position to ms (based on the given sample rate).
     pub fn start_ms(&self, sample_rate: u32) -> u64 {
         (self.start_sample * 1000) / u64::from(sample_rate.max(1))
     }
 
-    /// 終了位置を ms に変換（指定サンプルレート基準）。
+    /// Converts the end position to ms (based on the given sample rate).
     pub fn end_ms(&self, sample_rate: u32) -> u64 {
         (self.end_sample * 1000) / u64::from(sample_rate.max(1))
     }
 
-    /// セグメント長（サンプル数）。
+    /// Segment length (in samples).
     pub fn len_samples(&self) -> u64 {
         self.end_sample.saturating_sub(self.start_sample)
     }
 }
 
-/// セグメント化状態機械。
+/// Segmentation state machine.
 ///
-/// frame index ではなくフレーム末尾の絶対サンプル位置で進む。1 frame が
-/// `frame_size` サンプル (16k=512) で、`feed` ごとに位置が `frame_size` 進む。
+/// Advances by the absolute sample position of the frame end rather than by frame index. One
+/// frame is `frame_size` samples (16k=512), and each `feed` advances the position by
+/// `frame_size`.
 #[derive(Debug, Clone)]
 pub struct Segmenter {
     threshold: f32,
@@ -46,23 +48,25 @@ pub struct Segmenter {
     min_speech_samples: u64,
     min_silence_samples: u64,
     speech_pad_samples: u64,
-    max_speech_samples: u64, // 0 = 無制限
+    max_speech_samples: u64, // 0 = unlimited
     frame_size: u64,
 
-    /// 発話中フラグ。
+    /// In-speech flag.
     triggered: bool,
-    /// 現在の発話の開始サンプル位置（生・未パディング）。
+    /// Start sample position of the current speech (raw, unpadded).
     current_start: u64,
-    /// 無音が始まった位置。0 = 無音区間なし（silero と同じ番兵）。
+    /// Position where silence started. 0 = no silent stretch (the same sentinel as silero).
     temp_end: u64,
-    /// 次に feed するフレーム末尾の絶対サンプル位置（これまで feed したサンプル総数）。
+    /// Absolute sample position of the end of the next frame to feed (the total number of
+    /// samples fed so far).
     next_pos: u64,
-    /// 直前に確定（pad 適用後）したセグメント終端。pad 重なりクランプ用。0 = 未確定。
+    /// End of the most recently finalized segment (after pad). Used for the pad-overlap clamp.
+    /// 0 = none finalized yet.
     prev_end: u64,
 }
 
 impl Segmenter {
-    /// 設定からセグメンタを構築する。
+    /// Constructs a segmenter from the configuration.
     pub fn new(config: &VadConfig) -> Self {
         Segmenter {
             threshold: config.threshold,
@@ -80,7 +84,7 @@ impl Segmenter {
         }
     }
 
-    /// 状態を初期化する。
+    /// Resets the state.
     pub fn reset(&mut self) {
         self.triggered = false;
         self.current_start = 0;
@@ -89,56 +93,61 @@ impl Segmenter {
         self.prev_end = 0;
     }
 
-    /// 1 フレーム分の発話確率を食わせ、確定したセグメントがあれば返す。
+    /// Feeds the speech probability of one frame and returns any finalized segments.
     ///
-    /// `prob` はそのフレーム [next_pos, next_pos + frame_size) の発話確率。内部位置は
-    /// `frame_size` 進む。silero `get_speech_timestamps` のループ本体に対応する。
+    /// `prob` is the speech probability of that frame [next_pos, next_pos + frame_size). The
+    /// internal position advances by `frame_size`. Corresponds to the loop body of silero's
+    /// `get_speech_timestamps`.
     pub fn feed(&mut self, prob: f32, out: &mut Vec<Segment>) {
-        // このフレームが占める区間 [frame_start, frame_end)。
+        // The range this frame occupies [frame_start, frame_end).
         let frame_start = self.next_pos;
         let frame_end = frame_start + self.frame_size;
         self.next_pos = frame_end;
 
-        // 発話あり (prob >= threshold)。
+        // Speech present (prob >= threshold).
         if prob >= self.threshold {
-            // 無音カウンタをリセット（silero: temp_end = 0）。
+            // Reset the silence counter (silero: temp_end = 0).
             if self.temp_end != 0 {
                 self.temp_end = 0;
             }
             if !self.triggered {
                 self.triggered = true;
-                // silero は frame index * window。ここでは frame 先頭の絶対サンプル位置。
+                // silero uses frame index * window. Here it is the absolute sample position of
+                // the frame start.
                 self.current_start = frame_start;
             }
-            // triggered 中は silero と同じく毎フレーム max_speech を見る。
+            // While triggered, check max_speech every frame, as silero does.
             self.check_max_speech(frame_end, out);
             return;
         }
 
-        // 無音側 (prob < neg_threshold) かつ発話中。
+        // Silence side (prob < neg_threshold) while in speech.
         if prob < self.neg_threshold && self.triggered {
             if self.temp_end == 0 {
                 self.temp_end = frame_start;
             }
-            // 無音が min_silence に達したら発話終了を確定。終端は無音開始位置 (temp_end)。
+            // When the silence reaches min_silence, finalize the speech end. The end is the
+            // silence start position (temp_end).
             if frame_start.saturating_sub(self.temp_end) >= self.min_silence_samples {
                 self.finalize_segment(self.current_start, self.temp_end, out);
                 self.triggered = false;
                 self.temp_end = 0;
                 return;
             }
-            // まだ min_silence 未満。発話継続のまま max_speech 評価へ落ちる。
+            // Still under min_silence. Fall through to the max_speech check with speech
+            // continuing.
         }
-        // threshold > prob >= neg_threshold のグレーゾーンは silero と同じく状態を
-        // 変えず継続する（triggered のまま無音カウントも始めない）。
+        // In the gray zone threshold > prob >= neg_threshold, continue without changing state,
+        // as silero does (stay triggered and do not start counting silence either).
 
-        // triggered 継続中の無音/グレーフレームでの max_speech 強制分割。
+        // Forced max_speech split on silent/gray frames while still triggered.
         self.check_max_speech(frame_end, out);
     }
 
-    /// triggered 中に発話長が max_speech を超えていれば強制分割する。
+    /// Forces a split if the speech length exceeds max_speech while triggered.
     ///
-    /// silero: 直近の無音 (temp_end) があればそこで切って続行、無ければ現フレーム末尾で切る。
+    /// silero: if there is a recent silence (temp_end), split there and continue; otherwise
+    /// split at the end of the current frame.
     fn check_max_speech(&mut self, frame_end: u64, out: &mut Vec<Segment>) {
         if !self.triggered || self.max_speech_samples == 0 {
             return;
@@ -148,20 +157,21 @@ impl Segmenter {
             return;
         }
         if self.temp_end != 0 {
-            // 直近の無音位置で分割し、その位置から次発話を継続。
+            // Split at the recent silence position and continue the next speech from there.
             let split = self.temp_end;
             self.finalize_segment(self.current_start, split, out);
             self.current_start = split;
             self.temp_end = 0;
         } else {
-            // 無音が無いまま長すぎ → 現フレーム末尾で分割し継続。
+            // Too long with no silence → split at the end of the current frame and continue.
             self.finalize_segment(self.current_start, frame_end, out);
             self.current_start = frame_end;
         }
     }
 
-    /// 入力終端に達したときに呼ぶ。発話中なら現在位置までを最終セグメントとして確定する。
-    /// silero は末尾の未確定発話を `audio_length` まで採用する。
+    /// Called when the end of input is reached. If in speech, finalizes up to the current
+    /// position as the final segment. silero accepts trailing unfinalized speech up to
+    /// `audio_length`.
     pub fn flush(&mut self, out: &mut Vec<Segment>) {
         if self.triggered {
             self.finalize_segment(self.current_start, self.next_pos, out);
@@ -170,20 +180,21 @@ impl Segmenter {
         }
     }
 
-    /// 生（未パディング）の発話区間を min_speech で篩い、pad を適用して `out` に積む。
+    /// Filters a raw (unpadded) speech segment by min_speech, applies the pad, and pushes it to
+    /// `out`.
     fn finalize_segment(&mut self, raw_start: u64, raw_end: u64, out: &mut Vec<Segment>) {
-        // min_speech 未満は捨てる（silero: (end - start) < min_speech_samples）。
+        // Discard anything under min_speech (silero: (end - start) < min_speech_samples).
         if raw_end.saturating_sub(raw_start) < self.min_speech_samples {
             return;
         }
 
-        // speech_pad: 開始を手前へ、終了を後ろへ広げる。
+        // speech_pad: widen the start earlier and the end later.
         let mut start = raw_start.saturating_sub(self.speech_pad_samples);
         let end = raw_end + self.speech_pad_samples;
 
-        // 直前セグメントと pad が重ならないようクランプする。silero は隣接セグメント間の
-        // 隙間を pad*2 と比べて中点で割るが、ここでは prev_end を侵さないよう開始を
-        // クランプする（等価で保守的）。
+        // Clamp so the pad does not overlap the previous segment. silero compares the gap
+        // between adjacent segments with pad*2 and splits it at the midpoint, but here the
+        // start is clamped so as not to intrude on prev_end (equivalent and conservative).
         if self.prev_end != 0 && start < self.prev_end {
             start = self.prev_end;
         }

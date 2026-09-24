@@ -1,8 +1,9 @@
-//! FLAC 逐次書き出しクラス [`FlacEncoder`]。
+//! Incremental FLAC writer class [`FlacEncoder`].
 //!
-//! 録音チャンクを逐次 FLAC ファイルへ圧縮保存するアドオン（[`flexaudio_encode`]）の Python
-//! 露出。`split_seconds>0` で連番ファイル（`name-001.flac`, `name-002.flac`, ...）へ分割
-//! ローテーションする（境界はフレーム数ベースで、チャンクは分割せず取りこぼしも無い）。
+//! Python exposure of the add-on that incrementally compresses recorded chunks into a FLAC
+//! file ([`flexaudio_encode`]). With `split_seconds>0` it rotates into numbered files
+//! (`name-001.flac`, `name-002.flac`, ...) (boundaries are frame-count based; chunks are never
+//! split and nothing is dropped).
 
 use std::path::{Path, PathBuf};
 
@@ -13,14 +14,16 @@ use flexaudio_encode::FlacWriter;
 
 use crate::encode_err_to_py;
 
-/// FLAC 形式が flacenc の検証で許す最大サンプルレート（Hz）。[`FlacWriter::create`] と同値。
+/// The maximum sample rate (Hz) that flacenc's validation allows for the FLAC format. Same
+/// value as in [`FlacWriter::create`].
 const MAX_SAMPLE_RATE: u32 = 96_000;
 
-/// 分割録音の `index` 番目（1 始まり）のファイルパスを作る（純関数）。
+/// Builds the file path of the `index`-th (1-based) file of a split recording (pure function).
 ///
-/// `rec.flac` なら `rec-001.flac, rec-002.flac, ...` のように拡張子の前へ 3 桁ゼロ詰め
-/// 連番を挟む。1000 番目以降は桁が自然に増える。拡張子が無いパス（`rec`）は末尾に連番を
-/// 足す（`rec-001`）。親ディレクトリは保たれる。flexaudio-cli の `split_file_path` と同じ流儀。
+/// For `rec.flac`, inserts a 3-digit zero-padded sequence number before the extension, as in
+/// `rec-001.flac, rec-002.flac, ...`. From the 1000th on, the number of digits grows
+/// naturally. A path without an extension (`rec`) gets the number appended (`rec-001`). The
+/// parent directory is preserved. Same convention as `split_file_path` in flexaudio-cli.
 fn split_file_path(base: &Path, index: u64) -> PathBuf {
     let stem = base
         .file_stem()
@@ -33,39 +36,45 @@ fn split_file_path(base: &Path, index: u64) -> PathBuf {
     base.with_file_name(name)
 }
 
-/// 録音チャンクを逐次 FLAC へ書き出すエンコーダ。
+/// Encoder that incrementally writes recorded chunks to FLAC.
 ///
-/// [`write_chunk`](FlacEncoder::write_chunk) に interleaved f32（flexaudio の
-/// `AudioChunk.data` と同じ形）を流し、終わったら [`finalize`](FlacEncoder::finalize) で
-/// ヘッダを確定する。context manager（`with`）にも対応し、`with` を抜けるとき finalize する。
+/// Feed interleaved f32 (the same shape as flexaudio's `AudioChunk.data`) to
+/// [`write_chunk`](FlacEncoder::write_chunk), and when done, finalize the header with
+/// [`finalize`](FlacEncoder::finalize). It also supports the context manager protocol (`with`)
+/// and finalizes when leaving the `with` block.
 ///
-/// `split_seconds>0` を指定すると、書き込んだフレーム数が `split_seconds × sample_rate` に
-/// 達するたびに現在のファイルを finalize して次の連番ファイルへ切り替える（各ファイルは
-/// 指定秒より最大 1 チャンク長くなりうる。チャンクは分割せず取りこぼしも無い）。
+/// With `split_seconds>0`, each time the number of written frames reaches
+/// `split_seconds × sample_rate`, the current file is finalized and the next numbered file is
+/// switched to (each file can be up to 1 chunk longer than the given seconds; chunks are never
+/// split and nothing is dropped).
 ///
-/// ファイルは最初のチャンクが来るまで開かない（遅延生成）。分割なしで一度も書かずに
-/// finalize した場合は空ファイルを作らない。finalize を呼ばずに破棄しても、下層の
-/// `FlacWriter` の Drop がベストエフォートで閉じる（確実に検知したいなら finalize を呼ぶ）。
+/// The file is not opened until the first chunk arrives (lazy creation). Finalizing without
+/// ever writing and without splitting creates no empty file. Even if it is discarded without
+/// calling finalize, the underlying `FlacWriter`'s Drop closes it best-effort (call finalize
+/// if you need to detect failures reliably).
 #[pyclass(module = "flexaudio", name = "FlacEncoder")]
 pub struct FlacEncoder {
-    // `--out` に相当するベースパス（分割時は連番の元、分割なしはこのまま使う）。
+    // Base path equivalent to `--out` (the source of the numbered names when splitting; used
+    // as-is without splitting).
     base: PathBuf,
     sample_rate: u32,
     channels: u16,
-    // 1 ファイルあたりのフレーム数しきい値（split_seconds × sample_rate）。0 = 分割なし。
+    // Frame-count threshold per file (split_seconds × sample_rate). 0 = no splitting.
     frames_per_file: u64,
-    // 現在書き込み中のライター（遅延生成。ローテーション直後や書き込み前は None）。
+    // The writer currently being written to (lazily created; None right after a rotation or
+    // before any write).
     writer: Option<FlacWriter>,
-    // 現在のファイルへ書き込んだフレーム数（ローテーションで 0 に戻る）。
+    // Frames written to the current file (reset to 0 on rotation).
     frames_in_current: u64,
-    // これまでに開いたファイル数（次の連番を決めるのに使う）。
+    // Number of files opened so far (used to determine the next sequence number).
     files_opened: u64,
-    // finalize 済みなら以後の write_chunk を拒否する。
+    // Once finalized, subsequent write_chunk calls are rejected.
     finalized: bool,
 }
 
 impl FlacEncoder {
-    /// 次に開くファイルのパス。分割なしはベースパスそのまま、分割ありは 1 始まり連番。
+    /// Path of the next file to open. Without splitting it is the base path as-is; with
+    /// splitting it is the 1-based numbered name.
     fn next_path(&self) -> PathBuf {
         if self.frames_per_file > 0 {
             split_file_path(&self.base, self.files_opened + 1)
@@ -74,7 +83,7 @@ impl FlacEncoder {
         }
     }
 
-    /// 書き込み先ファイルが未オープンなら開く（遅延生成）。
+    /// Opens the destination file if it is not open yet (lazy creation).
     fn ensure_writer(&mut self) -> PyResult<()> {
         if self.writer.is_none() {
             let path = self.next_path();
@@ -86,7 +95,7 @@ impl FlacEncoder {
         Ok(())
     }
 
-    /// 現在のファイルを finalize して閉じる（開いていなければ何もしない）。
+    /// Finalizes and closes the current file (does nothing if none is open).
     fn finalize_current(&mut self) -> PyResult<()> {
         if let Some(writer) = self.writer.take() {
             writer.finalize().map_err(encode_err_to_py)?;
@@ -97,15 +106,16 @@ impl FlacEncoder {
 
 #[pymethods]
 impl FlacEncoder {
-    /// `path` に 16bit FLAC を書くエンコーダを作る。`channels` は 1..=2、`sample_rate` は
-    /// 1..=96000 Hz（範囲外は `ValueError`）。`split_seconds>0` で連番分割ローテーション。
+    /// Creates an encoder that writes 16-bit FLAC to `path`. `channels` is 1..=2 and
+    /// `sample_rate` is 1..=96000 Hz (out of range raises `ValueError`). `split_seconds>0`
+    /// enables numbered split rotation.
     ///
-    /// この時点ではファイルを開かない（最初の `write_chunk` で開く）。
+    /// The file is not opened at this point (it is opened by the first `write_chunk`).
     #[new]
     #[pyo3(signature = (path, sample_rate, channels, split_seconds = 0))]
     fn new(path: PathBuf, sample_rate: u32, channels: u16, split_seconds: u64) -> PyResult<Self> {
-        // 下層 FlacWriter::create と同じ範囲を、ファイルを作る前にここで検証する
-        // （遅延生成なので不正パラメータでも空ファイルを残さない）。
+        // Validate the same ranges as the underlying FlacWriter::create here, before creating
+        // the file (creation is lazy, so invalid parameters leave no empty file behind).
         if !(1..=2).contains(&channels) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "channels must be 1 or 2, got {channels}"
@@ -120,7 +130,8 @@ impl FlacEncoder {
             base: path,
             sample_rate,
             channels,
-            // split_seconds × sample_rate。桁溢れは飽和で握る（現実的な値では起きない）。
+            // split_seconds × sample_rate. Overflow is absorbed by saturation (it does not
+            // happen with realistic values).
             frames_per_file: split_seconds.saturating_mul(u64::from(sample_rate)),
             writer: None,
             frames_in_current: 0,
@@ -129,11 +140,11 @@ impl FlacEncoder {
         })
     }
 
-    /// interleaved f32 サンプルを追記する。長さは `channels` の倍数であること（そうでなければ
-    /// `ValueError`）。`samples` は list / array.array / numpy 配列いずれも渡せる。空は no-op。
+    /// Appends interleaved f32 samples. The length must be a multiple of `channels` (otherwise
+    /// `ValueError`). `samples` may be a list, array.array, or numpy array. Empty is a no-op.
     ///
-    /// 書き込み後にフレーム数が `split_seconds × sample_rate` 以上になったら、その場で
-    /// 現在のファイルを finalize して次の連番ファイルへローテーションする。
+    /// If the frame count reaches `split_seconds × sample_rate` or more after the write, the
+    /// current file is finalized on the spot and rotated to the next numbered file.
     fn write_chunk(&mut self, samples: Vec<f32>) -> PyResult<()> {
         if self.finalized {
             return Err(PyRuntimeError::new_err(
@@ -145,37 +156,41 @@ impl FlacEncoder {
         }
         self.ensure_writer()?;
         {
-            let writer = self.writer.as_mut().expect("writer は直前で開いている");
-            // 長さがチャンネル数の倍数でなければ FlacWriter が Unsupported を返す（ここで弾く）。
+            let writer = self.writer.as_mut().expect("writer was just opened above");
+            // If the length is not a multiple of the channel count, FlacWriter returns
+            // Unsupported (rejected here).
             writer.write_chunk(&samples).map_err(encode_err_to_py)?;
         }
-        // 上の write_chunk が成功した＝長さは channels の倍数。フレーム数を積む。
+        // The write_chunk above succeeded = the length is a multiple of channels. Accumulate
+        // the frame count.
         let frames = (samples.len() / self.channels as usize) as u64;
         self.frames_in_current += frames;
 
         if self.frames_per_file > 0 && self.frames_in_current >= self.frames_per_file {
-            // 現在のファイルを確定して次の連番へ（次の write_chunk が新ファイルを開く）。
+            // Finalize the current file and move to the next number (the next write_chunk
+            // opens the new file).
             self.finalize_current()?;
             self.frames_in_current = 0;
         }
         Ok(())
     }
 
-    /// 端数フレームの書き出しとヘッダ確定を行い、現在のファイルを閉じる。二重呼び出し安全
-    /// （2 回目以降は no-op）。
+    /// Writes out the partial frames, finalizes the header, and closes the current file. Safe
+    /// to call twice (the second and later calls are no-ops).
     fn finalize(&mut self) -> PyResult<()> {
         self.finalize_current()?;
         self.finalized = true;
         Ok(())
     }
 
-    /// context manager 対応。`with flexaudio.FlacEncoder(...) as enc:` で使える。
+    /// Context manager support. Usable as `with flexaudio.FlacEncoder(...) as enc:`.
     fn __enter__(slf: Py<Self>) -> Py<Self> {
         slf
     }
 
-    /// `with` ブロックを抜けるとき finalize する。ブロック内で例外が起きていなければ
-    /// finalize のエラーも伝播する（例外発生中は元の例外を隠さないよう best-effort）。
+    /// Finalizes when leaving the `with` block. If no exception occurred inside the block, a
+    /// finalize error is propagated too (while an exception is in flight it is best-effort, so
+    /// as not to hide the original exception).
     fn __exit__(
         &mut self,
         exc_type: Option<Bound<'_, PyAny>>,
@@ -184,8 +199,9 @@ impl FlacEncoder {
     ) -> PyResult<bool> {
         let result = self.finalize_current();
         self.finalized = true;
-        // ブロックが正常終了なら finalize のエラーを伝える。例外発生中は元の例外を優先し、
-        // finalize の失敗は握る（下層 Drop はもう走らない＝ take 済み）。
+        // If the block ended normally, propagate the finalize error. While an exception is in
+        // flight, the original exception takes priority and the finalize failure is swallowed
+        // (the underlying Drop no longer runs = already taken).
         if exc_type.is_none() {
             result?;
         }
@@ -207,17 +223,17 @@ mod tests {
             split_file_path(Path::new("rec.flac"), 2),
             PathBuf::from("rec-002.flac")
         );
-        // 1000 番目以降は桁が自然に増える。
+        // From the 1000th on, the number of digits grows naturally.
         assert_eq!(
             split_file_path(Path::new("rec.flac"), 1000),
             PathBuf::from("rec-1000.flac")
         );
-        // 親ディレクトリは保たれる。
+        // The parent directory is preserved.
         assert_eq!(
             split_file_path(Path::new("/tmp/out/rec.flac"), 3),
             PathBuf::from("/tmp/out/rec-003.flac")
         );
-        // 拡張子が無ければ末尾に連番を足す。
+        // Without an extension, the number is appended at the end.
         assert_eq!(
             split_file_path(Path::new("rec"), 5),
             PathBuf::from("rec-005")
@@ -226,7 +242,7 @@ mod tests {
 
     #[test]
     fn frames_per_file_reflects_split_seconds() {
-        // split_seconds × sample_rate がしきい値。0 は分割なし。
+        // split_seconds × sample_rate is the threshold. 0 means no splitting.
         let enc = FlacEncoder::new(PathBuf::from("x.flac"), 48_000, 2, 0).unwrap();
         assert_eq!(enc.frames_per_file, 0);
 
@@ -243,7 +259,7 @@ mod tests {
         assert!(FlacEncoder::new(PathBuf::from("x.flac"), 48_000, 3, 0).is_err());
         assert!(FlacEncoder::new(PathBuf::from("x.flac"), 0, 2, 0).is_err());
         assert!(FlacEncoder::new(PathBuf::from("x.flac"), MAX_SAMPLE_RATE + 1, 2, 0).is_err());
-        // 範囲内は通る。
+        // In-range values pass.
         assert!(FlacEncoder::new(PathBuf::from("x.flac"), 48_000, 2, 0).is_ok());
     }
 }
