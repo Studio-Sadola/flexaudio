@@ -101,7 +101,7 @@ pub(crate) struct TapChain {
 // SAFETY: The ids held by TapChain are u32 and Send. `RcBlock` / `Retained<CATapDescription>`
 // are created and dropped within the owning thread (the backend's dedicated thread) and are
 // never shared across a thread boundary. The backends themselves
-// (`MacSystemBackend`/`MacProcessBackend`) are `Send`, and TapChain itself is designed never
+// (`MacSystemBackend`/`MacProcessBackend`) are `Send`, so TapChain itself is designed never
 // to cross threads. Therefore no Send/Sync is declared for TapChain.
 
 impl Drop for TapChain {

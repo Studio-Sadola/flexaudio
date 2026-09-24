@@ -12,7 +12,7 @@ keywords = ["audio", "wasapi", "loopback", "capture", "windows"]
 categories = ["multimedia::audio", "os::windows-apis"]
 documentation = "https://docs.rs/flexaudio-os-windows"
 
-# Windows-only crate. The backend itself compiles to nothing outside
+# Windows-only crate. The backend itself compiles to nothing on non-Windows targets via
 # `#[cfg(target_os = "windows")]`, and the windows dependency is pulled in only by the
 # target-specific sections below. Only the pure build-number function also compiles on
 # non-Windows targets.
