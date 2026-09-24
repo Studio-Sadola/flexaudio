@@ -25,15 +25,15 @@ repository = "https://github.com/Studio-Sadola/flexaudio"
 authors = ["tubome (Studio Sadola)"]
 
 [workspace.dependencies]
-# flexaudio-core が要求する純 Rust 依存 (システムライブラリ不要・実行時ネットワーク禁止)
+# Pure-Rust dependencies required by flexaudio-core (no system libraries, no network access at runtime)
 bitflags = "2"
 ringbuf = "0.4"
 rtrb = "0.3"
 rubato = "3"
 thiserror = "2"
-# マイク入力バックエンド (flexaudio-mic)。rust 1.85 互換の安定版を採用。
+# Microphone input backend (flexaudio-mic). Uses the stable release compatible with Rust 1.85.
 cpal = "0.16"
-# Linux システム出力キャプチャ (flexaudio-os-linux)。libpipewire-0.3 + libclang を要求し
-# target.'cfg(target_os = "linux")' でのみ引く（非 Linux はビルドに pipewire を一切引かない）。
+# Linux system-output capture (flexaudio-os-linux). Requires libpipewire-0.3 + libclang and is
+# pulled in only under target.'cfg(target_os = "linux")' (non-Linux builds never pull in pipewire).
 pipewire = "0.10"
-# 実装フェーズで追加（tract-onnx、pyo3、numpy 等）
+# Added during the implementation phase (tract-onnx, pyo3, numpy, etc.)

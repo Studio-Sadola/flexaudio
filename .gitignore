@@ -23,7 +23,7 @@ Thumbs.db
 
 # Rust
 /target
-# Cargo.lock はコミットする（ワークスペースに配布物 cdylib/Python wheel を含むため）
+# Cargo.lock is committed (the workspace ships artifacts: a cdylib and a Python wheel)
 
-# VAD モデルは同梱必須（完全オフライン要件）。*.onnx の除外から復帰させる
+# The VAD model must be bundled (fully-offline requirement). Re-include it from the *.onnx exclusion
 !crates/flexaudio-vad/assets/*.onnx
