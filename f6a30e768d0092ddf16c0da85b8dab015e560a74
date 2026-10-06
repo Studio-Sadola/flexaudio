@@ -1,0 +1,15 @@
+English translation of the original Japanese commit message:
+
+fix(stream): preserve discontinuity on the first resumed chunk
+
+In crates/flexaudio/src/stream.rs, update resume_generation and clear
+paused under the delivery lock. Each tap checks the generation under
+that same lock when enqueueing, so its first resumed chunk receives
+DISCONTINUITY rather than a later chunk winning the race. Primary and
+secondary taps track generations independently; chunks discarded while
+paused do not advance their observed generation. Sequence numbers stay
+continuous, with no silence inserted for pauses. Keep
+discontinuity_pending for source switching and recovery. Add a 300-round
+test for both taps. The message notes that the old code also passed: the
+test checks behavior but did not reproduce the race. Shared locking
+closes the faulty interleaving.
