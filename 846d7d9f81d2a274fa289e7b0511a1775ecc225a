@@ -1,0 +1,9 @@
+English translation of the original Japanese commit message:
+
+fix(macos): scope the Error import to device tests
+
+Move flexaudio_core::types::Error into the test module in
+crates/flexaudio-os-macos/src/devices.rs. It was unused in non-test
+builds and caused the macOS Clippy -D warnings gate to fail. Use a fully
+qualified rustdoc link and clarify that UID lookup failures use
+map_os_status. Device enumeration behavior is unchanged.
