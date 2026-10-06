@@ -1,0 +1,15 @@
+English translation of the original Japanese commit message:
+
+feat(vad): use tract inference to remove Windows runtime DLLs
+
+Replace ONNX Runtime with pure-Rust tract-onnx =0.23.7. The message
+describes an embedded Silero 16 kHz model, output-name validation, and a
+plan optimized once per Vad. Reusable rubato sinc resampling handles 8
+kHz input while retaining input-based probability counts and event
+timing. Reported comparisons allow 1e-4 at 16 kHz and 0.05 at 8 kHz
+against reference results. The supplied diff is truncated before the VAD
+implementation changes. Windows npm builds use a static CRT and reject
+MSVCP, VCRUNTIME, VCOMP, DirectML, onnxruntime, or unreadable dependency
+results. The VAD Rust minimum becomes 1.91; the 1.85 gate still excludes
+it. The message reports passing local checks; Windows/macOS loads were
+untested.
