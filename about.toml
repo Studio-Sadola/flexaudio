@@ -1,0 +1,61 @@
+# License preference order: choose MIT when a crate offers it as an alternative.
+# This is an explicit allowlist; newly required licenses must be reviewed here.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+
+# Build scripts and test tools are not shipped. Normal and transitive normal
+# dependencies remain included, even when also used by a build script or test.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+# Skip our unpublished binding/CLI crates' own MIT notices, keeping their deps.
+private = { ignore = true }
+
+[r-efi]
+# MIT is first globally; neither LGPL nor other unneeded alternatives are allowed.
+accepted = ["MIT"]
+
+# Harvest the entire upstream files, including all copyright notices and the
+# complete BSD disclaimer / MPL terms. No start/end slices or copied crate texts.
+[nnnoiseless.clarify]
+license = "BSD-3-Clause"
+[[nnnoiseless.clarify.files]]
+path = "COPYING"
+checksum = "26e8aae6fb3622e281d8d99aa7ba0df8ef3a83465d8717f2e4cacbcbed8efc92"
+
+[dyn-eq.clarify]
+license = "MPL-2.0"
+[[dyn-eq.clarify.files]]
+path = "LICENSE"
+checksum = "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85"
+
+# These public workspace crates contain old hand-written notices. Clarifying
+# their own LICENSE prevents the scanner from harvesting those notices again.
+[flexaudio.clarify]
+license = "MIT"
+[[flexaudio.clarify.files]]
+path = "LICENSE"
+checksum = "7991650b36ae9328bbfbd8af76f44552731168630477c9c348dfbd326e4d12de"
+
+[flexaudio-vad.clarify]
+license = "MIT"
+[[flexaudio-vad.clarify.files]]
+path = "LICENSE"
+checksum = "7991650b36ae9328bbfbd8af76f44552731168630477c9c348dfbd326e4d12de"

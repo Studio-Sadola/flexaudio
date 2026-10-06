@@ -30,6 +30,6 @@ features = ["extension-module"]
 module-name = "flexaudio"
 # Include third-party license notices in both the wheel and sdist. Since the VAD addon redistributes
 # pure-Rust tract and the embedded Silero VAD model, their notices must be included in the package.
-# The `license = { file = "LICENSE" }` setting above stores LICENSE in .dist-info. Plain strings
-# in include are included in both the sdist and wheel.
-include = ["THIRD_PARTY_NOTICES.md"]
+# The `license = { file = "LICENSE" }` setting above stores LICENSE in .dist-info.
+# Specify both formats explicitly so source and binary distributions carry the generated notice.
+include = [{ path = "THIRD_PARTY_NOTICES.md", format = ["sdist", "wheel"] }]

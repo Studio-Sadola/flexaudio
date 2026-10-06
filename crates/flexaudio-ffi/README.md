@@ -224,4 +224,9 @@ the binary.
 | [tract-onnx](https://crates.io/crates/tract-onnx) | Pure Rust inference for VAD (`flexaudio-vad`) | MIT OR Apache-2.0 |
 | Silero VAD model | VAD model weights (embedded in the binary) | MIT |
 
-When redistributing, include the copyright notices and license terms listed above.
+When redistributing the C static or shared library, ship
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) alongside the library and header.
+It contains the complete dependency license texts, MPL source-availability links,
+and the embedded Silero model notice. From the repository root, regenerate it with
+`scripts/gen-third-party-notices.sh`; CI checks it with
+`scripts/gen-third-party-notices.sh --check`.

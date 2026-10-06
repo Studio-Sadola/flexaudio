@@ -26,6 +26,17 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  third-party-notices:
+    name: Third-party notices gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Install pinned cargo-about
+        run: cargo install cargo-about --locked --version 0.9.2 --features cli
+      - name: Check generated notices
+        run: scripts/gen-third-party-notices.sh --check
+
   release-version-tests:
     name: Release version gate self-tests
     runs-on: ubuntu-latest
