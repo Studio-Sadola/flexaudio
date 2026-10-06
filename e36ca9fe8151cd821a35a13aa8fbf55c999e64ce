@@ -1,0 +1,14 @@
+English translation of the original Japanese commit message:
+
+fix(mic): initialize Windows WASAPI on a process-lifetime thread
+
+Route flexaudio-mic host access through cpal_default_host(). On Windows,
+windows_keeper.rs initializes cpal 0.16.0's shared WASAPI enumerator on
+a thread parked until process exit. OnceLock makes callers wait for
+initialization; startup failures return backend errors. Previously, a
+short-lived first caller could exit and tear down its COM apartment,
+causing later microphone calls to crash with 0xC0000005. This can happen
+after switching from system capture to mic/mix, stopping, and then
+listing devices or opening another microphone stream. Restore
+flexaudio-mic tests in Windows CI and add a regression test that lists
+devices on two successive short-lived threads without a real mic.
