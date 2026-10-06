@@ -1,7 +1,7 @@
 # flexaudio
 
 **Flexible, cross-platform audio capture for Rust.** Capture from microphones,
-system output (loopback), and individual processes on **Linux**, **Windows**,
+system output (loopback), individual processes, and microphone + system mix on **Linux**, **Windows**,
 and **macOS** through one unified API.
 
 ```rust
@@ -33,13 +33,27 @@ stream.stop();
 - `Stream::poll_chunk` / `poll_event` — simple pull loop; no callbacks required.
 - `Stream::switch_source` — hot-swap source without stopping the stream.
 - `devices()` / `watch_devices()` — enumeration and hotplug notifications.
+- `processes()` lists audio-session/stream owners (including idle/stopped
+  processes), excluding the caller; use `pid` as `target_pid` for capture and
+  `is_output_active` to check current playback.
+- `SourceKind::Mix` combines mic + system audio. Select each side with
+  `mix_mic_device_id` / `mix_system_device_id` (`None` uses defaults), and set
+  `mix_mic_gain` / `mix_system_gain` before mixing; `gain` applies afterward.
+  `device_id` is ignored for Mix.
+- `exclude_pids` combines with `exclude_self` for system capture and the system
+  side of Mix. Windows excludes one process-tree root (self when `exclude_self`
+  is true, otherwise the first PID); every entry must equal that root, and
+  distinct PIDs are rejected. macOS resolves audio objects once at start and
+  honors device selection. Linux matches exact PIDs (`application.process.id`
+  for pulse-proxied streams, `pipewire.sec.pid` for native clients), without
+  descendants. Linux and Windows ignore system-device selection during exclusion.
 - Output is normalized interleaved `f32` at a sample rate / channel count you
   choose (two-stage resampling internally).
 
 ## Install
 
 ```sh
-cargo add flexaudio
+cargo add flexaudio@0.3
 ```
 
 ## Permissions

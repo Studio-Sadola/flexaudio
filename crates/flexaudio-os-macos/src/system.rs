@@ -50,11 +50,11 @@ use crate::tap::{build_tap_chain, TapChain, TapKind};
 /// Choose the system tap from the resolved exclusion snapshot and optional device UID.
 fn system_tap_kind(excluded_objects: Vec<u32>, device_uid: Option<String>) -> TapKind {
     match device_uid {
-        Some(device_uid) => TapKind::ExcludeProcessesOnDevice {
+        Some(device_uid) if excluded_objects.is_empty() => TapKind::ExcludeProcessesOnDevice {
             ids: excluded_objects,
             device_uid,
         },
-        None => TapKind::ExcludeProcesses(excluded_objects),
+        _ => TapKind::ExcludeProcesses(excluded_objects),
     }
 }
 

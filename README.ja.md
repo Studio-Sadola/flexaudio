@@ -2,12 +2,10 @@
 
 [English](README.md) | **日本語**
 
-この文書は英語版 README.md の翻訳です。内容が食い違う場合は英語版を正とします。
-
 **Rust 向けの、汎用的で柔軟なクロスプラットフォーム音声キャプチャライブラリです。**
 
 `flexaudio` は、**Linux**・**Windows**・**macOS** で、**マイク**、
-**システム出力（ループバック）**、**個別プロセス**から音声をキャプチャする統一 API を提供します。
+**システム出力（ループバック）**、**個別プロセス**、**マイクとシステム出力のミックス**から音声をキャプチャする統一 API を提供します。
 すべての音声ソースを、指定した出力形式のインターリーブされた `f32` ストリームに正規化し、
 シンプルなポーリングループでチャンクとデバイス／ストリームのイベントを受け取れます。
 
@@ -44,6 +42,7 @@ stream.stop();
 - **システム出力／プロセス単位**のキャプチャは、コンパイル時に選択される OS 固有のバックエンドを使います。
   その OS でサポートされていないソースを指定すると、`Error::Unsupported` が返ります。
 - プロセス単位のキャプチャには、`StreamConfig` の `target_pid` が必要です。
+- `SourceKind::Mix` は、3 つのプラットフォームすべてでマイクとシステム出力を組み合わせます。
 
 ---
 
@@ -57,7 +56,7 @@ flexaudio = "0.3"
 または、次のコマンドを使います。
 
 ```sh
-cargo add flexaudio
+cargo add flexaudio@0.3
 ```
 
 音声区間検出（VAD）のアドオンは、別のクレートです。
@@ -124,6 +123,67 @@ Silero VAD モデルはバイナリに埋め込まれているため、実行時
 
 ---
 
+## マイクとシステム出力のミックス
+
+`SourceKind::Mix` は、マイク入力とシステム出力を 1 つのストリームに組み合わせます。
+`devices()` が返す ID を使い、`mix_mic_device_id` と `mix_system_device_id` で
+それぞれのデバイスを選択します。`None` はデフォルトの入力／出力を選択します。
+Mix では `device_id` は無視されます。ミックス前の線形ゲイン `mix_mic_gain` と
+`mix_system_gain` のデフォルトは `1.0` です。`gain` はミックス後に適用する全体の倍率です。
+
+```rust
+use flexaudio::{open, SourceKind, StreamConfig};
+
+let mut stream = open(StreamConfig {
+    kind: SourceKind::Mix,
+    mix_mic_gain: 1.0,
+    mix_system_gain: 0.5,
+    ..Default::default()
+})?;
+stream.start()?;
+stream.stop();
+# Ok::<(), flexaudio::Error>(())
+```
+
+---
+
+## PID による再生音声の除外
+
+`StreamConfig::exclude_pids` は、`exclude_self` と組み合わせて、
+**システムキャプチャおよび Mix のシステム側**から再生音声を除外します。
+マイクとプロセス単位のソースは、有効な除外指定を無視します。
+各バインディングでも同じ制御を利用できます。
+
+| インターフェース | PID による除外 |
+|---|---|
+| Rust | `StreamConfig { exclude_pids: vec![1234], ..Default::default() }` |
+| N-API | `openStream({ kind: 'system', excludePids: [1234] }, onChunk)` |
+| C | `flexaudio_open_with_exclude_pids(&config, pids, count)`。ソースの切り替えには `flexaudio_switch_source_with_exclude_pids` を使います。 |
+| Python | `flexaudio.open("system", exclude_pids=[1234])`。`Stream.switch_source()` でも指定できます。 |
+| CLI | `flexaudio-cli --source system --exclude-pid 1234`。複数の PID は `--exclude-pid` を繰り返して指定します。 |
+
+- **Windows:** 1 つのルートを持つプロセスツリーを除外します。`exclude_self` を
+  指定すると呼び出し元のプロセスがルートになり、それ以外はリストの最初の PID がルートになります。
+  すべての PID はそのルートと同じ値である必要があります。子孫の PID であっても、
+  異なる PID は `Error::InvalidArg` で拒否されます。ルートを 1 回指定してください。
+  WASAPI のプロセスループバックは出力エンドポイントを指定できないため、
+  除外が有効な間は、指定されたシステムデバイスを使用しません。
+- **macOS:** キャプチャ開始時に、PID を Core Audio のプロセスオブジェクトへ
+  1 回だけ解決します（スナップショット）。その時点で音声オブジェクトを持たないプロセスは
+  除外されません。新しい音声ヘルパーが現れた場合は、キャプチャを開き直してください。
+  プロセスが終了している場合を除き、検索の失敗はキャプチャの失敗になります。
+  PID は `1..=2147483647` に収まる必要があります。
+  指定されたシステムデバイスは、除外と併せて使用されます。
+- **Linux:** 子孫を含めず、PID の完全一致で除外します。Pulse 経由のストリームでは
+  `application.process.id`、ネイティブクライアントでは `pipewire.sec.pid` を使います。
+  除外中、Pulse 経由のストリームは PID が判明するまでキャプチャされません。
+  アプリケーションのストリームを集約する処理はデバイス単位ではないため、
+  除外が有効な間は、指定されたシステムデバイスを使用しません。
+
+デバイスの規則は `mix_system_device_id` にも適用されます。マイクの選択には影響しません。
+
+---
+
 <a id="listing-capturable-processes"></a>
 
 ## キャプチャ可能なプロセスの列挙
@@ -154,7 +214,7 @@ if let Some(p) = target {
 | 項目／プラットフォーム | Linux (PipeWire) | Windows (WASAPI) | macOS (Core Audio) |
 |---|---|---|---|
 | 列挙される対象 | `Stream/Output/Audio` ノードを所有するクライアント | すべての有効な再生エンドポイントの音声セッション（システム音と期限切れセッションは除外） | Core Audio が認識しているプロセスオブジェクト（`kAudioHardwarePropertyProcessObjectList`。入力のみのプロセスも含みます） |
-| `pid` | クライアントの `pipewire.sec.pid`（キャプチャバックエンドと同じ方法で解決します） | `IAudioSessionControl2::GetProcessId` | `kAudioProcessPropertyPID` |
+| `pid` | Pulse 経由のストリームでは `application.process.id`、ネイティブクライアントでは `pipewire.sec.pid`（キャプチャバックエンドと同じ方法で解決します） | `IAudioSessionControl2::GetProcessId` | `kAudioProcessPropertyPID` |
 | `name` | ノードの `application.name`、なければクライアントの値 | イメージファイル名から `.exe` を除いたもの | 実行ファイル名 |
 | `executable` | `/proc/<pid>/exe` のベース名。`exe` を読めない場合は `/proc/<pid>/comm` の値 | プロセスイメージのベース名 | `proc_pidpath` から取得したベース名 |
 | `bundle_id` | — | — | `kAudioProcessPropertyBundleID` |
@@ -258,10 +318,30 @@ SemVer に従い、**マイナー**バージョンの更新（`0.2 → 0.3`）�
 | `flexaudio-os-windows` | ✅ | WASAPI によるループバック／プロセス単位のバックエンド（Windows）です。 |
 | `flexaudio-os-macos` | ✅ | Core Audio の process tap を使うバックエンド（macOS）です。 |
 | `flexaudio-vad` | ✅ | Silero VAD のアドオンです（オフライン動作、モデル埋め込み済み）。 |
+| `flexaudio-encode` | ✅ | ストリーミング FLAC エンコード（flacenc）です。 |
+| `flexaudio-denoise` | ✅ | RNNoise によるノイズ除去（nnnoiseless）です。 |
 | `flexaudio-cli` | — | 参考実装の CLI／ストリーミングキャプチャツールです。 |
-| `flexaudio-napi` | — (npm) | Node.js N-API アドオンです（crates.io ではなく npm に公開しています）。 |
+| `flexaudio-napi` | — (npm) | Node.js N-API アドオンです（npm を通じて配布します。初回公開はまだ行われていません）。 |
 | `flexaudio-ffi` | — | C ABI です（ポーリングによるキャプチャ、VAD / FLAC / ノイズ除去、`flexaudio_processes`）。 |
 | `bindings/flexaudio-py` | — | PyO3 による Python バインディングです（`open` / `devices` / `processes` / アドオン）。 |
+
+✅ の付いた 9 つのクレートは crates.io に公開されています。ワークスペースには 13 のメンバーがあります。
+
+| ワークスペースのメンバー |
+|---|
+| `crates/flexaudio-core` |
+| `crates/flexaudio-os-windows` |
+| `crates/flexaudio-os-macos` |
+| `crates/flexaudio-os-linux` |
+| `crates/flexaudio-mic` |
+| `crates/flexaudio` |
+| `crates/flexaudio-cli` |
+| `crates/flexaudio-ffi` |
+| `crates/flexaudio-napi` |
+| `crates/flexaudio-vad` |
+| `crates/flexaudio-encode` |
+| `crates/flexaudio-denoise` |
+| `bindings/flexaudio-py` |
 
 ---
 
@@ -269,6 +349,7 @@ SemVer に従い、**マイナー**バージョンの更新（`0.2 → 0.3`）�
 
 [MIT](LICENSE) © 2026 tubome / Studio Sadola.
 
-このプロジェクトは、サードパーティのソフトウェア（Silero VAD モデル、ONNX Runtime、PipeWire、
-および制約の少ないライセンスの Rust クレート）を同梱、またはリンクしています。
+このプロジェクトは、サードパーティのソフトウェア（Silero VAD モデルと VAD 用の
+純粋な Rust による tract 推論、ノイズ除去用の nnnoiseless を介した RNNoise、
+PipeWire、および制約の少ないライセンスの Rust クレート）を同梱、またはリンクしています。
 必要なライセンス表示については、[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) を参照してください。

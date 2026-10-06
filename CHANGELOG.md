@@ -12,52 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **`StreamConfig::exclude_pids` / N-API `excludePids`.** System-loopback
-  capture can exclude a set of pids in addition to `exclude_self`. Electron
-  hosts render audio from a helper process, so excluding the addon's own pid
-  was not enough on Linux and macOS. Linux excludes every listed pid. macOS:
-  every pid is added to the tap's exclude list,
-  resolved to its Core Audio process object once at capture start — a helper
-  that has not yet rendered audio has no object and is not excluded, so open
-  the capture while the app is already playing or reopen it when a helper
-  appears. Windows: one process tree — `exclude_self` wins, otherwise the first
-  pid; any other listed pid is rejected with `Error::InvalidArg`.
-
-### Changed
-- **Exclusion is fail-closed.** Windows rejects any listed PID outside the
-  single excluded process tree with `Error::InvalidArg`. On macOS, every PID
-  must fit 1..=2147483647 (`i32::MAX`); otherwise capture fails with
-  `Error::InvalidArg`. macOS also fails capture start when a requested PID
-  lookup fails, unless the process is confirmed gone. N-API rejects non-integer, zero, negative, and out-of-range
-  `processId` / `excludePids` values instead of coercing them. On Linux,
-  pulse-proxied streams are matched by `application.process.id` and remain out
-  of exclusion-mode captures until that PID is known.
-
-### Tests
-- The real-PipeWire smoke test checks each channel using distinct left and
-  right tones.
-
-### Fixed
-- **Linux: fan-in capture no longer latches a half-linked node.** `try_link`
-  now commits a target only once the capture stream's own input ports have all
-  arrived, the target has every output port its node info declares (or, when
-  the node has not declared a count, its currently visible ports are fully
-  paired), and each channel the capture can take is paired; a `try_link` fired by the first
-  input-port global used to link FL alone and never revisit the node, so stereo
-  sources came through at half level with one channel missing.
-- **Linux: libpulse clients now resolve to their own pid.** Stream nodes are
-  bound and `application.process.id` is read from their info props (the
-  registry `global` event omits it). Pulse-proxied streams (`client.api =
-  pipewire-pulse`) are matched only by that property and are not captured in
-  exclude mode until it is known. Native PipeWire clients still fall back to
-  `pipewire.sec.pid`. Previously, PulseAudio clients such as Electron/Chromium
-  and Zoom shared pipewire-pulse's pid in `processes()` and could not be
-  excluded individually.
-
-## [0.3.0] - not yet released
+## [0.3.0] - 2026-10-07
 
 ### Added
+
 - **Process enumeration: `flexaudio::processes() -> Result<Vec<ProcessInfo>>`.**
   Lists the processes that have an audio output session/stream and can be
   passed to per-process capture as `target_pid`. The calling process is
@@ -67,8 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries `pid`, `name` (always non-empty), and, when the OS exposes them,
   `executable`, `bundle_id` (macOS), and `is_output_active`.
   - **Linux:** PipeWire clients that own a `Stream/Output/Audio` node; the PID
-    comes from the client's `pipewire.sec.pid` (the same resolution the
-    capture backend uses); activity = node state `Running`. `executable` is
+    comes from `application.process.id` for pulse-proxied streams and
+    `pipewire.sec.pid` for native clients (the same resolution the capture
+    backend uses); activity = node state `Running`. `executable` is
     the basename of `/proc/<pid>/exe`, falling back to `/proc/<pid>/comm`.
   - **Windows:** audio sessions on every active render endpoint
     (`IAudioSessionManager2`); activity = session state `Active`. Listing and
@@ -104,8 +63,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   option is left unset (the standalone `Vad` keeps silero's unbounded default).
 - Denoise now runs once on the shared 48 kHz normalized signal, so both the
   primary and the secondary tap receive denoised audio.
+- **`StreamConfig::exclude_pids` / N-API `excludePids`.** System-loopback
+  capture can exclude a set of pids in addition to `exclude_self`. Electron
+  hosts render audio from a helper process, so excluding the addon's own pid
+  was not enough on Linux and macOS. Linux excludes every listed pid. macOS:
+  every pid is added to the tap's exclude list,
+  resolved to its Core Audio process object once at capture start — a helper
+  that has not yet rendered audio has no object and is not excluded, so open
+  the capture while the app is already playing or reopen it when a helper
+  appears. Windows: one process tree — `exclude_self` wins, otherwise the first
+  pid; any other listed pid is rejected with `Error::InvalidArg`.
+- **Microphone + system mix:** `SourceKind::Mix` combines both inputs, with
+  independent device selection and pre-mix gains plus a global post-mix gain.
+- **PID exclusion across bindings:** C adds `flexaudio_open_with_exclude_pids`
+  and `flexaudio_switch_source_with_exclude_pids` without changing `FlexConfig`;
+  Python adds keyword-only `exclude_pids` to `open()` and `switch_source()`;
+  the CLI adds repeatable `--exclude-pid`. Exclusion applies to system capture
+  and the system side of Mix, combined with self-exclusion.
+- **Windows ARM64 npm binaries:** prebuilt npm artifacts now cover five
+  platforms (Linux x64/arm64, macOS arm64, Windows x64/arm64). Python wheels
+  remain available on four platforms (no Windows ARM64 wheel).
 
 ### Changed
+
 - The N-API TypeScript declarations now type the callbacks:
   `openStream(options, onChunk: (chunk: JsAudioChunk) => void, onEvent?)` and
   `watchDevices(onEvent: (event: JsDeviceEvent) => void)` instead of the
@@ -117,8 +97,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the last PCM and the `frames:0` terminator — has been delivered to JS. Do
   not block synchronously inside `onChunk`, or terminator delivery and
   `stop()` resolution can stall.
+- **Exclusion is fail-closed.** Windows rejects any listed PID different from the
+  single excluded process tree root with `Error::InvalidArg`. On macOS, every PID
+  must fit 1..=2147483647 (`i32::MAX`); otherwise capture fails with
+  `Error::InvalidArg`. macOS also fails capture start when a requested PID
+  lookup fails, unless the process is confirmed gone. N-API rejects non-integer, zero, negative, and out-of-range
+  `processId` / `excludePids` values instead of coercing them. On Linux,
+  pulse-proxied streams are matched by `application.process.id` and remain out
+  of exclusion-mode captures until that PID is known.
+- **macOS device + exclusion:** capture honors a requested system output device
+  together with PID exclusion, including the system side of Mix. Linux and
+  Windows retain their existing behavior: the requested system device is not
+  used while exclusion is active.
+- **Pure-Rust VAD inference:** replace ONNX Runtime with tract-onnx 0.23.7 and
+  an embedded Silero 16 kHz model; sinc-resample 8 kHz input while retaining
+  input-based event timing. VAD and bindings that include it require Rust 1.91.
+- **English codebase:** translate code comments, documentation, and user-facing
+  text into English; `README.ja.md` is the Japanese translation of the canonical
+  English README.
+
+### Fixed
+
+- **Linux: fan-in capture no longer latches a half-linked node.** `try_link`
+  now commits a target only once the capture stream's own input ports have all
+  arrived, the target has every output port its node info declares (or, when
+  the node has not declared a count, its currently visible ports are fully
+  paired), and each channel the capture can take is paired; a `try_link` fired by the first
+  input-port global used to link FL alone and never revisit the node, so stereo
+  sources came through at half level with one channel missing.
+- **Linux: libpulse clients now resolve to their own pid.** Stream nodes are
+  bound and `application.process.id` is read from their info props (the
+  registry `global` event omits it). Pulse-proxied streams (`client.api =
+  pipewire-pulse`) are matched only by that property and are not captured in
+  exclude mode until it is known. Native PipeWire clients still fall back to
+  `pipewire.sec.pid`. Previously, PulseAudio clients such as Electron/Chromium
+  and Zoom shared pipewire-pulse's pid in `processes()` and could not be
+  excluded individually.
+- **Windows process-loopback format conversion:** enable WASAPI automatic PCM
+  conversion to the fixed 48 kHz stereo capture format instead of relying on
+  an unavailable process-loopback mix format.
+- **Capture lifecycle:** mark the first resumed chunk on both taps with
+  `DISCONTINUITY` under the delivery lock. Keep cpal's Windows WASAPI enumerator
+  on a process-lifetime thread so later microphone calls survive the first
+  caller's exit.
+- **macOS device errors:** propagate output-device enumeration and UID lookup
+  failures through the shared OSStatus mapping instead of masking them.
+
+### Tests
+
+- The real-PipeWire smoke test checks each channel using distinct left and
+  right tones.
+
+### Packaging
+
+- **Shared release version gate:** all three release workflows check the tag
+  or explicit dispatch version against Rust, Python, and npm manifests before
+  uploads or publication. Manual dry runs default to enabled.
+- **npm publication hardening:** skip only an exact platform package version
+  already present in the registry; other failures stop publication. Include
+  `LICENSE` and `THIRD_PARTY_NOTICES.md` in every platform package. The first
+  npm publication remains pending and requires an interactive human with 2FA.
+- **Windows binary checks:** use a Node.js PE parser to inspect normal and
+  delayed imports, enforce the documented DLL allowlist, and validate names
+  containing `+`. Windows npm builds use a static CRT.
+- **CI coverage:** pin required checks to Rust 1.98.1, guard the pin, preview
+  upstream stable, lint native Windows/macOS crates, and check all 13 members
+  at their declared MSRV (nine at Rust 1.85, four at Rust 1.91).
 
 ### Migration from 0.2
+
 - **Rust `StreamConfig` literals:** the struct gained `secondary_output`. A
   literal that lists every field without `..Default::default()` no longer
   compiles; add `secondary_output: None` or end the literal with
@@ -145,6 +192,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The first Rust workspace release — a ground-up Rust rewrite of the earlier prototype.
 
 ### Added
+
 - **Complete capture matrix ("9 cells"):** microphone, system-output loopback,
   and per-process capture across Linux, Windows, and macOS.
   - **Linux:** PipeWire backend for system and per-process capture
@@ -169,10 +217,11 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
   streaming `SpeechStart`/`SpeechEnd` and batch `get_speech_timestamps`.
 - **`flexaudio-cli`:** reference capture tool with WAV output and raw-PCM
   streaming to stdout (`--out -`) for real-time pipelines.
-- **`flexaudio-napi`:** Node.js N-API addon (published to npm) for in-process
+- **`flexaudio-napi`:** Node.js N-API addon (distributed through npm; first publication pending) for in-process
   use from TypeScript/Electron.
 
 ### Packaging
+
 - Added `LICENSE` (MIT) at the workspace root and in each crate.
 - Added `THIRD_PARTY_NOTICES.md` covering the bundled Silero VAD model,
   statically linked ONNX Runtime, dynamically linked PipeWire/libspa, and the
@@ -248,8 +297,7 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
   kHz model; use sinc resampling for 8 kHz input while retaining
   input-based event timing. Raise the VAD Rust minimum to 1.91. Windows
   npm builds use a static CRT and check for runtime DLL dependencies.
-  The supplied implementation diff is truncated; model and resampling
-  details come from the commit message. (804e641)
+  (804e641)
 
 ### 2026-07-05 - 0.2.0 publishing follow-up
 
