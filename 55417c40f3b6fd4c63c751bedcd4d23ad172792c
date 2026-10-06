@@ -1,0 +1,14 @@
+English translation of the original Japanese commit message:
+
+fix(napi): reject PE dependencies outside the Windows allowlist
+
+Add pe-dependency-policy.mjs to accept only seven documented Windows
+DLLs and api-ms-win-* API sets, comparing names case-insensitively. The
+old denylist passed unrecognized bundled dependencies such as
+libc++.dll, libunwind.dll, and ggml-*.dll. Forbidden MSVC and inference
+runtime patterns override the allowlist, even if added by mistake. New
+entries require evidence that Windows provides the DLL. Invalid inputs
+and zero readable imports still fail. Add policy tests and five
+synthetic-PE CLI cases for allowed imports, user32.dll, libc++.dll,
+delayed VCRUNTIME140.dll, and empty imports. The existing per-push CI
+job now protects the release check with these tests.
