@@ -1,0 +1,13 @@
+English translation of the original Japanese commit message:
+
+ci(release-npm): replace dumpbin with a Node.js PE parser
+
+Replace dumpbin in .github/workflows/release-npm.yml with the Node.js
+checker at crates/flexaudio-napi/__test__/check-pe-dependencies.mjs.
+Successful Windows builds had failed inspection because dumpbin was not
+on PATH, preventing artifact uploads. The checker uses Node built-ins,
+reads both normal and delayed imports, and handles RVA/VA name
+addresses. It rejects MSVCP, VCRUNTIME, VCOMP, DirectML, and onnxruntime
+dependencies. Missing inputs, invalid PE files, and zero readable
+dependencies also fail. Logs show the machine type and separate normal
+and delayed DLL lists.
