@@ -1,0 +1,14 @@
+English translation of the original Japanese commit message:
+
+fix(macos): propagate output-device enumeration failures
+
+Make all_device_ids return Result instead of converting Core Audio read
+failures into an empty device list. Propagate errors through
+list_output_devices and uid_for_device_name using the shared
+map_os_status mapping, preserving OSStatus for generic backend errors.
+System capture startup returns UID lookup errors through ready_tx
+instead of reporting every failure as DeviceNotFound. Callers can
+distinguish no devices from enumeration or permission failure. The
+public API already had an error path, so its contract is unchanged. Add
+injected-reader tests for an empty list, OSStatus -1, and the 'nope'
+permission error; retain the unknown-device Ok(None) check.
