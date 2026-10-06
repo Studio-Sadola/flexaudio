@@ -9,7 +9,7 @@
 #    register this repo + workflow as a Trusted Publisher for each crate at
 #    https://crates.io/crates/<name>/settings, then use the OIDC exchange shown
 #    in the commented block below instead of CARGO_REGISTRY_TOKEN. That needs
-#    `permissions: id-token: write` (already declared) and removes the secret.
+#    `permissions: id-token: write` on the publish job and removes the secret.
 #
 # Triggered by pushing a version tag (e.g. v0.2.0) or run manually. It is a
 # no-op on ordinary pushes / PRs.
@@ -22,24 +22,60 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      version:
+        description: "Release version (MAJOR.MINOR.PATCH, without v)"
+        type: string
+        required: true
       dry_run:
         description: "Build/package only; do not actually publish to crates.io"
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
-  # Required only if you switch to crates.io Trusted Publishing (OIDC). Harmless
-  # to leave declared when using token auth.
-  id-token: write
 
 jobs:
+  version-gate:
+    name: Validate release versions
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check tag or explicit dispatch version
+        id: check
+        shell: bash
+        working-directory: .
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            python3 .github/scripts/check-release-versions.py --tag "$REF_NAME"
+            VERSION="${REF_NAME#v}"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            python3 .github/scripts/check-release-versions.py --version "$INPUT_VERSION"
+            VERSION="$INPUT_VERSION"
+          else
+            echo "::error::Unsupported release trigger."
+            exit 1
+          fi
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+
   publish:
     name: Publish crates (dependency order)
+    needs: version-gate
     runs-on: ubuntu-latest
     env:
       # cargo publish reads this automatically. Keep it scoped to this job.
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      RELEASE_VERSION: ${{ needs.version-gate.outputs.version }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
     steps:
       - uses: actions/checkout@v4
@@ -65,7 +101,7 @@ jobs:
       #   uses: rust-lang/crates-io-auth-action@v1
       #   id: auth
       # # then export the minted token for the publish step:
-      # #   echo "CARGO_REGISTRY_TOKEN=${{ steps.auth.outputs.token }}" >> "$GITHUB_ENV"
+      # # Pass steps.auth.outputs.token through the publish step env, not a run script.
 
       - name: Publish crates in dependency order
         shell: bash
@@ -88,8 +124,7 @@ jobs:
             flexaudio
           )
 
-          VERSION="$(cargo metadata --format-version=1 --no-deps \
-            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="flexaudio-core"))')"
+          VERSION="$RELEASE_VERSION"
           echo "Publishing flexaudio workspace version ${VERSION}"
 
           UA="flexaudio-release-workflow (https://github.com/${GITHUB_REPOSITORY})"

@@ -23,8 +23,9 @@
 //! Process and system use separate flags:
 //! - `--mode include|exclude` (process only; default include): include captures only the target
 //!   PID; exclude captures all system audio except the target PID (`--process-id` required).
-//! - `--exclude-self` (system only): removes this process's playback from system audio to prevent
-//!   feedback. The process source ignores `--exclude-self`; the system source ignores `--mode`.
+//! - `--exclude-self` / repeatable `--exclude-pid <PID>`: remove playback from system capture
+//!   or the system side of mix. Require a system/mix source, including in `--sources` schedules.
+//!   The system source ignores `--mode`.
 //!
 //! ```text
 //! flexaudio-cli --list-devices
@@ -149,8 +150,8 @@ struct Cli {
     /// is the sum of all `secs`). If `process` is included, `--process-id` is required.
     /// Prints `[switch] -> <kind>` to stderr at each boundary. If a switch fails, a warning is
     /// printed and recording continues with the previous source. For WAV output, each `secs` must
-    /// be at least 1. `--mode` / `--exclude-self` are passed to every segment; `--mode` applies only
-    /// to process segments, and `--exclude-self` only to system segments.
+    /// be at least 1. `--mode` / `--exclude-self` / `--exclude-pid` are passed to every segment;
+    /// `--mode` applies only to process segments, and exclusions only to system segments.
     #[arg(long)]
     sources: Option<String>,
 
@@ -175,11 +176,17 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = ModeArg::Include)]
     mode: ModeArg,
 
-    /// Remove this process's playback from system audio (system only; prevents feedback loops;
-    /// Linux / Windows / macOS). Applies only to `--source system`; ignored for mic / process.
+    /// Remove this process's playback from system capture or the system side of mix
+    /// (prevents feedback loops; Linux / Windows / macOS). Requires a system/mix source.
     /// Use `--mode exclude` to exclude a target PID.
     #[arg(long, default_value_t = false)]
     exclude_self: bool,
+
+    /// Exclude this PID's playback from system capture (or the system side of mix). Repeat for
+    /// multiple PIDs; combines with --exclude-self. On Windows all excluded PIDs must belong to
+    /// one process tree root (pass the root PID once).
+    #[arg(long = "exclude-pid", value_name = "PID", value_parser = clap::value_parser!(u32).range(1..))]
+    exclude_pids: Vec<u32>,
 
     /// Capture duration in seconds. `0` streams indefinitely (intended for `--out -`; stops on
     /// Ctrl-C or a broken pipe).
@@ -332,7 +339,7 @@ fn parse_sources(spec: &str) -> std::result::Result<Vec<Segment>, String> {
 }
 
 /// Build [`StreamConfig`] from the given [`SourceKind`] and shared CLI settings
-/// (output / pid / exclude_self). Used to create config for each `--sources` segment.
+/// (output / pid / exclusions). Used for initial capture and every `--sources` segment.
 fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
     StreamConfig {
         kind,
@@ -340,8 +347,9 @@ fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
         target_pid: cli.process_id,
         // `mode` applies only to process segments (the facade ignores it for mic/system).
         mode: cli.mode.into(),
-        // `exclude_self` applies only to system segments (ignored for mic/process).
+        // Exclusions apply to system capture and the system side of mix (ignored for mic/process).
         exclude_self: cli.exclude_self,
+        exclude_pids: cli.exclude_pids.clone(),
         // `device_id` applies to mic (input) and system (output endpoint); the facade ignores it
         // for process. Set it on every segment so the relevant segment can use it.
         device_id: cli.device_id.clone(),
@@ -355,6 +363,23 @@ fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
         mix_system_gain: cli.system_gain,
         ..Default::default()
     }
+}
+
+/// Reject exclusions when the effective source plan has no system capture.
+fn validate_exclusion_sources(cli: &Cli, segments: Option<&[Segment]>) -> Result<(), Error> {
+    let has_system = match segments {
+        Some(segments) => segments
+            .iter()
+            .any(|segment| matches!(segment.kind, SourceKind::SystemLoopback | SourceKind::Mix)),
+        None => matches!(cli.source, SourceArg::System | SourceArg::Mix),
+    };
+    if (cli.exclude_self || !cli.exclude_pids.is_empty()) && !has_system {
+        return Err(Error::InvalidArg(
+            "--exclude-pid and --exclude-self require --source system or mix, or a system segment in --sources."
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Hot-swap scheduler for `--sources`.
@@ -445,6 +470,13 @@ fn main() -> ExitCode {
 
 /// Main operation. Returns failures as human-readable `String` messages.
 fn run(cli: &Cli) -> std::result::Result<(), String> {
+    // Enforce the resource guard before any device access, including enumeration modes.
+    if cli.exclude_pids.len() > 4096 {
+        return Err(describe_error(Error::InvalidArg(
+            "exclude_pids: too many entries (max 4096)".into(),
+        )));
+    }
+
     // Device listing mode (enumerate without recording, then exit). Handle this before and
     // independently of `--source` and related options.
     if cli.list_devices {
@@ -502,6 +534,8 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
             Some(segs)
         }
     };
+
+    validate_exclusion_sources(cli, segments.as_deref()).map_err(describe_error)?;
 
     // Resolve SourceKind and its display label. The `flexaudio::open` facade builds and selects
     // the backend (internally choosing a `Box<dyn CaptureBackend>` and returning a Stream). The CLI
@@ -591,27 +625,7 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
 
     // Open the stream. `open` selects a `Box<dyn CaptureBackend>` internally based on config.kind.
     // Do not start it yet (two-stage flow). Read native_format from the opened Stream.
-    let config = StreamConfig {
-        kind,
-        output,
-        target_pid: cli.process_id,
-        // `mode` is process-only; default is include.
-        mode: cli.mode.into(),
-        // `exclude_self` excludes this process from system capture; system-only.
-        exclude_self: cli.exclude_self,
-        // `device_id` selects mic input or a system output endpoint (the facade ignores it for
-        // process).
-        device_id: cli.device_id.clone(),
-        // Input gain at startup (linear multiplier). `open` rejects invalid values with InvalidArg.
-        gain: cli.gain,
-        // Mix-only device selection and per-source gain (the facade ignores these for other
-        // sources; `open` rejects invalid per-source gain values with InvalidArg).
-        mix_mic_device_id: cli.mic_device_id.clone(),
-        mix_system_device_id: cli.system_device_id.clone(),
-        mix_mic_gain: cli.mic_gain,
-        mix_system_gain: cli.system_gain,
-        ..Default::default()
-    };
+    let config = config_for_kind(cli, kind);
     let mut stream = flexaudio::open(config).map_err(describe_error)?;
 
     // --- Show native format ---
@@ -1413,6 +1427,117 @@ mod tests {
         let mut full = vec!["flexaudio-cli"];
         full.extend_from_slice(args);
         Cli::parse_from(full)
+    }
+
+    #[test]
+    fn exclude_pid_parses_range_and_preserves_repeated_values() {
+        let cli = cli_from(&[
+            "--source",
+            "system",
+            "--exclude-pid",
+            "1",
+            "--exclude-pid",
+            "4294967295",
+            "--exclude-pid",
+            "1",
+            "--exclude-self",
+        ]);
+        assert_eq!(cli.exclude_pids, vec![1, u32::MAX, 1]);
+        assert!(cli.exclude_self);
+        assert!(cli_from(&[]).exclude_pids.is_empty());
+    }
+
+    #[test]
+    fn exclude_pid_rejects_invalid_values() {
+        for value in ["0", "-1", "4294967296", "abc", "1.5", "true"] {
+            let argument = format!("--exclude-pid={value}");
+            assert!(
+                Cli::try_parse_from(["flexaudio-cli", argument.as_str()]).is_err(),
+                "must reject {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_rejects_exclusions_without_system_capture() {
+        for exclusion in [vec!["--exclude-self"], vec!["--exclude-pid", "123"]] {
+            for source in ["mic", "process"] {
+                let mut args = vec!["--source", source, "--process-id", "42"];
+                args.extend_from_slice(&exclusion);
+                let err = run(&cli_from(&args)).expect_err("reject before device access");
+                assert!(err.contains("require --source system or mix"), "err: {err}");
+            }
+            // The schedule overrides --source, so its effective sources decide validity.
+            let mut args = vec![
+                "--source",
+                "system",
+                "--sources",
+                "mic:1,process:1",
+                "--process-id",
+                "42",
+            ];
+            args.extend_from_slice(&exclusion);
+            let err = run(&cli_from(&args)).expect_err("reject before device access");
+            assert!(err.contains("system segment in --sources"), "err: {err}");
+        }
+    }
+
+    #[test]
+    fn exclusions_allow_system_mix_and_later_system_segments() {
+        for source in ["system", "mix"] {
+            let cli = cli_from(&["--source", source, "--exclude-self", "--exclude-pid", "123"]);
+            validate_exclusion_sources(&cli, None).expect("system capture supports exclusions");
+        }
+        let cli = cli_from(&[
+            "--sources",
+            "mic:1,system:1",
+            "--exclude-self",
+            "--exclude-pid",
+            "123",
+        ]);
+        let segments =
+            parse_sources(cli.sources.as_deref().expect("schedule")).expect("valid schedule");
+        validate_exclusion_sources(&cli, Some(&segments)).expect("later system segment suffices");
+        validate_exclusion_sources(&cli_from(&[]), None).expect("no exclusions is valid");
+    }
+
+    #[test]
+    fn exclusion_pid_limit_is_checked_before_device_access() {
+        let mut cli = cli_from(&["--source", "system"]);
+        cli.exclude_pids = vec![1; 4097];
+        let err = run(&cli).expect_err("reject before device access");
+        assert!(
+            err.contains("exclude_pids: too many entries (max 4096)"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn exclusions_reach_shared_builder_and_scheduled_configs() {
+        let cli = cli_from(&[
+            "--exclude-pid",
+            "123",
+            "--exclude-pid",
+            "123",
+            "--exclude-self",
+        ]);
+        for kind in [
+            SourceKind::Mic,
+            SourceKind::SystemLoopback,
+            SourceKind::ProcessLoopback,
+            SourceKind::Mix,
+        ] {
+            let config = config_for_kind(&cli, kind);
+            assert_eq!(config.exclude_pids, vec![123, 123]);
+            assert!(config.exclude_self);
+        }
+        let segments = parse_sources("mic:1,system:1,process:1").expect("valid schedule");
+        let scheduler = SwitchScheduler::new(&cli, &segments, Instant::now());
+        assert_eq!(scheduler.configs.len(), 2);
+        for config in &scheduler.configs {
+            assert_eq!(config.exclude_pids, vec![123, 123]);
+            assert!(config.exclude_self);
+        }
     }
 
     // --- parse_sources ---

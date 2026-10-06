@@ -27,6 +27,47 @@ pub(crate) const DEFAULT_OUTPUT_RATE: u32 = 48_000;
 pub(crate) const DEFAULT_OUTPUT_CHANNELS: u16 = 2;
 const DEFAULT_CHUNK_MS: u32 = 20;
 const DEFAULT_GAIN: f32 = 1.0;
+const MAX_EXCLUDE_PIDS: usize = 4096;
+
+/// Validate and copy the caller's PID array without retaining the C pointer.
+///
+/// # Safety
+/// For a nonempty list of at most 4096 entries, an aligned, non-NULL pointer must refer to
+/// that many initialized `u32` values in one allocation, readable and unchanged during this call.
+pub(crate) unsafe fn copy_exclude_pids(
+    exclude_pids: *const u32,
+    exclude_pids_len: usize,
+) -> flexaudio::Result<Vec<u32>> {
+    if exclude_pids_len > MAX_EXCLUDE_PIDS {
+        return Err(flexaudio::Error::InvalidArg(
+            "exclude_pids: too many entries (max 4096)".into(),
+        ));
+    }
+    if exclude_pids_len == 0 {
+        return Ok(Vec::new());
+    }
+    if exclude_pids.is_null() {
+        return Err(flexaudio::Error::InvalidArg(
+            "exclude_pids: pointer is null with nonzero length".into(),
+        ));
+    }
+    if !exclude_pids.is_aligned() {
+        return Err(flexaudio::Error::InvalidArg(
+            "exclude_pids: pointer is not aligned for uint32_t".into(),
+        ));
+    }
+    // The length cap also bounds the byte length below isize::MAX. The caller guarantees
+    // readable memory; NULL and alignment checks alone cannot establish pointer validity.
+    let owned = slice::from_raw_parts(exclude_pids, exclude_pids_len).to_vec();
+    for (index, pid) in owned.iter().enumerate() {
+        if *pid == 0 {
+            return Err(flexaudio::Error::InvalidArg(format!(
+                "exclude_pids[{index}] must be a positive integer in 1..=4294967295, got 0"
+            )));
+        }
+    }
+    Ok(owned)
+}
 
 /// Resolve output format in `FlexConfig`, including sentinel values (0 → default).
 ///
@@ -107,6 +148,7 @@ fn gain_or_default(gain: f32) -> f32 {
 
 /// Build [`StreamConfig`] from `FlexConfig`. As in napi's `build_config`, do not expose
 /// `ring_capacity_chunks`; use its default. Map fields with sentinel 0 to their defaults.
+/// Transfer the owned, boundary-validated exclusion list into the stream configuration.
 ///
 /// If `device_id` / `mix_mic_device_id` / `mix_system_device_id` contains invalid UTF-8, set
 /// last_error and return `Err`.
@@ -114,7 +156,10 @@ fn gain_or_default(gain: f32) -> f32 {
 /// # Safety
 /// `config` must point to a valid `FlexConfig`, and each string field must be NULL or point to
 /// a valid NUL-terminated C string.
-pub unsafe fn build_config(config: &FlexConfig) -> Result<StreamConfig, ()> {
+pub unsafe fn build_config(
+    config: &FlexConfig,
+    exclude_pids: Vec<u32>,
+) -> Result<StreamConfig, ()> {
     let device_id = opt_string_from_c(config.device_id, "device_id")?;
     let mix_mic_device_id = opt_string_from_c(config.mix_mic_device_id, "mix_mic_device_id")?;
     let mix_system_device_id =
@@ -134,6 +179,7 @@ pub unsafe fn build_config(config: &FlexConfig) -> Result<StreamConfig, ()> {
         // mode is process-only; exclude_self is system-only. The facade handles them separately.
         mode: process_mode_from_c(config.mode),
         exclude_self: config.exclude_self,
+        exclude_pids,
         chunk_ms: if config.chunk_ms == 0 {
             DEFAULT_CHUNK_MS
         } else {
@@ -480,7 +526,7 @@ mod tests {
     #[test]
     fn build_config_applies_defaults_for_sentinels() {
         let c = make_config(FlexSourceKind::Mic);
-        let cfg = unsafe { build_config(&c) }.unwrap();
+        let cfg = unsafe { build_config(&c, Vec::new()) }.unwrap();
         assert_eq!(cfg.kind, SourceKind::Mic);
         // Sentinel 0 selects the default.
         assert_eq!(cfg.output.sample_rate, 48_000);
@@ -511,7 +557,7 @@ mod tests {
         c.output_channels = 1;
         c.chunk_ms = 20;
         c.gain = 2.5;
-        let cfg = unsafe { build_config(&c) }.unwrap();
+        let cfg = unsafe { build_config(&c, Vec::new()) }.unwrap();
         assert_eq!(cfg.kind, SourceKind::ProcessLoopback);
         assert_eq!(cfg.target_pid, Some(4321));
         assert_eq!(cfg.mode, ProcessMode::Exclude);
@@ -526,12 +572,12 @@ mod tests {
     fn build_config_maps_gain_sentinel_and_explicit() {
         // 0.0 is a sentinel for default 1.0 (same convention as output_rate 0→48000).
         let c = make_config(FlexSourceKind::Mic);
-        let cfg = unsafe { build_config(&c) }.unwrap();
+        let cfg = unsafe { build_config(&c, Vec::new()) }.unwrap();
         assert_eq!(cfg.gain, 1.0);
         // Explicit values pass through unchanged.
         let mut c2 = make_config(FlexSourceKind::Mic);
         c2.gain = 0.5;
-        let cfg2 = unsafe { build_config(&c2) }.unwrap();
+        let cfg2 = unsafe { build_config(&c2, Vec::new()) }.unwrap();
         assert_eq!(cfg2.gain, 0.5);
     }
 
@@ -540,7 +586,7 @@ mod tests {
         let id = CString::new("dev-x").unwrap();
         let mut c = make_config(FlexSourceKind::Mic);
         c.device_id = id.as_ptr();
-        let cfg = unsafe { build_config(&c) }.unwrap();
+        let cfg = unsafe { build_config(&c, Vec::new()) }.unwrap();
         assert_eq!(cfg.device_id.as_deref(), Some("dev-x"));
     }
 
@@ -553,7 +599,7 @@ mod tests {
         c.mix_system_device_id = sys_id.as_ptr();
         c.mix_mic_gain = 0.5;
         c.mix_system_gain = 2.0;
-        let cfg = unsafe { build_config(&c) }.unwrap();
+        let cfg = unsafe { build_config(&c, Vec::new()) }.unwrap();
         assert_eq!(cfg.kind, SourceKind::Mix);
         assert_eq!(cfg.mix_mic_device_id.as_deref(), Some("mic-a"));
         assert_eq!(cfg.mix_system_device_id.as_deref(), Some("sink-b"));

@@ -1828,6 +1828,101 @@ mod tests {
         );
     }
 
+    /// Resume while raw intake is blocked, then check the secondary tap independently.
+    /// The raw-consumer lock excludes new raw reads during resume; it does not prove that
+    /// the worker has already read the pending flags at the top of its current iteration.
+    #[test]
+    fn resume_flags_secondary_first_chunk_with_raw_intake_blocked() {
+        let config = StreamConfig {
+            secondary_output: Some(OutputFormat {
+                sample_rate: 16_000,
+                channels: 1,
+            }),
+            ring_capacity_chunks: 200,
+            ..Default::default()
+        };
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(config, backend).expect("open");
+        stream.start().expect("start");
+
+        let mut last_secondary_seq = None;
+        let got_before = wait_until(
+            || {
+                while stream.poll_chunk().is_some() {}
+                if let Some(chunk) = stream.poll_secondary() {
+                    last_secondary_seq = Some(chunk.seq);
+                    true
+                } else {
+                    false
+                }
+            },
+            Duration::from_secs(2),
+        );
+        assert!(got_before, "expected a secondary chunk before pause");
+
+        stream.pause();
+        // Clone shared state so holding its lock does not borrow the stream while polling.
+        let shared = stream.shared.clone();
+        {
+            let raw = shared
+                .raw_consumer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            while stream.poll_chunk().is_some() {}
+            while let Some(chunk) = stream.poll_secondary() {
+                last_secondary_seq = Some(chunk.seq);
+            }
+            // Keep the lock only across resume, without a sleep that could overflow RawRing.
+            stream.resume();
+            drop(raw);
+        }
+
+        let mut first_after = None;
+        let got_after = wait_until(
+            || {
+                while stream.poll_chunk().is_some() {}
+                if let Some(chunk) = stream.poll_secondary() {
+                    first_after = Some(chunk);
+                    true
+                } else {
+                    false
+                }
+            },
+            Duration::from_secs(2),
+        );
+        let overflow_count = shared
+            .raw_consumer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .expect("raw consumer")
+            .overflow_count();
+        stream.stop();
+
+        assert!(got_after, "expected a secondary chunk after resume");
+        // Otherwise overflow could supply DISCONTINUITY and hide missing resume wiring.
+        assert_eq!(overflow_count, 0, "raw overflow must not mask resume flags");
+        let first = first_after.expect("first secondary chunk after resume");
+        assert!(
+            first.flags.contains(ChunkFlags::DISCONTINUITY),
+            "expected DISCONTINUITY on the first secondary chunk after resume: {:?}",
+            first.flags
+        );
+        assert!(
+            !first.flags.contains(ChunkFlags::RECOVERED),
+            "watchdog recovery must not mask resume flags"
+        );
+        assert_eq!(
+            first.seq,
+            last_secondary_seq.expect("last secondary sequence before pause") + 1,
+            "secondary sequence should remain continuous across pause"
+        );
+        assert_eq!(
+            first.dropped_before, 0,
+            "pause must not drop secondary chunks"
+        );
+    }
+
     /// Calling resume while not paused does not set DISCONTINUITY on the next chunk (no-op).
     #[test]
     fn resume_without_pause_is_noop() {
@@ -2304,6 +2399,48 @@ mod tests {
         }
     }
 
+    /// Starting after a pre-start pause clears that state for both taps.
+    #[test]
+    fn start_after_pause_delivers_the_secondary_tap() {
+        let config = StreamConfig {
+            secondary_output: Some(OutputFormat {
+                sample_rate: 16_000,
+                channels: 1,
+            }),
+            ring_capacity_chunks: 200,
+            ..Default::default()
+        };
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(config, backend).expect("open");
+        stream.pause();
+        stream.start().expect("start");
+        assert!(
+            !stream.is_paused(),
+            "start should clear the pre-start pause"
+        );
+
+        let mut primary = false;
+        let mut secondary = false;
+        let got_both = wait_until(
+            || {
+                while stream.poll_chunk().is_some() {
+                    primary = true;
+                }
+                while stream.poll_secondary().is_some() {
+                    secondary = true;
+                }
+                primary && secondary
+            },
+            Duration::from_secs(2),
+        );
+        stream.stop();
+        assert!(primary, "expected primary delivery after a pre-start pause");
+        assert!(
+            got_both && secondary,
+            "expected secondary delivery after a pre-start pause"
+        );
+    }
+
     /// secondary_output cannot be changed with switch_source (it is fixed at open).
     #[test]
     fn secondary_output_cannot_change_on_switch() {
@@ -2416,10 +2553,28 @@ mod tests {
 
     // --- Inject denoise into the internal canonical format (through core InnerProcessor) ---
 
+    /// Failure-detection bound, not a collection window. Debug RNNoise processing can
+    /// delay the first delivery beyond 500 ms under load; exit as soon as it arrives.
+    const DENOISE_TAP_TIMEOUT: Duration = Duration::from_secs(15);
+
     /// Verify with a smoke test that both primary and secondary taps continue delivering after
     /// set_denoise(true). The core flush/processing tests cover actual noise reduction.
     #[test]
     fn denoise_enabled_still_delivers_both_taps() {
+        fn drain_taps(stream: &mut Stream, primary: &mut usize, secondary: &mut usize) {
+            while stream.poll_chunk().is_some() {
+                *primary += 1;
+            }
+            while let Some(chunk) = stream.poll_secondary() {
+                assert_eq!(
+                    chunk.samples.len(),
+                    320,
+                    "secondary is 16k/mono = 320 samples"
+                );
+                *secondary += 1;
+            }
+        }
+
         let config = StreamConfig {
             secondary_output: Some(OutputFormat {
                 sample_rate: 16_000,
@@ -2434,25 +2589,31 @@ mod tests {
 
         let mut primary = 0usize;
         let mut secondary = 0usize;
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < deadline {
-            while let Some(_c) = stream.poll_chunk() {
-                primary += 1;
-            }
-            while let Some(c) = stream.poll_secondary() {
-                assert_eq!(c.samples.len(), 320, "secondary is 16k/mono = 320 samples");
-                secondary += 1;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        let primary_ok = wait_until(
+            || {
+                drain_taps(&mut stream, &mut primary, &mut secondary);
+                primary > 0
+            },
+            DENOISE_TAP_TIMEOUT,
+        );
+        let secondary_ok = wait_until(
+            || {
+                drain_taps(&mut stream, &mut primary, &mut secondary);
+                secondary > 0
+            },
+            DENOISE_TAP_TIMEOUT,
+        );
+        let last_sample_ns = stream.shared.last_sample_ns.load(Ordering::SeqCst);
         stream.stop();
         assert!(
-            primary > 0,
-            "primary chunks should arrive with denoise enabled"
+            primary_ok,
+            "no primary delivery with denoise within {DENOISE_TAP_TIMEOUT:?}: \
+             primary={primary}, secondary={secondary}, last_sample_ns={last_sample_ns}"
         );
         assert!(
-            secondary > 0,
-            "secondary chunks should arrive with denoise enabled"
+            secondary_ok,
+            "no secondary delivery with denoise within {DENOISE_TAP_TIMEOUT:?}: \
+             primary={primary}, secondary={secondary}, last_sample_ns={last_sample_ns}"
         );
     }
 }

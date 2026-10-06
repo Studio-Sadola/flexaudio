@@ -7,15 +7,64 @@
 //!
 //! [`Vad`]: crate::vad::Vad
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyDictMethods};
+use pyo3::types::{
+    PyBool, PyBytes, PyDict, PyDictMethods, PyInt, PySequence, PySequenceMethods, PyString,
+};
 
 use ::flexaudio as fa;
 use fa::{OutputFormat, StreamConfig};
 use flexaudio_vad::VadConfig;
 
 use crate::{parse_process_mode, parse_source_kind};
+
+/// Validate exclusion at the Python boundary before addons or device acquisition.
+/// Keep the sequence order and duplicates; integer extraction follows explicit type checks
+/// so bools and objects implementing only __index__ cannot become PIDs.
+pub(crate) fn parse_exclude_pids(value: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<u32>> {
+    let Some(value) = value.filter(|value| !value.is_none()) else {
+        return Ok(Vec::new());
+    };
+    let sequence_error =
+        || PyTypeError::new_err("exclude_pids must be a sequence of integers or None");
+    if value.is_instance_of::<PyString>()
+        || value.is_instance_of::<PyBytes>()
+        || value.is_instance_of::<PyDict>()
+    {
+        return Err(sequence_error());
+    }
+    let sequence = value.cast::<PySequence>().map_err(|_| sequence_error())?;
+    let len = sequence.len()?;
+    if len > 4096 {
+        return Err(PyValueError::new_err(
+            "exclude_pids: too many entries (max 4096)",
+        ));
+    }
+    let mut pids = Vec::with_capacity(len);
+    for index in 0..len {
+        let item = sequence.get_item(index)?;
+        let message = || {
+            format!(
+                "exclude_pids[{index}] must be a positive integer in 1..=4294967295, got {}",
+                match item.repr() {
+                    Ok(repr) => repr.to_string_lossy().into_owned(),
+                    // Python may refuse decimal formatting of extremely large integers.
+                    Err(_) => "<unrepresentable value>".to_string(),
+                }
+            )
+        };
+        if item.is_instance_of::<PyBool>() || !item.is_instance_of::<PyInt>() {
+            return Err(PyTypeError::new_err(message()));
+        }
+        let pid = match item.extract::<u32>() {
+            Ok(pid) if pid != 0 => pid,
+            _ => return Err(PyValueError::new_err(message())),
+        };
+        pids.push(pid);
+    }
+    Ok(pids)
+}
 
 /// Build [`StreamConfig`] from Python arguments. Use the default for `ring_capacity_chunks`.
 /// Like napi's `build_config`, accepts kind/device_id/process_id/mode/exclude_self/
@@ -28,6 +77,7 @@ pub(crate) fn build_config(
     process_id: Option<u32>,
     mode: &str,
     exclude_self: bool,
+    exclude_pids: Vec<u32>,
     output_rate: u32,
     output_channels: u16,
     chunk_ms: u32,
@@ -48,9 +98,10 @@ pub(crate) fn build_config(
         output,
         device_id,
         target_pid: process_id,
-        // mode is process-only; exclude_self is system-only. The facade handles them separately.
+        // mode is process-only; exclusions apply to system capture and the system side of mix.
         mode,
         exclude_self,
+        exclude_pids,
         chunk_ms,
         gain,
         // Mix-only (the facade ignores these for other source kinds).
@@ -160,10 +211,52 @@ mod tests {
     use super::*;
     use fa::{ProcessMode, SourceKind};
 
+    #[test]
+    fn exclusion_parser_preserves_valid_sequences() {
+        Python::initialize();
+        Python::attach(|py| {
+            for expression in [
+                pyo3::ffi::c_str!("[1, 4294967295, 1]"),
+                pyo3::ffi::c_str!("(1, 4294967295, 1)"),
+            ] {
+                let value = py.eval(expression, None, None).expect("valid sequence");
+                assert_eq!(
+                    parse_exclude_pids(Some(&value)).expect("valid PIDs"),
+                    vec![1, u32::MAX, 1]
+                );
+            }
+            let value = py
+                .eval(pyo3::ffi::c_str!("[1] * 4096"), None, None)
+                .expect("maximum length sequence");
+            assert_eq!(
+                parse_exclude_pids(Some(&value))
+                    .expect("valid length")
+                    .len(),
+                4096
+            );
+            assert!(parse_exclude_pids(None).expect("default").is_empty());
+            let value = py.None().into_bound(py);
+            assert!(parse_exclude_pids(Some(&value)).expect("None").is_empty());
+        });
+    }
+
     /// Helper that calls build_config with default-equivalent arguments, matching open/switch_source.
     fn build_config_with_defaults(kind: &str) -> PyResult<StreamConfig> {
         build_config(
-            kind, None, None, "include", false, 48_000, 2, 20, 1.0, None, None, 1.0, 1.0,
+            kind,
+            None,
+            None,
+            "include",
+            false,
+            Vec::new(),
+            48_000,
+            2,
+            20,
+            1.0,
+            None,
+            None,
+            1.0,
+            1.0,
         )
     }
 
@@ -175,6 +268,7 @@ mod tests {
         assert_eq!(cfg.output.channels, 2);
         assert_eq!(cfg.mode, ProcessMode::Include);
         assert!(!cfg.exclude_self);
+        assert!(cfg.exclude_pids.is_empty());
         assert_eq!(cfg.target_pid, None);
         assert_eq!(cfg.device_id, None);
         assert_eq!(cfg.chunk_ms, 20);
@@ -197,6 +291,7 @@ mod tests {
             Some(9999),
             "exclude",
             true,
+            vec![9999, 9999],
             16_000,
             1,
             20,
@@ -212,6 +307,7 @@ mod tests {
         assert_eq!(cfg.target_pid, Some(9999));
         assert_eq!(cfg.mode, ProcessMode::Exclude);
         assert!(cfg.exclude_self);
+        assert_eq!(cfg.exclude_pids, vec![9999, 9999]);
         assert_eq!(cfg.output.sample_rate, 16_000);
         assert_eq!(cfg.output.channels, 1);
         assert_eq!(cfg.gain, 2.5);
@@ -225,6 +321,7 @@ mod tests {
             None,
             "include",
             false,
+            Vec::new(),
             48_000,
             2,
             20,

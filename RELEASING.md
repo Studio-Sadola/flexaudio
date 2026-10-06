@@ -22,9 +22,51 @@ then.
 | **PyPI** | ✅ published | Wheels (Linux x64/arm64, macOS arm64, Windows x64) + sdist. |
 | **npm** | ⏳ **pending** | Blocked by an npm-side bug — see below. Re-run `release-npm.yml` to finish. |
 
-Prebuilt binaries cover Linux x64/arm64, macOS arm64 (Apple Silicon), and
-Windows x64. macOS x64 (Intel) is intentionally not prebuilt — Intel Mac Rust
-users still build from source via crates.io.
+There are **five npm platforms**: Linux x64/arm64, macOS arm64 (Apple Silicon),
+and Windows x64/arm64. There are **four wheel platforms**: Linux x64/arm64,
+macOS arm64, and Windows x64, plus the Python source distribution. Windows
+arm64 wheels are not built. macOS x64 (Intel) is intentionally not prebuilt;
+Intel Mac Rust users still build from source via crates.io.
+
+## Version gate and dry runs
+
+All three release workflows validate versions before any artifact upload or
+registry publish. Tags must match `^v[0-9]+\.[0-9]+\.[0-9]+$` exactly; for
+example, `v0.3.0` is accepted, while `v0.3.0-rc.1` is rejected. The tag's
+version must equal the workspace version in `Cargo.toml`, the Python project
+version in `bindings/flexaudio-py/pyproject.toml`, the main npm package version,
+every npm platform package version, and all main npm `optionalDependencies`
+versions. Missing or malformed version fields fail the gate.
+
+Platform manifests under `crates/flexaudio-napi/npm/` are generated during the
+npm release; a source checkout may have none. After generation the workflow
+runs the same gate again with `--require-platforms`, which also requires the
+complete platform package set to match `optionalDependencies`. Each platform
+package includes `LICENSE` and `THIRD_PARTY_NOTICES.md`; the workflow copies
+these after generation, adds them to `files`, and verifies their presence
+before publishing or running packaging validation.
+
+Check a checkout locally with Python 3.11 or newer:
+
+```bash
+python3 .github/scripts/check-release-versions.py --version 0.3.0
+python3 -m unittest discover -s .github/scripts -p test_check_release_versions.py -v
+```
+
+For a dry run, open GitHub Actions, select each release workflow, and choose
+**Run workflow** on the intended release ref. Enter the explicit `version`
+(for example, `0.3.0`, without `v`) and leave `dry_run` checked. It defaults to
+**true** in all three workflows. The selected ref's manifest versions must
+match the input. npm validates packaging for the main and all platform
+packages; PyPI builds and collects wheels and sdist; crates.io performs the
+existing leaf-crate dry runs (dependent crates are validated at real publish).
+None of these dry runs publishes a registry package. npm/PyPI build artifacts
+are still uploaded to GitHub Actions for inspection.
+
+Uncheck `dry_run` explicitly to publish a manual release. Pushing a valid
+release tag triggers real publishing. An npm platform package is skipped only
+when `npm view name@version version` succeeds for that exact package version;
+any other platform publish failure stops the job before the main package.
 
 ## npm is not published yet — how to finish it
 
@@ -41,11 +83,14 @@ platform issue, not a problem with this repo:
   [#8544](https://github.com/npm/cli/issues/8544)), so the first version can't
   be published over OIDC.
 
-**To finish once npm ships a fix:** the `NPM_TOKEN` secret and the workflow are
-already in place. When "Bypass 2FA" tokens work, re-create `NPM_TOKEN` as a
-granular token with Bypass 2FA enabled and re-run `release-npm.yml`. After the
-first successful publish, switch to OIDC trusted publishing (configure it per
-package at `npmjs.com/package/<name>/access`) for subsequent releases.
+**The first npm publish must be performed interactively by a human with 2FA**
+for the main package and each platform package. Use the `.node` binaries from
+a `release-npm.yml` dry run, prepare the platform packages with their license
+files, and publish the platform packages before the main package. CI cannot
+bootstrap these new packages through OIDC.
 
-Alternatively, the first version can be published interactively from a machine
-with 2FA, using the `.node` binaries produced by the `release-npm.yml` build job.
+The `NPM_TOKEN` secret and workflow are already in place. Once "Bypass 2FA"
+tokens work, re-create `NPM_TOKEN` as a granular token with Bypass 2FA enabled
+for subsequent CI releases. After the first successful interactive publish,
+OIDC trusted publishing can instead be configured per package at
+`npmjs.com/package/<name>/access` for subsequent releases.

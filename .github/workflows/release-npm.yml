@@ -21,16 +21,17 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      version:
+        description: "Release version (MAJOR.MINOR.PATCH, without v)"
+        type: string
+        required: true
       dry_run:
         description: "Build all platforms but skip the npm publish step"
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
-  # Required for npm --provenance: signs the published packages from this
-  # public repo's workflow run (no effect on private repos).
-  id-token: write
 
 # All napi commands run inside the addon crate directory.
 defaults:
@@ -38,15 +39,49 @@ defaults:
     working-directory: crates/flexaudio-napi
 
 jobs:
+  version-gate:
+    name: Validate release versions
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check tag or explicit dispatch version
+        id: check
+        shell: bash
+        working-directory: .
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            python3 .github/scripts/check-release-versions.py --tag "$REF_NAME"
+            VERSION="${REF_NAME#v}"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            python3 .github/scripts/check-release-versions.py --version "$INPUT_VERSION"
+            VERSION="$INPUT_VERSION"
+          else
+            echo "::error::Unsupported release trigger."
+            exit 1
+          fi
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build addon (${{ matrix.target }})
+    needs: version-gate
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       # Matrix of host runner + Rust target triple.
       #
       # Covered: linux x64, linux arm64 (native on a hosted arm64 runner),
-      # macOS arm64, windows x64. This matches the napi "triples" /
+      # macOS arm64, windows x64/arm64. This matches the napi "triples" /
       # optionalDependencies in package.json.
       #
       # macOS x64 (Intel) is deliberately left out of the prebuilt package matrix.
@@ -99,14 +134,17 @@ jobs:
       - name: Build native addon (non-Windows)
         if: runner.os != 'Windows'
         shell: bash
-        run: npx napi build --platform --release --target ${{ matrix.target }}
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: npx napi build --platform --release --target "$BUILD_TARGET"
 
       - name: Build native addon (Windows, static CRT)
         if: runner.os == 'Windows'
         shell: bash
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: npx napi build --platform --release --target ${{ matrix.target }}
+          BUILD_TARGET: ${{ matrix.target }}
+        run: npx napi build --platform --release --target "$BUILD_TARGET"
 
       # The addon is built with the static CRT (see RUSTFLAGS above), so it must
       # not pull in an MSVC redistributable DLL (msvcp*/vcruntime*/vcomp*) or an
@@ -150,13 +188,23 @@ jobs:
 
   publish:
     name: Publish to npm
-    needs: build
+    needs: [version-gate, build]
+    permissions:
+      contents: read
+      # Only publishing requires the OIDC token used by --provenance.
+      id-token: write
+    env:
+      RELEASE_VERSION: ${{ needs.version-gate.outputs.version }}
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: crates/flexaudio-napi
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - uses: actions/setup-node@v4
         with:
@@ -183,13 +231,50 @@ jobs:
       # napi creates one npm package dir per platform under npm/ and moves each
       # downloaded .node into it. The root package.json already declares the
       # matching optionalDependencies and index.js/index.d.ts are committed, so
-      # nothing else is needed here. (We intentionally do NOT run `napi
-      # prepublish`: in napi-rs v2 it actually *publishes* the per-platform
+      # version and license checks below validate the generated packages.
+      # We intentionally do NOT run `napi prepublish`: in napi-rs v2 it
+      # actually *publishes* the per-platform
       # packages, which the explicit, auth-gated npm publish step below handles.)
       - name: Prepare per-platform npm packages
+        shell: bash
         run: |
+          set -euo pipefail
           npx napi create-npm-dir -t .
           npx napi artifacts --dir artifacts
+          python3 ../../.github/scripts/check-release-versions.py --version "$RELEASE_VERSION" --require-platforms
+          python3 - <<'PYTHON'
+          import json
+          import shutil
+          from pathlib import Path
+
+          notices = ("LICENSE", "THIRD_PARTY_NOTICES.md")
+          for directory in sorted(Path("npm").iterdir()):
+              manifest = directory / "package.json"
+              package = json.loads(manifest.read_text(encoding="utf-8"))
+              files = package.get("files")
+              if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
+                  raise SystemExit("Generated platform manifest must have a string files array")
+              for name in notices:
+                  shutil.copyfile(name, directory / name)
+                  if name not in files:
+                      files.append(name)
+              manifest.write_text(json.dumps(package, indent=2) + "\n", encoding="utf-8")
+          PYTHON
+
+      - name: Verify license files before publishing or dry run
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import json
+          from pathlib import Path
+
+          for directory in (Path("."), *sorted(Path("npm").iterdir())):
+              package = json.loads((directory / "package.json").read_text(encoding="utf-8"))
+              for name in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
+                  if name not in package.get("files", []) or not (directory / name).is_file():
+                      raise SystemExit(f"Missing packaged license file: {directory / name}")
+          PYTHON
 
       - name: Publish (root + per-platform packages)
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
@@ -205,7 +290,15 @@ jobs:
           # try to cut a GitHub release + re-publish the platform packages itself.
           # We publish explicitly here, so skip lifecycle scripts entirely.
           for dir in npm/*/; do
-            ( cd "$dir" && npm publish --ignore-scripts --access public --provenance || true )
+            (
+              cd "$dir"
+              PACKAGE_SPEC="$(node -e 'const p = require("./package.json"); process.stdout.write(`${p.name}@${p.version}`)')"
+              if npm view "$PACKAGE_SPEC" version >/dev/null 2>&1; then
+                echo "$PACKAGE_SPEC already published — skipping."
+              else
+                npm publish --ignore-scripts --access public --provenance
+              fi
+            )
           done
           # ...then the main package that depends on them.
           npm publish --ignore-scripts --access public --provenance
