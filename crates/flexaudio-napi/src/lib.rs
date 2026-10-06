@@ -569,6 +569,11 @@ pub struct OpenOptions {
     /// system 側に適用）。既定 false。mic / process では無視。
     /// Linux / Windows / macOS の 3 OS とも対応。
     pub exclude_self: Option<bool>,
+    /// Pids whose playback is excluded from a `system` capture (also the system
+    /// side of `mix`), in addition to `excludeSelf`. An Electron host passes its
+    /// whole process tree (`app.getAppMetrics()` pids). Ignored by mic/process.
+    /// Windows honours one process tree: `excludeSelf` wins, else the first pid.
+    pub exclude_pids: Option<Vec<u32>>,
     /// 既定 48000
     pub output_rate: Option<u32>,
     /// 既定 2
@@ -883,6 +888,7 @@ fn build_config(options: &OpenOptions) -> napi::Result<StreamConfig> {
         // mode は process 専用 / exclude_self は system 専用。混ぜないのは facade 側が見る。
         mode,
         exclude_self: options.exclude_self.unwrap_or(false),
+        exclude_pids: options.exclude_pids.clone().unwrap_or_default(),
         gain: options.gain.unwrap_or(1.0) as f32,
         // mix 専用（mic/system/process では facade が無視する）。側別ゲインは未指定 1.0。
         mix_mic_device_id: options.mic_device_id.clone(),
@@ -2337,6 +2343,7 @@ mod tests {
             process_id: None,
             mode: None,
             exclude_self: None,
+            exclude_pids: None,
             output_rate: None,
             output_channels: None,
             chunk_ms: None,
@@ -2376,6 +2383,17 @@ mod tests {
     }
 
     #[test]
+    fn build_config_exclude_pids() {
+        let mut opts = options_with_kind("system");
+        opts.exclude_pids = Some(vec![100, 200]);
+        let cfg = build_config(&opts).unwrap();
+        assert_eq!(cfg.exclude_pids, vec![100, 200]);
+        assert!(!cfg.exclude_self);
+        let cfg = build_config(&options_with_kind("system")).unwrap();
+        assert!(cfg.exclude_pids.is_empty());
+    }
+
+    #[test]
     fn build_config_reflects_all_fields() {
         let opts = OpenOptions {
             kind: "process".to_string(),
@@ -2383,6 +2401,7 @@ mod tests {
             process_id: Some(9999),
             mode: Some("exclude".to_string()),
             exclude_self: Some(true),
+            exclude_pids: None,
             output_rate: Some(16_000),
             output_channels: Some(1),
             chunk_ms: Some(20),

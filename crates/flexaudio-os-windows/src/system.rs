@@ -12,6 +12,11 @@
 //! （[`crate::process::setup_process_loopback`]）。この経路のネイティブフォーマットは
 //! プロセスループバック固定の `(48000, 2)`。エンドポイントに紐づかない機構なので
 //! `device_id` は無視する。
+//!
+//! Since `exclude_pids` was added, that EXCLUDE path is also taken with
+//! `exclude_self == false` when pids were set: WASAPI excludes exactly ONE process
+//! tree, so `exclude_self` wins and otherwise the first pid is the root
+//! (see [`WasapiSystemBackend::with_exclude_pids`]).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -60,6 +65,10 @@ pub struct WasapiSystemBackend {
     /// 自ホスト除外フラグ。`true` でプロセスループバック EXCLUDE 経路、`false` で古典
     /// loopback 経路。
     exclude_self: bool,
+    /// Extra pids excluded from the system capture (see `StreamConfig::exclude_pids`).
+    /// WASAPI process loopback takes exactly one process tree, so only the root
+    /// returned by [`exclude_root`](WasapiSystemBackend::exclude_root) is honoured.
+    exclude_pids: Vec<u32>,
     /// 出力エンドポイントの選択。`None` で既定 render、`Some(id)` で FriendlyName が
     /// `id` と一致する eRender エンドポイント。`exclude_self == true` では使わない。
     device_id: Option<String>,
@@ -90,10 +99,39 @@ impl WasapiSystemBackend {
         };
         Self {
             exclude_self,
+            exclude_pids: Vec::new(),
             device_id,
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
             native,
+        }
+    }
+
+    /// Exclude a process tree in addition to `exclude_self`. WASAPI process
+    /// loopback takes exactly ONE tree per client, so only one root is honoured:
+    /// `exclude_self` (this process's tree) wins, otherwise the first pid's tree.
+    /// Callers that need several unrelated trees excluded must open several
+    /// captures. Switches the native format to the process-loopback format.
+    ///
+    /// Idempotent: `native` is recomputed from the resulting exclude root, so
+    /// calling this again with an empty list restores the classic-loopback
+    /// format instead of leaving the process-loopback one latched.
+    pub fn with_exclude_pids(mut self, pids: Vec<u32>) -> Self {
+        self.exclude_pids = pids;
+        self.native = if self.exclude_root().is_some() {
+            PROCESS_LOOPBACK_FORMAT
+        } else {
+            query_native_format(self.device_id.as_deref()).unwrap_or(FALLBACK_FORMAT)
+        };
+        self
+    }
+
+    /// The pid whose process tree the EXCLUDE loopback is opened on, if any.
+    pub fn exclude_root(&self) -> Option<u32> {
+        if self.exclude_self {
+            Some(std::process::id())
+        } else {
+            self.exclude_pids.first().copied()
         }
     }
 }
@@ -263,7 +301,7 @@ impl CaptureBackend for WasapiSystemBackend {
         self.stop_flag.store(false, Ordering::SeqCst);
 
         let stop_flag = self.stop_flag.clone();
-        let exclude_self = self.exclude_self;
+        let exclude_root = self.exclude_root();
         let device_id = self.device_id.clone();
         // setup（COM init〜Initialize〜Start 直前）の成否を同期返却するチャネル。
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
@@ -271,7 +309,7 @@ impl CaptureBackend for WasapiSystemBackend {
         let handle = thread::Builder::new()
             .name("flexaudio-wasapi-system".into())
             .spawn(move || {
-                run_system_thread(exclude_self, device_id, sink, stop_flag, ready_tx);
+                run_system_thread(exclude_root, device_id, sink, stop_flag, ready_tx);
             })
             .map_err(|e| Error::Backend(format!("spawn wasapi system thread: {e}")))?;
 
@@ -311,20 +349,21 @@ impl Drop for WasapiSystemBackend {
     }
 }
 
-/// 所有スレッド本体。COM を初期化し、`exclude_self` に応じて loopback を構成して
+/// 所有スレッド本体。COM を初期化し、`exclude_root` に応じて loopback を構成して
 /// キャプチャループを回す。setup の成否を `ready_tx` で [`WasapiSystemBackend::start`]
 /// へ報告する。COM ガード（`_com`）はこの関数のスコープに閉じ、スレッド終了時に
 /// `CoUninitialize` される（COM オブジェクトより後に drop される宣言順）。
 ///
-/// - `exclude_self == false`: `device_id` が指す render endpoint（`None` で既定）の古典
+/// - `exclude_root == None`: `device_id` が指す render endpoint（`None` で既定）の古典
 ///   loopback（[`setup_system_loopback`]）。
-/// - `exclude_self == true`: 自ホスト PID を [`ProcessMode::Exclude`] で渡す
-///   プロセスループバック（[`crate::process::setup_process_loopback`]）。`device_id` は使わない。
+/// - `exclude_root == Some(root)`: `root` の PID（そのツリー）を [`ProcessMode::Exclude`] で
+///   渡すプロセスループバック（[`crate::process::setup_process_loopback`]）。`device_id` は
+///   使わない。
 ///
 /// どちらも同一の 4-tuple `(IAudioClient, IAudioCaptureClient, HANDLE, u16)` を返すので、
 /// 以降は共通の [`capture_loop`] へ合流する。
 fn run_system_thread(
-    exclude_self: bool,
+    exclude_root: Option<u32>,
     device_id: Option<String>,
     sink: RawSink,
     stop_flag: Arc<AtomicBool>,
@@ -334,11 +373,11 @@ fn run_system_thread(
     let _com = ComThread::new();
 
     // setup を行い、Initialize 済み client / capture / event / channels を得る。
-    // exclude_self で経路を分岐するが、戻り値の型は両者で同一。
-    let setup = if exclude_self {
-        // 自ホスト PID（そのツリー）を EXCLUDE して全システム音を録る（フィードバック防止）。
+    // exclude_root の有無で経路を分岐するが、戻り値の型は両者で同一。
+    let setup = if let Some(root) = exclude_root {
+        // root の PID（そのツリー）を EXCLUDE して全システム音を録る（フィードバック防止）。
         // `process` モジュールのプロセスループバック機構をそのまま再利用する。
-        unsafe { crate::process::setup_process_loopback(std::process::id(), ProcessMode::Exclude) }
+        unsafe { crate::process::setup_process_loopback(root, ProcessMode::Exclude) }
     } else {
         // device_id が指す render endpoint（None で既定）の古典 loopback。
         unsafe { setup_system_loopback(device_id.as_deref(), &sink) }
@@ -449,6 +488,30 @@ mod tests {
     fn new_exclude_self_native_is_fixed() {
         let backend = WasapiSystemBackend::new(true, Some("ignored".into()));
         assert_eq!(backend.native_format(), (48_000, 2));
+    }
+
+    /// `with_exclude_pids` stores the pids, switches native to the process-loopback
+    /// format, and picks the exclude root (`exclude_self` wins over the first pid).
+    #[test]
+    fn exclude_pids_switches_to_process_loopback_format() {
+        let be = WasapiSystemBackend::new(false, None).with_exclude_pids(vec![4242]);
+        assert_eq!(be.exclude_pids, vec![4242]);
+        assert_eq!(be.native, PROCESS_LOOPBACK_FORMAT);
+        assert_eq!(be.exclude_root(), Some(4242));
+        let selfy = WasapiSystemBackend::new(true, None).with_exclude_pids(vec![4242]);
+        assert_eq!(selfy.exclude_root(), Some(std::process::id()));
+        assert_eq!(WasapiSystemBackend::new(false, None).exclude_root(), None);
+
+        // Idempotence: clearing the list drops back out of the exclude path.
+        // `native` is recomputed by `query_native_format`, which needs COM and a
+        // render endpoint, so its exact value is environment-dependent here —
+        // only the root (pure) is asserted; the format restoration is covered by
+        // the same code path as `new`.
+        let cleared = WasapiSystemBackend::new(false, None)
+            .with_exclude_pids(vec![4242])
+            .with_exclude_pids(vec![]);
+        assert_eq!(cleared.exclude_root(), None);
+        assert!(cleared.exclude_pids.is_empty());
     }
 
     /// `list_output_devices` が panic しないこと。返ったエントリは loopback 扱い。

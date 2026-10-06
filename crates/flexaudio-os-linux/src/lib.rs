@@ -109,11 +109,21 @@ pub struct PwSystemBackend {
     /// `std::process::id()` として自分以外の全アプリ出力（`Stream/Output/Audio`）を
     /// fan-in リンクして録る。sink monitor は混合済みで自分だけ引けないので、これが
     /// 自分を除く唯一の手段。`false` なら sink の monitor をそのまま録る。
+    /// Since `exclude_pids` was added, `false` still selects the fan-in path when
+    /// `exclude_pids` is non-empty.
     exclude_self: bool,
+    /// Extra pids excluded from the system capture alongside `exclude_self`
+    /// (see `StreamConfig::exclude_pids`). A non-empty exclusion set — from
+    /// either source — selects the fan-in path.
+    exclude_pids: Vec<u32>,
     /// 録る sink を `node.name` で選ぶ。`None` なら既定 sink の monitor。`Some(id)` なら
     /// その sink の monitor を target.object で指定して録る（[`list_devices`] が返す
     /// `DeviceInfo.id` がこの `node.name`）。`exclude_self == true` の fan-in 経路では
     /// 効かない（特定 sink を狙う経路ではないので無視する）。
+    /// Since `exclude_pids` was added, the fan-in path is taken whenever the
+    /// effective exclusion set (`exclude_pids ∪ {self if exclude_self}`) is
+    /// non-empty, and `device_id` is ignored on that path — not only when
+    /// `exclude_self == true`.
     device_id: Option<String>,
     /// 起動中フラグ（二重 start ガード／drop 判定用）。`Send`。
     running: Arc<AtomicBool>,
@@ -137,11 +147,16 @@ impl PwSystemBackend {
     ///
     /// `device_id` で録る sink を `node.name` で選ぶ。`None` なら既定 sink。
     /// `exclude_self == true` のときは無視する（fan-in は特定 sink を狙わない）。
+    /// Since `exclude_pids` was added, the fan-in path is taken whenever the
+    /// effective exclusion set (`exclude_pids ∪ {self if exclude_self}`,
+    /// see [`with_exclude_pids`](Self::with_exclude_pids)) is non-empty, and
+    /// `device_id` is ignored on that path — not only when `exclude_self == true`.
     /// 実際の接続・ストリーム作成は [`start`](CaptureBackend::start) 内で専用
     /// スレッド上で行う。
     pub fn new(exclude_self: bool, device_id: Option<String>) -> Self {
         Self {
             exclude_self,
+            exclude_pids: Vec::new(),
             device_id,
             running: Arc::new(AtomicBool::new(false)),
             stop_tx: None,
@@ -152,6 +167,18 @@ impl PwSystemBackend {
     /// `exclude_self` フラグ。
     pub fn exclude_self(&self) -> bool {
         self.exclude_self
+    }
+
+    /// Exclude these pids' playback in addition to `exclude_self` (fan-in
+    /// path). Empty = no change.
+    pub fn with_exclude_pids(mut self, pids: Vec<u32>) -> Self {
+        self.exclude_pids = pids;
+        self
+    }
+
+    /// The extra excluded pids.
+    pub fn exclude_pids(&self) -> &[u32] {
+        &self.exclude_pids
     }
 }
 
@@ -176,8 +203,15 @@ impl CaptureBackend for PwSystemBackend {
         // 居なければ DeviceNotFound。enumerate_pw が Err（デーモン不在等）のときは握らず
         // 通常の setup へ進ませ、接続失敗を Backend として返させる（不在と「sink 無し」を
         // 取り違えないため）。exclude_self の fan-in 経路は特定 sink を狙わないので見ない。
+        // The fan-in path is now chosen by the whole exclusion set below, not by
+        // `exclude_self` alone.
+        // The effective exclusion set decides the path: non-empty means fan-in
+        // (link every app output except these pids), empty means sink-monitor.
+        let excluded =
+            effective_exclusion(self.exclude_self, &self.exclude_pids, std::process::id());
+        let fan_in = !excluded.is_empty();
         let device_id = self.device_id.clone();
-        if !self.exclude_self {
+        if !fan_in {
             if let Some(id) = device_id.as_deref() {
                 if let Ok(devs) = enumerate_pw() {
                     let found = devs.iter().any(|d| d.is_loopback && d.id == id);
@@ -203,10 +237,12 @@ impl CaptureBackend for PwSystemBackend {
         // そこから自プロセス分だけ引く OS プリミティブが PipeWire に無いため、自分を除く
         // にはこのアプリ出力 fan-in しかない。exclude_self == false は sink monitor のまま。
         // exclude_self のときは fan-in なので device_id は使わない。
-        let exclude_self = self.exclude_self;
+        // `exclude_pids` joins the same mechanism: the excluded PID is now the
+        // whole `excluded` set, and an empty set (neither flag nor pids) is what
+        // keeps the plain sink-monitor path.
         let handle = thread::Builder::new()
             .name(
-                if exclude_self {
+                if fan_in {
                     "flexaudio-pw-system-excl"
                 } else {
                     "flexaudio-pw-system"
@@ -214,15 +250,10 @@ impl CaptureBackend for PwSystemBackend {
                 .into(),
             )
             .spawn(move || {
-                if exclude_self {
-                    // 自分（std::process::id()）以外を録る Exclude 機構へ委ねる。
+                if fan_in {
+                    // 除外 PID 集合以外を録る Exclude 機構へ委ねる。
                     // 停止/ready チャネルと Terminate は system 経路と共通。
-                    run_pw_process_loop(
-                        PidSelect::Exclude(std::process::id()),
-                        sink,
-                        stop_rx,
-                        &ready_tx,
-                    );
+                    run_pw_process_loop(PidSelect::Exclude(excluded), sink, stop_rx, &ready_tx);
                 } else {
                     run_pw_loop(device_id, sink, stop_rx, &ready_tx);
                 }
@@ -423,7 +454,9 @@ impl CaptureBackend for PwProcessBackend {
         // - Exclude: 対象 PID 以外の全 Stream/Output/Audio ノードをリンク（fan-in）。
         let select = match self.mode {
             ProcessMode::Include => PidSelect::Include(self.target_pid),
-            ProcessMode::Exclude => PidSelect::Exclude(self.target_pid),
+            ProcessMode::Exclude => {
+                PidSelect::Exclude(std::collections::HashSet::from([self.target_pid]))
+            }
         };
 
         // ループスレッドへの停止チャネル（受信端は loop に attach する）。
@@ -599,6 +632,12 @@ struct NodeEntry {
     /// Set true by the info callback whether or not it carried `application.process.id`;
     /// read by `exclude_decidable` to gate Exclude-mode linking.
     info_seen: bool,
+    /// How many output ports the node itself declares (`NodeInfoRef::n_output_ports`),
+    /// filled from the bound node's info; `None` until that info arrives (and in
+    /// `processes.rs`, which does not read it). Port globals trickle in one at a
+    /// time, so this declared count is what tells `link_plan_is_complete` that a
+    /// stereo node's FR port is still missing rather than that the node is mono.
+    n_output_ports: Option<u32>,
 }
 
 /// 1 ポートの登録情報（registry の `ObjectType::Port` global から拾う）。
@@ -680,6 +719,38 @@ fn pair_ports(out_ports: &[(u32, String)], in_ports: &[(u32, String)]) -> Vec<(u
     pairs
 }
 
+/// Decide whether a fan-in link for one target node can be committed now.
+/// Globals arrive one port at a time on BOTH sides: the capture stream's own
+/// inputs and the target's outputs. A partial pairing latched into `linked`
+/// is never revisited, so commit only when (a) every capture input exists,
+/// (b) every target output the node declared exists, and (c) each channel the
+/// capture can take is paired — `min(out, capture)` so a 5.1 source links its
+/// front pair instead of waiting forever.
+///
+/// A declared count of `Some(0)` is treated as "not known yet", not as "this
+/// node has no outputs": a node that has published ports but declares zero of
+/// them has not finished describing itself, so committing a plan against it
+/// would latch whatever arrived first. Only `None` (no info yet) falls back to
+/// "whatever ports are visible are all of them".
+///
+/// Known bound: (b) trusts that every declared output port eventually surfaces
+/// as a registry `Port` global. If one never does — props without `node.id` or
+/// `port.direction`, or a registry permission that hides it — `out_ports_len >=
+/// n` is unsatisfiable and the node is never linked. There is no timeout and no
+/// fallback to the ports that did arrive.
+fn link_plan_is_complete(
+    expected_out: Option<u32>, // bound info's n_output_ports, if known
+    out_ports_len: usize,
+    in_ports_len: usize,
+    pairs_len: usize,
+    capture_channels: usize, // NATIVE_CHANNELS as usize
+) -> bool {
+    in_ports_len >= capture_channels
+        && out_ports_len > 0
+        && expected_out.is_none_or(|n| n > 0 && out_ports_len >= n as usize)
+        && pairs_len >= out_ports_len.min(capture_channels)
+}
+
 /// ノードの PID を解決する（PipeWire 非依存・到着順非依存）。
 ///
 /// ノード自身に PID があればそれを使い、無ければ `client.id` で所有 Client を引いて
@@ -724,41 +795,74 @@ fn exclude_decidable(entry: &NodeEntry) -> bool {
 
 /// 自前キャプチャ stream のノード名。registry で自分の入力ポートを引くための固有名で、
 /// 対象 PID を埋めて衝突を避ける。
-fn capture_node_name(target_pid: u32) -> String {
-    format!("flexaudio-capture-{target_pid}")
+/// The suffix is now [`PidSelect::node_key`], not a bare pid, because Exclude
+/// holds a whole set.
+fn capture_node_name(key: &str) -> String {
+    format!("flexaudio-capture-{key}")
 }
 
-/// プロセスキャプチャループのノード選択述語。
+/// The effective exclusion set for a system capture: the configured
+/// `exclude_pids` plus `self_pid` when `exclude_self` is set (a set, so a
+/// self pid already listed in `exclude_pids` does not appear twice).
 ///
-/// Include / Exclude / exclude_self の 3 経路を 1 本の fan-in リンク機構で扱う。内包する
-/// `u32` はいずれも比較対象の PID で、Include は一致を、Exclude は不一致（その PID を残す）
-/// をリンク条件にする。
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// An empty result means the plain sink-monitor path; a non-empty one means the
+/// fan-in path. `self_pid` is a parameter rather than `std::process::id()` so
+/// the decision is testable without depending on the running process.
+fn effective_exclusion(
+    exclude_self: bool,
+    exclude_pids: &[u32],
+    self_pid: u32,
+) -> std::collections::HashSet<u32> {
+    let mut excluded: std::collections::HashSet<u32> = exclude_pids.iter().copied().collect();
+    if exclude_self {
+        excluded.insert(self_pid);
+    }
+    excluded
+}
+
+/// Node-selection predicate for the fan-in capture loop.
+///
+/// `Include(pid)` links the one output node owned by `pid`; `Exclude(set)`
+/// links every resolved output node whose pid is NOT in `set` (used by
+/// `ProcessMode::Exclude`, `exclude_self`, and `exclude_pids`).
+#[derive(Clone, PartialEq, Eq)]
 enum PidSelect {
     /// 解決済み PID == この PID のノードだけリンクする（Include。代表 1 ノード）。
     Include(u32),
-    /// 解決済み PID != この PID の `Stream/Output/Audio` ノードをすべてリンクする
-    /// （Exclude / exclude_self）。内包 PID は録音から除外するプロセスの PID。
-    Exclude(u32),
+    /// Link every `Stream/Output/Audio` node whose resolved pid is not in this
+    /// set (Exclude / `exclude_self` / `exclude_pids`). The set holds the pids
+    /// to keep OUT of the recording.
+    Exclude(std::collections::HashSet<u32>),
 }
 
 impl PidSelect {
-    /// 比較対象 PID（Include は録る側、Exclude は除外する側）。`global_remove` で
-    /// 対象/除外 Client の消失を判定するのに使う。
-    fn pid(self) -> u32 {
+    /// Is `pid` one of the pids this predicate is *about* (the included pid, or
+    /// a member of the exclusion set)? Used to track those Clients for
+    /// `global_remove`.
+    fn is_subject_pid(&self, pid: u32) -> bool {
         match self {
-            PidSelect::Include(p) | PidSelect::Exclude(p) => p,
+            PidSelect::Include(p) => *p == pid,
+            PidSelect::Exclude(set) => set.contains(&pid),
         }
     }
 
     /// 解決済み PID がこの select の対象になるか（PipeWire 非依存）。未解決（`None`）
     /// は対象外— 資格未確認のノードをうっかりリンクしないのと対称に、うっかり
     /// リンク済みのまま残さない側の判定にも使う（info 更新後の再評価）。
-    fn selects(self, resolved: Option<u32>) -> bool {
+    fn selects(&self, resolved: Option<u32>) -> bool {
         match (self, resolved) {
-            (PidSelect::Include(pid), Some(other)) => other == pid,
-            (PidSelect::Exclude(pid), Some(other)) => other != pid,
+            (PidSelect::Include(p), Some(r)) => *p == r,
+            (PidSelect::Exclude(set), Some(r)) => !set.contains(&r),
             (_, None) => false,
+        }
+    }
+
+    /// Suffix for this capture stream's `node.name` (registry-visible, unique
+    /// enough to avoid colliding with another concurrent capture).
+    fn node_key(&self) -> String {
+        match self {
+            PidSelect::Include(p) => p.to_string(),
+            PidSelect::Exclude(set) => format!("excl-{}", set.iter().min().copied().unwrap_or(0)),
         }
     }
 }
@@ -823,7 +927,8 @@ fn setup_pw_process(
     // - node.name=flexaudio-capture-<pid>: registry で自分の入力ポートを引くための固有名
     // STREAM_CAPTURE_SINK も AUTOCONNECT も付けない（マイクへの自動リンクを防ぎ、明示
     // link-factory リンクだけにする）。node.name に select の比較 PID を埋めて衝突を避ける。
-    let node_name = capture_node_name(select.pid());
+    // Include embeds the pid; Exclude embeds `excl-<smallest excluded pid>`.
+    let node_name = capture_node_name(&select.node_key());
     let props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Capture",
@@ -872,9 +977,12 @@ fn setup_pw_process(
     let nodes: Rc<RefCell<HashMap<u32, NodeEntry>>> = Rc::new(RefCell::new(HashMap::new()));
     // Client 表: Client の registry global id → その Client の pipewire.sec.pid。
     let client_pid: Rc<RefCell<HashMap<u32, u32>>> = Rc::new(RefCell::new(HashMap::new()));
-    // 比較対象 PID（Include は録る PID / Exclude は除外する PID）の Client の registry
-    // global id（判明時 Some）。global_remove で対象/除外 Client の消失を判定するのに使う。
-    let target_client_id: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
+    // Registry global ids of the Clients owned by this predicate's subject pids
+    // (the included pid, or any member of the exclusion set). `global_remove`
+    // uses it to notice such a Client disappearing. A set, because Exclude can
+    // be about several pids at once.
+    let target_client_ids: Rc<RefCell<std::collections::HashSet<u32>>> =
+        Rc::new(RefCell::new(std::collections::HashSet::new()));
     // ポート表: registry port global id → 登録情報（所有 node.id / direction / channel）。
     let ports: Rc<RefCell<HashMap<u32, PortEntry>>> = Rc::new(RefCell::new(HashMap::new()));
     // 現在リンク中の出力ノード表: 出力ノードの registry global id → そのノード向けに生成した
@@ -892,16 +1000,16 @@ fn setup_pw_process(
     // `select` の述語で対象ノード集合を決める:
     // - Include(pid): 解決済み PID == pid のノード（代表 1 ノードのみ。`linked` が既に
     //   非空なら何もしない＝単一ノードのまま）。
-    // - Exclude(pid): 解決済み PID != pid の `Stream/Output/Audio` ノードをすべて。PID 未解決
-    //   （None）のノードはまだリンクしない（Client 到着で PID が解けるまで待ち、除外
-    //   プロセスを取り違えない）。
+    // - Exclude(set): 解決済み PID が set に無い `Stream/Output/Audio` ノードをすべて。
+    //   PID 未解決（None）のノードはまだリンクしない（Client 到着で PID が解けるまで待ち、
+    //   除外プロセスを取り違えない）。
     // 既に `linked` のキーになっているノードは二重リンクしない。
     // ループスレッド上で呼ばれる（`!Send` な core/stream を触ってよい）。
     #[allow(clippy::too_many_arguments)]
     fn try_link(
         core: &pw::core::CoreRc,
         stream: &pw::stream::StreamRc,
-        select: PidSelect,
+        select: &PidSelect,
         self_node_id: &Cell<Option<u32>>,
         nodes: &RefCell<HashMap<u32, NodeEntry>>,
         client_pid: &RefCell<HashMap<u32, u32>>,
@@ -909,10 +1017,8 @@ fn setup_pw_process(
         linked: &RefCell<HashMap<u32, Vec<pw::link::Link>>>,
     ) {
         // Include は代表 1 ノードのみ。既にリンク済みなら何もしない。
-        if let PidSelect::Include(_) = select {
-            if !linked.borrow().is_empty() {
-                return;
-            }
+        if matches!(select, PidSelect::Include(_)) && !linked.borrow().is_empty() {
+            return;
         }
 
         // 自ノード id を stream から読み直す（connect 直後は未確定のことがある）。
@@ -927,44 +1033,35 @@ fn setup_pw_process(
 
         // リンクすべき出力ノード id 集合を述語で決める。
         // - Include: 解決済み PID == pid のノードを 1 件だけ。
-        // - Exclude: 解決済み PID（!= pid）のノードを全件（PID 未解決は除く）。
+        // - Exclude: 解決済み PID が除外 set に無いノードを全件（PID 未解決は除く）。
         let targets: Vec<u32> = {
             let nodes = nodes.borrow();
             let client_pid = client_pid.borrow();
             let linked = linked.borrow();
-            match select {
-                PidSelect::Include(pid) => nodes
-                    .iter()
-                    .find(|(id, entry)| {
-                        !linked.contains_key(id)
-                            && resolve_node_pid(entry, &client_pid) == Some(pid)
-                    })
-                    .map(|(&node_id, _)| node_id)
-                    .into_iter()
-                    .collect(),
-                PidSelect::Exclude(pid) => nodes
-                    .iter()
-                    .filter(|(id, entry)| {
-                        if linked.contains_key(id) {
-                            return false;
-                        }
-                        // info_seen が立つまでは判定不能として保留する（
-                        // exclude_decidable）。bind した info が一度も届いていない
-                        // ノードは client table 経由の暫定 PID（pipewire-pulse の pid
-                        // になりがち）しか持たず、除外対象プロセスを取り違えてリンク
-                        // しかねない。bind 自体に失敗したノードは info が永遠に届かず、
-                        // Exclude では永久にリンクされない — 除外対象を取り違えて
-                        // 録るより安全側。
-                        if !exclude_decidable(entry) {
-                            return false;
-                        }
-                        // 解決済みかつ除外 PID 以外のときだけ対象にする。未解決（None）は
-                        // Client 到着まで保留（除外プロセスを取り違えない）。
-                        matches!(resolve_node_pid(entry, &client_pid), Some(other) if other != pid)
-                    })
-                    .map(|(&node_id, _)| node_id)
-                    .collect(),
+            let mut ids: Vec<u32> = nodes
+                .iter()
+                .filter(|(id, entry)| {
+                    if linked.contains_key(id) {
+                        return false;
+                    }
+                    // info_seen が立つまでは判定不能として保留する（
+                    // exclude_decidable）。bind した info が一度も届いていない
+                    // ノードは client table 経由の暫定 PID（pipewire-pulse の pid
+                    // になりがち）しか持たず、除外対象プロセスを取り違えてリンク
+                    // しかねない。bind 自体に失敗したノードは info が永遠に届かず、
+                    // Exclude では永久にリンクされない — 除外対象を取り違えて
+                    // 録るより安全側。
+                    if matches!(select, PidSelect::Exclude(_)) && !exclude_decidable(entry) {
+                        return false;
+                    }
+                    select.selects(resolve_node_pid(entry, &client_pid))
+                })
+                .map(|(&id, _)| id)
+                .collect();
+            if matches!(select, PidSelect::Include(_)) {
+                ids.truncate(1); // Include links one representative node
             }
+            ids
         };
 
         if targets.is_empty() {
@@ -1002,7 +1099,29 @@ fn setup_pw_process(
 
             // チャンネル対応（FL→FL/FR→FR、モノは複製、取れなければ順序）でペアを作る。
             let pairs = pair_ports(&out_ports, &in_ports);
-            if pairs.is_empty() {
+            // The node's own declared output-port count, if its bound info has
+            // arrived. Borrow of `nodes` ends with this block — nothing below is
+            // allowed to hold it across `create_object`.
+            let expected_out: Option<u32> = nodes
+                .borrow()
+                .get(&target_node_id)
+                .and_then(|entry| entry.n_output_ports);
+            // Commit only a complete plan. Port globals arrive one at a time on
+            // BOTH sides, and a partial pairing inserted into `linked` below is
+            // fossilised, because a linked node is never re-paired: half-arrived
+            // capture inputs link FL alone, and a half-arrived target (one output
+            // port of a declared stereo node) makes `pair_ports`' mono rule
+            // duplicate FL onto both inputs. Leaving the node OUT of `linked`
+            // here is deliberate: the next port global re-evaluates it, and by
+            // then the missing port exists. (Subsumes the old is-empty check: a
+            // complete plan has at least one pair.)
+            if !link_plan_is_complete(
+                expected_out,
+                out_ports.len(),
+                in_ports.len(),
+                pairs.len(),
+                NATIVE_CHANNELS as usize,
+            ) {
                 continue;
             }
             let want = pairs.len();
@@ -1044,12 +1163,16 @@ fn setup_pw_process(
     // registry global / global_remove リスナ。
     // global: Client→client_pid 表 / Stream/Output/Audio ノード→nodes 表 /
     // Port→ports 表 に登録し、毎回 try_link でリンクを再評価する。
+    // `PidSelect` is no longer `Copy` (Exclude owns a HashSet), so every closure
+    // that used to capture it by copy gets its own clone.
+    let select_for_global = select.clone();
+    let select_for_remove = select.clone();
     let core_for_global = core.clone();
     let stream_for_global = stream.clone();
     let self_node_for_global = self_node_id.clone();
     let nodes_for_global = nodes.clone();
     let client_pid_for_global = client_pid.clone();
-    let target_client_for_global = target_client_id.clone();
+    let target_client_for_global = target_client_ids.clone();
     let ports_for_global = ports.clone();
     let linked_for_global = linked.clone();
     let registry_for_global = registry.clone();
@@ -1060,7 +1183,7 @@ fn setup_pw_process(
     let self_node_for_remove = self_node_id.clone();
     let nodes_for_remove = nodes.clone();
     let client_pid_for_remove = client_pid.clone();
-    let target_client_for_remove = target_client_id.clone();
+    let target_client_for_remove = target_client_ids.clone();
     let ports_for_remove = ports.clone();
     let linked_for_remove = linked.clone();
     let bound_for_remove = bound_nodes.clone();
@@ -1086,8 +1209,8 @@ fn setup_pw_process(
                         };
                         client_pid_for_global.borrow_mut().insert(global.id, pid);
                         // 比較対象 PID の Client を控える（global_remove で消失検知に使う）。
-                        if pid == select.pid() {
-                            target_client_for_global.set(Some(global.id));
+                        if select_for_global.is_subject_pid(pid) {
+                            target_client_for_global.borrow_mut().insert(global.id);
                         }
                     }
                     pw::types::ObjectType::Node => {
@@ -1111,6 +1234,8 @@ fn setup_pw_process(
                                 owning_client_id,
                                 app_pid,
                                 info_seen: false,
+                                // Only the bound info carries the declared port count.
+                                n_output_ports: None,
                             },
                         );
 
@@ -1130,7 +1255,7 @@ fn setup_pw_process(
                             let self_node_for_info = self_node_for_global.clone();
                             let core_for_info = core_for_global.clone();
                             let stream_for_info = stream_for_global.clone();
-                            let select_for_info = select; // `select` is Copy
+                            let select_for_info = select.clone(); // `select` is no longer Copy
                             let listener = node
                                 .add_listener_local()
                                 .info(move |info| {
@@ -1142,12 +1267,21 @@ fn setup_pw_process(
                                             )
                                         });
 
+                                        // The node's own declared output-port count. Port
+                                        // globals arrive one at a time, so this is what
+                                        // distinguishes "stereo, FR not here yet" from
+                                        // "mono" in link_plan_is_complete.
+                                        let n_out = info.n_output_ports();
+
                                         // 判定材料が変わったか: info_seen が初めて立つ
                                         // （これまで判定不能だったノードが判定可能になる）
                                         // か、app_pid が新しい値に更新されるか。どちらも
                                         // try_link の対象集合を変え得るので、その場合だけ
                                         // 以降の unlink 判定 / try_link を行う。
-                                        let updated_entry: Option<NodeEntry> = {
+                                        // A change of the declared output-port count counts
+                                        // too: it changes what link_plan_is_complete will
+                                        // accept for this node, so it must re-run try_link.
+                                        let updated_entry: Option<(NodeEntry, bool)> = {
                                             let mut nodes = nodes_for_info.borrow_mut();
                                             let Some(entry) = nodes.get_mut(&node_id) else {
                                                 return;
@@ -1158,9 +1292,14 @@ fn setup_pw_process(
                                             if pid_changed {
                                                 entry.app_pid = pid;
                                             }
-                                            (newly_decidable || pid_changed).then_some(*entry)
+                                            let n_out_changed = entry.n_output_ports != Some(n_out);
+                                            if n_out_changed {
+                                                entry.n_output_ports = Some(n_out);
+                                            }
+                                            (newly_decidable || pid_changed || n_out_changed)
+                                                .then_some((*entry, n_out_changed))
                                         };
-                                        let Some(entry) = updated_entry else {
+                                        let Some((entry, n_out_changed)) = updated_entry else {
                                             return;
                                         };
 
@@ -1172,8 +1311,18 @@ fn setup_pw_process(
                                             let client_pid = client_pid_for_info.borrow();
                                             resolve_node_pid(&entry, &client_pid)
                                         };
-                                        if linked_for_info.borrow().contains_key(&node_id)
-                                            && !select_for_info.selects(resolved)
+                                        // A declared output-port count that changed after we
+                                        // already committed a plan means the plan we latched
+                                        // was built against the old count and may be
+                                        // incomplete (e.g. the node declared 1 port when we
+                                        // linked and now declares 2). `try_link` only adds,
+                                        // so drop the existing links here and let it rebuild
+                                        // the plan against the new count; a plan that became
+                                        // incomplete must be revisited.
+                                        let already_linked =
+                                            linked_for_info.borrow().contains_key(&node_id);
+                                        if already_linked
+                                            && (!select_for_info.selects(resolved) || n_out_changed)
                                         {
                                             linked_for_info.borrow_mut().remove(&node_id);
                                         }
@@ -1183,7 +1332,7 @@ fn setup_pw_process(
                                         try_link(
                                             &core_for_info,
                                             &stream_for_info,
-                                            select_for_info,
+                                            &select_for_info,
                                             &self_node_for_info,
                                             &nodes_for_info,
                                             &client_pid_for_info,
@@ -1234,7 +1383,7 @@ fn setup_pw_process(
                 try_link(
                     &core_for_global,
                     &stream_for_global,
-                    select,
+                    &select_for_global,
                     &self_node_for_global,
                     &nodes_for_global,
                     &client_pid_for_global,
@@ -1251,9 +1400,10 @@ fn setup_pw_process(
                 // linked を変更し try_link を呼ぶ。
                 let mut relink_needed = false;
 
-                // 消えた id がリンク中ノード/対象・除外 Client/自ノードのどれか。
+                // 消えた id がリンク中ノード/対象・除外 Client/自ノードのどれか（対象・除外
+                // Client は set 参照）。
                 let was_linked_node = linked_for_remove.borrow().contains_key(&id);
-                let was_target_client = target_client_for_remove.get() == Some(id);
+                let was_target_client = target_client_for_remove.borrow().contains(&id);
                 // 自ノード（自前キャプチャ stream のノード）自体が消えたか。
                 let was_self_node = self_node_for_remove.get() == Some(id);
 
@@ -1288,9 +1438,19 @@ fn setup_pw_process(
                 // 委ねる。
                 // - 自ノード/自入力ポート: 入力側が消えたので全リンクが無効。
                 // - 対象/除外 Client: Include ならその PID の全ノードが消える（録る対象消滅）。
-                //   Exclude でも一括解除→再リンクで結果は正しい（除外 Client のノードはこの後
-                //   nodes 表から消えるので再リンクされず、残す側だけ張り直される）。
-                if was_self_node || was_self_in_port || was_target_client {
+                //   (Japanese above: the Exclude case used to be cleared here too, on the
+                //   grounds that clear-all then relink also ends up correct.) That applies
+                //   to Include only. In Exclude mode a tracked client id is an EXCLUDED
+                //   client, whose nodes are never in `linked` — so clearing every link on
+                //   its departure drops audio we were legitimately recording and costs an
+                //   audible gap while the links are rebuilt, which an Electron host pays
+                //   every time one of its libpulse helper clients closes. Nothing needs
+                //   clearing: the excluded client's own nodes get their own `global_remove`,
+                //   which handles any staleness.
+                if was_self_node
+                    || was_self_in_port
+                    || (was_target_client && matches!(select_for_remove, PidSelect::Include(_)))
+                {
                     // 保持中の Link を全部 drop（= リンク解除）して未リンクに戻す。
                     linked_for_remove.borrow_mut().clear();
                     relink_needed = true;
@@ -1307,7 +1467,7 @@ fn setup_pw_process(
                 }
 
                 if was_target_client {
-                    target_client_for_remove.set(None);
+                    target_client_for_remove.borrow_mut().remove(&id);
                 }
                 if was_self_node {
                     // 自ノードが消えたら id キャッシュをクリア。try_link が stream から
@@ -1326,7 +1486,7 @@ fn setup_pw_process(
                     try_link(
                         &core_for_remove,
                         &stream_for_remove,
-                        select,
+                        &select_for_remove,
                         &self_node_for_remove,
                         &nodes_for_remove,
                         &client_pid_for_remove,
@@ -2715,6 +2875,7 @@ mod tests {
             owning_client_id: Some(60),
             app_pid: None,
             info_seen: false,
+            n_output_ports: None,
         };
 
         // --- Node が先に来て Client がまだ表に無い状態 → 未解決（None）。
@@ -2738,6 +2899,7 @@ mod tests {
             owning_client_id: None,
             app_pid: None,
             info_seen: false,
+            n_output_ports: None,
         };
         assert_eq!(resolve_node_pid(&orphan, &client_pid), None);
 
@@ -2747,6 +2909,7 @@ mod tests {
             owning_client_id: Some(99), // 表に無い client.id でも
             app_pid: Some(424242),
             info_seen: true,
+            n_output_ports: None,
         };
         let empty: HashMap<u32, u32> = HashMap::new();
         assert_eq!(
@@ -2760,6 +2923,7 @@ mod tests {
             owning_client_id: Some(61),
             app_pid: None,
             info_seen: false,
+            n_output_ports: None,
         };
         // client 61 は未登録なので None、登録すればその PID。
         assert_eq!(resolve_node_pid(&other_node, &client_pid), None);
@@ -2800,6 +2964,7 @@ mod tests {
                     owning_client_id: None,
                     app_pid: None,
                     info_seen: false,
+                    n_output_ports: None,
                 },
                 false,
                 "info 未到達・PID 未解決 → 判定不能",
@@ -2809,6 +2974,7 @@ mod tests {
                     owning_client_id: Some(60),
                     app_pid: None,
                     info_seen: false,
+                    n_output_ports: None,
                 },
                 false,
                 "client.id 経由の暫定解決が Some でも、info 未到達なら判定不能\
@@ -2819,6 +2985,7 @@ mod tests {
                     owning_client_id: None,
                     app_pid: Some(28551),
                     info_seen: true,
+                    n_output_ports: None,
                 },
                 true,
                 "info 到達・PID 解決済み → 判定可能",
@@ -2828,6 +2995,7 @@ mod tests {
                     owning_client_id: Some(60),
                     app_pid: None,
                     info_seen: true,
+                    n_output_ports: None,
                 },
                 true,
                 "info は届いたが application.process.id 自体は無かった場合も、\
@@ -2837,6 +3005,73 @@ mod tests {
         for (entry, want, msg) in cases {
             assert_eq!(exclude_decidable(entry), *want, "{msg}");
         }
+    }
+
+    /// `PidSelect::Exclude` holds a SET of pids (`exclude_self` ∪ `exclude_pids`),
+    /// and the predicate trio (`is_subject_pid` / `selects` / `node_key`) is
+    /// PipeWire-independent.
+    #[test]
+    fn pid_select_exclude_takes_a_set() {
+        use std::collections::HashSet;
+        let sel = PidSelect::Exclude(HashSet::from([10, 20]));
+        assert!(sel.is_subject_pid(10) && sel.is_subject_pid(20) && !sel.is_subject_pid(30));
+        // Exclude links every RESOLVED pid outside the set; unresolved waits.
+        assert!(sel.selects(Some(30)));
+        assert!(!sel.selects(Some(20)));
+        assert!(!sel.selects(None));
+        let inc = PidSelect::Include(7);
+        assert!(inc.selects(Some(7)) && !inc.selects(Some(8)) && !inc.selects(None));
+        assert_eq!(inc.node_key(), "7");
+        assert_eq!(sel.node_key(), "excl-10");
+    }
+
+    /// `effective_exclusion` is table-driven and independent of the running
+    /// process: `exclude_pids` ∪ `{self_pid}` when `exclude_self`, deduped.
+    #[test]
+    fn effective_exclusion_unions_and_dedups() {
+        use std::collections::HashSet;
+        let self_pid = 4242u32;
+        let cases: &[(bool, &[u32], HashSet<u32>, &str)] = &[
+            (
+                false,
+                &[],
+                HashSet::new(),
+                "neither flag nor pids → sink-monitor path",
+            ),
+            (
+                true,
+                &[],
+                HashSet::from([self_pid]),
+                "exclude_self alone → just self",
+            ),
+            (
+                false,
+                &[5, 6],
+                HashSet::from([5, 6]),
+                "pids alone → fan-in without self",
+            ),
+            (
+                true,
+                &[5, 4242],
+                HashSet::from([5, self_pid]),
+                "self pid already listed → union, no duplicate",
+            ),
+        ];
+        for (excl_self, pids, want, msg) in cases {
+            assert_eq!(
+                effective_exclusion(*excl_self, pids, self_pid),
+                *want,
+                "{msg}"
+            );
+        }
+    }
+
+    /// `with_exclude_pids` records the extra pids without disturbing `exclude_self`.
+    #[test]
+    fn system_backend_exclude_pids_builder() {
+        let be = PwSystemBackend::new(false, None).with_exclude_pids(vec![5, 6]);
+        assert_eq!(be.exclude_pids(), &[5, 6]);
+        assert!(!be.exclude_self());
     }
 
     /// `pair_ports` のチャンネル対応付けを検証する（PipeWire 非依存）。
@@ -2883,6 +3118,103 @@ mod tests {
         // 出力 1 ポートなのでモノ複製規則が走り、残り入力へ複製される。
         let pairs = pair_ports(&out_fl, &in_fr);
         assert_eq!(pairs, vec![(70, 80)], "出力1ポートは残り入力へ複製");
+    }
+
+    /// Both sides of the fan-in race, as a table:
+    /// (expected_out, out_ports_len, in_ports_len, pairs_len, capture_channels).
+    #[test]
+    fn link_plan_is_complete_requires_every_channel_on_both_sides() {
+        struct Case {
+            expected_out: Option<u32>,
+            out_len: usize,
+            in_len: usize,
+            pairs_len: usize,
+            chans: usize,
+            want: bool,
+            why: &'static str,
+        }
+        let case = |expected_out, out_len, in_len, pairs_len, chans, want, why| Case {
+            expected_out,
+            out_len,
+            in_len,
+            pairs_len,
+            chans,
+            want,
+            why,
+        };
+        let cases = [
+            case(
+                Some(2),
+                2,
+                1,
+                1,
+                2,
+                false,
+                "capture input FR has not arrived yet",
+            ),
+            case(Some(2), 2, 2, 2, 2, true, "stereo source fully paired"),
+            case(
+                Some(2),
+                1,
+                2,
+                2,
+                2,
+                false,
+                "target output FR missing — pair_ports' mono rule duplicated FL onto both \
+                 inputs, which must not latch",
+            ),
+            case(
+                Some(1),
+                1,
+                2,
+                2,
+                2,
+                true,
+                "genuine mono source duplicated onto FL+FR",
+            ),
+            case(
+                Some(6),
+                6,
+                2,
+                2,
+                2,
+                true,
+                "5.1 source links its front pair instead of waiting forever",
+            ),
+            case(
+                None,
+                2,
+                2,
+                2,
+                2,
+                true,
+                "declared count unknown — current ports fully paired",
+            ),
+            case(None, 0, 2, 0, 2, false, "nothing to link"),
+            case(
+                Some(0),
+                1,
+                2,
+                2,
+                2,
+                false,
+                "a declared count of 0 alongside a visible port means the node has not \
+                 finished describing itself — not known yet, so incomplete",
+            ),
+        ];
+        for c in cases {
+            assert_eq!(
+                link_plan_is_complete(c.expected_out, c.out_len, c.in_len, c.pairs_len, c.chans),
+                c.want,
+                "{} ({:?}, {}, {}, {}, {})",
+                c.why,
+                c.expected_out,
+                c.out_len,
+                c.in_len,
+                c.pairs_len,
+                c.chans
+            );
+        }
     }
 
     /// スモークテスト: プロセスキャプチャの `start` は PipeWire 不在/registry 取得
