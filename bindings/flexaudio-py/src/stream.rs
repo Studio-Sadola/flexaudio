@@ -11,7 +11,7 @@ use ::flexaudio as fa;
 use flexaudio_denoise::Denoiser as CoreDenoiser;
 use flexaudio_vad::Vad as CoreVad;
 
-use crate::config::{build_config, vad_config_from_dict, validate_denoise};
+use crate::config::{build_config, parse_exclude_pids, vad_config_from_dict, validate_denoise};
 use crate::marshal::{chunk_to_py, event_to_py, PyAudioChunk, PyStreamEvent};
 use crate::{denoise_err_to_py, to_py_err, vad_err_to_py};
 
@@ -157,6 +157,10 @@ impl Stream {
     /// `mic_device_id`/`system_device_id`/`mic_gain`/`system_gain` are for mix only and ignored for
     /// other sources.
     ///
+    /// `exclude_pids` accepts a sequence of integer PIDs in 1..=4294967295 (max 4096);
+    /// values are validated even for mic/process sources before accessing any device.
+    /// Applies to system capture and the system side of mix, alongside `exclude_self`.
+    ///
     /// Specify `vad` / `denoise` again to configure integrated addons. A source change makes audio
     /// discontinuous, so rebuild addons as requested (reset their internal state). If omitted, defaults
     /// (`vad=None` / `denoise=False`) disable addons, as with open; specify them on each switch.
@@ -167,6 +171,7 @@ impl Stream {
         process_id = None,
         mode = "include".to_string(),
         exclude_self = false,
+        exclude_pids = None,
         output_rate = 48_000,
         output_channels = 2,
         chunk_ms = 20,
@@ -186,6 +191,7 @@ impl Stream {
         process_id: Option<u32>,
         mode: String,
         exclude_self: bool,
+        exclude_pids: Option<Bound<'_, PyAny>>,
         output_rate: u32,
         output_channels: u16,
         chunk_ms: u32,
@@ -197,6 +203,8 @@ impl Stream {
         vad: Option<Bound<'_, PyDict>>,
         denoise: bool,
     ) -> PyResult<()> {
+        let exclude_pids = parse_exclude_pids(exclude_pids.as_ref())?;
+
         // Addons depend on output format. Since a switch cannot change it, validate and build using
         // output_rate/output_channels from open (the output_rate argument is used by core's
         // switch_source to check that formats match).
@@ -213,6 +221,7 @@ impl Stream {
             process_id,
             &mode,
             exclude_self,
+            exclude_pids,
             output_rate,
             output_channels,
             chunk_ms,
@@ -254,6 +263,10 @@ impl Stream {
 /// `mic_device_id`/`system_device_id`/`mic_gain`/`system_gain` are for mix only: they select the mic
 /// and system devices and set pre-mix gain (ignored for other sources; global `gain` is applied after mixing).
 ///
+/// `exclude_pids` accepts a sequence of integer PIDs in 1..=4294967295 (max 4096);
+/// values are validated even for mic/process sources before accessing any device.
+/// Applies to system capture and the system side of mix, alongside `exclude_self`.
+///
 /// Integrated addons:
 /// - `vad` (dict, default None): specifying it enables integrated VAD. Keys match the standalone
 ///   `Vad` arguments (`threshold` / `min_speech_ms` / `min_silence_ms` / `speech_pad_ms` /
@@ -270,6 +283,7 @@ impl Stream {
     process_id = None,
     mode = "include".to_string(),
     exclude_self = false,
+    exclude_pids = None,
     output_rate = 48_000,
     output_channels = 2,
     chunk_ms = 20,
@@ -288,6 +302,7 @@ pub fn open(
     process_id: Option<u32>,
     mode: String,
     exclude_self: bool,
+    exclude_pids: Option<Bound<'_, PyAny>>,
     output_rate: u32,
     output_channels: u16,
     chunk_ms: u32,
@@ -299,6 +314,8 @@ pub fn open(
     vad: Option<Bound<'_, PyDict>>,
     denoise: bool,
 ) -> PyResult<Stream> {
+    let exclude_pids = parse_exclude_pids(exclude_pids.as_ref())?;
+
     // Validate and build addons first. Reject denoise unless the output rate is 48 kHz, and reject
     // invalid VAD settings, before acquiring a device.
     let (vad_state, denoiser) =
@@ -310,6 +327,7 @@ pub fn open(
         process_id,
         &mode,
         exclude_self,
+        exclude_pids,
         output_rate,
         output_channels,
         chunk_ms,
@@ -328,4 +346,70 @@ pub fn open(
         output_rate,
         output_channels,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::ffi::c_str;
+
+    #[test]
+    fn switch_exclusion_validation_needs_no_hardware() {
+        Python::initialize();
+        Python::attach(|py| {
+            let inner = fa::Stream::open(
+                fa::StreamConfig::default(),
+                Box::new(fa::MockBackend::new(48_000, 2, 0.0)),
+            )
+            .expect("open mock stream");
+            let stream = Py::new(
+                py,
+                Stream {
+                    inner,
+                    denoiser: None,
+                    vad: None,
+                    output_rate: 48_000,
+                    output_channels: 2,
+                },
+            )
+            .expect("create Python stream");
+            let locals = PyDict::new(py);
+            locals.set_item("stream", stream).expect("set fixture");
+            py.run(
+                c_str!(
+                    r#"
+for kind in ("mic", "system", "process", "mix"):
+    for value, error_type, message in (
+        ([True], TypeError, "exclude_pids[0]"),
+        ([1.5], TypeError, "exclude_pids[0]"),
+        (["1"], TypeError, "exclude_pids[0]"),
+        ([1, 2, 3, 0], ValueError, "exclude_pids[3]"),
+        ([-1], ValueError, "exclude_pids[0]"),
+        ([4294967296], ValueError, "exclude_pids[0]"),
+        ([2 ** 256], ValueError, "exclude_pids[0]"),
+        ([10 ** 5000], ValueError, "exclude_pids[0]"),
+        ("123", TypeError, "exclude_pids must be a sequence"),
+        (b"123", TypeError, "exclude_pids must be a sequence"),
+        ({1: 2}, TypeError, "exclude_pids must be a sequence"),
+        ({1}, TypeError, "exclude_pids must be a sequence"),
+        ((pid for pid in [1]), TypeError, "exclude_pids must be a sequence"),
+        ([False] * 4097, ValueError, "exclude_pids: too many entries (max 4096)"),
+    ):
+        try:
+            # Invalid addon settings ensure exclusion validation happens first.
+            stream.switch_source(kind, exclude_pids=value, denoise=True,
+                                 vad={"threshold": "invalid"})
+        except error_type as error:
+            assert message in str(error), str(error)
+        else:
+            raise AssertionError("invalid exclusion was accepted")
+stream.stop()
+"#
+                ),
+                None,
+                Some(&locals),
+            )
+            .expect("switch validation errors");
+        });
+    }
 }

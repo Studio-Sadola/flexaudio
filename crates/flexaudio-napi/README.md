@@ -2,15 +2,16 @@
 
 Native **N-API** bindings that let Node.js / TypeScript / Electron capture audio
 through the [flexaudio](https://github.com/Studio-Sadola/flexaudio) Rust library:
-microphone, system output (loopback), and per-process capture on **Linux**,
+microphone, system output (loopback), per-process capture, and mic + system mix on **Linux**,
 **Windows**, and **macOS**.
 
 Three offline audio add-ons are compiled into the same binary and exposed to
 JavaScript: **voice activity detection** (Silero VAD on pure-Rust tract),
-**noise suppression** (RNNoise), and streaming **FLAC** encoding. They run fully
+**noise suppression** (RNNoise via nnnoiseless), and streaming **FLAC** encoding. They run fully
 offline — no model files to ship, no network at runtime.
 
-> This is the **npm** package for flexaudio (the Rust crate `flexaudio-napi`).
+> This package is distributed through npm; first publication pending.
+> It is the **npm** package for flexaudio (the Rust crate `flexaudio-napi`).
 > It is **not** published to crates.io; consume the core library from Rust via
 > the `flexaudio` crate instead.
 
@@ -20,7 +21,7 @@ offline — no model files to ship, no network at runtime.
 npm install @studio-sadola/flexaudio
 ```
 
-The correct prebuilt native binary for your platform is pulled in automatically
+After the first publication, the correct prebuilt native binary for your platform is pulled in automatically
 via the platform-specific `optionalDependencies` (`@studio-sadola/flexaudio-<triple>`).
 
 ## Usage
@@ -47,13 +48,33 @@ await stream.stop();
 ```
 
 `stream.switchSource(options)` hot-swaps the input source without stopping.
-`watchDevices(cb)` reports hotplug (added / removed / defaultChanged) events.
+`watchDevices(cb)` reports hotplug (added / removed / defaultChanged) events
+on Linux via PipeWire. On Windows/macOS, it uses a no-op watcher and emits no
+device-change events.
+
+## Microphone + system mix
+
+Use `kind: 'mix'` to combine microphone and system audio in one stream.
+`micDeviceId` and `systemDeviceId` select IDs from `devices()`; omitting them
+uses the default input/output. `deviceId` is ignored for mix. `micGain` and
+`systemGain` are linear pre-mix multipliers (default `1.0`); `gain` applies
+ommediately after mixing.
+
+```js
+const stream = openStream(
+  { kind: 'mix', micGain: 1.0, systemGain: 0.5 },
+  onChunk,
+);
+// later:
+await stream.stop();
+```
 
 ## Picking a process to capture
 
-`processes()` lists the processes that have an audio output session/stream and
-can be captured per process. Idle/stopped processes are included; whether
-something is playing now is `isOutputActive`. Pass `pid` as `processId`:
+`processes()` lists audio output session/stream owners on Linux/Windows. On
+macOS, it lists all processes known to Core Audio, including input-only
+processes. Idle/stopped processes are included; use `isOutputActive` to check
+current playback. Pass `pid` as `processId` for per-process capture:
 
 ```js
 const { processes, openStream } = require('@studio-sadola/flexaudio');
@@ -81,7 +102,9 @@ Server 2022).
 
 ## Excluding your own app (Electron hosts)
 
-`excludeSelf: true` excludes the process the addon runs in. Electron renders
+`excludePids` and `excludeSelf` apply to system capture and the system side of
+mix; mic/process sources ignore valid exclusions. `excludeSelf: true` excludes
+the process the addon runs in. Electron renders
 audio from an audio utility process. On Linux and macOS, pass the audio service
 PIDs from `app.getAppMetrics()` as well. On Windows, use `excludeSelf: true`
 alone: the audio utility process is a direct child of the main process and
@@ -100,9 +123,11 @@ const stream = openStream({ kind: 'system', excludeSelf: true, excludePids: pids
 Invalid values cause an `InvalidArg` error; duplicates are allowed. `processId`
 has the same validation rules.
 
-Linux and macOS exclude every listed PID. Windows can exclude only **one
-process tree**; any other PID fails with an error instead of being silently
-ignored. For Electron, keep `excludePids` empty and use `excludeSelf: true`.
+Linux matches exact PIDs without descendants; native clients use
+`pipewire.sec.pid`. macOS excludes listed PIDs resolved to audio objects.
+Windows can exclude only **one process tree root**: self with `excludeSelf`,
+otherwise the first listed PID. Every entry must equal the root; distinct PIDs
+fail with an error, even if they are descendants. For Electron, keep `excludePids` empty and use `excludeSelf: true`.
 On macOS, each PID must also fit a positive signed 32-bit integer
 (`1..=2147483647`) or capture fails. On Linux, while exclusion is active, a
 stream relayed through `pipewire-pulse` is not captured until its
@@ -113,6 +138,11 @@ capture starts. A helper that has not yet rendered any audio has no such object
 and is therefore not excluded: this is a start-time snapshot. A failed PID
 lookup fails the open unless the process is gone. Open the capture while the
 app is already playing, or reopen it when a new helper appears.
+
+macOS honors `deviceId` (or `systemDeviceId` for mix) together with exclusion.
+Linux and Windows do not use the requested system device while exclusion is
+active: Linux fan-in is not device-scoped, and WASAPI process loopback cannot
+target an output endpoint. Microphone selection is unaffected.
 
 ## Chunk delivery shape (primary, secondary, VAD)
 
@@ -147,8 +177,8 @@ const stream = openStream(
 ```
 
 Pair primary and secondary chunks by `ptsNs` (a zero-based recording clock),
-never by `seq`: each tap counts its own sequence, and the secondary tap runs
-about 20–60 ms behind the primary.
+never by `seq`: each tap counts its own sequence. Relative timing depends on
+the output formats and buffering; there is no fixed delay between taps.
 
 `stream` also exposes `pause()` / `resume()`, `setGain(x)`, and the read-only
 `isPaused()`, `gain()`, `nativeFormat()` (`{ sampleRate, channels }`) and
@@ -227,5 +257,6 @@ macOS 14.4 or later.
 
 [MIT](LICENSE) © 2026 tubome / Studio Sadola. This package redistributes native code
 and bundled assets: the embedded Silero VAD model (built-in VAD add-on), the
-pure-Rust tract inference crates, and the embedded RNNoise weights (noise suppression).
+pure-Rust tract inference crates, and RNNoise via nnnoiseless with embedded
+weights (noise suppression).
 See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

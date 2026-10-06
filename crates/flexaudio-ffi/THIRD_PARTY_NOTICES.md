@@ -13,7 +13,7 @@ including their copyright notices. A crate may appear under multiple texts.
 
 | License | Count of crate uses |
 | --- | ---: |
-| MIT (MIT License) | 182 |
+| MIT (MIT License) | 176 |
 | Apache-2.0 (Apache License 2.0) | 8 |
 | BSD-3-Clause (BSD 3-Clause "New" or "Revised" License) | 1 |
 | MPL-2.0 (Mozilla Public License 2.0) | 1 |
@@ -1109,41 +1109,6 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- [heck 0.5.0](https://crates.io/crates/heck/0.5.0)
-
-````text
-Copyright (c) 2015 The Rust Project Developers
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-````
-
-### MIT — MIT License
-
-Used by:
-
 - [easyfft 0.4.2](https://crates.io/crates/easyfft/0.4.2)
 - [generic_singleton 0.5.3](https://crates.io/crates/generic_singleton/0.5.3)
 
@@ -2076,45 +2041,6 @@ Used by:
 
 ````text
 Copyright (c) 2023 The Rust Project Developers
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-````
-
-### MIT — MIT License
-
-Used by:
-
-- [pyo3-ffi 0.29.0](https://crates.io/crates/pyo3-ffi/0.29.0)
-- [pyo3-macros-backend 0.29.0](https://crates.io/crates/pyo3-macros-backend/0.29.0)
-- [pyo3-macros 0.29.0](https://crates.io/crates/pyo3-macros/0.29.0)
-- [pyo3 0.29.0](https://crates.io/crates/pyo3/0.29.0)
-- [pyo3 0.29.0](https://crates.io/crates/pyo3/0.29.0)
-
-````text
-Copyright (c) 2023-present PyO3 Project and Contributors.  https://github.com/PyO3
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated

@@ -28,6 +28,12 @@ mod types;
 mod vad;
 mod watch;
 
+// This crate builds C libraries rather than an rlib, so compile the FFI regression tests
+// as a unit-test module while keeping their source under tests/.
+#[cfg(test)]
+#[path = "../tests/ffi/exclude_pids.rs"]
+mod exclude_pids_tests;
+
 use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -86,18 +92,69 @@ fn fail(err: flexaudio::Error) -> i32 {
 /// suppression / VAD) here and attach them to the stream (`poll_chunk` applies denoise → VAD).
 /// When denoise is enabled, the output rate must be 48000 (otherwise return NULL and set
 /// last_error; RNNoise requires 48 kHz). Free the returned handle with `flexaudio_free`.
+/// This is equivalent to `flexaudio_open_with_exclude_pids(config, NULL, 0)`.
 ///
 /// # Safety
 /// `config` must point to a valid `FlexConfig` (NULL is treated as a failure).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_open(config: *const FlexConfig) -> *mut FlexStream {
+    open_with_exclude_pids(config, std::ptr::null(), 0)
+}
+
+/// Open a stream with additional PIDs excluded from system capture (or the system side of
+/// mix), combined with `config.exclude_self`. Mic and process sources ignore valid lists.
+/// The stream is not started; free the returned handle with `flexaudio_free`.
+///
+/// Every PID must be in 1..=4294967295, even for sources that ignore the list. At most 4096
+/// entries are accepted. Order and duplicates are preserved. The list is copied before
+/// returning; the caller may release or change the array after this call.
+/// On Windows, all listed PIDs must equal the process tree root (this process when
+/// `exclude_self` is true, otherwise the first listed PID). macOS resolves PIDs once at
+/// start; Linux matches exact PIDs without their child processes.
+///
+/// Returns NULL and sets `flexaudio_last_error` on failure, including a NULL pointer with
+/// nonzero length, a misaligned PID pointer, an excessive length, or a zero PID (the message
+/// names its index). A zero length never dereferences `exclude_pids` and permits NULL.
+/// Add-on settings and output defaults follow `flexaudio_open`.
+///
+/// # Safety
+/// `config` must point to a valid `FlexConfig` with valid NUL-terminated string fields or NULL.
+/// For a nonempty list of at most 4096 entries, `exclude_pids` must point to that many
+/// initialized uint32_t values in one allocation, readable and unchanged during this call.
+/// NULL and misaligned pointers are rejected before dereferencing.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_open_with_exclude_pids(
+    config: *const FlexConfig,
+    exclude_pids: *const u32,
+    exclude_pids_len: usize,
+) -> *mut FlexStream {
+    open_with_exclude_pids(config, exclude_pids, exclude_pids_len)
+}
+
+/// Shared implementation for both open entry points, including validation and panic handling.
+unsafe fn open_with_exclude_pids(
+    config: *const FlexConfig,
+    exclude_pids: *const u32,
+    exclude_pids_len: usize,
+) -> *mut FlexStream {
     guard_ptr(|| {
         clear_last_error();
+        if !config.is_null() && !config.is_aligned() {
+            set_last_error("flexaudio_open: config pointer is not aligned");
+            return std::ptr::null_mut();
+        }
         let Some(config) = config.as_ref() else {
             set_last_error("flexaudio_open: config pointer is null");
             return std::ptr::null_mut();
         };
-        let stream_config = match convert::build_config(config) {
+        let exclude_pids = match convert::copy_exclude_pids(exclude_pids, exclude_pids_len) {
+            Ok(pids) => pids,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return std::ptr::null_mut();
+            }
+        };
+        let stream_config = match convert::build_config(config, exclude_pids) {
             Ok(c) => c,
             // build_config has already set last_error.
             Err(()) => return std::ptr::null_mut(),
@@ -395,6 +452,7 @@ pub unsafe extern "C" fn flexaudio_poll_event(s: *mut FlexStream, out: *mut Flex
 /// `config.vad` are also ignored because the add-ons configured at open remain in use. Since
 /// `switch_source` cannot change the output format, the 48 kHz constraint and VAD settings do
 /// not change.
+/// This is equivalent to `flexaudio_switch_source_with_exclude_pids(s, config, NULL, 0)`.
 ///
 /// # Safety
 /// `s` must be a valid handle, and `config` must point to a valid `FlexConfig`.
@@ -403,22 +461,82 @@ pub unsafe extern "C" fn flexaudio_switch_source(
     s: *mut FlexStream,
     config: *const FlexConfig,
 ) -> i32 {
+    switch_source_with_exclude_pids(s, config, std::ptr::null(), 0)
+}
+
+/// Hot-swap the source with additional PIDs excluded from system capture (or the system
+/// side of mix), combined with `config.exclude_self`. Mic and process sources ignore valid
+/// lists. Gain, add-ons, and output format follow `flexaudio_switch_source`.
+///
+/// Every PID must be in 1..=4294967295 and at most 4096 entries are accepted. Order and
+/// duplicates are preserved. The list is copied before returning; the caller may release or
+/// change the array after this call. Platform exclusion rules follow
+/// `flexaudio_open_with_exclude_pids`.
+///
+/// Returns FLEX_OK on success, FLEX_INVALID_ARG for invalid arguments, or another negative
+/// error code on failure, and sets `flexaudio_last_error`. A NULL pointer with nonzero length,
+/// a misaligned PID pointer, an excessive length, or a zero PID is invalid; zero-PID messages
+/// name the offending index. A zero length never dereferences `exclude_pids` and permits NULL.
+/// Invalid lists are rejected before replacing the source or accessing devices.
+///
+/// # Safety
+/// `s` must be a valid stream handle and `config` must point to a valid `FlexConfig` with valid
+/// NUL-terminated string fields or NULL. For a nonempty list of at most 4096 entries,
+/// `exclude_pids` must point to that many initialized uint32_t values in one allocation,
+/// readable and unchanged during this call. NULL and misaligned pointers are rejected before
+/// dereferencing.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_switch_source_with_exclude_pids(
+    s: *mut FlexStream,
+    config: *const FlexConfig,
+    exclude_pids: *const u32,
+    exclude_pids_len: usize,
+) -> i32 {
+    switch_source_with_exclude_pids(s, config, exclude_pids, exclude_pids_len)
+}
+
+/// Shared implementation for both source-switch entry points.
+unsafe fn switch_source_with_exclude_pids(
+    s: *mut FlexStream,
+    config: *const FlexConfig,
+    exclude_pids: *const u32,
+    exclude_pids_len: usize,
+) -> i32 {
     guard_i32(|| {
         clear_last_error();
+        if !s.is_null() && !s.is_aligned() {
+            set_last_error("flexaudio_switch_source: stream pointer is not aligned");
+            return code::FLEX_INVALID_ARG;
+        }
         let Some(stream) = s.as_mut() else {
             set_last_error("flexaudio_switch_source: stream pointer is null");
             return code::FLEX_INVALID_ARG;
         };
+        if !config.is_null() && !config.is_aligned() {
+            set_last_error("flexaudio_switch_source: config pointer is not aligned");
+            return code::FLEX_INVALID_ARG;
+        }
         let Some(config) = config.as_ref() else {
             set_last_error("flexaudio_switch_source: config pointer is null");
             return code::FLEX_INVALID_ARG;
         };
-        let stream_config = match convert::build_config(config) {
+        let exclude_pids = match convert::copy_exclude_pids(exclude_pids, exclude_pids_len) {
+            Ok(pids) => pids,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return code::FLEX_INVALID_ARG;
+            }
+        };
+        let stream_config = match convert::build_config(config, exclude_pids) {
             Ok(c) => c,
             Err(()) => return code::FLEX_INVALID_ARG,
         };
         match stream.inner.switch_source(stream_config) {
             Ok(()) => code::FLEX_OK,
+            Err(e @ flexaudio::Error::InvalidArg(_)) => {
+                set_last_error(e.to_string());
+                code::FLEX_INVALID_ARG
+            }
             Err(e) => fail(e),
         }
     })

@@ -297,8 +297,10 @@ pub struct StreamConfig {
     /// [`Error::DeviceNotFound`]. Ignored for [`SourceKind::ProcessLoopback`]
     /// (the target is selected by `target_pid`). Also ignored for [`SourceKind::Mix`]
     /// (select each side with `mix_mic_device_id` / `mix_system_device_id` instead).
-    /// Exclusion on a system capture is a known limitation: while exclusion is active,
-    /// the system capture does not honor `device_id`.
+    /// While process exclusion is active on a system capture, macOS honors both the
+    /// requested device and the exclusion set. Linux and Windows ignore the requested
+    /// device: Linux's application-stream fan-in is not device-scoped, and Windows'
+    /// WASAPI process loopback cannot target an output endpoint.
     pub device_id: Option<String>,
     /// Source kind.
     pub kind: SourceKind,
@@ -340,8 +342,11 @@ pub struct StreamConfig {
     /// unrelated trees is unsupported. A common ancestor may be listed when
     /// excluding its entire tree is acceptable.
     ///
-    /// While exclusion is active, the system capture does not honor
-    /// [`device_id`](Self::device_id) (known limitation).
+    /// While exclusion is active, macOS honors the requested output device together
+    /// with the exclusion set. Linux and Windows ignore the requested device because
+    /// Linux's application-stream fan-in is not device-scoped and Windows' WASAPI
+    /// process loopback cannot target an output endpoint. This applies to both
+    /// [`device_id`](Self::device_id) and [`mix_system_device_id`](Self::mix_system_device_id).
     pub exclude_pids: Vec<u32>,
     /// Output chunk format. Default `{48000, 2}` (pass-through).
     pub output: OutputFormat,

@@ -79,6 +79,42 @@ int main(void) {
 }
 ```
 
+## Exclude Playback by PID
+
+Use the extended entry points without changing the `FlexConfig` layout:
+
+```c
+FlexConfig cfg = {0};
+cfg.kind = FLEX_SOURCE_KIND_SYSTEM;
+uint32_t excluded[] = {12345}; /* Replace with the process tree root to exclude. */
+size_t count = sizeof excluded / sizeof excluded[0];
+
+FlexStream *s = flexaudio_open_with_exclude_pids(&cfg, excluded, count);
+if (!s) {
+    fprintf(stderr, "open failed: %s\n", flexaudio_last_error());
+} else {
+    if (flexaudio_start(s) == FLEX_OK) {
+        /* ... poll audio; later replace the source and its exclusion list ... */
+        if (flexaudio_switch_source_with_exclude_pids(s, &cfg, excluded, count) < 0)
+            fprintf(stderr, "switch failed: %s\n", flexaudio_last_error());
+    }
+    flexaudio_free(s);
+}
+```
+
+Lists are copied during each call; the array can be changed or released afterward. Each PID
+must be in `1..=4294967295`, and the list can contain at most 4096 entries. Order and duplicates
+are preserved. NULL is allowed with length zero; NULL with a nonzero length or a misaligned
+pointer is invalid. Zero-PID errors identify the offending index. Validation applies even to
+mic and process sources, which ignore valid lists. Legacy `flexaudio_open` and
+`flexaudio_switch_source` use the same implementation with an empty list.
+
+Exclusion applies to system capture and the system side of mix, combined with `exclude_self`.
+Windows requires every listed PID to equal one process tree root (the current process when
+`exclude_self` is true, otherwise the first listed PID). macOS resolves PIDs once at start;
+Linux matches exact PIDs without descendants. macOS honors the selected device alongside
+exclusion; Linux and Windows ignore device selection while exclusion is active.
+
 ## Add denoise / VAD to a Stream
 
 When `denoise` / `has_vad` is enabled, each chunk passes through **denoise → VAD** just before
@@ -188,4 +224,9 @@ the binary.
 | [tract-onnx](https://crates.io/crates/tract-onnx) | Pure Rust inference for VAD (`flexaudio-vad`) | MIT OR Apache-2.0 |
 | Silero VAD model | VAD model weights (embedded in the binary) | MIT |
 
-When redistributing, include the copyright notices and license terms listed above.
+When redistributing the C static or shared library, ship
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) alongside the library and header.
+It contains the complete dependency license texts, MPL source-availability links,
+and the embedded Silero model notice. From the repository root, regenerate it with
+`scripts/gen-third-party-notices.sh`; CI checks it with
+`scripts/gen-third-party-notices.sh --check`.

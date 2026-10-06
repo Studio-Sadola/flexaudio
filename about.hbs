@@ -1,0 +1,42 @@
+# Third-Party Notices
+
+Generated with cargo-about 0.9.2 by `scripts/gen-third-party-notices.sh`.
+Do not edit this generated file. Crate licenses come from `about.toml` and
+`about.hbs`; non-crate notices are maintained in `third-party/extra-notices.md`.
+
+This document covers normal dependencies for the shipping targets configured in
+`about.toml`, including transitive dependencies. Build-only and development-only
+dependencies are excluded. Distinct license texts are reproduced in full,
+including their copyright notices. A crate may appear under multiple texts.
+
+## License overview
+
+| License | Count of crate uses |
+| --- | ---: |
+{{#each overview}}
+| {{{id}}} ({{{name}}}) | {{count}} |
+{{/each}}
+
+## License texts
+{{#each licenses}}
+
+### {{{id}}} — {{{name}}}
+
+Used by:
+
+{{#each used_by}}
+- [{{{crate.name}}} {{{crate.version}}}](https://crates.io/crates/{{{crate.name}}}/{{{crate.version}}})
+{{/each}}
+{{#if (eq id "MPL-2.0")}}
+
+Source availability:
+
+{{#each used_by}}
+The source code of {{{crate.name}}} {{{crate.version}}} is available at https://crates.io/crates/{{{crate.name}}}/{{{crate.version}}} and https://docs.rs/crate/{{{crate.name}}}/{{{crate.version}}}/source/
+{{/each}}
+{{/if}}
+
+````text
+{{{text}}}
+````
+{{/each}}

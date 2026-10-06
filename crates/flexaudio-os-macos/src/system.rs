@@ -27,10 +27,9 @@
 //!   `start` returns [`Error::DeviceNotFound`]. Enumerate devices with
 //!   [`list_output_devices`](crate::list_output_devices).
 //!
-//! When `exclude_self == true`, ignore `device_id` and create a self-excluding tap for the
-//! default output (prioritize excluding our own audio).
-//! Since `exclude_pids` was added this holds whenever the effective exclusion set is
-//! non-empty, not only when `exclude_self == true`.
+//! Device selection and process exclusion are combined: the tap captures audio sent to the
+//! requested device while excluding the resolved process objects. Without a requested device,
+//! the exclusion tap uses the default output.
 //!
 //! # Threading / Send
 //! Keep `!Send` ObjC objects used by the tap/aggregate/IOProc ([`TapChain`]) on a dedicated
@@ -47,6 +46,17 @@ use flexaudio_core::types::{Error, Result};
 
 use crate::common::{translate_pid_to_object, FALLBACK_FORMAT};
 use crate::tap::{build_tap_chain, TapChain, TapKind};
+
+/// Choose the system tap from the resolved exclusion snapshot and optional device UID.
+fn system_tap_kind(excluded_objects: Vec<u32>, device_uid: Option<String>) -> TapKind {
+    match device_uid {
+        Some(device_uid) => TapKind::ExcludeProcessesOnDevice {
+            ids: excluded_objects,
+            device_uid,
+        },
+        None => TapKind::ExcludeProcesses(excluded_objects),
+    }
+}
 
 fn checked_exclusion_pid(pid: u32) -> Result<i32> {
     match i32::try_from(pid) {
@@ -108,7 +118,7 @@ pub struct MacSystemBackend {
     exclude_pids: Vec<u32>,
     /// Target output device name (= [`DeviceInfo::id`](flexaudio_core::types::DeviceInfo)).
     /// `None` uses a global tap for the default output; `Some(name)` targets that output device.
-    /// Ignored when `exclude_self == true`.
+    /// Process exclusions also apply to the selected device.
     device_id: Option<String>,
     /// Running flag (guards repeated start, signals stop, and tracks drop state). `Send`.
     stop_flag: Arc<AtomicBool>,
@@ -127,7 +137,7 @@ impl MacSystemBackend {
     ///
     /// If `device_id` is `Some(name)`, create a tap for the named output device (resolve name →
     /// UID at `start`, returning [`Error::DeviceNotFound`] if missing). `None` selects the
-    /// default output. Ignore `device_id` when `exclude_self == true`.
+    /// default output. Process exclusions also apply when a device is selected.
     ///
     /// Cache fallback native format `(48000, 2)`. The actual format comes from the tap's ASBD
     /// when the tap is created at `start`, but `native_format` must return a value at
@@ -197,50 +207,43 @@ impl CaptureBackend for MacSystemBackend {
         if self.exclude_self {
             excluded.push(std::process::id());
         }
-        // Move device_id (String) into the closure. It is unused when the exclusion set is nonempty.
+        // Move device_id (String) into the closure for owner-thread UID resolution.
         let device_id = self.device_id.clone();
 
         let handle = thread::Builder::new()
             .name("flexaudio-macos-system".into())
             .spawn(move || {
-                let kind = if !excluded.is_empty() {
-                    // Exclusion beats device_id: a global tap on the default output
-                    // minus every excluded process that currently has an audio object.
-                    // Resolve PIDs through Core Audio on the owning thread,
-                    // as in process.rs. A missing audio object remains a snapshot
-                    // limitation; translation errors require confirmed process exit.
-                    let mut ids = Vec::with_capacity(excluded.len());
-                    let own_pid = std::process::id();
-                    for pid in excluded {
-                        let macos_pid = match checked_exclusion_pid(pid) {
-                            Ok(pid) => pid,
-                            Err(e) => {
-                                let _ = ready_tx.send(Err(e));
-                                return;
-                            }
-                        };
-                        match resolve_exclusion(
-                            translate_pid_to_object(macos_pid),
-                            pid == own_pid,
-                            || probe_process_exists(macos_pid),
-                        ) {
-                            Ok(None) => {}
-                            Ok(Some(object_id)) => ids.push(object_id),
-                            Err(e) => {
-                                let _ = ready_tx.send(Err(e));
-                                return;
-                            }
+                // Resolve PIDs through Core Audio on the owning thread, as in process.rs.
+                // A missing audio object remains a snapshot limitation; translation errors
+                // require confirmed process exit. Resolve exclusions before device access.
+                let mut ids = Vec::with_capacity(excluded.len());
+                let own_pid = std::process::id();
+                for pid in excluded {
+                    let macos_pid = match checked_exclusion_pid(pid) {
+                        Ok(pid) => pid,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    match resolve_exclusion(
+                        translate_pid_to_object(macos_pid),
+                        pid == own_pid,
+                        || probe_process_exists(macos_pid),
+                    ) {
+                        Ok(None) => {}
+                        Ok(Some(object_id)) => ids.push(object_id),
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
                         }
                     }
-                    TapKind::ExcludeProcesses(ids)
-                } else if let Some(name) = device_id {
-                    // Selected output device. Resolve name → UID and tap all audio for that
-                    // device (no exclusions). Return DeviceNotFound if no device matches.
+                }
+                let device_uid = if let Some(name) = device_id {
+                    // Resolve the selected output device even when exclusions are active.
+                    // Return DeviceNotFound if no device matches.
                     match crate::devices::uid_for_device_name(&name) {
-                        Ok(Some(uid)) => TapKind::ExcludeProcessesOnDevice {
-                            ids: Vec::new(),
-                            device_uid: uid,
-                        },
+                        Ok(Some(uid)) => Some(uid),
                         Ok(None) => {
                             let _ = ready_tx.send(Err(Error::DeviceNotFound));
                             return;
@@ -251,9 +254,9 @@ impl CaptureBackend for MacSystemBackend {
                         }
                     }
                 } else {
-                    // Default output. Capture all system audio with no exclusions; no PID conversion needed.
-                    TapKind::ExcludeProcesses(Vec::new())
+                    None
                 };
+                let kind = system_tap_kind(ids, device_uid);
                 run_tap_thread(kind, sink, stop_flag, ready_tx);
             })
             .map_err(|e| Error::Backend(format!("spawn macos system thread: {e}")))?;
@@ -338,6 +341,40 @@ pub(crate) fn run_tap_thread(
 mod tests {
     use super::*;
     use flexaudio_core::raw_ring;
+
+    #[test]
+    fn system_tap_without_device_or_exclusions_captures_default_output() {
+        assert!(matches!(
+            system_tap_kind(Vec::new(), None),
+            TapKind::ExcludeProcesses(ids) if ids.is_empty()
+        ));
+    }
+
+    #[test]
+    fn system_tap_without_device_preserves_exclusions() {
+        assert!(matches!(
+            system_tap_kind(vec![42, 43, 42], None),
+            TapKind::ExcludeProcesses(ids) if ids == vec![42, 43, 42]
+        ));
+    }
+
+    #[test]
+    fn system_tap_with_device_and_no_exclusions_captures_selected_output() {
+        assert!(matches!(
+            system_tap_kind(Vec::new(), Some("output-device-uid".into())),
+            TapKind::ExcludeProcessesOnDevice { ids, device_uid }
+                if ids.is_empty() && device_uid == "output-device-uid"
+        ));
+    }
+
+    #[test]
+    fn system_tap_with_device_preserves_exclusions_and_uid() {
+        assert!(matches!(
+            system_tap_kind(vec![42, 43, 42], Some("output-device-uid".into())),
+            TapKind::ExcludeProcessesOnDevice { ids, device_uid }
+                if ids == vec![42, 43, 42] && device_uid == "output-device-uid"
+        ));
+    }
 
     #[test]
     fn exclusion_without_audio_object_skips_without_probe() {

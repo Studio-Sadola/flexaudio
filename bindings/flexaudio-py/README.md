@@ -71,6 +71,36 @@ stream. `pause()` / `resume()` / `is_paused()` control delivery.
 `Stream.native_format()` returns the source's native `(sample_rate, channels)`
 and `Stream.dropped_chunks()` returns the cumulative number of dropped chunks.
 
+### Excluding playback by PID
+
+`open()` and `Stream.switch_source()` accept keyword-only `exclude_pids=None`.
+Pass a list, tuple, or another integer sequence to exclude playback from system
+capture or the system side of `"mix"`. It combines with `exclude_self=True`:
+
+```python
+with flexaudio.open("system", exclude_pids=[1234]) as stream:
+    stream.switch_source("mix", exclude_pids=(1234,))
+```
+
+Every PID must be an integer in `1..=4294967295`; booleans, floats, and strings
+raise `TypeError`. Out-of-range integers raise `ValueError` identifying the
+entry's index, including integers larger than a native integer can hold.
+Strings, bytes, dictionaries, sets, and generators are not accepted as the
+sequence (`TypeError`). More than 4096 entries raises `ValueError`. `None` and
+an empty sequence exclude no explicit PIDs. Order and duplicates are preserved.
+Validation happens before any device access, including for `"mic"` and
+`"process"`, which ignore valid exclusions.
+
+Platform behavior:
+
+- Windows supports one process tree root: when `exclude_self=True`, every
+  listed PID must equal the calling process's PID; otherwise every listed PID
+  must equal the first one. Distinct roots raise `ValueError`.
+- macOS resolves PIDs once when capture starts and honors a selected system
+  device together with exclusions.
+- Linux matches exact PIDs, without excluding descendants. Linux and Windows
+  ignore the selected system device while exclusion is active.
+
 ### Integrated denoise and VAD
 
 `open()` (and `switch_source()`) accept `denoise=True` and `vad={...}` to run

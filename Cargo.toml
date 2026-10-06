@@ -36,4 +36,3 @@ cpal = "0.16"
 # Linux system output capture (flexaudio-os-linux). Requires libpipewire-0.3 + libclang and is included
 # only for target.'cfg(target_os = "linux")' (other platforms do not build against PipeWire).
 pipewire = "0.10"
-# Add during the implementation phase (tract-onnx, pyo3, numpy, etc.)

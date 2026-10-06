@@ -18,11 +18,36 @@ on:
     branches: [redesign/flexaudio-rust, main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  third-party-notices:
+    name: Third-party notices gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Install pinned cargo-about
+        run: cargo install cargo-about --locked --version 0.9.2 --features cli
+      - name: Check generated notices
+        run: scripts/gen-third-party-notices.sh --check
+
+  release-version-tests:
+    name: Release version gate self-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test release version validation
+        run: python3 -m unittest discover -s .github/scripts -p test_check_release_versions.py -v
+
   lint-test-linux:
     name: Lint & Test (Linux / PipeWire)
     runs-on: ubuntu-latest

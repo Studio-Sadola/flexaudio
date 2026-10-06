@@ -322,10 +322,36 @@ typedef struct FlexDeviceEvent {
 // suppression / VAD) here and attach them to the stream (`poll_chunk` applies denoise → VAD).
 // When denoise is enabled, the output rate must be 48000 (otherwise return NULL and set
 // last_error; RNNoise requires 48 kHz). Free the returned handle with `flexaudio_free`.
+// This is equivalent to `flexaudio_open_with_exclude_pids(config, NULL, 0)`.
 //
 // # Safety
 // `config` must point to a valid `FlexConfig` (NULL is treated as a failure).
 struct FlexStream *flexaudio_open(const struct FlexConfig *config);
+
+// Open a stream with additional PIDs excluded from system capture (or the system side of
+// mix), combined with `config.exclude_self`. Mic and process sources ignore valid lists.
+// The stream is not started; free the returned handle with `flexaudio_free`.
+//
+// Every PID must be in 1..=4294967295, even for sources that ignore the list. At most 4096
+// entries are accepted. Order and duplicates are preserved. The list is copied before
+// returning; the caller may release or change the array after this call.
+// On Windows, all listed PIDs must equal the process tree root (this process when
+// `exclude_self` is true, otherwise the first listed PID). macOS resolves PIDs once at
+// start; Linux matches exact PIDs without their child processes.
+//
+// Returns NULL and sets `flexaudio_last_error` on failure, including a NULL pointer with
+// nonzero length, a misaligned PID pointer, an excessive length, or a zero PID (the message
+// names its index). A zero length never dereferences `exclude_pids` and permits NULL.
+// Add-on settings and output defaults follow `flexaudio_open`.
+//
+// # Safety
+// `config` must point to a valid `FlexConfig` with valid NUL-terminated string fields or NULL.
+// For a nonempty list of at most 4096 entries, `exclude_pids` must point to that many
+// initialized uint32_t values in one allocation, readable and unchanged during this call.
+// NULL and misaligned pointers are rejected before dereferencing.
+struct FlexStream *flexaudio_open_with_exclude_pids(const struct FlexConfig *config,
+                                                    const uint32_t *exclude_pids,
+                                                    uintptr_t exclude_pids_len);
 
 // Stop the stream, then free it. NULL-safe.
 //
@@ -431,10 +457,37 @@ int32_t flexaudio_poll_event(struct FlexStream *s, struct FlexEvent *out);
 // `config.vad` are also ignored because the add-ons configured at open remain in use. Since
 // `switch_source` cannot change the output format, the 48 kHz constraint and VAD settings do
 // not change.
+// This is equivalent to `flexaudio_switch_source_with_exclude_pids(s, config, NULL, 0)`.
 //
 // # Safety
 // `s` must be a valid handle, and `config` must point to a valid `FlexConfig`.
 int32_t flexaudio_switch_source(struct FlexStream *s, const struct FlexConfig *config);
+
+// Hot-swap the source with additional PIDs excluded from system capture (or the system
+// side of mix), combined with `config.exclude_self`. Mic and process sources ignore valid
+// lists. Gain, add-ons, and output format follow `flexaudio_switch_source`.
+//
+// Every PID must be in 1..=4294967295 and at most 4096 entries are accepted. Order and
+// duplicates are preserved. The list is copied before returning; the caller may release or
+// change the array after this call. Platform exclusion rules follow
+// `flexaudio_open_with_exclude_pids`.
+//
+// Returns FLEX_OK on success, FLEX_INVALID_ARG for invalid arguments, or another negative
+// error code on failure, and sets `flexaudio_last_error`. A NULL pointer with nonzero length,
+// a misaligned PID pointer, an excessive length, or a zero PID is invalid; zero-PID messages
+// name the offending index. A zero length never dereferences `exclude_pids` and permits NULL.
+// Invalid lists are rejected before replacing the source or accessing devices.
+//
+// # Safety
+// `s` must be a valid stream handle and `config` must point to a valid `FlexConfig` with valid
+// NUL-terminated string fields or NULL. For a nonempty list of at most 4096 entries,
+// `exclude_pids` must point to that many initialized uint32_t values in one allocation,
+// readable and unchanged during this call. NULL and misaligned pointers are rejected before
+// dereferencing.
+int32_t flexaudio_switch_source_with_exclude_pids(struct FlexStream *s,
+                                                  const struct FlexConfig *config,
+                                                  const uint32_t *exclude_pids,
+                                                  uintptr_t exclude_pids_len);
 
 // List available devices, allocate an array, and set `out_array` / `out_count`.
 //

@@ -22,10 +22,14 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      version:
+        description: "Release version (MAJOR.MINOR.PATCH, without v)"
+        type: string
+        required: true
       dry_run:
         description: "Build wheels/sdist but skip the PyPI publish step"
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
@@ -35,9 +39,43 @@ env:
   MANIFEST: bindings/flexaudio-py/Cargo.toml
 
 jobs:
+  version-gate:
+    name: Validate release versions
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check tag or explicit dispatch version
+        id: check
+        shell: bash
+        working-directory: .
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            python3 .github/scripts/check-release-versions.py --tag "$REF_NAME"
+            VERSION="${REF_NAME#v}"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            python3 .github/scripts/check-release-versions.py --version "$INPUT_VERSION"
+            VERSION="$INPUT_VERSION"
+          else
+            echo "::error::Unsupported release trigger."
+            exit 1
+          fi
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+
   # --- Linux wheels (manylinux), built inside maturin-action's container ---
   linux:
     name: Wheels (manylinux ${{ matrix.target }})
+    needs: version-gate
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -117,6 +155,8 @@ jobs:
       # "externally managed" issues on the runner's system Python. The repair runs
       # natively on each arch's own runner, so no cross-arch handling is needed.
       - name: Repair wheel (bundle everything except system PipeWire/ALSA)
+        env:
+          WHEEL_TARGET: ${{ matrix.target }}
         run: |
           python3 -m venv "${RUNNER_TEMP}/auditwheel-venv"
           "${RUNNER_TEMP}/auditwheel-venv/bin/pip" install --upgrade pip auditwheel patchelf
@@ -124,7 +164,7 @@ jobs:
           mkdir -p dist
           for whl in dist-unrepaired/*.whl; do
             auditwheel repair "$whl" \
-              --plat "manylinux_2_34_${{ matrix.target }}" \
+              --plat "manylinux_2_34_${WHEEL_TARGET}" \
               --exclude libpipewire-0.3.so.0 \
               --exclude libspa-0.2.so \
               --exclude libasound.so.2 \
@@ -142,6 +182,7 @@ jobs:
   # supported runner and package target.
   macos:
     name: Wheels (macOS aarch64)
+    needs: version-gate
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -163,6 +204,7 @@ jobs:
   # --- Windows wheels (x64) ---
   windows:
     name: Wheels (Windows x64)
+    needs: version-gate
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -180,6 +222,7 @@ jobs:
   # --- Source distribution ---
   sdist:
     name: sdist
+    needs: version-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -196,7 +239,7 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: [linux, macos, windows, sdist]
+    needs: [version-gate, linux, macos, windows, sdist]
     runs-on: ubuntu-latest
     # Trusted Publishing requires an OIDC token.
     permissions:
