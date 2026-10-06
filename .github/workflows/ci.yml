@@ -46,7 +46,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Test release version validation
-        run: python3 -m unittest discover -s .github/scripts -p test_check_release_versions.py -v
+        run: python3 -m unittest discover -s .github/scripts -p "test_*.py" -v
 
   lint-test-linux:
     name: Lint & Test (Linux / PipeWire)

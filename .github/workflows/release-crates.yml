@@ -82,6 +82,35 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate publish order and derive dry-run leaves
+        id: release-plan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Publish dependencies first and the facade last. flexaudio-cli /
+          # -ffi / -napi / -py are publish=false and intentionally excluded.
+          CRATES=(
+            flexaudio-core
+            flexaudio-mic
+            flexaudio-os-linux
+            flexaudio-os-macos
+            flexaudio-os-windows
+            flexaudio-vad
+            flexaudio-encode
+            flexaudio-denoise
+            flexaudio
+          )
+
+          METADATA="$(cargo metadata --format-version 1 --no-deps --offline)"
+          python3 .github/scripts/workspace-leaf-crates.py verify-order "${CRATES[@]}" <<< "$METADATA"
+          LEAVES="$(python3 .github/scripts/workspace-leaf-crates.py leaves "${CRATES[@]}" <<< "$METADATA")"
+          printf 'crates=%s\n' "${CRATES[*]}" >> "$GITHUB_OUTPUT"
+          printf 'leaves=%s\n' "${LEAVES//$'\n'/ }" >> "$GITHUB_OUTPUT"
 
       # Same system dependencies as ci.yml so the Linux crates resolve their
       # native deps (PipeWire / ALSA / libclang). The platform-specific Windows
@@ -105,24 +134,12 @@ jobs:
 
       - name: Publish crates in dependency order
         shell: bash
+        env:
+          PUBLISH_CRATES: ${{ steps.release-plan.outputs.crates }}
+          LEAF_CRATES: ${{ steps.release-plan.outputs.leaves }}
         run: |
           set -euo pipefail
-
-          # Publish order: flexaudio-core first, then everything that depends on
-          # it ({mic, os-linux, os-macos, os-windows, vad}), then the facade
-          # crate (flexaudio) last. flexaudio-cli / -ffi / -napi / -py are
-          # publish=false and are intentionally excluded.
-          CRATES=(
-            flexaudio-core
-            flexaudio-mic
-            flexaudio-os-linux
-            flexaudio-os-macos
-            flexaudio-os-windows
-            flexaudio-vad
-            flexaudio-encode
-            flexaudio-denoise
-            flexaudio
-          )
+          read -r -a CRATES <<< "$PUBLISH_CRATES"
 
           VERSION="$RELEASE_VERSION"
           echo "Publishing flexaudio workspace version ${VERSION}"
@@ -200,7 +217,7 @@ jobs:
               # resolvable before the next crate goes up.
               # --no-verify: os-windows/os-macos can't verification-build on Linux
               # (native SDKs absent); each OS is already verified in ci.yml.
-              case " flexaudio-core flexaudio-vad flexaudio-encode flexaudio-denoise " in
+              case " ${LEAF_CRATES} " in
                 *" ${crate} "*)
                   echo "[dry-run] cargo publish -p ${crate} --no-verify"
                   cargo publish -p "${crate}" --no-verify --dry-run --allow-dirty
