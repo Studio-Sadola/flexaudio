@@ -1,0 +1,11 @@
+English translation of the original Japanese commit message:
+
+fix(vad): satisfy the Rust 1.98 chunking lint in tests
+
+Replace four constant-width chunks_exact calls with as_chunks::<N>().0
+in flexaudio-vad unit tests and tests/speech_fixture.rs. Rust 1.98 added
+clippy::chunks_exact_to_as_chunks, which broke CI when stable advanced.
+All four changes affect test code; incomplete trailing chunks are still
+ignored, so audio processing behavior is unchanged. The replacement is
+compatible with the crate's declared Rust 1.91 minimum. At this point,
+the CI MSRV job checked Rust 1.85 crates only and did not cover VAD.
