@@ -1,0 +1,9 @@
+English translation of the original Japanese commit message:
+
+ci(release-npm): upgrade npm CLI before publishing
+
+Upgrade npm to the latest CLI in .github/workflows/release-npm.yml
+before installing publishing dependencies. Recent npm versions support
+staged publishing for new packages in scopes that require 2FA, allowing
+interactive approval instead of rejecting the publish outright.
+The publishing job continues to use Node.js 22.
