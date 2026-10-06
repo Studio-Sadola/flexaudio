@@ -1,0 +1,15 @@
+English translation of the original Japanese commit message:
+
+ci: pin Rust 1.98.1 and expand native lint and MSRV gates
+
+Pin Linux, Windows, macOS, N-API, and guard jobs to Rust 1.98.1 to avoid
+unexpected gate changes when upstream stable advances. Add
+.github/scripts/check-toolchain-pins.py to catch inconsistent pins and
+direct cargo/rustc jobs with no declared toolchain. MSRV exemptions use
+cargo metadata rust-version values rather than job names. Add a
+non-blocking upstream-stable preview for Clippy and tests. Native
+Windows/macOS crates get Clippy --all-targets -D warnings. Expand MSRV
+gates to nine Rust 1.85 crates and four Rust 1.91 add-ons (ffi, napi,
+py, vad). Linux cross-checks the two OS-only crates for compilation;
+native jobs cover linking/tests. MSRV jobs omit Clippy because its lints
+change by version.
