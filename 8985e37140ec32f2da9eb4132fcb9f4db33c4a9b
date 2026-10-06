@@ -1,0 +1,13 @@
+English translation of the original Japanese commit message:
+
+ci(release-crates): retry rate limits and document npm release status
+
+Retry cargo publish for the same crate on crates.io HTTP 429 responses,
+waiting 660 seconds between attempts, with a limit of 10 attempts.
+Other publishing errors still fail immediately. This lets an initial
+multi-crate release wait out new-crate rate limits in one workflow run.
+Add RELEASING.md with the recorded 0.2.0 registry status: all nine
+crates
+and the PyPI wheels and sdist were published, while npm was pending.
+It documents the reported npm 2FA-token and first-publish OIDC blockers,
+workflow retry instructions, and an interactive 2FA publishing option.
