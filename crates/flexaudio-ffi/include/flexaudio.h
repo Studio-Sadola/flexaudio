@@ -16,574 +16,568 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-// 成功。
+// Success.
 #define FLEX_OK 0
 
-// 引数が無効（NULL ポインタ・不正な UTF-8・未知の列挙値など）。
+// Invalid argument (NULL pointer, invalid UTF-8, unknown enum value, etc.).
 #define FLEX_INVALID_ARG -1
 
-// flexaudio の操作が失敗した（メッセージは last_error に入る）。
+// A flexaudio operation failed (the message is stored in last_error).
 #define FLEX_FAILURE -2
 
-// FFI 境界で panic を捕捉した（メッセージは last_error に入る）。
+// A panic was caught at the FFI boundary (the message is stored in last_error).
 #define FLEX_PANIC -3
 
-// ハンドルの状態が操作に合わない（finalize 済みの FLAC への write など）。
+// The handle state does not allow the operation (such as writing to finalized FLAC).
 #define FLEX_INVALID_STATE -4
 
-// 録音するオーディオソースの種別（[`flexaudio::SourceKind`] に対応）。
+// Audio source kind to record (corresponds to [`flexaudio::SourceKind`]).
 typedef enum FlexSourceKind {
-    // マイク入力。
+    // Microphone input.
     FLEX_SOURCE_KIND_MIC = 0,
-    // システム出力全体のループバック。
+    // Loopback of all system output.
     FLEX_SOURCE_KIND_SYSTEM = 1,
-    // 特定プロセスの出力ループバック。
+    // Output loopback for a specific process.
     FLEX_SOURCE_KIND_PROCESS = 2,
-    // マイクとシステム音声を 1 本に合成して録る。
+    // Record microphone and system audio mixed into one stream.
     FLEX_SOURCE_KIND_MIX = 3,
 } FlexSourceKind;
 
-// process ソースで対象 PID を含めるか除くか（[`flexaudio::ProcessMode`] に対応）。
+// Whether to include or exclude the target PID for process sources (corresponds to [`flexaudio::ProcessMode`]).
 typedef enum FlexProcessMode {
-    // 対象 PID（そのプロセスツリー）だけを録る。
+    // Capture only the target PID (and its process tree).
     FLEX_PROCESS_MODE_INCLUDE = 0,
-    // 対象 PID 以外の全システム音を録る。
+    // Capture all system audio except the target PID.
     FLEX_PROCESS_MODE_EXCLUDE = 1,
 } FlexProcessMode;
 
-// ストリームイベントの種別（[`flexaudio::Event`] に対応）。
+// Stream event kind (corresponds to [`flexaudio::Event`]).
 typedef enum FlexEventKind {
-    // チャンクリング満杯によりチャンクがドロップされた（個数は `FlexEvent::count`）。
+    // Chunks were dropped because the chunk ring was full (count in `FlexEvent::count`).
     FLEX_EVENT_KIND_CHUNK_DROPPED = 0,
-    // データ到着が途絶し、ストリームが失速した。
+    // Data stopped arriving and the stream stalled.
     FLEX_EVENT_KIND_STALLED = 1,
-    // 失速後にデータ到着が復帰した。
+    // Data resumed after a stall.
     FLEX_EVENT_KIND_RECOVERED = 2,
-    // 必要な権限が拒否された。
+    // A required permission was denied.
     FLEX_EVENT_KIND_PERMISSION_DENIED = 3,
-    // キャプチャデバイスが失われた。
+    // The capture device was lost.
     FLEX_EVENT_KIND_DEVICE_LOST = 4,
-    // その他のバックエンドエラー（メッセージは `flexaudio_last_error` で取る）。
+    // Other backend error (retrieve the message with `flexaudio_last_error`).
     FLEX_EVENT_KIND_ERROR = 5,
-    // 既知のどれにも当たらないイベント（将来のバリアント追加に備える）。
+    // Event not matching a known kind (reserved for future variants).
     FLEX_EVENT_KIND_UNKNOWN = 6,
 } FlexEventKind;
 
-// プロセスが今音声を出力中か（[`flexaudio::ProcessInfo::is_output_active`] に対応）。
+// Whether the process is currently outputting audio (corresponds to [`flexaudio::ProcessInfo::is_output_active`]).
 //
-// OS がその状態を公開しないときは `Unknown`（Rust の `None`）。
+// `Unknown` when the OS does not expose this state (Rust `None`).
 typedef enum FlexOutputActivity {
-    // OS が状態を公開していない／読めなかった。
+    // The OS does not expose the state or it could not be read.
     FLEX_OUTPUT_ACTIVITY_UNKNOWN = 0,
-    // 出力していない（Linux=ノードが Running 以外 / Windows=セッションが Inactive /
-    // macOS=IsRunningOutput が 0）。
+    // Not outputting (Linux = node is not Running / Windows = session is Inactive /
+    // macOS = IsRunningOutput is 0).
     FLEX_OUTPUT_ACTIVITY_INACTIVE = 1,
-    // 出力中。
+    // Outputting audio.
     FLEX_OUTPUT_ACTIVITY_ACTIVE = 2,
 } FlexOutputActivity;
 
-// デバイス着脱イベントの種別（[`flexaudio::DeviceEvent`] に対応）。
+// Device connection event kind (corresponds to [`flexaudio::DeviceEvent`]).
 typedef enum FlexDeviceEventKind {
-    // デバイスが追加された（`device`/`name` 等が埋まる）。
+    // A device was added (`device`/`name`, etc. are populated).
     FLEX_DEVICE_EVENT_KIND_ADDED = 0,
-    // デバイスが取り外された（`id` のみ）。
+    // A device was removed (`id` only).
     FLEX_DEVICE_EVENT_KIND_REMOVED = 1,
-    // OS 既定デバイスが変わった（`id` と `source_kind`）。
+    // The OS default device changed (`id` and `source_kind`).
     FLEX_DEVICE_EVENT_KIND_DEFAULT_CHANGED = 2,
-    // 既知のどれにも当たらないイベント（将来のバリアント追加に備える）。
+    // An event that does not match a known kind (for future variants).
     FLEX_DEVICE_EVENT_KIND_UNKNOWN = 3,
 } FlexDeviceEventKind;
 
-// ノイズ抑制の不透明ハンドル。中身は [`flexaudio_denoise::Denoiser`]。
-// `flexaudio_denoise_new` で作り `flexaudio_denoise_free` で解放する。
+// Opaque noise suppression handle containing [`flexaudio_denoise::Denoiser`].
+// Create it with `flexaudio_denoise_new` and release it with `flexaudio_denoise_free`.
 typedef struct FlexDenoiser FlexDenoiser;
 
-// FLAC 書き出しの不透明ハンドル。`flexaudio_flac_create` で作り、`flexaudio_flac_write` で
-// チャンクを追記し、`flexaudio_flac_finalize` で確定、`flexaudio_flac_free` で解放する。
+// Opaque handle for FLAC output. Create it with `flexaudio_flac_create`, append chunks with
+// `flexaudio_flac_write`, finalize with `flexaudio_flac_finalize`, and release with `flexaudio_flac_free`.
 typedef struct FlexFlac FlexFlac;
 
-// 録音ストリームの不透明ハンドル。中身は [`flexaudio::Stream`] と、有効時に同居する
-// アドオン（denoise / VAD）で、C 側はポインタだけを持つ。`flexaudio_open` で作り
-// `flexaudio_free` で解放する。
+// Opaque handle for a recording stream. It contains [`flexaudio::Stream`] and any enabled
+// addons (denoise / VAD); C code holds only a pointer. Create with `flexaudio_open` and
+// release with `flexaudio_free`.
 //
-// アドオンはストリームの状態としてここに閉じ込める（薄いラッパ）。`poll_chunk` が
-// 返す前に denoise → VAD の順で通す。`flexaudio_switch_source` はソースだけを差し替え、
-// アドオンは open 時の構成のまま保つ（gain と同じ扱い）。
+// Keep addons here as part of the stream state (thin wrapper). Before `poll_chunk`
+// returns, process data through denoise → VAD. `flexaudio_switch_source` replaces only the source;
+// addons retain their configuration from open (same as gain).
 typedef struct FlexStream FlexStream;
 
-// VAD の不透明ハンドル。中身は [`flexaudio_vad::Vad`]（ONNX セッションを 1 つ持つ）。
-// `flexaudio_vad_new` で作り `flexaudio_vad_free` で解放する。
+// Opaque VAD handle containing [`flexaudio_vad::Vad`] (which holds one ONNX session).
+// Create it with `flexaudio_vad_new` and free it with `flexaudio_vad_free`.
 typedef struct FlexVad FlexVad;
 
-// デバイスの不透明ウォッチャハンドル。中身は [`flexaudio::DeviceWatcher`]。
-// `flexaudio_watch_devices` で作り `flexaudio_watcher_free` で解放する。
+// Opaque device watcher handle containing [`flexaudio::DeviceWatcher`]. Create with
+// `flexaudio_watch_devices` and release with `flexaudio_watcher_free`.
 typedef struct FlexWatcher FlexWatcher;
 
-// VAD（発話区間検出）の設定。`FlexConfig::vad` と `flexaudio_vad_new` に渡す。
+// VAD (voice activity detection) configuration. Passed to `FlexConfig::vad` and `flexaudio_vad_new`.
 //
-// 各値は番兵 0 で既定を表す（[`flexaudio_vad::VadConfig`] の既定値に写す）。
-// `threshold` 0 → 0.5、`neg_threshold` 0 → silero 式 `max(threshold-0.15, 0.01)`、
-// `min_speech_ms` 0 → 250、`min_silence_ms` 0 → 100、`speech_pad_ms` 0 → 30、
-// `sample_rate` 0 → 16000。`max_speech_ms` は 0 がそのまま「無制限」（既定）を意味する。
+// For each value, the sentinel 0 selects the default from [`flexaudio_vad::VadConfig`].
+// `threshold` 0 → 0.5, `neg_threshold` 0 → Silero formula `max(threshold-0.15, 0.01)`,
+// `min_speech_ms` 0 → 250, `min_silence_ms` 0 → 100, `speech_pad_ms` 0 → 30,
+// `sample_rate` 0 → 16000. `max_speech_ms` 0 means unlimited (the default).
 //
 // [`flexaudio_vad_new`]: crate::flexaudio_vad_new
 typedef struct FlexVadConfig {
-    // 発話開始とみなす確率しきい値（>=）。0 なら 0.5。
+    // Probability threshold (>=) for speech start. 0 selects 0.5.
     float threshold;
-    // 無音開始とみなす負側しきい値（<）。0 なら silero 式で自動決定。
+    // Lower (silence-side) threshold (<) for silence start.
+    // 0 selects the Silero formula automatically.
     float neg_threshold;
-    // 採用する発話の最小長（ms）。これ未満のセグメントは破棄。0 なら 250。
+    // Minimum accepted speech duration (ms). Shorter segments are discarded. 0 selects 250.
     uint32_t min_speech_ms;
-    // 発話終了の確定に必要な無音長（ms）。0 なら 100。
+    // Silence duration (ms) required to finalize speech end. 0 selects 100.
     uint32_t min_silence_ms;
-    // セグメント境界を前後に広げるパディング（ms）。0 なら 30。
+    // Padding (ms) added before and after segment boundaries. 0 selects 30.
     uint32_t speech_pad_ms;
-    // 1 セグメントの最大長（ms）。0 は無制限（既定）。超過時は強制分割。
+    // Maximum segment duration (ms). 0 is unlimited (default). Longer segments are forcibly split.
     uint32_t max_speech_ms;
-    // サンプルレート（8000 または 16000）。0 なら 16000。
+    // Sample rate (8000 or 16000). 0 selects 16000.
     uint32_t sample_rate;
 } FlexVadConfig;
 
-// ストリームを開くための構成。`flexaudio_open` / `flexaudio_switch_source` に渡す。
+// Configuration for opening a stream. Passed to `flexaudio_open` / `flexaudio_switch_source`.
 //
-// 文字列・任意値は番兵で「未指定」を表す（`device_id` が NULL なら既定デバイス、
-// `process_id` が 0 ならなし、`output_rate`/`output_channels`/`chunk_ms` が 0 なら既定）。
+// Sentinel values mean "unspecified" for strings and optional values (`device_id` NULL selects the default device,
+// `process_id` 0 means none, and `output_rate`/`output_channels`/`chunk_ms` 0 select defaults).
 typedef struct FlexConfig {
-    // ソース種別。
+    // Source kind.
     enum FlexSourceKind kind;
-    // 選ぶデバイスの ID（UTF-8, NUL 終端）。NULL なら既定デバイス。
+    // ID of the selected device (UTF-8, NUL-terminated). NULL selects the default device.
     const char *device_id;
-    // process ソースの対象 PID。0 ならなし（process では start 時にエラーになりうる）。
+    // Target PID for a process source. 0 means none (may cause an error when starting a process source).
     uint32_t process_id;
-    // 対象 PID を含めるか除くか（process ソースのみ）。
+    // Whether to include or exclude the target PID (process sources only).
     enum FlexProcessMode mode;
-    // 自ホストの再生音をシステム音から除くか（system ソースのみ。mix では system 側
-    // に適用）。
+    // Whether to exclude this process's playback from system audio (system source only;
+    // for mix, applies to the system side).
     bool exclude_self;
-    // 出力サンプルレート（Hz）。0 なら 48000。
+    // Output sample rate (Hz). 0 selects 48000.
     uint32_t output_rate;
-    // 出力チャンネル数。0 なら 2。
+    // Output channel count. 0 selects 2.
     uint16_t output_channels;
-    // チャンク長（ミリ秒）。0 なら 20。
+    // Chunk duration (ms). 0 selects 20.
     uint32_t chunk_ms;
-    // 開始時の入力ゲイン（線形倍率）。0 なら 1.0（既定）。実行時のミュートは
-    // `flexaudio_set_gain(s, 0.0)` を使う。
+    // Input gain at start (linear multiplier). 0 selects 1.0 (default). For runtime mute, use
+    // `flexaudio_set_gain(s, 0.0)`.
     float gain;
-    // mix の mic 側で選ぶ入力デバイスの ID（UTF-8, NUL 終端・mix 専用）。
-    // NULL なら既定入力。
+    // Input device ID (UTF-8, NUL-terminated) for the mic side of mix (mix only).
+    // NULL selects the default input.
     const char *mix_mic_device_id;
-    // mix の system 側で選ぶ出力エンドポイントの ID（UTF-8, NUL 終端・mix 専用）。
-    // NULL なら既定出力。
+    // Output endpoint ID (UTF-8, NUL-terminated) for the system side of mix (mix only).
+    // NULL selects the default output.
     const char *mix_system_device_id;
-    // mix の mic 側の合成前倍率（線形・mix 専用）。0 なら 1.0（既定）。
-    // 合成後にグローバル `gain` が掛かる。
+    // Pre-mix linear gain for the mic side of mix (mix only). 0 selects 1.0 (default).
+    // Global `gain` is applied after mixing.
     float mix_mic_gain;
-    // mix の system 側の合成前倍率（線形・mix 専用）。0 なら 1.0（既定）。
+    // Pre-mix linear gain for the system side of mix (mix only). 0 selects 1.0 (default).
     float mix_system_gain;
-    // ノイズ抑制（RNNoise）をストリームに挟むか。`true` で有効。有効時は出力レートが
-    // 48000 でなければ `flexaudio_open` が失敗する（NULL + last_error）。denoise は
-    // `poll_chunk` が返す直前に data をインプレース処理する（VAD より前段）。
+    // Whether to apply noise suppression (RNNoise) to the stream. Enabled when `true`. The output rate must be
+    // 48000 or `flexaudio_open` fails (NULL + last_error). denoise
+    // processes data in place just before `poll_chunk` returns (before VAD).
     bool denoise;
-    // VAD（発話区間検出）をストリームに挟むか。`true` で `vad` の設定に従い、poll した
-    // 各チャンクを VAD に通して `FlexChunk::vad_events` を埋める。
+    // Whether to apply VAD (voice activity detection) to the stream. When `true`, each polled chunk is processed
+    // by VAD according to `vad` and populates `FlexChunk::vad_events`.
     bool has_vad;
-    // VAD の設定（`has_vad` が `true` のときだけ使う。`false` なら無視）。
+    // VAD configuration (used only when `has_vad` is `true`; ignored when `false`).
     struct FlexVadConfig vad;
 } FlexConfig;
 
-// VAD が確定した 1 イベント。`flexaudio_vad_process` の出力配列と `FlexChunk::vad_events`
-// に入る。
+// One event finalized by VAD. Stored in the output array of `flexaudio_vad_process` and in `FlexChunk::vad_events`
+//.
 //
-// `at_sample` は VAD 内部レート（`sample_rate`＝8000/16000）のサンプル基準で、入力
-// サンプル基準ではない（[`flexaudio_vad::VadEvent`] と同じ）。
+// `at_sample` is measured at the internal VAD rate (`sample_rate` = 8000/16000), not at the input
+// sample rate (same as [`flexaudio_vad::VadEvent`]).
 typedef struct FlexVadEvent {
-    // 種別。0 = 発話開始（SpeechStart）、1 = 発話終了（SpeechEnd）。
+    // Kind. 0 = speech start (SpeechStart), 1 = speech end (SpeechEnd).
     int32_t kind;
-    // イベントのサンプル位置（VAD 内部レート基準・開始は含む/終了は排他）。
+    // Event sample position at the internal VAD rate (start inclusive / end exclusive).
     int64_t at_sample;
 } FlexVadEvent;
 
-// 取得した 1 チャンクのオーディオデータ。`flexaudio_poll_chunk` が埋める。
+// One captured audio chunk, populated by `flexaudio_poll_chunk`.
 //
-// `data` は flexaudio 所有の interleaved f32 で、長さは `len`（= `frames * channels`）。
-// 使い終わったら必ず `flexaudio_chunk_free` で解放する（C の free は使わない）。
+// `data` is flexaudio-owned interleaved f32 with length `len` (= `frames * channels`).
+// Always release it with `flexaudio_chunk_free` when finished (do not use C `free`).
 typedef struct FlexChunk {
-    // interleaved f32 サンプルへのポインタ。`flexaudio_chunk_free` で解放する。
+    // Pointer to interleaved f32 samples. Release with `flexaudio_chunk_free`.
     float *data;
-    // `data` の要素数（= `frames * channels`）。
+    // Number of elements in `data` (= `frames * channels`).
     uintptr_t len;
-    // チャンク内のフレーム数。
+    // Number of frames in the chunk.
     uint32_t frames;
-    // 先頭サンプルの単調プレゼンテーションタイムスタンプ（ns）。
+    // Monotonic presentation timestamp (ns) of the first sample.
     int64_t pts_ns;
-    // ストリーム層が付与する単調増加のシーケンス番号。
+    // Monotonically increasing sequence number assigned by the stream layer.
     uint64_t seq;
-    // チャンクの状態フラグ（ChunkFlags のビット）。
+    // Chunk state flags (ChunkFlags bits).
     uint32_t flags;
-    // このチャンクが届くまでにドロップされたチャンク数。
+    // Number of chunks dropped before this chunk arrived.
     uint32_t dropped_before;
-    // 全サンプル絶対値の最大（線形振幅）。
+    // Maximum absolute sample value (linear amplitude).
     float peak;
-    // 全サンプルの二乗平均平方根（線形）。
+    // Root-mean-square value of all samples (linear).
     float rms;
-    // このチャンクで VAD が確定したイベント配列。VAD 無効時・イベント無しのときは
-    // NULL（`vad_events_len = 0`）。非 NULL のときは `flexaudio_chunk_free` が
-    // `data` と一緒に解放する。
+    // Events finalized by VAD for this chunk. NULL when VAD is disabled or there are no events
+    // (`vad_events_len = 0`). When non-NULL, `flexaudio_chunk_free` releases it
+    // together with `data`.
     struct FlexVadEvent *vad_events;
-    // `vad_events` の要素数。VAD 無効時・イベント無しでは 0。
+    // Number of `vad_events`. 0 when VAD is disabled or there are no events.
     uintptr_t vad_events_len;
 } FlexChunk;
 
-// 取得した 1 イベント。`flexaudio_poll_event` が埋める。
+// One captured event, populated by `flexaudio_poll_event`.
 //
-// `Error` のときはメッセージが `flexaudio_last_error` に入る。
+// For `Error`, the message is stored in `flexaudio_last_error`.
 typedef struct FlexEvent {
-    // イベント種別。
+    // Event kind.
     enum FlexEventKind kind;
-    // `ChunkDropped` のドロップ数。それ以外では 0。
+    // Number dropped for `ChunkDropped`; 0 for other kinds.
     int64_t count;
 } FlexEvent;
 
-// 列挙された 1 デバイスの情報（[`flexaudio::DeviceInfo`] に対応）。
+// Information for one enumerated device (corresponds to [`flexaudio::DeviceInfo`]).
 //
-// `id` / `name` は flexaudio 所有の UTF-8 NUL 終端文字列。配列ごと
-// `flexaudio_devices_free` で解放する（C の free は使わない）。
+// `id` / `name` are flexaudio-owned, NUL-terminated UTF-8 strings. Release the entire array with
+// `flexaudio_devices_free` (do not use C `free`).
 typedef struct FlexDeviceInfo {
-    // 安定 ID（`flexaudio_devices_free` で解放）。
+    // Stable ID (released by `flexaudio_devices_free`).
     char *id;
-    // 人間向け表示名（`flexaudio_devices_free` で解放）。
+    // Human-readable display name (released by `flexaudio_devices_free`).
     char *name;
-    // このデバイスをキャプチャするときのソース種別。
+    // Source kind used to capture this device.
     enum FlexSourceKind source_kind;
-    // ネイティブ（既定）サンプルレート（Hz）。
+    // Native (default) sample rate (Hz).
     uint32_t sample_rate;
-    // ネイティブ（既定）チャンネル数。
+    // Native (default) channel count.
     uint16_t channels;
-    // ループバック（システム出力の monitor）なら true。
+    // True for loopback (system-output monitor).
     bool is_loopback;
-    // OS の既定デバイスなら true。
+    // True if this is the OS default device.
     bool is_default;
 } FlexDeviceInfo;
 
-// 列挙された 1 プロセスの情報（[`flexaudio::ProcessInfo`] に対応）。
+// Information for one enumerated process (corresponds to [`flexaudio::ProcessInfo`]).
 //
-// `pid` を `FlexConfig::process_id` に渡すとそのプロセスを録れる。文字列は flexaudio 所有の
-// UTF-8 NUL 終端で、配列ごと `flexaudio_processes_free` で解放する（C の free は使わない）。
-// `executable` / `bundle_id` は取れなかったとき NULL。
+// Pass `pid` to `FlexConfig::process_id` to capture that process. Strings are flexaudio-owned,
+// NUL-terminated UTF-8 and released with the entire array by `flexaudio_processes_free` (do not use C `free`).
+// `executable` / `bundle_id` are NULL when unavailable.
 typedef struct FlexProcessInfo {
-    // OS のプロセス ID（0 以外）。
+    // OS process ID (nonzero).
     uint32_t pid;
-    // 表示名（常に非空。`flexaudio_processes_free` で解放）。
+    // Display name (never empty; released by `flexaudio_processes_free`).
     char *name;
-    // 実行ファイルのベース名。取れなければ NULL。
+    // Executable basename, or NULL if unavailable.
     char *executable;
-    // macOS の bundle ID。取れなければ（macOS 以外は常に）NULL。
+    // macOS bundle ID, or NULL if unavailable (always NULL outside macOS).
     char *bundle_id;
-    // 出力中か（不明なら `Unknown`）。
+    // Whether it is outputting audio (`Unknown` if unavailable).
     enum FlexOutputActivity output_activity;
 } FlexProcessInfo;
 
-// 取得した 1 つのデバイスイベント。`flexaudio_watcher_poll` が埋める。
+// One retrieved device event, populated by `flexaudio_watcher_poll`.
 //
-// フィールドの有効範囲は `kind` による:
-// - `Added`: `id`/`name` と `source_kind`/`sample_rate`/`channels`/`is_loopback`/`is_default`
-//   がすべて埋まる（追加されたデバイスの完全な情報）。
-// - `Removed`: `id` のみ（`name` は NULL・数値は 0）。
-// - `DefaultChanged`: `id` と `source_kind`（既定が切り替わった側）のみ。
+// Valid fields depend on `kind`:
+// - `Added`: all of `id`/`name` and `source_kind`/`sample_rate`/`channels`/`is_loopback`/`is_default`
+//   are populated (full details for the added device).
+// - `Removed`: only `id` (`name` is NULL and numeric fields are 0).
+// - `DefaultChanged`: only `id` and `source_kind` (the side whose default changed).
 //
-// `id`/`name` は flexaudio 所有の UTF-8 NUL 終端文字列で、[`flexaudio_device_event_free`]
-// で解放する（C の free は使わない）。
+// `id`/`name` are UTF-8 NUL-terminated strings owned by flexaudio; release them with
+// [`flexaudio_device_event_free`] (do not use C `free`).
 typedef struct FlexDeviceEvent {
-    // イベント種別。
+    // Event kind.
     enum FlexDeviceEventKind kind;
-    // 安定 ID（`Added`/`Removed`/`DefaultChanged` で有効・`flexaudio_device_event_free`
-    // で解放）。`Unknown` では NULL。
+    // Stable ID (valid for `Added`/`Removed`/`DefaultChanged`; release with
+    // `flexaudio_device_event_free`). NULL for `Unknown`.
     char *id;
-    // 表示名（`Added` のみ・`flexaudio_device_event_free` で解放）。他では NULL。
+    // Display name (`Added` only; release with `flexaudio_device_event_free`). NULL for other kinds.
     char *name;
-    // `Added` では当該デバイスのソース種別、`DefaultChanged` では既定が切り替わった側
-    // （`Mic` = 既定 source / `System` = 既定 sink）。他では未使用（`Mic`）。
+    // For `Added`, the device source kind. For `DefaultChanged`, the side whose default changed
+    // (`Mic` = default source / `System` = default sink). Unused for other kinds (`Mic`).
     enum FlexSourceKind source_kind;
-    // ネイティブサンプルレート（`Added` のみ・他では 0）。
+    // Native sample rate (`Added` only; 0 otherwise).
     uint32_t sample_rate;
-    // ネイティブチャンネル数（`Added` のみ・他では 0）。
+    // Native channel count (`Added` only; 0 otherwise).
     uint16_t channels;
-    // ループバック（`Added` のみ）。
+    // Whether this is loopback (`Added` only).
     bool is_loopback;
-    // OS の既定デバイス（`Added` のみ）。
+    // Whether this is the OS default device (`Added` only).
     bool is_default;
 } FlexDeviceEvent;
 
-// 構成からストリームを開く（まだ start しない）。失敗で NULL を返し last_error をセット。
+// Open a stream from the configuration (without starting it). On failure, return NULL and
+// set last_error.
 //
-// `config.denoise` / `config.has_vad` が有効なら、対応するアドオン（ノイズ抑制 / VAD）を
-// ここで構築してストリームに同居させる（`poll_chunk` が denoise → VAD の順で通す）。
-// denoise 有効時は出力レートが 48000 でなければ失敗する（NULL + last_error。RNNoise は
-// 48kHz 固定）。返ったハンドルは `flexaudio_free` で解放する。
+// If `config.denoise` / `config.has_vad` is enabled, build the corresponding add-ons (noise
+// suppression / VAD) here and attach them to the stream (`poll_chunk` applies denoise → VAD).
+// When denoise is enabled, the output rate must be 48000 (otherwise return NULL and set
+// last_error; RNNoise requires 48 kHz). Free the returned handle with `flexaudio_free`.
 //
 // # Safety
-// `config` は有効な `FlexConfig` を指していなければならない（NULL は失敗扱い）。
+// `config` must point to a valid `FlexConfig` (NULL is treated as a failure).
 struct FlexStream *flexaudio_open(const struct FlexConfig *config);
 
-// ストリームを停止してから解放する。NULL 安全。
+// Stop the stream, then free it. NULL-safe.
 //
 // # Safety
-// `s` は `flexaudio_open` が返したハンドル（または NULL）でなければならない。
-// 解放後の `s` を使ってはならない。
+// `s` must be a handle returned by `flexaudio_open` (or NULL). Do not use `s` after freeing it.
 void flexaudio_free(struct FlexStream *s);
 
-// キャプチャを開始する。
+// Start capture.
 //
 // # Safety
-// `s` は有効なハンドルでなければならない（NULL は InvalidArg）。
+// `s` must be a valid handle (NULL is InvalidArg).
 int32_t flexaudio_start(struct FlexStream *s);
 
-// キャプチャを停止する。
+// Stop capture.
 //
 // # Safety
-// `s` は有効なハンドルでなければならない（NULL は InvalidArg）。
+// `s` must be a valid handle (NULL is InvalidArg).
 int32_t flexaudio_stop(struct FlexStream *s);
 
-// 配信を一時停止する（デバイスは動かしたまま）。
+// Pause delivery while leaving the device running.
 //
 // # Safety
-// `s` は有効なハンドルでなければならない（NULL は InvalidArg）。
+// `s` must be a valid handle (NULL is InvalidArg).
 int32_t flexaudio_pause(struct FlexStream *s);
 
-// 一時停止を解除して配信を再開する。
+// Resume delivery after a pause.
 //
 // # Safety
-// `s` は有効なハンドルでなければならない（NULL は InvalidArg）。
+// `s` must be a valid handle (NULL is InvalidArg).
 int32_t flexaudio_resume(struct FlexStream *s);
 
-// 一時停止中なら true を返す。NULL や panic では false。
+// Return true if paused. Return false for NULL or on panic.
 //
 // # Safety
-// `s` は有効なハンドル（または NULL）でなければならない。
+// `s` must be a valid handle (or NULL).
 bool flexaudio_is_paused(const struct FlexStream *s);
 
-// 入力ゲイン（線形倍率）を変更する。1.0 でそのまま、2.0 で約 +6dB、0.0 で無音。
-// 録音中いつでも呼べて、次のチャンクから効く（20ms 粒度）。乗算後のサンプルは
-// ±1.0 にクランプされる。有限かつ 0 以上でなければ FLEX_INVALID_ARG。
+// Change the input gain (linear multiplier): 1.0 leaves it unchanged, 2.0 is about +6 dB,
+// and 0.0 is silent. Can be called during recording; it takes effect on the next chunk (20 ms
+// granularity). Samples are clamped to ±1.0 after multiplication. Must be finite and at least
+// 0, or FLEX_INVALID_ARG is returned.
 //
 // # Safety
-// `s` は有効なハンドルでなければならない（NULL は InvalidArg）。
-int32_t flexaudio_set_gain(struct FlexStream *s,
-                           float gain);
+// `s` must be a valid handle (NULL is InvalidArg).
+int32_t flexaudio_set_gain(struct FlexStream *s, float gain);
 
-// 現在の入力ゲイン（線形倍率）を返す。NULL や panic では 1.0。
+// Return the current input gain (linear multiplier). Return 1.0 for NULL or on panic.
 //
 // # Safety
-// `s` は有効なハンドル（または NULL）でなければならない。
+// `s` must be a valid handle (or NULL).
 float flexaudio_gain(const struct FlexStream *s);
 
-// 現在の backend のネイティブフォーマット `(sample_rate, channels)` を `sr`/`ch` に書く。
+// Write the current backend's native format `(sample_rate, channels)` to `sr` / `ch`.
 //
-// open 時に backend から取得した値で、`flexaudio_switch_source` で更新される。表示・診断用
-// （出力フォーマットは `config` で指定した値）。戻り 0 = 成功 / 負 = エラー。
+// These values come from the backend at open and are updated by `flexaudio_switch_source`.
+// They are for display / diagnostics; the output format is set in `config`. Return 0 on
+// success and a negative value on error.
 //
 // # Safety
-// `s` は有効なハンドル、`sr`/`ch` は有効な書き込み先でなければならない（NULL は InvalidArg）。
-int32_t flexaudio_native_format(const struct FlexStream *s,
-                                uint32_t *sr,
-                                uint16_t *ch);
+// `s` must be a valid handle, and `sr` / `ch` must be valid output pointers (NULL is InvalidArg).
+int32_t flexaudio_native_format(const struct FlexStream *s, uint32_t *sr, uint16_t *ch);
 
-// これまでにチャンクリングが DROP_OLDEST で捨てた累計チャンク数を返す。NULL や panic では 0。
+// Return the total number of chunks dropped by the chunk ring using DROP_OLDEST. Return 0 for
+// NULL or on panic.
 //
 // # Safety
-// `s` は有効なハンドル（または NULL）でなければならない。
+// `s` must be a valid handle (or NULL).
 uint64_t flexaudio_dropped_chunks(const struct FlexStream *s);
 
-// チャンクを 1 つ取り出して `out` を埋める。
+// Retrieve one chunk and fill `out`.
 //
-// 戻り 1 = 取得して `out` を埋めた / 0 = 今は無し / 負 = エラー。`out.data` は
-// flexaudio 所有で、使い終わったら `flexaudio_chunk_free` で解放する。
+// Return 1 when a chunk is retrieved and `out` is filled, 0 when none is available, or a
+// negative value on error. `out.data` is owned by flexaudio; free it with
+// `flexaudio_chunk_free` when done.
 //
-// アドオンが有効なら、返す前にチャンクを denoise → VAD の順で通す。VAD 有効時は
-// 確定したイベントが `out.vad_events`（要素数 `out.vad_events_len`）に入り、これも
-// `flexaudio_chunk_free` が `data` と一緒に解放する（無効時・イベント無しは NULL/0）。
+// If add-ons are enabled, the chunk passes through denoise → VAD before it is returned. When
+// VAD is enabled, confirmed events are stored in `out.vad_events` (with count
+// `out.vad_events_len`) and freed along with `data` by `flexaudio_chunk_free` (NULL/0 when
+// disabled or when there are no events).
 //
 // # Safety
-// `s` は有効なハンドル、`out` は有効な `FlexChunk` の書き込み先でなければならない。
-int32_t flexaudio_poll_chunk(struct FlexStream *s,
-                             struct FlexChunk *out);
+// `s` must be a valid handle, and `out` must point to a valid `FlexChunk` destination.
+int32_t flexaudio_poll_chunk(struct FlexStream *s, struct FlexChunk *out);
 
-// `flexaudio_poll_chunk` が埋めた `data` を解放し、`data=NULL` / `len=0` にする。
-// NULL・二重解放とも安全。
+// Free the `data` filled by `flexaudio_poll_chunk` and set `data=NULL` / `len=0`.
+// Safe for NULL and repeated calls.
 //
 // # Safety
-// `chunk` は `flexaudio_poll_chunk` が埋めた `FlexChunk`（または NULL）を指して
-// いなければならない。
+// `chunk` must point to a `FlexChunk` filled by `flexaudio_poll_chunk` (or be NULL).
 void flexaudio_chunk_free(struct FlexChunk *chunk);
 
-// イベントを 1 つ取り出して `out` を埋める。
+// Retrieve one event and fill `out`.
 //
-// 戻り 1 = 取得 / 0 = 今は無し / 負 = エラー。`Error` イベントのときは
-// `out.kind = Error` にし、メッセージを last_error に入れる。
-//
-// # Safety
-// `s` は有効なハンドル、`out` は有効な `FlexEvent` の書き込み先でなければならない。
-int32_t flexaudio_poll_event(struct FlexStream *s,
-                             struct FlexEvent *out);
-
-// 録音を止めずに入力ソースをホットスワップする。`config.gain` は無視される
-// （ゲインはストリームの状態。変更は `flexaudio_set_gain`）。同様に `config.denoise` /
-// `config.has_vad` / `config.vad` も無視される（アドオンは open 時に確定したものを保つ。
-// 出力フォーマットは switch_source で変えられないので、48k 制約や VAD 設定は不変）。
+// Return 1 when an event is retrieved, 0 when none is available, or a negative value on error.
+// For an `Error` event, set `out.kind = Error` and store the message in last_error.
 //
 // # Safety
-// `s` は有効なハンドル、`config` は有効な `FlexConfig` を指していなければならない。
-int32_t flexaudio_switch_source(struct FlexStream *s,
-                                const struct FlexConfig *config);
+// `s` must be a valid handle, and `out` must point to a valid `FlexEvent` destination.
+int32_t flexaudio_poll_event(struct FlexStream *s, struct FlexEvent *out);
 
-// 利用可能なデバイスを列挙し、配列を確保して `out_array` / `out_count` にセットする。
-//
-// 成功で 0。確保した配列は `flexaudio_devices_free` で解放する。ヘッドレス環境では
-// 0 件（`out_array=NULL` / `out_count=0`）でも成功扱い。
+// Hot-swap the input source without stopping capture. `config.gain` is ignored because gain is
+// stream state; change it with `flexaudio_set_gain`. `config.denoise` / `config.has_vad` /
+// `config.vad` are also ignored because the add-ons configured at open remain in use. Since
+// `switch_source` cannot change the output format, the 48 kHz constraint and VAD settings do
+// not change.
 //
 // # Safety
-// `out_array` / `out_count` は有効な書き込み先でなければならない（NULL は InvalidArg）。
-int32_t flexaudio_devices(struct FlexDeviceInfo **out_array,
-                          uintptr_t *out_count);
+// `s` must be a valid handle, and `config` must point to a valid `FlexConfig`.
+int32_t flexaudio_switch_source(struct FlexStream *s, const struct FlexConfig *config);
 
-// `flexaudio_devices` が確保した配列と各 `id`/`name` を解放する。NULL 安全。
+// List available devices, allocate an array, and set `out_array` / `out_count`.
+//
+// Return 0 on success. Free the allocated array with `flexaudio_devices_free`. In a headless
+// environment, an empty result (`out_array=NULL` / `out_count=0`) is still successful.
 //
 // # Safety
-// `arr`/`count` は `flexaudio_devices` が返したもの（または NULL/0）でなければならない。
-void flexaudio_devices_free(struct FlexDeviceInfo *arr,
-                            uintptr_t count);
+// `out_array` / `out_count` must be valid output pointers (NULL is InvalidArg).
+int32_t flexaudio_devices(struct FlexDeviceInfo **out_array, uintptr_t *out_count);
 
-// プロセス別キャプチャの対象にできる、音声出力のセッション（ストリーム）を持つ
-// プロセスを列挙し、配列を確保して `out_array` / `out_count` にセットする。
-// 呼び出し元プロセス自身は含まない。停止中・Idle も載る。今鳴っているかは
-// `output_activity` で見る。
-//
-// 成功で 0。候補が無ければ 0 件（`out_array=NULL` / `out_count=0`）で成功
-// （プロセス別キャプチャは使えるが、そういうプロセスが今は無い）。確保した配列は
-// `flexaudio_processes_free` で **1 回だけ** 解放する。この環境でプロセス別キャプチャが
-// 使えない（Linux で PipeWire に届かない・macOS 14.4 未満・Windows build 20348
-// 以上（Windows 11・Windows Server 2022）でない・非対応 OS・権限拒否）、OS が
-// 3 秒以内に応答しなかった、または前の問い合わせが
-// まだ終わっていないときは `FLEX_FAILURE`（理由は `flexaudio_last_error`）。
+// Free the array allocated by `flexaudio_devices` and each `id` / `name`. NULL-safe.
 //
 // # Safety
-// `out_array` / `out_count` は有効な書き込み先でなければならない（NULL は InvalidArg）。
-int32_t flexaudio_processes(struct FlexProcessInfo **out_array,
-                            uintptr_t *out_count);
+// `arr` / `count` must be values returned by `flexaudio_devices` (or NULL/0).
+void flexaudio_devices_free(struct FlexDeviceInfo *arr, uintptr_t count);
 
-// `flexaudio_processes` が確保した配列と各文字列を解放する。NULL 安全。
-// **1 回だけ**呼ぶこと（同じポインタへの二度呼びは二重解放＝未定義動作）。
+// List processes with audio output sessions (streams) that can be captured individually,
+// allocate an array, and set `out_array` / `out_count`. The calling process is excluded.
+// Processes whose audio sessions are stopped or idle are also included. Check `output_activity`
+// to see whether a process is currently producing audio.
+//
+// Return 0 on success. If there are no candidates, an empty result (`out_array=NULL` /
+// `out_count=0`) is still successful: per-process capture is available, but there are no
+// matching processes now. Free the allocated array **once only** with
+// `flexaudio_processes_free`. Return `FLEX_FAILURE` (with the reason in `flexaudio_last_error`)
+// if per-process capture is unavailable in this environment (PipeWire is unreachable on
+// Linux; macOS is earlier than 14.4; Windows is older than build 20348 (Windows 11 / Windows
+// Server 2022 or later is required); the OS is unsupported; or access is denied), if the OS does
+// not respond within 3 seconds, or if the previous query is still running.
 //
 // # Safety
-// `arr`/`count` は `flexaudio_processes` が返したもの（または NULL/0）でなければならず、
-// この関数は同じ `arr` に対して 1 回だけ呼ぶ。
-void flexaudio_processes_free(struct FlexProcessInfo *arr,
-                              uintptr_t count);
+// `out_array` / `out_count` must be valid output pointers (NULL is InvalidArg).
+int32_t flexaudio_processes(struct FlexProcessInfo **out_array, uintptr_t *out_count);
 
-// 現在のスレッドの直近エラーメッセージを返す。
+// Free the array allocated by `flexaudio_processes` and each string. NULL-safe.
+// Call **once only**; calling twice with the same pointer causes a double-free and undefined
+// behavior.
 //
-// 同一スレッドで次に last_error を更新する FFI 呼び出しまで有効。エラーが無ければ
-// NULL。返るポインタは flexaudio 所有で、C 側で free してはならない。
+// # Safety
+// `arr` / `count` must be values returned by `flexaudio_processes` (or NULL/0). Call this
+// function only once for the same `arr`.
+void flexaudio_processes_free(struct FlexProcessInfo *arr, uintptr_t count);
+
+// Return the most recent error message for the current thread.
+//
+// Valid until the next FFI call on the same thread updates last_error. Returns NULL if there
+// is no error. The returned pointer is owned by flexaudio; do not free it from C.
 const char *flexaudio_last_error(void);
 
-// チャンネル数（1 = mono / 2 = stereo interleaved）を指定して denoiser を構築する。
+// Creates a denoiser for the given channel count (1 = mono, 2 = interleaved stereo).
 //
-// `channels` が 1..=2 以外なら NULL を返し last_error をセット。返ったハンドルは
-// `flexaudio_denoise_free` で解放する。48kHz 前提はモジュールの説明を参照。
+// Returns NULL and sets last_error if `channels` is outside 1..=2. Release the returned
+// handle with `flexaudio_denoise_free`. See the module docs for the 48 kHz requirement.
 struct FlexDenoiser *flexaudio_denoise_new(uint16_t channels);
 
-// interleaved f32（48kHz・±1.0 正規化）を **インプレース**でノイズ抑制する。
+// Suppresses noise in interleaved f32 samples (48 kHz, normalized to ±1.0) **in place**.
 //
-// `len` はチャンネル数の倍数であること（倍数でなければ InvalidArg）。`len=0` は no-op。
-// 出力は入力を 480 サンプル/ch 遅らせた列で、ストリーム先頭のその分は無音になる。
-// 戻り 0 = 成功 / 負 = エラー。
+// `len` must be a multiple of the channel count (otherwise InvalidArg). `len=0` is a
+// no-op. Output is delayed by 480 samples per channel, so the beginning is silent.
+// Returns 0 on success and a negative value on error.
 //
 // # Safety
-// `d` は有効なハンドル、`samples` は `len` 要素の有効な可変配列（`len=0` なら NULL 可）で
-// なければならない。
-int32_t flexaudio_denoise_process(struct FlexDenoiser *d,
-                                  float *samples,
-                                  uintptr_t len);
+// `d` must be a valid handle. `samples` must point to a valid mutable array of `len`
+// elements; NULL is allowed when `len=0`.
+int32_t flexaudio_denoise_process(struct FlexDenoiser *d, float *samples, uintptr_t len);
 
-// RNN 状態・持ち越しバッファ・遅延線を初期化する（生成直後と同じ状態に戻す）。
+// Resets the RNN state, carry buffer, and delay line to their initial state.
 //
 // # Safety
-// `d` は有効なハンドルでなければならない（NULL は InvalidArg）。
+// `d` must be a valid handle (NULL is InvalidArg).
 int32_t flexaudio_denoise_reset(struct FlexDenoiser *d);
 
-// denoiser ハンドルを解放する。NULL 安全。
+// Releases a denoiser handle. NULL is safe.
 //
 // # Safety
-// `d` は `flexaudio_denoise_new` が返したハンドル（または NULL）でなければならない。
-// 解放後の `d` を使ってはならない。
+// `d` must be a handle returned by `flexaudio_denoise_new`, or NULL. Do not use `d`
+// after releasing it.
 void flexaudio_denoise_free(struct FlexDenoiser *d);
 
-// `path` に FLAC 書き出しを開く。`split_seconds = 0` で単一ファイル、1 以上で
-// `split_seconds` 秒ごとに `name-001.flac` 連番へローテーションする。
+// Open FLAC output at `path`. `split_seconds = 0` creates one file; values of 1 or more rotate to
+// numbered files such as `name-001.flac` every `split_seconds` seconds.
 //
-// 失敗（NULL / 不正な UTF-8 パス / 非対応の `sr`・`ch`）で NULL を返し last_error を
-// セットする。`ch` は 1..=2、`sr` は 1..=96000 Hz。返ったハンドルは
-// `flexaudio_flac_free` で解放する（`flexaudio_flac_finalize` を呼ばずに free しても
-// ベストエフォートで閉じる）。
+// On failure (NULL, invalid UTF-8 path, unsupported `sr` or `ch`), return NULL and set last_error.
+// `ch` must be 1..=2 and `sr` must be 1..=96000 Hz. Release the returned handle with
+// `flexaudio_flac_free` (free without `flexaudio_flac_finalize` still attempts a best-effort close).
 //
 // # Safety
-// `path` は有効な NUL 終端 C 文字列（UTF-8）を指していなければならない（NULL は失敗扱い）。
+// `path` must point to a valid NUL-terminated UTF-8 C string (NULL is treated as failure).
 struct FlexFlac *flexaudio_flac_create(const char *path,
                                        uint32_t sr,
                                        uint16_t ch,
                                        uint32_t split_seconds);
 
-// interleaved f32（長さ = フレーム数 × チャンネル数）を追記する。
+// Append interleaved f32 (length = frame count × channel count).
 //
-// `len` はチャンネル数の倍数であること（倍数でなければ InvalidArg）。`len=0` は no-op。
-// finalize 済みのハンドルへの write は [`FLEX_INVALID_STATE`](code::FLEX_INVALID_STATE)。
-// 戻り 0 = 成功 / 負 = エラー。
+// `len` must be a multiple of the channel count (otherwise InvalidArg). `len=0` is a no-op.
+// Writing to a finalized handle returns [`FLEX_INVALID_STATE`](code::FLEX_INVALID_STATE).
+// Returns 0 on success and a negative value on error.
 //
 // # Safety
-// `f` は有効なハンドル、`samples` は `len` 要素の有効な配列（`len=0` なら NULL 可）で
-// なければならない。
+// `f` must be a valid handle and `samples` a valid array of `len` elements (NULL is allowed when `len=0`).
 int32_t flexaudio_flac_write(struct FlexFlac *f,
                              const float *samples,
                              uintptr_t len);
 
-// 端数を書き切り、現在のファイルを確定して閉じる。以後の write は InvalidState。
+// Write any remaining data, finalize and close the current file. Further writes return InvalidState.
 //
-// 二重 finalize は安全（no-op で 0 を返す）。戻り 0 = 成功 / 負 = エラー。
+// Calling finalize more than once is safe (no-op returning 0). Returns 0 on success and a negative value on error.
 //
 // # Safety
-// `f` は有効なハンドルでなければならない（NULL は InvalidArg）。
+// `f` must be a valid handle (NULL is InvalidArg).
 int32_t flexaudio_flac_finalize(struct FlexFlac *f);
 
-// FLAC ハンドルを解放する。NULL 安全。
+// Release a FLAC handle. NULL-safe.
 //
-// finalize せずに free した場合も、内部の [`FlacWriter`] が drop 時にベストエフォートで
-// 端数書き出しとヘッダ確定を試みる（エラーは握り潰す。確実に検知したいなら先に
-// `flexaudio_flac_finalize` を呼ぶ）。
+// If freed without finalize, the internal [`FlacWriter`] still makes a best-effort attempt to
+// write remaining data and finalize the header on drop (errors are swallowed; call
+// `flexaudio_flac_finalize` first to detect them reliably).
 //
 // # Safety
-// `f` は `flexaudio_flac_create` が返したハンドル（または NULL）でなければならない。
-// 解放後の `f` を使ってはならない。
+// `f` must be a handle returned by `flexaudio_flac_create` (or NULL).
+// Do not use `f` after release.
 void flexaudio_flac_free(struct FlexFlac *f);
 
-// 設定から VAD を構築する。`config` が NULL なら既定設定（silero 準拠）。
+// Create a VAD from a config. A NULL `config` uses the defaults (Silero-compatible).
 //
-// 失敗（モデルのロード失敗・不正な sample_rate 等）で NULL を返し last_error をセット。
-// 返ったハンドルは `flexaudio_vad_free` で解放する。
+// Returns NULL and sets last_error on failure (model load failure, invalid sample_rate, etc.).
+// Free the returned handle with `flexaudio_vad_free`.
 //
 // # Safety
-// `config` は NULL か、有効な `FlexVadConfig` を指していなければならない。
+// `config` must be NULL or point to a valid `FlexVadConfig`.
 struct FlexVad *flexaudio_vad_new(const struct FlexVadConfig *config);
 
-// 任意フォーマット（`in_rate` / `in_ch` の interleaved f32）のサンプルを VAD に通し、
-// 確定したイベント配列を確保して `out` / `out_len` にセットする。
+// Process samples in any format (`in_rate` / `in_ch`, interleaved f32) through VAD,
+// allocate the confirmed event array, and set `out` / `out_len`.
 //
-// 内部で mono 化・VAD レートへのリサンプルをしてから処理する（[`flexaudio_vad::Vad::process_pcm`]）。
-// イベントが無ければ `out=NULL` / `out_len=0`。確保した配列は
-// `flexaudio_vad_events_free` で解放する。戻り 0 = 成功 / 負 = エラー。
+// Internally, convert to mono and resample to the VAD rate before processing ([`flexaudio_vad::Vad::process_pcm`]).
+// If there are no events, set `out=NULL` / `out_len=0`. Free the allocated array with
+// `flexaudio_vad_events_free`. Returns 0 on success or a negative value on error.
 //
 // # Safety
-// `v` は有効なハンドル、`samples` は `len` 要素の有効な配列（`len=0` なら NULL 可）、
-// `out` / `out_len` は有効な書き込み先でなければならない。
+// `v` must be a valid handle; `samples` must be a valid array of `len` elements (NULL is allowed when `len=0`);
+// `out` / `out_len` must point to valid writable locations.
 int32_t flexaudio_vad_process(struct FlexVad *v,
                               const float *samples,
                               uintptr_t len,
@@ -592,56 +586,53 @@ int32_t flexaudio_vad_process(struct FlexVad *v,
                               struct FlexVadEvent **out,
                               uintptr_t *out_len);
 
-// `flexaudio_vad_process` が確保したイベント配列を解放する。NULL / 0 は安全。
+// Free an event array allocated by `flexaudio_vad_process`. NULL / 0 is safe.
 //
 // # Safety
-// `events`/`len` は `flexaudio_vad_process` が返したもの（または NULL/0）でなければならない。
-void flexaudio_vad_events_free(struct FlexVadEvent *events,
-                               uintptr_t len);
+// `events` / `len` must come from `flexaudio_vad_process` (or be NULL / 0).
+void flexaudio_vad_events_free(struct FlexVadEvent *events, uintptr_t len);
 
-// VAD の状態（内部 state / context / 端数バッファ / リサンプラ）を初期化する。
+// Reset VAD state (internal state / context / remainder buffer / resampler).
 //
 // # Safety
-// `v` は有効なハンドルでなければならない（NULL は InvalidArg）。
+// `v` must be a valid handle (NULL is InvalidArg).
 int32_t flexaudio_vad_reset(struct FlexVad *v);
 
-// VAD ハンドルを解放する。NULL 安全。
+// Free a VAD handle. NULL is safe.
 //
 // # Safety
-// `v` は `flexaudio_vad_new` が返したハンドル（または NULL）でなければならない。
-// 解放後の `v` を使ってはならない。
+// `v` must be a handle returned by `flexaudio_vad_new` (or NULL).
+// Do not use `v` after freeing it.
 void flexaudio_vad_free(struct FlexVad *v);
 
-// デバイスの着脱・既定変更の監視を開始し、ウォッチャハンドルを返す。
+// Start monitoring device connection and default changes, then return a watcher handle.
 //
-// Linux は PipeWire レジストリを永続監視する。PipeWire 不在・非対応 OS では no-op へ
-// 縮退して有効なハンドルを返す（着脱が来ないだけ・poll は常に 0）。失敗時のみ NULL +
-// last_error。返ったハンドルは `flexaudio_watcher_free` で解放する。
+// On Linux, continuously monitor the PipeWire registry. If PipeWire is unavailable or the OS is
+// unsupported, degrade to a no-op and return a valid handle (no device events arrive; poll always
+// returns 0). Only failures return NULL + last_error. Release the returned handle with
+// `flexaudio_watcher_free`.
 struct FlexWatcher *flexaudio_watch_devices(void);
 
-// デバイスイベントを 1 つ取り出して `out` を埋める（非ブロッキング）。
+// Retrieve one device event into `out` (non-blocking).
 //
-// 戻り 1 = 取得して `out` を埋めた / 0 = 今は無し / 負 = エラー。埋めた `out` は使い
-// 終わったら `flexaudio_device_event_free` で解放する。
+// Return 1 = retrieved and filled `out` / 0 = none currently available / negative = error. Release
+// a populated `out` with `flexaudio_device_event_free` when finished.
 //
 // # Safety
-// `w` は有効なハンドル、`out` は有効な `FlexDeviceEvent` の書き込み先でなければならない。
-int32_t flexaudio_watcher_poll(struct FlexWatcher *w,
-                               struct FlexDeviceEvent *out);
+// `w` must be a valid handle and `out` must point to a valid `FlexDeviceEvent` destination.
+int32_t flexaudio_watcher_poll(struct FlexWatcher *w, struct FlexDeviceEvent *out);
 
-// `flexaudio_watcher_poll` が埋めた `id`/`name` を解放し、NULL にする。NULL・二重解放
-// とも安全。
+// Release `id`/`name` populated by `flexaudio_watcher_poll` and set them to NULL. Safe for NULL and
+// repeated calls.
 //
 // # Safety
-// `ev` は `flexaudio_watcher_poll` が埋めた `FlexDeviceEvent`（または NULL）を指して
-// いなければならない。
+// `ev` must point to a `FlexDeviceEvent` populated by `flexaudio_watcher_poll`, or be NULL.
 void flexaudio_device_event_free(struct FlexDeviceEvent *ev);
 
-// ウォッチャを停止して解放する。NULL 安全。
+// Stop and release the watcher. NULL-safe.
 //
 // # Safety
-// `w` は `flexaudio_watch_devices` が返したハンドル（または NULL）でなければならない。
-// 解放後の `w` を使ってはならない。
+// `w` must be a handle returned by `flexaudio_watch_devices`, or NULL. Do not use `w` after release.
 void flexaudio_watcher_free(struct FlexWatcher *w);
 
 #endif  /* FLEXAUDIO_H */

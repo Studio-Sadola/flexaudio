@@ -1,19 +1,19 @@
-//! flexaudio-encode — 録音チャンクを逐次 FLAC ファイルへ圧縮保存するアドオン。
+//! flexaudio-encode — an add-on that compresses recording chunks into FLAC files as they arrive.
 //!
-//! `flexaudio-core` には依存せず、interleaved `&[f32]` のサンプル列だけを受け取る。
-//! エンコードは純 Rust の flacenc で行うので、システムライブラリも実行時ネットワークも
-//! 要らない。長時間録音を WAV のまま置くとギガバイト級になるところを、可逆のまま
-//! おおむね半分前後まで圧縮できる（例: 3 時間の会議録音 WAV 約 2GB → FLAC 数百 MB）。
+//! It does not depend on `flexaudio-core` and accepts only interleaved `&[f32]` samples.
+//! Encoding uses the pure Rust `flacenc` crate, with no system libraries or runtime
+//! network access. It can losslessly compress long recordings to roughly half the size
+//! of WAV (for example, a 3-hour meeting recording of about 2 GB becomes a few hundred MB).
 //!
-//! チャンクを受け取るたびにブロック単位でエンコードしてファイルへ流すため、録音の
-//! 長さに関係なくメモリ使用量は一定。ストリーム情報（総サンプル数・MD5 など）は
-//! [`FlacWriter::finalize`] でヘッダに書き戻して確定する。
+//! Each incoming chunk is encoded in blocks and streamed to a file, so memory use stays
+//! constant regardless of recording length. Stream metadata (total sample count, MD5,
+//! etc.) is finalized in the header by [`FlacWriter::finalize`].
 //!
-//! # 例
+//! # Example
 //! ```no_run
 //! use flexaudio_encode::FlacWriter;
 //!
-//! // flexaudio の正規形 (48kHz / stereo) をそのまま渡す想定。
+//! // Pass flexaudio's canonical format (48 kHz / stereo) directly.
 //! let mut writer = FlacWriter::create("meeting.flac", 48_000, 2).unwrap();
 //! for chunk in some_audio_chunks() {
 //!     writer.write_chunk(chunk).unwrap();

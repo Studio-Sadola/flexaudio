@@ -1,28 +1,28 @@
-//! flexaudio-mic — cpal によるマイク入力バックエンド（全 OS）。
+//! flexaudio-mic — cross-platform microphone input backend using cpal.
 //!
-//! [`CpalMicBackend`] は cpal で入力デバイスから生 interleaved `f32` フレームを取り、
-//! [`RawSink`] へ非ブロッキングに push する [`CaptureBackend`] 実装。検証は主に
-//! Linux/ALSA だが、cpal が対応する OS なら動く。
+//! [`CpalMicBackend`] implements [`CaptureBackend`]. It reads raw interleaved `f32` frames
+//! from an input device through cpal and pushes them to [`RawSink`] without blocking. It is
+//! tested mainly on Linux/ALSA, but works on any OS supported by cpal.
 //!
-//! # `cpal::Stream` が `!Send` なので所有スレッドへ閉じ込める
-//! [`CaptureBackend`] は `Send` を要求するが [`cpal::Stream`] は `!Send` なので、
-//! backend 構造体に直接持てない。[`start`](CpalMicBackend::start) でスレッドを
-//! spawn し、その中で stream を build + `play()` して停止シグナルまで `park` する。
-//! 停止時にそのスレッドが Stream を drop してキャプチャが止まる。構造体自身が持つのは
-//! `Send` なもの（停止フラグ・[`JoinHandle`]・キャッシュ済みフォーマット）だけ。
+//! # Keep `cpal::Stream` on its owner thread because it is `!Send`
+//! [`CaptureBackend`] requires `Send`, but [`cpal::Stream`] is `!Send` and cannot be stored
+//! directly in the backend struct. [`start`](CpalMicBackend::start) spawns a thread that
+//! builds and plays the stream, then parks until signaled to stop. That thread drops the
+//! stream on shutdown, stopping capture. The struct stores only `Send` values (a stop flag,
+//! [`JoinHandle`], and the cached format).
 //!
 //! ```no_run
 //! use flexaudio_mic::CpalMicBackend;
 //! use flexaudio_core::{CaptureBackend, RawSink, raw_ring};
 //!
-//! // 既定入力デバイス（device_id = None）。特定デバイスを選ぶなら
-//! // `CpalMicBackend::new(Some("デバイス名".into()))`（id = デバイス名）。
+//! // Default input device (device_id = None). To choose a specific device, use
+//! // `CpalMicBackend::new(Some("device name".into()))` (id = device name).
 //! let mut backend = CpalMicBackend::new(None);
 //! let (rate, channels) = backend.native_format();
-//! let (prod, _cons) = raw_ring(rate as usize * channels as usize); // 1 秒ぶん
+//! let (prod, _cons) = raw_ring(rate as usize * channels as usize); // one second of audio
 //! let sink = RawSink::new(prod, rate, channels);
 //! backend.start(sink).unwrap();
-//! // ... _cons から生フレームを pop ...
+//! // ... pop raw frames from _cons ...
 //! backend.stop();
 //! ```
 
@@ -44,17 +44,17 @@ use flexaudio_core::types::{DeviceInfo, Error, Result, SourceKind};
 #[cfg(windows)]
 mod windows_keeper;
 
-/// 入力デバイスが取れないとき [`native_format`](CpalMicBackend::native_format) が
-/// 返す既定フォーマット `(48000 Hz, mono)`。`start` 時にデバイスが無ければ
-/// [`Error::DeviceNotFound`] になる。
+/// Fallback format `(48000 Hz, mono)` returned by
+/// [`native_format`](CpalMicBackend::native_format) when no input device is available.
+/// If no device exists at `start`, return [`Error::DeviceNotFound`].
 const FALLBACK_FORMAT: (u32, u16) = (48_000, 1);
 
-/// cpal の既定ホストを返す唯一の入口。
+/// The only entry point that returns cpal's default host.
 ///
-/// Windows では、cpal 0.16 の process-wide WASAPI enumerator が最初に生成された STA
-/// スレッドの COM lifetime に依存する。先に keeper で enumerator を初期化完了してから
-/// host を返すことで、短命な呼出側スレッドが最初の生成元になる競合を構造的に防ぐ。
-/// 他 OS では keeper を作らず、従来どおり `cpal::default_host()` をそのまま返す。
+/// On Windows, cpal 0.16's process-wide WASAPI enumerator depends on the COM lifetime of the
+/// STA thread that first creates it. Initialize the enumerator through a keeper before
+/// returning the host, preventing a short-lived caller thread from becoming the first
+/// creator. Other OSes skip the keeper and return `cpal::default_host()` as before.
 fn cpal_default_host() -> Result<cpal::Host> {
     #[cfg(windows)]
     windows_keeper::ensure()?;
@@ -62,37 +62,37 @@ fn cpal_default_host() -> Result<cpal::Host> {
     Ok(cpal::default_host())
 }
 
-/// cpal によるマイク入力キャプチャバックエンド。
+/// Microphone input capture backend using cpal.
 ///
-/// 既定入力デバイス（`device_id = None`）か、デバイス名で選んだ入力デバイス
-/// （`device_id = Some(id)`）から生 interleaved `f32` フレームを取り [`RawSink`] へ
-/// 流す。詳細はモジュールドキュメント参照。
+/// Reads raw interleaved `f32` frames from the default input device (`device_id = None`) or
+/// from a device selected by name (`device_id = Some(id)`), then sends them to [`RawSink`].
+/// See the module docs for details.
 ///
-/// `Send`。持つのは停止フラグ・[`JoinHandle`]・キャッシュ済みフォーマット・
-/// device_id だけで、`!Send` な [`cpal::Stream`] は所有スレッド内に閉じ込める。
+/// This type is `Send`. It stores only a stop flag, [`JoinHandle`], cached format, and
+/// device_id; the `!Send` [`cpal::Stream`] stays on its owner thread.
 pub struct CpalMicBackend {
-    /// 所有スレッドへの停止指示。`true` で stream を drop して終了する。
+    /// Stop signal for the owner thread. When `true`, it drops the stream and exits.
     stop_flag: Arc<AtomicBool>,
-    /// cpal stream を所有するスレッドのハンドル（start 後に `Some`）。
+    /// Handle to the thread that owns the cpal stream (`Some` after start).
     handle: Option<JoinHandle<()>>,
-    /// `new` 時に問い合わせてキャッシュしたネイティブフォーマット。
+    /// Native format queried and cached by `new`.
     native: (u32, u16),
-    /// 選択する入力デバイスの ID（デバイス名）。`None` で既定入力デバイス。
+    /// ID (device name) of the selected input device. `None` uses the default input device.
     device_id: Option<String>,
 }
 
 impl CpalMicBackend {
-    /// マイクバックエンドを構築する。
+    /// Create a microphone backend.
     ///
     /// `device_id`:
-    /// - `None` → 既定入力デバイス（`host.default_input_device()`）。
-    /// - `Some(id)` → `host.input_devices()` を走査し `device.name()? == id` の最初の
-    ///   デバイス（id は [`list_devices`] が返すデバイス名）。
+    /// - `None` → default input device (`host.default_input_device()`).
+    /// - `Some(id)` → first device in `host.input_devices()` where `device.name()? == id`
+    ///   (id is a device name returned by [`list_devices`]).
     ///
-    /// 選んだデバイスのネイティブフォーマットを問い合わせてキャッシュする。デバイスが
-    /// 無い／一致しない／問い合わせ失敗なら `FALLBACK_FORMAT`（`(48000, 1)`）を
-    /// キャッシュする。new 自体は panic もエラーもせず必ず成功し、device_id が一致
-    /// しなければ [`start`](Self::start) で [`Error::DeviceNotFound`] になる。
+    /// Query and cache the selected device's native format. If the device is missing, does
+    /// not match, or the query fails, cache `FALLBACK_FORMAT` (`(48000, 1)`). `new` always
+    /// succeeds without panicking or returning an error; if device_id does not match,
+    /// [`start`](Self::start) returns [`Error::DeviceNotFound`].
     pub fn new(device_id: Option<String>) -> Self {
         let native = query_native_format(device_id.as_deref()).unwrap_or(FALLBACK_FORMAT);
         Self {
@@ -110,22 +110,23 @@ impl Default for CpalMicBackend {
     }
 }
 
-/// `device_id` の入力デバイスを cpal ホストから解決する。
+/// Resolve the input device for `device_id` from the cpal host.
 ///
-/// - `None` → `host.default_input_device()`（取れなければ [`Error::DeviceNotFound`]）。
-/// - `Some(id)` → `host.input_devices()` を走査し `device.name()? == id` の最初の
-///   一致を返す。無ければ [`Error::DeviceNotFound`]。
+/// - `None` → `host.default_input_device()` (or [`Error::DeviceNotFound`] if unavailable).
+/// - `Some(id)` → Return the first device in `host.input_devices()` where `device.name()? == id`,
+///   or [`Error::DeviceNotFound`] if none match.
 ///
-/// 名前が取れないデバイスは比較できないのでスキップ。`input_devices()` 自体が失敗
-/// する環境（ALSA 不在等）も [`Error::DeviceNotFound`] に写す。
+/// Skip devices whose names cannot be read because they cannot be compared. If
+/// `input_devices()` itself fails (for example, because ALSA is unavailable), map it to
+/// [`Error::DeviceNotFound`].
 fn resolve_input_device(host: &cpal::Host, device_id: Option<&str>) -> Result<Device> {
     match device_id {
         None => host.default_input_device().ok_or(Error::DeviceNotFound),
-        // デバイス名で一致する最初のデバイス。
+        // First device whose name matches.
         Some(id) => {
             let devices = host.input_devices().map_err(|_| Error::DeviceNotFound)?;
             for device in devices {
-                // 名前が取れないデバイスは比較できないのでスキップ。
+                // Skip devices whose names cannot be read because they cannot be compared.
                 if let Ok(name) = device.name() {
                     if name == id {
                         return Ok(device);
@@ -137,9 +138,9 @@ fn resolve_input_device(host: &cpal::Host, device_id: Option<&str>) -> Result<De
     }
 }
 
-/// `device_id` で選択した入力デバイスのネイティブフォーマット
-/// `(sample_rate, channels)` を取得する。デバイス解決／設定取得に失敗すれば `None`
-/// （呼び元が [`FALLBACK_FORMAT`] へ落とす）。
+/// Get the native `(sample_rate, channels)` format for the input device selected by
+/// `device_id`. Return `None` if resolving the device or reading its configuration fails
+/// (the caller falls back to [`FALLBACK_FORMAT`]).
 fn query_native_format(device_id: Option<&str>) -> Option<(u32, u16)> {
     let host = cpal_default_host().ok()?;
     let device = resolve_input_device(&host, device_id).ok()?;
@@ -147,25 +148,26 @@ fn query_native_format(device_id: Option<&str>) -> Option<(u32, u16)> {
     Some((config.sample_rate().0, config.channels()))
 }
 
-/// 入力（マイク）デバイスを列挙する。`devices()` のマイク分。
+/// Enumerate input (microphone) devices, for the microphone portion of `devices()`.
 ///
-/// `host.input_devices()` を走査し各デバイスを [`DeviceInfo`] へ写す:
-/// - `id` / `name`: cpal は永続 ID を持たないので device name を ID 代わりに両方へ
-///   入れる（再接続で index が変わるため。同一構成なら同じ name）。
-/// - `sample_rate` / `channels`: `default_input_config()` から。取れない（実際には
-///   開けない等）デバイスはスキップ。
-/// - `source_kind = Mic` / `is_loopback = false`。
-/// - `is_default`: `host.default_input_device()` の name と一致すれば `true`。
+/// Walk `host.input_devices()` and convert each device to [`DeviceInfo`]:
+/// - `id` / `name`: cpal has no persistent device ID, so use the device name for both. The
+///   index can change after reconnecting, while the name remains the same for the same setup.
+/// - `sample_rate` / `channels`: from `default_input_config()`. Skip devices whose config
+///   cannot be read (for example, devices that cannot actually be opened).
+/// - `source_kind = Mic` / `is_loopback = false`.
+/// - `is_default`: `true` when the name matches `host.default_input_device()`.
 ///
-/// デバイスが無い／ホスト初期化失敗の環境では空 `Vec`（panic しない）。同名デバイス
-/// が複数あると id が重複し得るが、cpal でこれ以上安定なキーは取れないので許容する。
+/// Return an empty `Vec` without panicking if no devices exist or host initialization fails.
+/// IDs may collide when multiple devices share a name, but cpal provides no more stable key,
+/// so this is accepted.
 pub fn list_devices() -> Result<Vec<DeviceInfo>> {
     let host = cpal_default_host()?;
 
-    // 既定入力デバイス名（is_default 判定用）。取れなければ既定一致は付かない。
+    // Default input device name (for is_default); if unavailable, no device is marked default.
     let default_name = host.default_input_device().and_then(|d| d.name().ok());
 
-    // input_devices() 自体が失敗する環境（ALSA 不在等）は空リスト扱い。
+    // Treat input_devices() failures (such as missing ALSA) as an empty list.
     let devices = match host.input_devices() {
         Ok(it) => it,
         Err(_) => return Ok(Vec::new()),
@@ -173,11 +175,11 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
 
     let mut out = Vec::new();
     for device in devices {
-        // name が取れないデバイスは ID を作れないのでスキップ。
+        // Skip devices whose name cannot be read because an ID cannot be created.
         let Ok(name) = device.name() else {
             continue;
         };
-        // 既定入力 config が取れない＝広告されていても実際には開けない。スキップ。
+        // Skip devices whose default input config is unavailable; they may be advertised but cannot be opened.
         let Ok(config) = device.default_input_config() else {
             continue;
         };
@@ -201,17 +203,17 @@ impl CaptureBackend for CpalMicBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
-        // 既に所有スレッドが生きていれば何もしない（二重 start に安全）。
+        // Do nothing if the owner thread is already alive (safe for repeated start calls).
         if self.handle.is_some() {
             return Ok(());
         }
-        // 前回の stop 後でも再 start できるようフラグをリセット。
+        // Reset the flag so start can be called again after stop.
         self.stop_flag.store(false, Ordering::SeqCst);
 
         let stop_flag = self.stop_flag.clone();
-        // cpal::Device は !Send なので、device_id 文字列だけ渡してスレッド内で解決する。
+        // cpal::Device is !Send, so pass only the device_id string and resolve it on the thread.
         let device_id = self.device_id.clone();
-        // build/play の成否を所有スレッドから start() へ返す ready channel。
+        // Ready channel reports build/play success or failure from the owner thread to start().
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
 
         let handle = thread::Builder::new()
@@ -221,18 +223,18 @@ impl CaptureBackend for CpalMicBackend {
             })
             .map_err(|e| Error::Backend(format!("spawn cpal mic thread: {e}")))?;
 
-        // 所有スレッドが stream を build + play できたか待つ。
+        // Wait for the owner thread to build and play the stream.
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.handle = Some(handle);
                 Ok(())
             }
             Ok(Err(e)) => {
-                // build/play 失敗。所有スレッドは ready 送信後に即終了するので join。
+                // Build/play failed. The owner thread exits after sending ready, so join it.
                 let _ = handle.join();
                 Err(e)
             }
-            // ready 送信前に所有スレッドが死んだ（通常ありえない）。
+            // The owner thread died before sending ready (should not normally happen).
             Err(_) => {
                 let _ = handle.join();
                 Err(Error::Backend(
@@ -243,10 +245,10 @@ impl CaptureBackend for CpalMicBackend {
     }
 
     fn stop(&mut self) {
-        // handle が無ければ何もしない（再入・二重 stop に安全）。
+        // Do nothing if there is no handle (safe for re-entry and repeated stop calls).
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
-            // 所有スレッドは park 中。unpark で起こし、Stream を drop させて終了。
+            // The owner thread is parked. Wake it so it drops the Stream and exits.
             h.thread().unpark();
             let _ = h.join();
         }
@@ -259,11 +261,11 @@ impl Drop for CpalMicBackend {
     }
 }
 
-/// 所有スレッド本体。cpal input stream を build + play し、停止まで park する。
+/// Owner-thread body. Builds and plays the cpal input stream, then parks until stopped.
 ///
-/// build/play の成否を `ready_tx` で [`CpalMicBackend::start`] へ報告する。成功後は
-/// `stop_flag` が立つまで park して `stream` を生かし、立ったら関数を抜けて
-/// `stream` を drop することでキャプチャを止める。
+/// Reports build/play success or failure to [`CpalMicBackend::start`] through `ready_tx`.
+/// After success, parks with `stream` alive until `stop_flag` is set, then exits and drops
+/// `stream` to stop capture.
 fn run_capture_thread(
     sink: RawSink,
     device_id: Option<String>,
@@ -273,7 +275,7 @@ fn run_capture_thread(
     let stream = match build_stream(sink, device_id.as_deref()) {
         Ok(s) => s,
         Err(e) => {
-            // 失敗を報告して即終了。
+            // Report the failure and exit immediately.
             let _ = ready_tx.send(Err(e));
             return;
         }
@@ -284,37 +286,37 @@ fn run_capture_thread(
         return;
     }
 
-    // ここまで来れば起動成功。
+    // The stream has started successfully.
     let _ = ready_tx.send(Ok(()));
 
-    // stop シグナルまで stream を生かしたまま park する。
-    // 偽の wakeup に備え stop_flag を毎回確認する。
+    // Keep the stream alive while parked until the stop signal arrives.
+    // Check stop_flag each time in case of a spurious wakeup.
     while !stop_flag.load(Ordering::SeqCst) {
         thread::park();
     }
-    // ここを抜けると stream が drop されキャプチャが停止する。
+    // Leaving this scope drops the stream and stops capture.
     drop(stream);
 }
 
-/// RT 変換コールバックのスクラッチを事前確保するときに見込む最大ブロック長（秒）。
+/// Maximum expected block duration (seconds) used to preallocate scratch for RT conversion callbacks.
 ///
-/// 1 コールバックの最大フレーム数を、ネイティブ SR×ch × この秒数で見積もって
-/// stream セットアップ時に確保する。実機のブロックは通常 数 ms〜数十 ms なので
-/// 1 秒ぶんあれば定常状態で容量拡大（= RT 内アロケート）は起きない。想定を超える
-/// 巨大ブロックが来ても、[`fill_scratch`] が一度だけ `reserve` で広げて以後その容量
-/// を保つ（panic しない）。
+/// Estimate the maximum frames per callback as native sample rate × channels × this duration,
+/// then allocate during stream setup. Hardware blocks are usually a few to tens of ms, so a
+/// one-second allocation avoids growth (and RT allocation) during steady state. If a larger
+/// block arrives, [`fill_scratch`] grows once with `reserve` and retains that capacity without
+/// panicking.
 const MAX_SCRATCH_SECONDS: usize = 1;
 
-/// 変換経路（I16/U16/I32）の RT コールバックで、interleaved 入力を変換しながら
-/// 事前確保済みスクラッチへ詰める。
+/// In RT callbacks for conversion paths (I16/U16/I32), convert interleaved input into the
+/// preallocated scratch buffer.
 ///
-/// `scratch` は stream セットアップ時に最大ブロック長で確保済み。定常状態では容量内
-/// なので `clear` + `push` は再確保を起こさない。`n` が容量を超えたときだけ一度
-/// `reserve` で広げ、以後その容量を保つ。`convert` を各サンプルへ適用する。
+/// `scratch` is allocated for the maximum block size during stream setup. In steady state,
+/// `clear` + `push` stay within capacity and do not reallocate. If `n` exceeds capacity, grow
+/// once with `reserve` and retain that capacity. Apply `convert` to each sample.
 #[inline]
 fn fill_scratch<T: Copy>(scratch: &mut Vec<f32>, data: &[T], convert: impl Fn(T) -> f32) {
     let n = data.len();
-    // 容量内なら reserve は何もしない。容量超のときだけ一度広げる。
+    // reserve is a no-op within capacity; grow once only when capacity is exceeded.
     if n > scratch.capacity() {
         scratch.reserve(n - scratch.capacity());
     }
@@ -324,30 +326,32 @@ fn fill_scratch<T: Copy>(scratch: &mut Vec<f32>, data: &[T], convert: impl Fn(T)
     }
 }
 
-/// プライミング過渡バッファと判定する f32 ピーク振幅の閾値。
+/// f32 peak-amplitude threshold for identifying priming transient buffers.
 ///
-/// flexaudio の f32 サンプルは契約上 `[-1.0, 1.0]`。Linux の PipeWire ALSA 互換
-/// ブリッジ（`default` PCM）は、冷えた状態で stream を開くと開始直後の数百 ms ぶん
-/// 範囲を大きく超えたフルスケール矩形のプライミング用ダミーバッファを吐く（実測ピーク
-/// ≈ 3.3、左右ほぼ逆相なので source 段では DC≈0 だが、下流のレート変換で巨大 DC と
-/// クリップに化ける）。正常音声は契約上 1.0 が上限なので、ピークが 1.0 を明確に超えた
-/// バッファを過渡とみなせる。±1.0 ちょうどの正常音声を巻き込まないよう 1.0 直上に置く。
+/// flexaudio's f32 samples are contractually in `[-1.0, 1.0]`. When a Linux PipeWire ALSA
+/// compatibility bridge (`default` PCM) opens a stream from a cold state, it emits full-scale
+/// rectangular priming buffers for the first few hundred ms, far outside this range (measured
+/// peak ≈ 3.3; the channels are nearly opposite-phase, so source-stage DC is ≈0, but later
+/// resampling turns it into huge DC and clipping). Since valid audio is capped at 1.0 by the
+/// contract, a peak clearly above 1.0 identifies a transient. Set the limit just above 1.0 so
+/// valid audio at exactly ±1.0 is not caught.
 const PRIMING_PEAK_LIMIT: f32 = 1.001;
 
-/// キャプチャ開始直後のプライミング過渡バッファを破棄するガード。
+/// Guard that discards priming transient buffers immediately after capture starts.
 ///
-/// 過渡バッファは `[-1.0, 1.0]` を超えるフルスケール矩形なので、ピークが
-/// [`PRIMING_PEAK_LIMIT`] を超えるバッファだけ捨てる。
+/// Transient buffers are full-scale rectangles outside `[-1.0, 1.0]`; discard only buffers
+/// whose peak exceeds [`PRIMING_PEAK_LIMIT`].
 ///
-/// 固定秒数で頭を捨てる方式は、過渡の無い環境（Mac / Windows / warm な Linux）でも
-/// 頭出し無音を作ってしまう。ピークだけ見て過渡か判定するので、過渡が無い環境では
-/// 1 バッファも捨てず、過渡の実長にも自動追従する。
+/// Discarding a fixed duration would add leading silence even on systems without transients
+/// (Mac / Windows / warm Linux). Checking only the peak means no buffers are discarded when
+/// there is no transient, and the guard automatically follows the transient's actual duration.
 ///
-/// 先頭側が過渡（範囲外）に見える間だけ捨て、レンジ内バッファが 1 つ来たら以後は
-/// 永久に通す（latch-open）。過渡は起動直後だけ現れて単調減衰するので途中で再発
-/// しない。RT コールバック内専用なので、判定はバッファ 1 走査の `abs` 比較だけ。
+/// Discard buffers only while the leading buffers look transient (out of range). Once one
+/// in-range buffer arrives, latch open and pass everything from then on. Transients occur
+/// only at startup and decay monotonically, so they do not recur. Used only in RT callbacks;
+/// detection is a single buffer scan with `abs` comparisons.
 struct TransientGuard {
-    /// 既に正常（レンジ内）バッファを通したか。`true` 以降は常に通す。
+    /// Whether a valid (in-range) buffer has already passed. Always pass buffers after this is `true`.
     latched: bool,
 }
 
@@ -356,15 +360,15 @@ impl TransientGuard {
         Self { latched: false }
     }
 
-    /// interleaved f32 バッファを与え、プライミング過渡（捨てるべき）なら `true`。
-    /// レンジ内バッファを 1 つでも通したら、以後は常に `false`（通す）。
+    /// Given an interleaved f32 buffer, return `true` if it is a priming transient and should
+    /// be discarded. Once any in-range buffer passes, always return `false` (pass it through).
     fn should_drop(&mut self, data: &[f32]) -> bool {
         if self.latched || data.is_empty() {
-            // 既に正常区間。または空バッファ（捨てる意味がない）。
+            // Already past the transient, or the buffer is empty (nothing to discard).
             self.latched = true;
             return false;
         }
-        // バッファ 1 走査でピーク振幅を求める。
+        // Find the peak amplitude in one pass over the buffer.
         let mut peak = 0.0f32;
         for &s in data {
             let a = s.abs();
@@ -372,7 +376,7 @@ impl TransientGuard {
                 peak = a;
             }
         }
-        // 契約レンジを明確に超える＝プライミング過渡。
+        // Clearly outside the contract range: this is a priming transient.
         let is_transient = peak > PRIMING_PEAK_LIMIT;
         if !is_transient {
             self.latched = true;
@@ -381,21 +385,21 @@ impl TransientGuard {
     }
 }
 
-/// `device_id` の入力デバイスへ input stream を build する（まだ `play` しない）。
-/// `device_id = None` で既定入力デバイス。一致するデバイスが無ければ
-/// [`Error::DeviceNotFound`]。
+/// Build (but do not yet play) an input stream for the device selected by `device_id`.
+/// `device_id = None` selects the default input device. Return [`Error::DeviceNotFound`] if
+/// no device matches.
 ///
-/// sample format ごとにコールバックを分岐し、F32 はそのまま、I16/U16/I32 は
-/// `f32` `[-1.0, 1.0]` へ変換して [`RawSink::push`] へ渡す。開始直後のプライミング
-/// 過渡バッファは [`TransientGuard`] が破棄する（PipeWire ALSA ブリッジ対策）。
+/// Select a callback for each sample format: pass F32 through directly and convert I16/U16/I32
+/// to `f32` in `[-1.0, 1.0]` before sending to [`RawSink::push`]. [`TransientGuard`] discards
+/// priming transient buffers after startup (for the PipeWire ALSA bridge).
 fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> {
     let host = cpal_default_host()?;
-    // None=既定 / Some=name 一致の最初。不一致は DeviceNotFound。
+    // None selects default; Some selects the first name match. A mismatch is DeviceNotFound.
     let device = resolve_input_device(&host, device_id)?;
 
-    // 既定入力 config が取れない＝広告されたデバイスが実際には開けない
-    // （サウンドカード無しのサーバ等で ALSA "default" PCM が開けない場合を含む）。
-    // 使える入力デバイスが無いのと等価なので DeviceNotFound に写す。
+    // If the default input config is unavailable, the advertised device cannot actually be
+    // opened (including ALSA "default" PCM on a server without a sound card). Treat this as
+    // having no usable input device and map it to DeviceNotFound.
     let supported = device
         .default_input_config()
         .map_err(|_| Error::DeviceNotFound)?;
@@ -403,25 +407,25 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
     let config: cpal::StreamConfig = supported.into();
 
     let err_fn = |e: cpal::StreamError| {
-        // RT 経路外のエラーコールバック。ログ手段が未配線なので今は黙殺する
-        // （TODO: 配線層で Event::DeviceLost 等へ写す）。
+        // Error callback outside the RT path. Swallow for now because logging is not wired up.
+        // TODO: Map this to Event::DeviceLost or similar in the integration layer.
         let _ = e;
     };
 
-    // 変換経路のスクラッチを最大ブロック長（ネイティブ SR×ch × MAX_SCRATCH_SECONDS）
-    // で事前確保する。RT コールバック内の初回/拡大アロケート（xrun リスク）を定常状態
-    // で避けるため。最低 1 は確保する。
+    // Preallocate conversion scratch for the maximum block size (native sample rate × channels
+    // × MAX_SCRATCH_SECONDS). This avoids first-use/growth allocations in RT callbacks during
+    // steady state (xrun risk). Allocate at least one item.
     let scratch_cap = (config.sample_rate.0 as usize)
         .saturating_mul(config.channels as usize)
         .saturating_mul(MAX_SCRATCH_SECONDS)
         .max(1);
 
-    // sink はコールバックへ move。F32 以外は変換用に閉じ込める。過渡判定は f32 値に
-    // 対して行うので、変換フォーマットでは変換後に判定する。
+    // Move the sink into the callback. Non-F32 formats capture the converter. Since transient
+    // detection uses f32 values, converted formats are checked after conversion.
     //
-    // cpal の data コールバックは FFI（C ABI）境界を越えて呼ばれるので、ここで panic
-    // すると未定義動作になり得る。今 live なパニック経路は無いが、念のため各コールバック
-    // 本体を catch_unwind で包み、万一の panic はその回のブロックを捨てるだけにする。
+    // cpal data callbacks cross an FFI (C ABI) boundary, where a panic could cause undefined
+    // behavior. No current path is known to panic, but wrap each callback body in catch_unwind
+    // so an unexpected panic only discards that block.
     let stream = match sample_format {
         SampleFormat::F32 => {
             let mut sink = sink;
@@ -430,7 +434,7 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let _ = catch_unwind(AssertUnwindSafe(|| {
-                        // 既に interleaved f32。プライミング過渡なら捨てる。
+                        // Already interleaved f32. Discard if this is a priming transient.
                         if guard.should_drop(data) {
                             return;
                         }
@@ -443,7 +447,7 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
         }
         SampleFormat::I16 => {
             let mut sink = sink;
-            // 変換用スクラッチ。最大ブロック長で事前確保し、RT 内で容量拡大させない。
+            // Conversion scratch, preallocated for the maximum block size to avoid growth in RT.
             let mut scratch: Vec<f32> = Vec::with_capacity(scratch_cap);
             let mut guard = TransientGuard::new();
             device.build_input_stream(
@@ -469,7 +473,7 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
                 &config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
                     let _ = catch_unwind(AssertUnwindSafe(|| {
-                        // u16 [0, 65535] を中点 32768 基準で [-1, 1) へ。
+                        // Map u16 [0, 65535] to [-1, 1) around midpoint 32768.
                         fill_scratch(&mut scratch, data, |s| (s as f32 - 32_768.0) / 32_768.0);
                         if guard.should_drop(&scratch) {
                             return;
@@ -515,8 +519,8 @@ mod tests {
     use super::*;
     use flexaudio_core::raw_ring;
 
-    /// interleaved stereo の f32 バッファを `frames` フレームぶん生成する。
-    /// 各サンプルは交互に `±peak`（ピーク振幅 `peak` の矩形）。
+    /// Generate `frames` of interleaved stereo f32 samples.
+    /// Samples alternate between `±peak` (a square wave with peak amplitude `peak`).
     fn make_buf(frames: usize, peak: f32) -> Vec<f32> {
         let mut v = Vec::with_capacity(frames * 2);
         for i in 0..frames {
@@ -527,89 +531,93 @@ mod tests {
         v
     }
 
-    /// [`TransientGuard`] が「範囲外フルスケール（過渡）→ 減衰 → レンジ内」の列の
-    /// 先頭側（ピークが [`PRIMING_PEAK_LIMIT`] 超のバッファ）だけを破棄し、レンジ内
-    /// バッファが来たら latch して以後は全て通すこと。
+    /// Verify that [`TransientGuard`] discards only the leading buffers above
+    /// [`PRIMING_PEAK_LIMIT`] in an out-of-range full-scale transient → decay → in-range
+    /// sequence, then latches open and passes all later buffers.
     #[test]
     fn transient_guard_drops_priming_then_latches_open() {
         let frames = 1024;
         let mut g = TransientGuard::new();
 
-        // 範囲外フルスケール矩形（実測のプライミング過渡相当 peak≈3.3）→ 破棄。
+        // Out-of-range full-scale square wave (measured priming transient equivalent, peak≈3.3): discard.
         assert!(g.should_drop(&make_buf(frames, 3.3)));
-        // 減衰中だがまだ範囲外（peak=1.5 > LIMIT）→ 破棄。
+        // Decaying but still out of range (peak=1.5 > LIMIT): discard.
         assert!(g.should_drop(&make_buf(frames, 1.5)));
-        // レンジ内に戻った正常音声（peak=0.88）→ 通す＝ここで latch。
+        // Back in range (valid audio, peak=0.88): pass and latch open.
         assert!(!g.should_drop(&make_buf(frames, 0.88)));
-        // latch 後は、たとえ範囲外バッファが来ても以後は必ず通す（途中再発を防ぐ）。
+        // After latching, always pass later buffers, even if out of range (prevents recurrence).
         assert!(!g.should_drop(&make_buf(frames, 3.3)));
     }
 
-    /// 過渡が全く無い環境（Mac/Win/warm Linux）では先頭からレンジ内音声なので、
-    /// [`TransientGuard`] は 1 バッファも破棄しない（頭出し無音ゼロ）。
+    /// In environments without transients (Mac/Windows/warm Linux), audio is in range from
+    /// the start, so [`TransientGuard`] discards no buffers and adds no leading silence.
     #[test]
     fn transient_guard_passes_clean_audio_from_the_start() {
         let frames = 1024;
         let mut g = TransientGuard::new();
-        // デジタルフルスケール ±1.0 ちょうどでも誤検知しない（LIMIT が 1.0 直上）。
+        // Do not misclassify digital full scale ±1.0 (LIMIT is just above 1.0).
         assert!(!g.should_drop(&make_buf(frames, 1.0)));
         assert!(!g.should_drop(&make_buf(frames, 0.5)));
-        // 無音（全ゼロ）も破棄しない。
+        // Do not discard silence (all zeros) either.
         assert!(!g.should_drop(&vec![0.0f32; frames * 2]));
     }
 
-    /// 空バッファは破棄せず latch する。
+    /// Do not discard an empty buffer; latch open.
     #[test]
     fn transient_guard_handles_empty_buffer() {
         let mut g = TransientGuard::new();
         assert!(!g.should_drop(&[]));
-        // 空で latch したので、以後の範囲外バッファも通す。
+        // Latching on empty means even later out-of-range buffers pass through.
         assert!(!g.should_drop(&make_buf(1024, 3.3)));
     }
 
-    /// [`fill_scratch`] が容量内では再確保を起こさず、変換も正しいこと。RT コール
-    /// バックでの定常状態アロケート無しを担保する。
+    /// Verify that [`fill_scratch`] does not reallocate within capacity and converts correctly,
+    /// ensuring no steady-state allocations in RT callbacks.
     #[test]
     fn fill_scratch_no_realloc_in_steady_state() {
-        // 最大想定ブロック長で確保。
-        let cap = 480 * 2; // 10ms @ 48k stereo 相当
+        // Allocate for the maximum expected block size.
+        let cap = 480 * 2; // equivalent to 10 ms at 48 kHz stereo
         let mut scratch: Vec<f32> = Vec::with_capacity(cap);
         let before = scratch.capacity();
 
-        // 容量内のブロックを何度詰めても容量は変わらない（= 再確保が起きない）。
+        // Filling in-capacity blocks repeatedly does not change capacity (no reallocation).
         let data: Vec<i16> = (0..cap as i16).collect();
         for _ in 0..100 {
             fill_scratch(&mut scratch, &data, |s| s as f32 / -(i16::MIN as f32));
             assert_eq!(scratch.len(), data.len());
-            assert_eq!(scratch.capacity(), before, "定常状態で容量拡大しない");
+            assert_eq!(
+                scratch.capacity(),
+                before,
+                "capacity does not grow in steady state"
+            );
         }
-        // 変換が正しい（i16::MIN は -1.0 にマップ）。
+        // Conversion is correct (i16::MIN maps to -1.0).
         let mut one = Vec::with_capacity(1);
         fill_scratch(&mut one, &[i16::MIN], |s| s as f32 / -(i16::MIN as f32));
         assert_eq!(one[0], -1.0);
     }
 
-    /// `new` + `native_format` が panic しないこと（入力デバイス有無を問わず）。
-    /// device_id = None（既定）でも Some（特定デバイス）でも new は必ず成功する。
+    /// `new` + `native_format` do not panic, whether or not an input device exists.
+    /// `new` always succeeds with either device_id = None (default) or Some (specific device).
     #[test]
     fn new_and_native_format_do_not_panic() {
-        // 既定入力デバイス（device_id = None）。
+        // Default input device (device_id = None).
         let backend = CpalMicBackend::new(None);
         let (rate, channels) = backend.native_format();
-        // フォーマットは常に正の値（デバイス無しなら FALLBACK_FORMAT）。
+        // Format values are always positive (FALLBACK_FORMAT when no device exists).
         assert!(rate > 0);
         assert!(channels > 0);
 
-        // 存在しない device_id でも new は panic せず成功し、FALLBACK_FORMAT を返す
-        // （解決失敗の表面化は start/build_stream まで遅延する設計）。
+        // Even for a nonexistent device_id, new succeeds without panicking and returns
+        // FALLBACK_FORMAT (resolution failure is deferred until start/build_stream).
         let backend = CpalMicBackend::new(Some("__no_such_device__".into()));
         let (rate, channels) = backend.native_format();
         assert_eq!((rate, channels), FALLBACK_FORMAT);
     }
 
-    /// 存在しない device_id を指定した `start` は panic せず
-    /// [`Error::DeviceNotFound`] になる（cold-start/TransientGuard と整合）。
-    /// 既定入力デバイスの有無に依らず、不一致 id は必ず DeviceNotFound。
+    /// `start` with a nonexistent device_id returns [`Error::DeviceNotFound`] without
+    /// panicking (consistent with cold-start/TransientGuard behavior). A mismatched ID always
+    /// yields DeviceNotFound, regardless of default-device availability.
     #[test]
     fn start_with_unknown_device_id_yields_device_not_found() {
         let mut backend = CpalMicBackend::new(Some("__no_such_device__".into()));
@@ -620,64 +628,64 @@ mod tests {
 
         match backend.start(sink) {
             Err(Error::DeviceNotFound) => {}
-            other => panic!("unknown device_id は DeviceNotFound であるべき: {other:?}"),
+            other => panic!("unknown device_id should return DeviceNotFound: {other:?}"),
         }
     }
 
-    /// [`list_devices`] はデバイス有無を問わず panic せず `Ok(Vec)` を返す。
-    /// 返ったデバイスは全て `Mic` / 非ループバックで、`id == name` の安定キーを持つ。
+    /// [`list_devices`] returns `Ok(Vec)` without panicking, whether or not devices exist.
+    /// Every returned device is `Mic`, is not loopback, and has the stable key `id == name`.
     #[test]
     fn list_devices_never_panics_and_is_consistent() {
-        let devices = list_devices().expect("list_devices は Err を返さない設計");
+        let devices = list_devices().expect("list_devices is designed not to return Err");
         for d in &devices {
             assert_eq!(d.source_kind, SourceKind::Mic);
-            assert!(!d.is_loopback, "マイクはループバックではない");
-            // 安定キー: cpal では id にデバイス名を使う。
+            assert!(!d.is_loopback, "microphones are not loopback devices");
+            // Stable key: cpal uses the device name as the ID.
             assert_eq!(d.id, d.name);
-            assert!(!d.id.is_empty(), "id（=name）は空でない");
+            assert!(!d.id.is_empty(), "id (= name) is nonempty");
             assert!(d.sample_rate > 0);
             assert!(d.channels > 0);
         }
-        // 既定入力は高々 1 つ。
+        // At most one default input device.
         assert!(devices.iter().filter(|d| d.is_default).count() <= 1);
     }
 
-    /// `start` は入力デバイスが無い環境（サーバー・CI 等）では `Err(DeviceNotFound)` に
-    /// なり得る。Ok と Err(DeviceNotFound) の両方を許容し、panic だけは不可。
-    /// 入力デバイスがある環境では実際にキャプチャが起動し、stop で停止する。
+    /// `start` may return `Err(DeviceNotFound)` where no input device exists (servers/CI).
+    /// Both Ok and Err(DeviceNotFound) are acceptable; panicking is not. Where an input device
+    /// exists, capture starts and stops on stop.
     #[test]
     fn start_then_stop_tolerates_missing_device() {
         let mut backend = CpalMicBackend::new(None);
         let (rate, channels) = backend.native_format();
-        let cap = (rate as usize * channels as usize).max(1); // 約 1 秒
+        let cap = (rate as usize * channels as usize).max(1); // about one second
         let (prod, _cons) = raw_ring(cap);
         let sink = RawSink::new(prod, rate, channels);
 
         match backend.start(sink) {
             Ok(()) => {
-                // 起動できた環境では停止が安全に行えること。
+                // In environments where start succeeds, stop must be safe.
                 backend.stop();
-                // 二重 stop も安全。
+                // Repeated stop calls are safe too.
                 backend.stop();
             }
             Err(Error::DeviceNotFound) => {
-                // 入力デバイス無し環境（CI/サーバ）では許容。
+                // Accept this when no input device is present (CI/server).
             }
             Err(other) => panic!("unexpected error from start(): {other:?}"),
         }
     }
 
-    /// 実マイクから実際に録音する end-to-end テスト。入力デバイスのある
-    /// ラップトップ等で `cargo test -p flexaudio-mic -- --ignored` で回す。
-    /// サーバ/CI には入力デバイスが無いため既定では `#[ignore]`。
+    /// End-to-end test that records from a real microphone. Run with
+    /// `cargo test -p flexaudio-mic -- --ignored` on a laptop or other machine with an input
+    /// device. Ignored by default because servers/CI usually have no input device.
     #[test]
-    #[ignore = "実マイク必須。ラップトップで `cargo test -p flexaudio-mic -- --ignored` で実行"]
+    #[ignore = "requires a real microphone; run `cargo test -p flexaudio-mic -- --ignored` on a laptop"]
     fn end_to_end_captures_real_audio() {
         use std::time::Duration;
 
         let mut backend = CpalMicBackend::new(None);
         let (rate, channels) = backend.native_format();
-        let cap = rate as usize * channels as usize * 2; // 約 2 秒
+        let cap = rate as usize * channels as usize * 2; // about two seconds
         let (prod, mut cons) = raw_ring(cap);
         let sink = RawSink::new(prod, rate, channels);
 
@@ -685,14 +693,14 @@ mod tests {
             .start(sink)
             .expect("start() should succeed with a real input device");
 
-        // 数百ミリ秒キャプチャしてサンプルが流れてくることを確認。
+        // Capture for a few hundred milliseconds and verify that samples arrive.
         thread::sleep(Duration::from_millis(500));
         backend.stop();
 
         let mut buf = vec![0.0f32; cap];
         let got = cons.pop_slice(&mut buf);
         assert!(got > 0, "expected captured samples, got none");
-        // サンプルは [-1, 1] の範囲内に収まること（変換の健全性）。
+        // Samples stay within [-1, 1] (conversion is valid).
         assert!(buf[..got].iter().all(|&s| (-1.5..=1.5).contains(&s)));
     }
 }

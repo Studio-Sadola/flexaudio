@@ -1,10 +1,10 @@
-//! [`crate::Vad::process_pcm`] の前段。任意フォーマットの interleaved PCM を mono に
-//! 落とし、VAD の動作レート（16000 か 8000）へリサンプルして、既存の 16k/mono 経路へ
-//! 渡せる形にする。
+//! Preprocessing for [`crate::Vad::process_pcm`]. Converts interleaved PCM in any format to mono,
+//! resamples it to the VAD operating rate (16000 or 8000), and prepares it for the existing
+//! 16k/mono path.
 //!
-//! 流儀は flexaudio-core の正規化器に合わせてある。mono 化は各チャンネルの単純平均
-//! （stereo なら L/R 平均）、リサンプルはアンチエイリアス込みの rubato sinc。リサンプラは
-//! 呼び出しをまたいで内部遅延と端数を持ち越すので、細切れに渡しても継ぎ目は出ない。
+//! It follows the flexaudio-core normalizer: mono conversion uses a simple average across
+//! channels (L/R average for stereo), and resampling uses rubato sinc with anti-aliasing. The
+//! resampler carries its internal delay and remainder across calls, so split input has no seams.
 
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
@@ -12,41 +12,44 @@ use rubato::{
     WindowFunction,
 };
 
-/// [`crate::Vad::process_pcm`] が受け取る入力 PCM のフォーマット記述子。
+/// Input PCM format descriptor accepted by [`crate::Vad::process_pcm`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PcmFormat {
-    /// 入力サンプルレート (Hz)。
+    /// Input sample rate (Hz).
     pub sample_rate: u32,
-    /// 入力チャンネル数（interleaved のチャンネル数）。
+    /// Number of input channels (channels in interleaved data).
     pub channels: u16,
 }
 
-/// interleaved の任意 ch を mono へ落とし、VAD レートへリサンプルする前段変換器。
+/// Preprocessor that downmixes any number of interleaved channels to mono and resamples to the VAD
+/// rate.
 ///
-/// 入力フォーマット（[`PcmFormat`]）と目標レートは生成時に固定する。入力レートが目標と
-/// 同じ場合は mono 化だけ行い、リサンプラは持たない。
+/// The input format ([`PcmFormat`]) and target rate are fixed at construction. If the input rate
+/// matches the target, only mono conversion is performed and no resampler is used.
 pub(crate) struct PcmConverter {
     format: PcmFormat,
     channels: usize,
-    /// 目標レートへの SR 変換器。入力レートが目標と一致するなら `None`（mono 化のみ）。
+    /// Sample-rate converter for the target rate. `None` if the input rate matches (mono
+    /// conversion only).
     resampler: Option<MonoResampler>,
-    /// 1 フレームに満たない端数 interleaved サンプル。次回入力の前に連結して持ち越す。
+    /// Remainder of interleaved samples that does not make a full frame. Carry it over and prepend
+    /// it to the next input.
     remainder: Vec<f32>,
-    /// mono 化した結果を溜めるスクラッチ（アロケーションの使い回し）。
+    /// Scratch buffer for mono-converted samples (reuse allocations).
     mono: Vec<f32>,
 }
 
 impl PcmConverter {
-    /// 入力フォーマットと目標レート（VAD の動作レート）から変換器を作る。
+    /// Create a converter from the input format and target rate (the VAD operating rate).
     ///
-    /// rubato の構築は極端なレート比などで失敗し得るので、その場合はエラー文字列を返す
-    /// （呼び出し側で panic させずに扱う）。
+    /// rubato construction can fail for extreme rate ratios, so return an error string for the
+    /// caller to handle without panicking.
     pub(crate) fn new(format: PcmFormat, target_rate: u32) -> Result<Self, String> {
         Self::new_with_resampler_chunk(format, target_rate, None)
     }
 
-    /// VAD の 8 kHz フレーム（256 samples）を、連続性を保ったまま 16 kHz の 512 samples
-    /// へ変換する専用変換器を作る。
+    /// Create a dedicated converter that maps VAD's 8 kHz frames (256 samples) to 16 kHz frames
+    /// (512 samples) while preserving continuity.
     pub(crate) fn new_8k_to_16k_frame_resampler() -> Result<Self, String> {
         let mut converter = Self::new_with_resampler_chunk(
             PcmFormat {
@@ -57,10 +60,10 @@ impl PcmConverter {
             Some(256),
         )?;
 
-        // rubato の sinc は開始時に未来側のタップを待つため、最初の実フレームだけ 508
-        // samples になる。256 samples の無音 pre-roll を先に通し、対応する出力を捨てる。
-        // 以降は実フレームごとに512 samplesとなり、実音声側の境界でゼロ埋めやフレーム
-        // 分割をしない。
+        // rubato's sinc waits for future taps at startup, so the first real frame would produce
+        // only 508 samples. Feed 256 samples of silent pre-roll first and discard its output.
+        // After that, each real frame produces 512 samples without zero-padding or splitting
+        // frames at real audio boundaries.
         let mut discarded = Vec::new();
         converter.convert(&[0.0; 256], &mut discarded)?;
         Ok(converter)
@@ -90,22 +93,22 @@ impl PcmConverter {
         })
     }
 
-    /// この変換器が対象とする入力フォーマットか。
+    /// Whether this converter handles the given input format.
     pub(crate) fn matches(&self, format: PcmFormat) -> bool {
         self.format == format
     }
 
-    /// interleaved 入力を mono 化し、必要ならリサンプルして、目標レートの mono サンプルを
-    /// `out` へ追記する。
+    /// Downmix interleaved input to mono, resample if needed, and append target-rate mono samples
+    /// to `out`.
     ///
-    /// フレーム境界（channels の倍数）に満たない端数は内部に持ち越すので、任意の位置で
-    /// 分割して渡しても一括で渡したときと同じ結果になる。
+    /// Any remainder that does not reach a frame boundary (a multiple of channels) is carried
+    /// internally, so input split at any position produces the same result as a single input.
     pub(crate) fn convert(
         &mut self,
         interleaved: &[f32],
         out: &mut Vec<f32>,
     ) -> Result<(), String> {
-        // 前回の端数に今回分を連結し、揃ったフレームだけ mono 化する。
+        // Append this input to the previous remainder and downmix only complete frames.
         self.remainder.extend_from_slice(interleaved);
         let frames = self.remainder.len() / self.channels;
         let used = frames * self.channels;
@@ -122,10 +125,12 @@ impl PcmConverter {
     }
 }
 
-/// interleaved の `channels` ch を各フレームのチャンネル平均で mono 化し `out` へ push する。
+/// Downmix `channels` interleaved channels to mono by averaging each frame's channels, then push
+/// the result to `out`.
 ///
-/// stereo は L/R 平均、それ以上は全チャンネルの平均。`channels <= 1` はそのままコピー。
-/// `src` の長さは `channels` の倍数であること（端数フレームは呼び出し側で除いておく）。
+/// Stereo uses the L/R average; higher channel counts use the average of all channels. Copy as-is
+/// when `channels <= 1`. `src` must have a length divisible by `channels` (the caller removes any
+/// incomplete frame).
 fn downmix_to_mono(src: &[f32], channels: usize, out: &mut Vec<f32>) {
     if channels <= 1 {
         out.extend_from_slice(src);
@@ -138,26 +143,26 @@ fn downmix_to_mono(src: &[f32], channels: usize, out: &mut Vec<f32>) {
     }
 }
 
-/// mono 1ch 専用の rubato sinc リサンプラ。固定入力チャンク（`FixedAsync::Input`）で
-/// 動き、端数と内部遅延は呼び出しをまたいで持ち越す。
+/// rubato sinc resampler for mono (one channel). Uses fixed input chunks (`FixedAsync::Input`) and
+/// carries remainders and internal delay across calls.
 ///
-/// パラメータは flexaudio-core の正規化器と同じ（sinc_len=128 / BlackmanHarris2 など）。
+/// Parameters match the flexaudio-core normalizer (sinc_len=128 / BlackmanHarris2, etc.).
 struct MonoResampler {
     inner: Async<f32>,
-    /// rubato が 1 回の `process` で要求する入力フレーム数（固定）。
+    /// Fixed number of input frames rubato requires for one `process` call.
     chunk_in_frames: usize,
-    /// 1 回の `process` が生成しうる最大出力フレーム数。
+    /// Maximum output frames that one `process` call can produce.
     max_out_frames: usize,
-    /// 未処理の入力 mono サンプル。
+    /// Unprocessed mono input samples.
     in_accum: Vec<f32>,
-    /// rubato への出力スクラッチ（使い回してアロケートを避ける）。
+    /// Output scratch for rubato (reused to avoid allocations).
     out_scratch: Vec<f32>,
 }
 
 impl MonoResampler {
     fn new(in_sr: u32, out_sr: u32, input_chunk_frames: Option<usize>) -> Result<Self, String> {
         let ratio = out_sr as f64 / in_sr as f64;
-        // 固定入力チャンクは 20ms 相当の入力フレーム（端数は rubato が内部に保持する）。
+        // A fixed input chunk corresponds to 20 ms of input frames (rubato retains any remainder).
         let chunk_in_frames = input_chunk_frames.unwrap_or_else(|| (in_sr as usize / 50).max(64));
 
         let params = SincInterpolationParameters {
@@ -170,7 +175,7 @@ impl MonoResampler {
 
         let inner = Async::<f32>::new_sinc(
             ratio,
-            1.0, // 比は固定
+            1.0, // Fixed ratio.
             &params,
             chunk_in_frames,
             1, // mono
@@ -189,11 +194,11 @@ impl MonoResampler {
         })
     }
 
-    /// mono 入力を溜め、`chunk_in_frames` 単位で可能な限りリサンプルして `out` へ追記する。
-    /// 満たない端数は `in_accum` に残して次回へ持ち越す。
+    /// Accumulate mono input, resample as many `chunk_in_frames` chunks as possible, and append
+    /// them to `out`. Carry any incomplete remainder in `in_accum` to the next call.
     fn push(&mut self, mono: &[f32], out: &mut Vec<f32>) -> Result<(), String> {
         self.in_accum.extend_from_slice(mono);
-        let step = self.chunk_in_frames; // mono なのでフレーム数 = サンプル数。
+        let step = self.chunk_in_frames; // For mono, frame count equals sample count.
 
         while self.in_accum.len() >= step {
             let in_adapter = InterleavedSlice::new(&self.in_accum[..step], 1, self.chunk_in_frames)
@@ -214,7 +219,7 @@ impl MonoResampler {
                 .process_into_buffer(&in_adapter, &mut out_adapter, Some(&indexing))
                 .map_err(|e| format!("rubato process_into_buffer failed: {e}"))?;
 
-            out.extend_from_slice(&self.out_scratch[..out_written]); // mono。
+            out.extend_from_slice(&self.out_scratch[..out_written]); // Mono.
             self.in_accum.drain(..step);
         }
         Ok(())
@@ -228,7 +233,7 @@ mod tests {
 
     #[test]
     fn downmix_stereo_is_lr_average() {
-        // 完全逆相は 0、同相は元の値。
+        // Perfectly inverted phase yields 0; in-phase channels retain their value.
         let src = [0.5, -0.5, 0.3, 0.3, 1.0, 0.0];
         let mut out = Vec::new();
         downmix_to_mono(&src, 2, &mut out);
@@ -237,7 +242,7 @@ mod tests {
 
     #[test]
     fn downmix_quad_is_channel_average() {
-        let src = [1.0, 2.0, 3.0, 4.0]; // 1 フレーム 4ch → 平均 2.5。
+        let src = [1.0, 2.0, 3.0, 4.0]; // One 4-channel frame → average 2.5.
         let mut out = Vec::new();
         downmix_to_mono(&src, 4, &mut out);
         assert_eq!(out, vec![2.5]);
@@ -251,8 +256,8 @@ mod tests {
         assert_eq!(out, src.to_vec());
     }
 
-    /// 正弦波を 48k→16k へリサンプルしても周波数（ゼロ交差）と振幅（RMS）が保たれる。
-    /// 過渡を避けて中央だけで測る。
+    /// Resampling a sine wave from 48k to 16k preserves its frequency (zero crossings) and
+    /// amplitude (RMS). Measure only the middle to avoid transients.
     #[test]
     fn resample_48k_to_16k_preserves_tone() {
         let mut conv = PcmConverter::new(
@@ -267,7 +272,7 @@ mod tests {
         let freq = 440.0_f32;
         let amp = 0.5_f32;
         let mut out = Vec::new();
-        // 2 秒ぶん、441 サンプルずつ push（細切れでも継ぎ目が出ないことも兼ねる）。
+        // Push two seconds of audio in 441-sample chunks (also checks for seams across chunks).
         let total = 48_000 * 2;
         let mut i = 0usize;
         while i < total {
@@ -278,29 +283,33 @@ mod tests {
             conv.convert(&block, &mut out).unwrap();
             i += take;
         }
-        assert!(out.len() >= 16_000, "1 秒以上の出力が必要: {}", out.len());
+        assert!(
+            out.len() >= 16_000,
+            "at least one second of output is required: {}",
+            out.len()
+        );
 
-        // 過渡（先頭・末尾各 0.25 秒 = 4000 sample）を捨てて中央 1 秒で測る。
+        // Discard 0.25 seconds at each end (4000 samples) to measure the middle second.
         let mid = &out[4_000..4_000 + 16_000];
 
-        // 周波数: 16000 sample 中のゼロ交差 ≈ 2*440 = 880。
+        // Frequency: about 2*440 = 880 zero crossings in 16000 samples.
         let crossings = zero_crossings(mid);
         assert!(
             (876..=884).contains(&crossings),
-            "16k リサンプル後の周波数がずれた: crossings={crossings}"
+            "frequency shifted after resampling to 16k: crossings={crossings}"
         );
 
-        // 振幅: 正弦の RMS は amp/√2 ≈ 0.3536。
+        // Amplitude: a sine wave's RMS is amp/√2 ≈ 0.3536.
         let got = rms(mid);
         let expect = amp / std::f32::consts::SQRT_2;
         assert!(
             (got - expect).abs() < 0.02,
-            "16k リサンプル後の RMS がずれた: got={got} expect={expect}"
+            "RMS shifted after resampling to 16k: got={got} expect={expect}"
         );
     }
 
-    /// SR が目標と一致するときはリサンプラを持たず（mono 化のみ）、mono 化した値が
-    /// そのまま出る。
+    /// When the sample rate matches the target, no resampler is used (only mono conversion), and
+    /// the downmixed values are returned unchanged.
     #[test]
     fn same_rate_stereo_only_downmixes() {
         let mut conv = PcmConverter::new(
@@ -317,7 +326,8 @@ mod tests {
         assert_eq!(out, vec![0.0, 0.2]);
     }
 
-    /// フレーム境界（ch の倍数）に満たない端数を挟んで分割しても、一括と同じ mono 列。
+    /// Splitting input around a remainder that does not reach a frame boundary (a multiple of
+    /// channels) produces the same mono sequence as processing it all at once.
     #[test]
     fn split_across_partial_frame_matches_bulk() {
         let fmt = PcmFormat {
@@ -332,7 +342,7 @@ mod tests {
             .convert(&interleaved, &mut bulk)
             .unwrap();
 
-        // 奇数長（フレーム境界をまたぐ）で分割して流す。
+        // Process chunks of odd length, splitting across frame boundaries.
         let mut split = Vec::new();
         let mut conv = PcmConverter::new(fmt, 16_000).unwrap();
         for chunk in interleaved.chunks(777) {

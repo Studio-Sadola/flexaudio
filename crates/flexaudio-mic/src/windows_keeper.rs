@@ -1,4 +1,4 @@
-//! Windows で cpal のプロセス共有 WASAPI enumerator を生かし続ける。
+//! Keep cpal's process-wide WASAPI enumerator alive on Windows.
 
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -10,18 +10,19 @@ use cpal::traits::HostTrait;
 
 use flexaudio_core::types::{Error, Result};
 
-/// cpal の `OnceLock<Enumerator>` を初期化済みにした長命 keeper の結果。
+/// Result from the long-lived keeper that initializes cpal's `OnceLock<Enumerator>`.
 ///
-/// `OnceLock` の初期化クロージャが返るまで、他の呼出側は待つ。従ってこの値が `Ok`
-/// なら、keeper が WASAPI enumerator を作った後であることが保証される。
+/// Other callers wait for the `OnceLock` initializer to return. Therefore, `Ok` guarantees that
+/// the keeper has created the WASAPI enumerator.
 static KEEPER_READY: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
-/// cpal の WASAPI enumerator を keeper スレッド上で初期化済みにする。
+/// Initialize cpal's WASAPI enumerator on the keeper thread.
 ///
-/// cpal 0.16 は `IMMDeviceEnumerator` をプロセス共有の `OnceLock` に持つ一方、最初に
-/// 作ったスレッドの STA 初期化を thread-local RAII で保持する。そのスレッドが終了すると
-/// enumerator は解放済み COM apartment にひも付き、以後の利用が access violation になる。
-/// この関数を cpal の全入口より先に呼び、最初の初期化スレッドをプロセス終了まで生かす。
+/// cpal 0.16 stores `IMMDeviceEnumerator` in a process-wide `OnceLock`, while the STA
+/// initialization of the thread that first creates it is held by thread-local RAII. When that
+/// thread exits, the enumerator remains tied to a released COM apartment, and later use causes an
+/// access violation. Call this before every cpal entry point to keep the first initialization
+/// thread alive until process exit.
 pub(super) fn ensure() -> Result<()> {
     match KEEPER_READY.get_or_init(start_keeper) {
         Ok(()) => Ok(()),
@@ -29,14 +30,15 @@ pub(super) fn ensure() -> Result<()> {
     }
 }
 
-/// keeper を起動して WASAPI enumerator の初期化完了を待つ。
+/// Start the keeper and wait for WASAPI enumerator initialization to finish.
 fn start_keeper() -> std::result::Result<(), String> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let handle = thread::Builder::new()
         .name("flexaudio-cpal-wasapi-keeper".into())
         .spawn(move || {
-            // cpal は COM 初期化失敗を panic で表す。この境界で型付きエラーへ変換して
-            // 呼出側へ返す。失敗時はスレッドを終了し、成功時だけ生存し続ける。
+            // cpal reports COM initialization failures by panicking. Convert that panic to a
+            // typed error at this boundary and return it to the caller. Exit on failure; stay
+            // alive only on success.
             let initialized = catch_unwind(AssertUnwindSafe(initialize_enumerator))
                 .map_err(panic_message)
                 .and_then(|result| result);
@@ -44,11 +46,11 @@ fn start_keeper() -> std::result::Result<(), String> {
             let _ = ready_tx.send(initialized);
 
             if keep_alive {
-                // cpal の COM guard は thread-local で、スレッド終了時にだけ
-                // CoUninitialize を呼ぶ。keeper 自身は COM 呼出しを受け付けず、cpal が
-                // process-wide に保持する enumerator の生成元を生かすだけなので、Windows
-                // message queue を処理する必要はない。park は guard を生かしたまま、CPU を
-                // 消費せずプロセス終了まで待機する。
+                // cpal's COM guard is thread-local and calls CoUninitialize only when the thread
+                // exits. The keeper does not accept COM calls; it only keeps alive the thread
+                // that created cpal's process-wide enumerator. It does not need to process the
+                // Windows message queue. `park` keeps the guard alive until process exit without
+                // consuming CPU.
                 loop {
                     thread::park();
                 }
@@ -56,8 +58,8 @@ fn start_keeper() -> std::result::Result<(), String> {
         })
         .map_err(|error| format!("spawn cpal WASAPI keeper thread: {error}"))?;
 
-    // JoinHandle を drop して keeper を detach する。成功時の keeper は意図的に process
-    // lifetime まで終了しないので、呼出側に join 責務を持たせない。
+    // Drop the JoinHandle to detach the keeper. On success it intentionally stays alive for the
+    // process lifetime, so callers do not have to join it.
     drop(handle);
 
     ready_rx
@@ -65,17 +67,16 @@ fn start_keeper() -> std::result::Result<(), String> {
         .map_err(|_| "cpal WASAPI keeper exited before initialization completed".to_owned())?
 }
 
-/// cpal の process-wide `ENUMERATOR` をこの長命スレッドで初期化する。
+/// Initialize cpal's process-wide `ENUMERATOR` on this long-lived thread.
 fn initialize_enumerator() -> std::result::Result<(), String> {
     let host = cpal::default_host();
-    // Windows/WASAPI の `default_input_device()` は、入力端点が無い場合も先に
-    // `get_enumerator()` を通る。よって戻り値が None でも keeper が `ENUMERATOR` を
-    // 初期化済みであるという目的は満たす。
+    // On Windows/WASAPI, `default_input_device()` calls `get_enumerator()` first even when no
+    // input endpoint exists. Thus, the keeper initializes `ENUMERATOR` even if the result is None.
     let _ = host.default_input_device();
     Ok(())
 }
 
-/// `catch_unwind` の payload を診断可能なエラー文字列にする。
+/// Convert a `catch_unwind` payload to a diagnostic error string.
 fn panic_message(payload: Box<dyn Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         format!("cpal WASAPI keeper initialization panicked: {message}")

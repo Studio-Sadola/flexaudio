@@ -1,21 +1,20 @@
-//! プロセス列挙結果（[`ProcessInfo`]）の OS 非依存な後処理。
+//! OS-independent post-processing for process enumeration results ([`ProcessInfo`]).
 //!
-//! 各 OS バックエンドは「見つけたまま」の生リスト（同じ PID が複数セッション／ノードで
-//! 重複し得る・名前が空のこともある）を返す。facade はそれをここへ通して、全 OS で同じ
-//! 形に揃える:
+//! Each OS backend returns a raw list as found (a PID may appear in multiple sessions or nodes,
+//! and names may be empty). The facade passes it through here to normalize it across all OSes:
 //!
-//! 1. `pid == 0` と除外 PID（既定は呼び出し元プロセス自身）を落とす。
-//! 2. 同じ PID を 1 件へ統合する（出力中フラグは「どれか 1 つでも出力中なら出力中」）。
-//! 3. 表示名を必ず非空にする（名乗り名 → 実行ファイル名 → bundle ID → `pid <N>`）。
-//! 4. 出力中を先頭に、表示名（大小無視）→ PID の順で並べる（呼ぶたびに同じ順序）。
+//! 1. Drop PID 0 and the excluded PID (the caller's process by default).
+//! 2. Merge entries with the same PID (active output wins if any entry is active).
+//! 3. Ensure the display name is non-empty (reported name → executable name → bundle ID → `pid <N>`).
+//! 4. Sort active entries first, then by display name (case-insensitive), then PID for stable results.
 
 use std::collections::BTreeMap;
 
 use crate::types::ProcessInfo;
 
-/// パス文字列から実行ファイルのベース名を取り出す（`/` と `\` の両方を区切りとみなす）。
+/// Extract the executable basename from a path (`/` and `\` are both separators).
 ///
-/// 末尾の区切りは無視する。ベース名が空になるときは `None`。
+/// Trailing separators are ignored. Returns `None` if the basename is empty.
 ///
 /// ```
 /// use flexaudio_core::process_list::executable_basename;
@@ -31,9 +30,8 @@ pub fn executable_basename(path: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 出力中フラグを統合する。どれか 1 つでも `Some(true)` なら `Some(true)`
-/// （出力中が勝つ）。true が無く `Some(false)` があれば `Some(false)`。両方 `None`
-/// なら `None`（不明のまま）。
+/// Merge output activity flags. `Some(true)` wins if either value is true.
+/// Otherwise, return `Some(false)` if either value is false, or `None` if both are unknown.
 fn merge_activity(a: Option<bool>, b: Option<bool>) -> Option<bool> {
     match (a, b) {
         (Some(true), _) | (_, Some(true)) => Some(true),
@@ -42,7 +40,7 @@ fn merge_activity(a: Option<bool>, b: Option<bool>) -> Option<bool> {
     }
 }
 
-/// 空白だけの文字列を `None` に寄せる。
+/// Convert a whitespace-only string to `None`.
 fn non_blank(value: Option<String>) -> Option<String> {
     value.and_then(|v| {
         let trimmed = v.trim();
@@ -54,7 +52,7 @@ fn non_blank(value: Option<String>) -> Option<String> {
     })
 }
 
-/// 同じ PID の 2 件目以降を 1 件目へ畳み込む（空欄だけを埋め、既存の値は上書きしない）。
+/// Merge a duplicate PID into the first entry, filling empty fields without overwriting existing values.
 fn merge_into(kept: &mut ProcessInfo, other: ProcessInfo) {
     if kept.name.trim().is_empty() {
         kept.name = other.name;
@@ -68,7 +66,7 @@ fn merge_into(kept: &mut ProcessInfo, other: ProcessInfo) {
     kept.is_output_active = merge_activity(kept.is_output_active, other.is_output_active);
 }
 
-/// 表示名を決める（名乗り名 → 実行ファイル名 → bundle ID → `pid <N>`）。
+/// Choose a display name (reported name → executable name → bundle ID → `pid <N>`).
 fn display_name(info: &ProcessInfo) -> String {
     let own = info.name.trim();
     if !own.is_empty() {
@@ -80,11 +78,11 @@ fn display_name(info: &ProcessInfo) -> String {
         .unwrap_or_else(|| format!("pid {}", info.pid))
 }
 
-/// 生のプロセスリストを正規化する（重複統合・除外・表示名補完・安定ソート）。
+/// Normalize the raw process list by merging duplicates, excluding PIDs, filling display names, and sorting.
 ///
-/// `exclude_pid` に `Some(pid)` を渡すとその PID を落とす（facade は呼び出し元プロセス
-/// 自身＝`std::process::id()` を渡す）。`pid == 0` は常に落とす（どの OS でも
-/// 「プロセスではない」を表す値で、`target_pid` にも使えない）。
+/// Pass `Some(pid)` as `exclude_pid` to drop that PID (the facade passes the caller's own
+/// `std::process::id()`). PID 0 is always dropped; it means “not a process” on every OS and
+/// cannot be used as `target_pid`.
 pub fn normalize_process_list(raw: Vec<ProcessInfo>, exclude_pid: Option<u32>) -> Vec<ProcessInfo> {
     let mut by_pid: BTreeMap<u32, ProcessInfo> = BTreeMap::new();
     for mut info in raw {
@@ -108,7 +106,7 @@ pub fn normalize_process_list(raw: Vec<ProcessInfo>, exclude_pid: Option<u32>) -
             info
         })
         .collect();
-    // 出力中（Some(true)）を先頭へ。残りは表示名（大小無視）→ PID で決定的に並べる。
+    // Put active entries (Some(true)) first, then sort deterministically by display name (case-insensitive) and PID.
     out.sort_by(|a, b| {
         let a_active = a.is_output_active == Some(true);
         let b_active = b.is_output_active == Some(true);

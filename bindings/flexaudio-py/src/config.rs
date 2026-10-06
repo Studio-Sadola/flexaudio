@@ -1,9 +1,9 @@
-//! Python 引数 → コアの各種 config への変換と検証。
+//! Convert and validate Python arguments for core configuration types.
 //!
-//! - [`build_config`]: `open` / `switch_source` の引数から [`StreamConfig`] を組む。
-//! - [`make_vad_config`] / [`vad_config_from_dict`]: VAD の設定を組む（独立 [`Vad`] 用は
-//!   明示引数、統合 VAD 用は Python の dict から）。
-//! - [`validate_denoise`]: 統合 denoise の 48kHz 前提を検証する。
+//! - [`build_config`]: Build [`StreamConfig`] from `open` / `switch_source` arguments.
+//! - [`make_vad_config`] / [`vad_config_from_dict`]: Build VAD configuration (explicit
+//!   arguments for standalone [`Vad`], or a Python dict for integrated VAD).
+//! - [`validate_denoise`]: Validate the 48 kHz requirement for integrated denoise.
 //!
 //! [`Vad`]: crate::vad::Vad
 
@@ -17,10 +17,10 @@ use flexaudio_vad::VadConfig;
 
 use crate::{parse_process_mode, parse_source_kind};
 
-/// Python 引数から [`StreamConfig`] を組む。`ring_capacity_chunks` は既定値を使う。
-/// napi の `build_config` と同じく kind/device_id/process_id/mode/exclude_self/
-/// output_rate/output_channels/chunk_ms/gain と mix 専用の mic_device_id/
-/// system_device_id/mic_gain/system_gain を受ける。
+/// Build [`StreamConfig`] from Python arguments. Use the default for `ring_capacity_chunks`.
+/// Like napi's `build_config`, accepts kind/device_id/process_id/mode/exclude_self/
+/// output_rate/output_channels/chunk_ms/gain and the mix-specific mic_device_id/
+/// system_device_id/mic_gain/system_gain.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_config(
     kind: &str,
@@ -48,25 +48,25 @@ pub(crate) fn build_config(
         output,
         device_id,
         target_pid: process_id,
-        // mode は process 専用 / exclude_self は system 専用。混ぜないのは facade 側が見る。
+        // mode is process-only; exclude_self is system-only. The facade handles them separately.
         mode,
         exclude_self,
         chunk_ms,
         gain,
-        // mix 専用（mix 以外では facade が無視する）。
+        // Mix-only (the facade ignores these for other source kinds).
         mix_mic_device_id: mic_device_id,
         mix_system_device_id: system_device_id,
         mix_mic_gain: mic_gain,
         mix_system_gain: system_gain,
-        // ring_capacity_chunks は既定値を使う。
+        // Use the default for ring_capacity_chunks.
         ..Default::default()
     })
 }
 
-/// 明示引数から [`VadConfig`] を組む（独立 [`Vad`](crate::vad::Vad) の構築に使う）。
+/// Build [`VadConfig`] from explicit arguments (used to construct standalone [`Vad`](crate::vad::Vad)).
 ///
-/// 妥当性検証（サンプルレート 8k/16k・しきい値域）は [`flexaudio_vad::Vad::new`] が行う
-/// ので、ここでは値を詰めるだけ。
+/// [`flexaudio_vad::Vad::new`] validates the sample rate (8k/16k) and threshold ranges, so
+/// this function only assigns the values.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_vad_config(
     threshold: f32,
@@ -88,17 +88,17 @@ pub(crate) fn make_vad_config(
     }
 }
 
-/// 統合 VAD 用に Python の dict から [`VadConfig`] を組む。
+/// Build [`VadConfig`] from a Python dict for integrated VAD.
 ///
-/// キーは独立 [`Vad`](crate::vad::Vad) の引数と同じ（`threshold` / `neg_threshold` /
+/// Keys match the arguments for standalone [`Vad`](crate::vad::Vad) (`threshold` / `neg_threshold` /
 /// `min_speech_ms` / `min_silence_ms` / `speech_pad_ms` / `max_speech_ms` /
-/// `sample_rate`）。未指定のキーは [`VadConfig::default`]（silero 既定）を使う。未知の
-/// キーは無視する（前方互換）。
+/// `sample_rate`). Missing keys use [`VadConfig::default`] (Silero defaults). Unknown keys
+/// are ignored for forward compatibility.
 pub(crate) fn vad_config_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<VadConfig> {
     let d = VadConfig::default();
     Ok(make_vad_config(
         get_f32(dict, "threshold")?.unwrap_or(d.threshold),
-        // neg_threshold は「キーが無い」も「明示 None」も既定（None）に倒す。
+        // Both a missing neg_threshold key and an explicit None use the default (None).
         get_opt_f32(dict, "neg_threshold")?.flatten(),
         get_u32(dict, "min_speech_ms")?.unwrap_or(d.min_speech_ms),
         get_u32(dict, "min_silence_ms")?.unwrap_or(d.min_silence_ms),
@@ -108,11 +108,12 @@ pub(crate) fn vad_config_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<VadConf
     ))
 }
 
-// dict から特定型のキーを取り出す小さなヘルパ群。pyo3 0.29 の FromPyObject は 2
-// ライフタイム + 関連 Error 型を持ち、ジェネリックにすると `?` の変換がトレイトソルバの
-// 制限に当たる。型ごとに具体化して素直に extract する（型不一致は ValueError で上がる）。
+// Small helpers to extract typed values from a dict. In pyo3 0.29, FromPyObject has two
+// lifetimes and an associated Error type. Generic helpers hit trait-solver limits when
+// converting with `?`, so use concrete helpers and call extract directly (type mismatches
+// surface as ValueError).
 
-/// キーが無ければ `None`。あれば f32 へ。
+/// Return `None` if the key is missing; otherwise extract an f32.
 fn get_f32(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<f32>> {
     match dict.get_item(key)? {
         Some(v) => Ok(Some(v.extract::<f32>()?)),
@@ -120,7 +121,7 @@ fn get_f32(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<f32>> {
     }
 }
 
-/// キーが無ければ `None`。あれば u32 へ。
+/// Return `None` if the key is missing; otherwise extract a u32.
 fn get_u32(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u32>> {
     match dict.get_item(key)? {
         Some(v) => Ok(Some(v.extract::<u32>()?)),
@@ -128,7 +129,8 @@ fn get_u32(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u32>> {
     }
 }
 
-/// neg_threshold 用: キーが無ければ `None`、あれば `Option<f32>`（Python の None も許す）。
+/// For neg_threshold: return `None` if the key is missing; otherwise extract `Option<f32>`
+/// (Python None is allowed).
 fn get_opt_f32(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<Option<f32>>> {
     match dict.get_item(key)? {
         Some(v) => Ok(Some(v.extract::<Option<f32>>()?)),
@@ -136,13 +138,14 @@ fn get_opt_f32(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<Option<f3
     }
 }
 
-/// 統合 denoise の前提（48kHz 出力）を検証する。denoise 有効かつ出力レートが 48000 で
-/// なければ `ValueError`。RNNoise が 48kHz 固定フレームでしか動かないため。
+/// Validate the 48 kHz output requirement for integrated denoise. If denoise is enabled and
+/// the output rate is not 48000, return `ValueError` because RNNoise only accepts fixed frames
+/// at 48 kHz.
 pub(crate) fn validate_denoise(denoise: bool, output_rate: u32) -> PyResult<()> {
     if denoise && output_rate != 48_000 {
         return Err(PyValueError::new_err(format!(
-            "denoise は 48000 Hz 出力専用です（output_rate={output_rate}）。\
-             denoise=True のときは output_rate を 48000 にしてください。"
+            "denoise requires 48000 Hz output (output_rate={output_rate}). \
+             Set output_rate to 48000 when denoise=True."
         )));
     }
     Ok(())
@@ -150,13 +153,14 @@ pub(crate) fn validate_denoise(denoise: bool, output_rate: u32) -> PyResult<()> 
 
 #[cfg(test)]
 mod tests {
-    //! StreamConfig / VadConfig の組み立てと denoise 検証を Python ランタイム無しで見る
-    //! （dict 経路は PyDict = Python ホストが要るので、明示引数版 make_vad_config で代替）。
+    //! Check StreamConfig / VadConfig construction and denoise validation without a Python
+    //! runtime (the dict path requires PyDict and a Python host, so use make_vad_config with
+    //! explicit arguments instead).
 
     use super::*;
     use fa::{ProcessMode, SourceKind};
 
-    /// 既定引数相当で build_config を呼ぶヘルパ（open/switch_source の既定と揃える）。
+    /// Helper that calls build_config with default-equivalent arguments, matching open/switch_source.
     fn build_config_with_defaults(kind: &str) -> PyResult<StreamConfig> {
         build_config(
             kind, None, None, "include", false, 48_000, 2, 20, 1.0, None, None, 1.0, 1.0,
@@ -257,7 +261,7 @@ mod tests {
 
     #[test]
     fn make_vad_config_defaults_match_crate() {
-        // 引数既定（Vad の __new__ 既定）と VadConfig::default が食い違っていないこと。
+        // Ensure Vad.__new__ argument defaults match VadConfig::default.
         let d = VadConfig::default();
         let cfg = make_vad_config(0.5, None, 250, 100, 30, 0, 16000);
         assert_eq!(cfg, d);
@@ -265,10 +269,10 @@ mod tests {
 
     #[test]
     fn validate_denoise_gate() {
-        // denoise 無効ならどのレートでも通る。
+        // Any rate is accepted when denoise is disabled.
         assert!(validate_denoise(false, 16_000).is_ok());
         assert!(validate_denoise(false, 48_000).is_ok());
-        // denoise 有効は 48000 のみ通る。
+        // When denoise is enabled, only 48000 is accepted.
         assert!(validate_denoise(true, 48_000).is_ok());
         assert!(validate_denoise(true, 16_000).is_err());
         assert!(validate_denoise(true, 44_100).is_err());

@@ -3,42 +3,40 @@ name = "flexaudio-py"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-# VAD アドオン（flexaudio-vad）が tract-onnx 0.23.7 の要求で 1.91 を指定しているため、
-# それを引くこのクレートも 1.91 に揃える（flexaudio-napi も同様。pyo3 自身の MSRV は
-# 1.83 だが、依存の最大値に合わせる）。
+# The VAD add-on (flexaudio-vad) requires Rust 1.91 through tract-onnx 0.23.7, so this crate also
+# targets 1.91 (as does flexaudio-napi). pyo3 itself has an MSRV of 1.83; use the highest dependency MSRV.
 rust-version = "1.91"
 authors.workspace = true
 repository.workspace = true
 description = "PyO3 Python binding for flexaudio. Distributed via PyPI, not crates.io."
-# cdylib は crates.io ではライブラリとして消費できない（PyPI 配布）。
+# A cdylib cannot be consumed as a library from crates.io (this is distributed via PyPI).
 publish = false
 
-# Python 拡張モジュール。Python アプリが flexaudio をインプロセスで叩く経路。
-# cdylib を `flexaudio`（プラットフォーム拡張 .so/.pyd）として import する。
+# Python extension module: lets Python applications call flexaudio in-process.
+# Import the cdylib as `flexaudio` (a platform extension, .so/.pyd).
 [lib]
 name = "flexaudio"
 crate-type = ["cdylib"]
 
 [features]
-# maturin（pyproject の [tool.maturin] features）が拡張ビルドで有効化する。
-# extension-module を default に入れると `cargo test` のテストバイナリが libpython を
-# リンクできず壊れるので（拡張は実行時に Python 本体へリンクする前提）、これだけ
-# optional にして cargo build / test は素のままにする。
+# maturin enables this for extension builds through the [tool.maturin] features in pyproject.
+# Making extension-module a default breaks `cargo test`, whose test binaries cannot link libpython
+# (extensions are expected to link to Python at runtime), so keep this feature optional. Plain cargo
+# build/test then work without it.
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 flexaudio = { path = "../../crates/flexaudio" }
 
-# アドオン群。Rust コアの VAD / FLAC / denoise を Python へ露出するために直接リンクする。
-# いずれも flexaudio-core には依存せず、interleaved f32 のサンプル列だけを受け取る自己
-# 完結のクレート（モデル・エンコーダは埋め込み済みで実行時ネットワーク不要）。
+# Add-ons linked directly to expose the Rust VAD / FLAC / denoise features to Python.
+# They do not depend on flexaudio-core and are self-contained crates that accept only interleaved
+# f32 samples (models and encoders are embedded; no runtime network access is needed).
 flexaudio-vad = { path = "../../crates/flexaudio-vad" }
 flexaudio-encode = { path = "../../crates/flexaudio-encode" }
 flexaudio-denoise = { path = "../../crates/flexaudio-denoise" }
 
-# pyo3 0.29（2025 系の安定最新）。
-# - abi3-py38: Python 3.8 以降で共通の安定 ABI ホイールを 1 つ吐く（毎マイナーで
-#   ビルドし直さなくてよい）。
-# - extension-module（libpython を直接リンクせず Python 拡張として読み込む）は上の
-#   crate feature 経由で maturin だけが有効化する。
+# pyo3 0.29 (the latest stable release in the 2025 series).
+# - abi3-py38: build one stable-ABI wheel for Python 3.8 and later, without rebuilding for each minor release.
+# - maturin alone enables extension-module through the crate feature above. This loads the module as a
+#   Python extension without linking libpython directly.
 pyo3 = { version = "0.29", features = ["abi3-py38"] }

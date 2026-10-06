@@ -1,15 +1,15 @@
-// N-API 0.3.0 契約: processes() と FlexStream.stop() は Promise。
-// 実音不要。前提は smoke.mjs と同じ（同じディレクトリの flexaudio.node）。
+// N-API 0.3.0 contract: processes() and FlexStream.stop() return Promises.
+// No real audio is needed. Prerequisites are the same as smoke.mjs (flexaudio.node in this directory).
 //
-// (a) processes() は Promise を返し、配列か型のあるエラーで終わる
-// (b) stop() の resolve より前に frames:0 の締めが届く。stop() の後に frames>0
-//     が来たならそれも resolve より前（来なければこの確かめは飛ばす）。
-//     resolve の後に onChunk は来ない。
-// (c) onChunk の中から stop() を呼んでも resolve まで行く（固まらない）
-// (d) stop() を 2 回呼んでも両方 resolve
-// (e) 既に止まった後の stop() は JS スレッドで即 resolve（P1 の経路 a）
-//     TSFN の Closing は mock では作れない（napi TSFN の Closing は
-//     環境＝Node 終了中の状態）。Stopped 後の即 resolve で代わる。
+// (a) processes() returns a Promise that resolves to an array or rejects with a typed error.
+// (b) The frames:0 final chunk arrives before stop() resolves. If frames>0 arrives after stop(),
+//     it must also arrive before resolve (skip this check if none arrives).
+//     onChunk is not called after resolve.
+// (c) Calling stop() from onChunk still resolves (does not hang).
+// (d) Calling stop() twice resolves both Promises.
+// (e) Calling stop() after it has stopped resolves immediately on the JS thread (P1 path a).
+//     A mock cannot create TSFN Closing (napi TSFN Closing is the Node shutdown state).
+//     Immediate resolve after Stopped covers this case instead.
 
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -116,9 +116,9 @@ async function testStopTwice() {
 }
 
 async function testStopAfterAlreadyStoppedResolvesImmediately() {
-  // P1 経路 (a): phase が既に Stopped なら、TSFN 往復を待たず JS スレッドで
-  // resolve_undefined する。TSFN の Closing は mock では作れない（napi の
-  // Closing は Node 終了中の環境状態）。
+  // P1 path (a): if the phase is already Stopped, call resolve_undefined on the JS thread
+  // without waiting for a TSFN round trip. A mock cannot create TSFN Closing (napi
+  // Closing is the environment state during Node shutdown).
   const stream = native.__openMockStream(48000, 2, 440.0, () => {});
   await new Promise((r) => setTimeout(r, 50));
   await withTimeout(stream.stop(), 5000, 'first stop()');

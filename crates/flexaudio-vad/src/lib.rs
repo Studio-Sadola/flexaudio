@@ -1,9 +1,9 @@
-//! flexaudio-vad — silero-VAD を純 Rust（tract-onnx）でオフライン実行する VAD アドオン。
+//! flexaudio-vad — An offline VAD addon that runs silero-VAD in pure Rust (tract-onnx).
 //!
-//! `flexaudio-core` には依存せず、`&[f32]` のサンプル列だけを受け取る。silero-VAD
-//! モデル (MIT) をバイナリに埋め込むので、実行時のモデルファイルもネットワークも要らない。
+//! It does not depend on `flexaudio-core` and accepts only a sample slice `&[f32]`. The silero-VAD
+//! model (MIT) is embedded in the binary, so no runtime model file or network access is needed.
 //!
-//! # 例 (ストリーミング)
+//! # Streaming example
 //! ```no_run
 //! use flexaudio_vad::{Vad, VadConfig, VadEvent};
 //! let mut vad = Vad::new(VadConfig::default()).unwrap();
@@ -18,7 +18,7 @@
 //! # fn some_audio_chunks() -> Vec<&'static [f32]> { vec![] }
 //! ```
 //!
-//! # 例 (バッチ)
+//! # Batch example
 //! ```no_run
 //! use flexaudio_vad::{get_speech_timestamps, VadConfig};
 //! let samples: Vec<f32> = vec![0.0; 16000];
@@ -43,29 +43,29 @@ use infer::{SileroEngine, MODEL_FRAME_SIZE, MODEL_SAMPLE_RATE};
 use resample::PcmConverter;
 use segmenter::Segmenter;
 
-/// VAD が確定したイベント。サンプル位置はパディング適用後。
+/// Event finalized by VAD. Sample positions are after padding is applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VadEvent {
-    /// 発話開始 (パディング適用後の絶対サンプル位置)。
+    /// Speech start (absolute sample position after padding).
     SpeechStart {
-        /// 発話が始まった絶対サンプル位置 (パディング適用後・含む)。
+        /// Absolute sample position where speech starts (after padding, inclusive).
         at_sample: u64,
     },
-    /// 発話終了 (パディング適用後の絶対サンプル位置・排他的)。
+    /// Speech end (absolute sample position after padding, exclusive).
     SpeechEnd {
-        /// 発話が終わった絶対サンプル位置 (パディング適用後・排他的)。
+        /// Absolute sample position where speech ends (after padding, exclusive).
         at_sample: u64,
     },
 }
 
-/// VAD のエラー型。
+/// VAD errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VadError {
-    /// モデルのロードに失敗。
+    /// Failed to load the model.
     ModelLoad(String),
-    /// 推論実行中のエラー。
+    /// Inference failed.
     Inference(String),
-    /// 設定値が不正。
+    /// Invalid configuration.
     InvalidConfig(String),
 }
 
@@ -81,34 +81,34 @@ impl std::fmt::Display for VadError {
 
 impl std::error::Error for VadError {}
 
-/// ストリーミング VAD。1 インスタンスが最適化済みの tract 計画を 1 つ持つ（共有しない）。
+/// Streaming VAD. Each instance owns one optimized tract plan (not shared).
 ///
-/// 任意長の `&[f32]` を [`Vad::process`] に流すと、内部で frame (16k=512 / 8k=256) 単位に
-/// 束ねて silero 推論し、セグメント状態機械を回して確定したイベントを返す。
+/// Pass any-length `&[f32]` input to [`Vad::process`]. It buffers samples into frames (16k=512 / 8k=256),
+/// runs Silero inference, advances the segment state machine, and returns finalized events.
 pub struct Vad {
     engine: SileroEngine,
     config: VadConfig,
     segmenter: Segmenter,
 
-    /// frame_size に満たない端数サンプルの残り（入力サンプルレート基準）。
+    /// Remaining samples below frame_size (at the input sample rate).
     pending: Vec<f32>,
 
-    /// 直近 [`Vad::process`] で計算した各フレームの生発話確率。
+    /// Raw speech probability for each frame computed by the most recent [`Vad::process`].
     last_probs: Vec<f32>,
 
-    /// [`Vad::process_pcm`] 用の前段変換器（任意フォーマット → VAD レートの mono）。
-    /// 変換が要らないフォーマット（VAD レートの mono）では作られない。入力フォーマットが
-    /// 変わったら作り直す。
+    /// Front-end converter for [`Vad::process_pcm`] (any format → mono at the VAD rate).
+    /// Not created for formats that need no conversion (mono at the VAD rate). Recreate it when the
+    /// input format changes.
     converter: Option<PcmConverter>,
-    /// 8 kHz 設定専用の連続した 8→16 kHz rubato 変換器。モデル入力だけを16 kHzへ
-    /// 上げ、公開のフレーム数・位置は `pending` と `segmenter` の8 kHz基準を保つ。
+    /// Continuous 8→16 kHz rubato converter for 8 kHz configuration. Only model input is upsampled to 16 kHz;
+    /// public frame counts and positions in `pending` and `segmenter` remain based on 8 kHz.
     upsampler_8k: Option<PcmConverter>,
 }
 
 impl Vad {
-    /// 埋め込みモデルを最適化して VAD を構築する。
+    /// Build VAD with the embedded, optimized model.
     ///
-    /// 計画の構築（`into_optimized`）に失敗したら [`VadError::ModelLoad`] を返す。
+    /// Returns [`VadError::ModelLoad`] if plan construction (`into_optimized`) fails.
     pub fn new(config: VadConfig) -> Result<Vad, VadError> {
         config.validate().map_err(VadError::InvalidConfig)?;
 
@@ -131,10 +131,10 @@ impl Vad {
         })
     }
 
-    /// 任意長の f32 サンプルを処理し、確定した [`VadEvent`] を返す。
+    /// Process any number of f32 samples and return finalized [`VadEvent`]s.
     ///
-    /// 内部で frame_size 単位に束ね、満たないサンプルは次回まで保持する。サンプル位置は
-    /// 呼び出しをまたいで連続する（累積）。
+    /// Internally buffers input into frame_size units and holds any remainder for the next call. Sample positions
+    /// are continuous across calls (cumulative).
     pub fn process(&mut self, samples: &[f32]) -> Vec<VadEvent> {
         let frame_size = self.config.frame_size();
         self.last_probs.clear();
@@ -142,22 +142,22 @@ impl Vad {
         let mut segments_out = Vec::new();
         let mut events = Vec::new();
 
-        // pending + 新規サンプルを連結して frame_size 単位に消費。
+        // Append new samples to pending and consume complete frame_size units.
         self.pending.extend_from_slice(samples);
 
         let mut offset = 0;
-        // self.pending を借用したまま &mut self の infer_frame には渡せないので、
-        // 1 フレーム分を局所バッファへコピーしてから推論する。
+        // Cannot call infer_frame (&mut self) while self.pending is borrowed, so
+        // copy one frame into a local buffer before inference.
         let mut frame_buf = vec![0.0f32; frame_size];
         while offset + frame_size <= self.pending.len() {
             frame_buf.copy_from_slice(&self.pending[offset..offset + frame_size]);
-            // 推論失敗時は無音 (0.0) に倒して継続。
+            // On inference failure, use silence (0.0) and continue.
             let prob = self.infer_frame(&frame_buf).unwrap_or(0.0);
             self.last_probs.push(prob);
             self.segmenter.feed(prob, &mut segments_out);
             offset += frame_size;
         }
-        // 消費済み分を捨てる。
+        // Discard consumed samples.
         self.pending.drain(0..offset);
 
         for seg in segments_out {
@@ -171,28 +171,28 @@ impl Vad {
         events
     }
 
-    /// 録音チャンクをそのまま渡せる自己完結の入口。任意フォーマット（`input_sample_rate` /
-    /// `input_channels` の interleaved f32）を内部で mono 化・VAD レートへリサンプルしてから
-    /// [`Vad::process`] と同じ経路にかける。
+    /// Self-contained entry point that accepts a recording chunk as-is. Converts any format (`input_sample_rate` /
+    /// interleaved f32 with `input_channels`) to mono and resamples to the VAD rate internally before
+    /// using the same path as [`Vad::process`].
     ///
-    /// 各言語バインディングが録音チャンク（例 48k/stereo）を変換せずそのまま流せるようにする
-    /// のが狙い。`samples` は interleaved で、長さは `input_channels` の倍数を想定する
-    /// （端数フレームは次回まで内部に持ち越すので、任意の位置で分割して渡してよい）。
+    /// This lets language bindings pass recording chunks (such as 48 kHz/stereo) without conversion.
+    /// `samples` must be interleaved and its length should be a multiple of `input_channels`
+    /// (partial frames are carried over, so input may be split at any point).
     ///
-    /// 入力が既に VAD レート（[`VadConfig::sample_rate`]）の mono なら、mono 化もリサンプル
-    /// もせず [`Vad::process`] へそのまま渡す（追加コストなし）。それ以外は各チャンネルの
-    /// 平均で mono 化し、rubato でリサンプルする。リサンプラは呼び出しをまたいで状態を持つ
-    /// ので、連続ストリームでも継ぎ目は出ない。
+    /// If the input is already mono at the VAD rate ([`VadConfig::sample_rate`]), pass it directly to
+    /// [`Vad::process`] without downmixing or resampling (no added cost). Otherwise, average channels
+    /// to mono and resample with rubato. The resampler retains state across calls,
+    /// avoiding seams in a continuous stream.
     ///
-    /// 返す [`VadEvent`] の `at_sample` は **VAD 内部レート（`config().sample_rate`＝16000
-    /// か 8000）のサンプル基準**で、入力サンプル基準ではない（リサンプル後の内部位置の累積）。
-    /// [`Vad::process`] と揃えてあるので両者を混ぜても位置は連続する。秒に直すなら
-    /// `at_sample as f64 / config().sample_rate as f64`、入力サンプル位置の目安が要るなら
-    /// `at_sample * input_sample_rate / config().sample_rate` で近似できる。
+    /// The returned [`VadEvent`] `at_sample` is measured at the **internal VAD rate (`config().sample_rate` = 16000
+    /// or 8000)**, not the input rate (cumulative internal position after resampling).
+    /// This matches [`Vad::process`], so positions remain continuous if the APIs are mixed. Convert to seconds with
+    /// `at_sample as f64 / config().sample_rate as f64`; estimate the input sample position with
+    /// `at_sample * input_sample_rate / config().sample_rate`.
     ///
-    /// リサンプラの構築や実行に失敗した場合（極端なレート比など）は、その呼び出し分を捨てて
-    /// 空のイベント列を返す（取り込みを panic で止めない。[`Vad::process`] が推論失敗を無音に
-    /// 倒すのと同じ方針）。
+    /// If resampler setup or execution fails (for example, with an extreme rate ratio), discard that call's input
+    /// and return no events (do not stop ingestion with a panic). This follows [`Vad::process`], which treats
+    /// inference failures as silence.
     pub fn process_pcm(
         &mut self,
         samples: &[f32],
@@ -205,19 +205,19 @@ impl Vad {
             channels: input_channels,
         };
 
-        // 入力フォーマットが前回と変わったら変換器を捨てる（必要なら下で作り直す）。
+        // Discard the converter if the input format changed (recreate it below if needed).
         if let Some(c) = &self.converter {
             if !c.matches(format) {
                 self.converter = None;
             }
         }
 
-        // 変換不要（既に VAD レートの mono）なら余計なコピーもリサンプルもせず既存経路へ。
+        // If conversion is unnecessary (already mono at the VAD rate), use the existing path without extra copies or resampling.
         if input_sample_rate == target && input_channels <= 1 {
             return self.process(samples);
         }
 
-        // 変換器を用意（初回・またはフォーマット変更時）。構築失敗はこの呼び出しを捨てて継続。
+        // Create the converter on first use or after a format change. On failure, discard this call and continue.
         if self.converter.is_none() {
             match PcmConverter::new(format, target) {
                 Ok(c) => self.converter = Some(c),
@@ -225,10 +225,13 @@ impl Vad {
             }
         }
 
-        // mono 化 + リサンプルして VAD レートの mono を得てから既存経路へ流す。
+        // Downmix and resample to mono at the VAD rate, then use the existing path.
         let mut converted = Vec::new();
         {
-            let conv = self.converter.as_mut().expect("converter は直前に用意済み");
+            let conv = self
+                .converter
+                .as_mut()
+                .expect("converter was initialized immediately above");
             if conv.convert(samples, &mut converted).is_err() {
                 return Vec::new();
             }
@@ -236,15 +239,15 @@ impl Vad {
         self.process(&converted)
     }
 
-    /// 1 フレーム (公開 `frame_size` サンプル) を silero に通し発話確率を返す。
+    /// Run one frame (public `frame_size` samples) through Silero and return its speech probability.
     ///
-    /// モデルは 16 kHz / 512 サンプル専用。8 kHz 設定では状態を持つ rubato の sinc
-    /// リサンプラで 256 サンプルを512にしてから同じ 64+512 の前置・state引き継ぎ経路へ
-    /// 渡す。公開側の時刻・
-    /// サンプル位置・フレーム数は入力レート基準のまま（セグメンタが `frame_size` で進む）。
+    /// The model requires 16 kHz / 512 samples. For 8 kHz configuration, use a stateful rubato sinc
+    /// resampler to convert 256 samples to 512, then use the same 64+512 prefix and state-carrying path.
+    /// Public timestamps,
+    /// sample positions, and frame counts remain at the input rate (the segmenter advances by `frame_size`).
     fn infer_frame(&mut self, frame: &[f32]) -> Result<f32, VadError> {
         debug_assert_eq!(frame.len(), self.config.frame_size());
-        // 公開レートの context を 16 kHz に直すと常に 64（8 kHz は 32×2）。
+        // The public-rate context is always 64 when converted to 16 kHz (32×2 at 8 kHz).
         debug_assert_eq!(
             if self.config.sample_rate == 8000 {
                 self.config.context_size() * 2
@@ -275,9 +278,9 @@ impl Vad {
         }
     }
 
-    /// 直近 [`Vad::process`] で計算した各フレームの生発話確率を返す。
+    /// Return raw speech probabilities for each frame computed by the latest [`Vad::process`].
     ///
-    /// セグメントイベントとは独立した第二の出力。
+    /// A second output, independent of segment events.
     pub fn last_frame_probabilities(&self) -> &[f32] {
         &self.last_probs
     }
@@ -309,37 +312,36 @@ impl Vad {
                 at_sample: seg.end_sample,
             });
         }
-        // 次の入力は新しい文脈から始める（累積位置・state・端数を初期化）。
+        // Start the next input in a fresh context (reset cumulative position, state, and remainder).
         self.reset();
         events
     }
 
-    /// state / context / 状態機械 / サンプル位置 / 端数バッファ / リサンプラ状態を
-    /// すべて初期化する。
+    /// Reset state, context, state machine, sample position, remainder buffer, and resampler state.
     pub fn reset(&mut self) {
         self.engine.reset();
         self.pending.clear();
         self.last_probs.clear();
         self.segmenter.reset();
-        // 変換器を捨てる。次の process_pcm がフォーマットに応じて作り直すので、
-        // リサンプラの内部遅延・端数もまとめてリセットされる。
+        // Discard the converter. The next process_pcm call recreates it for the input format,
+        // resetting resampler latency and remainder as well.
         self.converter = None;
         if self.config.sample_rate == 8_000 {
-            // 専用コンストラクタは pre-roll も含む。一般変換器として再構築すると初回だけ
-            // 508 samples になり公開フレームとの対応が崩れるため、必ずこちらを使う。
+            // The dedicated constructor includes pre-roll. Rebuilding it as a generic converter would
+            // produce 508 samples on the first call and break public frame alignment; always use this constructor.
             self.upsampler_8k = PcmConverter::new_8k_to_16k_frame_resampler().ok();
         }
     }
 
-    /// 現在の設定への参照。
+    /// Borrow the current configuration.
     pub fn config(&self) -> &VadConfig {
         &self.config
     }
 }
 
-/// バッチ処理用（silero `get_speech_timestamps` 相当）。
+/// Batch processing (equivalent to Silero `get_speech_timestamps`).
 ///
-/// 全サンプルを一括処理して確定セグメント列を返す。末尾で発話中なら入力終端まで採る。
+/// Process all samples at once and return finalized segments. If speech continues at the end, extend it to the input end.
 pub fn get_speech_timestamps(
     samples: &[f32],
     config: &VadConfig,
@@ -354,7 +356,7 @@ pub fn get_speech_timestamps(
         vad.last_probs.push(prob);
         vad.segmenter.feed(prob, &mut out);
     }
-    // 端数フレームは silero と同じく推論せず捨てる。入力終端で発話中なら確定。
+    // Like Silero, discard incomplete frames without inference. Finalize speech still open at end of input.
     vad.segmenter.flush(&mut out);
 
     Ok(out)
@@ -366,7 +368,7 @@ mod tests {
     use crate::config::VadConfig;
     use crate::segmenter::{Segment, Segmenter};
 
-    /// frame_size=512 @16k 前提で、確率列をセグメンタに流しセグメント列を得るヘルパ。
+    /// Helper that feeds probabilities to the segmenter and returns segments (assumes frame_size=512 at 16 kHz).
     fn run_probs(config: &VadConfig, probs: &[f32]) -> Vec<Segment> {
         let mut seg = Segmenter::new(config);
         let mut out = Vec::new();
@@ -378,11 +380,11 @@ mod tests {
     }
 
     fn base_config() -> VadConfig {
-        // pad=0 にして純粋な境界ロジックを検証しやすくする。512 サンプル/フレーム前提。
+        // Set pad=0 to simplify testing boundary logic. Assumes 512 samples per frame.
         VadConfig {
             threshold: 0.5,
             neg_threshold: Some(0.35),
-            min_speech_ms: 0, // 破棄を切る (個別テストで上書き)
+            min_speech_ms: 0, // Disable discarding (overridden by individual tests).
             min_silence_ms: 0,
             speech_pad_ms: 0,
             max_speech_ms: 0,
@@ -390,11 +392,11 @@ mod tests {
         }
     }
 
-    /// 16 kHz の実音声を rubato で8 kHzへ落とし、同じ8 kHz信号を正しい sinc 8→16 kHz
-    /// 変換で直接モデルへ渡した場合と、`Vad` の8 kHz経路へ渡した場合を比べる。
+    /// Downsample real 16 kHz audio to 8 kHz with rubato, then compare the 8 kHz VAD path with
+    /// passing the same 8 kHz signal directly to the model using proper sinc 8→16 kHz conversion.
     ///
-    /// 0.05 は実音声に対してリサンプラ実装差を許容しつつ、旧来のサンプル反復で測定した
-    /// 最大差 0.3705613 より十分小さい。0.5判定は全フレームで一致しなければならない。
+    /// 0.05 allows resampler implementation differences on real audio while remaining far below the
+    /// 0.3705613 maximum measured with the old sample-repetition method. The 0.5 decisions must match for every frame.
     #[test]
     fn eight_khz_inference_matches_sinc_upsampled_reference() {
         let wav = include_bytes!("../tests/fixtures/jp_2spk_FF_4s_16k.wav");
@@ -459,8 +461,8 @@ mod tests {
             );
         }
 
-        // reset 後も専用コンストラクタの pre-roll から始めるので、1 フレーム=512 samples
-        // の対応と確率列が初回と変わらない。
+        // After reset, the dedicated constructor still starts with pre-roll, so each 512-sample frame
+        // and probability sequence match the initial run.
         vad8.reset();
         let _ = vad8.process(&samples8);
         assert_eq!(vad8.last_frame_probabilities(), probs8);
@@ -471,25 +473,25 @@ mod tests {
         let mut c = VadConfig::default();
         assert_eq!(c.resolved_neg_threshold(), (0.5 - 0.15_f32).max(0.01));
         c.threshold = 0.1;
-        assert_eq!(c.resolved_neg_threshold(), 0.01); // クランプ下限
+        assert_eq!(c.resolved_neg_threshold(), 0.01); // Clamp minimum.
         c.neg_threshold = Some(0.2);
-        assert_eq!(c.resolved_neg_threshold(), 0.2); // 明示優先
+        assert_eq!(c.resolved_neg_threshold(), 0.2); // Explicit value takes precedence.
     }
 
     #[test]
     fn simple_speech_then_silence() {
-        // 512 サンプル/フレーム。min_silence=512 (=1フレーム), min_speech=0。
+        // 512 samples per frame. min_silence=512 (1 frame), min_speech=0.
         let mut c = base_config();
         c.min_silence_ms = 32; // 32ms @16k = 512 samples = 1 frame
-                               // 20 フレーム発話 → 30 フレーム無音
+                               // 20 speech frames → 30 silence frames
         let mut probs = vec![0.9f32; 20];
         probs.extend(vec![0.1f32; 30]);
         let segs = run_probs(&c, &probs);
         assert_eq!(segs.len(), 1, "exactly one segment");
         let s = segs[0];
-        // 開始 = フレーム0先頭 = 0。
+        // Start = beginning of frame 0 = 0.
         assert_eq!(s.start_sample, 0);
-        // 終了 = 無音開始位置 (フレーム20先頭 = 20*512)。
+        // End = start of silence (beginning of frame 20 = 20*512).
         assert_eq!(s.end_sample, 20 * 512);
     }
 
@@ -498,7 +500,7 @@ mod tests {
         let mut c = base_config();
         c.min_silence_ms = 32; // 1 frame
         c.min_speech_ms = 250; // 250ms @16k = 4000 samples ≈ 7.8 frames
-                               // 5 フレーム発話 (5*512=2560 < 4000) → 破棄されるべき
+                               // 5 speech frames (5*512=2560 < 4000) → should be discarded
         let mut probs = vec![0.9f32; 5];
         probs.extend(vec![0.1f32; 10]);
         let segs = run_probs(&c, &probs);
@@ -507,7 +509,7 @@ mod tests {
             "short segment must be discarded, got {segs:?}"
         );
 
-        // 10 フレーム発話 (5120 >= 4000) → 採用
+        // 10 speech frames (5120 >= 4000) → accepted
         let mut probs2 = vec![0.9f32; 10];
         probs2.extend(vec![0.1f32; 10]);
         let segs2 = run_probs(&c, &probs2);
@@ -517,30 +519,30 @@ mod tests {
 
     #[test]
     fn min_silence_boundary_keeps_segment_together() {
-        // 短い無音 (< min_silence) はセグメントを切らない。
+        // Short silence (< min_silence) does not end the segment.
         let mut c = base_config();
         c.min_silence_ms = 192; // 192ms @16k = 3072 samples = 6 frames
-                                // 10発話 → 3無音 (3*512=1536 < 3072 なので継続) → 10発話 → 長い無音
+                                // 10 speech → 3 silence (3*512=1536 < 3072, so continue) → 10 speech → long silence
         let mut probs = vec![0.9f32; 10];
         probs.extend(vec![0.1f32; 3]);
         probs.extend(vec![0.9f32; 10]);
-        probs.extend(vec![0.1f32; 10]); // 10*512=5120 >= 3072 で確定
+        probs.extend(vec![0.1f32; 10]); // 10*512=5120 >= 3072, so finalize.
         let segs = run_probs(&c, &probs);
         assert_eq!(segs.len(), 1, "short gap must NOT split, got {segs:?}");
         assert_eq!(segs[0].start_sample, 0);
-        // 終端 = 2回目発話塊の後の無音開始 = フレーム23先頭。
+        // End = start of silence after the second speech burst = beginning of frame 23.
         assert_eq!(segs[0].end_sample, 23 * 512);
     }
 
     #[test]
     fn min_silence_just_over_splits() {
-        // min_silence をちょうど超える無音は切る。
+        // Silence just exceeding min_silence ends the segment.
         let mut c = base_config();
         c.min_silence_ms = 64; // 64ms = 1024 samples = 2 frames
-                               // 5発話 → 3無音 (3*512=1536) → 5発話 → 無音
-                               // 無音3フレーム目で (frame_start - temp_end) を評価:
-                               //   temp_end は無音1フレーム目先頭。無音Nフレーム目先頭 - temp_end = (N-1)*512。
-                               //   >= 1024 となるのは N-1 >= 2 → N>=3 → 3フレーム目の feed で確定。
+                               // 5 speech → 3 silence (3*512=1536) → 5 speech → silence
+                               // On the third silence frame, evaluate (frame_start - temp_end):
+                               //   temp_end is the start of the first silence frame. Start of silence frame N - temp_end = (N-1)*512.
+                               //   >= 1024 when N-1 >= 2 → N>=3 → finalize when feeding frame 3.
         let mut probs = vec![0.9f32; 5];
         probs.extend(vec![0.1f32; 3]);
         probs.extend(vec![0.9f32; 5]);
@@ -548,7 +550,7 @@ mod tests {
         let segs = run_probs(&c, &probs);
         assert_eq!(segs.len(), 2, "long gap must split into two, got {segs:?}");
         assert_eq!(segs[0].start_sample, 0);
-        assert_eq!(segs[0].end_sample, 5 * 512); // 無音開始位置
+        assert_eq!(segs[0].end_sample, 5 * 512); // Start of silence.
     }
 
     #[test]
@@ -556,21 +558,21 @@ mod tests {
         let mut c = base_config();
         c.min_silence_ms = 32; // 1 frame
         c.speech_pad_ms = 32; // 32ms = 512 samples
-                              // フレーム2..5 が発話 (先頭に無音2フレームを置き、開始 pad が 0 でクランプされない様に)
-        let mut probs = vec![0.1f32; 2]; // フレーム0,1 無音
-        probs.extend(vec![0.9f32; 4]); // フレーム2..5 発話 (開始=2*512=1024)
-        probs.extend(vec![0.1f32; 5]); // 無音
+                              // Frames 2..5 are speech (prepend two silence frames so start padding is not clamped to 0).
+        let mut probs = vec![0.1f32; 2]; // Frames 0 and 1 are silence.
+        probs.extend(vec![0.9f32; 4]); // Frames 2..5 are speech (start=2*512=1024).
+        probs.extend(vec![0.1f32; 5]); // Silence.
         let segs = run_probs(&c, &probs);
         assert_eq!(segs.len(), 1);
-        // 開始 = 1024 - 512 = 512。
+        // Start = 1024 - 512 = 512.
         assert_eq!(segs[0].start_sample, 1024 - 512);
-        // 終了 = 無音開始(6*512=3072) + 512 = 3584。
+        // End = silence start (6*512=3072) + 512 = 3584.
         assert_eq!(segs[0].end_sample, 6 * 512 + 512);
     }
 
     #[test]
     fn speech_pad_start_clamps_at_zero() {
-        // フレーム0から発話 → 開始 pad が underflow せず 0 になる。
+        // Speech starts in frame 0 → start padding clamps to 0 without underflow.
         let mut c = base_config();
         c.min_silence_ms = 32;
         c.speech_pad_ms = 64; // 1024 samples
@@ -583,18 +585,18 @@ mod tests {
 
     #[test]
     fn pad_does_not_overlap_previous_segment() {
-        // 2 セグメントで、後段の開始 pad が前段の終了 pad を侵さないようクランプ。
+        // With two segments, clamp padding so the later start padding does not overlap the earlier end padding.
         let mut c = base_config();
         c.min_silence_ms = 64; // 2 frames
-        c.speech_pad_ms = 192; // 3072 samples = 6 frames (大きめに)
-                               // 5発話 → 3無音 (確定) → 5発話 → 無音
+        c.speech_pad_ms = 192; // 3072 samples = 6 frames (intentionally large).
+                               // 5 speech → 3 silence (finalize) → 5 speech → silence
         let mut probs = vec![0.9f32; 5];
         probs.extend(vec![0.1f32; 3]);
         probs.extend(vec![0.9f32; 5]);
         probs.extend(vec![0.1f32; 5]);
         let segs = run_probs(&c, &probs);
         assert_eq!(segs.len(), 2);
-        // seg0 終端 pad と seg1 開始 pad が重ならない (seg1.start >= seg0.end)。
+        // seg0 end padding and seg1 start padding do not overlap (seg1.start >= seg0.end).
         assert!(
             segs[1].start_sample >= segs[0].end_sample,
             "seg1.start ({}) must be >= seg0.end ({})",
@@ -605,18 +607,18 @@ mod tests {
 
     #[test]
     fn max_speech_forces_split_when_no_silence() {
-        // 無音が一切無いまま max_speech を超えたら強制分割。
+        // Force-split when max_speech is exceeded without any silence.
         let mut c = base_config();
         c.max_speech_ms = 192; // 3072 samples = 6 frames
         c.min_silence_ms = 32;
-        // 連続発話 20 フレーム (無音なし)。max_speech=6フレームごとに分割。
+        // 20 continuous speech frames (no silence). Split every max_speech=6 frames.
         let probs = vec![0.9f32; 20];
         let segs = run_probs(&c, &probs);
         assert!(
             segs.len() >= 2,
             "max_speech must force at least one split, got {segs:?}"
         );
-        // 各セグメントが max_speech 程度で切られている。
+        // Each segment is cut at about max_speech.
         for s in &segs {
             assert!(
                 s.len_samples() <= c.ms_to_samples(c.max_speech_ms) + 512,
@@ -627,19 +629,19 @@ mod tests {
 
     #[test]
     fn gray_zone_keeps_triggered() {
-        // threshold > prob >= neg_threshold のグレーゾーンでは発話継続 (切れない)。
+        // Speech continues in the gray zone threshold > prob >= neg_threshold (no split).
         let mut c = base_config(); // threshold 0.5, neg 0.35
         c.min_silence_ms = 32;
         let mut probs = vec![0.9f32; 5];
-        probs.extend(vec![0.4f32; 5]); // グレー (0.35 <= 0.4 < 0.5)
+        probs.extend(vec![0.4f32; 5]); // Gray zone (0.35 <= 0.4 < 0.5).
         probs.extend(vec![0.9f32; 5]);
-        probs.extend(vec![0.1f32; 5]); // 本当の無音
+        probs.extend(vec![0.1f32; 5]); // Actual silence.
         let segs = run_probs(&c, &probs);
         assert_eq!(segs.len(), 1, "gray zone must not split, got {segs:?}");
         assert_eq!(segs[0].end_sample, 15 * 512);
     }
 
-    // ---- 推論経路スモークテスト ----
+    // ---- Inference-path smoke tests ----
 
     #[test]
     fn vad_loads_model() {
@@ -652,7 +654,7 @@ mod tests {
         let mut vad = Vad::new(VadConfig::default()).unwrap();
         let zeros = vec![0.0f32; 16000];
         let events = vad.process(&zeros);
-        // 無音入力では SpeechStart は出ない。
+        // Silent input does not produce SpeechStart.
         assert!(
             !events
                 .iter()
@@ -669,9 +671,9 @@ mod tests {
 
     #[test]
     fn process_streams_across_calls() {
-        // 端数サンプルがコール境界をまたいでも全フレームが処理される。
+        // All frames are processed even when partial samples cross call boundaries.
         let mut vad = Vad::new(VadConfig::default()).unwrap();
-        // 300 + 300 + ... で 512 境界をまたぐ。合計 512*4 = 2048 サンプルを小分け。
+        // 300 + 300 + ... crosses 512-sample boundaries. Split 512*4 = 2048 samples into pieces.
         let total = 2048usize;
         let chunk = vec![0.0f32; 300];
         let mut fed = 0usize;
@@ -692,7 +694,7 @@ mod tests {
     #[test]
     fn reset_clears_state() {
         let mut vad = Vad::new(VadConfig::default()).unwrap();
-        vad.process(&vec![0.0f32; 1000]); // pending に端数を残す
+        vad.process(&vec![0.0f32; 1000]); // Leave a remainder in pending.
         vad.reset();
         assert_eq!(vad.last_frame_probabilities().len(), 0);
         assert_eq!(vad.config().sample_rate, 16000);
@@ -715,11 +717,11 @@ mod tests {
         assert!(segs.is_empty(), "silence yields no segments, got {segs:?}");
     }
 
-    // ---- flush（開いた発話の強制確定） ----
+    // ---- flush (force-finalize an open segment) ----
 
-    /// threshold=0 で全フレームを発話扱いにすると、無音が来ないので `process` では
-    /// セグメントが確定しない。`flush` で開いている発話を強制確定でき、確定後は reset
-    /// 済み（累積位置が 0 起点へ戻る）で次の入力が新しい文脈から始まる。
+    /// With threshold=0, every frame counts as speech and no silence arrives, so `process` does not
+    /// finalize the segment. `flush` can force-finalize it; afterward, reset
+    /// is complete (cumulative position returns to 0) and the next input starts in a fresh context.
     #[test]
     fn flush_closes_open_speech_segment() {
         let cfg = VadConfig {
@@ -732,75 +734,78 @@ mod tests {
             sample_rate: 16_000,
         };
         let mut vad = Vad::new(cfg).unwrap();
-        // 1 秒ぶん流す。無音が来ないので process ではセグメント未確定。
+        // Feed one second. No silence arrives, so process does not finalize the segment.
         let sig = vec![0.1f32; 16_000];
         let during = vad.process(&sig);
         assert!(
             during.is_empty(),
-            "無音が来ないので process ではセグメントは確定しない: {during:?}"
+            "Without silence, process does not finalize the segment: {during:?}"
         );
-        // flush で開いた発話を確定 → speechStart + speechEnd のペア。
+        // flush finalizes the open segment → speechStart + speechEnd pair.
         let flushed = vad.flush();
         assert_eq!(
             flushed.len(),
             2,
-            "flush は開いた発話を確定する: {flushed:?}"
+            "flush finalizes the open segment: {flushed:?}"
         );
         assert!(matches!(flushed[0], VadEvent::SpeechStart { at_sample: 0 }));
         assert!(matches!(flushed[1], VadEvent::SpeechEnd { .. }));
 
-        // flush 後は reset 済み＝新しい文脈。同一入力で開始位置が 0 起点へ戻る。
+        // flush resets state, starting a fresh context. The same input starts again at 0.
         let after = vad.process(&sig);
         assert!(
             after.is_empty(),
-            "reset 後は新規セグメントが未確定: {after:?}"
+            "After reset, the new segment is not finalized: {after:?}"
         );
         let flushed2 = vad.flush();
         assert_eq!(flushed2.len(), 2);
         assert_eq!(
             flushed[0], flushed2[0],
-            "reset 後は開始位置が 0 起点へ戻り、同一入力で同一開始になる"
+            "After reset, the start position returns to 0 and the same input has the same start"
         );
     }
 
-    /// 発話が開いていない（無音のみ）ときの flush は空を返す。
+    /// flush returns empty when no segment is open (silence only).
     #[test]
     fn flush_on_idle_returns_empty() {
         let mut vad = Vad::new(VadConfig::default()).unwrap();
         let zeros = vec![0.0f32; 16_000];
         vad.process(&zeros);
         let flushed = vad.flush();
-        assert!(flushed.is_empty(), "無発話中の flush は空: {flushed:?}");
+        assert!(
+            flushed.is_empty(),
+            "flush is empty when no speech is open: {flushed:?}"
+        );
     }
 
-    /// min_speech 未満の開いた発話は flush でも破棄される（segmenter の篩いに従う）。
+    /// An open segment shorter than min_speech is discarded by flush as well (per the segmenter filter).
     #[test]
     fn flush_discards_segment_shorter_than_min_speech() {
         let cfg = VadConfig {
             threshold: 0.0,
             neg_threshold: Some(0.0),
-            min_speech_ms: 1_000, // 1 秒未満は破棄。
+            min_speech_ms: 1_000, // Discard segments shorter than 1 second.
             min_silence_ms: 0,
             speech_pad_ms: 0,
             max_speech_ms: 0,
             sample_rate: 16_000,
         };
         let mut vad = Vad::new(cfg).unwrap();
-        // 300ms ぶん（< min_speech 1000ms）だけ流して flush。
+        // Feed only 300 ms (< min_speech 1000 ms), then flush.
         let sig = vec![0.1f32; 16_000 * 300 / 1000];
         vad.process(&sig);
         let flushed = vad.flush();
         assert!(
             flushed.is_empty(),
-            "min_speech 未満の open セグメントは flush でも破棄される: {flushed:?}"
+            "Open segments shorter than min_speech are discarded by flush too: {flushed:?}"
         );
     }
 
-    // ---- process_pcm（自己完結入口） ----
+    // ---- process_pcm (self-contained entry point) ----
 
-    /// 決定的な帯域内（<8kHz）テスト信号。倍音を重ねた合成波でリサンプルの効きが分かる。
-    /// なお silero は合成波を発話とみなさない（既定設定では確率が低い）ので、イベント自体は
-    /// 主に低しきい値の設定で出す。ここでは確率列の一致でリサンプルの正しさを確かめる。
+    /// Deterministic in-band (<8 kHz) test signal. A composite wave with harmonics makes resampling effects visible.
+    /// Silero does not treat synthetic waves as speech (low probability with defaults), so events are
+    /// generated mainly with a low threshold. Verify resampling by comparing probability sequences.
     fn harmonics(rate: usize, n: usize) -> Vec<f32> {
         (0..n)
             .map(|i| {
@@ -814,7 +819,7 @@ mod tests {
             .collect()
     }
 
-    /// mono を interleaved stereo（L=R）に複製する。
+    /// Duplicate mono into interleaved stereo (L=R).
     fn to_stereo(mono: &[f32]) -> Vec<f32> {
         let mut s = Vec::with_capacity(mono.len() * 2);
         for &v in mono {
@@ -824,8 +829,8 @@ mod tests {
         s
     }
 
-    /// 16k/mono を process_pcm に渡すと process と完全に同じ挙動（イベント列・確率列が
-    /// ビット一致）になる＝パススルー経路。
+    /// Passing 16 kHz/mono to process_pcm behaves exactly like process (event and probability sequences
+    /// are bit-identical): the pass-through path.
     #[test]
     fn process_pcm_passthrough_matches_process() {
         let sig = harmonics(16_000, 16_000);
@@ -840,44 +845,44 @@ mod tests {
 
         assert_eq!(
             e_pcm, e_proc,
-            "passthrough のイベント列が process と一致しない"
+            "passthrough event sequence differs from process"
         );
         assert_eq!(
             p_pcm, p_proc,
-            "passthrough の確率列が process とビット一致しない"
+            "passthrough probability sequence is not bit-identical to process"
         );
-        assert_eq!(p_pcm.len(), 16_000 / 512, "フレーム数が想定通りでない");
+        assert_eq!(p_pcm.len(), 16_000 / 512, "unexpected frame count");
     }
 
-    /// 48k/stereo を分割して process_pcm に渡しても、一括で渡したときとイベント列・確率列が
-    /// 一致する（リサンプラ状態が呼び出しをまたいで継続＝継ぎ目なし）。奇数長で分割して
-    /// フレーム境界もまたがせる。
+    /// Splitting 48 kHz/stereo input across process_pcm calls produces the same event and probability sequences
+    /// as a single batch (resampler state continues across calls without seams). Split at odd lengths
+    /// so input also crosses frame boundaries.
     #[test]
     fn process_pcm_split_matches_bulk() {
-        // 合成信号は silero が発話とみなさない（確率が低い）ので、確率値に依らず
-        // イベントが出る設定にする。threshold=0 で全フレームを発話扱いにし、max_speech で
-        // 一定長ごとに強制分割させる。イベント位置はリサンプル後のフレーム数で決まるので、
-        // 分割と一括が食い違えばイベント列がずれる＝継ぎ目検出にもなる。
+        // Silero gives synthetic signals low speech probability, so configure events to appear
+        // regardless of probability. threshold=0 treats all frames as speech; max_speech
+        // force-splits at fixed intervals. Event positions depend on frames after resampling, so
+        // differences between split and batch input shift the event sequence and reveal seams.
         let cfg = VadConfig {
             threshold: 0.0,
             neg_threshold: Some(0.0),
             min_speech_ms: 0,
             min_silence_ms: 0,
             speech_pad_ms: 0,
-            max_speech_ms: 200, // 200ms @16k = 3200 サンプルごとに強制分割。
+            max_speech_ms: 200, // Force-split every 3200 samples (200 ms at 16 kHz).
             sample_rate: 16_000,
         };
         let stereo = to_stereo(&harmonics(48_000, 48_000));
 
         let mut vad = Vad::new(cfg).unwrap();
 
-        // 一括投入。
+        // Submit as one batch.
         let bulk_events = vad.process_pcm(&stereo, 48_000, 2);
         let bulk_probs = vad.last_frame_probabilities().to_vec();
 
         vad.reset();
 
-        // 分割投入（777 サンプル＝奇数長でフレーム境界をまたぐ）。
+        // Submit in chunks of 777 samples (odd length, crossing frame boundaries).
         let mut split_events = Vec::new();
         let mut split_probs = Vec::new();
         for chunk in stereo.chunks(777) {
@@ -888,20 +893,20 @@ mod tests {
 
         assert_eq!(
             bulk_probs, split_probs,
-            "分割と一括で確率列が一致しない（継ぎ目が出ている）"
+            "split and batch probability sequences differ (a seam was introduced)"
         );
         assert_eq!(
             bulk_events, split_events,
-            "分割と一括でイベント列が一致しない"
+            "split and batch event sequences differ"
         );
         assert!(
             !bulk_events.is_empty(),
-            "この設定では発話イベントが出るはず（テストの実効性確認）"
+            "this configuration should produce speech events (verify the test is effective)"
         );
     }
 
-    /// reset 後に同一入力を process_pcm へ流すと、イベント列・確率列が完全に一致する
-    /// （リサンプラ状態も reset で初期化される）。
+    /// After reset, processing the same input with process_pcm produces identical event and probability sequences
+    /// (reset also clears resampler state).
     #[test]
     fn process_pcm_reset_is_deterministic() {
         let stereo = to_stereo(&harmonics(48_000, 24_000));
@@ -914,12 +919,15 @@ mod tests {
         let e2 = vad.process_pcm(&stereo, 48_000, 2);
         let p2 = vad.last_frame_probabilities().to_vec();
 
-        assert_eq!(e1, e2, "reset 後に同一入力で同一イベントにならない");
-        assert_eq!(p1, p2, "reset 後に同一入力で同一確率にならない");
+        assert_eq!(e1, e2, "same input after reset produced different events");
+        assert_eq!(
+            p1, p2,
+            "same input after reset produced different probabilities"
+        );
     }
 
-    /// 48k/stereo を process_pcm に流した結果が、同じ波形を直接 16k/mono で作って process に
-    /// 流した結果とほぼ一致する。過渡（先頭・末尾数フレーム）を除いた確率で突き合わせる。
+    /// Processing 48 kHz/stereo through process_pcm should nearly match creating the same waveform directly at 16 kHz/mono and passing it to process.
+    /// Compare probabilities excluding transients (a few frames at each end).
     #[test]
     fn process_pcm_48k_stereo_matches_direct_16k() {
         let n16 = 16_000usize;
@@ -934,22 +942,22 @@ mod tests {
         let pcm_events = pcm_vad.process_pcm(&stereo48, 48_000, 2);
         let pcm_probs = pcm_vad.last_frame_probabilities().to_vec();
 
-        // フレーム数はリサンプラ遅延で最大 1 フレーム差。共通部分の中央で確率を比べる。
+        // Resampler latency can change frame count by at most one. Compare probabilities in the shared middle region.
         let n = ref_probs.len().min(pcm_probs.len());
-        assert!(n >= 8, "十分なフレーム数が必要: {n}");
+        assert!(n >= 8, "at least 8 frames are required: {n}");
         for k in 2..(n - 2) {
             let d = (ref_probs[k] - pcm_probs[k]).abs();
             assert!(
                 d < 0.05,
-                "frame {k}: 直接16kと変換経路の確率差が大きい: {d} (ref={} pcm={})",
+                "frame {k}: probability difference between direct 16 kHz and converted paths is too large: {d} (ref={} pcm={})",
                 ref_probs[k],
                 pcm_probs[k]
             );
         }
-        // 既定設定では合成信号は無音扱い＝両経路とも発話イベントなし（等価）。
+        // With defaults, synthetic signals count as silence, so both paths produce no speech events (equivalent).
         assert_eq!(
             ref_events, pcm_events,
-            "変換経路のイベント列が直接16kと一致しない"
+            "converted-path events differ from direct 16 kHz events"
         );
     }
 }

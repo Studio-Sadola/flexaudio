@@ -1,10 +1,10 @@
-//! `processes()` の Linux 実機統合テスト（PipeWire がある環境でだけ走る）。
+//! Linux real-hardware integration test for `processes()` (runs only when PipeWire is available).
 //!
-//! `pw-play` で無音 WAV を再生する子プロセスを起こし、その PID が `processes()` に
-//! 出ること（＝プロセス別キャプチャの `target_pid` に渡せる候補として見えること）を確かめる。
-//! PipeWire に接続できない・`pw-play` が無い環境では理由を表示して何もせず成功する。
+//! Start a child process that plays a silent WAV with `pw-play`, then verify its PID appears
+//! in `processes()` as a candidate for `target_pid` in per-process capture. If PipeWire is
+//! unreachable or `pw-play` is missing, print the reason and succeed without doing anything.
 //!
-//! 実行例（非対話 SSH では PipeWire のソケットを見つけるために `XDG_RUNTIME_DIR` が要る）:
+//! Example (non-interactive SSH needs `XDG_RUNTIME_DIR` to locate the PipeWire socket):
 //! ```text
 //! XDG_RUNTIME_DIR=/run/user/$(id -u) cargo test -p flexaudio --test processes_linux -- --nocapture
 //! ```
@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// 子プロセスと一時ディレクトリを、テストが panic しても必ず片付ける。
+/// Always clean up the child process and temporary directory, even if the test panics.
 struct PlayerGuard {
     child: Child,
     dir: PathBuf,
@@ -32,7 +32,7 @@ impl Drop for PlayerGuard {
     }
 }
 
-/// 48 kHz / stereo / 16-bit の無音 WAV を書く。
+/// Write a silent 48 kHz / stereo / 16-bit WAV.
 fn write_silent_wav(path: &Path, seconds: u32) -> std::io::Result<()> {
     const RATE: u32 = 48_000;
     const CHANNELS: u16 = 2;
@@ -87,7 +87,7 @@ fn lists_a_pipewire_playback_process_by_pid() {
     let player = PlayerGuard { child, dir };
     let player_pid = player.child.id();
 
-    // 再生ストリームがレジストリに出るまで少し待つ（上限 5 秒）。
+    // Wait briefly for the playback stream to appear in the registry (5-second limit).
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut found = None;
     while Instant::now() < deadline {

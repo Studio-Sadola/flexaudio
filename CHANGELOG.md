@@ -182,6 +182,92 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
 - Declared per-crate MSRV: `1.85` for core/facade/OS/mic crates, `1.88` for
   `flexaudio-vad` and `flexaudio-napi`.
 
+## History before 0.3.0 (translated from Japanese commit messages)
+
+### 2026-09-23 - Capture correctness and Windows dependency checks
+
+#### Fixed
+
+- Mark the first resumed chunk of each primary and secondary stream with
+  DISCONTINUITY by checking resume generations under the delivery lock.
+  The 300-round test checks both taps but did not reproduce the old
+  race. (f6a30e7)
+- Propagate macOS output-device enumeration and UID
+  lookup failures instead of returning an empty list or masking errors
+  as DeviceNotFound. Preserve the shared OSStatus error mapping.
+  (d4eef38)
+- Move the macOS device module's test-only Error import into
+  its test module, fixing the Clippy gate without changing runtime
+  behavior. (846d7d9)
+- Parse DLL names containing '+' such as
+  libc++.dll in the Windows PE checker. Add name-validation and CLI
+  tests to N-API contract CI, keeping CLI execution unconditional on
+  older Node.js versions. (480433e)
+- Reject PE dependencies outside
+  seven documented Windows DLLs and api-ms-win-* API sets, while
+  retaining stronger forbidden-runtime rules. Add policy and
+  synthetic-PE CLI tests to per-push CI. (55417c4)
+
+### 2026-09-22 - Windows microphone lifetime
+
+#### Fixed
+
+- Initialize cpal's shared WASAPI enumerator on a process-lifetime
+  keeper thread so later microphone calls survive the first caller's
+  exit. Restore Windows microphone tests and add a two-thread regression
+  test. (e36ca9f)
+
+### 2026-09-21 - Rust toolchain and CI coverage
+
+#### Fixed
+
+- Update four VAD test chunking calls for the Rust 1.98 Clippy lint,
+  preserving trailing-remainder behavior and Rust 1.91 compatibility.
+  (b2375d3)
+
+#### CI
+
+- Pin required checks to Rust 1.98.1, add a toolchain-pin guard and a
+  non-blocking upstream-stable preview, and lint Windows/macOS native
+  crates. Expand MSRV coverage to nine Rust 1.85 crates and four Rust
+  1.91 add-ons, including cross-checks for OS-only crates. (0e6cbea)
+
+### 2026-09-20 - Windows npm artifact inspection
+
+#### CI
+
+- Replace dumpbin with a Node.js PE parser so missing runner tools no
+  longer prevent Windows artifact uploads. Inspect normal and delayed
+  imports, rejecting forbidden runtimes and unreadable inputs. (ab8df7f)
+
+### 2026-09-18 - Pure-Rust VAD inference
+
+#### Changed
+
+- Replace ONNX Runtime with tract-onnx =0.23.7 and an embedded Silero 16
+  kHz model; use sinc resampling for 8 kHz input while retaining
+  input-based event timing. Raise the VAD Rust minimum to 1.91. Windows
+  npm builds use a static CRT and check for runtime DLL dependencies.
+  The supplied implementation diff is truncated; model and resampling
+  details come from the commit message. (804e641)
+
+### 2026-07-05 - 0.2.0 publishing follow-up
+
+#### CI
+
+- Retry crates.io HTTP 429 publishing failures up to 10 attempts with
+  660-second waits, failing immediately on other errors. Add
+  RELEASING.md with the recorded 0.2.0 crates.io/PyPI publication
+  status, npm blockers, and instructions for completing npm publication.
+  (8985e37)
+- Skip npm lifecycle scripts during real and dry-run
+  publication and remove prepublishOnly, avoiding duplicate platform
+  publication and GitHub release creation from napi prepublish.
+  (924f009)
+- Upgrade npm CLI before publishing to support staged
+  publication and interactive approval of new packages in scopes
+  requiring 2FA. (1840fbb)
+
 [Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Studio-Sadola/flexaudio/releases/tag/v0.2.0

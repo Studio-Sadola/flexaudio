@@ -1,7 +1,7 @@
-//! 独立したノイズ抑制クラス [`Denoiser`]。
+//! Standalone noise suppression class [`Denoiser`].
 //!
-//! RNNoise（nnnoiseless）によるオフラインのノイズ抑制アドオン（[`flexaudio_denoise`]）の
-//! Python 露出。
+//! Python binding for the offline noise suppression addon ([`flexaudio_denoise`]) using
+//! RNNoise (`nnnoiseless`).
 
 use pyo3::prelude::*;
 
@@ -9,13 +9,13 @@ use flexaudio_denoise::Denoiser as CoreDenoiser;
 
 use crate::denoise_err_to_py;
 
-/// ストリーミングのノイズ抑制器。
+/// Streaming noise suppressor.
 ///
-/// **48kHz 前提**: 入力は ±1.0 正規化・48kHz・interleaved の f32 でなければならない
-/// （RNNoise が 48kHz 固定フレームでしか動かないため）。ステレオはチャンネル独立に処理する。
+/// **Requires 48 kHz**: Input must be interleaved f32 normalized to ±1.0 at 48 kHz because
+/// RNNoise only supports fixed frames at 48 kHz. Stereo channels are processed independently.
 ///
-/// 遅延: 出力は入力を 480 サンプル/ch（48kHz で 10ms）遅らせた列になる。ストリーム先頭の
-/// 480 サンプル/ch は遅延の詰め物（無音）で、末尾の残りは [`flush`](Denoiser::flush) が返す。
+/// Latency: Output trails input by 480 samples per channel (10 ms at 48 kHz). The first 480
+/// samples per channel are silence padding; [`flush`](Denoiser::flush) returns the remaining tail.
 #[pyclass(module = "flexaudio", name = "Denoiser")]
 pub struct Denoiser {
     inner: CoreDenoiser,
@@ -23,19 +23,20 @@ pub struct Denoiser {
 
 #[pymethods]
 impl Denoiser {
-    /// チャンネル数（1 = mono / 2 = stereo interleaved）を指定して構築する。1..=2 以外は
-    /// `ValueError`。
+    /// Create a suppressor with the given channel count (1 = mono, 2 = interleaved stereo).
+    /// Values outside 1..=2 raise `ValueError`.
     #[new]
     fn new(channels: u16) -> PyResult<Self> {
         let inner = CoreDenoiser::new(channels).map_err(denoise_err_to_py)?;
         Ok(Denoiser { inner })
     }
 
-    /// 任意長の interleaved（±1.0 正規化・48kHz）サンプルをノイズ抑制して返す。
+    /// Suppress noise in any-length interleaved samples (normalized to ±1.0 at 48 kHz) and return them.
     ///
-    /// 長さはチャンネル数の倍数であること（そうでなければ `ValueError`）。端数は次回へ持ち
-    /// 越すので、任意の位置で分割して連続で渡してよい。`samples` は list / array.array /
-    /// numpy 配列いずれも渡せる。返すのは同じ長さのノイズ抑制後サンプル（先頭は遅延の無音）。
+    /// Length must be a multiple of the channel count, or `ValueError` is raised. Partial frames
+    /// carry over to the next call, so input can be split and passed in consecutive chunks.
+    /// `samples` can be a list, array.array, or NumPy array. Returns noise-suppressed samples of
+    /// the same length, with latency silence at the start.
     fn process(&mut self, mut samples: Vec<f32>) -> PyResult<Vec<f32>> {
         self.inner
             .process(&mut samples)
@@ -43,18 +44,19 @@ impl Denoiser {
         Ok(samples)
     }
 
-    /// 持ち越し中の端数を処理し、遅延分の末尾 480 サンプル/ch を返してストリームを閉じる。
-    /// 呼び出し後は [`reset`](Denoiser::reset) と同じ初期状態に戻る（続けて再利用できる）。
+    /// Process any carried-over partial frame, return the 480-sample-per-channel latency tail,
+    /// and close the stream. Resets to the same initial state as [`reset`](Denoiser::reset), so
+    /// the instance can be reused.
     fn flush(&mut self) -> Vec<f32> {
         self.inner.flush()
     }
 
-    /// 状態・持ち越しバッファ・遅延線をすべて初期化する（同一入力から同一出力になる）。
+    /// Reset the state, carry-over buffer, and delay line (identical input then produces identical output).
     fn reset(&mut self) {
         self.inner.reset();
     }
 
-    /// 構築時に指定したチャンネル数。
+    /// Channel count specified at construction.
     fn channels(&self) -> u16 {
         self.inner.channels()
     }

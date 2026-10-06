@@ -1,25 +1,24 @@
-//! flexaudio-core — OS 非依存コア。
+//! flexaudio-core — OS-independent core.
 //!
-//! デスクトップ音声キャプチャ抽象化ライブラリ `flexaudio` の OS 非依存部分。
-//! リングバッファ / SR 変換 / チャンネル mix / 20ms チャンク化 / クロック正規化 /
-//! イベント・型定義を提供する。OS 固有のキャプチャは [`backend::CaptureBackend`] を
-//! 実装する別 crate（`flexaudio-os-*`）が担い、facade 層が両者を配線する。
+//! The OS-independent part of the desktop audio capture abstraction library `flexaudio`.
+//! Provides ring buffers, sample-rate conversion, channel mixing, 20 ms chunking, clock normalization,
+//! events, and type definitions. OS-specific capture is implemented by separate `flexaudio-os-*`
+//! crates that implement [`backend::CaptureBackend`], which the facade layer wires to the core.
 //!
-//! # 固定契約
-//! 内部処理はすべて interleaved `f32` / 48000 Hz / ステレオ 2ch / 20ms = 960
-//! frames/chunk で行う。外部へ出すレート/チャンネルは [`OutputFormat`] で変えられ
-//! （Normalizer 第 2 段が再変換。例 16k/1ch は 320 frames/chunk）、出力チャンクは
-//! レートに依らず時間ベースで 20ms。
+//! # Fixed contract
+//! All internal processing uses interleaved `f32` / 48000 Hz / stereo 2ch / 20 ms = 960
+//! frames/chunk. [`OutputFormat`] can change the external rate/channels (the Normalizer's second
+//! stage resamples; e.g. 16k/1ch gives 320 frames/chunk). Output chunks remain 20 ms regardless of rate.
 //!
-//! 公開 API にコールバックは無い。RT スレッドは push のみ、消費側は poll する。
-//! RT 経路は非ブロッキング（満杯時は DROP_OLDEST / overflow ドロップ）。PTS は
-//! デバイス由来で、ギャップを検知する。
+//! The public API has no callbacks. RT threads only push; consumers poll.
+//! The RT path never blocks (DROP_OLDEST / overflow drop when full). PTS comes from the device
+//! and gaps are detected.
 //!
-//! # 2 段リングバッファ構成
+//! # Two-stage ring-buffer layout
 //! ```text
-//! [RT cb] --push--> RawRing (rtrb, RT安全) --pop--> [取り込み/加工スレッド]
+//! [RT cb] --push--> RawRing (rtrb, RT-safe) --pop--> [ingest/process thread]
 //!                                                       |
-//!                                          Normalizer (mix + rubato SRC + 960切出)
+//!                                          Normalizer (mix + rubato SRC + 960-frame slicing)
 //!                                                       |
 //!                                                       v
 //!                                       ChunkRing (ringbuf, DROP_OLDEST) --try_pop--> [poll]
@@ -37,7 +36,7 @@ pub mod raw_ring;
 pub mod secondary_ring;
 pub mod types;
 
-// 主要型をクレート直下へ再エクスポート。
+// Re-export the main types at the crate root.
 pub use backend::{CaptureBackend, RawSink};
 pub use chunk_ring::{chunk_ring, ChunkConsumer, ChunkProducer};
 pub use clock::{monotonic_now_ns, ClockNormalizer};

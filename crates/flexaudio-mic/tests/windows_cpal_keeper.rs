@@ -1,16 +1,16 @@
 #![cfg(windows)]
 
-//! Windows 固有の cpal WASAPI lifetime 回帰テスト。
+//! Windows-specific regression test for cpal WASAPI lifetime.
 
 use std::thread;
 
-/// 短命な呼出側スレッドが終了した後も、別スレッドから cpal を利用できる。
+/// cpal remains usable from another thread after a short-lived caller thread exits.
 ///
-/// この integration test binary には本テストしかないため、修正前は最初の worker が
-/// `list_devices()` 内で cpal の process-wide enumerator を初期化して終了する。その後の
-/// worker の最初の cpal 呼出しは access violation でプロセスを終了する。修正後は各呼出し
-/// が keeper を先に通るので、両 worker は安全に終了する。音声端点が無い GitHub runner でも
-/// `list_devices()` は空 Vec を返す契約なので、実マイクを必要としない。
+/// This is the only test in this integration test binary. Before the fix, the first worker
+/// initialized cpal's process-wide enumerator inside `list_devices()` and then exited. The next
+/// worker's first cpal call terminated the process with an access violation. With the fix, each
+/// call goes through the keeper first, so both workers exit safely. The test needs no real
+/// microphone: `list_devices()` is expected to return an empty Vec on GitHub runners without audio endpoints.
 #[test]
 fn cpal_survives_after_calling_thread_exits() {
     let first = thread::spawn(flexaudio_mic::list_devices)
