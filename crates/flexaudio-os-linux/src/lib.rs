@@ -547,6 +547,11 @@ fn run_pw_process_loop(
     // drop され、PipeWire リソースがこのスレッド上で破棄される。
 }
 
+// Bound Node proxies + their info listeners, keyed by registry global id.
+// Binding is what delivers `application.process.id`: the registry `global`
+// props omit it, a bound object's `info` carries it.
+type BoundNode = (pw::node::Node, pw::node::NodeListener);
+
 /// プロセスキャプチャの run 中ずっと保持する所有物。drop するとキャプチャが止まる。
 ///
 /// - `CoreRc`: `core.create_object("link-factory", ...)` の主体。registry コールバック
@@ -561,6 +566,7 @@ fn run_pw_process_loop(
 ///   ループスレッド上で生かし続ける。registry コールバックがここへ insert / remove /
 ///   clear するので `Rc<RefCell<…>>` で共有する。Include は高々 1 エントリ、Exclude は
 ///   多数（マップごと drop すれば全リンクが切れる）。
+/// - `_bound_nodes`: bound Node proxies + their info listeners, keyed by registry global id — dropping an entry unregisters that node's info listener.
 #[allow(clippy::type_complexity)]
 struct ProcessKeep {
     _stream: pw::stream::StreamRc,
@@ -569,22 +575,30 @@ struct ProcessKeep {
     _registry_listener: pw::registry::Listener,
     _links: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, Vec<pw::link::Link>>>>,
     _core: pw::core::CoreRc,
+    _bound_nodes: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, BoundNode>>>,
 }
 
 /// 監視中の Stream/Output/Audio ノード 1 件の登録情報（registry global から拾う）。
 ///
 /// PipeWire では PID はノードでなく Client オブジェクトの `pipewire.sec.pid` に載る。
 /// ノード側には通常 PID が無く、`client.id` で所有 Client を指すだけ。なので PID 解決は
-/// 二段（ノード→client.id→Client の PID）。ノード自身に PID が載っていれば `app_pid` に
-/// 控える（将来構成への備え）。
+/// 二段（ノード→client.id→Client の PID）。ノードを bind した info から
+/// `application.process.id` が届けばそれを `app_pid` に控える。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NodeEntry {
     /// このノードを所有する Client の registry global id（ノード props の `client.id`）。
     /// 無いこともある（その場合は `app_pid` も client_pid 解決も当たらない）。
     owning_client_id: Option<u32>,
-    /// ノード自身の props に PID が載っていた場合の PID（通常は `None`。将来 PipeWire が
-    /// ノードに PID を載せる構成への備え）。
+    /// ノードを bind した info から埋まる PID（`application.process.id`）。
+    /// app_pid is filled from the bound node's info props (application.process.id),
+    /// which the registry global omits.
     app_pid: Option<u32>,
+    /// bind したノードの info コールバックが一度でも届いたか（中身の有無は問わない）。
+    /// Exclude リンクの可否判定に使う: false のままのノードは PID 未確定なので、
+    /// 誤って除外対象プロセスをリンクしないよう対象から外す（安全側）。
+    /// Set true by the info callback whether or not it carried `application.process.id`;
+    /// read by `exclude_decidable` to gate Exclude-mode linking.
+    info_seen: bool,
 }
 
 /// 1 ポートの登録情報（registry の `ObjectType::Port` global から拾う）。
@@ -685,6 +699,29 @@ fn resolve_node_pid(
     client_pid.get(&client_id).copied()
 }
 
+/// Resolve a registry object's owning process from its properties.
+///
+/// `application.process.id` is preferred: for libpulse clients (Electron,
+/// Chromium, most desktop apps) the daemon-assigned `pipewire.sec.pid` is
+/// pipewire-pulse's own pid, and only `application.process.id` (set by
+/// libpulse / libpipewire from the client's own props) names the app. It is
+/// self-declared, which is acceptable for capture selection and self-exclusion.
+/// `pipewire.sec.pid` is the fallback for clients that declare nothing.
+pub(crate) fn pid_from_props(app_process_id: Option<&str>, sec_pid: Option<&str>) -> Option<u32> {
+    let parse = |s: Option<&str>| s.and_then(|s| s.parse::<u32>().ok()).filter(|p| *p != 0);
+    parse(app_process_id).or_else(|| parse(sec_pid))
+}
+
+/// Exclude モードでこのノードをリンク対象として判定してよいか（PipeWire 非依存）。
+///
+/// bind したノードの info コールバックが一度も届いていなければ、PID 解決が client
+/// table 経由の暫定値（pipewire-pulse の pid になりがち）でしかなく、除外対象
+/// プロセスを取り違えてリンクしかねない。`info_seen` が立つまでは判定不能として
+/// 扱い、Exclude の対象から外す（安全側 — 未確認ノードは録らない）。
+fn exclude_decidable(entry: &NodeEntry) -> bool {
+    entry.info_seen
+}
+
 /// 自前キャプチャ stream のノード名。registry で自分の入力ポートを引くための固有名で、
 /// 対象 PID を埋めて衝突を避ける。
 fn capture_node_name(target_pid: u32) -> String {
@@ -713,6 +750,17 @@ impl PidSelect {
             PidSelect::Include(p) | PidSelect::Exclude(p) => p,
         }
     }
+
+    /// 解決済み PID がこの select の対象になるか（PipeWire 非依存）。未解決（`None`）
+    /// は対象外— 資格未確認のノードをうっかりリンクしないのと対称に、うっかり
+    /// リンク済みのまま残さない側の判定にも使う（info 更新後の再評価）。
+    fn selects(self, resolved: Option<u32>) -> bool {
+        match (self, resolved) {
+            (PidSelect::Include(pid), Some(other)) => other == pid,
+            (PidSelect::Exclude(pid), Some(other)) => other != pid,
+            (_, None) => false,
+        }
+    }
 }
 
 /// プロセスキャプチャのセットアップ一式。失敗は `Err(String)`（panic しない）。
@@ -729,6 +777,7 @@ impl PidSelect {
 ///   資格情報から付与＝詐称できない。実機 stock 構成で確認）。ノードは `client.id` で
 ///   Client を指すだけなので、PID 照合は二段（node → client.id → Client の PID。
 ///   [`resolve_node_pid`]）。Client が先でも Node が先でも、各 global 到着時に再評価する。
+///   application.process.id takes precedence — see pid_from_props.
 /// - `select`（[`PidSelect`]）の述語でリンク対象ノードを決める。Include は対象 PID に属する
 ///   Stream/Output/Audio ノード 1 件、Exclude は除外 PID 以外の解決済み PID を持つ
 ///   Stream/Output/Audio ノード全件（PID 未解決は Client 到着まで保留）。各対象ノードの
@@ -833,6 +882,10 @@ fn setup_pw_process(
     // エントリ、Exclude は多数。エントリ単位 remove で個別に、map ごと clear で一括にリンクを切れる。
     let linked: Rc<RefCell<HashMap<u32, Vec<pw::link::Link>>>> =
         Rc::new(RefCell::new(HashMap::new()));
+    // Bound Node proxies + their info listeners, keyed by registry global id.
+    // Binding is what delivers `application.process.id`: the registry `global`
+    // props omit it, a bound object's `info` carries it.
+    let bound_nodes: Rc<RefCell<HashMap<u32, BoundNode>>> = Rc::new(RefCell::new(HashMap::new()));
 
     // 状態が更新されるたびに、リンクすべき出力ノードのうち未リンクのものを再評価し、
     // 対象出力ポートと自入力ポートが揃っていれば link-factory でチャンネル対応リンクを張る。
@@ -893,6 +946,16 @@ fn setup_pw_process(
                     .iter()
                     .filter(|(id, entry)| {
                         if linked.contains_key(id) {
+                            return false;
+                        }
+                        // info_seen が立つまでは判定不能として保留する（
+                        // exclude_decidable）。bind した info が一度も届いていない
+                        // ノードは client table 経由の暫定 PID（pipewire-pulse の pid
+                        // になりがち）しか持たず、除外対象プロセスを取り違えてリンク
+                        // しかねない。bind 自体に失敗したノードは info が永遠に届かず、
+                        // Exclude では永久にリンクされない — 除外対象を取り違えて
+                        // 録るより安全側。
+                        if !exclude_decidable(entry) {
                             return false;
                         }
                         // 解決済みかつ除外 PID 以外のときだけ対象にする。未解決（None）は
@@ -989,6 +1052,8 @@ fn setup_pw_process(
     let target_client_for_global = target_client_id.clone();
     let ports_for_global = ports.clone();
     let linked_for_global = linked.clone();
+    let registry_for_global = registry.clone();
+    let bound_for_global = bound_nodes.clone();
 
     let core_for_remove = core.clone();
     let stream_for_remove = stream.clone();
@@ -998,6 +1063,7 @@ fn setup_pw_process(
     let target_client_for_remove = target_client_id.clone();
     let ports_for_remove = ports.clone();
     let linked_for_remove = linked.clone();
+    let bound_for_remove = bound_nodes.clone();
 
     let _registry_listener = registry
         .add_listener_local()
@@ -1011,10 +1077,11 @@ fn setup_pw_process(
                     pw::types::ObjectType::Client => {
                         // PID は Client の pipewire.sec.pid に常在する（デーモンが付与する
                         // ので詐称できない）。
-                        let Some(pid_str) = props.get(*pw::keys::SEC_PID) else {
-                            return;
-                        };
-                        let Ok(pid) = pid_str.parse::<u32>() else {
+                        // application.process.id takes precedence — see pid_from_props.
+                        let Some(pid) = pid_from_props(
+                            props.get(*pw::keys::APP_PROCESS_ID),
+                            props.get(*pw::keys::SEC_PID),
+                        ) else {
                             return;
                         };
                         client_pid_for_global.borrow_mut().insert(global.id, pid);
@@ -1033,17 +1100,103 @@ fn setup_pw_process(
                         let owning_client_id = props
                             .get(*pw::keys::CLIENT_ID)
                             .and_then(|s| s.parse::<u32>().ok());
-                        // ノード自身に PID が載れば直接照合できる（将来構成への備え）。
-                        let app_pid = props
-                            .get(*pw::keys::SEC_PID)
-                            .and_then(|s| s.parse::<u32>().ok());
+                        // ノードを bind して info を購読するまで PID は分からない
+                        // ことが多い（registry global の props に
+                        // application.process.id は載らない — 届くのは bound
+                        // info 経由のみ）。
+                        let app_pid = pid_from_props(props.get(*pw::keys::APP_PROCESS_ID), None);
                         nodes_for_global.borrow_mut().insert(
                             global.id,
                             NodeEntry {
                                 owning_client_id,
                                 app_pid,
+                                info_seen: false,
                             },
                         );
+
+                        // bind して info を購読し、届いた時点で app_pid / info_seen を
+                        // 埋めて再評価する。bind 自体に失敗しても enumeration は
+                        // client table 経由で続く（このノードだけ info_seen が
+                        // 永遠に立たず、Exclude では判定不能のまま＝リンクされない —
+                        // 安全側）。
+                        let bound: std::result::Result<pw::node::Node, _> =
+                            registry_for_global.bind(global);
+                        if let Ok(node) = bound {
+                            let node_id = global.id;
+                            let nodes_for_info = nodes_for_global.clone();
+                            let client_pid_for_info = client_pid_for_global.clone();
+                            let ports_for_info = ports_for_global.clone();
+                            let linked_for_info = linked_for_global.clone();
+                            let self_node_for_info = self_node_for_global.clone();
+                            let core_for_info = core_for_global.clone();
+                            let stream_for_info = stream_for_global.clone();
+                            let select_for_info = select; // `select` is Copy
+                            let listener = node
+                                .add_listener_local()
+                                .info(move |info| {
+                                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                                        let pid = info.props().and_then(|props| {
+                                            pid_from_props(
+                                                props.get(*pw::keys::APP_PROCESS_ID),
+                                                None,
+                                            )
+                                        });
+
+                                        // 判定材料が変わったか: info_seen が初めて立つ
+                                        // （これまで判定不能だったノードが判定可能になる）
+                                        // か、app_pid が新しい値に更新されるか。どちらも
+                                        // try_link の対象集合を変え得るので、その場合だけ
+                                        // 以降の unlink 判定 / try_link を行う。
+                                        let updated_entry: Option<NodeEntry> = {
+                                            let mut nodes = nodes_for_info.borrow_mut();
+                                            let Some(entry) = nodes.get_mut(&node_id) else {
+                                                return;
+                                            };
+                                            let newly_decidable = !entry.info_seen;
+                                            entry.info_seen = true;
+                                            let pid_changed = pid.is_some() && entry.app_pid != pid;
+                                            if pid_changed {
+                                                entry.app_pid = pid;
+                                            }
+                                            (newly_decidable || pid_changed).then_some(*entry)
+                                        };
+                                        let Some(entry) = updated_entry else {
+                                            return;
+                                        };
+
+                                        // すでにリンク中で、かつ最新の解決結果ではもう
+                                        // select の対象外なら、try_link に評価させる前に
+                                        // 自分でリンクを外す（try_link は追加のみで、
+                                        // 外れるべきリンクを外してくれない）。
+                                        let resolved = {
+                                            let client_pid = client_pid_for_info.borrow();
+                                            resolve_node_pid(&entry, &client_pid)
+                                        };
+                                        if linked_for_info.borrow().contains_key(&node_id)
+                                            && !select_for_info.selects(resolved)
+                                        {
+                                            linked_for_info.borrow_mut().remove(&node_id);
+                                        }
+
+                                        // ここまでで nodes/client_pid/linked のどの借用も
+                                        // 終わっている（すべて上のブロック内で drop 済み）。
+                                        try_link(
+                                            &core_for_info,
+                                            &stream_for_info,
+                                            select_for_info,
+                                            &self_node_for_info,
+                                            &nodes_for_info,
+                                            &client_pid_for_info,
+                                            &ports_for_info,
+                                            &linked_for_info,
+                                        );
+                                    }));
+                                })
+                                .register();
+                            bound_for_global
+                                .borrow_mut()
+                                .insert(node_id, (node, listener));
+                        }
                     }
                     pw::types::ObjectType::Port => {
                         // ポートを蓄積する（対象出力ポートと自入力ポートの両方をここから引く）。
@@ -1166,6 +1319,7 @@ fn setup_pw_process(
                 nodes_for_remove.borrow_mut().remove(&id);
                 client_pid_for_remove.borrow_mut().remove(&id);
                 ports_for_remove.borrow_mut().remove(&id);
+                bound_for_remove.borrow_mut().remove(&id);
 
                 // 再待機状態になったら、別の対象が既に揃っていれば即再リンクを試みる。
                 if relink_needed {
@@ -1193,6 +1347,7 @@ fn setup_pw_process(
             _registry_listener,
             _links: linked,
             _core: core,
+            _bound_nodes: bound_nodes,
         },
     ))
 }
@@ -2559,6 +2714,7 @@ mod tests {
         let node = NodeEntry {
             owning_client_id: Some(60),
             app_pid: None,
+            info_seen: false,
         };
 
         // --- Node が先に来て Client がまだ表に無い状態 → 未解決（None）。
@@ -2581,14 +2737,16 @@ mod tests {
         let orphan = NodeEntry {
             owning_client_id: None,
             app_pid: None,
+            info_seen: false,
         };
         assert_eq!(resolve_node_pid(&orphan, &client_pid), None);
 
-        // ノード自身に application.process.id が載れば Client を介さず直解決でき、
-        // client_pid 表が空でも解決できる（将来構成への備え）。
+        // ノードを bind した info から application.process.id が届けば Client を
+        // 介さず直解決でき、client_pid 表が空でも解決できる。
         let node_with_pid = NodeEntry {
             owning_client_id: Some(99), // 表に無い client.id でも
             app_pid: Some(424242),
+            info_seen: true,
         };
         let empty: HashMap<u32, u32> = HashMap::new();
         assert_eq!(
@@ -2601,6 +2759,7 @@ mod tests {
         let other_node = NodeEntry {
             owning_client_id: Some(61),
             app_pid: None,
+            info_seen: false,
         };
         // client 61 は未登録なので None、登録すればその PID。
         assert_eq!(resolve_node_pid(&other_node, &client_pid), None);
@@ -2608,6 +2767,76 @@ mod tests {
         assert_eq!(resolve_node_pid(&other_node, &client_pid), Some(555));
         // node(client 60) の解決は影響を受けない。
         assert_eq!(resolve_node_pid(&node, &client_pid), Some(13394));
+    }
+
+    /// libpulse clients reach PipeWire through pipewire-pulse, so their Client's
+    /// `pipewire.sec.pid` is pipewire-pulse's pid; the app's own pid is only in
+    /// `application.process.id`. The registry `global` event never carries that
+    /// key for Client or Node (confirmed live, 2026-09-22); it arrives only via
+    /// a bound object's `info` props. Symptom before the bind/info fix landed:
+    /// Moss/Chrome/Zoom all resolved to pid 3020 (pipewire-pulse) instead of
+    /// their own.
+    #[test]
+    fn pid_from_props_prefers_application_process_id() {
+        // libpulse client: app pid wins over the daemon's socket-peer pid.
+        assert_eq!(pid_from_props(Some("28551"), Some("3020")), Some(28551));
+        // native client without application.process.id: sec.pid is the answer.
+        assert_eq!(pid_from_props(None, Some("13394")), Some(13394));
+        // node props carry no sec.pid at all.
+        assert_eq!(pid_from_props(Some("42"), None), Some(42));
+        // garbage / zero app pid falls back to sec.pid; nothing usable → None.
+        assert_eq!(pid_from_props(Some("nope"), Some("7")), Some(7));
+        assert_eq!(pid_from_props(Some("0"), Some("7")), Some(7));
+        assert_eq!(pid_from_props(None, None), None);
+    }
+
+    /// `exclude_decidable` はテーブル駆動: `info_seen` 単独で決まり、
+    /// `app_pid`/`owning_client_id` の値には左右されない（PipeWire 非依存）。
+    #[test]
+    fn exclude_decidable_gates_on_info_seen_only() {
+        let cases: &[(NodeEntry, bool, &str)] = &[
+            (
+                NodeEntry {
+                    owning_client_id: None,
+                    app_pid: None,
+                    info_seen: false,
+                },
+                false,
+                "info 未到達・PID 未解決 → 判定不能",
+            ),
+            (
+                NodeEntry {
+                    owning_client_id: Some(60),
+                    app_pid: None,
+                    info_seen: false,
+                },
+                false,
+                "client.id 経由の暫定解決が Some でも、info 未到達なら判定不能\
+                 （race の本体: client table 経由の暫定 PID だけでは Exclude 対象にしない）",
+            ),
+            (
+                NodeEntry {
+                    owning_client_id: None,
+                    app_pid: Some(28551),
+                    info_seen: true,
+                },
+                true,
+                "info 到達・PID 解決済み → 判定可能",
+            ),
+            (
+                NodeEntry {
+                    owning_client_id: Some(60),
+                    app_pid: None,
+                    info_seen: true,
+                },
+                true,
+                "info は届いたが application.process.id 自体は無かった場合も、\
+                 info_seen が立っていれば判定可能（client table 解決へフォールバック）",
+            ),
+        ];
+        for (entry, want, msg) in cases {
+            assert_eq!(exclude_decidable(entry), *want, "{msg}");
+        }
     }
 
     /// `pair_ports` のチャンネル対応付けを検証する（PipeWire 非依存）。

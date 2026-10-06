@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # flexaudio-napi のビルド + Node スモークテスト（実音不要）。
 # napi CLI を使わず cargo build + 手動リネームで .node を用意（ネット最小化）。
+#
+# exclude-smoke.mjs is NOT run here: it needs a real PipeWire session
+# (pw-cli, pw-play, paplay). CI runs it in the smoke-linux-pipewire job.
 set -euo pipefail
 
 if [[ -f "$HOME/.cargo/env" ]]; then
