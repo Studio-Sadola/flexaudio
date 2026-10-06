@@ -1,11 +1,11 @@
-//! FLAC 逐次書き出しアドオンの独立ハンドルと C ABI。
+//! Standalone handle and C ABI for the streaming FLAC writer addon.
 //!
-//! [`FlexFlac`] は録音チャンク（interleaved f32）を可逆圧縮しながらファイルへ流す
-//! 不透明ハンドルで、内部で [`flexaudio_encode::FlacWriter`] を駆動する。`split_seconds` を
-//! 与えると、書き込んだフレーム数がしきい値に達するたびに連番ファイル（`name-001.flac`,
-//! `name-002.flac`, …）へローテーションする（CLI の `--split-seconds` と同じ流儀）。
+//! [`FlexFlac`] is an opaque handle that streams recording chunks (interleaved f32) to files while
+//! compressing them losslessly. It drives [`flexaudio_encode::FlacWriter`] internally. When
+//! `split_seconds` is set, it rotates to numbered files (`name-001.flac`,
+//! `name-002.flac`, …) each time the written frame count reaches the threshold, matching the CLI's `--split-seconds` behavior.
 //!
-//! 流儀はクレート全体と同じ（guard で panic を吸収・NULL 検査・失敗は last_error）。
+//! It follows the crate-wide conventions: guards catch panics, NULL is checked, and failures set last_error.
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -17,15 +17,15 @@ use flexaudio_encode::{EncodeError, FlacWriter};
 use crate::error::{clear_last_error, code, set_last_error};
 use crate::{guard_i32, guard_ptr};
 
-/// FLAC ライターの対応サンプルレート上限（Hz）。[`flexaudio_encode::FlacWriter`] が
-/// flacenc の検証に合わせて 96kHz までに制限しているのと揃える（create で先に弾く）。
+/// Maximum sample rate supported by the FLAC writer (Hz). Match the limit imposed by
+/// [`flexaudio_encode::FlacWriter`] (96 kHz for flacenc validation; reject it early in create).
 const MAX_SAMPLE_RATE: u32 = 96_000;
 
-/// 分割録音の `index` 番目（1 始まり）のファイルパスを作る（純関数）。
+/// Create the path for the `index`th split recording file (1-based; pure function).
 ///
-/// `rec.flac` なら `rec-001.flac, rec-002.flac, …` のように拡張子の前へ 3 桁ゼロ詰め連番を
-/// 挟む。1000 以降は桁が自然に増える。拡張子が無いパスは末尾に連番を足す。親ディレクトリは
-/// 保たれる（CLI の `split_file_path` と同じ規則）。
+/// For `rec.flac`, insert a zero-padded three-digit sequence before the extension, as in
+/// `rec-001.flac, rec-002.flac, …`. The number grows naturally beyond 999. If there is no extension,
+/// append the number to the path. Preserve the parent directory (same rule as CLI `split_file_path`).
 fn split_file_path(base: &Path, index: u64) -> PathBuf {
     let stem = base
         .file_stem()
@@ -38,25 +38,25 @@ fn split_file_path(base: &Path, index: u64) -> PathBuf {
     base.with_file_name(name)
 }
 
-/// ローテーション付き FLAC 書き出し器。`split_seconds = 0` なら単一ファイル。
+/// FLAC writer with file rotation. `split_seconds = 0` writes a single file.
 ///
-/// ファイルは最初のチャンクが来るまで開かない（遅延生成）ので、ちょうど境界で終わっても
-/// 空の末尾ファイルは残らない（CLI の `RotatingWavWriter` と同じ）。境界はチャンク粒度の
-/// 「以上になったら次へ」で、各ファイルは指定秒より最大 1 チャンク長くなりうる。
+/// Files are opened lazily on the first chunk, so finishing exactly at a boundary does not leave
+/// an empty trailing file (same as CLI `RotatingWavWriter`). Boundaries are checked per chunk:
+/// rotate when the threshold is reached or exceeded, so a file may run up to one chunk longer than requested.
 struct RotatingFlac {
-    /// ベースパス（分割時は連番の元・分割なしはこのまま使う）。
+    /// Base path (used to form numbered paths when splitting, otherwise used as-is).
     base: PathBuf,
     sample_rate: u32,
     channels: u16,
-    /// 1 ファイルあたりのフレーム数しきい値（split_seconds × rate）。0 = 分割なし。
+    /// Frame threshold per file (`split_seconds × rate`). 0 = no splitting.
     frames_per_file: u64,
-    /// 現在書き込み中のライター（遅延生成。ローテ直後や書き込み前は None）。
+    /// Current writer (created lazily; None after rotation or before writing).
     writer: Option<FlacWriter>,
-    /// 現在のファイルへ書き込んだフレーム数（ローテで 0 に戻る）。
+    /// Frames written to the current file (reset to 0 on rotation).
     frames_in_current: u64,
-    /// 次に開く分割ファイルの連番（1 始まり）。
+    /// Sequence number for the next split file to open (1-based).
     file_index: u64,
-    /// finalize 済みなら以後の write を弾く。
+    /// Reject writes after finalize.
     finalized: bool,
 }
 
@@ -74,7 +74,7 @@ impl RotatingFlac {
         }
     }
 
-    /// 現在書くべきファイルパス（分割なしは base、分割ありは連番）。
+    /// Path for the next write (base path when not splitting, numbered path when splitting).
     fn current_path(&self) -> PathBuf {
         if self.frames_per_file == 0 {
             self.base.clone()
@@ -83,12 +83,12 @@ impl RotatingFlac {
         }
     }
 
-    /// interleaved f32 を書く。長さはチャンネル数の倍数であること。境界に達したら
-    /// 現在のファイルを finalize して連番を進める。
+    /// Write interleaved f32. Length must be a multiple of the channel count. On reaching the
+    /// boundary, finalize the current file and advance the sequence number.
     fn write(&mut self, samples: &[f32]) -> Result<(), EncodeError> {
         let ch = self.channels as usize;
         if samples.is_empty() {
-            // 空は no-op（ファイルを開かない＝空ファイルを作らない）。
+            // Empty input is a no-op (do not open or create an empty file).
             return Ok(());
         }
         if !samples.len().is_multiple_of(ch) {
@@ -98,20 +98,20 @@ impl RotatingFlac {
             )));
         }
 
-        // 遅延生成: このチャンクで初めて現在ファイルを開く。
+        // Lazy creation: open the current file for the first time with this chunk.
         if self.writer.is_none() {
             let path = self.current_path();
             self.writer = Some(FlacWriter::create(&path, self.sample_rate, self.channels)?);
         }
-        // writer は直前に必ず用意済み。
+        // The writer was initialized above.
         self.writer
             .as_mut()
-            .expect("writer は直前に生成済み")
+            .expect("writer was initialized immediately above")
             .write_chunk(samples)?;
 
         self.frames_in_current += (samples.len() / ch) as u64;
 
-        // しきい値に達したら現在ファイルを閉じ、次チャンクから次ファイルへ。
+        // Once the threshold is reached, close the current file and use the next file for the next chunk.
         if self.frames_per_file > 0 && self.frames_in_current >= self.frames_per_file {
             if let Some(w) = self.writer.take() {
                 w.finalize()?;
@@ -122,7 +122,7 @@ impl RotatingFlac {
         Ok(())
     }
 
-    /// 端数を書き切り、現在のファイルを確定して閉じる。以後 write は不可。
+    /// Write any remaining data, finalize and close the current file. Further writes are rejected.
     fn finalize(&mut self) -> Result<(), EncodeError> {
         let result = match self.writer.take() {
             Some(w) => w.finalize(),
@@ -133,13 +133,13 @@ impl RotatingFlac {
     }
 }
 
-/// FLAC 書き出しの不透明ハンドル。`flexaudio_flac_create` で作り、`flexaudio_flac_write` で
-/// チャンクを追記し、`flexaudio_flac_finalize` で確定、`flexaudio_flac_free` で解放する。
+/// Opaque handle for FLAC output. Create it with `flexaudio_flac_create`, append chunks with
+/// `flexaudio_flac_write`, finalize with `flexaudio_flac_finalize`, and release with `flexaudio_flac_free`.
 pub struct FlexFlac {
     inner: RotatingFlac,
 }
 
-/// EncodeError をエラーコードへ写す（引数由来は InvalidArg・それ以外は Failure）。
+/// Map EncodeError to an error code (argument errors become InvalidArg; all others become Failure).
 fn flac_err(e: EncodeError) -> i32 {
     let is_arg = matches!(e, EncodeError::Unsupported(_));
     set_last_error(e.to_string());
@@ -150,16 +150,15 @@ fn flac_err(e: EncodeError) -> i32 {
     }
 }
 
-/// `path` に FLAC 書き出しを開く。`split_seconds = 0` で単一ファイル、1 以上で
-/// `split_seconds` 秒ごとに `name-001.flac` 連番へローテーションする。
+/// Open FLAC output at `path`. `split_seconds = 0` creates one file; values of 1 or more rotate to
+/// numbered files such as `name-001.flac` every `split_seconds` seconds.
 ///
-/// 失敗（NULL / 不正な UTF-8 パス / 非対応の `sr`・`ch`）で NULL を返し last_error を
-/// セットする。`ch` は 1..=2、`sr` は 1..=96000 Hz。返ったハンドルは
-/// `flexaudio_flac_free` で解放する（`flexaudio_flac_finalize` を呼ばずに free しても
-/// ベストエフォートで閉じる）。
+/// On failure (NULL, invalid UTF-8 path, unsupported `sr` or `ch`), return NULL and set last_error.
+/// `ch` must be 1..=2 and `sr` must be 1..=96000 Hz. Release the returned handle with
+/// `flexaudio_flac_free` (free without `flexaudio_flac_finalize` still attempts a best-effort close).
 ///
 /// # Safety
-/// `path` は有効な NUL 終端 C 文字列（UTF-8）を指していなければならない（NULL は失敗扱い）。
+/// `path` must point to a valid NUL-terminated UTF-8 C string (NULL is treated as failure).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_flac_create(
     path: *const c_char,
@@ -180,7 +179,7 @@ pub unsafe extern "C" fn flexaudio_flac_create(
                 return std::ptr::null_mut();
             }
         };
-        // create 時に早めに弾く（FlacWriter::create と同じ範囲。ファイルは作らない）。
+        // Reject invalid values early, matching FlacWriter::create; no file is created.
         if !(1..=2).contains(&ch) {
             set_last_error(format!(
                 "flexaudio_flac_create: channels must be 1 or 2, got {ch}"
@@ -198,15 +197,14 @@ pub unsafe extern "C" fn flexaudio_flac_create(
     })
 }
 
-/// interleaved f32（長さ = フレーム数 × チャンネル数）を追記する。
+/// Append interleaved f32 (length = frame count × channel count).
 ///
-/// `len` はチャンネル数の倍数であること（倍数でなければ InvalidArg）。`len=0` は no-op。
-/// finalize 済みのハンドルへの write は [`FLEX_INVALID_STATE`](code::FLEX_INVALID_STATE)。
-/// 戻り 0 = 成功 / 負 = エラー。
+/// `len` must be a multiple of the channel count (otherwise InvalidArg). `len=0` is a no-op.
+/// Writing to a finalized handle returns [`FLEX_INVALID_STATE`](code::FLEX_INVALID_STATE).
+/// Returns 0 on success and a negative value on error.
 ///
 /// # Safety
-/// `f` は有効なハンドル、`samples` は `len` 要素の有効な配列（`len=0` なら NULL 可）で
-/// なければならない。
+/// `f` must be a valid handle and `samples` a valid array of `len` elements (NULL is allowed when `len=0`).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_flac_write(
     f: *mut FlexFlac,
@@ -238,12 +236,12 @@ pub unsafe extern "C" fn flexaudio_flac_write(
     })
 }
 
-/// 端数を書き切り、現在のファイルを確定して閉じる。以後の write は InvalidState。
+/// Write any remaining data, finalize and close the current file. Further writes return InvalidState.
 ///
-/// 二重 finalize は安全（no-op で 0 を返す）。戻り 0 = 成功 / 負 = エラー。
+/// Calling finalize more than once is safe (no-op returning 0). Returns 0 on success and a negative value on error.
 ///
 /// # Safety
-/// `f` は有効なハンドルでなければならない（NULL は InvalidArg）。
+/// `f` must be a valid handle (NULL is InvalidArg).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_flac_finalize(f: *mut FlexFlac) -> i32 {
     guard_i32(|| {
@@ -253,7 +251,7 @@ pub unsafe extern "C" fn flexaudio_flac_finalize(f: *mut FlexFlac) -> i32 {
             return code::FLEX_INVALID_ARG;
         };
         if flac.inner.finalized {
-            // 既に確定済みなら何もしない（冪等）。
+            // Already finalized; do nothing (idempotent).
             return code::FLEX_OK;
         }
         match flac.inner.finalize() {
@@ -263,15 +261,15 @@ pub unsafe extern "C" fn flexaudio_flac_finalize(f: *mut FlexFlac) -> i32 {
     })
 }
 
-/// FLAC ハンドルを解放する。NULL 安全。
+/// Release a FLAC handle. NULL-safe.
 ///
-/// finalize せずに free した場合も、内部の [`FlacWriter`] が drop 時にベストエフォートで
-/// 端数書き出しとヘッダ確定を試みる（エラーは握り潰す。確実に検知したいなら先に
-/// `flexaudio_flac_finalize` を呼ぶ）。
+/// If freed without finalize, the internal [`FlacWriter`] still makes a best-effort attempt to
+/// write remaining data and finalize the header on drop (errors are swallowed; call
+/// `flexaudio_flac_finalize` first to detect them reliably).
 ///
 /// # Safety
-/// `f` は `flexaudio_flac_create` が返したハンドル（または NULL）でなければならない。
-/// 解放後の `f` を使ってはならない。
+/// `f` must be a handle returned by `flexaudio_flac_create` (or NULL).
+/// Do not use `f` after release.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_flac_free(f: *mut FlexFlac) {
     guard_i32(|| {
@@ -288,7 +286,7 @@ mod tests {
     use std::ffi::CString;
     use std::fs;
 
-    // split_file_path は CLI と同じ連番規則（回帰防止のため代表点を固定）。
+    // split_file_path follows the CLI numbering rule (pin representative cases to prevent regressions).
     #[test]
     fn split_file_path_inserts_padded_index() {
         assert_eq!(
@@ -303,7 +301,7 @@ mod tests {
             split_file_path(Path::new("/tmp/dir/rec.flac"), 3),
             PathBuf::from("/tmp/dir/rec-003.flac")
         );
-        // 拡張子なし。
+        // No extension.
         assert_eq!(
             split_file_path(Path::new("rec"), 2),
             PathBuf::from("rec-002")
@@ -312,7 +310,7 @@ mod tests {
 
     #[test]
     fn rotating_frames_per_file_reflects_split_seconds() {
-        // split_seconds × rate = 1 ファイルのフレーム数しきい値。0 は分割なし。
+        // split_seconds × rate = frame threshold per file. 0 means no splitting.
         let r = RotatingFlac::new(PathBuf::from("x.flac"), 48_000, 2, 5);
         assert_eq!(r.frames_per_file, 5 * 48_000);
         let single = RotatingFlac::new(PathBuf::from("x.flac"), 48_000, 2, 0);
@@ -320,7 +318,7 @@ mod tests {
         assert_eq!(single.current_path(), PathBuf::from("x.flac"));
     }
 
-    /// 一意な一時パス（プロセス ID + ラベルで衝突回避。テスト後に必ず消す）。
+    /// Unique temporary path (process ID + label avoids collisions; always remove it after the test).
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("flexffi_{}_{}.flac", std::process::id(), label))
     }
@@ -334,24 +332,27 @@ mod tests {
         let f = unsafe { flexaudio_flac_create(cpath.as_ptr(), 48_000, 1, 0) };
         assert!(!f.is_null());
 
-        // 1 ブロック分（4096 フレーム mono）を書く。
+        // Write one block (4096 mono frames).
         let samples = vec![0.0f32; 4096];
         assert_eq!(
             unsafe { flexaudio_flac_write(f, samples.as_ptr(), samples.len()) },
             code::FLEX_OK
         );
         assert_eq!(unsafe { flexaudio_flac_finalize(f) }, code::FLEX_OK);
-        // finalize 後の write は InvalidState。
+        // Writes after finalize return InvalidState.
         assert_eq!(
             unsafe { flexaudio_flac_write(f, samples.as_ptr(), samples.len()) },
             code::FLEX_INVALID_STATE
         );
-        // 二重 finalize は冪等。
+        // A second finalize is idempotent.
         assert_eq!(unsafe { flexaudio_flac_finalize(f) }, code::FLEX_OK);
         unsafe { flexaudio_flac_free(f) };
 
-        assert!(path.exists(), "FLAC ファイルが作られているはず");
-        assert!(fs::metadata(&path).unwrap().len() > 0, "空でないはず");
+        assert!(path.exists(), "FLAC file should have been created");
+        assert!(
+            fs::metadata(&path).unwrap().len() > 0,
+            "file should not be empty"
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -364,16 +365,16 @@ mod tests {
         let _ = fs::remove_file(&f2);
         let cpath = CString::new(base.to_str().unwrap()).unwrap();
 
-        // split_seconds=1 @48k mono → 48000 フレームで 1 ファイル。
+        // split_seconds=1 at 48 kHz mono → 48000 frames per file.
         let f = unsafe { flexaudio_flac_create(cpath.as_ptr(), 48_000, 1, 1) };
         assert!(!f.is_null());
-        // ちょうどしきい値に達する量を書く → file-001 が閉じて連番が進む。
+        // Write exactly to the threshold → file-001 closes and the sequence advances.
         let block = vec![0.0f32; 48_000];
         assert_eq!(
             unsafe { flexaudio_flac_write(f, block.as_ptr(), block.len()) },
             code::FLEX_OK
         );
-        // 次のチャンクで file-002 を開く。
+        // Open file-002 on the next chunk.
         let block2 = vec![0.0f32; 4096];
         assert_eq!(
             unsafe { flexaudio_flac_write(f, block2.as_ptr(), block2.len()) },
@@ -382,21 +383,21 @@ mod tests {
         assert_eq!(unsafe { flexaudio_flac_finalize(f) }, code::FLEX_OK);
         unsafe { flexaudio_flac_free(f) };
 
-        assert!(f1.exists(), "1 本目 {f1:?} が作られているはず");
-        assert!(f2.exists(), "2 本目 {f2:?} が作られているはず");
+        assert!(f1.exists(), "first file {f1:?} should have been created");
+        assert!(f2.exists(), "second file {f2:?} should have been created");
         let _ = fs::remove_file(&f1);
         let _ = fs::remove_file(&f2);
     }
 
     #[test]
     fn create_rejects_bad_params_and_null() {
-        // NULL パス。
+        // NULL path.
         assert!(unsafe { flexaudio_flac_create(std::ptr::null(), 48_000, 1, 0) }.is_null());
-        // 非対応チャンネル / サンプルレート。
+        // Unsupported channel count / sample rate.
         let p = CString::new("/tmp/does_not_matter.flac").unwrap();
         assert!(unsafe { flexaudio_flac_create(p.as_ptr(), 48_000, 3, 0) }.is_null());
         assert!(unsafe { flexaudio_flac_create(p.as_ptr(), 0, 1, 0) }.is_null());
-        // NULL ハンドル操作は InvalidArg / free は安全。
+        // Operations on a NULL handle return InvalidArg; free is safe.
         assert_eq!(
             unsafe { flexaudio_flac_write(std::ptr::null_mut(), std::ptr::null(), 0) },
             code::FLEX_INVALID_ARG

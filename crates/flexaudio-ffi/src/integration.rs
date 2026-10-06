@@ -1,9 +1,9 @@
-//! ストリームへのアドオン統合（案 B）。
+//! Stream-integrated noise suppression and VAD.
 //!
-//! `FlexConfig` の `denoise` / `has_vad` に応じて、[`FlexStream`] の中に Denoiser / VAD を
-//! 同居させ、`poll_chunk` が返す直前にチャンクを **denoise → VAD** の順で通す。ここは
-//! その組み立て（[`build_addons`]）と処理経路（[`FlexStream::poll_processed`]）だけを持つ薄い
-//! 統合層で、個々のアドオンのロジックは各クレート側にある（神クラス化しない）。
+//! Based on `denoise` / `has_vad` in `FlexConfig`, keep Denoiser / VAD inside `FlexStream` and
+//! process chunks as **denoise → VAD** just before `poll_chunk` returns them. This thin layer handles
+//! construction ([`build_addons`]) and processing ([`FlexStream::poll_processed`]); add-on logic
+//! remains in each crate (avoiding a god class).
 
 use flexaudio_denoise::Denoiser;
 use flexaudio_vad::Vad;
@@ -12,19 +12,19 @@ use crate::convert::{self, resolve_output, vad_config_from_c, vad_events_to_c};
 use crate::error::set_last_error;
 use crate::types::{FlexChunk, FlexConfig, FlexStream};
 
-/// `FlexConfig` から denoise / VAD アドオンを組み立てる（`flexaudio_open` が使う）。
+/// Build denoise / VAD add-ons from `FlexConfig` (used by `flexaudio_open`).
 ///
-/// - `denoise` 有効時は出力レートが 48000 でなければ `Err`（RNNoise は 48kHz 固定）。
-///   出力チャンネル数（番兵込みで解決）で Denoiser を作る。
-/// - `has_vad` 有効時は `vad` を [`VadConfig`](flexaudio_vad::VadConfig) に写して VAD を作る。
+/// - If `denoise` is enabled, output rate must be 48000 (RNNoise is fixed at 48 kHz); otherwise return `Err`.
+///   Create Denoiser using the resolved output channel count (including the sentinel value).
+/// - If `has_vad` is enabled, map `vad` to [`VadConfig`](flexaudio_vad::VadConfig) and create VAD.
 ///
-/// いずれも失敗時は last_error をセットして `Err(())` を返す（呼び出し側はそのまま NULL を
-/// 返せばよい）。無効なアドオンは `None`。
+/// On failure, both set last_error and return `Err(())` (the caller can return NULL directly).
+/// Disabled add-ons are `None`.
 pub(crate) fn build_addons(config: &FlexConfig) -> Result<(Option<Denoiser>, Option<Vad>), ()> {
     let output = resolve_output(config);
 
     let denoiser = if config.denoise {
-        // RNNoise は 48kHz 前提。出力レートが違うなら開かせない（open で弾く）。
+        // RNNoise requires 48 kHz. Reject other output rates during open.
         if output.sample_rate != 48_000 {
             set_last_error(format!(
                 "denoise requires output_rate 48000 (0=default), got {}",
@@ -60,23 +60,23 @@ pub(crate) fn build_addons(config: &FlexConfig) -> Result<(Option<Denoiser>, Opt
 }
 
 impl FlexStream {
-    /// チャンクを 1 つ poll し、有効なアドオンを **denoise → VAD** の順で通してから
-    /// `FlexChunk` に写して返す。無ければ `None`。
+    /// Poll one chunk, run enabled add-ons in **denoise → VAD** order, then convert it to
+    /// `FlexChunk`. Return `None` if there is no chunk.
     ///
-    /// - denoise: interleaved data をインプレース処理する（48kHz 前提は open で保証済み）。
-    /// - VAD: （denoise 後の）data を出力フォーマットのまま `process_pcm` に通し、確定した
-    ///   イベントを `FlexChunk::vad_events` に詰める。
+    /// - denoise: process interleaved data in place (48 kHz is guaranteed by open).
+    /// - VAD: pass data in the output format (after denoise) to `process_pcm` and append finalized
+    ///   events to `FlexChunk::vad_events`.
     pub(crate) fn poll_processed(&mut self) -> Option<FlexChunk> {
         let mut chunk = self.inner.poll_chunk()?;
 
-        // 1) denoise（インプレース）。長さは frames×channels でチャンネル数の倍数なので
-        //    エラーにはならないが、万一のときは元データのまま素通しさせる。
+        // 1) denoise (in place). Length is frames×channels, hence divisible by channel count,
+        //    so this should not fail; if it does, pass through the original data.
         if let Some(dn) = self.denoiser.as_mut() {
             let _ = dn.process(&mut chunk.data);
         }
 
-        // 2) VAD。出力フォーマット（open 以降不変）を process_pcm に渡す。
-        //    output は Copy なので、可変借用の前に控えておく。
+        // 2) VAD. Pass the unchanged output format (guaranteed after open) to process_pcm.
+        //    output is Copy, so save it before borrowing mutably.
         let output = self.inner.config().output;
         let vad_events = match self.vad.as_mut() {
             Some(vad) => vad.process_pcm(&chunk.data, output.sample_rate, output.channels),
@@ -133,30 +133,30 @@ mod tests {
     #[test]
     fn no_addons_yields_none() {
         let c = base_config();
-        let (dn, vad) = build_addons(&c).expect("アドオン無効は常に Ok");
+        let (dn, vad) = build_addons(&c).expect("Disabled add-ons always succeed");
         assert!(dn.is_none());
         assert!(vad.is_none());
     }
 
     #[test]
     fn denoise_requires_48k_output() {
-        // denoise 有効 + 非 48k → Err。
+        // Denoise enabled + non-48k → Err.
         let mut c = base_config();
         c.denoise = true;
         c.output_rate = 16_000;
         assert!(build_addons(&c).is_err());
 
-        // denoise 有効 + 48k（明示）→ Ok で Denoiser が作られる。
+        // Denoise enabled + explicit 48k → Ok and creates Denoiser.
         let mut c48 = base_config();
         c48.denoise = true;
         c48.output_rate = 48_000;
-        let (dn, _) = build_addons(&c48).expect("48k なら通る");
+        let (dn, _) = build_addons(&c48).expect("48k should succeed");
         assert!(dn.is_some());
 
-        // denoise 有効 + 既定（output_rate=0 → 48000）→ Ok。
+        // Denoise enabled + default (output_rate=0 → 48000) → Ok.
         let mut cdef = base_config();
         cdef.denoise = true;
-        let (dn2, _) = build_addons(&cdef).expect("既定 48k なら通る");
+        let (dn2, _) = build_addons(&cdef).expect("Default 48k should succeed");
         assert!(dn2.is_some());
     }
 }

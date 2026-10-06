@@ -1,21 +1,21 @@
-//! flexaudio-encode のエラー型と結果型。
+//! Error and result types for flexaudio-encode.
 
-/// flexaudio-encode の操作で発生しうるエラー。
+/// Errors that can occur during flexaudio-encode operations.
 ///
-/// 将来バリアントを足せるよう `#[non_exhaustive]`（外部の match は `_ =>` が要る）。
+/// Marked `#[non_exhaustive]` so variants can be added later (external matches need `_ =>`).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum EncodeError {
-    /// ファイル入出力の失敗。
+    /// File I/O failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    /// 対応していないパラメータ（チャンネル数・サンプルレート・チャンク長など）。
+    /// An unsupported parameter, such as channel count, sample rate, or chunk length.
     #[error("unsupported: {0}")]
     Unsupported(String),
-    /// FLAC エンコーダ内部のエラー（説明文付き）。
+    /// An internal FLAC encoder error with a description.
     #[error("encoder error: {0}")]
     Encoder(String),
 }
 
-/// flexaudio-encode 全体で用いる結果型。
+/// Result type used throughout flexaudio-encode.
 pub type Result<T> = std::result::Result<T, EncodeError>;

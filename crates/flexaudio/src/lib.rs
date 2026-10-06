@@ -1,9 +1,10 @@
-//! flexaudio — 汎用クロスプラットフォーム音声キャプチャライブラリ（mic / system loopback / per-process、Linux・Windows・macOS）。
+//! flexaudio — a general-purpose cross-platform audio capture library (mic / system loopback /
+//! per-process on Linux, Windows, and macOS).
 //!
-//! コア + OS バックエンド + mic を cfg で束ねる facade。
+//! Facade that combines the core, OS backends, and mic through cfg.
 //!
-//! [`Stream`] が 1 ソースのキャプチャパイプライン（backend → RawRing → 加工スレッド
-//! → Normalizer → ChunkRing → poll + ウォッチドッグ復帰）を駆動する。
+//! [`Stream`] drives the capture pipeline for one source (backend → RawRing → processing
+//! thread → Normalizer → ChunkRing → poll, with watchdog recovery).
 
 #![warn(missing_docs)]
 
@@ -20,41 +21,41 @@ pub use mock::MockBackend;
 pub use processes::processes;
 pub use stream::Stream;
 
-// `open()` と一緒に使う型を facade トップから直接出す。利用側や napi バインディングが
-// `flexaudio::core` を経由せず `flexaudio::{StreamConfig, SourceKind, ...}` で揃えられる。
+// Re-export types used with `open()` from the facade root so consumers and napi bindings can
+// use `flexaudio::{StreamConfig, SourceKind, ...}` without going through `flexaudio::core`.
 pub use flexaudio_core::backend::CaptureBackend;
 pub use flexaudio_core::types::{
     AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Error, Event, OutputFormat, ProcessInfo,
     ProcessMode, Result, SecondaryChunk, SourceKind, StreamConfig,
 };
 
-/// 全ソースのオーディオデバイスを 1 つのリストで返す。
+/// Return audio devices for all sources in one list.
 ///
-/// - マイク入力（[`core::SourceKind::Mic`], `is_loopback = false`）—
-///   [`flexaudio_mic::list_devices`] 経由（cpal, 全 OS）。
-/// - システム音声出力（[`core::SourceKind::SystemLoopback`],
-///   `is_loopback = true`）— OS 別バックエンド経由（Linux: PipeWire の Audio/Sink。
-///   Linux では PipeWire が Audio/Source（マイク）も列挙するので、cpal 分と重複し得る。
-///   Windows/macOS: 出力エンドポイント列挙）。返った `id` は
-///   `--source system --device-id <ID>` でその出力を選ぶのに使える。
+/// - Microphone input ([`core::SourceKind::Mic`], `is_loopback = false`) via
+///   [`flexaudio_mic::list_devices`] (cpal, all OSes).
+/// - System audio output ([`core::SourceKind::SystemLoopback`], `is_loopback = true`) via
+///   OS-specific backends (Linux: PipeWire Audio/Sink. PipeWire also lists Audio/Source
+///   (microphones) on Linux, so these may duplicate cpal entries. Windows/macOS: output
+///   endpoint enumeration). Use a returned `id` with `--source system --device-id <ID>` to
+///   select that output.
 ///
-/// 各 [`DeviceInfo`] の `id` は取得できる範囲で最も安定なキー（cpal=デバイス名 /
-/// PipeWire=`node.name`）。`is_default` は OS の既定デバイスに付く。
+/// Each [`DeviceInfo`] uses the most stable available key for `id` (cpal=device name /
+/// PipeWire=`node.name`). The OS default device has `is_default` set.
 ///
-/// # OS 分岐
-/// - Linux: cpal（マイク）+ PipeWire（sink + source）を結合。PipeWire セッションが
-///   無ければ PipeWire 分は空になり、cpal 分のみ返る。
-/// - Windows / macOS: cpal（マイク）+ OS の出力エンドポイントを結合。
+/// # OS-specific behavior
+/// - Linux: Combine cpal microphones with PipeWire sinks and sources. If there is no PipeWire
+///   session, the PipeWire portion is empty and only cpal devices are returned.
+/// - Windows / macOS: Combine cpal microphones with OS output endpoints.
 ///
-/// デバイスが無い／列挙に失敗した環境でも panic せず、取得できた範囲のリスト
-/// （しばしば空）を返す。
+/// Does not panic when devices are absent or enumeration fails; returns the devices found
+/// (often an empty list).
 pub fn devices() -> Result<Vec<DeviceInfo>> {
-    // マイク入力（cpal）は全 OS 共通。Linux はこの後 PipeWire 分を extend するので
-    // mut が要るが、他 OS では extend しないので mut が不要。その差を allow で吸収する。
+    // Microphone input (cpal) is common to all OSes. Linux extends this with PipeWire devices,
+    // so mut is needed there; other OSes do not extend it. The allow handles this difference.
     #[allow(unused_mut)]
     let mut all = flexaudio_mic::list_devices()?;
 
-    // システム出力エンドポイントは OS 別。
+    // System output endpoints are OS-specific.
     #[cfg(target_os = "linux")]
     {
         let linux = flexaudio_os_linux::list_devices()?;
@@ -74,72 +75,74 @@ pub fn devices() -> Result<Vec<DeviceInfo>> {
     Ok(all)
 }
 
-/// デバイスの着脱・既定変更（ホットプラグ）を監視する [`DeviceWatcher`] を開始する。
+/// Start a [`DeviceWatcher`] for device and default-device changes (hot-plug).
 ///
-/// 返ったウォッチャの [`DeviceWatcher::poll_event`] を周期的に呼ぶと、デバイスの
-/// 接続・切断・既定変更が [`DeviceEvent`] として pull 型で取り出せる。capture
-/// stream 単位の [`core::Event`] とは別系統で、デバイス単位の事象を扱う。
+/// Call [`DeviceWatcher::poll_event`] periodically to pull device connection, disconnection,
+/// and default-device changes as [`DeviceEvent`] values. These are device-level events,
+/// separate from capture-stream-level [`core::Event`].
 ///
-/// # OS 分岐 / 縮退
-/// - Linux: PipeWire レジストリを永続監視する（`flexaudio-os-linux`）。PipeWire
-///   デーモン不在・接続失敗時は [`NoopWatcher`](device_watcher) へ縮退して `Ok` を返す
-///   （着脱が来ないだけ。`devices()` がデーモン不在を空リストに握るのと同じ扱い）。
-/// - その他 OS: 常に no-op（着脱は配信されない）。
+/// # OS-specific behavior and degraded mode
+/// - Linux: Persistently monitor the PipeWire registry (`flexaudio-os-linux`). If the PipeWire
+///   daemon is absent or a connection fails, degrade to [`NoopWatcher`](device_watcher) and
+///   return `Ok` (no device-change events arrive, like `devices()` returning an empty list
+///   when the daemon is absent).
+/// - Other OSes: Always no-op (device changes are not reported).
 ///
-/// PipeWire 不在でも panic せず縮退するので、実用上は `Ok` を返す。
+/// Degrades without panicking when PipeWire is absent, so this normally returns `Ok`.
 pub fn watch_devices() -> Result<DeviceWatcher> {
     device_watcher::watch_devices()
 }
 
-/// [`StreamConfig`] からソース種別と OS に応じて backend を選び、[`Stream`] を構築して
-/// 返す高レベル入口（まだ start しない）。
+/// High-level entry point that selects a backend based on the source kind and OS, then builds
+/// and returns a [`Stream`] (not started yet).
 ///
-/// 利用側（CLI・napi バインディング等）は backend を自前で構築せず、`StreamConfig` を
-/// 渡すだけでよい。低レベル入口 [`Stream::open`]（呼び元が `Box<dyn CaptureBackend>` を
-/// 渡す）は mock テスト・上級用途のために残してある。
+/// Consumers (CLI, napi bindings, etc.) only need to pass `StreamConfig`; they do not construct
+/// a backend themselves. The low-level entry point [`Stream::open`] (which accepts a
+/// `Box<dyn CaptureBackend>`) remains available for mock tests and advanced use.
 ///
-/// 戻った [`Stream`] はまだキャプチャしていない。消費側が [`Stream::start`] を呼んでから
-/// [`Stream::poll_chunk`] / [`Stream::poll_event`] を周期的に呼ぶ。
+/// The returned [`Stream`] has not started capturing. The consumer calls [`Stream::start`],
+/// then periodically calls [`Stream::poll_chunk`] / [`Stream::poll_event`].
 ///
-/// # ソース → バックエンドの分岐
-/// - [`SourceKind::Mic`] → [`flexaudio_mic::CpalMicBackend`]（cpal, 全 OS）。
+/// # Source-to-backend mapping
+/// - [`SourceKind::Mic`] → [`flexaudio_mic::CpalMicBackend`] (cpal, all OSes).
 /// - [`SourceKind::SystemLoopback`] → Linux / Windows / macOS
-///   （Linux: [`flexaudio_os_linux::PwSystemBackend`]＝出力の monitor / PipeWire。
-///   Windows: `flexaudio_os_windows::WasapiSystemBackend`＝render endpoint の
-///   WASAPI loopback）。`config.exclude_self`（自ホスト除外）と `config.device_id`
-///   （出力エンドポイント選択・`None` で既定出力）をそのまま渡す。
-///   その他 OS では [`Error::Unsupported`]。
+///   (Linux: [`flexaudio_os_linux::PwSystemBackend`] = output monitor / PipeWire.
+///   Windows: `flexaudio_os_windows::WasapiSystemBackend` = WASAPI loopback on the render
+///   endpoint). Pass through `config.exclude_self` (exclude this process) and
+///   `config.device_id` (select the output endpoint; `None` uses the default output).
+///   Other OSes return [`Error::Unsupported`].
 /// - [`SourceKind::ProcessLoopback`] → Linux / Windows / macOS
-///   （Linux: [`flexaudio_os_linux::PwProcessBackend`]。Windows:
-///   `flexaudio_os_windows::WasapiProcessBackend`）。`config.target_pid` が必須で、
-///   無ければ [`Error::InvalidArg`]。`config.mode` をそのまま渡す。
-///   その他 OS では [`Error::Unsupported`]。
-/// - [`SourceKind::Mix`] → mic 子（cpal）と system 子（OS 別ループバック）を内部に
-///   持つ合成バックエンド。各子を 48k/stereo へ揃えて側別ゲイン
-///   （`config.mix_mic_gain` / `config.mix_system_gain`）で加算合成し、1 本の
-///   ストリームとして届ける。デバイスは `config.mix_mic_device_id` /
-///   `config.mix_system_device_id` で選ぶ（`None` で既定）。`config.exclude_self` は
-///   system 側に適用される。system 側が非対応の OS では [`Error::Unsupported`]。
+///   (Linux: [`flexaudio_os_linux::PwProcessBackend`]; Windows:
+///   `flexaudio_os_windows::WasapiProcessBackend`). `config.target_pid` is required; if it is
+///   missing, [`Error::InvalidArg`] is returned. Pass through `config.mode`. Other OSes return
+///   [`Error::Unsupported`].
+/// - [`SourceKind::Mix`] → Composite backend containing a mic child (cpal) and system child
+///   (OS-specific loopback). Each child is normalized to 48 kHz stereo, scaled by its own gain
+///   (`config.mix_mic_gain` / `config.mix_system_gain`), and mixed into one stream. Select
+///   devices with `config.mix_mic_device_id` / `config.mix_system_device_id` (`None` uses the
+///   default). `config.exclude_self` applies to the system child. If system capture is not
+///   supported on the OS, return [`Error::Unsupported`].
 ///
-/// process ソースは `config.mode` だけを見て `config.exclude_self` を無視し、system
-/// ソースは `config.exclude_self` だけを見て `config.mode` を無視する。両者を合成せず、
-/// それぞれ OS の単一 PID 除外プリミティブへ 1 対 1 で写す。
+/// Process sources use only `config.mode` and ignore `config.exclude_self`; system sources
+/// use only `config.exclude_self` and ignore `config.mode`. They are not combined: each maps
+/// one-to-one to the OS's single-PID exclusion primitive.
 ///
-/// # エラー
-/// - 出力フォーマットが非対応 → [`Error::UnsupportedFormat`]（早期に弾く）。
-/// - ProcessLoopback で `target_pid` 欠落 → [`Error::InvalidArg`]
-///   （[`ProcessMode::Exclude`] でも `target_pid` 必須）。
-/// - Mix で `mix_mic_gain` / `mix_system_gain` が有限でない・負 → [`Error::InvalidArg`]。
-/// - 当該 OS で非対応のソース（Linux/Windows/macOS 以外の system/process/mix）→ [`Error::Unsupported`]。
-/// - その他は [`Stream::open`] 由来（`ring_capacity_chunks == 0` 等）。
+/// # Errors
+/// - Unsupported output format → [`Error::UnsupportedFormat`] (rejected early).
+/// - Missing `target_pid` for ProcessLoopback → [`Error::InvalidArg`] (required even for
+///   [`ProcessMode::Exclude`]).
+/// - Non-finite or negative `mix_mic_gain` / `mix_system_gain` for Mix → [`Error::InvalidArg`].
+/// - Source unsupported on this OS (system/process/mix on OSes other than Linux/Windows/macOS)
+///   → [`Error::Unsupported`].
+/// - Other errors come from [`Stream::open`] (such as `ring_capacity_chunks == 0`).
 ///
-/// # 除外（Exclude / exclude_self）
-/// process [`ProcessMode::Exclude`]（対象 PID 以外の全システム音）/ system
-/// `exclude_self=true`（自プロセスを除外）は Linux / Windows / macOS の 3 OS とも対応。
-/// Linux は PipeWire の対象外ノード fan-in、Windows/macOS は各 OS のネイティブ PID 除外で
-/// 実現する。Include / `exclude_self=false` は除外せず対象そのものを録る。
+/// # Exclusion (Exclude / exclude_self)
+/// Process [`ProcessMode::Exclude`] (all system audio except the target PID) and system
+/// `exclude_self=true` (exclude this process) are supported on Linux, Windows, and macOS.
+/// Linux uses PipeWire fan-in of all nodes except the target; Windows/macOS use native
+/// per-process exclusion. Include / `exclude_self=false` captures the target without exclusion.
 ///
-/// # 例
+/// # Example
 /// ```no_run
 /// use flexaudio::{open, StreamConfig, SourceKind};
 ///
@@ -150,21 +153,21 @@ pub fn watch_devices() -> Result<DeviceWatcher> {
 /// let mut stream = open(config)?;
 /// stream.start()?;
 /// while let Some(chunk) = stream.poll_chunk() {
-///     // chunk.data は出力フォーマットの interleaved f32
+///     // chunk.data is interleaved f32 in the output format
 ///     let _ = chunk;
 /// }
 /// stream.stop();
 /// # Ok::<(), flexaudio::Error>(())
 /// ```
 pub fn open(config: StreamConfig) -> Result<Stream> {
-    // 出力フォーマットを先に弾く（Stream::open でも再検証されるが、backend を構築する
-    // 前にエラーを返したい）。
+    // Validate the output format early. Stream::open also checks it, but errors should be
+    // returned before constructing the backend.
     config.output.validate()?;
     validate_exclude_pids(&config)?;
 
     let backend = build_backend(&config)?;
 
-    // 低レベル入口へ委譲（Normalizer 構成・スレッド配線はここが担う）。
+    // Delegate to the low-level entry point (which configures the Normalizer and threads).
     Stream::open(config, backend)
 }
 
@@ -180,61 +183,59 @@ pub(crate) fn validate_exclude_pids(config: &StreamConfig) -> Result<()> {
     Ok(())
 }
 
-/// [`StreamConfig`] からソース種別と OS に応じて backend を 1 つ構築する。
+/// Build one backend from [`StreamConfig`] based on the source kind and OS.
 ///
-/// [`open`] は出力フォーマット検証後にこれを呼ぶ。
-/// [`Stream::switch_source`](crate::stream::Stream::switch_source) も切替先の
-/// backend を作るのに同じ関数を使う。
+/// [`open`] calls this after validating the output format.
+/// [`Stream::switch_source`](crate::stream::Stream::switch_source) uses the same function to
+/// build the replacement backend.
 ///
-/// 分岐・エラーは [`open`] のドキュメントと同じ:
-/// - [`SourceKind::Mic`] → [`flexaudio_mic::CpalMicBackend`]（全 OS）。
-///   `config.device_id` を渡して特定入力デバイスを選べる（`None` で既定入力。
-///   id は [`devices`] が返す安定 ID = デバイス名。不一致は `start` 時に
-///   [`Error::DeviceNotFound`]）。`config.device_id` は mic（入力デバイス）と system
-///   （出力エンドポイント）の両方に効く（`None` で既定）。process では見ない
-///   （target_pid で対象を決める）。
-/// - [`SourceKind::SystemLoopback`] → Linux/Windows/macOS 対応
-///   （Linux=[`flexaudio_os_linux::PwSystemBackend`] / Windows=WASAPI loopback /
-///   macOS=CoreAudio Process Tap）。`config.device_id` で出力エンドポイントを選べる
-///   （`None` で既定出力）。非対応 OS は [`Error::Unsupported`]。
-/// - [`SourceKind::ProcessLoopback`] → Linux/Windows/macOS 対応
-///   （Linux=[`flexaudio_os_linux::PwProcessBackend`] / Windows=WASAPI process loopback /
-///   macOS=CoreAudio Process Tap）。`target_pid` 必須・欠落で [`Error::InvalidArg`]。
-///   非対応 OS は [`Error::Unsupported`]。
-/// - [`SourceKind::Mix`] → mic 子（[`flexaudio_mic::CpalMicBackend`]、
-///   `config.mix_mic_device_id`）と system 子（[`build_system_backend`]、
-///   `config.exclude_self` + `config.mix_system_device_id`）を持つ合成バックエンド
-///   （`mix::CompositeBackend`）。`mix_mic_gain` / `mix_system_gain` は有限かつ
-///   0 以上でなければ [`Error::InvalidArg`]。system 側が非対応の OS は
-///   [`Error::Unsupported`]。
+/// The mappings and errors are the same as documented for [`open`]:
+/// - [`SourceKind::Mic`] → [`flexaudio_mic::CpalMicBackend`] (all OSes). Pass `config.device_id`
+///   to select an input device (`None` uses the default). The ID is the stable device-name key
+///   returned by [`devices`]; a mismatch returns [`Error::DeviceNotFound`] at `start`.
+///   `config.device_id` applies to mic input and system output selection (`None` uses the
+///   default); process capture does not use it (the target is selected by target_pid).
+/// - [`SourceKind::SystemLoopback`] → supported on Linux/Windows/macOS
+///   (Linux=[`flexaudio_os_linux::PwSystemBackend`] / Windows=WASAPI loopback /
+///   macOS=CoreAudio Process Tap). Select an output endpoint with `config.device_id`
+///   (`None` uses the default output). Other OSes return [`Error::Unsupported`].
+/// - [`SourceKind::ProcessLoopback`] → supported on Linux/Windows/macOS
+///   (Linux=[`flexaudio_os_linux::PwProcessBackend`] / Windows=WASAPI process loopback /
+///   macOS=CoreAudio Process Tap). `target_pid` is required; if missing, return
+///   [`Error::InvalidArg`]. Other OSes return [`Error::Unsupported`].
+/// - [`SourceKind::Mix`] → `mix::CompositeBackend` with a mic child
+///   ([`flexaudio_mic::CpalMicBackend`], `config.mix_mic_device_id`) and a system child
+///   ([`build_system_backend`], `config.exclude_self` + `config.mix_system_device_id`).
+///   `mix_mic_gain` / `mix_system_gain` must be finite and nonnegative or return
+///   [`Error::InvalidArg`]. Return [`Error::Unsupported`] if system capture is unavailable.
 pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBackend>> {
-    // Error は複数の分岐で使う（PID 欠落は InvalidArg、非対応 OS は Unsupported）ので
-    // 関数頭で use する。
+    // Error is used by multiple branches (missing PID -> InvalidArg, unsupported OS -> Unsupported),
+    // so import it at the top of the function.
     use flexaudio_core::types::Error;
 
     let backend: Box<dyn CaptureBackend> = match config.kind {
-        // マイク入力は全 OS 共通（cpal）。device_id で特定入力デバイスを選べる
-        // （None=既定入力デバイス。id は devices() が返す安定 ID = デバイス名）。
-        // 同じ device_id は system でも出力エンドポイント選択に効く。
+        // Microphone input is common to all OSes (cpal). device_id selects an input device
+        // (None=default input; id is the stable device-name key returned by devices()). The
+        // same device_id selects the output endpoint for system capture.
         SourceKind::Mic => Box::new(flexaudio_mic::CpalMicBackend::new(config.device_id.clone())),
 
-        // システム出力ループバックは Linux / Windows / macOS 対応。
-        // exclude_self（自ホスト除外）と device_id（出力エンドポイント選択）を backend へ
-        // 渡す。mode は見ない。device_id=None で既定出力。
+        // System output loopback is supported on Linux / Windows / macOS.
+        // Pass exclude_self (exclude this process) and device_id (select output endpoint)
+        // to the backend. mode is ignored. device_id=None selects the default output.
         SourceKind::SystemLoopback => build_system_backend(
             config.exclude_self,
             config.exclude_pids.clone(),
             config.device_id.clone(),
         )?,
 
-        // プロセス出力ループバックは Linux / Windows / macOS 対応・target_pid 必須。
-        // mode（Include/Exclude）を backend へ渡す。exclude_self は見ない。
-        // mode:Exclude でも target_pid は必須（無ければ InvalidArg）。
+        // Per-process output loopback is supported on Linux / Windows / macOS and requires target_pid.
+        // Pass mode (Include/Exclude) to the backend. exclude_self is ignored.
+        // target_pid is required even for mode:Exclude (otherwise InvalidArg).
         SourceKind::ProcessLoopback => {
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             {
                 let pid = config.target_pid.ok_or_else(|| {
-                    Error::InvalidArg("ProcessLoopback には target_pid が必要".into())
+                    Error::InvalidArg("ProcessLoopback requires target_pid".into())
                 })?;
                 #[cfg(target_os = "linux")]
                 {
@@ -258,9 +259,9 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
             }
         }
 
-        // mic + system のミックス。子 2 つを合成バックエンドへ注入する。側別ゲインは
-        // グローバル gain（Stream::open が検証）と同じ基準で検証する。device_id は
-        // 見ない（mix_mic_device_id / mix_system_device_id で各側を選ぶ）。
+        // Mix mic and system by injecting both children into the composite backend. Validate
+        // per-side gains using the same rules as global gain (checked by Stream::open).
+        // Ignore device_id; select each side with mix_mic_device_id / mix_system_device_id.
         SourceKind::Mix => {
             for (name, gain) in [
                 ("mix_mic_gain", config.mix_mic_gain),
@@ -275,8 +276,8 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
             let mic = Box::new(flexaudio_mic::CpalMicBackend::new(
                 config.mix_mic_device_id.clone(),
             ));
-            // exclude_self は Mix では system 側に適用する（フィードバック防止の意図は
-            // system 単独と同じ）。非対応 OS はここで Unsupported になる。
+            // For Mix, apply exclude_self to the system side (same feedback-prevention intent
+            // as standalone system capture). Unsupported OSes return Unsupported here.
             let system = build_system_backend(
                 config.exclude_self,
                 config.exclude_pids.clone(),
@@ -294,12 +295,12 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
     Ok(backend)
 }
 
-/// システム出力ループバックの backend を OS に応じて 1 つ構築する。
+/// Build the system output loopback backend for the current OS.
 ///
-/// [`SourceKind::SystemLoopback`] 本体と [`SourceKind::Mix`] の system 側の両方が
-/// 使う共通ヘルパ（OS 分岐を二重化しない）。`exclude_self` は自ホスト除外、
-/// `device_id` は出力エンドポイント選択（`None` で既定出力）。
-/// Linux / Windows / macOS 以外は [`Error::Unsupported`]。
+/// Shared helper for [`SourceKind::SystemLoopback`] and the system side of [`SourceKind::Mix`]
+/// to avoid duplicating OS branches. `exclude_self` excludes this process; `device_id`
+/// selects an output endpoint (`None` uses the default). OSes other than Linux / Windows / macOS
+/// return [`Error::Unsupported`].
 /// `exclude_pids` are extra pids excluded alongside `exclude_self`
 /// (see [`StreamConfig::exclude_pids`]); empty = exclusion is `exclude_self` alone.
 fn build_system_backend(
@@ -377,8 +378,8 @@ mod tests {
         }
     }
 
-    /// Mix の側別ゲイン検証: 負・NaN は backend 構築前に InvalidArg で弾かれる
-    /// （デバイスには一切触れない）。
+    /// Mix per-side gain validation: negative or NaN values return InvalidArg before backend
+    /// construction (no devices are touched).
     #[test]
     fn mix_config_rejects_invalid_side_gains() {
         for (mic_gain, system_gain) in [
@@ -395,21 +396,21 @@ mod tests {
             };
             match open(config) {
                 Ok(_) => {
-                    panic!("mix ゲイン ({mic_gain}, {system_gain}) は InvalidArg で弾かれるはず")
+                    panic!("mix gains ({mic_gain}, {system_gain}) should be rejected as InvalidArg")
                 }
                 Err(Error::InvalidArg(msg)) => {
                     assert!(
                         msg.contains("mix_mic_gain") || msg.contains("mix_system_gain"),
-                        "どちらのゲインが不正か分かるメッセージのはず: {msg}"
+                        "message should identify which gain is invalid: {msg}"
                     );
                 }
-                Err(other) => panic!("InvalidArg を期待したが別のエラー: {other:?}"),
+                Err(other) => panic!("expected InvalidArg, got a different error: {other:?}"),
             }
         }
     }
 
-    /// 妥当な Mix config は backend 構築（open）まで通る（まだ start しないので
-    /// 実デバイスには触れない。ヘッドレス環境でも成立）。
+    /// A valid Mix config passes backend construction (open). Since it is not started, no real
+    /// devices are touched, so this also works in headless environments.
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     #[test]
     fn mix_config_with_valid_gains_opens() {
@@ -419,8 +420,8 @@ mod tests {
             mix_system_gain: 2.0,
             ..Default::default()
         };
-        let stream = open(config).expect("妥当な Mix config は open まで通るはず");
-        // 合成バックエンドは内部正規形を名乗る（Stream 第 1 段はパススルー）。
+        let stream = open(config).expect("valid Mix config should open successfully");
+        // The composite backend reports its internal canonical format (Stream's first stage is pass-through).
         assert_eq!(stream.native_format(), (48_000, 2));
     }
 }

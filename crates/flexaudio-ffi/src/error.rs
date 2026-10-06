@@ -1,7 +1,8 @@
-//! エラーコードと thread-local の直近エラーメッセージ。
+//! Error codes and the most recent thread-local error message.
 //!
-//! 関数の戻り値（`i32`）でエラーの種別だけを返し、人間向けメッセージは呼び出し元の
-//! スレッドごとに保持する。C 側は失敗を見たら [`flexaudio_last_error`] で文字列を取る。
+//! Functions return only the error kind (`i32`); human-readable messages are stored
+//! per caller thread. On failure, C callers can get the message with
+//! [`flexaudio_last_error`].
 //!
 //! [`flexaudio_last_error`]: crate::flexaudio_last_error
 
@@ -10,48 +11,49 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
 
-/// FFI 関数の戻りコード。0 が成功、負がエラー。
+/// FFI function return codes. Zero means success; negative values indicate errors.
 ///
-/// `poll_*` だけは正の 1 を「取得あり」、0 を「なし」に使う（エラーは負のまま）。
-/// 名前は C のヘッダで `FLEX_OK` 等になり、C 側の名前空間と衝突しないようにする。
+/// Only `poll_*` uses positive 1 for “available” and 0 for “none”; errors remain negative.
+/// The C header uses names such as `FLEX_OK` to avoid collisions in the C namespace.
 pub mod code {
-    /// 成功。
+    /// Success.
     pub const FLEX_OK: i32 = 0;
-    /// 引数が無効（NULL ポインタ・不正な UTF-8・未知の列挙値など）。
+    /// Invalid argument (NULL pointer, invalid UTF-8, unknown enum value, etc.).
     pub const FLEX_INVALID_ARG: i32 = -1;
-    /// flexaudio の操作が失敗した（メッセージは last_error に入る）。
+    /// A flexaudio operation failed (the message is stored in last_error).
     pub const FLEX_FAILURE: i32 = -2;
-    /// FFI 境界で panic を捕捉した（メッセージは last_error に入る）。
+    /// A panic was caught at the FFI boundary (the message is stored in last_error).
     pub const FLEX_PANIC: i32 = -3;
-    /// ハンドルの状態が操作に合わない（finalize 済みの FLAC への write など）。
+    /// The handle state does not allow the operation (such as writing to finalized FLAC).
     pub const FLEX_INVALID_STATE: i32 = -4;
 }
 
 thread_local! {
-    // 直近のエラーメッセージ。同一スレッドで次に last_error を更新する FFI 呼び出しまで
-    // 有効。`flexaudio_last_error` が返すポインタはこの中身を指す。
+    // Most recent error message, valid until the next FFI call on this thread updates
+    // last_error. The pointer returned by `flexaudio_last_error` refers to this value.
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
-/// 直近のエラーメッセージを現在のスレッドに記録する。
+/// Records the most recent error message for the current thread.
 ///
-/// メッセージ中の NUL は CString が拒否するので、その場合は固定文言に差し替える
-/// （メッセージを失っても last_error 自体は必ずセットする）。
+/// CString rejects embedded NUL bytes, so replace such messages with a fixed string.
+/// Always set last_error, even if the original message is lost.
 pub fn set_last_error(msg: impl Into<String>) {
     let cstring = CString::new(msg.into())
         .unwrap_or_else(|_| CString::new("error message contained a NUL byte").unwrap());
     LAST_ERROR.with(|slot| *slot.borrow_mut() = Some(cstring));
 }
 
-/// 直近のエラーを消す（成功した操作の前後で呼び、古いメッセージを残さない）。
+/// Clears the most recent error so successful operations do not leave stale messages.
 pub fn clear_last_error() {
     LAST_ERROR.with(|slot| *slot.borrow_mut() = None);
 }
 
-/// 現在のスレッドの直近エラーメッセージへのポインタを返す。
+/// Returns a pointer to the most recent error message for the current thread.
 ///
-/// 返るポインタは thread-local の中身を指し、同一スレッドで次に last_error を更新する
-/// 呼び出しまで有効。エラーが無ければ NULL。C 側で free してはならない。
+/// The pointer refers to thread-local storage and remains valid until the next call on
+/// the same thread updates last_error. Returns NULL if there is no error. Do not free
+/// it from C.
 pub fn last_error_ptr() -> *const c_char {
     LAST_ERROR.with(|slot| match &*slot.borrow() {
         Some(cstring) => cstring.as_ptr(),

@@ -1,11 +1,11 @@
-//! Silero VAD の 16 kHz ONNX 推論器（`tract-onnx`）。
+//! Silero VAD's 16 kHz ONNX inference engine (`tract-onnx`).
 //!
-//! 埋め込みモデルは 16 kHz 専用（入力 `input` `[1,576]` f32 と `state` `[2,1,128]` f32、
-//! `sr` 入力なし）。公開 API の 8 kHz は呼び出し側の状態付き sinc リサンプラで 16 kHz
-//! に変換してからここへ渡す。
+//! The embedded model supports only 16 kHz (inputs `input` `[1,576]` f32 and `state` `[2,1,128]`
+//! f32, with no `sr` input). The public API's 8 kHz input is converted to 16 kHz by the caller's
+//! stateful sinc resampler before being passed here.
 //!
-//! 計画（`into_optimized` → `into_runnable`）は起動時に一度だけ作り、フレームごとに
-//! 使い回す。state `[2,1,128]` と context 64 サンプルはフレーム間で引き継ぐ。
+//! Build the plan (`into_optimized` → `into_runnable`) once at startup and reuse it for each frame.
+//! Carry the `[2,1,128]` state and 64-sample context across frames.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -14,46 +14,47 @@ use tract_onnx::prelude::*;
 
 use crate::VadError;
 
-/// 上流 snakers4/silero-vad コミット `1a26f187f9dbc77d9dcaee0bfefafcc092ef7970` の
-/// `src/silero_vad/data/silero_vad_openvino_16k.onnx`。
+/// `src/silero_vad/data/silero_vad_openvino_16k.onnx` from upstream snakers4/silero-vad commit
+/// `1a26f187f9dbc77d9dcaee0bfefafcc092ef7970`.
 ///
 /// URL: https://github.com/snakers4/silero-vad/blob/1a26f187f9dbc77d9dcaee0bfefafcc092ef7970/src/silero_vad/data/silero_vad_openvino_16k.onnx
 /// sha256: 7776b81ad1b0350c15d7f1555943b9232eb53e9ca5d989c6d0cea9ebc8664d87
 ///
-/// 16 kHz 専用・If ノードなし。入力 `input` `[1,576]` f32 と `state` `[2,1,128]` f32。
-/// `sr` 入力は無い。出力は `output`（発話確率）と `stateN`。
+/// 16 kHz only, with no If node. Inputs: `input` `[1,576]` f32 and `state` `[2,1,128]` f32.
+/// There is no `sr` input. Outputs are `output` (speech probability) and `stateN`.
 static MODEL_BYTES: &[u8] = include_bytes!("../assets/silero_vad_openvino_16k.onnx");
 
-/// モデルが想定するサンプルレート。
+/// Sample rate expected by the model.
 pub(crate) const MODEL_SAMPLE_RATE: u32 = 16_000;
-/// 16 kHz の silero フレーム長。
+/// Silero frame length at 16 kHz.
 pub(crate) const MODEL_FRAME_SIZE: usize = 512;
-/// 16 kHz の silero 前置コンテキスト長。
+/// Silero pre-context length at 16 kHz.
 const MODEL_CONTEXT_SIZE: usize = 64;
-/// `concat(context, frame)` の長さ（16 kHz = 64+512）。
+/// Length of `concat(context, frame)` (64+512 at 16 kHz).
 const MODEL_INPUT_LEN: usize = MODEL_CONTEXT_SIZE + MODEL_FRAME_SIZE;
-/// state テンソルの要素数 (`2 * 1 * 128`)。
+/// Number of elements in the state tensor (`2 * 1 * 128`).
 const STATE_LEN: usize = 2 * 128;
 
-/// 16 kHz silero グラフを 1 本の最適化済み計画として持つ推論器。
+/// Inference engine holding the 16 kHz Silero graph as one optimized plan.
 pub(crate) struct SileroEngine {
     plan: Arc<TypedSimplePlan>,
-    /// モデル入力列における `input` の位置。
+    /// Position of `input` in the model's input list.
     input_ix: usize,
-    /// モデル入力列における `state` の位置。
+    /// Position of `state` in the model's input list.
     state_ix: usize,
-    /// モデル出力列における `output`（発話確率）の位置。
+    /// Position of `output` (speech probability) in the model's output list.
     output_ix: usize,
-    /// モデル出力列における `stateN` の位置。
+    /// Position of `stateN` in the model's output list.
     state_out_ix: usize,
-    /// silero state テンソル `[2,1,128]`（フレーム間で継承）。
+    /// Silero state tensor `[2,1,128]`, carried across frames.
     state: Vec<f32>,
-    /// 前回フレーム末尾の context（16 kHz = 64）。次フレームの前置に使う。
+    /// Context from the end of the previous frame (64 samples at 16 kHz), used as pre-context for
+    /// the next frame.
     context: Vec<f32>,
 }
 
 impl SileroEngine {
-    /// 埋め込みモデルを `into_optimized` して推論計画を構築する。
+    /// Optimize the embedded model with `into_optimized` and build the inference plan.
     pub(crate) fn load() -> Result<Self, VadError> {
         let (plan, input_ix, state_ix, output_ix, state_out_ix) = load_plan()?;
         Ok(SileroEngine {
@@ -67,10 +68,11 @@ impl SileroEngine {
         })
     }
 
-    /// 16 kHz の 1 フレーム (`MODEL_FRAME_SIZE` サンプル) を通し発話確率を返す。
+    /// Run one 16 kHz frame (`MODEL_FRAME_SIZE` samples) and return its speech probability.
     ///
-    /// 入力は frame そのものではなく `concat(context, frame)` で、長さは 576。
-    /// 推論後、context を今回入力末尾の 64 サンプルで、state を出力 `stateN` で更新する。
+    /// The input is `concat(context, frame)`, not just the frame, and has length 576.
+    /// After inference, update the context with the last 64 input samples and the state with output
+    /// `stateN`.
     pub(crate) fn infer_16k_frame(&mut self, frame: &[f32]) -> Result<f32, VadError> {
         debug_assert_eq!(frame.len(), MODEL_FRAME_SIZE);
         debug_assert_eq!(self.context.len(), MODEL_CONTEXT_SIZE);
@@ -79,7 +81,8 @@ impl SileroEngine {
         x.extend_from_slice(&self.context);
         x.extend_from_slice(frame);
 
-        // 次回 context = 今回入力末尾の 64 サンプル。x はテンソルへ move されるので先に控える。
+        // Next frame's context is the last 64 samples of this input. Save them before x is moved into
+        // the tensor.
         let next_context: Vec<f32> = x[MODEL_INPUT_LEN - MODEL_CONTEXT_SIZE..].to_vec();
 
         let in_t = Tensor::from_shape(&[1, MODEL_INPUT_LEN], &x)
@@ -128,7 +131,7 @@ impl SileroEngine {
         Ok(prob)
     }
 
-    /// state / context をゼロ初期化する。
+    /// Zero-initialize the state and context.
     pub(crate) fn reset(&mut self) {
         self.state.fill(0.0);
         self.context.fill(0.0);
@@ -147,9 +150,9 @@ fn load_plan() -> Result<(Arc<TypedSimplePlan>, usize, usize, usize, usize), Vad
     model = model
         .with_input_fact(state_ix, f32::fact([2usize, 1usize, 128usize]).into())
         .map_err(|e| VadError::ModelLoad(format!("{e:#}")))?;
-    // `into_optimized` の中身と同じ Typed 最適化経路を明示する。tract 0.23.7 の debug
-    // 検査はこのモデルの Scan 展開が作る同名の一時 Const を拒否するため、各段で名前を
-    // 一意化する。計画はここで一度だけ構築され、フレームごとには再最適化しない。
+    // Spell out the same Typed optimization path used inside `into_optimized`. tract 0.23.7's debug
+    // checks reject duplicate temporary Const names created when expanding this model's Scan, so
+    // make names unique at each stage. Build the plan once here; do not re-optimize per frame.
     uniquify_node_names(&mut model);
     let mut typed = model
         .into_typed()
@@ -183,8 +186,8 @@ fn uniquify_names<F: Fact, O>(nodes: &mut [Node<F, O>]) {
     }
 }
 
-/// tract 0.23.7 は debug の `compact()` 後にノード名の一意を検査する。silero の
-/// Scan 展開が同名の一時 Const を作る場合だけは、すでに完了した最適化結果を採用する。
+/// tract 0.23.7 checks node-name uniqueness after debug `compact()`. If Silero's Scan expansion
+/// creates duplicate temporary Const names, accept the optimization result that has already finished.
 fn accept_debug_duplicate_names(result: TractResult<()>) -> Result<(), VadError> {
     match result {
         Ok(()) => Ok(()),

@@ -1,14 +1,14 @@
-//! FLAC ストリーミング書き出し ([`FlacWriter`])。
+//! FLAC streaming writer ([`FlacWriter`]).
 //!
-//! flacenc の主入口 `encode_with_fixed_block_size` は全サンプルを [`Source`] から
-//! 一括で読む設計で、長時間録音では全データをメモリに抱えることになる。ここでは
-//! フレーム単位の入口 [`flacenc::encode_fixed_size_frame`] を使い、ブロック
-//! （4096 サンプル/ch）が溜まるたびにエンコードしてファイルへ流す。
+//! flacenc's main entry point, `encode_with_fixed_block_size`, reads all samples from
+//! [`Source`] at once, which would keep an entire long recording in memory. This uses the
+//! frame-level entry point [`flacenc::encode_fixed_size_frame`] and encodes each block
+//! (4096 samples/channel) as soon as it is full, writing it to the file.
 //!
-//! STREAMINFO ヘッダは作成時に仮の値（総サンプル数 0・MD5 ゼロ）で書いておき、
-//! [`FlacWriter::finalize`] で先頭へシークして確定値に書き換える。STREAMINFO は
-//! 固定長 34 バイトなのでヘッダ全長は常に 42 バイトで変わらず、上書きで安全に
-//! 差し替えられる。
+//! The STREAMINFO header is initially written with placeholder values (zero total samples
+//! and a zero MD5), then [`FlacWriter::finalize`] seeks to the start and replaces them with
+//! the final values. STREAMINFO has a fixed length of 34 bytes, so the full header is always
+//! 42 bytes and can be safely overwritten.
 //!
 //! [`Source`]: flacenc::source::Source
 
@@ -24,71 +24,71 @@ use flacenc::source::{Context, Fill, FrameBuf};
 
 use crate::error::{EncodeError, Result};
 
-/// 1 フレームあたりのブロックサイズ（サンプル/チャンネル）。flacenc の既定値と同じ。
+/// Block size per frame (samples per channel), matching flacenc's default.
 const BLOCK_SIZE: usize = 4096;
 
-/// 量子化ビット深度。現状 16bit 固定。
-/// flacenc 自体は 24bit まで対応しているので、必要になれば [`quantize_i16`] の
-/// スケールとここを広げれば 24bit FLAC も書ける（現時点では余地のみ）。
+/// Quantization bit depth. Currently fixed at 16 bits.
+/// flacenc supports up to 24 bits, so 24-bit FLAC could be written by expanding the scale
+/// in [`quantize_i16`] and this value if needed (not currently implemented).
 const BITS_PER_SAMPLE: usize = 16;
 
-/// 対応するサンプルレート上限 (Hz)。FLAC 形式自体は 655,350 Hz まで表せるが、
-/// flacenc の検証が 96 kHz までに制限しているのでそれに合わせる。
+/// Maximum supported sample rate (Hz). FLAC itself can represent up to 655,350 Hz, but
+/// flacenc's validation is limited to 96 kHz, so this matches that limit.
 const MAX_SAMPLE_RATE: u32 = 96_000;
 
-/// FLAC ヘッダ全長: "fLaC" マジック 4B + メタデータブロックヘッダ 4B + STREAMINFO 34B。
+/// Total FLAC header length: "fLaC" magic (4 bytes) + metadata block header (4 bytes) + STREAMINFO (34 bytes).
 const HEADER_LEN: usize = 42;
 
-/// f32 サンプル 1 個を 16bit 整数へ量子化する（ディザなしの単純量子化）。
+/// Quantize one f32 sample to a 16-bit integer (simple quantization without dithering).
 ///
-/// 量子化の正典は [`flexaudio_core::quantize_i16`]（全層で同一実装を共有する）。flacenc の
-/// API 都合で `i32` を要求するので、core の `i16` 版へ委譲して昇格する。スケールは 32768
-/// （負側フルスケール = -1.0 基準）・`+1.0` は 32767 へクランプ・範囲外は飽和・NaN は 0。
+/// The canonical quantizer is [`flexaudio_core::quantize_i16`], shared across all layers.
+/// flacenc's API requires `i32`, so this delegates to the core `i16` version and widens the
+/// result. The scale is 32768 (negative full scale is based on -1.0); `+1.0` is clamped to
+/// 32767, out-of-range values saturate, and NaN becomes 0.
 #[inline]
 fn quantize_i16(x: f32) -> i32 {
     flexaudio_core::quantize_i16(x) as i32
 }
 
-/// flacenc 系エラーを [`EncodeError::Encoder`] に写すヘルパ。
+/// Helper to map flacenc errors to [`EncodeError::Encoder`].
 fn enc_err(e: impl std::fmt::Display) -> EncodeError {
     EncodeError::Encoder(e.to_string())
 }
 
-/// 録音チャンクを逐次 FLAC ファイルへ書き出すライター。
+/// Writer that streams recording chunks to a FLAC file.
 ///
-/// interleaved `f32`（flexaudio の `AudioChunk.data` と同じ形）を
-/// [`write_chunk`](FlacWriter::write_chunk) に流し、終わったら
-/// [`finalize`](FlacWriter::finalize) でヘッダを確定する。エンコードは呼び出し
-/// スレッド上で同期的に行う。
+/// Pass interleaved `f32` samples (the same format as flexaudio's `AudioChunk.data`) to
+/// [`write_chunk`](FlacWriter::write_chunk), then finalize the header with
+/// [`finalize`](FlacWriter::finalize). Encoding runs synchronously on the caller thread.
 ///
-/// finalize を呼ばずに drop した場合もベストエフォートで閉じる（端数の書き出しと
-/// ヘッダ確定を試み、エラーは握りつぶす）。確実に完結させたいときは finalize を
-/// 呼ぶこと。
+/// Dropping without calling finalize still attempts to close the file (writing any remaining
+/// samples and finalizing the header); errors are swallowed. Call finalize to ensure it is
+/// complete.
 pub struct FlacWriter {
     file: BufWriter<File>,
     config: Verified<EncoderConfig>,
-    /// 確定値を積算するストリーム情報。finalize でヘッダに書き戻す。
+    /// Stream information accumulated for the final header values.
     stream_info: StreamInfo,
-    /// エンコード入力用のブロックバッファ（flacenc がチャンネル分離して保持）。
+    /// Input block buffer; flacenc stores channels separately.
     frame_buf: FrameBuf,
-    /// MD5 と総サンプル数の積算（エンコードとは独立した flacenc の仕組み）。
+    /// Accumulates the MD5 and total sample count using flacenc's encoding-independent mechanism.
     context: Context,
-    /// フレームのビット列化に使い回すシンク。
+    /// Reusable sink for serializing frame bits.
     sink: ByteSink,
-    /// ブロックサイズに満たない量子化済みサンプルの持ち越し。
+    /// Carries quantized samples that do not yet fill a block.
     pending: Vec<i32>,
     channels: usize,
-    /// 次に書くフレーム番号（固定ブロックサイズなのでフレーム単位の連番）。
+    /// Number of the next frame to write; frames are sequential because block size is fixed.
     frame_number: usize,
-    /// finalize 済みなら Drop で何もしない。
+    /// If finalized, Drop does nothing.
     finalized: bool,
 }
 
 impl FlacWriter {
-    /// `path` に 16bit FLAC ファイルを新規作成する（既存ファイルは上書き）。
+    /// Create a new 16-bit FLAC file at `path`, overwriting any existing file.
     ///
-    /// 対応範囲は `channels` 1..=2、`sample_rate` 1..=96,000 Hz。範囲外は
-    /// [`EncodeError::Unsupported`]（ファイルは作られない）。
+    /// Supported values are `channels` 1..=2 and `sample_rate` 1..=96,000 Hz. Out-of-range
+    /// values return [`EncodeError::Unsupported`] without creating a file.
     pub fn create<P: AsRef<Path>>(path: P, sample_rate: u32, channels: u16) -> Result<FlacWriter> {
         if !(1..=2).contains(&channels) {
             return Err(EncodeError::Unsupported(format!(
@@ -107,7 +107,7 @@ impl FlacWriter {
         let mut stream_info =
             StreamInfo::new(sample_rate as usize, channels as usize, BITS_PER_SAMPLE)
                 .map_err(enc_err)?;
-        // 固定ブロックサイズのストリームとして宣言する（flacenc の一括入口と同じ流儀）。
+        // Declare a fixed-block-size stream, matching flacenc's batch entry point.
         stream_info
             .set_block_sizes(BLOCK_SIZE, BLOCK_SIZE)
             .map_err(enc_err)?;
@@ -126,18 +126,17 @@ impl FlacWriter {
             frame_number: 0,
             finalized: false,
         };
-        // 仮ヘッダ。finalize で同じ長さのまま確定値に上書きする。
+        // Write a placeholder header; finalize overwrites it with final values of the same length.
         let header = writer.header_bytes()?;
         writer.file.write_all(&header)?;
         Ok(writer)
     }
 
-    /// interleaved `f32` サンプルを追記する。
+    /// Append interleaved `f32` samples.
     ///
-    /// 長さは `channels` の倍数であること（flexaudio の `AudioChunk.data` は
-    /// そのまま渡せる）。倍数でなければ [`EncodeError::Unsupported`] を返し、
-    /// 何も書かない。ブロックに満たない端数は内部に持ち越し、次の呼び出しか
-    /// finalize で書かれる。
+    /// The length must be a multiple of `channels` (`AudioChunk.data` from flexaudio can be
+    /// passed directly). Otherwise, this returns [`EncodeError::Unsupported`] and writes
+    /// nothing. A partial block is buffered and written by the next call or during finalize.
     pub fn write_chunk(&mut self, interleaved: &[f32]) -> Result<()> {
         if interleaved.len() % self.channels != 0 {
             return Err(EncodeError::Unsupported(format!(
@@ -152,23 +151,23 @@ impl FlacWriter {
         self.drain_full_blocks()
     }
 
-    /// 端数フレームの書き出しとヘッダ確定を行い、ファイルを閉じる。
+    /// Write any remaining samples, finalize the header, and close the file.
     ///
-    /// self を消費するので、以後の [`write_chunk`](FlacWriter::write_chunk) は型で
-    /// 不可能。Drop でも同じ処理をベストエフォートで行うが、書き込みエラーを
-    /// 検知できるのはこちらだけなので finalize 推奨。
+    /// Consumes `self`, so the type prevents further calls to
+    /// [`write_chunk`](FlacWriter::write_chunk). Drop makes a best-effort attempt at the same
+    /// operation, but only finalize reports write errors, so finalize is recommended.
     pub fn finalize(mut self) -> Result<()> {
         let result = self.finish_inner();
-        // Drop での二重実行を防ぐ（失敗していても再試行はしない）。
+        // Prevent Drop from running this twice; do not retry even if it failed.
         self.finalized = true;
         result
     }
 
-    /// pending から満杯ブロックをすべてエンコードして書き出す。
+    /// Encode and write all full blocks from pending samples.
     fn drain_full_blocks(&mut self) -> Result<()> {
         let block_len = BLOCK_SIZE * self.channels;
-        // self.pending を借用したまま &mut self の encode_block は呼べないので、
-        // 一旦取り出して処理し、戻すときに消費済み分を落とす。
+        // encode_block needs &mut self, so pending cannot stay borrowed. Take it out, process
+        // it, then remove the consumed samples when restoring it.
         let pending = std::mem::take(&mut self.pending);
         let mut consumed = 0;
         let mut result = Ok(());
@@ -184,11 +183,11 @@ impl FlacWriter {
         result
     }
 
-    /// 1 ブロック分（最終ブロックのみ端数可）の量子化済みサンプルを 1 フレームに
-    /// エンコードしてファイルへ書く。
+    /// Encode one block of quantized samples (the final block may be partial) into one frame
+    /// and write it to the file.
     fn encode_block(&mut self, block: &[i32]) -> Result<()> {
         self.frame_buf.fill_interleaved(block).map_err(enc_err)?;
-        // MD5 と総サンプル数はここで積算される。
+        // Accumulate the MD5 and total sample count here.
         self.context.fill_interleaved(block).map_err(enc_err)?;
 
         let frame = flacenc::encode_fixed_size_frame(
@@ -198,31 +197,31 @@ impl FlacWriter {
             &self.stream_info,
         )
         .map_err(enc_err)?;
-        // min/max フレームサイズ統計を積む（finalize でヘッダに反映される）。
+        // Accumulate min/max frame size statistics for the header written during finalize.
         self.stream_info.update_frame_info(&frame);
 
         self.sink.clear();
         frame.write(&mut self.sink).map_err(enc_err)?;
-        // FLAC フレームはバイト境界で終わるので as_slice で欠けなく取れる。
+        // FLAC frames end on byte boundaries, so as_slice returns all of the data.
         self.file.write_all(self.sink.as_slice())?;
         self.frame_number += 1;
         Ok(())
     }
 
-    /// finalize の実体。Drop からも呼ばれる。
+    /// Implementation of finalize, also called by Drop.
     fn finish_inner(&mut self) -> Result<()> {
-        // 端数を最終フレームとして吐く（FLAC は最終フレームだけ短くてよい）。
+        // Write remaining samples as the final frame; only the last FLAC frame may be short.
         if !self.pending.is_empty() {
             let tail = std::mem::take(&mut self.pending);
             self.encode_block(&tail)?;
         }
 
-        // STREAMINFO を確定させる。
-        // - min/max ブロックサイズ: RFC 9639 では最終（端数）ブロックを数えないが、
-        //   update_frame_info は数えてしまい、端数が 16 サンプル未満だと仕様違反の
-        //   ヘッダになる（claxon などが拒否する）。固定ブロックサイズのストリーム
-        //   なので宣言値に戻す。
-        // - 総サンプル数: update_frame_info も積算するが、Context の値を正とする。
+        // Finalize STREAMINFO.
+        // - Min/max block size: RFC 9639 excludes the final partial block, but
+        //   update_frame_info includes it. If the tail has fewer than 16 samples, this creates
+        //   a non-compliant header that claxon and others reject. Restore the declared value
+        //   because this is a fixed-block-size stream.
+        // - Total samples: update_frame_info also accumulates this, but Context is authoritative.
         self.stream_info
             .set_block_sizes(BLOCK_SIZE, BLOCK_SIZE)
             .map_err(enc_err)?;
@@ -230,7 +229,7 @@ impl FlacWriter {
         self.stream_info
             .set_total_samples(self.context.total_samples());
 
-        // 先頭の仮ヘッダを同じ長さの確定ヘッダで上書きする。
+        // Overwrite the placeholder header at the start with the final header of the same length.
         let header = self.header_bytes()?;
         self.file.rewind()?;
         self.file.write_all(&header)?;
@@ -238,18 +237,18 @@ impl FlacWriter {
         Ok(())
     }
 
-    /// 現時点の StreamInfo から FLAC ヘッダ（"fLaC" + STREAMINFO ブロック）を作る。
+    /// Build a FLAC header ("fLaC" + STREAMINFO block) from the current StreamInfo.
     ///
-    /// 常に [`HEADER_LEN`] バイト。作成時と finalize 時で長さが変わらないことに
-    /// 依存して、finalize では先頭を上書きする。
+    /// Always [`HEADER_LEN`] bytes. finalize overwrites the start of the file, relying on the
+    /// header length staying constant between creation and finalize.
     fn header_bytes(&self) -> Result<Vec<u8>> {
         let mut info = self.stream_info.clone();
         if self.frame_number == 0 {
-            // フレームが 1 つも無い間は min/max フレームサイズが flacenc の番兵値
-            // (u32::MAX / 0) のままなので、FLAC の「0 = 不明」に倒してから書く。
+            // With no frames, min/max frame sizes remain at flacenc's sentinel values
+            // (u32::MAX / 0). Write them as FLAC's "0 = unknown" instead.
             info.set_frame_sizes(0, 0).map_err(enc_err)?;
         }
-        // フレームを持たない Stream の直列化 = マジック + STREAMINFO ブロックのみ。
+        // Serializing a Stream with no frames writes only the magic and STREAMINFO block.
         let stream = Stream::with_stream_info(info);
         let mut sink = ByteSink::new();
         stream.write(&mut sink).map_err(enc_err)?;
@@ -262,13 +261,13 @@ impl FlacWriter {
 impl Drop for FlacWriter {
     fn drop(&mut self) {
         if !self.finalized {
-            // ベストエフォート。エラーは握りつぶす（検知したいなら finalize を呼ぶ）。
+            // Best effort; swallow errors. Call finalize to detect them.
             let _ = self.finish_inner();
         }
     }
 }
 
-// flacenc 側の型（Verified 等）が Debug を持たないので derive できず、手書きする。
+// flacenc types such as Verified do not implement Debug, so implement it manually.
 impl std::fmt::Debug for FlacWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlacWriter")
@@ -290,16 +289,16 @@ mod tests {
         assert_eq!(quantize_i16(0.0), 0);
         assert_eq!(quantize_i16(0.25), 8192);
         assert_eq!(quantize_i16(-1.0), -32768);
-        // 正側フルスケールは 16bit に収まらないのでクランプ。
+        // Positive full scale does not fit in 16 bits, so clamp it.
         assert_eq!(quantize_i16(1.0), 32767);
-        // 範囲外は飽和。
+        // Out-of-range values saturate.
         assert_eq!(quantize_i16(2.0), 32767);
         assert_eq!(quantize_i16(-2.0), -32768);
-        // 非有限値。
+        // Non-finite values.
         assert_eq!(quantize_i16(f32::NAN), 0);
         assert_eq!(quantize_i16(f32::INFINITY), 32767);
         assert_eq!(quantize_i16(f32::NEG_INFINITY), -32768);
-        // 丸めは最近接（round half away from zero）。1.5/32768 は 2 進で正確。
+        // Round to nearest (round half away from zero). 1.5/32768 is exact in binary.
         assert_eq!(quantize_i16(1.5 / 32768.0), 2);
         assert_eq!(quantize_i16(-1.5 / 32768.0), -2);
     }

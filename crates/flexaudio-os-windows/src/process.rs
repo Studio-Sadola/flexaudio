@@ -1,24 +1,22 @@
-//! [`WasapiProcessBackend`] — プロセス別 WASAPI loopback。
+//! [`WasapiProcessBackend`] — per-process WASAPI loopback.
 //!
-//! `ActivateAudioInterfaceAsync` + `AUDIOCLIENT_ACTIVATION_PARAMS`（プロセス
-//! ループバック）で特定 PID（そのプロセスツリー）の音声を録る。`mode`
-//! （[`ProcessMode::Include`]）で「対象ツリーの音だけ」、[`ProcessMode::Exclude`]
-//! で「対象ツリーを除く全システム音」を録る。Linux の
-//! [`PwProcessBackend`](../flexaudio_os_linux)（link-factory fan-out）相当。
+//! Capture audio for a PID and its process tree with `ActivateAudioInterfaceAsync` and
+//! `AUDIOCLIENT_ACTIVATION_PARAMS` (process loopback). `mode` [`ProcessMode::Include`] captures
+//! only the target tree; [`ProcessMode::Exclude`] captures all system audio except that tree. This
+//! corresponds to Linux's [`PwProcessBackend`](../flexaudio_os_linux) (link-factory fan-out).
 //!
-//! このモジュールの [`setup_process_loopback`] は `pub(crate)` で、`system` モジュール
-//! （[`WasapiSystemBackend`](crate::WasapiSystemBackend)）の `exclude_self == true`
-//! 経路からも呼ばれる（自ホスト PID を EXCLUDE して全システム音を録る）。
+//! [`setup_process_loopback`] is `pub(crate)` and is also called by the `exclude_self == true` path
+//! in the `system` module ([`WasapiSystemBackend`](crate::WasapiSystemBackend)) to exclude the
+//! calling process PID and capture all system audio.
 //!
-//! # PROPVARIANT（VT_BLOB）の難所
+//! # PROPVARIANT (VT_BLOB) details
 //!
-//! `ActivateAudioInterfaceAsync` の `activationparams` は
-//! `Option<*const windows_core::PROPVARIANT>` で、`AUDIOCLIENT_ACTIVATION_PARAMS` を
-//! VT_BLOB の PROPVARIANT に詰めて渡す必要がある。windows-core 0.54 では
-//! `PROPVARIANT::from_raw` の引数が private な `imp::PROPVARIANT` で、外から型名を書けない
-//! （公開の生構造体も無い）。そこで SDK の PROPVARIANT レイアウトに厳密一致させた
-//! `#[repr(C)]` ミラー構造体 [`RawPropVariant`] を自前定義し、`transmute` で `from_raw`
-//! へ渡す。
+//! `ActivateAudioInterfaceAsync` takes `activationparams` as
+//! `Option<*const windows_core::PROPVARIANT>`, so `AUDIOCLIENT_ACTIVATION_PARAMS` must be packed
+//! into a VT_BLOB PROPVARIANT. In windows-core 0.54, `PROPVARIANT::from_raw` takes the private
+//! `imp::PROPVARIANT` type, which cannot be named externally, and there is no public raw struct.
+//! Define a `#[repr(C)]` mirror [`RawPropVariant`] that exactly matches the SDK layout, then pass it
+//! to `from_raw` with `transmute`.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,49 +44,48 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 use crate::common::{capture_loop, init_loopback_capture, map_hr, wait_event_signaled, ComThread};
 use windows::core::PCWSTR;
 
-/// プロセスループバックのネイティブフォーマットは固定 `(48000, 2)`。
-/// プロセスループバックは `GetMixFormat` を使えないため、自前で WAVEFORMATEX を組む。
+/// Process loopback has a fixed native format of `(48000, 2)`.
+/// It cannot use `GetMixFormat`, so build the WAVEFORMATEX manually.
 const NATIVE_RATE: u32 = 48_000;
 const NATIVE_CHANNELS: u16 = 2;
 
-/// SDK の `PROPVARIANT` に厳密一致させた x64 24 バイトのミラー構造体。
+/// A 24-byte x64 mirror struct that exactly matches the SDK's `PROPVARIANT`.
 ///
-/// windows-core 0.54 は `PROPVARIANT::from_raw` の引数 `imp::PROPVARIANT` が private で
-/// 外から型名を書けないため、レイアウト一致のミラーを作り `transmute` で渡す。
+/// In windows-core 0.54, `PROPVARIANT::from_raw` takes a private `imp::PROPVARIANT` that cannot be
+/// named externally, so use a layout-matched mirror and pass it with `transmute`.
 ///
-/// レイアウトは実測した windows-core 0.54 の生 `PROPVARIANT_0_0` / `PROPVARIANT_0_0_0`
-/// と一致: `vt: u16` + `wReserved1/2/3: u16 ×3`（ここまで 8 バイトで value union 境界へ
-/// 整列）+ 16 バイトの value union。value union（`PROPVARIANT_0_0_0`）は `CAUB`/`BLOB`/
-/// `CAFILETIME` 等の「`u32` カウント + ポインタ」型を含むので x64 で 16 バイト、ゆえに
-/// PROPVARIANT 全体は 8+16 = 24 バイト。VT_BLOB の union 先頭は
-/// `BLOB { cbSize: u32, pBlobData: *mut u8 }`。x64 ではポインタ整列のため cbSize(offset 8)
-/// の後に 4 バイトパディングが入り、pBlobData は offset 16。
+/// The layout matches the measured raw `PROPVARIANT_0_0` / `PROPVARIANT_0_0_0` from windows-core
+/// 0.54: `vt: u16` + `wReserved1/2/3: u16 ×3` (8 bytes, aligned to the value union boundary) + a
+/// 16-byte value union. The union (`PROPVARIANT_0_0_0`) includes `CAUB` / `BLOB` / `CAFILETIME` and
+/// other “u32 count + pointer” types, so it is 16 bytes on x64. The whole PROPVARIANT is 8+16=24
+/// bytes. The VT_BLOB union starts with `BLOB { cbSize: u32, pBlobData: *mut u8 }`; x64 adds 4 bytes
+/// of padding after cbSize (offset 8) for pointer alignment, placing pBlobData at offset 16.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RawPropVariant {
-    /// VARENUM。VT_BLOB = 65。
+    /// VARENUM. VT_BLOB = 65.
     vt: u16,
     w_reserved1: u16,
     w_reserved2: u16,
     w_reserved3: u16,
-    /// BLOB.cbSize（バイト数）。offset 8。
+    /// BLOB.cbSize (byte count). Offset 8.
     blob_cb_size: u32,
-    /// x64 のポインタ整列パディング（cbSize:u32 → pBlobData:ptr は 8 バイト境界）。offset 12。
+    /// x64 pointer-alignment padding (`cbSize:u32` to `pBlobData:ptr` on an 8-byte boundary). Offset 12.
     _pad: u32,
-    /// BLOB.pBlobData（ブロブ実体への参照。コピーされないので生存させること）。offset 16。
+    /// BLOB.pBlobData (reference to blob data; keep it alive because it is not copied). Offset 16.
     blob_p_data: *mut u8,
 }
 
 const VT_BLOB_U16: u16 = 65;
 
-// レイアウト（24 バイト / 8 バイトアライン）を SDK PROPVARIANT と一致させていることを
-// コンパイル時に確認する。`PROPVARIANT` 自体のサイズとも突き合わせる（生 imp::PROPVARIANT
-// の薄ラッパなので同サイズのはず）。
+// Compile-time checks verify that the layout (24 bytes / 8-byte aligned) matches the SDK PROPVARIANT.
+// Also compare against the size of `PROPVARIANT` itself (a thin wrapper over raw imp::PROPVARIANT,
+// so it should have the same size).
 //
-// このミラーは 64bit ポインタ前提の 24 バイトレイアウト（value union が「u32 カウント +
-// ポインタ」型で 16 バイト）。32bit ターゲットではポインタが 4 バイトとなり PROPVARIANT の
-// サイズ/アライン/パディングが変わるので、その場合は以下の const assert がコンパイル不可に
-// なってビルド時に弾く。flexaudio の Windows サポートは 64bit のみ（x86_64 / aarch64）。
+// This mirror's 24-byte layout assumes 64-bit pointers (the value union's “u32 count + pointer”
+// type is 16 bytes). On 32-bit targets, 4-byte pointers change PROPVARIANT size/alignment/padding,
+// causing the const assertions below to fail at build time. flexaudio supports only 64-bit Windows
+// (x86_64 / aarch64).
 const _: () = {
     assert!(core::mem::size_of::<RawPropVariant>() == 24);
     assert!(core::mem::align_of::<RawPropVariant>() == 8);
@@ -96,25 +93,24 @@ const _: () = {
     assert!(core::mem::align_of::<PROPVARIANT>() == 8);
 };
 
-/// `AUDIOCLIENT_ACTIVATION_PARAMS` を指す VT_BLOB の `PROPVARIANT` を組む。
+/// Build a VT_BLOB `PROPVARIANT` pointing to `AUDIOCLIENT_ACTIVATION_PARAMS`.
 ///
-/// `params` は呼び出し元が `ActivateAudioInterfaceAsync` + 完了待ちまで生存させること
-/// （BLOB はコピーされず参照される）。
+/// The caller must keep `params` alive through `ActivateAudioInterfaceAsync` and completion waiting
+/// (the BLOB is referenced, not copied).
 ///
-/// 戻り値を [`ManuallyDrop`] で包むのはメモリ安全性のため。windows-core 0.54 の
-/// `PROPVARIANT` は `Drop` で `PropVariantClear` を呼び、VT_BLOB では `pBlobData` を
-/// `CoTaskMemFree` で解放しようとする。だが本関数の `pBlobData` は呼び出し元のスタック上の
-/// `params` を指す（COM 確保メモリではない）ので、素の `PROPVARIANT` を drop させると
-/// スタックポインタを free してヒープ破壊（STATUS_HEAP_CORRUPTION）になる。ミラーは BLOB
-/// ポインタを借用しているだけで自前のヒープ資源を持たないため、`Drop` を抑止して中身を
-/// leak させてもリークの実害は無い（params 本体は呼び出し元が所有・解放する）。
+/// Wrap the return value in [`ManuallyDrop`] for memory safety. windows-core 0.54's `PROPVARIANT`
+/// calls `PropVariantClear` on drop, which tries to free `pBlobData` with `CoTaskMemFree` for
+/// VT_BLOB. Here `pBlobData` points to the caller's stack `params` (not COM-allocated memory), so
+/// dropping a plain `PROPVARIANT` would free a stack pointer and corrupt the heap
+/// (STATUS_HEAP_CORRUPTION). The mirror only borrows the BLOB pointer and owns no heap resource, so
+/// suppressing `Drop` and leaking the wrapper is harmless; the caller owns and frees `params`.
 ///
 /// # Safety
-/// `params` は有効な `AUDIOCLIENT_ACTIVATION_PARAMS` を指し、戻り値の `PROPVARIANT` の
-/// 生存期間を通じて生きていること。
-// `transmute` の宛先型 `windows_core::imp::bindings::PROPVARIANT` は private で型名を書けず
-// `_` 推論にするしかないため、clippy::missing_transmute_annotations を満たせない。レイアウト
-// 一致は上の const assert で担保済みなので局所許可する。
+/// `params` must point to a valid `AUDIOCLIENT_ACTIVATION_PARAMS` and remain alive for the lifetime
+/// of the returned `PROPVARIANT`.
+// The `transmute` target type `windows_core::imp::bindings::PROPVARIANT` is private and cannot be
+// named, so it must be inferred as `_` and cannot satisfy clippy::missing_transmute_annotations.
+// The const assertions above guarantee the matching layout, so allow this locally.
 #[allow(clippy::missing_transmute_annotations)]
 unsafe fn make_blob_propvariant(
     params: *mut AUDIOCLIENT_ACTIVATION_PARAMS,
@@ -128,37 +124,36 @@ unsafe fn make_blob_propvariant(
         _pad: 0,
         blob_p_data: params as *mut u8,
     };
-    // from_raw の引数型 imp::PROPVARIANT は private で名前を書けないため、`_` 推論で
-    // transmute する（RawPropVariant とレイアウト一致を上の const assert で担保）。
+    // `from_raw`'s argument type imp::PROPVARIANT is private, so infer the `transmute` target as `_`;
+    // the const assertions above guarantee it matches RawPropVariant's layout.
     core::mem::ManuallyDrop::new(PROPVARIANT::from_raw(core::mem::transmute::<
         RawPropVariant,
         _,
     >(raw)))
 }
 
-/// `ActivateCompleted` で起動側スレッドへ完了を知らせるだけの完了ハンドラ。
+/// Completion handler that only notifies the initiating thread through `ActivateCompleted`.
 ///
-/// 結果（`IAudioClient`）の取り出しは起動側スレッドが `op.GetActivateResult` で行う
-/// （COM オブジェクトをスレッド跨ぎさせない）。本ハンドラは `SetEvent` だけなので
-/// 内部可変も不要（`&self` で足りる）。
+/// The initiating thread retrieves the result (`IAudioClient`) with `op.GetActivateResult`, keeping
+/// COM objects on one thread. This handler only calls `SetEvent`, so it needs no interior mutability
+/// and `&self` is sufficient.
 #[implement(IActivateAudioInterfaceCompletionHandler)]
 struct ActivationHandler {
-    /// 完了通知用イベント（手動リセット）。`ActivateCompleted` で `SetEvent`。
+    /// Manual-reset event for completion notification. `ActivateCompleted` calls `SetEvent`.
     done: HANDLE,
 }
 
-// windows-implement 0.53（windows 0.54 が引く版）の `#[implement]` は、`_Impl` サフィックス
-// のトレイトを元の構造体（ここでは `ActivationHandler`）に対して実装させる。生成される
-// `ActivationHandler_Impl` はラッパで、`this: ActivationHandler` を内包し Deref で元構造体の
-// フィールドへ到達するので、`self.done` で素直にアクセスできる。
+// In windows-implement 0.53 (used by windows 0.54), `#[implement]` implements the `_Impl`-suffixed
+// trait for the original struct (`ActivationHandler`). The generated `ActivationHandler_Impl` wrapper
+// contains `this: ActivationHandler` and dereferences to its fields, so `self.done` works directly.
 impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler {
     fn ActivateCompleted(
         &self,
         _operation: Option<&IActivateAudioInterfaceAsyncOperation>,
     ) -> windows::core::Result<()> {
-        // これは OS（WASAPI の activation 基盤）が呼ぶ FFI 境界コールバック。境界を越える
-        // panic は UB なので本体を catch_unwind で包む。現状は SetEvent だけで panic しないが、
-        // 将来の変更に備えた保険。
+        // The OS (WASAPI activation infrastructure) calls this FFI-boundary callback. A panic crossing
+        // the boundary is UB, so wrap the body in catch_unwind. It currently only calls SetEvent and
+        // cannot panic, but keep the guard for future changes.
         let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
             let _ = SetEvent(self.done);
         }));
@@ -166,32 +161,30 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler {
     }
 }
 
-/// プロセス別 loopback で特定 PID（そのツリー）の音声をキャプチャする
-/// [`CaptureBackend`]。
+/// [`CaptureBackend`] that captures audio for a PID and its process tree through process loopback.
 ///
-/// 専用スレッド上で COM を初期化し、`ActivateAudioInterfaceAsync`
-/// （`VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK` + VT_BLOB の
-/// `AUDIOCLIENT_ACTIVATION_PARAMS`）で `IAudioClient` を取得、固定 WAVEFORMATEX
-/// （48k/2ch/f32）で Initialize し、イベント駆動でパケットを [`RawSink::push`] へ流す。
+/// Initialize COM on a dedicated thread, get `IAudioClient` with `ActivateAudioInterfaceAsync`
+/// (`VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK` + VT_BLOB `AUDIOCLIENT_ACTIVATION_PARAMS`), initialize
+/// with a fixed WAVEFORMATEX (48k/2ch/f32), and send event-driven packets to [`RawSink::push`].
 ///
-/// この型は `Send`（保持するのは `target_pid` / `mode` / 停止フラグ /
-/// [`JoinHandle`] / 固定フォーマット。`!Send` な COM は専用スレッド内に閉じ込める）。
+/// This type is `Send` (it stores only `target_pid` / `mode` / stop flag / [`JoinHandle`] / fixed
+/// format). `!Send` COM objects remain on the dedicated thread.
 pub struct WasapiProcessBackend {
-    /// キャプチャ対象プロセスの PID。
+    /// PID of the process to capture.
     target_pid: u32,
-    /// 録音モード。[`ProcessMode::Include`] で INCLUDE（対象ツリーの音だけ）、
-    /// [`ProcessMode::Exclude`] で EXCLUDE（対象ツリー以外の全システム音）。
+    /// Capture mode. [`ProcessMode::Include`] captures only the target tree;
+    /// [`ProcessMode::Exclude`] captures all system audio except the target tree.
     mode: ProcessMode,
-    /// 起動中フラグ（二重 start ガード／停止指示／drop 判定）。`Send`。
+    /// Running flag (guards duplicate start, signals stop, and is checked on drop). `Send`.
     stop_flag: Arc<AtomicBool>,
-    /// COM/キャプチャを所有するスレッドのハンドル（start 後に `Some`）。
+    /// Handle for the thread that owns COM/capture (`Some` after start).
     handle: Option<JoinHandle<()>>,
-    /// 固定ネイティブフォーマット `(48000, 2)`。
+    /// Fixed native format `(48000, 2)`.
     native: (u32, u16),
 }
 
 impl WasapiProcessBackend {
-    /// 対象 PID と `mode` からバックエンドを構築する（この時点では接続しない）。
+    /// Build a backend from the target PID and `mode` (does not connect yet).
     pub fn new(target_pid: u32, mode: ProcessMode) -> Self {
         Self {
             target_pid,
@@ -202,12 +195,12 @@ impl WasapiProcessBackend {
         }
     }
 
-    /// キャプチャ対象の PID。
+    /// PID of the process to capture.
     pub fn target_pid(&self) -> u32 {
         self.target_pid
     }
 
-    /// 保持している録音モード（[`ProcessMode::Include`] / [`ProcessMode::Exclude`]）。
+    /// Capture mode ([`ProcessMode::Include`] / [`ProcessMode::Exclude`]).
     pub fn mode(&self) -> ProcessMode {
         self.mode
     }
@@ -270,8 +263,8 @@ impl Drop for WasapiProcessBackend {
     }
 }
 
-/// プロセス別 loopback 用の固定 WAVEFORMATEX（48000 / 2ch / f32）。
-/// プロセスループバックは `GetMixFormat` を使えないため自前で組む。
+/// Fixed WAVEFORMATEX for process loopback (48000 / 2ch / f32).
+/// Process loopback cannot use `GetMixFormat`, so build this manually.
 fn fixed_process_format() -> WAVEFORMATEX {
     WAVEFORMATEX {
         wFormatTag: WAVE_FORMAT_IEEE_FLOAT as u16, // = 3
@@ -284,9 +277,9 @@ fn fixed_process_format() -> WAVEFORMATEX {
     }
 }
 
-/// 所有スレッド本体。COM を初期化し、プロセスループバック activation で `IAudioClient`
-/// を取得して固定フォーマットでキャプチャループを回す。setup の成否を `ready_tx` で
-/// [`WasapiProcessBackend::start`] へ報告する。
+/// Owner thread body. Initialize COM, get `IAudioClient` through process-loopback activation, and
+/// run the capture loop with the fixed format. Report setup success or failure to
+/// [`WasapiProcessBackend::start`] over `ready_tx`.
 fn run_process_thread(
     target_pid: u32,
     mode: ProcessMode,
@@ -312,15 +305,15 @@ fn run_process_thread(
     unsafe { capture_loop(&client, &capture, event, channels, sink, &stop_flag) };
 }
 
-/// プロセスループバックをセットアップし、Initialize 済みの `IAudioClient` /
-/// `IAudioCaptureClient` / イベントハンドル / チャンネル数（固定 2）を返す。
+/// Set up process loopback and return the initialized `IAudioClient` / `IAudioCaptureClient` / event
+/// handle / channel count (fixed at 2).
 ///
-/// `mode` で INCLUDE（対象ツリーだけ）／EXCLUDE（対象ツリー以外の全システム音）を選ぶ。
-/// `system` モジュールの `exclude_self == true` 経路は、自ホスト PID を
-/// [`ProcessMode::Exclude`] で渡してこれを再利用する（だから `pub(crate)`）。
+/// Use `mode` to select INCLUDE (target tree only) or EXCLUDE (all system audio except the target
+/// tree). The `exclude_self == true` path in the `system` module reuses this with the calling
+/// process PID and [`ProcessMode::Exclude`], which is why this function is `pub(crate)`.
 ///
 /// # Safety
-/// 呼び出しスレッドで COM が初期化済みであること。
+/// COM must be initialized on the calling thread.
 #[allow(clippy::type_complexity)]
 pub(crate) unsafe fn setup_process_loopback(
     target_pid: u32,
@@ -331,10 +324,10 @@ pub(crate) unsafe fn setup_process_loopback(
     HANDLE,
     u16,
 )> {
-    // 列挙と同じ版チェック。反応的な E_NOTIMPL / E_NOINTERFACE の写しは残す。
+    // Same OS-version check as enumeration. Keep reactive mapping for E_NOTIMPL / E_NOINTERFACE.
     crate::version::ensure_process_loopback_supported()?;
 
-    // activation params を組む。mode で INCLUDE/EXCLUDE を切り替える。
+    // Build activation params. `mode` selects INCLUDE or EXCLUDE.
     let loopback_mode = match mode {
         ProcessMode::Include => PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
         ProcessMode::Exclude => PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
@@ -349,47 +342,46 @@ pub(crate) unsafe fn setup_process_loopback(
         },
     };
 
-    // VT_BLOB の PROPVARIANT を組む。params / prop は ActivateAudioInterfaceAsync +
-    // 完了待ち（GetActivateResult）まで生存させる（BLOB は参照）。`prop` が `ManuallyDrop`
-    // なのは、スタックの BLOB を `PropVariantClear` で free するとヒープ破壊になるため
-    // （`make_blob_propvariant` の doc 参照）。
+    // Build the VT_BLOB PROPVARIANT. Keep params / prop alive through ActivateAudioInterfaceAsync and
+    // completion (`GetActivateResult`), since the BLOB is referenced. `prop` is `ManuallyDrop` because
+    // freeing the stack BLOB with `PropVariantClear` would corrupt the heap (see `make_blob_propvariant` docs).
     let prop = make_blob_propvariant(&mut params as *mut _);
 
-    // 完了通知イベント（手動リセット=true / 初期非シグナル）。
+    // Completion notification event (manual reset=true / initially non-signaled).
     let done_event = CreateEventW(None, true, false, PCWSTR::null())
         .map_err(|e| map_hr("CreateEventW(activation done)", e))?;
 
-    // 完了ハンドラ（SetEvent するだけ）。WaitForSingleObject 完了まで drop しない
-    // （参照カウント生存）。
+    // Completion handler (only calls SetEvent). Keep it alive until WaitForSingleObject completes
+    // so its reference count remains valid.
     let handler: IActivateAudioInterfaceCompletionHandler =
         ActivationHandler { done: done_event }.into();
 
     let op: IActivateAudioInterfaceAsyncOperation = match ActivateAudioInterfaceAsync(
         VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
         &IAudioClient::IID,
-        // `&*prop` で ManuallyDrop を剥がして `&PROPVARIANT` → `*const PROPVARIANT`。
+        // Dereference ManuallyDrop with `&*prop`, converting `&PROPVARIANT` to `*const PROPVARIANT`.
         Some(&*prop as *const _),
         &handler,
     ) {
         Ok(op) => op,
         Err(e) => {
             let _ = CloseHandle(done_event);
-            // 古い OS（プロセスループバック非対応）は E_NOINTERFACE/E_NOTIMPL 等。
+            // Older OS versions without process loopback return E_NOINTERFACE/E_NOTIMPL, etc.
             return Err(map_process_activation_err("ActivateAudioInterfaceAsync", e));
         }
     };
 
-    // 完了を待つ（5 秒）。タイムアウトは Backend エラーに写す。
+    // Wait up to 5 seconds. Map a timeout to a Backend error.
     if !wait_event_signaled(done_event, 5000) {
         let _ = CloseHandle(done_event);
         return Err(Error::Backend(
             "process loopback activation timed out".into(),
         ));
     }
-    // 完了イベントはもう不要。params/prop/handler はこの関数末尾まで生存させる。
+    // The completion event is no longer needed. Keep params/prop/handler alive until this function ends.
     let _ = CloseHandle(done_event);
 
-    // activation 結果を取り出す（起動側スレッドで。COM をスレッド跨ぎさせない）。
+    // Retrieve the activation result on the initiating thread (keep COM objects on one thread).
     let mut hr = HRESULT(0);
     let mut unknown: Option<windows::core::IUnknown> = None;
     op.GetActivateResult(&mut hr, &mut unknown)
@@ -403,9 +395,9 @@ pub(crate) unsafe fn setup_process_loopback(
         .cast()
         .map_err(|e| map_hr("cast activated IUnknown to IAudioClient", e))?;
 
-    // 固定フォーマットで Initialize → event → capture。
-    // AUTOCONVERTPCM は公式 ApplicationLoopback サンプルと同じ旗（プロセスループバックは
-    // MixFormat を返さないので、要求形式への変換をエンジンに任せる）。
+    // Initialize with the fixed format, then set up the event and capture.
+    // AUTOCONVERTPCM matches the official ApplicationLoopback sample (process loopback provides no
+    // MixFormat, so let the engine convert to the requested format).
     let wfx = fixed_process_format();
     let (capture, event) = init_loopback_capture(
         &client,
@@ -413,23 +405,23 @@ pub(crate) unsafe fn setup_process_loopback(
         AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     )?;
 
-    // params/prop/handler/op をここまで生かしてから drop（BLOB 参照・ハンドラ生存）。
+    // Keep params/prop/handler/op alive until here before dropping them (BLOB reference and handler lifetime).
     drop(op);
     drop(handler);
-    // `prop` は `ManuallyDrop`。中身は BLOB ポインタ（params への借用）だけで自前資源を
-    // 持たないため、`PropVariantClear` を呼ばずに leak させてよい。これでスタックポインタの
-    // free（ヒープ破壊）を避ける。リークの実害は無い。
-    let _ = prop; // Initialize 完了まで prop を生存させるための明示 touch。
-    let _ = params; // params も Initialize 完了まで生かす。
+    // `prop` is `ManuallyDrop`. It only contains a BLOB pointer (borrowing params) and owns no resource,
+    // so it is safe to leak without calling `PropVariantClear`. This avoids freeing a stack pointer
+    // (heap corruption), and the leak has no practical impact.
+    let _ = prop; // Explicitly keep prop alive until Initialize completes.
+    let _ = params; // Keep params alive until Initialize completes too.
 
     Ok((client, capture, event, NATIVE_CHANNELS))
 }
 
-/// プロセスループバック activation 由来の HRESULT エラーを、古い OS（非対応）の場合は
-/// [`Error::UnsupportedOsVersion`] へ、それ以外は [`Error::Backend`] へ写す。
+/// Map HRESULT errors from process-loopback activation to [`Error::UnsupportedOsVersion`] on older
+/// (unsupported) OS versions, or [`Error::Backend`] otherwise.
 fn map_process_activation_err(ctx: &str, e: windows::core::Error) -> Error {
-    // E_NOTIMPL = 0x80004001 / E_NOINTERFACE = 0x80004002。プロセスループバック未対応
-    // OS（古い Windows 10 等）はこれらで弾かれることがある。
+    // E_NOTIMPL = 0x80004001 / E_NOINTERFACE = 0x80004002. OS versions without process loopback
+    // (such as older Windows 10 releases) may return these.
     const E_NOTIMPL: i32 = 0x80004001u32 as i32;
     const E_NOINTERFACE: i32 = 0x80004002u32 as i32;
     let code = e.code().0;
@@ -444,9 +436,9 @@ fn map_process_activation_err(ctx: &str, e: windows::core::Error) -> Error {
 mod tests {
     use super::*;
     use flexaudio_core::raw_ring;
-    // `ProcessMode` は親モジュールの `use` 経由で `super::*` から見える。
+    // `ProcessMode` is available through `super::*` via the parent module's `use`.
 
-    /// `new` + `native_format` は固定 `(48000, 2)` を返し panic しない。
+    /// `new` + `native_format` return fixed `(48000, 2)` without panicking.
     #[test]
     fn new_and_native_format_are_fixed() {
         let backend = WasapiProcessBackend::new(1234, ProcessMode::Include);
@@ -455,8 +447,8 @@ mod tests {
         assert_eq!(backend.mode(), ProcessMode::Include);
     }
 
-    /// PROPVARIANT ミラーが SDK レイアウト（24B/8 アライン）と一致すること（const assert
-    /// に加えランタイムでも確認）。
+    /// Check at runtime, in addition to the const assertions, that the PROPVARIANT mirror matches
+    /// the SDK layout (24 bytes / 8-byte aligned).
     #[test]
     fn raw_propvariant_layout_matches_sdk() {
         assert_eq!(core::mem::size_of::<RawPropVariant>(), 24);
@@ -464,11 +456,11 @@ mod tests {
         assert_eq!(core::mem::size_of::<PROPVARIANT>(), 24);
     }
 
-    /// `start` → `stop` がデバイス/対象 PID 有無を問わず panic しないこと。
-    /// 対象 PID が無効/非対応 OS では `Err` を許容（panic だけ不可）。
+    /// `start` → `stop` does not panic regardless of device or target PID availability.
+    /// `Err` is acceptable for an invalid target PID or unsupported OS; a panic is not.
     #[test]
     fn start_then_stop_tolerates_missing_target() {
-        // 存在しない PID。activation 自体は通り得るが Initialize/capture で失敗し得る。
+        // A nonexistent PID. Activation may succeed but Initialize/capture can fail.
         let mut backend = WasapiProcessBackend::new(0xFFFF_FFFE, ProcessMode::Include);
         let (rate, channels) = backend.native_format();
         let cap = (rate as usize * channels as usize).max(1);
@@ -480,7 +472,7 @@ mod tests {
                 backend.stop();
                 backend.stop();
             }
-            Err(_e) => { /* 非対応 OS / activation 失敗は許容 */ }
+            Err(_e) => { /* Unsupported OS / activation failure is allowed. */ }
         }
     }
 
@@ -499,7 +491,7 @@ mod tests {
 
         let mut backend = WasapiProcessBackend::new(pid, ProcessMode::Include);
         let (rate, channels) = backend.native_format();
-        let cap = rate as usize * channels as usize * 2; // 約 2 秒
+        let cap = rate as usize * channels as usize * 2; // About 2 seconds.
         let (prod, mut cons) = raw_ring(cap);
         let sink = RawSink::new(prod, rate, channels);
 

@@ -1,12 +1,12 @@
-//! macOS バックエンドの共通ヘルパ。PID→AudioObjectID 変換、`AudioObjectGetPropertyData`
-//! の薄いラッパ、ASBD から `(rate, channels)` と float 判定の読み取り、`OSStatus`→[`Error`]
-//! 変換、単調クロック。
+//! Shared helpers for the macOS backend: PID → AudioObjectID conversion, a thin wrapper around
+//! `AudioObjectGetPropertyData`, reading `(rate, channels)` and float status from ASBD, converting
+//! `OSStatus` to [`Error`], and a monotonic clock.
 //!
-//! [`MacSystemBackend`](crate::MacSystemBackend) と
-//! [`MacProcessBackend`](crate::MacProcessBackend) はどちらも [`tap`](crate::tap) の
-//! チェーン（process tap → aggregate device → IOProc）を回す。両者の違いは
-//! [`CATapDescription`] の作り方（INCLUDE = mixdown / EXCLUDE = global）だけなので、
-//! tap 生成から aggregate・IOProc・破棄までは共通にしてある。
+//! Both [`MacSystemBackend`](crate::MacSystemBackend) and
+//! [`MacProcessBackend`](crate::MacProcessBackend) run the [`tap`](crate::tap) chain (process tap
+//! → aggregate device → IOProc). They differ only in how they create [`CATapDescription`]
+//! (INCLUDE = mixdown / EXCLUDE = global), so tap creation, aggregation, IOProc, and teardown are
+//! shared.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -23,45 +23,47 @@ use objc2_core_audio::{
 use objc2_core_audio_types::{kAudioFormatFlagIsFloat, AudioStreamBasicDescription};
 use objc2_core_foundation::{CFRetained, CFString};
 
-/// CoreAudio の `OSStatus` 成功値 `noErr`。
+/// CoreAudio's `OSStatus` success value, `noErr`.
 pub(crate) const NO_ERR: i32 = 0;
 
-/// フォーマット取得に失敗したときのフォールバック `(48000, 2)`。
+/// Fallback `(48000, 2)` when format retrieval fails.
 pub(crate) const FALLBACK_FORMAT: (u32, u16) = (48_000, 2);
 
-/// 単調クロック（ns）。下流の `ClockNormalizer` が初回原点を取るので、ここは到着時刻の
-/// 単調近似で足りる。
+/// Monotonic clock (ns). The downstream `ClockNormalizer` establishes the initial origin, so a
+/// monotonic approximation of the arrival time is sufficient here.
 pub(crate) fn now_ns() -> i64 {
     monotonic_now_ns()
 }
 
-/// `OSStatus` を文脈文字列付きで [`Error`] へ変換する。
+/// Convert `OSStatus` to [`Error`] with context.
 ///
-/// 権限拒否系（`kAudioHardwareIllegalOperationError`。TCC で tap 作成が弾かれると来る）を
-/// [`Error::PermissionDenied`] へ、デバイス不在系（`kAudioHardwareBadDeviceError`）を
-/// [`Error::DeviceNotFound`] へ寄せ、他 OS と error 種別を揃える。確実な権限判定は初回
-/// キャプチャの OS プロンプトに委ねる方針（private TCC SPI 不使用）なので、ここは「拒否
-/// らしき」コードを最善努力でマップするだけ。それ以外は [`Error::Backend`]。
+/// Map permission-denial statuses (`kAudioHardwareIllegalOperationError`, returned when TCC
+/// rejects tap creation) to [`Error::PermissionDenied`], and missing-device statuses
+/// (`kAudioHardwareBadDeviceError`) to [`Error::DeviceNotFound`] to align error kinds across OSes.
+/// The first capture's OS prompt is the authoritative permission check (no private TCC SPI), so
+/// this only best-effort maps statuses that look like denials. Other statuses become
+/// [`Error::Backend`].
 pub(crate) fn map_os_status(ctx: &str, status: i32) -> Error {
-    // CoreAudio の代表的 OSStatus（4cc）。
+    // Representative CoreAudio OSStatus values (four-character codes).
     // 'who?' = kAudioHardwareUnknownPropertyError, '!obj' = kAudioHardwareBadObjectError,
     // 'nope' = kAudioHardwareIllegalOperationError, 'stop' = kAudioHardwareNotRunningError,
-    // '!dev' = kAudioHardwareBadDeviceError。
-    const ILLEGAL_OPERATION: i32 = 0x6e6f7065; // 'nope' — TCC 不許可時に来やすい
+    // '!dev' = kAudioHardwareBadDeviceError.
+    const ILLEGAL_OPERATION: i32 = 0x6e6f7065; // 'nope' — common when TCC denies access
     const NOT_RUNNING: i32 = 0x73746f70; // 'stop'
     const BAD_OBJECT: i32 = 0x216f626a; // '!obj'
-    const BAD_DEVICE: i32 = 0x21646576; // '!dev' — 指定デバイス不在/不正
+    const BAD_DEVICE: i32 = 0x21646576; // '!dev' — requested device is missing or invalid
 
     match status {
-        // 'nope'（不正操作）は権限未許可で tap/aggregate 生成が拒否されたときも来るので
-        // PermissionDenied に寄せる（OS プロンプト未承認時の典型）。
+        // 'nope' (illegal operation) can also mean tap/aggregate creation was denied due to
+        // missing permission, so map it to PermissionDenied (typical when the OS prompt is denied).
         ILLEGAL_OPERATION => Error::PermissionDenied,
-        // '!dev'（不正デバイス）は指定デバイス/エンドポイント不在に当たるので DeviceNotFound へ。
+        // '!dev' (invalid device) indicates the requested device or endpoint is missing, so map it
+        // to DeviceNotFound.
         BAD_DEVICE => Error::DeviceNotFound,
         NOT_RUNNING => Error::Backend(format!("{ctx}: CoreAudio not running (OSStatus 'stop')")),
         BAD_OBJECT => Error::Backend(format!("{ctx}: bad audio object (OSStatus '!obj')")),
         other => {
-            // 4cc を可読化（印字可能 ASCII なら4文字、そうでなければ10進）。
+            // Make the four-character code readable (four printable ASCII characters, or decimal).
             let be = (other as u32).to_be_bytes();
             if be.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
                 Error::Backend(format!(
@@ -75,7 +77,7 @@ pub(crate) fn map_os_status(ctx: &str, status: i32) -> Error {
     }
 }
 
-/// プロパティアドレスを scope / main element 指定で作る。
+/// Create a property address with the given scope and main element.
 fn property_address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress {
         mSelector: selector,
@@ -84,16 +86,16 @@ fn property_address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
     }
 }
 
-/// global scope / main element のプロパティアドレスを作る。
+/// Create a property address for global scope and the main element.
 fn global_address(selector: u32) -> AudioObjectPropertyAddress {
     property_address(selector, kAudioObjectPropertyScopeGlobal)
 }
 
-/// CFString 型プロパティ（デバイス名 / UID / プロセスの bundle ID）を読んで `String`
-/// にする。取得できなければ `None`。
+/// Read a CFString property (device name / UID / process bundle ID) as a `String`. Returns `None`
+/// if it cannot be read.
 ///
-/// これらのプロパティは `CFStringRef` を +1 retain で返す（CF の Copy 規約）。
-/// `CFRetained::from_raw` で所有権を受け取り、drop で release する。
+/// These properties return a `CFStringRef` with +1 retain (the CF Copy rule). Take ownership with
+/// `CFRetained::from_raw` and release it on drop.
 pub(crate) fn read_cfstring_property(
     object: AudioObjectID,
     selector: u32,
@@ -102,7 +104,7 @@ pub(crate) fn read_cfstring_property(
     let addr = property_address(selector, scope);
     let mut cf_ref: *const CFString = core::ptr::null();
     let mut size = core::mem::size_of::<*const CFString>() as u32;
-    // SAFETY: addr/size は有効なローカル。out は CFStringRef 1 個ぶんのポインタ領域。
+    // SAFETY: `addr`/`size` are valid locals. `out` points to storage for one CFStringRef.
     let status = unsafe {
         AudioObjectGetPropertyData(
             object,
@@ -116,23 +118,24 @@ pub(crate) fn read_cfstring_property(
     if status != NO_ERR || cf_ref.is_null() {
         return None;
     }
-    // SAFETY: cf_ref は OS が +1 retain して返した有効な CFString。from_raw で所有権を取り、
-    // この関数を抜けるときに drop が release する。
+    // SAFETY: `cf_ref` is a valid CFString returned by the OS with +1 retain. `from_raw` takes
+    // ownership, and drop releases it when this function exits.
     let cf = unsafe { CFRetained::from_raw(NonNull::new_unchecked(cf_ref as *mut CFString)) };
     Some(cf.to_string())
 }
 
-/// PID を `AudioObjectID`（プロセスオブジェクト）へ変換する。
+/// Convert a PID to an `AudioObjectID` (process object).
 ///
-/// system object に `kAudioHardwarePropertyTranslatePIDToProcessObject` を、qualifier に
-/// `pid`(i32) を渡して問い合わせる。`Ok(0)` はそのプロセスが無音/不在で対応するオーディオ
-/// オブジェクトが無いという意味（呼び出し側が [`Error::DeviceNotFound`] 等に解釈する）。
+/// Query the system object with `kAudioHardwarePropertyTranslatePIDToProcessObject` and pass
+/// `pid` (i32) as the qualifier. `Ok(0)` means the process is silent or absent and has no
+/// corresponding audio object (the caller interprets this as [`Error::DeviceNotFound`] or similar).
 pub(crate) fn translate_pid_to_object(pid: i32) -> Result<AudioObjectID, Error> {
     let address = global_address(kAudioHardwarePropertyTranslatePIDToProcessObject);
     let mut out_object: AudioObjectID = 0;
     let mut size = core::mem::size_of::<AudioObjectID>() as u32;
 
-    // SAFETY: address/size/out は有効なローカル。qualifier は pid(i32) への有効ポインタ。
+    // SAFETY: `address`/`size`/`out` are valid locals. The qualifier is a valid pointer to `pid`
+    // (i32).
     let status = unsafe {
         AudioObjectGetPropertyData(
             kAudioObjectSystemObject as AudioObjectID,
@@ -152,17 +155,17 @@ pub(crate) fn translate_pid_to_object(pid: i32) -> Result<AudioObjectID, Error> 
     Ok(out_object)
 }
 
-/// system object の「`AudioObjectID` の配列」型プロパティを読む
-/// （`kAudioHardwarePropertyDevices` のデバイス一覧、`kAudioHardwarePropertyProcessObjectList`
-/// のプロセスオブジェクト一覧など）。
+/// Read an array-valued `AudioObjectID` property from the system object (for example, the device
+/// list from `kAudioHardwarePropertyDevices` or process objects from
+/// `kAudioHardwarePropertyProcessObjectList`).
 ///
-/// size 照会と data 読みのあいだに一覧の大きさが変わると
-/// `kAudioHardwareBadPropertySizeError` になり得るので、一時的な失敗は数回読み直す。
-/// `GetPropertyData` に渡す大きさは要素数 × 要素の大きさ（確保したバッファちょうどの
-/// バイト数）。
+/// If the list changes size between the size query and data read, it may return
+/// `kAudioHardwareBadPropertySizeError`, so retry transient failures a few times. Pass the exact
+/// allocated buffer size to `GetPropertyData`: element count × element size in bytes.
 ///
-/// 失敗時は生の `OSStatus` を返す。空扱いにするか [`map_os_status`] で型付きエラーにするかは
-/// 呼び出し側が決める（デバイス列挙は空扱い、プロセス列挙は型付きエラー）。
+/// On failure, return the raw `OSStatus`. The caller decides whether to treat it as empty or
+/// convert it to a typed error with [`map_os_status`] (device enumeration treats it as empty;
+/// process enumeration returns a typed error).
 pub(crate) fn read_system_object_list(selector: u32) -> Result<Vec<AudioObjectID>, i32> {
     const MAX_ATTEMPTS: u32 = 4;
     let mut last_status = NO_ERR;
@@ -181,7 +184,7 @@ pub(crate) fn read_system_object_list(selector: u32) -> Result<Vec<AudioObjectID
 fn read_system_object_list_once(selector: u32) -> Result<Vec<AudioObjectID>, i32> {
     let address = global_address(selector);
     let mut size: u32 = 0;
-    // SAFETY: address/size は有効なローカル。qualifier 不要（null/0）。
+    // SAFETY: `address`/`size` are valid locals. No qualifier is needed (null/0).
     let status = unsafe {
         AudioObjectGetPropertyDataSize(
             kAudioObjectSystemObject as AudioObjectID,
@@ -201,7 +204,7 @@ fn read_system_object_list_once(selector: u32) -> Result<Vec<AudioObjectID>, i32
     }
     let mut ids: Vec<AudioObjectID> = vec![0; count];
     let mut data_size = (count * elem) as u32;
-    // SAFETY: ids は count 要素ぶん確保済み。data_size は要素数×要素の大きさ。
+    // SAFETY: `ids` has space for `count` elements. `data_size` is element count × element size.
     let status = unsafe {
         AudioObjectGetPropertyData(
             kAudioObjectSystemObject as AudioObjectID,
@@ -215,24 +218,24 @@ fn read_system_object_list_once(selector: u32) -> Result<Vec<AudioObjectID>, i32
     if status != NO_ERR {
         return Err(status);
     }
-    // 実際に書かれた要素数に詰める（2 回の呼び出しの間に一覧が縮むことがある）。
+    // Truncate to the number of elements actually written (the list may shrink between calls).
     ids.truncate(data_size as usize / elem);
     Ok(ids)
 }
 
-/// tap の `kAudioTapPropertyFormat`（ASBD）を読む。
+/// Read the tap's `kAudioTapPropertyFormat` (ASBD).
 ///
-/// 取得できなければ `None`（呼び出し側がフォールバックを使う）。rate/channels と
-/// `mFormatFlags`（float 判定）の両方をここから読む。
+/// Returns `None` if unavailable (the caller uses a fallback). Read both rate/channels and
+/// `mFormatFlags` (for float detection) here.
 fn read_tap_asbd(tap_id: AudioObjectID) -> Option<AudioStreamBasicDescription> {
     let address = global_address(kAudioTapPropertyFormat);
-    // ASBD には Default が無いので、ゼロ初期化してから OS に埋めさせる。
-    // SAFETY: AudioStreamBasicDescription は数値フィールドだけの `#[repr(C)]` POD なので
-    // ゼロ初期化が有効な値になる。
+    // ASBD has no Default, so zero-initialize it and let the OS fill it in.
+    // SAFETY: AudioStreamBasicDescription is a `#[repr(C)]` POD with only numeric fields, so zero
+    // initialization is valid.
     let mut asbd: AudioStreamBasicDescription = unsafe { core::mem::zeroed() };
     let mut size = core::mem::size_of::<AudioStreamBasicDescription>() as u32;
 
-    // SAFETY: address/size/asbd は有効なローカル。qualifier 不要（null/0）。
+    // SAFETY: `address`/`size`/`asbd` are valid locals. No qualifier is needed (null/0).
     let status = unsafe {
         AudioObjectGetPropertyData(
             tap_id,
@@ -251,7 +254,7 @@ fn read_tap_asbd(tap_id: AudioObjectID) -> Option<AudioStreamBasicDescription> {
     Some(asbd)
 }
 
-/// tap の ASBD から `(sample_rate, channels)` を読む。取得できなければ `None`。
+/// Read `(sample_rate, channels)` from the tap's ASBD. Returns `None` if unavailable.
 pub(crate) fn tap_native_format(tap_id: AudioObjectID) -> Option<(u32, u16)> {
     let asbd = read_tap_asbd(tap_id)?;
     let rate = asbd.mSampleRate as u32;
@@ -262,16 +265,17 @@ pub(crate) fn tap_native_format(tap_id: AudioObjectID) -> Option<(u32, u16)> {
     Some((rate, channels))
 }
 
-/// tap の ASBD が float サンプル（`kAudioFormatFlagIsFloat`）かどうかを調べる。
+/// Check whether the tap's ASBD indicates float samples (`kAudioFormatFlagIsFloat`).
 ///
-/// IOProc は `mData as *const f32` でサンプルをそのまま f32 として読むので、tap が非 float
-/// （int PCM 等）だと UB になり得る。build 時にこれを呼び、非 float と確定したときだけ弾く。
-/// ASBD を取得できなかった（`None`）ときは判定不能なので、呼び出し側はフォールバック挙動
-/// （float 決め打ち）を続ける。実機の tap は常に float なので取得不能で弾く必要は無い。
+/// The IOProc reads samples directly as f32 via `mData as *const f32`, so a non-float tap (such
+/// as int PCM) could cause UB. Call this during build and reject only when non-float is confirmed.
+/// If the ASBD cannot be read (`None`), the format is unknown, so the caller continues with its
+/// fallback behavior (assume float). Real hardware taps are always float, so an unavailable ASBD
+/// does not need to cause rejection.
 ///
-/// - `Some(true)`  : float ビットが立っている。
-/// - `Some(false)` : float ビットが無い（非 float なので弾くべき）。
-/// - `None`        : ASBD を取得できず判定不能。
+/// - `Some(true)`: float bit is set.
+/// - `Some(false)`: float bit is absent (reject as non-float).
+/// - `None`: ASBD could not be read, so the format is unknown.
 pub(crate) fn tap_format_is_float(tap_id: AudioObjectID) -> Option<bool> {
     let asbd = read_tap_asbd(tap_id)?;
     Some((asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0)
@@ -281,25 +285,25 @@ pub(crate) fn tap_format_is_float(tap_id: AudioObjectID) -> Option<bool> {
 mod tests {
     use super::*;
 
-    /// `map_os_status` が代表コードを期待どおり変換すること。
+    /// `map_os_status` converts representative codes as expected.
     #[test]
     fn map_os_status_maps_known_codes() {
         assert!(matches!(
             map_os_status("x", 0x6e6f7065),
             Error::PermissionDenied
         ));
-        // '!dev'（不正デバイス）は DeviceNotFound。
+        // '!dev' (invalid device) maps to DeviceNotFound.
         assert!(matches!(
             map_os_status("x", 0x21646576),
             Error::DeviceNotFound
         ));
         assert!(matches!(map_os_status("x", 0x73746f70), Error::Backend(_)));
-        // 4cc 可読化（印字可能 ASCII）。
+        // Four-character-code formatting (printable ASCII).
         let e = map_os_status("ctx", i32::from_be_bytes(*b"abcd"));
         assert!(format!("{e}").contains("abcd"));
     }
 
-    /// フォールバックフォーマットは契約どおり `(48000, 2)`。
+    /// The fallback format is `(48000, 2)` as specified by the contract.
     #[test]
     fn fallback_format_is_48k_stereo() {
         assert_eq!(FALLBACK_FORMAT, (48_000, 2));

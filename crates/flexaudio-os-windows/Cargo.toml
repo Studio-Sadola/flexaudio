@@ -12,14 +12,14 @@ keywords = ["audio", "wasapi", "loopback", "capture", "windows"]
 categories = ["multimedia::audio", "os::windows-apis"]
 documentation = "https://docs.rs/flexaudio-os-windows"
 
-# Windows 専用クレート。バックエンド本体は `#[cfg(target_os = "windows")]` で空コンパイルに
-# なり、windows 依存も以下の target 限定セクションでしか引かれない。ビルド番号の純粋関数
-# だけは非 Windows でもコンパイルする。
+# Windows-only crate. The backend compiles to an empty module under `#[cfg(target_os = "windows")]`
+# on other platforms, and the windows dependency is included only by the target-specific section below.
+# Pure functions for build-number handling still compile on non-Windows platforms.
 [target.'cfg(target_os = "windows")'.dependencies]
 flexaudio-core = { path = "../flexaudio-core", version = "0.3.0" }
 
-# windows は cpal（flexaudio-mic 経由）と版を揃えるため =0.54.0 にピン。
-# feature は WASAPI / process loopback / COM / PROPVARIANT 周りを手で列挙する。
+# Pin windows to =0.54.0 to match cpal (through flexaudio-mic).
+# List the features needed for WASAPI / process loopback / COM / PROPVARIANT explicitly.
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "=0.54.0"
 features = [
@@ -29,14 +29,14 @@ features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Threading",
-    # RtlGetVersion（互換モードで偽られない実ビルド番号）と OSVERSIONINFOW。
+    # RtlGetVersion (actual build number, not masked by compatibility mode) and OSVERSIONINFOW.
     "Win32_System_SystemInformation",
     "Wdk_System_SystemServices",
     "Win32_System_Variant",
     "Win32_Media_Audio",
     "Win32_Media_KernelStreaming",
     "Win32_Media_Multimedia",
-    # 出力エンドポイント列挙: プロパティストアと FriendlyName キー。
+    # Enumerating output endpoints: property store and FriendlyName key.
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Devices_FunctionDiscovery",
 ]

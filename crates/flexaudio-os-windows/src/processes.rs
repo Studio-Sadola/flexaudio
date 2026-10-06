@@ -1,19 +1,19 @@
-//! 録れるプロセスの列挙（[`list_processes`]）— WASAPI の音声セッションから。
+//! Enumerate recordable processes ([`list_processes`]) from WASAPI audio sessions.
 //!
-//! 有効な全 render エンドポイントについて
+//! For every active render endpoint,
 //! `IMMDevice::Activate(IAudioSessionManager2)` → `GetSessionEnumerator` →
-//! 各 `IAudioSessionControl2` の `GetProcessId` / `GetState` を読み、音声セッションを
-//! 持つプロセスを返す。システム音セッション（`IsSystemSoundsSession == S_OK`）・
-//! 期限切れセッション・PID 0 は除く。
+//! read `GetProcessId` / `GetState` from each `IAudioSessionControl2` and return processes with
+//! audio sessions. Exclude system sound sessions (`IsSystemSoundsSession == S_OK`), expired sessions,
+//! and PID 0.
 //!
-//! 返すのは「見つけたまま」の生リスト（同じ PID が複数エンドポイント／複数セッションで
-//! 重複し得る）で、重複統合・自プロセス除外・並べ替えは facade
-//! （`flexaudio_core::process_list::normalize_process_list`）が行う。
+//! Return the raw list as found (a PID may appear across endpoints or sessions). The facade
+//! (`flexaudio_core::process_list::normalize_process_list`) merges duplicates, excludes the current
+//! process, and sorts the results.
 //!
-//! 読み取り専用で、音声を開かない（`IAudioClient` を Initialize しない）ので、
-//! マイクのプライバシー設定などの権限プロンプトは出ない。プロセス名は
-//! `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `QueryFullProcessImageNameW` で取り、
-//! 開けないプロセス（保護プロセス等）は名前なしで返す（facade が `pid <N>` を補う）。
+//! This is read-only and does not open audio (it does not initialize `IAudioClient`), so it does not
+//! trigger permission prompts such as microphone privacy prompts. Read process names with
+//! `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` and `QueryFullProcessImageNameW`. Return no name
+//! for processes that cannot be opened (such as protected processes); the facade supplies `pid <N>`.
 
 use flexaudio_core::process_list::executable_basename;
 use flexaudio_core::types::{Error, ProcessInfo, Result};
@@ -31,29 +31,28 @@ use windows::Win32::System::Threading::{
 
 use crate::common::{map_hr, ComThread};
 
-/// `QueryFullProcessImageNameW` のバッファ長（UTF-16 単位）。長いパス（`\\?\` 付き）でも
-/// 収まる上限 32767 文字 + NUL。
+/// `QueryFullProcessImageNameW` buffer length in UTF-16 units: the 32767-character limit plus NUL,
+/// enough for long paths with the `\\?\` prefix.
 const IMAGE_PATH_CAPACITY: usize = 32_768;
 
-/// 1 セッションから読んだ生の値。
+/// Raw values read from one session.
 struct SessionRecord {
     pid: u32,
-    /// `Some(true)`=Active / `Some(false)`=Inactive / `None`=状態を読めなかった。
+    /// `Some(true)`=Active / `Some(false)`=Inactive / `None`=state could not be read.
     active: Option<bool>,
 }
 
-/// 音声セッションを持つプロセスを列挙する（生リスト）。
+/// Enumerate processes with audio sessions (raw list).
 ///
-/// プロセスループバックに要る OS の版（build 20348 以上）を先に確かめ、未満なら
-/// [`Error::UnsupportedOsVersion`]（録音側と同じ関数）。render エンドポイントが
-/// 1 つも無ければ `Ok(空)`。エンドポイントはあるのにどれからもセッションマネージャを
-/// 取れなかったときは、最後の失敗を型付き [`Error`] で返す
-/// （例: アクセス拒否 → [`Error::PermissionDenied`]）。
+/// Check first that the OS supports process loopback (build 20348 or later); otherwise return
+/// [`Error::UnsupportedOsVersion`] using the same function as capture. Return `Ok(empty)` if there
+/// are no render endpoints. If endpoints exist but none provide a session manager, return the last
+/// failure as a typed [`Error`] (for example, access denied becomes [`Error::PermissionDenied`]).
 pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     crate::version::ensure_process_loopback_supported()?;
     let _com = ComThread::new();
-    // SAFETY: この関数内で COM を初期化済み（ComThread）。COM インターフェイスはこの関数内
-    // （同一スレッド）でだけ使い、スレッド境界を跨がない。
+    // SAFETY: COM is initialized in this function (ComThread). COM interfaces are used only here,
+    // on the same thread, and never cross a thread boundary.
     let sessions = unsafe { collect_sessions()? };
 
     let mut image_buffer = vec![0u16; IMAGE_PATH_CAPACITY];
@@ -72,10 +71,10 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     Ok(out)
 }
 
-/// 全 render エンドポイントのセッションを集める。
+/// Collect sessions from all render endpoints.
 ///
 /// # Safety
-/// 呼び出しスレッドで COM が初期化済みであること。
+/// COM must be initialized on the calling thread.
 unsafe fn collect_sessions() -> Result<Vec<SessionRecord>> {
     let enumerator: IMMDeviceEnumerator =
         CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
@@ -129,19 +128,19 @@ unsafe fn collect_sessions() -> Result<Vec<SessionRecord>> {
     Ok(sessions)
 }
 
-/// 1 セッションを読む。システム音・期限切れ・PID 0・読めないセッションは `None`。
+/// Read one session. Return `None` for system sounds, expired sessions, PID 0, or unreadable sessions.
 ///
 /// # Safety
-/// 呼び出しスレッドで COM が初期化済みであること。`session_list` は有効。
+/// COM must be initialized on the calling thread. `session_list` must be valid.
 unsafe fn read_session(
     session_list: &windows::Win32::Media::Audio::IAudioSessionEnumerator,
     session_index: i32,
 ) -> Option<SessionRecord> {
     let control = session_list.GetSession(session_index).ok()?;
     let control2: IAudioSessionControl2 = control.cast().ok()?;
-    // windows 0.54 の `IsSystemSoundsSession` は `HRESULT` を返す（`Result<()>` ではない）。
-    // S_OK = システム音セッション（通知音など・特定アプリではない）。S_FALSE (1) = 通常。
-    // S_FALSE も成功扱い（HRESULT >= 0）なので `Result<()>` に包むと区別が消える。
+    // In windows 0.54, `IsSystemSoundsSession` returns `HRESULT` (not `Result<()>`).
+    // S_OK means a system sound session (such as a notification), not a specific app; S_FALSE (1) is normal.
+    // S_FALSE is also considered success (HRESULT >= 0), so wrapping it in `Result<()>` loses the distinction.
     if control2.IsSystemSoundsSession() == S_OK {
         return None;
     }
@@ -159,10 +158,10 @@ unsafe fn read_session(
     })
 }
 
-/// PID のイメージパス（Win32 形式）。開けない／読めないときは `None`。
+/// Get the PID's image path in Win32 format. Return `None` if it cannot be opened or read.
 fn process_image_path(pid: u32, buffer: &mut [u16]) -> Option<String> {
-    // SAFETY: OpenProcess の戻りハンドルは必ず CloseHandle する。buffer は呼び出し元が
-    // 所有する書き込み可能領域で、size はその UTF-16 要素数（戻りで実長に更新される）。
+    // SAFETY: Always close the handle returned by OpenProcess. The caller owns `buffer`, which is
+    // writable; `size` is its length in UTF-16 units and is updated with the actual length on return.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut size = buffer.len() as u32;
@@ -184,7 +183,7 @@ fn process_image_path(pid: u32, buffer: &mut [u16]) -> Option<String> {
     }
 }
 
-/// 実行ファイル名から表示名を作る（末尾の `.exe` を大小無視で落とす）。
+/// Create a display name from the executable name, ignoring a trailing `.exe` case-insensitively.
 fn display_stem(executable: &str) -> String {
     let lower = executable.to_ascii_lowercase();
     match lower.strip_suffix(".exe") {
@@ -205,7 +204,7 @@ mod tests {
         assert_eq!(display_stem(".exe"), ".exe");
     }
 
-    /// 実機での列挙は panic せず、返ったエントリは pid 非 0。
+    /// Enumeration on real hardware does not panic, and returned entries have nonzero PIDs.
     #[test]
     fn list_processes_does_not_panic() {
         if let Ok(list) = list_processes() {
@@ -216,7 +215,7 @@ mod tests {
         }
     }
 
-    /// 自プロセスの PID を読めること（名前解決経路の実機確認）。
+    /// The current process PID can be read (real-hardware check of the name-resolution path).
     #[test]
     fn own_image_path_is_readable() {
         let mut buffer = vec![0u16; IMAGE_PATH_CAPACITY];

@@ -1,15 +1,15 @@
-// flexaudio-napi シームレス・ソース切替の実音 end-to-end 手動検証（実機 / PipeWire 必須）。
+// Manual real-audio end-to-end check for seamless source switching in flexaudio-napi (requires real hardware and PipeWire).
 //
-// openStream で開いた単一ストリームに対し switchSource を呼び、mic → system →
-// process とソースをホットスワップしても 1 本の連続コールバックストリームのまま
-// 録れることを確かめる。CI 不可（実音・再生プロセス要）＝手動実行用。
+// Call switchSource on a single stream opened with openStream. Verify that hot-swapping sources
+// from mic → system → process still records through one continuous callback stream.
+// This cannot run in CI (requires real audio and a playback process); run it manually.
 //
-// 使い方:
-//   # 既知振幅のサインを鳴らすプロセスを用意し PID を控える（例 pw-cat にサインをパイプ）
+// Usage:
+//   # Start a process that plays a sine wave at a known amplitude and note its PID (for example, pipe a sine wave to pw-cat).
 //   TARGET_PID=<pid> node realswitch.mjs
 //
-// 期待: t=0,1s（mic 区間）はマイク入力で peak が高め、t>=2s（system→process 区間）は
-// 再生中サインの振幅（例 0.3）に揃う。切替は単一ストリーム内で透過。
+// Expected: at t=0–1s (mic interval), peak is higher from microphone input. At t>=2s
+// (system → process interval), it matches the playing sine amplitude (for example, 0.3). Switching is seamless within the single stream.
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const flex = require('./flexaudio.node');

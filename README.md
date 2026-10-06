@@ -1,6 +1,6 @@
 # flexaudio
 
-**English** | [日本語](README.ja.md)
+**English** | [Japanese](README.ja.md)
 
 **General-purpose, flexible, cross-platform audio capture for Rust.**
 

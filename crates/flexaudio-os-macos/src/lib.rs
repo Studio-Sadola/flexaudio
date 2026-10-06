@@ -1,27 +1,28 @@
-//! flexaudio-os-macos — macOS バックエンド。Core Audio Process Taps
-//! (objc2-core-audio, macOS 14.4+) を使う。
+//! flexaudio-os-macos — macOS backend using Core Audio Process Taps
+//! (objc2-core-audio, macOS 14.4+).
 //!
-//! システム音声出力全体（[`MacSystemBackend`]）と特定プロセス（[`MacProcessBackend`]）を
-//! Process Tap で録る。Windows の WASAPI loopback / Linux の PipeWire monitor に相当する。
+//! Captures all system audio output ([`MacSystemBackend`]) or a specific process
+//! ([`MacProcessBackend`]) with Process Tap. Equivalent to Windows WASAPI loopback / Linux PipeWire
+//! monitor.
 //!
-//! # アーキテクチャ
-//! tap チェーン（`CATapDescription` → process tap → private aggregate device →
-//! IOProc block → start）は [`tap`] モジュールにまとめてあり、両バックエンドは
-//! INCLUDE/EXCLUDE の `TapKind` を切り替えて同じチェーンを回す。`!Send` な ObjC オブジェクト
-//! （`Retained<CATapDescription>` / `RcBlock` / `TapChain`）はバックエンドの専用スレッド内に
-//! 閉じ込め、`Send` な本体（停止フラグ・`JoinHandle`・フォーマット）だけがスレッドを跨ぐ
-//! （cpal / Windows / Linux バックエンドと同じ作り）。
+//! # Architecture
+//! The tap chain (`CATapDescription` → process tap → private aggregate device → IOProc block →
+//! start) lives in the [`tap`] module. Both backends use the same chain, switching the `TapKind`
+//! between INCLUDE and EXCLUDE. `!Send` ObjC objects (`Retained<CATapDescription>` / `RcBlock` /
+//! `TapChain`) stay on the backend's dedicated thread; only the `Send` state (stop flag,
+//! `JoinHandle`, and format) crosses threads (the same design as the cpal / Windows / Linux backends).
 //!
-//! # 権限（TCC）
-//! システム/プロセス音声キャプチャは TCC の `kTCCServiceAudioCapture` を要求する
-//! （Info.plist の `NSAudioCaptureUsageDescription`）。private TCC SPI は使わず、権限の可否は
-//! 初回キャプチャ時の OS プロンプトに委ねる。tap 作成が未承認で弾かれた場合は
-//! [`map_os_status`](common::map_os_status) が権限拒否系 OSStatus を
-//! [`Error::PermissionDenied`](flexaudio_core::types::Error) へ寄せる。
+//! # Permissions (TCC)
+//! System/process audio capture requires TCC's `kTCCServiceAudioCapture`
+//! (`NSAudioCaptureUsageDescription` in Info.plist). We do not use private TCC SPI; the OS prompt
+//! on first capture determines permission. If tap creation is rejected because permission has not
+//! been granted, [`map_os_status`](common::map_os_status) maps the permission-related OSStatus to
+//! [`Error::PermissionDenied`](flexaudio_core::types::Error).
 //!
-//! # 非 macOS
-//! macOS 専用。`#![cfg(target_os = "macos")]` で非 macOS では空コンパイルになり、objc2 系依存も
-//! `Cargo.toml` の `target.'cfg(...macos)'` セクションでのみ引かれる（Linux/Windows ビルドは無傷）。
+//! # Non-macOS
+//! macOS only. `#![cfg(target_os = "macos")]` makes this compile as an empty crate on other
+//! platforms, and objc2 dependencies are included only in the `target.'cfg(...macos)'` section of
+//! `Cargo.toml` (Linux/Windows builds are unaffected).
 
 #![cfg(target_os = "macos")]
 #![warn(missing_docs)]

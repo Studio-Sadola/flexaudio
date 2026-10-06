@@ -1,62 +1,62 @@
-//! 共有型: 内部正規形の定数 / [`AudioChunk`] / [`ChunkFlags`] / [`SourceKind`] /
-//! [`OutputFormat`] / [`StreamConfig`] / [`Event`] / [`Error`]。
+//! Shared types: internal canonical-form constants / [`AudioChunk`] / [`ChunkFlags`] / [`SourceKind`] /
+//! [`OutputFormat`] / [`StreamConfig`] / [`Event`] / [`Error`].
 //!
-//! 内部正規形は interleaved `f32` / 48000 Hz / ステレオ 2ch / 20ms = 960
-//! frames per chunk。
+//! The internal canonical form is interleaved `f32` / 48000 Hz / stereo, 2 channels / 20 ms = 960
+//! frames per chunk.
 //!
-//! 出力フォーマットは [`OutputFormat`] で指定する（既定 `{48000, 2}`）。
-//! Normalizer 第 2 段が内部正規形からそのレート/チャンネルへ再変換する。出力
-//! チャンクは時間ベースで 20ms なので、レートに応じて [`AudioChunk::frames`] が
-//! 変わる（48k=960 / 16k=320 / 8k=160）。既定 `{48000, 2}` のときは第 2 段が
-//! パススルーになり、内部正規形がそのまま出力される。
+//! Specify the output format with [`OutputFormat`] (default `{48000, 2}`).
+//! Normalizer stage 2 converts from the internal canonical form to that rate and channel count. Since output
+//! chunks are time-based at 20 ms, [`AudioChunk::frames`] varies with the rate
+//! (48k=960 / 16k=320 / 8k=160). With the default `{48000, 2}`, stage 2 is
+//! a pass-through and emits the internal canonical form unchanged.
 
 use bitflags::bitflags;
 
-/// 内部正規形のサンプルレート（Hz）。全ストリームは一旦このレートへ正規化される。
+/// Sample rate (Hz) of the internal canonical form. All streams are normalized to this rate first.
 pub const SAMPLE_RATE: u32 = 48_000;
 
-/// 内部正規形のチャンネル数。常にステレオ（2ch interleaved）。
+/// Channel count of the internal canonical form. Always stereo (2-channel interleaved).
 pub const CHANNELS: u16 = 2;
 
 bitflags! {
-    /// 1 つの [`AudioChunk`] に付随する状態フラグ。
+    /// State flags associated with an [`AudioChunk`].
     ///
-    /// FFI 越しに安定したビット幅で渡すため `u32` 背景表現。
+    /// Use `u32` as the representation to keep the bit width stable across FFI.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct ChunkFlags: u32 {
-        /// このチャンク直前にストリームの不連続（ドロップ / ギャップ）があった。
+        /// A stream discontinuity (drop / gap) occurred immediately before this chunk.
         const DISCONTINUITY = 0b0000_0001;
-        /// デバイス喪失などからの自動復帰後の最初のチャンク。
+        /// First chunk after automatic recovery, such as after device loss.
         const RECOVERED = 0b0000_0010;
-        /// 無音生成チャンク（ギャップ補填等で合成された無音）。
+        /// Generated-silence chunk (silence synthesized to fill a gap, etc.).
         const SILENCE = 0b0000_0100;
     }
 }
 
-/// 正規化済み 20ms オーディオチャンク。
+/// Normalized 20 ms audio chunk.
 ///
-/// `data` は interleaved `f32`（出力チャンネル順）で、長さは
-/// `frames * output.channels`。チャンクは時間ベースで 20ms なので、出力レートに
-/// 応じて `frames` が変わる（48k=960 / 16k=320 / 8k=160）。既定の出力 `{48000, 2}`
-/// では `frames == 960`（1920 サンプル）。
+/// `data` is interleaved `f32` in output-channel order, with length
+/// `frames * output.channels`. Chunks are time-based at 20 ms, so `frames` varies
+/// with the output rate (48k=960 / 16k=320 / 8k=160). With default output `{48000, 2}`
+///, `frames == 960` (1920 samples).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioChunk {
-    /// interleaved `f32` サンプル。長さ = `frames * output.channels`。
+    /// Interleaved `f32` samples. Length = `frames * output.channels`.
     pub data: Vec<f32>,
-    /// チャンク内のフレーム数（1 フレーム = 全出力チャンネル 1 サンプル組）。
+    /// Number of frames in the chunk (one sample per output channel per frame).
     pub frames: usize,
-    /// 先頭サンプルの正規化済み単調プレゼンテーションタイムスタンプ（ns）。
+    /// Normalized monotonic presentation timestamp (ns) of the first sample.
     pub pts_ns: i64,
-    /// ストリーム層が単調増加で付与するシーケンス番号。
+    /// Monotonically increasing sequence number assigned by the stream layer.
     pub seq: u64,
-    /// このチャンクの状態フラグ。
+    /// State flags for this chunk.
     pub flags: ChunkFlags,
-    /// このチャンクが届くまでに（直前に）ドロップされたチャンク数。
+    /// Number of chunks dropped immediately before this chunk arrived.
     pub dropped_before: u32,
-    /// このチャンクの最終 `data`（出力フォーマット）における全サンプル絶対値の最大。
-    /// 線形振幅（通常 `0.0..=1.0`）。
+    /// Maximum absolute sample value in the final `data` (output format) for this chunk.
+    /// Linear amplitude (usually `0.0..=1.0`).
     pub peak: f32,
-    /// このチャンクの最終 `data`（出力フォーマット）における二乗平均平方根（線形）。
+    /// Linear root-mean-square value in the final `data` (output format) for this chunk.
     pub rms: f32,
 }
 
@@ -74,175 +74,174 @@ pub struct AudioChunk {
 /// (about 20-60ms).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecondaryChunk {
-    /// interleaved `f32` サンプル。長さ = `frames * secondary_output.channels`。
+    /// Interleaved `f32` samples. Length = `frames * secondary_output.channels`.
     pub samples: Vec<f32>,
-    /// チャンク内のフレーム数（1 フレーム = 全出力チャンネル 1 サンプル組）。
+    /// Number of frames in the chunk (one sample per output channel per frame).
     pub frames: usize,
-    /// 先頭サンプルの録音開始 0 起点プレゼンテーションタイムスタンプ（ns）。
-    /// 主 [`AudioChunk`] と同じ録音時計に乗るが、値は主とは独立。
+    /// Presentation timestamp (ns) of the first sample, relative to recording start at 0.
+    /// Uses the same recording clock as the primary [`AudioChunk`], but has independent values.
     pub pts_ns: i64,
-    /// 副タップ独自の単調シーケンス番号（主タップとは別カウンタ）。
+    /// Monotonic sequence number for the secondary tap (separate counter from the primary tap).
     pub seq: u64,
-    /// このチャンクの状態フラグ。
+    /// State flags for this chunk.
     pub flags: ChunkFlags,
-    /// このチャンクが届くまでに（直前に）ドロップされた副チャンク数。
+    /// Number of secondary chunks dropped immediately before this chunk arrived.
     pub dropped_before: u32,
-    /// `samples`（量子化前 f32）における全サンプル絶対値の最大（線形振幅）。
+    /// Maximum absolute sample value (linear amplitude) in `samples` (f32 before quantization).
     pub peak: f32,
-    /// `samples`（量子化前 f32）における二乗平均平方根（線形）。
+    /// Linear root-mean-square value in `samples` (f32 before quantization).
     pub rms: f32,
 }
 
-/// `devices()` が 1 デバイスにつき返す情報。
+/// Information returned for each device by `devices()`.
 ///
-/// 全 OS バックエンド共通の形。マイク入力（[`SourceKind::Mic`]）とシステム音声出力
-/// （[`SourceKind::SystemLoopback`]）を 1 つのリストにまとめて返す。
+/// Common shape for all OS backends. Combines microphone input ([`SourceKind::Mic`]) and system audio output
+/// ([`SourceKind::SystemLoopback`]) in one list.
 ///
-/// `id` は再接続で index が変わらないよう、取得できる範囲で安定なキーを使う。
-/// cpal（マイク, 全 OS）は永続 ID を持たないのでデバイス名を id にし、PipeWire
-/// （Linux）は `node.name` を id にする（表示名 `name` には `node.description` を使う）。
+/// Use the most stable key available for `id`; a device's list index can change after reconnect.
+/// cpal (microphones on all OSes) has no persistent ID, so use the device name as id. PipeWire
+/// (Linux) uses `node.name` as id (`node.description` is used for the display name `name`).
 ///
-/// 同じマシン・同じ構成で列挙し直せば同じ `id` が返る。別マシンや OS をまたいだ
-/// 一意性は保証しない。
+/// Enumerating again on the same machine with the same configuration returns the same `id`. Uniqueness across
+/// different machines or operating systems is not guaranteed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
-    /// 安定 ID。[`StreamConfig::device_id`] に渡せるキー（cpal=デバイス名 /
-    /// PipeWire=`node.name`）。
+    /// Stable ID. Key accepted by [`StreamConfig::device_id`] (cpal = device name /
+    /// PipeWire = `node.name`).
     pub id: String,
-    /// 人間向け表示名（PipeWire は `node.description` 優先、無ければ `node.name`）。
+    /// Human-readable display name (PipeWire prefers `node.description`, falling back to `node.name`).
     pub name: String,
-    /// このデバイスをキャプチャするときのソース種別。
+    /// Source kind used to capture this device.
     pub source_kind: SourceKind,
-    /// デバイスのネイティブ（既定）サンプルレート（Hz）。不明時は妥当な既定値。
+    /// Native (default) device sample rate (Hz), or a reasonable default if unknown.
     pub sample_rate: u32,
-    /// デバイスのネイティブ（既定）チャンネル数。不明時は妥当な既定値。
+    /// Native (default) device channel count, or a reasonable default if unknown.
     pub channels: u16,
-    /// ループバック（システム出力の monitor）なら `true`、録音デバイス（マイク）なら
-    /// `false`。
+    /// `true` for loopback (system-output monitor), `false` for a recording device (microphone).
     pub is_loopback: bool,
-    /// OS の既定デバイス（既定入力 / 既定出力 sink）なら `true`。
+    /// `true` if this is the OS default device (default input / output sink).
     pub is_default: bool,
 }
 
-/// `processes()` が 1 プロセスにつき返す情報（プロセス別キャプチャの対象候補）。
+/// Information returned for each process by `processes()` (candidate for per-process capture).
 ///
-/// 全 OS バックエンド共通の形。列挙されるのは「今そのプロセス別キャプチャ経路
-/// （[`SourceKind::ProcessLoopback`]）で録れる見込みがある、音声出力のセッション
-/// （ストリーム）を持つプロセス」。停止中・Idle も載る。今鳴っているかは
-/// [`is_output_active`](Self::is_output_active) で見る:
-/// - Linux（PipeWire）: `Stream/Output/Audio` ノードを持つ Client（PID は Client の
-///   `pipewire.sec.pid`＝デーモンがソケット資格情報から付与する値）。
-/// - Windows（WASAPI）: 有効な render エンドポイント上の音声セッションを持つプロセス
-///   （Windows build 20348 or later (Windows 11 / Windows Server 2022)。未満は列挙
-///   自体が [`Error::UnsupportedOsVersion`]）。
-/// - macOS（Core Audio, 14.4+）: Core Audio が把握しているプロセスオブジェクト
-///   （入力だけのプロセスを含む）。
+/// Common shape for all OS backends. Lists processes with an audio-output session that can likely be captured
+/// through the per-process capture path ([`SourceKind::ProcessLoopback`])
+/// (audio output session/stream). Stopped and idle sessions are included. Check whether audio is currently playing with
+/// [`is_output_active`](Self::is_output_active):
+/// - Linux (PipeWire): Client with a `Stream/Output/Audio` node (PID is the Client's
+///   `pipewire.sec.pid`, set by the daemon from socket credentials).
+/// - Windows (WASAPI): Process with an audio session on an active render endpoint
+///   (Windows build 20348 or later (Windows 11 / Windows Server 2022). Below this, enumeration
+///   itself returns [`Error::UnsupportedOsVersion`]).
+/// - macOS (Core Audio, 14.4+): Process objects known to Core Audio
+///   (including input-only processes).
 ///
-/// [`pid`](Self::pid) を [`StreamConfig::target_pid`] に渡せばそのプロセスを録れる。
-/// `name` / `executable` / `bundle_id` は表示用で、アプリ自身が名乗る値を含むので
-/// 認可や同一性判定には使わないこと（キーは `pid`）。
+/// Pass [`pid`](Self::pid) to [`StreamConfig::target_pid`] to capture that process.
+/// `name` / `executable` / `bundle_id` are for display and may contain values claimed by the app, so
+/// do not use them for authorization or identity checks (`pid` is the key).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessInfo {
-    /// OS のプロセス ID。[`StreamConfig::target_pid`] に渡すキー。常に 0 以外。
+    /// OS process ID. Key passed to [`StreamConfig::target_pid`]. Always nonzero.
     pub pid: u32,
-    /// 人間向け表示名（常に非空）。OS が名乗る名前（PipeWire の `application.name` 等）→
-    /// 実行ファイル名 → bundle ID → `"pid <N>"` の順で決まる。
+    /// Human-readable display name (never empty). Chosen in this order: OS-reported name (such as PipeWire `application.name`) →
+    /// executable name → bundle ID → `"pid <N>"`.
     pub name: String,
-    /// 実行ファイルのベース名（例 `firefox` / `chrome.exe`）。取得できたときだけ `Some`。
-    /// Linux は `/proc/<pid>/exe` を試し、読めなければ `/proc/<pid>/comm` に落ちる。
+    /// Executable basename (for example, `firefox` or `chrome.exe`). `Some` only when the OS provides it.
+    /// Linux tries `/proc/<pid>/exe` and falls back to `/proc/<pid>/comm` if it cannot be read.
     pub executable: Option<String>,
-    /// macOS の bundle ID（例 `com.apple.Music`）。macOS で取得できたときだけ `Some`。
+    /// macOS bundle ID (for example, `com.apple.Music`). `Some` only when macOS provides it.
     pub bundle_id: Option<String>,
-    /// 今まさに音声を出力中か。OS がその状態を公開している場合だけ `Some`
-    /// （Linux=ノードが Running / Windows=セッションが Active /
-    /// macOS=`kAudioProcessPropertyIsRunningOutput`）。取れなければ `None`＝不明。
+    /// Whether audio is currently playing. `Some` only when the OS exposes this state
+    /// (Linux = node is Running / Windows = session is Active /
+    /// macOS = `kAudioProcessPropertyIsRunningOutput`). `None` if unavailable (unknown).
     pub is_output_active: Option<bool>,
 }
 
-/// デバイスの着脱・既定変更を表すホットプラグイベント。
+/// Hotplug event for device attach/detach or default-device changes.
 ///
-/// capture stream 単位の [`Event`] とは別系統で、`DeviceWatcher`（facade 層）が
-/// デバイス単位の事象として配信する。`poll_event` で取る。着脱は低頻度だが
-/// 取りこぼせないので、配信キューは上限を設けない。
+/// Separate from capture-stream [`Event`], `DeviceWatcher` (facade layer) delivers these events
+/// per device through `poll_event`. Attach/detach events are infrequent, but must not be lost,
+/// so the delivery queue is unbounded.
 ///
-/// 将来バリアントを足せるよう `#[non_exhaustive]`（外部の match は `_ =>` が要る）。
+/// Mark `#[non_exhaustive]` to allow future variants (external matches must include `_ =>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DeviceEvent {
-    /// デバイスが追加された（接続・新規ノード出現）。
+    /// A device was added (connected or a new node appeared).
     Added(DeviceInfo),
-    /// デバイスが取り外された（切断・ノード消滅）。
-    /// PipeWire の `global_remove` は数値 id しか渡さないため、安定 ID（`node.name`）のみ返す。
+    /// A device was removed (disconnected or node disappeared).
+    /// PipeWire `global_remove` provides only a numeric id, so return only the stable ID (`node.name`).
     Removed {
-        /// 取り外されたデバイスの安定 ID（= [`DeviceInfo::id`] = PipeWire の `node.name`）。
+        /// Stable ID of the removed device (= [`DeviceInfo::id`] = PipeWire `node.name`).
         id: String,
     },
-    /// OS 既定デバイスが変わった（既定 sink / source の切替）。
+    /// The OS default device changed (default sink / source switched).
     DefaultChanged {
-        /// 既定が切り替わったソース種別（`Mic` = 既定 source / `SystemLoopback` = 既定 sink）。
+        /// Source kind whose default changed (`Mic` = default source / `SystemLoopback` = default sink).
         kind: SourceKind,
-        /// 新しい既定デバイスの安定 ID（= `node.name`）。
+        /// Stable ID of the new default device (= `node.name`).
         id: String,
     },
 }
 
-/// キャプチャするオーディオソースの種別。
+/// Kind of audio source to capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKind {
-    /// マイク入力（録音デバイス）。
+    /// Microphone input (recording device).
     Mic,
-    /// システム出力全体のループバック（既定スピーカーのミックス）。
+    /// Loopback of all system output (default speaker mix).
     SystemLoopback,
-    /// 特定プロセスの出力ループバック。
+    /// Output loopback for a specific process.
     ProcessLoopback,
-    /// マイクとシステム音声を 1 本に合成して録る（mic + system のミックス）。
+    /// Record microphone and system audio mixed into one stream (mic + system mix).
     Mix,
 }
 
-/// [`SourceKind::ProcessLoopback`] で対象 PID をどう扱うか（process ソース専用）。
+/// How to handle the target PID for [`SourceKind::ProcessLoopback`] (process sources only).
 ///
-/// - [`Include`](ProcessMode::Include)（既定）: 対象 `target_pid`（そのプロセス
-///   ツリー）だけを録る。
-/// - [`Exclude`](ProcessMode::Exclude): 対象 `target_pid`（そのプロセスツリー）以外
-///   の全システム音を録る（`target_pid` が必須）。
+/// - [`Include`](ProcessMode::Include) (default): Capture only the target `target_pid` (its process
+///   tree).
+/// - [`Exclude`](ProcessMode::Exclude): Capture all system audio except the target `target_pid` (and its process tree)
+///   (`target_pid` is required).
 ///
 /// Process sources use this `mode` and ignore [`StreamConfig::exclude_self`] and
 /// [`StreamConfig::exclude_pids`]. System sources use `exclude_self` and
 /// `exclude_pids` and ignore `mode`; microphone sources ignore all three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProcessMode {
-    /// 対象 `target_pid`（そのプロセスツリー）だけを録る（既定）。
+    /// Capture only the target `target_pid` (and its process tree; default).
     #[default]
     Include,
-    /// 対象 `target_pid`（そのプロセスツリー）以外の全システム音を録る。
-    /// `target_pid` が必須（無ければ facade が [`Error::InvalidArg`]）。
+    /// Capture all system audio except the target `target_pid` (and its process tree).
+    /// `target_pid` is required (otherwise the facade returns [`Error::InvalidArg`]).
     Exclude,
 }
 
-/// 出力チャンクのフォーマット（サンプルレートとチャンネル数）。
+/// Output chunk format (sample rate and channel count).
 ///
-/// Normalizer 第 2 段が内部正規形 48k/stereo からこのフォーマットへ再変換する。
-/// 既定は内部正規形と同じ `{sample_rate: 48000, channels: 2}` で、このとき第 2 段は
-/// パススルーになる。
+/// Normalizer stage 2 converts from the internal canonical form (48 kHz/stereo) to this format.
+/// The default is the same as the internal canonical form, `{sample_rate: 48000, channels: 2}`; in that case, stage 2
+/// is a pass-through.
 ///
-/// `sample_rate` はダウン/アップサンプル先（rubato でアンチエイリアス込み）。
-/// `channels` は 1（mono）または 2（stereo）で、stereo→mono は L/R 平均、
-/// mono→stereo は複製。
+/// `sample_rate` is the target rate for down/up-sampling (with rubato antialiasing).
+/// `channels` is 1 (mono) or 2 (stereo). stereo→mono averages L/R;
+/// mono→stereo duplicates the channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputFormat {
-    /// 出力サンプルレート（Hz）。
+    /// Output sample rate (Hz).
     pub sample_rate: u32,
-    /// 出力チャンネル数（1 = mono / 2 = stereo）。
+    /// Output channel count (1 = mono / 2 = stereo).
     pub channels: u16,
 }
 
 impl OutputFormat {
-    /// 扱える出力レートの下限/上限（0 や極端な値を弾く）。
+    /// Supported output-rate range (rejects 0 and extreme values).
     const MIN_RATE: u32 = 4_000;
     const MAX_RATE: u32 = 384_000;
 
-    /// 構成が妥当か検証する。`channels` は 1 か 2、`sample_rate` は
-    /// `MIN_RATE..=MAX_RATE`。外れていれば [`Error::UnsupportedFormat`]。
+    /// Validate the configuration. `channels` must be 1 or 2; `sample_rate` must be
+    /// within `MIN_RATE..=MAX_RATE`, otherwise return [`Error::UnsupportedFormat`].
     pub fn validate(&self) -> Result<()> {
         if self.channels != 1 && self.channels != 2 {
             return Err(Error::UnsupportedFormat(format!(
@@ -261,7 +260,7 @@ impl OutputFormat {
         Ok(())
     }
 
-    /// 出力レートでの 20ms チャンクのフレーム数（48k=960 / 16k=320 / 8k=160）。
+    /// Frames per 20 ms chunk at the output rate (48k=960 / 16k=320 / 8k=160).
     pub fn chunk_frames(&self) -> usize {
         (self.sample_rate as usize * 20) / 1000
     }
@@ -269,7 +268,7 @@ impl OutputFormat {
 
 impl Default for OutputFormat {
     fn default() -> Self {
-        // 内部正規形と同一にして第 2 段をパススルーにする。
+        // Match the internal canonical form so stage 2 is a pass-through.
         Self {
             sample_rate: SAMPLE_RATE,
             channels: CHANNELS,
@@ -277,41 +276,41 @@ impl Default for OutputFormat {
     }
 }
 
-/// 1 ストリームを開くための構成。
+/// Configuration for opening one stream.
 ///
-/// [`Default`] は `chunk_ms = 20`, `ring_capacity_chunks = 50`, `mode = Include`,
+/// [`Default`] returns `chunk_ms = 20`, `ring_capacity_chunks = 50`, `mode = Include`,
 /// `exclude_self = false`, `exclude_pids = []`, `kind = Mic`, `output = {48000, 2}`, `gain = 1.0`,
 /// `mix_mic_device_id = None`, `mix_system_device_id = None`, `mix_mic_gain = 1.0`,
-/// `mix_system_gain = 1.0` を返す。
+/// and `mix_system_gain = 1.0`.
 ///
 /// Process-source PID handling is controlled by [`mode`](Self::mode). System-source
 /// exclusion is controlled by [`exclude_pids`](Self::exclude_pids) and
 /// [`exclude_self`](Self::exclude_self), with effective set
 /// `exclude_pids ∪ {this process if exclude_self}`. The system side of [`SourceKind::Mix`]
 /// uses the same exclusion set; microphone and process sources ignore both exclusion fields.
-/// `mix_*` の 4 フィールドは [`SourceKind::Mix`] 専用で、それ以外のソースでは無視される。
+/// The four `mix_*` fields apply only to [`SourceKind::Mix`] and are ignored for other sources.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamConfig {
-    /// 選ぶデバイス。mic（入力デバイス）と system（出力エンドポイント）の両方に効く。
-    /// `None` なら既定（mic=既定入力 / system=既定出力）、`Some(id)` なら `devices()`
-    /// が返す安定 ID に一致するデバイス。不一致なら `start` 時に
-    /// [`Error::DeviceNotFound`]。[`SourceKind::ProcessLoopback`] では無視される
-    /// （`target_pid` で対象を決める）。[`SourceKind::Mix`] でも無視される
-    /// （代わりに `mix_mic_device_id` / `mix_system_device_id` で各側を選ぶ）。
+    /// Device to select. Applies to both mic (input device) and system (output endpoint).
+    /// `None` selects the default (mic = default input / system = default output); `Some(id)` selects the device returned by `devices()`
+    /// with the matching stable ID. If no device matches, `start` returns
+    /// [`Error::DeviceNotFound`]. Ignored for [`SourceKind::ProcessLoopback`]
+    /// (the target is selected by `target_pid`). Also ignored for [`SourceKind::Mix`]
+    /// (select each side with `mix_mic_device_id` / `mix_system_device_id` instead).
     /// Exclusion on a system capture is a known limitation: while exclusion is active,
     /// the system capture does not honor `device_id`.
     pub device_id: Option<String>,
-    /// ソース種別。
+    /// Source kind.
     pub kind: SourceKind,
-    /// チャンク長（ミリ秒）。20 固定。
+    /// Chunk duration (ms). Fixed at 20.
     pub chunk_ms: u32,
-    /// チャンクリングの容量（チャンク数）。満杯時は DROP_OLDEST。
+    /// Chunk-ring capacity (number of chunks). Drops the oldest when full.
     pub ring_capacity_chunks: usize,
-    /// [`SourceKind::ProcessLoopback`] の対象 PID。
+    /// Target PID for [`SourceKind::ProcessLoopback`].
     pub target_pid: Option<u32>,
-    /// 対象 PID を含めるか除くか（process ソースのみ）。[`ProcessMode::Include`]
-    /// が既定。[`SourceKind::ProcessLoopback`] 以外では無視される。`Exclude` は
-    /// `target_pid` 必須（無ければ facade が [`Error::InvalidArg`]）。
+    /// Whether to include or exclude the target PID (process sources only). [`ProcessMode::Include`]
+    /// is the default. Ignored except for [`SourceKind::ProcessLoopback`]. `Exclude` requires
+    /// `target_pid` (otherwise the facade returns [`Error::InvalidArg`]).
     pub mode: ProcessMode,
     /// Exclude this process's playback from system audio to prevent feedback
     /// (system source only). When `true`, `std::process::id()` is added to the
@@ -344,35 +343,35 @@ pub struct StreamConfig {
     /// While exclusion is active, the system capture does not honor
     /// [`device_id`](Self::device_id) (known limitation).
     pub exclude_pids: Vec<u32>,
-    /// 出力チャンクのフォーマット。既定 `{48000, 2}`（パススルー）。
+    /// Output chunk format. Default `{48000, 2}` (pass-through).
     pub output: OutputFormat,
-    /// 副出力タップのフォーマット（省略 = 副タップなし）。
+    /// Secondary output-tap format (omitted = no secondary tap).
     ///
-    /// `Some(fmt)` を指定すると、同じキャプチャを主 [`output`](Self::output) とは別の
-    /// フォーマットへ再変換した副タップが有効になり、[`SecondaryChunk`] として
-    /// `poll_secondary` から取り出せる。内部正規形（48k/stereo）は 1 度だけ生成し、
-    /// 主・副はそれぞれ独立の第 2 段で再変換されるので、両者は「同一区間のサンプル」で
-    /// はなく `pts_ns` による時刻対応で突き合わせる。副タップは常に `f32`（sample encoding
-    /// を持たない）。`None` なら副タップは作られず、`poll_secondary` は常に `None`。
+    /// With `Some(fmt)`, enable a secondary tap that converts the same capture to a format
+    /// different from primary [`output`](Self::output) and returns it as [`SecondaryChunk`]
+    /// through `poll_secondary`. Generate the internal canonical form (48 kHz/stereo) once, then
+    /// convert primary and secondary independently in stage 2. They are not samples from exactly the same
+    /// interval, so align them by `pts_ns`. The secondary tap is always `f32` (no sample encoding
+    ///). With `None`, no secondary tap is created and `poll_secondary` always returns `None`.
     ///
-    /// `Stream::switch_source` では変更できない（open 時に固定）。
+    /// Cannot be changed with `Stream::switch_source` (fixed when opened).
     pub secondary_output: Option<OutputFormat>,
-    /// 開始時の入力ゲイン（線形倍率）。1.0=そのまま、2.0=約+6dB、0.0=無音。既定 1.0。
-    /// 有限かつ 0.0 以上であること（外れていれば open が [`Error::InvalidArg`]）。
-    /// 実行時変更は `Stream::set_gain`。
+    /// Input gain at start (linear multiplier). 1.0 = unchanged, 2.0 ≈ +6 dB, 0.0 = silence. Default 1.0.
+    /// Must be finite and >= 0.0 (otherwise open returns [`Error::InvalidArg`]).
+    /// Change it at runtime with `Stream::set_gain`.
     pub gain: f32,
-    /// [`SourceKind::Mix`] の mic 側で選ぶ入力デバイス。`None` なら既定入力。
-    /// id は `devices()` が返す mic の安定 ID。`Mix` 以外では無視される。
+    /// Input device for the mic side of [`SourceKind::Mix`]. `None` selects the default input.
+    /// id is the stable mic ID returned by `devices()`. Ignored except for `Mix`.
     pub mix_mic_device_id: Option<String>,
-    /// [`SourceKind::Mix`] の system 側で選ぶ出力エンドポイント。`None` なら既定出力。
-    /// id は `devices()` が返す system の安定 ID。`Mix` 以外では無視される。
+    /// Output endpoint for the system side of [`SourceKind::Mix`]. `None` selects the default output.
+    /// id is the stable system ID returned by `devices()`. Ignored except for `Mix`.
     pub mix_system_device_id: Option<String>,
-    /// [`SourceKind::Mix`] の mic 側の合成前倍率（線形）。既定 1.0。`Mix` 以外では
-    /// 無視される。既存の [`gain`](Self::gain) はグローバルで合成後に適用される
-    /// （最終値 ≒ clamp(clamp(mic×mix_mic_gain + sys×mix_system_gain) × gain)）。
+    /// Pre-mix linear gain for the mic side of [`SourceKind::Mix`]. Default 1.0. Ignored except for
+    /// `Mix`. Existing [`gain`](Self::gain) is global and applied after mixing
+    /// (final value ≈ clamp(clamp(mic×mix_mic_gain + sys×mix_system_gain) × gain)).
     pub mix_mic_gain: f32,
-    /// [`SourceKind::Mix`] の system 側の合成前倍率（線形）。既定 1.0。`Mix` 以外では
-    /// 無視される。合成後のグローバル倍率は [`gain`](Self::gain) を参照。
+    /// Pre-mix linear gain for the system side of [`SourceKind::Mix`]. Default 1.0. Ignored except for
+    /// `Mix`. See [`gain`](Self::gain) for the global post-mix multiplier.
     pub mix_system_gain: f32,
 }
 
@@ -398,65 +397,65 @@ impl Default for StreamConfig {
     }
 }
 
-/// ストリーム実行中に消費側へ通知される非同期イベント。
+/// Asynchronous event delivered to the consumer while the stream runs.
 ///
-/// 将来バリアントを足せるよう `#[non_exhaustive]`（外部の match は `_ =>` が要る）。
+/// Mark `#[non_exhaustive]` to allow future variants (external matches must include `_ =>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
-    /// チャンクリング満杯により `count` 個のチャンクがドロップされた。
+    /// `count` chunks were dropped because the chunk ring was full.
     ChunkDropped {
-        /// 直近の通知以降にドロップされた累計（または増分）数。
+        /// Total (or incremental) number dropped since the previous notification.
         count: u64,
     },
-    /// データ到着が途絶し、ストリームが失速したと判定された。
+    /// Data stopped arriving; the stream was deemed stalled.
     StreamStalled,
-    /// 失速後にデータ到着が復帰した。
+    /// Data resumed after the stall.
     StreamRecovered,
-    /// 必要な権限が拒否された。
+    /// A required permission was denied.
     PermissionDenied,
-    /// キャプチャデバイスが失われた（切断など）。
+    /// The capture device was lost (for example, disconnected).
     DeviceLost,
-    /// その他のバックエンドエラー（説明文付き）。
+    /// Other backend error (with description).
     Error(String),
 }
 
-/// flexaudio-core の操作で発生しうるエラー。
+/// Errors that can occur during flexaudio-core operations.
 ///
-/// 将来バリアントを足せるよう `#[non_exhaustive]`（外部の match は `_ =>` が要る）。
+/// Mark `#[non_exhaustive]` to allow future variants (external matches must include `_ =>`).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// 引数が無効。
+    /// Invalid argument.
     #[error("invalid argument: {0}")]
     InvalidArg(String),
-    /// 現在の状態では実行できない操作。
+    /// Operation is not allowed in the current state.
     #[error("invalid state: {0}")]
     InvalidState(String),
-    /// 指定デバイスが見つからない。
+    /// Specified device was not found.
     #[error("device not found")]
     DeviceNotFound,
-    /// 権限が拒否された。
+    /// Permission was denied.
     #[error("permission denied")]
     PermissionDenied,
-    /// 実行中の OS バージョンが当該機能を満たさない。
+    /// The running OS version does not meet this feature's requirements.
     #[error("unsupported OS version")]
     UnsupportedOsVersion,
-    /// デバイスが実行中に失われた。
+    /// The device was lost while running.
     #[error("device lost")]
     DeviceLost,
-    /// バックエンド固有のエラー（説明文付き）。
+    /// Backend-specific error (with description).
     #[error("backend error: {0}")]
     Backend(String),
-    /// 要求された出力フォーマット（レート/チャンネル）が非対応。
+    /// Requested output format (rate / channels) is unsupported.
     #[error("unsupported output format: {0}")]
     UnsupportedFormat(String),
-    /// この環境ではサポートされない操作。
+    /// Operation is unsupported in this environment.
     #[error("unsupported")]
     Unsupported,
 }
 
-/// flexaudio-core 全体で用いる結果型。
+/// Result type used throughout flexaudio-core.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
@@ -475,16 +474,16 @@ mod tests {
         assert_eq!(c.device_id, None);
         assert_eq!(c.target_pid, None);
         assert_eq!(c.gain, 1.0);
-        // Mix 専用フィールドの既定（デバイス未指定・合成前倍率 1.0）。
+        // Defaults for Mix-only fields (no device selected; pre-mix gain 1.0).
         assert_eq!(c.mix_mic_device_id, None);
         assert_eq!(c.mix_system_device_id, None);
         assert_eq!(c.mix_mic_gain, 1.0);
         assert_eq!(c.mix_system_gain, 1.0);
-        // 既定の出力は内部正規形と同一（第 2 段パススルー）。
+        // Default output matches the internal canonical form (stage 2 pass-through).
         assert_eq!(c.output.sample_rate, SAMPLE_RATE);
         assert_eq!(c.output.channels, CHANNELS);
         assert_eq!(c.output, OutputFormat::default());
-        // 既定では副タップなし。
+        // No secondary tap by default.
         assert_eq!(c.secondary_output, None);
     }
 
@@ -518,7 +517,7 @@ mod tests {
 
     #[test]
     fn output_format_validation_rejects_bad_configs() {
-        // ch=0 / ch=3 は非対応。
+        // ch=0 / ch=3 are unsupported.
         assert!(OutputFormat {
             sample_rate: 48_000,
             channels: 0
@@ -531,7 +530,7 @@ mod tests {
         }
         .validate()
         .is_err());
-        // 極端なレートは非対応。
+        // Extreme rates are unsupported.
         assert!(OutputFormat {
             sample_rate: 100,
             channels: 1
@@ -544,7 +543,7 @@ mod tests {
         }
         .validate()
         .is_err());
-        // 妥当な構成は OK。
+        // Valid configuration is OK.
         assert!(OutputFormat {
             sample_rate: 16_000,
             channels: 1
@@ -558,14 +557,14 @@ mod tests {
     fn device_info_builds_and_clones() {
         let mic = DeviceInfo {
             id: "alsa_input.pci-0000_00_1f.3".into(),
-            name: "内蔵マイク".into(),
+            name: "Built-in Microphone".into(),
             source_kind: SourceKind::Mic,
             sample_rate: 48_000,
             channels: 2,
             is_loopback: false,
             is_default: true,
         };
-        // Clone / PartialEq が機能すること（列挙結果の比較・複製に使う）。
+        // Clone / PartialEq work (used to compare and duplicate enumeration results).
         assert_eq!(mic, mic.clone());
         assert!(!mic.is_loopback);
         assert!(mic.is_default);
@@ -583,7 +582,7 @@ mod tests {
 
     #[test]
     fn process_mode_default_is_include() {
-        // 既定は Include（対象 PID だけ録る）。Exclude は明示指定が要る。
+        // Default is Include (capture only the target PID). Exclude must be explicitly selected.
         assert_eq!(ProcessMode::default(), ProcessMode::Include);
         assert_ne!(ProcessMode::Include, ProcessMode::Exclude);
     }

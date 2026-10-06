@@ -1,8 +1,8 @@
-//! 独立した VAD（音声区間検出）クラス [`Vad`]。
+//! Standalone VAD (speech segment detection) class [`Vad`].
 //!
-//! silero-VAD を ONNX でオフライン実行するアドオン（[`flexaudio_vad`]）の Python 露出。
-//! 録音チャンク（任意フォーマットの interleaved f32）をそのまま [`Vad::process`] に流すと、
-//! 内部で mono 化・VAD レートへリサンプルしてから発話境界を判定する。
+//! Python binding for the addon ([`flexaudio_vad`]) that runs Silero VAD offline with ONNX.
+//! Feed recording chunks (interleaved f32 in any format) directly to [`Vad::process`];
+//! it converts them to mono, resamples to the VAD rate, and detects speech boundaries.
 
 use pyo3::prelude::*;
 
@@ -12,13 +12,13 @@ use crate::config::make_vad_config;
 use crate::marshal::{vad_event_to_py, PyVadEvent};
 use crate::vad_err_to_py;
 
-/// ストリーミング VAD。1 インスタンスが ONNX セッションを 1 つ持つ。
+/// Streaming VAD. Each instance holds one ONNX session.
 ///
-/// 任意フォーマットの録音チャンクを [`process`](Vad::process) に流すと、確定した発話境界を
-/// [`VadEvent`](PyVadEvent) のリストで返す。`at_sample` は VAD 内部レート基準。
-// rubato のリサンプラ（VAD の前段変換）が !Sync なので pyclass の Send+Sync 既定を満たせ
-// ない。Python は poll 型の単一スレッド利用（GIL 下）が前提なので unsendable にして生成
-// スレッドに固定する。
+/// Feed recording chunks in any format to [`process`](Vad::process) to get confirmed speech boundaries
+/// as a list of [`VadEvent`](PyVadEvent). `at_sample` is relative to the VAD’s internal rate.
+// rubato’s resampler (the conversion before VAD) is !Sync, so this pyclass cannot meet the default Send+Sync
+// bounds. Python use is single-threaded and poll-based (under the GIL), so mark it unsendable and pin it to
+// the thread where it was created.
 #[pyclass(module = "flexaudio", name = "Vad", unsendable)]
 pub struct Vad {
     inner: CoreVad,
@@ -26,10 +26,10 @@ pub struct Vad {
 
 #[pymethods]
 impl Vad {
-    /// 設定を指定して VAD を構築する。既定値は silero-VAD の `get_speech_timestamps`
-    /// （= [`VadConfig::default`](flexaudio_vad::VadConfig)）に揃えてある。`sample_rate` は
-    /// 8000 か 16000 のみ（それ以外は `ValueError`）。`neg_threshold` は無音判定の負側
-    /// しきい値で、`None` なら `max(threshold - 0.15, 0.01)`（silero 準拠）。
+    /// Create a VAD with the given settings. Defaults match Silero VAD’s `get_speech_timestamps`
+    /// (`VadConfig::default` in [`flexaudio_vad::VadConfig`]). `sample_rate` must be
+    /// 8000 or 16000 (otherwise `ValueError`). `neg_threshold` is the lower (silence-side) threshold
+    /// for silence detection; when `None`, it is `max(threshold - 0.15, 0.01)` (Silero-compatible).
     #[new]
     #[pyo3(signature = (
         threshold = 0.5,
@@ -63,11 +63,11 @@ impl Vad {
         Ok(Vad { inner })
     }
 
-    /// 任意フォーマット（`input_sample_rate` / `input_channels` の interleaved f32）の
-    /// サンプル列を処理し、確定した [`VadEvent`](PyVadEvent) のリストを返す。
+    /// Process samples in any format (interleaved f32 with `input_sample_rate` / `input_channels`)
+    /// and return a list of confirmed [`VadEvent`](PyVadEvent).
     ///
-    /// 端数フレームは内部に持ち越すので、任意の位置で分割して連続で渡してよい（継ぎ目は
-    /// 出ない）。`samples` は list / array.array / numpy 配列いずれも渡せる。
+    /// Partial frames are carried forward internally, so chunks can be split at any point and passed
+    /// consecutively without gaps. `samples` can be a list, array.array, or NumPy array.
     fn process(
         &mut self,
         samples: Vec<f32>,
@@ -81,7 +81,7 @@ impl Vad {
             .collect()
     }
 
-    /// 状態・端数バッファ・リサンプラをすべて初期化する（別のストリームを続けて処理できる）。
+    /// Reset all state, the remainder buffer, and the resampler (so another stream can be processed).
     fn reset(&mut self) {
         self.inner.reset();
     }

@@ -1,255 +1,256 @@
-//! C ABI で渡す `#[repr(C)]` 型と opaque ハンドル。
+//! `#[repr(C)]` types and opaque handles exposed through the C ABI.
 //!
-//! cbindgen がこれらをそのまま `flexaudio.h` の struct / enum に写す。レイアウトは
-//! C 側と一致させる必要があるので、フィールドの型・順序を勝手に変えないこと。
+//! cbindgen copies these directly to structs / enums in `flexaudio.h`. Keep the layout consistent
+//! with the C side; do not change field types or order.
 
 use std::os::raw::c_char;
 
 use flexaudio_denoise::Denoiser;
 use flexaudio_vad::Vad;
 
-/// 録音するオーディオソースの種別（[`flexaudio::SourceKind`] に対応）。
+/// Audio source kind to record (corresponds to [`flexaudio::SourceKind`]).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlexSourceKind {
-    /// マイク入力。
+    /// Microphone input.
     Mic = 0,
-    /// システム出力全体のループバック。
+    /// Loopback of all system output.
     System = 1,
-    /// 特定プロセスの出力ループバック。
+    /// Output loopback for a specific process.
     Process = 2,
-    /// マイクとシステム音声を 1 本に合成して録る。
+    /// Record microphone and system audio mixed into one stream.
     Mix = 3,
 }
 
-/// process ソースで対象 PID を含めるか除くか（[`flexaudio::ProcessMode`] に対応）。
+/// Whether to include or exclude the target PID for process sources (corresponds to [`flexaudio::ProcessMode`]).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlexProcessMode {
-    /// 対象 PID（そのプロセスツリー）だけを録る。
+    /// Capture only the target PID (and its process tree).
     Include = 0,
-    /// 対象 PID 以外の全システム音を録る。
+    /// Capture all system audio except the target PID.
     Exclude = 1,
 }
 
-/// VAD（発話区間検出）の設定。`FlexConfig::vad` と `flexaudio_vad_new` に渡す。
+/// VAD (voice activity detection) configuration. Passed to `FlexConfig::vad` and `flexaudio_vad_new`.
 ///
-/// 各値は番兵 0 で既定を表す（[`flexaudio_vad::VadConfig`] の既定値に写す）。
-/// `threshold` 0 → 0.5、`neg_threshold` 0 → silero 式 `max(threshold-0.15, 0.01)`、
-/// `min_speech_ms` 0 → 250、`min_silence_ms` 0 → 100、`speech_pad_ms` 0 → 30、
-/// `sample_rate` 0 → 16000。`max_speech_ms` は 0 がそのまま「無制限」（既定）を意味する。
+/// For each value, the sentinel 0 selects the default from [`flexaudio_vad::VadConfig`].
+/// `threshold` 0 → 0.5, `neg_threshold` 0 → Silero formula `max(threshold-0.15, 0.01)`,
+/// `min_speech_ms` 0 → 250, `min_silence_ms` 0 → 100, `speech_pad_ms` 0 → 30,
+/// `sample_rate` 0 → 16000. `max_speech_ms` 0 means unlimited (the default).
 ///
 /// [`flexaudio_vad_new`]: crate::flexaudio_vad_new
 #[repr(C)]
 pub struct FlexVadConfig {
-    /// 発話開始とみなす確率しきい値（>=）。0 なら 0.5。
+    /// Probability threshold (>=) for speech start. 0 selects 0.5.
     pub threshold: f32,
-    /// 無音開始とみなす負側しきい値（<）。0 なら silero 式で自動決定。
+    /// Lower (silence-side) threshold (<) for silence start.
+    /// 0 selects the Silero formula automatically.
     pub neg_threshold: f32,
-    /// 採用する発話の最小長（ms）。これ未満のセグメントは破棄。0 なら 250。
+    /// Minimum accepted speech duration (ms). Shorter segments are discarded. 0 selects 250.
     pub min_speech_ms: u32,
-    /// 発話終了の確定に必要な無音長（ms）。0 なら 100。
+    /// Silence duration (ms) required to finalize speech end. 0 selects 100.
     pub min_silence_ms: u32,
-    /// セグメント境界を前後に広げるパディング（ms）。0 なら 30。
+    /// Padding (ms) added before and after segment boundaries. 0 selects 30.
     pub speech_pad_ms: u32,
-    /// 1 セグメントの最大長（ms）。0 は無制限（既定）。超過時は強制分割。
+    /// Maximum segment duration (ms). 0 is unlimited (default). Longer segments are forcibly split.
     pub max_speech_ms: u32,
-    /// サンプルレート（8000 または 16000）。0 なら 16000。
+    /// Sample rate (8000 or 16000). 0 selects 16000.
     pub sample_rate: u32,
 }
 
-/// VAD が確定した 1 イベント。`flexaudio_vad_process` の出力配列と `FlexChunk::vad_events`
-/// に入る。
+/// One event finalized by VAD. Stored in the output array of `flexaudio_vad_process` and in `FlexChunk::vad_events`
+///.
 ///
-/// `at_sample` は VAD 内部レート（`sample_rate`＝8000/16000）のサンプル基準で、入力
-/// サンプル基準ではない（[`flexaudio_vad::VadEvent`] と同じ）。
+/// `at_sample` is measured at the internal VAD rate (`sample_rate` = 8000/16000), not at the input
+/// sample rate (same as [`flexaudio_vad::VadEvent`]).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlexVadEvent {
-    /// 種別。0 = 発話開始（SpeechStart）、1 = 発話終了（SpeechEnd）。
+    /// Kind. 0 = speech start (SpeechStart), 1 = speech end (SpeechEnd).
     pub kind: i32,
-    /// イベントのサンプル位置（VAD 内部レート基準・開始は含む/終了は排他）。
+    /// Event sample position at the internal VAD rate (start inclusive / end exclusive).
     pub at_sample: i64,
 }
 
-/// ストリームを開くための構成。`flexaudio_open` / `flexaudio_switch_source` に渡す。
+/// Configuration for opening a stream. Passed to `flexaudio_open` / `flexaudio_switch_source`.
 ///
-/// 文字列・任意値は番兵で「未指定」を表す（`device_id` が NULL なら既定デバイス、
-/// `process_id` が 0 ならなし、`output_rate`/`output_channels`/`chunk_ms` が 0 なら既定）。
+/// Sentinel values mean "unspecified" for strings and optional values (`device_id` NULL selects the default device,
+/// `process_id` 0 means none, and `output_rate`/`output_channels`/`chunk_ms` 0 select defaults).
 #[repr(C)]
 pub struct FlexConfig {
-    /// ソース種別。
+    /// Source kind.
     pub kind: FlexSourceKind,
-    /// 選ぶデバイスの ID（UTF-8, NUL 終端）。NULL なら既定デバイス。
+    /// ID of the selected device (UTF-8, NUL-terminated). NULL selects the default device.
     pub device_id: *const c_char,
-    /// process ソースの対象 PID。0 ならなし（process では start 時にエラーになりうる）。
+    /// Target PID for a process source. 0 means none (may cause an error when starting a process source).
     pub process_id: u32,
-    /// 対象 PID を含めるか除くか（process ソースのみ）。
+    /// Whether to include or exclude the target PID (process sources only).
     pub mode: FlexProcessMode,
-    /// 自ホストの再生音をシステム音から除くか（system ソースのみ。mix では system 側
-    /// に適用）。
+    /// Whether to exclude this process's playback from system audio (system source only;
+    /// for mix, applies to the system side).
     pub exclude_self: bool,
-    /// 出力サンプルレート（Hz）。0 なら 48000。
+    /// Output sample rate (Hz). 0 selects 48000.
     pub output_rate: u32,
-    /// 出力チャンネル数。0 なら 2。
+    /// Output channel count. 0 selects 2.
     pub output_channels: u16,
-    /// チャンク長（ミリ秒）。0 なら 20。
+    /// Chunk duration (ms). 0 selects 20.
     pub chunk_ms: u32,
-    /// 開始時の入力ゲイン（線形倍率）。0 なら 1.0（既定）。実行時のミュートは
-    /// `flexaudio_set_gain(s, 0.0)` を使う。
+    /// Input gain at start (linear multiplier). 0 selects 1.0 (default). For runtime mute, use
+    /// `flexaudio_set_gain(s, 0.0)`.
     pub gain: f32,
-    /// mix の mic 側で選ぶ入力デバイスの ID（UTF-8, NUL 終端・mix 専用）。
-    /// NULL なら既定入力。
+    /// Input device ID (UTF-8, NUL-terminated) for the mic side of mix (mix only).
+    /// NULL selects the default input.
     pub mix_mic_device_id: *const c_char,
-    /// mix の system 側で選ぶ出力エンドポイントの ID（UTF-8, NUL 終端・mix 専用）。
-    /// NULL なら既定出力。
+    /// Output endpoint ID (UTF-8, NUL-terminated) for the system side of mix (mix only).
+    /// NULL selects the default output.
     pub mix_system_device_id: *const c_char,
-    /// mix の mic 側の合成前倍率（線形・mix 専用）。0 なら 1.0（既定）。
-    /// 合成後にグローバル `gain` が掛かる。
+    /// Pre-mix linear gain for the mic side of mix (mix only). 0 selects 1.0 (default).
+    /// Global `gain` is applied after mixing.
     pub mix_mic_gain: f32,
-    /// mix の system 側の合成前倍率（線形・mix 専用）。0 なら 1.0（既定）。
+    /// Pre-mix linear gain for the system side of mix (mix only). 0 selects 1.0 (default).
     pub mix_system_gain: f32,
-    /// ノイズ抑制（RNNoise）をストリームに挟むか。`true` で有効。有効時は出力レートが
-    /// 48000 でなければ `flexaudio_open` が失敗する（NULL + last_error）。denoise は
-    /// `poll_chunk` が返す直前に data をインプレース処理する（VAD より前段）。
+    /// Whether to apply noise suppression (RNNoise) to the stream. Enabled when `true`. The output rate must be
+    /// 48000 or `flexaudio_open` fails (NULL + last_error). denoise
+    /// processes data in place just before `poll_chunk` returns (before VAD).
     pub denoise: bool,
-    /// VAD（発話区間検出）をストリームに挟むか。`true` で `vad` の設定に従い、poll した
-    /// 各チャンクを VAD に通して `FlexChunk::vad_events` を埋める。
+    /// Whether to apply VAD (voice activity detection) to the stream. When `true`, each polled chunk is processed
+    /// by VAD according to `vad` and populates `FlexChunk::vad_events`.
     pub has_vad: bool,
-    /// VAD の設定（`has_vad` が `true` のときだけ使う。`false` なら無視）。
+    /// VAD configuration (used only when `has_vad` is `true`; ignored when `false`).
     pub vad: FlexVadConfig,
 }
 
-/// 取得した 1 チャンクのオーディオデータ。`flexaudio_poll_chunk` が埋める。
+/// One captured audio chunk, populated by `flexaudio_poll_chunk`.
 ///
-/// `data` は flexaudio 所有の interleaved f32 で、長さは `len`（= `frames * channels`）。
-/// 使い終わったら必ず `flexaudio_chunk_free` で解放する（C の free は使わない）。
+/// `data` is flexaudio-owned interleaved f32 with length `len` (= `frames * channels`).
+/// Always release it with `flexaudio_chunk_free` when finished (do not use C `free`).
 #[repr(C)]
 pub struct FlexChunk {
-    /// interleaved f32 サンプルへのポインタ。`flexaudio_chunk_free` で解放する。
+    /// Pointer to interleaved f32 samples. Release with `flexaudio_chunk_free`.
     pub data: *mut f32,
-    /// `data` の要素数（= `frames * channels`）。
+    /// Number of elements in `data` (= `frames * channels`).
     pub len: usize,
-    /// チャンク内のフレーム数。
+    /// Number of frames in the chunk.
     pub frames: u32,
-    /// 先頭サンプルの単調プレゼンテーションタイムスタンプ（ns）。
+    /// Monotonic presentation timestamp (ns) of the first sample.
     pub pts_ns: i64,
-    /// ストリーム層が付与する単調増加のシーケンス番号。
+    /// Monotonically increasing sequence number assigned by the stream layer.
     pub seq: u64,
-    /// チャンクの状態フラグ（ChunkFlags のビット）。
+    /// Chunk state flags (ChunkFlags bits).
     pub flags: u32,
-    /// このチャンクが届くまでにドロップされたチャンク数。
+    /// Number of chunks dropped before this chunk arrived.
     pub dropped_before: u32,
-    /// 全サンプル絶対値の最大（線形振幅）。
+    /// Maximum absolute sample value (linear amplitude).
     pub peak: f32,
-    /// 全サンプルの二乗平均平方根（線形）。
+    /// Root-mean-square value of all samples (linear).
     pub rms: f32,
-    /// このチャンクで VAD が確定したイベント配列。VAD 無効時・イベント無しのときは
-    /// NULL（`vad_events_len = 0`）。非 NULL のときは `flexaudio_chunk_free` が
-    /// `data` と一緒に解放する。
+    /// Events finalized by VAD for this chunk. NULL when VAD is disabled or there are no events
+    /// (`vad_events_len = 0`). When non-NULL, `flexaudio_chunk_free` releases it
+    /// together with `data`.
     pub vad_events: *mut FlexVadEvent,
-    /// `vad_events` の要素数。VAD 無効時・イベント無しでは 0。
+    /// Number of `vad_events`. 0 when VAD is disabled or there are no events.
     pub vad_events_len: usize,
 }
 
-/// ストリームイベントの種別（[`flexaudio::Event`] に対応）。
+/// Stream event kind (corresponds to [`flexaudio::Event`]).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlexEventKind {
-    /// チャンクリング満杯によりチャンクがドロップされた（個数は `FlexEvent::count`）。
+    /// Chunks were dropped because the chunk ring was full (count in `FlexEvent::count`).
     ChunkDropped = 0,
-    /// データ到着が途絶し、ストリームが失速した。
+    /// Data stopped arriving and the stream stalled.
     Stalled = 1,
-    /// 失速後にデータ到着が復帰した。
+    /// Data resumed after a stall.
     Recovered = 2,
-    /// 必要な権限が拒否された。
+    /// A required permission was denied.
     PermissionDenied = 3,
-    /// キャプチャデバイスが失われた。
+    /// The capture device was lost.
     DeviceLost = 4,
-    /// その他のバックエンドエラー（メッセージは `flexaudio_last_error` で取る）。
+    /// Other backend error (retrieve the message with `flexaudio_last_error`).
     Error = 5,
-    /// 既知のどれにも当たらないイベント（将来のバリアント追加に備える）。
+    /// Event not matching a known kind (reserved for future variants).
     Unknown = 6,
 }
 
-/// 取得した 1 イベント。`flexaudio_poll_event` が埋める。
+/// One captured event, populated by `flexaudio_poll_event`.
 ///
-/// `Error` のときはメッセージが `flexaudio_last_error` に入る。
+/// For `Error`, the message is stored in `flexaudio_last_error`.
 #[repr(C)]
 pub struct FlexEvent {
-    /// イベント種別。
+    /// Event kind.
     pub kind: FlexEventKind,
-    /// `ChunkDropped` のドロップ数。それ以外では 0。
+    /// Number dropped for `ChunkDropped`; 0 for other kinds.
     pub count: i64,
 }
 
-/// 列挙された 1 デバイスの情報（[`flexaudio::DeviceInfo`] に対応）。
+/// Information for one enumerated device (corresponds to [`flexaudio::DeviceInfo`]).
 ///
-/// `id` / `name` は flexaudio 所有の UTF-8 NUL 終端文字列。配列ごと
-/// `flexaudio_devices_free` で解放する（C の free は使わない）。
+/// `id` / `name` are flexaudio-owned, NUL-terminated UTF-8 strings. Release the entire array with
+/// `flexaudio_devices_free` (do not use C `free`).
 #[repr(C)]
 pub struct FlexDeviceInfo {
-    /// 安定 ID（`flexaudio_devices_free` で解放）。
+    /// Stable ID (released by `flexaudio_devices_free`).
     pub id: *mut c_char,
-    /// 人間向け表示名（`flexaudio_devices_free` で解放）。
+    /// Human-readable display name (released by `flexaudio_devices_free`).
     pub name: *mut c_char,
-    /// このデバイスをキャプチャするときのソース種別。
+    /// Source kind used to capture this device.
     pub source_kind: FlexSourceKind,
-    /// ネイティブ（既定）サンプルレート（Hz）。
+    /// Native (default) sample rate (Hz).
     pub sample_rate: u32,
-    /// ネイティブ（既定）チャンネル数。
+    /// Native (default) channel count.
     pub channels: u16,
-    /// ループバック（システム出力の monitor）なら true。
+    /// True for loopback (system-output monitor).
     pub is_loopback: bool,
-    /// OS の既定デバイスなら true。
+    /// True if this is the OS default device.
     pub is_default: bool,
 }
 
-/// プロセスが今音声を出力中か（[`flexaudio::ProcessInfo::is_output_active`] に対応）。
+/// Whether the process is currently outputting audio (corresponds to [`flexaudio::ProcessInfo::is_output_active`]).
 ///
-/// OS がその状態を公開しないときは `Unknown`（Rust の `None`）。
+/// `Unknown` when the OS does not expose this state (Rust `None`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlexOutputActivity {
-    /// OS が状態を公開していない／読めなかった。
+    /// The OS does not expose the state or it could not be read.
     Unknown = 0,
-    /// 出力していない（Linux=ノードが Running 以外 / Windows=セッションが Inactive /
-    /// macOS=IsRunningOutput が 0）。
+    /// Not outputting (Linux = node is not Running / Windows = session is Inactive /
+    /// macOS = IsRunningOutput is 0).
     Inactive = 1,
-    /// 出力中。
+    /// Outputting audio.
     Active = 2,
 }
 
-/// 列挙された 1 プロセスの情報（[`flexaudio::ProcessInfo`] に対応）。
+/// Information for one enumerated process (corresponds to [`flexaudio::ProcessInfo`]).
 ///
-/// `pid` を `FlexConfig::process_id` に渡すとそのプロセスを録れる。文字列は flexaudio 所有の
-/// UTF-8 NUL 終端で、配列ごと `flexaudio_processes_free` で解放する（C の free は使わない）。
-/// `executable` / `bundle_id` は取れなかったとき NULL。
+/// Pass `pid` to `FlexConfig::process_id` to capture that process. Strings are flexaudio-owned,
+/// NUL-terminated UTF-8 and released with the entire array by `flexaudio_processes_free` (do not use C `free`).
+/// `executable` / `bundle_id` are NULL when unavailable.
 #[repr(C)]
 pub struct FlexProcessInfo {
-    /// OS のプロセス ID（0 以外）。
+    /// OS process ID (nonzero).
     pub pid: u32,
-    /// 表示名（常に非空。`flexaudio_processes_free` で解放）。
+    /// Display name (never empty; released by `flexaudio_processes_free`).
     pub name: *mut c_char,
-    /// 実行ファイルのベース名。取れなければ NULL。
+    /// Executable basename, or NULL if unavailable.
     pub executable: *mut c_char,
-    /// macOS の bundle ID。取れなければ（macOS 以外は常に）NULL。
+    /// macOS bundle ID, or NULL if unavailable (always NULL outside macOS).
     pub bundle_id: *mut c_char,
-    /// 出力中か（不明なら `Unknown`）。
+    /// Whether it is outputting audio (`Unknown` if unavailable).
     pub output_activity: FlexOutputActivity,
 }
 
-/// 録音ストリームの不透明ハンドル。中身は [`flexaudio::Stream`] と、有効時に同居する
-/// アドオン（denoise / VAD）で、C 側はポインタだけを持つ。`flexaudio_open` で作り
-/// `flexaudio_free` で解放する。
+/// Opaque handle for a recording stream. It contains [`flexaudio::Stream`] and any enabled
+/// addons (denoise / VAD); C code holds only a pointer. Create with `flexaudio_open` and
+/// release with `flexaudio_free`.
 ///
-/// アドオンはストリームの状態としてここに閉じ込める（薄いラッパ）。`poll_chunk` が
-/// 返す前に denoise → VAD の順で通す。`flexaudio_switch_source` はソースだけを差し替え、
-/// アドオンは open 時の構成のまま保つ（gain と同じ扱い）。
+/// Keep addons here as part of the stream state (thin wrapper). Before `poll_chunk`
+/// returns, process data through denoise → VAD. `flexaudio_switch_source` replaces only the source;
+/// addons retain their configuration from open (same as gain).
 pub struct FlexStream {
     pub(crate) inner: flexaudio::Stream,
-    /// 有効時のノイズ抑制器（48k 前提。open 時に構築）。無効なら `None`。
+    /// Noise suppressor when enabled (requires 48 kHz; constructed at open). `None` when disabled.
     pub(crate) denoiser: Option<Denoiser>,
-    /// 有効時の VAD（open 時に構築）。無効なら `None`。
+    /// VAD when enabled (constructed at open). `None` when disabled.
     pub(crate) vad: Option<Vad>,
 }

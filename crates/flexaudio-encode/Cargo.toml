@@ -13,14 +13,14 @@ readme = "README.md"
 documentation = "https://docs.rs/flexaudio-encode"
 
 [dependencies]
-# 純 Rust FLAC エンコーダ (Apache-2.0)。default features (log/par/serde) は
-# 一括エンコード経路のマルチスレッド化や設定のシリアライズ向けで、フレーム単位の
-# 逐次エンコードには不要なので落とす（crossbeam-channel / serde / log を引かない）。
+# Pure-Rust FLAC encoder (Apache-2.0). Default features (log/par/serde) support parallel batch
+# encoding and settings serialization, which sequential frame-by-frame encoding does not need.
+# Disable them to avoid pulling in crossbeam-channel / serde / log.
 flacenc = { version = "0.5", default-features = false }
 thiserror = { workspace = true }
-# f32→s16 量子化の正典（全層で同一実装を共有するため core の quantize_i16 を使う）。
+# Canonical f32→s16 quantization: use core's quantize_i16 so all layers share one implementation.
 flexaudio-core = { path = "../flexaudio-core", version = "0.3.0" }
 
 [dev-dependencies]
-# 往復検証用の純 Rust FLAC デコーダ (Apache-2.0)。テストのみ。
+# Pure-Rust FLAC decoder (Apache-2.0) for round-trip verification. Tests only.
 claxon = "0.4"

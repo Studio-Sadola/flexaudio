@@ -1,21 +1,21 @@
-//! 1 ソースのキャプチャパイプラインを所有する [`Stream`]。
+//! [`Stream`] owns a single-source capture pipeline.
 //!
-//! コア部品（[`RawRing`](mod@flexaudio_core::raw_ring) / [`Normalizer`] /
+//! It wires core components ([`RawRing`](mod@flexaudio_core::raw_ring) / [`Normalizer`] /
 //! [`ChunkRing`](mod@flexaudio_core::chunk_ring) / [`ClockNormalizer`] /
-//! [`CaptureBackend`]）を配線し、プル型 API（[`poll_chunk`](Stream::poll_chunk) /
-//! [`poll_event`](Stream::poll_event)）で消費側へ供給する。
+//! [`CaptureBackend`]) and supplies the consumer through the pull API
+//! ([`poll_chunk`](Stream::poll_chunk) / [`poll_event`](Stream::poll_event)).
 //!
-//! # スレッド構成
-//! - backend の RT スレッド: [`RawSink`] 経由で生フレームを
-//!   [`RawRing`](mod@flexaudio_core::raw_ring) へ push するだけ（非ブロッキング）。
-//! - 取り込み/加工スレッド（1 本・通常優先度）: RawRing を pop → [`Normalizer`] で
-//!   48k/stereo/20ms 化 → 単調増加 `seq` を付与 →
-//!   [`ChunkRing`](mod@flexaudio_core::chunk_ring)（DROP_OLDEST）へ push。
-//!   最後にサンプルを処理した時刻を `AtomicI64` で更新する。
-//! - ウォッチドッグスレッド（1 本・~250ms tick）: 一定時間サンプル更新が止まったら
-//!   無音死と判定し、backend を指数バックオフ（250ms→5s・ジッタ）で再オープンする。
-//!   失速で [`Event::StreamStalled`]、復帰で [`Event::StreamRecovered`] を発火し、復帰後の
-//!   最初のチャンクに [`ChunkFlags::RECOVERED`] | [`ChunkFlags::DISCONTINUITY`] を立てる。
+//! # Thread layout
+//! - Backend RT thread: only pushes raw frames through [`RawSink`] to
+//!   [`RawRing`](mod@flexaudio_core::raw_ring) (non-blocking).
+//! - Intake/processing thread (one, normal priority): pops RawRing → normalizes to
+//!   48k/stereo/20ms → assigns monotonically increasing `seq` → pushes to
+//!   [`ChunkRing`](mod@flexaudio_core::chunk_ring) (DROP_OLDEST). Updates the last sample processing
+//!   time in `AtomicI64`.
+//! - Watchdog thread (one, ~250ms tick): if samples stop arriving for long enough, treats the stream
+//!   as stalled and reopens the backend with exponential backoff (250ms→5s, with jitter). Fires
+//!   [`Event::StreamStalled`] on a stall and [`Event::StreamRecovered`] on recovery, and marks the
+//!   first post-recovery chunk with [`ChunkFlags::RECOVERED`] | [`ChunkFlags::DISCONTINUITY`].
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
@@ -101,146 +101,145 @@ fn build_normalizer(
     Ok(n)
 }
 
-/// RawRing の容量（f32 サンプル単位）。ネイティブ SR×ch に依存させず、
-/// 多めに確保して RT 経路のドロップを避ける（約 0.5 秒 @ 48k stereo 相当の余裕）。
-/// mix ソースの合成バックエンド（`mix.rs`）も子リングに同じ容量を使う。
+/// RawRing capacity in f32 samples. Keep it independent of native SR×ch and large enough to avoid
+/// drops on the RT path (about 0.5 seconds of 48k stereo headroom). The mix source's composite
+/// backend (`mix.rs`) uses the same capacity for its child rings.
 pub(crate) const RAW_RING_SAMPLES: usize = 48_000;
 
-/// ウォッチドッグの tick 間隔。
+/// Watchdog tick interval.
 const WATCHDOG_TICK: Duration = Duration::from_millis(250);
 
-/// この時間サンプル到着が途絶したら「無音死」と判定する既定閾値。
+/// Default threshold for treating a sample gap this long as a stall.
 const STALL_THRESHOLD: Duration = Duration::from_secs(2);
 
-/// 再オープン指数バックオフの下限。
+/// Lower bound for exponential reopen backoff.
 const BACKOFF_MIN: Duration = Duration::from_millis(250);
-/// 再オープン指数バックオフの上限。
+/// Upper bound for exponential reopen backoff.
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
-/// 1 ソースのキャプチャパイプライン。
+/// Capture pipeline for a single source.
 ///
-/// [`open`](Self::open) で構成し、[`start`](Self::start) でキャプチャを開始する。
-/// 消費側は [`poll_chunk`](Self::poll_chunk) / [`poll_event`](Self::poll_event) を
-/// 非ブロッキングに呼ぶ。[`stop`](Self::stop) は全スレッドを join する。
+/// Configure it with [`open`](Self::open) and start capture with [`start`](Self::start).
+/// Consumers call [`poll_chunk`](Self::poll_chunk) / [`poll_event`](Self::poll_event) without
+/// blocking. [`stop`](Self::stop) joins all threads.
 pub struct Stream {
     config: StreamConfig,
 
-    /// backend を共有し、取り込みスレッド/ウォッチドッグスレッドが (再)オープンする。
+    /// Shared backend, reopened by the intake/watchdog threads.
     shared: Arc<SharedState>,
 
-    /// 消費側が取り出すチャンクリングの consumer。
+    /// Consumer end of the chunk ring, read by the caller.
     chunk_consumer: ChunkConsumer,
 
-    /// 副タップの consumer（`config.secondary_output` が `Some` のときのみ）。
+    /// Secondary tap consumer (only when `config.secondary_output` is `Some`).
     secondary_consumer: Option<SecondaryChunkConsumer>,
 
-    /// イベントキューの consumer 側（共有）。
+    /// Consumer end of the shared event queue.
     events: Arc<Mutex<VecDeque<Event>>>,
 
-    /// 取り込み/加工スレッド。
+    /// Intake/processing thread.
     worker: Option<JoinHandle<()>>,
-    /// ウォッチドッグスレッド。
+    /// Watchdog thread.
     watchdog: Option<JoinHandle<()>>,
 
-    /// 開始済みか（二重 start 防止）。
+    /// Whether started (prevents duplicate start calls).
     started: bool,
 }
 
-/// 取り込みスレッド・ウォッチドッグスレッド・main で共有する状態。
+/// State shared by the intake thread, watchdog thread, and main thread.
 struct SharedState {
-    /// backend 本体（再オープンのためロックで保護）。
+    /// Backend implementation, protected by a lock for reopen.
     backend: Mutex<Box<dyn CaptureBackend>>,
 
-    /// 現在有効な RawConsumer。再オープン時にウォッチドッグが差し替える。
-    /// `None` の間（再オープン中）は取り込みスレッドは pop しない。
+    /// Currently active RawConsumer. Replaced by the watchdog on reopen.
+    /// The intake thread does not pop while this is `None` (during reopen).
     raw_consumer: Mutex<Option<RawConsumer>>,
 
-    /// `raw_consumer` の世代。再オープンのたびに増える。取り込みスレッドは
-    /// 世代変化を検知して内部状態（Normalizer 等）をリセットする。
+    /// Generation of `raw_consumer`, incremented on each reopen. The intake thread detects changes
+    /// and resets internal state such as the Normalizer.
     raw_generation: AtomicU64,
 
-    /// 最後にサンプルを処理（pop して Normalizer へ投入）した単調時刻（ns）。
+    /// Monotonic time (ns) when the last sample was processed (popped and fed to Normalizer).
     last_sample_ns: AtomicI64,
 
-    /// 全スレッドへの停止指示。
+    /// Stop request for all threads.
     stopping: AtomicBool,
 
-    /// 復帰直後フラグ。ウォッチドッグが復帰時に true にし、取り込みスレッドが
-    /// 次チャンクへ RECOVERED|DISCONTINUITY を立てて false に戻す。
+    /// Post-recovery flag. The watchdog sets it to true on recovery; the intake thread marks the next
+    /// chunk RECOVERED|DISCONTINUITY and resets it to false.
     recovered_pending: AtomicBool,
 
-    /// イベントキュー（producer/consumer 共有）。
+    /// Event queue shared by producer and consumer.
     events: Arc<Mutex<VecDeque<Event>>>,
 
-    /// ChunkRing の producer（取り込みスレッドが使用）。
+    /// Producer end of ChunkRing (used by the intake thread).
     chunk_producer: Mutex<Option<ChunkProducer>>,
 
-    /// 現在の `backend` のネイティブフォーマット `(sample_rate, channels)`。
+    /// Native format `(sample_rate, channels)` of the current `backend`.
     ///
-    /// ウォッチドッグ復帰（同一 backend 再オープン）では不変だが、
-    /// [`Stream::switch_source`] でソースを差し替えると新 backend の値へ更新される
-    /// （mic↔system/process でネイティブ SR/ch が変わるのが普通）。
-    /// 取り込みスレッドは世代変化を検知してここを読み直し、第 1 段
-    /// （native 依存）の [`Normalizer`] を作り直す。
+    /// Unchanged when the watchdog reopens the same backend, but updated to the new backend's value
+    /// when [`Stream::switch_source`] changes the source (native SR/ch commonly differ between
+    /// mic↔system/process). On a generation change, the intake thread rereads this and rebuilds the
+    /// native-dependent first stage of [`Normalizer`].
     native_format: Mutex<(u32, u16)>,
 
-    /// ソース切替中フラグ。[`Stream::switch_backend`] が切替中 true にする。
-    /// 切替中はウォッチドッグが並行再オープンしないよう失速処理をスキップする
-    /// （切替の旧 backend stop で一時的に idle になっても誤って再オープンしない）。
+    /// Source-switch flag. [`Stream::switch_backend`] sets it to true during a switch. The watchdog
+    /// skips stall handling during a switch to avoid concurrent reopen (the old backend is briefly
+    /// idle while stopped, which must not trigger an incorrect reopen).
     switching: AtomicBool,
 
-    /// 意図的な不連続フラグ。[`Stream::switch_backend`] がソース切替成功時に
-    /// true にし、取り込みスレッドが次チャンクへ DISCONTINUITY（RECOVERED は
-    /// 付けない＝自動復帰ではなく意図的切替）を立てて false に戻す。
+    /// Intentional discontinuity flag. [`Stream::switch_backend`] sets it to true on a successful
+    /// source switch; the intake thread marks the next chunk DISCONTINUITY (without RECOVERED,
+    /// because this was an intentional switch, not automatic recovery) and resets it to false.
     discontinuity_pending: AtomicBool,
 
-    /// ポーズ中フラグ。pause() で true。取り込みスレッドは完成チャンクを破棄して
-    /// 配信しない（RawRing の取り込みは続けるのでデバイスは止まらず、ウォッチドッグの
-    /// 失速判定もぶれない）。resume() で false に戻す。
+    /// Pause flag. pause() sets it to true. The intake thread discards completed chunks instead of
+    /// delivering them (RawRing capture continues, so the device stays active and watchdog stall
+    /// detection remains accurate). resume() resets it to false.
     paused: AtomicBool,
 
-    /// `pause()` とチャンク push の排他。pause が返ったあと、取り込みスレッドが
-    /// 組み立て済みのチャンクを後から列へ入れる競合を閉じる。
+    /// Serializes `pause()` with chunk enqueueing so the intake thread cannot enqueue a chunk
+    /// after `pause()` returns.
     delivery: Mutex<()>,
 
-    /// 実際の pause→resume 遷移ごとの世代。各タップは delivery ロックの下でこれを
-    /// 観測し、変化後に最初に enqueue するチャンクへ DISCONTINUITY を立てる。
+    /// Generation for each actual pause→resume transition. Each tap observes it under the delivery
+    /// lock and marks its first chunk enqueued after a change with DISCONTINUITY.
     resume_generation: AtomicU64,
 
-    /// 入力ゲイン（線形倍率）の f32 ビット表現（`f32::to_bits`/`from_bits` で保持）。
-    /// open() で config.gain から初期化し、set_gain() が録音中いつでも書き換える。
-    /// 取り込みスレッドが完成チャンクごとに読み、1.0 以外なら各サンプルへ乗算する。
+    /// Input gain (linear multiplier) stored as f32 bits (using `f32::to_bits`/`from_bits`).
+    /// Initialized from config.gain in open(); set_gain() can update it during recording. The
+    /// intake thread reads it per completed chunk and multiplies each sample when it is not 1.0.
     gain_bits: AtomicU32,
 
-    /// 録音エポック（ns）。「最初に配信された主チャンクの算出 pts」を 1 度だけ確定し、
-    /// 以後全チャンク（主・副）から引いて録音開始 0 起点にする。番兵 `i64::MIN` = 未確定。
-    /// reopen/switch をまたいでもリセットしない（録音全体で 1 本の時計）。
+    /// Recording epoch (ns). Set once to the computed PTS of the first delivered primary chunk, then
+    /// subtract it from all later chunks (primary and secondary) so recording starts at zero. The
+    /// `i64::MIN` sentinel means unset. Never reset across reopen/switch (one clock per recording).
     recording_epoch_ns: AtomicI64,
 
-    /// 内部正規形へのノイズ抑制を有効にするか。取り込みスレッドが Normalizer を（再）構築
-    /// するときに読み、有効なら core の InnerProcessor へ denoise を注入する。
+    /// Whether to enable noise suppression in the internal canonical format. Read when the intake
+    /// thread (re)builds Normalizer; if enabled, denoise is injected into core's InnerProcessor.
     denoise_enabled: AtomicBool,
 
-    /// 副 ChunkRing の producer（副タップ設定時のみ Some）。取り込みスレッドが使う。
+    /// Producer end of the secondary ChunkRing (Some only when the secondary tap is configured).
     secondary_producer: Mutex<Option<SecondaryChunkProducer>>,
 }
 
 impl SharedState {
     fn push_event(&self, ev: Event) {
-        // poison でもイベントは torn しない（VecDeque を回収して継続）。
+        // Recover the VecDeque and continue even if poisoned; events are not torn.
         let mut q = self.events.lock().unwrap_or_else(|e| e.into_inner());
         q.push_back(ev);
     }
 }
 
-/// backend の `start(sink)` を [`catch_unwind`](std::panic::catch_unwind) で包んで
-/// 呼ぶ。backend が panic しても mutex を poison させる前に [`Error::Backend`] へ
-/// 変換して返す（呼び出し側はこれを `Event::Error`/`Err` として表に出せる）。
+/// Call backend `start(sink)` inside [`catch_unwind`](std::panic::catch_unwind). If the backend
+/// panics, convert it to [`Error::Backend`] before it can poison the mutex (the caller can surface it
+/// as `Event::Error`/`Err`).
 ///
-/// `&mut Box<dyn CaptureBackend>` は `UnwindSafe` ではないため [`AssertUnwindSafe`]
-/// で包む。安全なのは、panic を捕捉したらこの関数は `Err` を返すだけで、論理的に
-/// 壊れたかもしれない backend を以降使い続けないため（呼び出し側は失敗として扱い、
-/// stop/再オープン/drop へ進む）。ロックガードは正常に保持・drop され、poison しない。
+/// `&mut Box<dyn CaptureBackend>` is not `UnwindSafe`, so wrap it in [`AssertUnwindSafe`]. This is
+/// safe because after catching a panic this function only returns `Err`; the caller treats the
+/// possibly corrupted backend as failed and proceeds to stop/reopen/drop instead of reusing it. The
+/// lock guard is held and dropped normally, so the mutex is not poisoned.
 fn start_backend_catching(be: &mut Box<dyn CaptureBackend>, sink: RawSink) -> Result<()> {
     match std::panic::catch_unwind(AssertUnwindSafe(|| be.start(sink))) {
         Ok(res) => res,
@@ -248,39 +247,39 @@ fn start_backend_catching(be: &mut Box<dyn CaptureBackend>, sink: RawSink) -> Re
     }
 }
 
-/// backend の `stop()` を [`catch_unwind`](std::panic::catch_unwind) で包んで呼ぶ。
-/// stop は `()` を返すため、panic は握りつぶして継続する（停止経路で再度 panic を
-/// 伝播させても得は無く、mutex poison と連鎖 panic を防ぐのが目的）。`true` を返すと
-/// 正常停止、`false` は panic を捕捉したこと（観測・診断用）を表す。
+/// Call backend `stop()` inside [`catch_unwind`](std::panic::catch_unwind). Since stop returns `()`,
+/// swallow a panic and continue (propagating another panic during shutdown has no benefit; this
+/// prevents mutex poisoning and panic cascades). Returns `true` on normal stop and `false` if a panic
+/// was caught (for observation/diagnostics).
 ///
-/// `AssertUnwindSafe` の安全性は [`start_backend_catching`] と同じ（捕捉後は backend を
-/// 使い続けず、ガードは正常 drop される）。
+/// The safety rationale for `AssertUnwindSafe` is the same as in [`start_backend_catching`]: the
+/// backend is not reused after a caught panic, and the guard is dropped normally.
 #[must_use]
 fn stop_backend_catching(be: &mut Box<dyn CaptureBackend>) -> bool {
     std::panic::catch_unwind(AssertUnwindSafe(|| be.stop())).is_ok()
 }
 
 impl Stream {
-    /// 構成と backend からストリームを開く（まだキャプチャは始めない）。
+    /// Open a stream from the configuration and backend (capture has not started yet).
     ///
-    /// `config.chunk_ms` は固定契約上 20ms 前提。`ring_capacity_chunks` が
-    /// チャンクリング容量になる。backend の [`native_format`](CaptureBackend::native_format)
-    /// から [`Normalizer`] を構成する。
+    /// The fixed contract assumes `config.chunk_ms` is 20ms. `ring_capacity_chunks` sets the chunk
+    /// ring capacity. Configure [`Normalizer`] from the backend's
+    /// [`native_format`](CaptureBackend::native_format).
     pub fn open(config: StreamConfig, backend: Box<dyn CaptureBackend>) -> Result<Stream> {
         if config.ring_capacity_chunks == 0 {
             return Err(Error::InvalidArg("ring_capacity_chunks must be > 0".into()));
         }
-        // 入力ゲインは有限かつ 0.0 以上（NaN・無限大・負は InvalidArg）。
+        // Input gain must be finite and at least 0.0 (NaN, infinity, and negative values are InvalidArg).
         if !config.gain.is_finite() || config.gain < 0.0 {
             return Err(Error::InvalidArg(format!(
                 "gain must be finite and >= 0.0, got {}",
                 config.gain
             )));
         }
-        // 出力フォーマットが対応域か検証（非対応は UnsupportedFormat）。
+        // Validate that the output format is supported (otherwise UnsupportedFormat).
         config.output.validate()?;
         crate::validate_exclude_pids(&config)?;
-        // 副出力フォーマットも同様に検証する（設定時のみ）。
+        // Validate the secondary output format the same way, when configured.
         if let Some(sec) = config.secondary_output {
             sec.validate()?;
         }
@@ -292,7 +291,7 @@ impl Stream {
         }
 
         let (chunk_producer, chunk_consumer) = chunk_ring(config.ring_capacity_chunks);
-        // 副タップ設定時のみ専用リングを作る（公開 chunk_ring<AudioChunk> は不変）。
+        // Create a dedicated ring only when a secondary tap is configured (public chunk_ring<AudioChunk> stays unchanged).
         let (secondary_producer, secondary_consumer) = if config.secondary_output.is_some() {
             let (p, c) = secondary_chunk_ring(config.ring_capacity_chunks);
             (Some(p), Some(c))
@@ -334,30 +333,30 @@ impl Stream {
         })
     }
 
-    /// キャプチャを開始する。
+    /// Start capture.
     ///
-    /// RawRing を作って backend を起動し、取り込み/加工スレッドとウォッチドッグ
-    /// スレッドを起動する。既に開始済みなら何もしない。
+    /// Create RawRing, start the backend, and start the intake/processing and watchdog threads. Does
+    /// nothing if already started.
     pub fn start(&mut self) -> Result<()> {
         if self.started {
             return Ok(());
         }
         self.shared.stopping.store(false, Ordering::SeqCst);
 
-        // 新しい start はポーズ状態を引き継がない（前回 pause したまま stop していても、
-        // 再 start は通常状態から始める）。
+        // A new start does not carry over a paused state (even if the previous run was stopped while
+        // paused, restart in the normal state).
         self.shared.paused.store(false, Ordering::SeqCst);
 
-        // 新しい録音は 0 起点の時計を張り直す（前回録音のエポックを持ち越さない）。
+        // Start a new zero-based clock for this recording (do not carry over the previous epoch).
         self.shared
             .recording_epoch_ns
             .store(i64::MIN, Ordering::SeqCst);
 
-        // 初回 backend 起動: RawRing を作り sink を backend へ渡す。
+        // First backend startup: create RawRing and pass its sink to the backend.
         Self::open_backend_once(&self.shared)?;
 
-        // 取り込み/加工スレッドへ移すため chunk_producer を取り出す。
-        // poison でも回収して継続する（中の Option を take するだけ）。
+        // Take chunk_producer to move it to the intake/processing thread.
+        // Recover even if poisoned (only takes the inner Option).
         let chunk_producer = self
             .shared
             .chunk_producer
@@ -366,7 +365,7 @@ impl Stream {
             .take()
             .ok_or_else(|| Error::InvalidState("chunk producer already taken".into()))?;
 
-        // 副タップ設定時はその producer も取り出して取り込みスレッドへ移す。
+        // If the secondary tap is configured, take its producer too and move it to the intake thread.
         let secondary_producer = self
             .shared
             .secondary_producer
@@ -374,10 +373,10 @@ impl Stream {
             .unwrap_or_else(|e| e.into_inner())
             .take();
 
-        // 取り込み/加工スレッド。初期 native_format は shared から読む
-        // （以降は世代変化のたびに run_intake が shared を読み直して追従する）。
+        // Intake/processing thread. Read the initial native_format from shared state; run_intake
+        // rereads it after each generation change.
         let worker_shared = self.shared.clone();
-        // poison でも回収して継続（中の (u32, u16) を読むだけ）。
+        // Recover and continue even if poisoned (only reads the inner (u32, u16)).
         let initial_native = *self
             .shared
             .native_format
@@ -400,7 +399,7 @@ impl Stream {
             .map_err(|e| Error::Backend(format!("spawn intake thread: {e}")))?;
         self.worker = Some(worker);
 
-        // ウォッチドッグスレッド。
+        // Watchdog thread.
         let wd_shared = self.shared.clone();
         let watchdog = thread::Builder::new()
             .name("flexaudio-watchdog".into())
@@ -414,17 +413,17 @@ impl Stream {
         Ok(())
     }
 
-    /// キャプチャを停止し、全スレッドを join する。
+    /// Stop capture and join all threads.
     ///
-    /// 再入・二重 stop に安全。stop 後は [`poll_chunk`](Self::poll_chunk) で
-    /// 既にリングへ溜まったチャンクを取り切れる。
+    /// Safe for reentry and repeated stop calls. After stop, drain chunks already buffered in the
+    /// ring with [`poll_chunk`](Self::poll_chunk).
     pub fn stop(&mut self) {
-        // 停止フラグ → 全スレッドが次ループ頭で抜ける。
+        // Set the stop flag; all threads exit at the next loop head.
         self.shared.stopping.store(true, Ordering::SeqCst);
 
-        // backend を止めて生成スレッドを終わらせる（RT push を止める）。
-        // poison でも回収して stop を試みる。stop が panic しても catch_unwind で
-        // 握りつぶし、mutex を再 poison させず join へ進む（無言死させない）。
+        // Stop the backend to end its producer thread (stop RT pushes).
+        // Recover even if poisoned and attempt stop. If stop panics, catch_unwind swallows it so the
+        // mutex is not poisoned again and we can proceed to join (no silent death).
         {
             let mut be = self
                 .shared
@@ -434,7 +433,7 @@ impl Stream {
             let _ = stop_backend_catching(&mut be);
         }
 
-        // スレッド join。
+        // Join threads.
         if let Some(h) = self.worker.take() {
             let _ = h.join();
         }
@@ -445,21 +444,21 @@ impl Stream {
         self.started = false;
     }
 
-    /// キャプチャを一時停止する。
+    /// Temporarily pause capture delivery.
     ///
-    /// OS 側のキャプチャは動かしたまま、完成チャンクの配信だけを止める。停止中は
-    /// [`poll_chunk`](Self::poll_chunk) が新しいチャンクを返さない。内部では取り込みを続けて
-    /// デバイスを生かしておくので、再開は素早く、ウォッチドッグの失速判定も誤発火しない。
-    /// 既に停止中なら何もしない（多重呼び出し安全）。
+    /// Keep OS-side capture running but stop delivering completed chunks. While paused,
+    /// [`poll_chunk`](Self::poll_chunk) returns no new chunks. Intake continues internally to keep the
+    /// device active, enabling a quick resume and avoiding false watchdog stall reports. Does nothing
+    /// if already paused (safe to call repeatedly).
     ///
-    /// この呼び出しが返った時点で、取り込みスレッドが組み立て中だったチャンクは列へ入るか
-    /// 破棄される。既に列にある分を取り切れば、その後 [`poll_chunk`](Self::poll_chunk) は
-    /// 新しいチャンクを返さない。
+    /// When this call returns, any chunk being assembled by the intake thread has either been queued
+    /// or discarded. After draining chunks already queued, [`poll_chunk`](Self::poll_chunk) returns no
+    /// new chunks.
     ///
-    /// [`start`](Self::start) する前に呼んでもフラグは立つが、効くのは取り込みが回り始めてから。
+    /// Calling this before [`start`](Self::start) sets the flag, but it takes effect only once intake starts.
     pub fn pause(&self) {
-        // delivery を握ってからフラグを立てる。取り込みスレッドの push と同じロックなので、
-        // ここを出たあと「組み立て済みチャンクが後から列に入る」窓は無い。
+        // Set the flag while holding delivery. The intake thread uses the same lock for pushes, so no
+        // assembled chunk can enter the queue after this returns.
         let _g = self
             .shared
             .delivery
@@ -468,40 +467,40 @@ impl Stream {
         self.shared.paused.store(true, Ordering::SeqCst);
     }
 
-    /// [`pause`](Self::pause) を解除して配信を再開する。
+    /// Resume delivery after [`pause`](Self::pause).
     ///
-    /// 再開後、主・副それぞれのストリームで最初に届くチャンクへ
-    /// [`ChunkFlags::DISCONTINUITY`] を立てる（ポーズで音が時間的に飛んだことを消費側へ
-    /// 伝える）。各チャンクの `seq` はポーズ前後で連続し、ポーズ区間ぶんの無音は挿入しない。
-    /// 停止していなければ何もしない（多重呼び出し安全）。
+    /// After resume, mark the first chunk delivered on each stream (primary and secondary) with
+    /// [`ChunkFlags::DISCONTINUITY`] to signal the time gap to consumers. Each stream's `seq` remains
+    /// continuous across the pause; no silence is inserted for the paused interval. Does nothing if
+    /// not paused (safe to call repeatedly).
     pub fn resume(&self) {
-        // delivery を握って世代更新→paused=false を一つの enqueue 境界にする。
-        // intake は同じロック内で世代を読むので、resume 後に最初に入る各タップの
-        // チャンクを取りこぼさず DISCONTINUITY として識別できる。
+        // Hold delivery while advancing the generation and setting paused=false, making this one
+        // enqueue boundary. Intake reads the generation under the same lock, so the first chunk for
+        // each tap after resume is reliably marked DISCONTINUITY.
         let _g = self
             .shared
             .delivery
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // 実際にポーズ中だったときだけ世代を進める（ポーズしていないのに resume を
-        // 呼んでも余計な DISCONTINUITY を出さない）。
+        // Advance the generation only if actually paused (resume on an unpaused stream must not add
+        // an unnecessary DISCONTINUITY).
         if self.shared.paused.load(Ordering::SeqCst) {
             self.shared.resume_generation.fetch_add(1, Ordering::SeqCst);
             self.shared.paused.store(false, Ordering::SeqCst);
         }
     }
 
-    /// 現在ポーズ中かどうか。
+    /// Whether currently paused.
     pub fn is_paused(&self) -> bool {
         self.shared.paused.load(Ordering::SeqCst)
     }
 
-    /// 入力ゲイン（線形倍率）を変更する。1.0=そのまま、2.0=約+6dB、0.0=無音。
+    /// Change input gain (linear multiplier). 1.0 = unchanged, 2.0 ≈ +6 dB, 0.0 = silence.
     ///
-    /// 録音中いつでも呼べて、次の完成チャンクから効く（チャンクは 20ms 粒度）。
-    /// 乗算後のサンプルは `-1.0..=1.0` にクランプされる。1.0 のときはサンプルに
-    /// 一切触れない（バイト完全パススルー）。有限かつ 0.0 以上でなければ
-    /// [`Error::InvalidArg`]（現在値は変わらない）。
+    /// May be called at any time during recording; takes effect from the next completed chunk (20 ms
+    /// granularity). Samples are clamped to `-1.0..=1.0` after multiplication. At 1.0, samples are
+    /// untouched (byte-for-byte passthrough). Values must be finite and >= 0, or
+    /// [`Error::InvalidArg`] is returned and the current value remains unchanged.
     pub fn set_gain(&self, gain: f32) -> Result<()> {
         if !gain.is_finite() || gain < 0.0 {
             return Err(Error::InvalidArg(format!(
@@ -514,64 +513,65 @@ impl Stream {
         Ok(())
     }
 
-    /// 現在の入力ゲイン（線形倍率）。
+    /// Current input gain (linear multiplier).
     pub fn gain(&self) -> f32 {
         f32::from_bits(self.shared.gain_bits.load(Ordering::Relaxed))
     }
 
-    /// 完成済みチャンクを 1 つ取り出す（非ブロッキング）。無ければ `None`。
+    /// Retrieve one completed chunk (non-blocking). Returns `None` if none is available.
     ///
-    /// 返るチャンクは出力フォーマット（`config.output`）の interleaved `f32`。
-    /// チャンクは時間ベース 20ms 固定で `data.len() == frames * output.channels`。
-    /// 既定 `{48000, 2}` なら `frames == 960`（`data.len() == 1920`）。
-    /// `peak`/`rms` は最終 data に対して算出済み。`seq` は単調増加。
+    /// Returned chunks contain interleaved `f32` in the output format (`config.output`). Chunks are
+    /// fixed at 20 ms, with `data.len() == frames * output.channels`. With the default `{48000, 2}`,
+    /// `frames == 960` (`data.len() == 1920`). `peak`/`rms` are computed from final data. `seq`
+    /// increases monotonically.
     pub fn poll_chunk(&mut self) -> Option<AudioChunk> {
         self.chunk_consumer.try_pop()
     }
 
-    /// 完成済みの副タップチャンクを 1 つ取り出す（非ブロッキング）。無ければ `None`。
+    /// Retrieve one completed secondary tap chunk (non-blocking). Returns `None` if none is available.
     ///
-    /// 副タップは `config.secondary_output` が `Some` のときだけ生成される。未設定なら
-    /// 常に `None`。副チャンクは主 [`AudioChunk`] と同じ録音時計（0 起点）に乗る `pts_ns`
-    /// を持つが、値は主とは独立で、副 Stage2 のリサンプラ群遅延ぶん主より 20〜60ms 遅れる。
-    /// 主↔副の対応は `pts_ns`（時刻）で取ること（`seq` は各タップ独立カウンタ）。
+    /// Secondary chunks are generated only when `config.secondary_output` is `Some`; otherwise this
+    /// always returns `None`. Secondary PTS values use the same zero-based recording clock as the
+    /// primary [`AudioChunk`], but are independent and lag the primary by 20–60 ms due to group delay
+    /// in the secondary Stage2 resampler. Match primary and secondary by `pts_ns` (time), since each
+    /// tap has its own `seq` counter.
     pub fn poll_secondary(&mut self) -> Option<SecondaryChunk> {
         self.secondary_consumer.as_mut().and_then(|c| c.try_pop())
     }
 
-    /// 内部正規形へのノイズ抑制（RNNoise）を有効/無効にする。
+    /// Enable or disable noise suppression (RNNoise) in the internal canonical format.
     ///
-    /// [`start`](Self::start) の前に呼ぶこと（取り込みスレッドが Normalizer を構築する
-    /// ときに反映される。録音中の変更は次の世代交代＝ソース切替/自動復帰で反映される）。
-    /// 有効時は 48kHz/stereo の内部正規形へ 1 度だけ適用され、主・副の両タップが除去済み
-    /// 音声を受ける（+10ms の固定遅延）。core は denoise 非依存で、この facade が実装を
-    /// 差し込む。
+    /// Call before [`start`](Self::start) (applied when the intake thread builds Normalizer; changes
+    /// during recording take effect on the next generation change, a source switch or automatic
+    /// recovery). When enabled, denoise runs once on the 48kHz/stereo internal canonical format, so
+    /// both taps receive denoised audio (+10ms fixed latency). Core does not depend on denoise; this
+    /// facade injects the implementation.
     pub fn set_denoise(&self, enabled: bool) {
         self.shared.denoise_enabled.store(enabled, Ordering::SeqCst);
     }
 
-    /// 未配信イベントを 1 つ取り出す（非ブロッキング）。無ければ `None`。
+    /// Retrieve one undelivered event (non-blocking). Returns `None` if none is available.
     pub fn poll_event(&mut self) -> Option<Event> {
         self.events.lock().ok().and_then(|mut q| q.pop_front())
     }
 
-    /// これまでにチャンクリングが DROP_OLDEST で捨てた累計チャンク数。
+    /// Total chunks discarded by the chunk ring through DROP_OLDEST.
     pub fn dropped_chunks(&self) -> u64 {
         self.chunk_consumer.dropped_count()
     }
 
-    /// 現在の構成への参照。
+    /// Reference to the current configuration.
     pub fn config(&self) -> &StreamConfig {
         &self.config
     }
 
-    /// 現在の backend のネイティブフォーマット `(sample_rate, channels)`。
+    /// Native format `(sample_rate, channels)` of the current backend.
     ///
-    /// open 時に backend から取得した値。ウォッチドッグ復帰では不変だが、
-    /// [`switch_source`](Self::switch_source) でソースを切り替えると新 backend の
-    /// 値に更新される。表示・診断用（出力フォーマットは `config().output`）。
+    /// Value obtained from the backend at open. Unchanged on watchdog recovery, but updated to the
+    /// new backend's value when [`switch_source`](Self::switch_source) changes the source. For display
+    /// and diagnostics (output format is `config().output`).
     pub fn native_format(&self) -> (u32, u16) {
-        // poison でも回収して値を読む（連鎖 panic させない）。
+        // Recover and read the value even if poisoned (avoid a panic cascade).
         *self
             .shared
             .native_format
@@ -579,28 +579,27 @@ impl Stream {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    // --- 内部 ---
+    // --- Internal ---
 
-    /// 現 `shared.backend` を（再）start し、新しい RawRing/RawConsumer を共有へ
-    /// 載せて世代を進める。初回起動・ウォッチドッグ再オープンの双方で使う。
+    /// (Re)start the current `shared.backend`, install a new RawRing/RawConsumer in shared state, and
+    /// advance the generation. Used for both initial startup and watchdog reopen.
     ///
-    /// 手順:
-    /// 1. 現 backend の [`native_format`](CaptureBackend::native_format) を取得し
-    ///    `shared.native_format` を更新（同一 backend の再オープンでは不変、
-    ///    将来ここを別 backend で呼んでも追従する）。
-    /// 2. その rate/ch で新しい RawRing を作る（旧 RawRing の format 残骸を持ち込ま
-    ///    ない＝位相破壊を避ける）。
-    /// 3. backend を start。
-    /// 4. 新 RawConsumer を共有へ載せ替え（旧 consumer は drop）、世代を ++。
-    /// 5. `last_sample_ns` を now にして即失速判定を避ける。
+    /// Steps:
+    /// 1. Read the current backend's [`native_format`](CaptureBackend::native_format) and update
+    ///    `shared.native_format` (unchanged when reopening the same backend, but this also handles a
+    ///    different backend if called that way in the future).
+    /// 2. Create a new RawRing with that rate/ch (do not carry over format residue from the old ring,
+    ///    which would damage phase).
+    /// 3. Start the backend.
+    /// 4. Install the new RawConsumer in shared state (drop the old consumer) and increment generation.
+    /// 5. Set `last_sample_ns` to now to avoid an immediate stall check.
     ///
-    /// backend ロックは start 時のみ取る（呼び出し側がロックを保持していない
-    /// 前提）。低レベルな切替（[`switch_backend`](Self::switch_backend)）は
-    /// backend を直接差し替えるため本関数を経由しない（旧ソース復帰の局面でのみ
-    /// 本関数を再利用する）。
+    /// Acquire the backend lock only while starting (the caller must not hold the lock). The
+    /// low-level switch ([`switch_backend`](Self::switch_backend)) directly replaces the backend and
+    /// does not use this function, except when restoring the old source after a failed switch.
     fn open_backend_once(shared: &Arc<SharedState>) -> Result<()> {
-        // 現 backend のネイティブフォーマットを取得して shared へ反映する。
-        // poison でも回収して継続（backend ロックは start を跨ぐため poison しうる）。
+        // Read the current backend's native format and update shared state.
+        // Recover and continue if poisoned (the backend lock spans start and may be poisoned).
         let (rate, channels) = {
             let be = shared.backend.lock().unwrap_or_else(|e| e.into_inner());
             be.native_format()
@@ -613,21 +612,21 @@ impl Stream {
             *nf = (rate, channels);
         }
 
-        // 新しい RawRing（旧 format の残骸を持ち込まない）。
+        // New RawRing (do not carry over residue from the old format).
         let (producer, consumer) = raw_ring(RAW_RING_SAMPLES);
         let sink = RawSink::new(producer, rate, channels);
 
         {
-            // poison でも回収。backend が start() で panic しても catch_unwind が
-            // mutex poison 前に Error::Backend へ変換して返すので、ここで `?` により
-            // 呼び出し側（start()=呼び元へ Err / watchdog=Event::Error）へ伝わる。
+            // Recover even if poisoned. If backend start() panics, catch_unwind converts it to
+            // Error::Backend before mutex poisoning, so `?` returns it to the caller (start() returns
+            // Err / watchdog emits Event::Error).
             let mut be = shared.backend.lock().unwrap_or_else(|e| e.into_inner());
             start_backend_catching(&mut be, sink)?;
         }
 
-        // 新しい consumer を共有へ載せ、世代を進める（旧 consumer は drop）。
+        // Install the new consumer in shared state and advance the generation (drop the old consumer).
         {
-            // poison でも回収して載せ替える（中の Option を差し替えるだけ）。
+            // Recover and install it even if poisoned (only replace the inner Option).
             let mut rc = shared
                 .raw_consumer
                 .lock()
@@ -636,53 +635,53 @@ impl Stream {
         }
         shared.raw_generation.fetch_add(1, Ordering::SeqCst);
 
-        // 起動直後を「最後に到着した時刻」として扱い、即失速判定を避ける。
+        // Treat startup as the last sample arrival to avoid an immediate stall check.
         shared
             .last_sample_ns
             .store(monotonic_now_ns(), Ordering::SeqCst);
         Ok(())
     }
 
-    /// 低レベルなソース切替。現在の backend を新しい backend へ差し替え、チャンク
-    /// ストリーム（seq・PTS）の連続性を保ったまま入力ソースを変える。
+    /// Low-level source switch. Replace the current backend with a new one while preserving chunk
+    /// stream continuity (seq and PTS).
     ///
-    /// `seq` は取り込みスレッドのローカル変数で backend にも `SharedState` にも無いので、
-    /// ここで触らなければ差し替え前後で連続する。PTS は取り込みスレッドが世代変化を
-    /// 検知して `Normalizer`/`ClockNormalizer` を作り直し、新ソース初回サンプルの実時刻で
-    /// 再アンカーするので単調を保つ。
+    /// `seq` is local to the intake thread and is not stored in the backend or `SharedState`, so it
+    /// remains continuous if left untouched here. On a generation change, the intake thread rebuilds
+    /// `Normalizer`/`ClockNormalizer` and re-anchors PTS to the actual arrival time of the new
+    /// source's first sample, preserving monotonicity.
     ///
-    /// 手順（generation++ は最後に 1 回だけ・全 Atomic は SeqCst）:
-    /// - 未 start なら [`Error::InvalidState`]。
-    /// - `switching = true`（ウォッチドッグの並行再オープンを止める）。
-    /// - backend ロック下で旧 backend を `stop()` → 新 backend の native を取得して
-    ///   `shared.native_format` 更新 → 新 RawRing → `new_backend.start(sink)`。
-    ///   - 成功: backend を新へ差し替え、新 consumer を載せ替え（旧 drop）。
-    ///   - 失敗: 旧 backend を [`open_backend_once`](Self::open_backend_once) で
-    ///     再 start して旧ソースを継続（連続性を壊さない）。`discontinuity_pending`
-    ///     を立て世代を ++、`switching=false` にして `Err` を返す。
-    /// - 成功時: `discontinuity_pending = true`（意図的切替なので RECOVERED は付けない）
-    ///   → `generation += 1`（最後に 1 回だけ）→ `last_sample_ns = now` →
-    ///   `switching = false` → `Ok`。
+    /// Steps (increment generation once at the end; all atomics use SeqCst):
+    /// - If not started, return [`Error::InvalidState`].
+    /// - Set `switching = true` (prevent concurrent watchdog reopen).
+    /// - Under the backend lock, stop the old backend → read the new backend's native format and
+    ///   update `shared.native_format` → create a new RawRing → call `new_backend.start(sink)`.
+    ///   - On success, replace the backend and install the new consumer (drop the old one).
+    ///   - On failure, restart the old backend with [`open_backend_once`](Self::open_backend_once) and
+    ///     continue the old source (preserve continuity). Set `discontinuity_pending`, increment
+    ///     generation, set `switching=false`, and return `Err`.
+    /// - On success, set `discontinuity_pending = true` (intentional switch, so do not set RECOVERED)
+    ///   → increment generation once at the end → set `last_sample_ns = now` → set `switching = false`
+    ///   → return `Ok`.
     ///
-    /// [`Box<dyn CaptureBackend>`] を直接受け取るので、mock backend で切替挙動を検証できる。
-    /// 高レベル入口は [`switch_source`](Self::switch_source)。
+    /// Takes [`Box<dyn CaptureBackend>`] directly so mock backends can verify switch behavior. The
+    /// high-level entry point is [`switch_source`](Self::switch_source).
     ///
-    /// `#[doc(hidden)] pub`: 公開 API ではない（ドキュメントに出さない）が、別クレートの
-    /// 統合テスト（`tests/integration.rs`）から MockBackend を渡して呼べるようにする。
+    /// `#[doc(hidden)] pub`: not part of the public API (omitted from docs), but allows integration
+    /// tests in another crate (`tests/integration.rs`) to call this with a MockBackend.
     #[doc(hidden)]
     pub fn switch_backend(&mut self, new_backend: Box<dyn CaptureBackend>) -> Result<()> {
         if !self.started {
             return Err(Error::InvalidState(
-                "switch_backend は start 済みのストリームでのみ可能".into(),
+                "switch_backend is only available on a started stream".into(),
             ));
         }
 
-        // 切替開始: ウォッチドッグの失速→再オープンと衝突しないよう先に止める。
+        // Begin switch: pause the watchdog first to avoid racing its stall recovery.
         self.shared.switching.store(true, Ordering::SeqCst);
 
-        // backend ロック下で旧 stop → 新 start を一気に行う。
-        // poison でも回収して継続する（backend ロックは stop/start を跨ぐため poison
-        // しうる。回収できれば差し替え処理はそのまま正しく行える）。
+        // Under the backend lock, stop the old backend and start the new one as one operation.
+        // Recover even if poisoned (the lock spans stop/start and may be poisoned; recovering it lets
+        // the replacement proceed correctly).
         {
             let mut be = self
                 .shared
@@ -690,33 +689,33 @@ impl Stream {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
 
-            // 旧 backend を止める（RT push を止める）。panic しても catch_unwind で
-            // 握りつぶし、mutex poison・連鎖 panic を避けて切替を続行する。
+            // Stop the old backend (stop RT pushes). If it panics, catch_unwind swallows it so the
+            // switch can continue without mutex poisoning or panic cascades.
             let _ = stop_backend_catching(&mut be);
 
-            // 新 backend のネイティブフォーマット。
+            // Native format of the new backend.
             let (rate, channels) = new_backend.native_format();
 
-            // 新 RawRing（旧 format 残骸を持ち込まない）。
+            // New RawRing (do not carry over old format residue).
             let (producer, consumer) = raw_ring(RAW_RING_SAMPLES);
             let sink = RawSink::new(producer, rate, channels);
 
-            // 新 backend を start。panic は catch_unwind が Error::Backend へ変換する
-            // ので、下の Err 分岐（旧ソース復帰 → Err 返却）に乗る。失敗時は旧ソースへ復帰。
+            // Start the new backend. catch_unwind converts a panic to Error::Backend, so it follows
+            // the Err branch below (restore old source → return Err). Restore the old source on failure.
             let mut new_backend = new_backend;
             match start_backend_catching(&mut new_backend, sink) {
                 Ok(()) => {
-                    // 順序が効く。取り込みスレッドは世代をロック外で load してから
-                    // raw_consumer を lock して pop する。新 consumer を先に載せると、
-                    // 世代を ++ する前に新ソースの native サンプルが旧 normalizer へ流れ込み、
-                    // 位相が壊れる。そこで native_format 更新 → 世代 ++（+ DISCONTINUITY 等）
-                    // → 最後に consumer/backend を差し替える順にする。こうすれば取り込み側が
-                    // 新 consumer を観測する時には必ず新世代が見え、normalizer を作り直して
-                    // から pop する。
+                    // Ordering matters. Intake loads generation outside the lock, then locks
+                    // raw_consumer and pops. Installing the new consumer first could feed native
+                    // samples from the new source into the old Normalizer before generation advances,
+                    // corrupting phase. Therefore update native_format → increment generation (and
+                    // set DISCONTINUITY, etc.) → replace consumer/backend last. When intake observes
+                    // the new consumer, the new generation is visible and it rebuilds Normalizer
+                    // before popping.
                     //
-                    // shared.native_format を新ソースの値へ更新。
+                    // Update shared.native_format to the new source's value.
                     {
-                        // poison でも回収（中の (u32, u16) を更新するだけ）。
+                        // Recover even if poisoned (only update the inner (u32, u16)).
                         let mut nf = self
                             .shared
                             .native_format
@@ -724,23 +723,23 @@ impl Stream {
                             .unwrap_or_else(|e| e.into_inner());
                         *nf = (rate, channels);
                     }
-                    // 意図的切替なので RECOVERED は付けず DISCONTINUITY のみ。
+                    // Intentional switch: set DISCONTINUITY only, not RECOVERED.
                     self.shared
                         .discontinuity_pending
                         .store(true, Ordering::SeqCst);
-                    // 起動直後を最終到着時刻に（即失速判定を避ける）。
+                    // Treat startup as the last arrival time (avoid an immediate stall check).
                     self.shared
                         .last_sample_ns
                         .store(monotonic_now_ns(), Ordering::SeqCst);
-                    // 世代を進める（最後に 1 回だけ）。consumer 差し替えより前に行い、
-                    // 新 consumer 観測時には必ず新世代が見えるようにする。
+                    // Advance generation once, before replacing the consumer, so the new generation
+                    // is visible when the new consumer is observed.
                     self.shared.raw_generation.fetch_add(1, Ordering::SeqCst);
 
-                    // backend を新へ差し替え（旧 backend は drop）。
+                    // Replace with the new backend (drop the old backend).
                     *be = new_backend;
-                    // 新 consumer を共有へ載せ替え（旧 consumer は drop）。最後に行う。
+                    // Install the new consumer in shared state (drop the old consumer). Do this last.
                     {
-                        // poison でも回収（Option を差し替えるだけ）。
+                        // Recover even if poisoned (only replace the Option).
                         let mut rc = self
                             .shared
                             .raw_consumer
@@ -750,55 +749,54 @@ impl Stream {
                     }
                 }
                 Err(e) => {
-                    // 新ソース起動失敗 → 旧 backend（`*be` のまま）を再 start して継続。
-                    // backend ロックを保持したままだと open_backend_once が再ロックで
-                    // デッドロックするため、ここで一旦解放してから復帰させる。
+                    // New source startup failed → restart the old backend (still `*be`) and continue.
+                    // Release the backend lock before restoring it, or open_backend_once will lock it
+                    // again and deadlock.
                     drop(be);
-                    // 旧 backend を再オープン（native_format は旧 backend の値へ戻る）。
+                    // Reopen the old backend (native_format returns to the old backend's value).
                     let _ = Self::open_backend_once(&self.shared);
-                    // 旧ソース再開も「不連続」扱いにする（一瞬途切れたため）。
+                    // Resuming the old source is also discontinuous (it was interrupted briefly).
                     self.shared
                         .discontinuity_pending
                         .store(true, Ordering::SeqCst);
-                    // open_backend_once が generation を ++ 済み。switching を戻して Err。
+                    // open_backend_once already incremented generation. Reset switching and return Err.
                     self.shared.switching.store(false, Ordering::SeqCst);
                     return Err(e);
                 }
             }
         }
 
-        // --- 切替成功 ---
-        // generation++・native_format 更新・各フラグは backend ロック下で実施済み
-        // （新 consumer 観測前に新世代が見えるよう順序付け）。ここでは switching を
-        // 戻すだけ。
+        // --- Switch succeeded ---
+        // Generation increment, native_format update, and flags were handled under the backend lock
+        // (ordered so the new generation is visible before the new consumer). Only reset switching here.
         self.shared.switching.store(false, Ordering::SeqCst);
         Ok(())
     }
 
-    /// 録音を止めずに入力ソース（mic/system/process）を切り替える高レベル入口。
+    /// High-level entry point to switch input source (mic/system/process) without stopping recording.
     ///
-    /// `new_config` からソース別バックエンドを `build_backend`（facade 内 private）で
-    /// 構築し（失敗時は旧ソース無傷のまま `Err`）、[`switch_backend`](Self::switch_backend)
-    /// で差し替える。出力フォーマット（`output`）は切り替えられない（チャンクの
-    /// frames/data.len が変わると連続ストリームが壊れるため）。変更要求は
-    /// [`Error::InvalidArg`] で弾く。
+    /// Build the source-specific backend from `new_config` with `build_backend` (private to the
+    /// facade); on failure, return `Err` with the old source untouched. Replace it with
+    /// [`switch_backend`](Self::switch_backend). The output format (`output`) cannot change because
+    /// changes to chunk frames/data.len would break the continuous stream. Reject such requests with
+    /// [`Error::InvalidArg`].
     ///
-    /// 成功時、`config` の可変項目（`kind` / `device_id` / `target_pid` / `mode`
-    /// / `exclude_self` / `exclude_pids`）だけを新しい値へ更新する。`output` / `chunk_ms`
-    /// / `ring_capacity_chunks` は据え置く。`new_config.gain` も無視する（ゲインは
-    /// ストリームの状態であり、切替では変わらない。変更は [`set_gain`](Self::set_gain)）。
+    /// On success, update only the mutable `config` fields (`kind` / `device_id` / `target_pid` /
+    /// `mode` / `exclude_self` / `exclude_pids`). Keep `output` / `chunk_ms` /
+    /// `ring_capacity_chunks` unchanged. Ignore `new_config.gain` too (gain is stream state and does
+    /// not change on source switch; change it with [`set_gain`](Self::set_gain)).
     ///
-    /// # エラー
-    /// - 未 start → [`Error::InvalidState`]。
-    /// - `output` 変更要求 → [`Error::InvalidArg`]。
-    /// - 新ソースの backend 構築失敗（process の PID 欠落・非対応 OS 等）→
-    ///   `build_backend`（facade 内 private）由来のエラー（旧ソースは無傷）。
-    /// - 新 backend の start 失敗 → [`switch_backend`](Self::switch_backend) が
-    ///   旧ソースへ復帰したうえで当該エラーを返す。
+    /// # Errors
+    /// - Not started → [`Error::InvalidState`].
+    /// - Request to change `output` → [`Error::InvalidArg`].
+    /// - New backend construction fails (missing process PID, unsupported OS, etc.) → error from
+    ///   `build_backend` (private to the facade); the old source remains untouched.
+    /// - New backend start fails → [`switch_backend`](Self::switch_backend) restores the old source
+    ///   and returns the error.
     pub fn switch_source(&mut self, new_config: StreamConfig) -> Result<()> {
         if !self.started {
             return Err(Error::InvalidState(
-                "switch_source は start 済みのストリームでのみ可能".into(),
+                "switch_source is only available on a started stream".into(),
             ));
         }
         if new_config.output != self.config.output {
@@ -806,18 +804,18 @@ impl Stream {
                 "output format cannot change during switch_source".into(),
             ));
         }
-        // 副タップのフォーマットも open 時固定（切替中に副 Normalizer/リングを再構成しない）。
+        // The secondary tap format is also fixed at open (do not rebuild its Normalizer/ring on switch).
         if new_config.secondary_output != self.config.secondary_output {
             return Err(Error::InvalidArg(
                 "secondary output format cannot change during switch_source".into(),
             ));
         }
-        // 新ソースの backend を構築（失敗時は旧ソース無傷のまま早期 return）。
+        // Build the new source backend (on failure, return early with the old source untouched).
         crate::validate_exclude_pids(&new_config)?;
         let backend = crate::build_backend(&new_config)?;
-        // 差し替え（連続性は switch_backend が保証）。
+        // Swap it in (switch_backend guarantees continuity).
         self.switch_backend(backend)?;
-        // 成功時のみ config の可変項目を更新（output 等は据え置き）。
+        // Update mutable config fields only on success (keep output and other fields unchanged).
         self.config = StreamConfig {
             kind: new_config.kind,
             device_id: new_config.device_id,
@@ -839,10 +837,11 @@ impl Drop for Stream {
     }
 }
 
-/// 録音開始 0 起点の絶対時刻へ写す。最初に配信される（主）チャンクの算出 pts を録音
-/// エポックとして 1 度だけ確定し（番兵 `i64::MIN` から書き換え）、以後全チャンクから引く。
-/// 取り込みスレッドだけが書くので競合しない。以後 reopen/switch をまたいでも固定なので、
-/// pts は 0 起点で録音全体を通して連続する。
+/// Convert to an absolute timestamp starting at zero when recording begins. Set the computed PTS of
+/// the first delivered (primary) chunk as the recording epoch once (replacing the `i64::MIN`
+/// sentinel), then subtract it from every chunk. Only the intake thread writes this, so there is no
+/// race. The epoch remains fixed across reopen/switch, keeping PTS continuous from zero throughout
+/// the recording.
 fn apply_epoch(shared: &SharedState, raw_pts: i64) -> i64 {
     let epoch = shared.recording_epoch_ns.load(Ordering::SeqCst);
     if epoch == i64::MIN {
@@ -853,8 +852,8 @@ fn apply_epoch(shared: &SharedState, raw_pts: i64) -> i64 {
     }
 }
 
-/// 完成チャンクの `data` へ入力ゲイン（線形倍率）を適用する。1.0 のときはサンプルに一切
-/// 触れない（バイト完全パススルー）。1.0 以外なら各サンプルへ乗算し ±1.0 にクランプする。
+/// Apply input gain (linear multiplier) to a completed chunk's `data`. At 1.0, leave samples
+/// untouched (byte-for-byte passthrough). Otherwise multiply each sample and clamp to ±1.0.
 fn apply_gain(data: &mut [f32], gain: f32) {
     if gain != 1.0 {
         for x in data.iter_mut() {
@@ -863,14 +862,14 @@ fn apply_gain(data: &mut [f32], gain: f32) {
     }
 }
 
-/// 取り込み/加工スレッド本体。
+/// Intake/processing thread body.
 ///
-/// RawConsumer を pop → [`Normalizer`]（Stage1 共有 → 主/副の各 Stage2 へ分岐）へ投入 →
-/// 完成チャンクへ `seq`・録音 0 起点 pts・peak/rms・不連続フラグを付与 → 主/副リングへ
-/// push。世代変化（再オープン / ソース切替）を検知したら Normalizer/Clock を作り直し、
-/// 次チャンクへ RECOVERED|DISCONTINUITY を立てる。RawRing オーバーフロー（キャプチャ側の
-/// 欠落）も検知し、次の主・副チャンク両方へ DISCONTINUITY を立てる。停止時は Normalizer を
-/// flush して末尾テールを吐き切る。
+/// Pop from RawConsumer → feed [`Normalizer`] (shared Stage1 → split to primary/secondary Stage2)
+/// → add `seq`, recording-zero-based PTS, peak/rms, and discontinuity flags to completed chunks →
+/// push to the primary/secondary rings. On a generation change (reopen/source switch), rebuild the
+/// Normalizer/Clock and set RECOVERED|DISCONTINUITY on the next chunk. Detect RawRing overflow
+/// (capture-side data loss) too, and set DISCONTINUITY on the next primary and secondary chunks.
+/// Flush the Normalizer on stop to emit its final tail.
 fn run_intake(
     shared: Arc<SharedState>,
     mut chunk_producer: ChunkProducer,
@@ -880,7 +879,8 @@ fn run_intake(
     secondary_output: Option<OutputFormat>,
 ) {
     let (mut rate, mut channels) = initial_native;
-    // Normalizer 構築失敗（rubato 構築失敗等）は無言で死なせず Event::Error を出して終了。
+    // If Normalizer construction fails (for example, rubato setup), emit Event::Error and exit rather
+    // than dying silently.
     let mut normalizer = match build_normalizer(&shared, rate, channels, output, secondary_output) {
         Ok(n) => n,
         Err(e) => {
@@ -889,31 +889,32 @@ fn run_intake(
         }
     };
     let mut clock = ClockNormalizer::new();
-    let mut seq: u64 = 0; // 主タップ seq。
-    let mut sec_seq: u64 = 0; // 副タップ seq（主とは別カウンタ）。
+    let mut seq: u64 = 0; // Primary tap sequence number.
+    let mut sec_seq: u64 = 0; // Secondary tap sequence number (separate from primary).
     let mut current_generation = shared.raw_generation.load(Ordering::SeqCst);
-    // resume 世代もタップごとに独立して観測する。副タップは主と別リング・別 consumer
-    // なので、主の観測済み世代を流用すると副の最初のチャンクに印を付け損ねる。
-    // 新しい intake は世代 0 から開始する。start() と worker 起動の間に resume() が
-    // 入っても、その resume は最初の配信に反映しなければならないため、共有の現在値で
-    // 初期化せず、その遷移を見逃さない。
+    // Observe resume generations independently per tap. The secondary tap has a separate ring and
+    // consumer, so reusing the primary's observed generation could miss marking its first chunk.
+    // A new intake starts at generation 0. If resume() occurs between start() and worker startup, it
+    // must still affect the first delivery, so do not initialize from the shared current value and
+    // miss that transition.
     let mut primary_resume_generation = 0;
     let mut secondary_resume_generation = 0;
-    // RawRing オーバーフロー累計の前回観測値（世代交代でリングが作り直され 0 に戻る）。
+    // Previously observed cumulative RawRing overflows (the ring is recreated and reset to 0 on a
+    // generation change).
     let mut overflow_baseline: u64 = 0;
 
-    // 不連続 pending をタップ毎に持つ（共有 AtomicBool を両タップのローカルへ扇状に配る）。
-    // rec_* は RECOVERED|DISCONTINUITY、disc_* は DISCONTINUITY のみ。持ち越すことで
-    // ポーズ中に破棄しても resume 後の最初のチャンクへ確実に載る。
+    // Keep pending discontinuities per tap (fan out the shared AtomicBool to both local tap states).
+    // rec_* means RECOVERED|DISCONTINUITY; disc_* means DISCONTINUITY only. Carry them forward so
+    // they are applied to the first chunk after resume even if chunks are discarded while paused.
     let mut rec_primary = false;
     let mut rec_secondary = false;
     let mut disc_primary = false;
     let mut disc_secondary = false;
 
-    // タップ毎の最後に配信した pts。契約（録音 0 起点・非減少）を保証するため、各
-    // チャンクの pts をこの値と 0 でクランプする。起動直後は各タップの PTS 外挿がわずかに
-    // 負へ振れうる（主エポック基準・数 ms）ので 0 で下限を切る。世代交代をまたぐ後退も
-    // ここで吸収する。
+    // Last delivered PTS per tap. Clamp each chunk's PTS against this value and 0 to guarantee the
+    // contract (recording starts at zero and timestamps never decrease). Immediately after startup,
+    // each tap's PTS extrapolation can be slightly negative (a few ms relative to the primary epoch),
+    // so use 0 as the lower bound. This also absorbs regressions across generation changes.
     let mut last_pts_primary: i64 = 0;
     let mut last_pts_secondary: i64 = 0;
 
@@ -922,15 +923,16 @@ fn run_intake(
         .map(|f| f.channels.max(1) as usize)
         .unwrap_or(1);
 
-    // pop 用スクラッチ（RawRing 容量ぶん確保。1 回で全量取り出せる）。
+    // Pop scratch buffer (sized to the RawRing capacity so the whole ring can be drained in one call).
     let mut scratch = vec![0.0f32; RAW_RING_SAMPLES];
 
     loop {
         let stopping = shared.stopping.load(Ordering::SeqCst);
 
-        // 世代変化（再オープン / ソース切替）検知 → 新しいソースへリセット。native_format が
-        // 変わり得るので shared を読み直し、第 1 段（native 依存）の Normalizer を作り直す。
-        // 録音エポックはここでリセットしない（0 起点で世代跨ぎ連続）。
+        // Detect a generation change (reopen/source switch) and reset for the new source. Since
+        // native_format may change, reread shared state and rebuild the native-dependent Stage 1
+        // Normalizer. Do not reset the recording epoch here; timestamps stay continuous from zero
+        // across generations.
         let gen = shared.raw_generation.load(Ordering::SeqCst);
         if gen != current_generation {
             current_generation = gen;
@@ -950,12 +952,13 @@ fn run_intake(
                 }
             };
             clock = ClockNormalizer::new();
-            // 新しい RawConsumer は overflow を 0 起点から数える（偽の巨大差分を避ける）。
+            // The new RawConsumer counts overflows from 0 (avoid a falsely huge delta).
             overflow_baseline = 0;
         }
 
-        // 共有 pending をタップ毎ローカルへ配る。切替中は switching でウォッチドッグを止める
-        // ので両方同時には立たないが、立っても OR で合成される。
+        // Fan out shared pending flags to each tap's local state. The watchdog is stopped by
+        // switching during a source switch, so both flags should not be set together; if they are,
+        // they are combined with OR.
         if shared.recovered_pending.swap(false, Ordering::SeqCst) {
             rec_primary = true;
             rec_secondary = true;
@@ -965,7 +968,7 @@ fn run_intake(
             disc_secondary = true;
         }
 
-        // RawRing から取り出して Normalizer へ。overflow（キャプチャ側の欠落）も観測する。
+        // Drain RawRing into the Normalizer and observe overflows (capture-side data loss).
         let mut produced_any = false;
         let mut push_err: Option<Error> = None;
         let mut overflow_now = overflow_baseline;
@@ -979,7 +982,7 @@ fn run_intake(
                 overflow_now = rc.overflow_count();
                 if got > 0 {
                     let samples = &scratch[..got];
-                    // device PTS: ネイティブ SR を基準にした単調近似（到着時刻）。
+                    // Device PTS: monotonic approximation based on the native sample rate (arrival time).
                     let device_pts = monotonic_now_ns();
                     let norm_pts = clock.normalize(device_pts);
                     if let Err(e) = normalizer.push(samples, norm_pts) {
@@ -994,36 +997,37 @@ fn run_intake(
             }
         }
 
-        // push が失敗していたら Event::Error を出して取り込みを終了（無言死しない）。
+        // If push failed, emit Event::Error and exit intake (do not die silently).
         if let Some(e) = push_err {
             shared.push_event(Event::Error(format!("normalizer push failed: {e}")));
             return;
         }
 
-        // RawRing オーバーフロー（RT が intake を追い越しサンプルを捨てた）を検知したら、
-        // 次の主・副チャンク両方へ DISCONTINUITY を立てる（正規形以前の欠落＝両タップが
-        // 等しく影響を受ける）。pts は wall-clock 再アンカーで既にギャップを反映する。
+        // On RawRing overflow (RT outran intake and discarded samples), set DISCONTINUITY on the
+        // next primary and secondary chunks (loss before normalization affects both taps equally).
+        // The PTS already reflects the gap through wall-clock re-anchoring.
         if overflow_now > overflow_baseline {
             disc_primary = true;
             disc_secondary = true;
         }
         overflow_baseline = overflow_now;
 
-        // 停止時は末尾テール（denoise 遅延線 + リサンプラ残余）を flush して吐き切る。
+        // On stop, flush and emit the tail (denoise delay line + resampler remainder).
         if stopping {
             normalizer.flush();
         }
 
-        // --- 主タップ: 完成チャンクを全て取り出して ChunkRing へ。---
+        // --- Primary tap: drain all completed chunks into ChunkRing. ---
         let gain = f32::from_bits(shared.gain_bits.load(Ordering::Relaxed));
         let mut emitted_any = false;
         while let Some((mut data, raw_pts)) = normalizer.pop_chunk() {
-            // ポーズ中は破棄する（pop で out_frame_origin は進むので pts は前進を保つ）。
-            // pending は消費せず持ち越し、resume 後の最初のチャンクへ載せる。
+            // Discard while paused (out_frame_origin advances on pop, so PTS still progresses).
+            // Keep pending flags for the first chunk after resume.
             if shared.paused.load(Ordering::SeqCst) {
                 continue;
             }
-            // 0 起点化 → 非負・非減少へクランプ（契約: 録音 0 起点・非減少）。
+            // Shift to zero-based time, then clamp to non-negative and non-decreasing values
+            // (contract: recording starts at zero and timestamps never decrease).
             let pts_ns = apply_epoch(&shared, raw_pts).max(last_pts_primary);
             last_pts_primary = pts_ns;
             debug_assert_eq!(data.len() % out_channels, 0);
@@ -1045,14 +1049,14 @@ fn run_intake(
                 pts_ns,
                 seq,
                 flags,
-                dropped_before: 0, // ChunkRing が push 時に上書きする。
+                dropped_before: 0, // ChunkRing overwrites this on push.
                 peak,
                 rms,
             };
 
-            // pause() と同じ delivery ロックの下で再確認してから push する。
-            // 組み立て中に pause が返っていても、列へは入らない（破棄）か、
-            // pause 側がこの push を待ってから返る。
+            // Recheck and push under the same delivery lock as pause(). If pause() returned while
+            // this chunk was being assembled, either the chunk is discarded or pause waits for this
+            // push to finish before returning.
             {
                 let _g = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
                 if shared.paused.load(Ordering::SeqCst) {
@@ -1068,21 +1072,23 @@ fn run_intake(
                 if let Some(total) = chunk_producer.push(chunk) {
                     shared.push_event(Event::ChunkDropped { count: total });
                 }
-                // push 成功と同じ臨界区間でだけ観測済みに進める。ポーズで破棄した
-                // チャンクでは進めないので、resume 後最初の配信へ印が持ち越される。
+                // Advance the observed generation only in the same critical section as a successful
+                // push. Discarded chunks while paused do not advance it, so the flag carries over to
+                // the first delivery after resume.
                 primary_resume_generation = resume_generation;
                 emitted_any = true;
             }
         }
 
-        // --- 副タップ: 設定時のみ。主と対称に pop・破棄・flag 付与する。---
+        // --- Secondary tap: only when configured; pop, discard, and add flags like the primary. ---
         if let Some(sec_prod) = secondary_producer.as_mut() {
             while let Some((mut samples, raw_pts)) = normalizer.pop_secondary() {
-                // ポーズ中は副も pop して破棄する（out_buf の無限成長を防ぐ）。
+                // Pop and discard secondary chunks while paused too (prevent unbounded out_buf growth).
                 if shared.paused.load(Ordering::SeqCst) {
                     continue;
                 }
-                // 0 起点化 → 非負・非減少へクランプ（契約: 録音 0 起点・非減少）。
+                // Shift to zero-based time, then clamp to non-negative and non-decreasing values
+                // (contract: recording starts at zero and timestamps never decrease).
                 let pts_ns = apply_epoch(&shared, raw_pts).max(last_pts_secondary);
                 last_pts_secondary = pts_ns;
                 debug_assert_eq!(samples.len() % sec_channels, 0);
@@ -1104,7 +1110,7 @@ fn run_intake(
                     pts_ns,
                     seq: sec_seq,
                     flags,
-                    dropped_before: 0, // 副リングが push 時に上書きする。
+                    dropped_before: 0, // The secondary ring overwrites this on push.
                     peak,
                     rms,
                 };
@@ -1120,32 +1126,33 @@ fn run_intake(
                     rec_secondary = false;
                     disc_secondary = false;
                     sec_seq += 1;
-                    // 副タップのドロップは dropped_before で観測できる（専用イベントは出さない）。
+                    // Secondary tap drops are observable through dropped_before (no dedicated event).
                     let _ = sec_prod.push(chunk);
-                    // 主とは独立した副リングへ実際に enqueue した時点でだけ進める。
+                    // Advance only when the chunk is actually enqueued in the secondary ring, which
+                    // is independent of the primary ring.
                     secondary_resume_generation = resume_generation;
                     emitted_any = true;
                 }
             }
         }
 
-        // 停止指示なら末尾を吐き切ったので終了。
+        // If stop was requested, the tail has been flushed; exit.
         if stopping {
             break;
         }
 
-        // データが無ければ少し眠って CPU を空転させない。
+        // Sleep briefly when there is no data to avoid busy-spinning the CPU.
         if !produced_any && !emitted_any {
             thread::sleep(Duration::from_millis(2));
         }
     }
 }
 
-/// ウォッチドッグスレッド本体。
+/// Watchdog thread body.
 ///
-/// ~250ms tick で最終サンプル到着時刻を監視し、[`STALL_THRESHOLD`] を超えて
-/// 途絶したら backend を指数バックオフで再オープンする。失速で
-/// [`Event::StreamStalled`]、復帰で [`Event::StreamRecovered`] を発火する。
+/// Check the last sample arrival time on ~250 ms ticks. If samples stop for longer than
+/// [`STALL_THRESHOLD`], reopen the backend with exponential backoff. Fire
+/// [`Event::StreamStalled`] on a stall and [`Event::StreamRecovered`] on recovery.
 fn run_watchdog(shared: Arc<SharedState>) {
     let mut stalled = false;
     let mut backoff = BACKOFF_MIN;
@@ -1159,9 +1166,9 @@ fn run_watchdog(shared: Arc<SharedState>) {
             break;
         }
 
-        // ソース切替中は失速判定・再オープンをしない（switch_backend が旧 backend を
-        // 一時的に stop して idle になるため、誤って並行再オープンするのを防ぐ）。
-        // 切替は last_sample_ns を now に更新して終わるので、次 tick から通常監視へ戻る。
+        // Do not check for stalls or reopen during a source switch (switch_backend temporarily stops
+        // the old backend, making it idle, so this prevents an incorrect concurrent reopen).
+        // The switch updates last_sample_ns to now before finishing, so normal checks resume next tick.
         if shared.switching.load(Ordering::SeqCst) {
             continue;
         }
@@ -1173,7 +1180,7 @@ fn run_watchdog(shared: Arc<SharedState>) {
 
         if !stalled {
             if idle >= STALL_THRESHOLD {
-                // 失速判定。
+                // Stall detected.
                 stalled = true;
                 backoff = BACKOFF_MIN;
                 shared.push_event(Event::StreamStalled);
@@ -1181,9 +1188,9 @@ fn run_watchdog(shared: Arc<SharedState>) {
             continue;
         }
 
-        // 失速中: backend を止めて再オープンを試みる。
-        // poison でも回収して stop を試み、stop が panic しても catch_unwind で
-        // 握りつぶす（ウォッチドッグを無言死させず再オープンへ進む）。
+        // During a stall, stop the backend and try to reopen it.
+        // Recover a poisoned lock and attempt stop. If stop panics, catch_unwind swallows it so the
+        // watchdog can proceed to reopen instead of dying silently.
         {
             let mut be = shared.backend.lock().unwrap_or_else(|e| e.into_inner());
             let _ = stop_backend_catching(&mut be);
@@ -1202,16 +1209,15 @@ fn run_watchdog(shared: Arc<SharedState>) {
         };
 
         if reopened {
-            // open_backend_once が last_sample_ns を now に更新・世代を ++ 済み。
-            // 復帰後の最初のチャンクへ RECOVERED|DISCONTINUITY を立てるよう
-            // recovered_pending を倒す（取り込みスレッドが次チャンクで消費する）。
-            // 復帰が本物かは次の tick で idle を見て確認する。
+            // open_backend_once has updated last_sample_ns to now and incremented the generation.
+            // Set recovered_pending so the intake thread marks the first post-recovery chunk with
+            // RECOVERED|DISCONTINUITY. Confirm the recovery on the next tick by checking for idle.
             shared.recovered_pending.store(true, Ordering::SeqCst);
             stalled = false;
             shared.push_event(Event::StreamRecovered);
             backoff = BACKOFF_MIN;
         } else {
-            // 失敗 → 指数バックオフ（ジッタ付き）で待ってから再試行。
+            // On failure, wait with exponential backoff and jitter before retrying.
             let jittered = jittered_backoff(backoff);
             sleep_interruptible(&shared, jittered);
             backoff = (backoff * 2).min(BACKOFF_MAX);
@@ -1219,11 +1225,10 @@ fn run_watchdog(shared: Arc<SharedState>) {
     }
 }
 
-/// 出力フォーマットの最終 interleaved `data` から peak（全サンプル絶対値の最大）と
-/// rms（二乗平均平方根・線形）を求める。
+/// Compute peak (maximum absolute sample value) and RMS (root mean square, linear) from the final
+/// interleaved `data` in the output format.
 ///
-/// 20ms チャンク（最大 1920 サンプル）に対する 1 走査なので極小コスト。空 data は
-/// `(0.0, 0.0)`。
+/// One pass over a 20 ms chunk (up to 1920 samples) is very cheap. Empty data returns `(0.0, 0.0)`.
 fn peak_rms(data: &[f32]) -> (f32, f32) {
     if data.is_empty() {
         return (0.0, 0.0);
@@ -1241,19 +1246,19 @@ fn peak_rms(data: &[f32]) -> (f32, f32) {
     (peak, rms)
 }
 
-/// バックオフへ時刻ベースの軽いジッタ（±約 12.5%）を加える（`rand` 不使用）。
+/// Add slight time-based jitter (about ±12.5%) to the backoff, without using `rand`.
 fn jittered_backoff(base: Duration) -> Duration {
     let base_ns = base.as_nanos() as u64;
-    // monotonic ns の下位ビットを擬似乱数源に使う。
+    // Use the low bits of monotonic nanoseconds as a pseudo-random source.
     let entropy = monotonic_now_ns() as u64;
-    // ±(base/8) の範囲。
+    // Range: ±(base/8).
     let span = (base_ns / 8).max(1);
     let delta = (entropy % (2 * span)) as i64 - span as i64;
     let result = base_ns as i64 + delta;
     Duration::from_nanos(result.max(0) as u64)
 }
 
-/// `stopping` を見ながら細かく刻んでスリープする（停止指示に素早く反応する）。
+/// Sleep in short intervals while checking `stopping` (respond quickly to stop requests).
 fn sleep_interruptible(shared: &Arc<SharedState>, dur: Duration) {
     let step = Duration::from_millis(50);
     let mut remaining = dur;
@@ -1277,7 +1282,7 @@ mod tests {
     use flexaudio_core::types::SourceKind;
     use std::time::Instant;
 
-    /// 期限まで poll_chunk しながらチャンクを集めるヘルパ。
+    /// Helper to collect chunks by polling until the deadline.
     fn collect_for(stream: &mut Stream, dur: Duration) -> Vec<AudioChunk> {
         let mut chunks = Vec::new();
         let start = Instant::now();
@@ -1290,7 +1295,7 @@ mod tests {
         chunks
     }
 
-    /// `条件 cond` が真になるまで（最大 `timeout`）待つ。真になれば true。
+    /// Wait until `cond` is true (up to `timeout`); return true if it becomes true.
     fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration) -> bool {
         let start = Instant::now();
         while start.elapsed() < timeout {
@@ -1302,16 +1307,16 @@ mod tests {
         cond()
     }
 
-    /// `Stream::open` の結果から Err を取り出す（`Stream` は `Debug` 非実装のため
-    /// `expect_err` が使えない）。Ok だった場合はメッセージ付きで panic する。
+    /// Extract Err from a `Stream::open` result (`Stream` does not implement `Debug`, so
+    /// `expect_err` cannot be used). Panic with a message if the result is Ok.
     fn open_err(result: Result<Stream>, ctx: &str) -> Error {
         match result {
-            Ok(_) => panic!("{ctx}: エラーを期待したが Ok だった"),
+            Ok(_) => panic!("{ctx}: expected an error, got Ok"),
             Err(e) => e,
         }
     }
 
-    // --- 入力検証（Stream::open のエラー経路） ---
+    // --- Input validation (Stream::open error paths) ---
 
     #[test]
     fn open_validates_exclusion_pids_for_system_capture() {
@@ -1372,7 +1377,7 @@ mod tests {
         stream.stop();
     }
 
-    /// `ring_capacity_chunks == 0` は InvalidArg で弾かれる（リング容量 0 は不正）。
+    /// `ring_capacity_chunks == 0` is rejected with InvalidArg (a ring capacity of 0 is invalid).
     #[test]
     fn open_rejects_zero_ring_capacity() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
@@ -1380,14 +1385,14 @@ mod tests {
             ring_capacity_chunks: 0,
             ..Default::default()
         };
-        let err = open_err(Stream::open(config, backend), "容量 0");
+        let err = open_err(Stream::open(config, backend), "capacity 0");
         assert!(
             matches!(err, Error::InvalidArg(_)),
-            "InvalidArg のはず: {err:?}"
+            "expected InvalidArg: {err:?}"
         );
     }
 
-    /// 非対応の出力フォーマット（channels=3）は validate 失敗で UnsupportedFormat。
+    /// An unsupported output format (channels=3) fails validation with UnsupportedFormat.
     #[test]
     fn open_rejects_invalid_output_channels() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
@@ -1401,11 +1406,11 @@ mod tests {
         let err = open_err(Stream::open(config, backend), "ch=3");
         assert!(
             matches!(err, Error::UnsupportedFormat(_)),
-            "UnsupportedFormat のはず: {err:?}"
+            "expected UnsupportedFormat: {err:?}"
         );
     }
 
-    /// 極端な出力レート（範囲外）も UnsupportedFormat で弾かれる。
+    /// An extreme, out-of-range output rate is also rejected with UnsupportedFormat.
     #[test]
     fn open_rejects_out_of_range_output_rate() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
@@ -1416,18 +1421,18 @@ mod tests {
             },
             ..Default::default()
         };
-        let err = open_err(Stream::open(config, backend), "極端なレート");
+        let err = open_err(Stream::open(config, backend), "extreme rate");
         assert!(
             matches!(err, Error::UnsupportedFormat(_)),
-            "UnsupportedFormat のはず: {err:?}"
+            "expected UnsupportedFormat: {err:?}"
         );
     }
 
-    /// backend の native_format が 0（rate=0 / ch=0）なら InvalidArg で弾かれる。
+    /// If the backend's native_format is 0 (rate=0 / ch=0), it is rejected with InvalidArg.
     #[test]
     fn open_rejects_zero_native_format() {
-        // MockBackend::new は内部で max(1) するため 0 を作れない。テスト専用の
-        // ゼロ native_format バックエンドを定義して検証する。
+        // MockBackend::new applies max(1) internally, so it cannot produce 0. Define a test-only
+        // backend with a zero native_format to verify this.
         struct ZeroFormatBackend;
         impl CaptureBackend for ZeroFormatBackend {
             fn native_format(&self) -> (u32, u16) {
@@ -1445,17 +1450,17 @@ mod tests {
         );
         assert!(
             matches!(err, Error::InvalidArg(_)),
-            "InvalidArg のはず: {err:?}"
+            "expected InvalidArg: {err:?}"
         );
     }
 
-    // --- poll_event（pull 型イベント取得） ---
+    // --- poll_event (pull-style event retrieval) ---
 
-    /// `poll_event` でイベントが pull 型で取れる。ChunkRing 容量を極小にして
-    /// DROP_OLDEST を強制し、`Event::ChunkDropped` が poll_event で観測できることを確認。
+    /// Events can be retrieved through `poll_event`. Set ChunkRing capacity very low to force
+    /// DROP_OLDEST and verify that `Event::ChunkDropped` is observable through poll_event.
     #[test]
     fn poll_event_yields_chunk_dropped() {
-        // 容量 1 + ほとんど poll しない → 速やかに DROP_OLDEST が起きる。
+        // Capacity 1 plus almost no polling quickly triggers DROP_OLDEST.
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         let config = StreamConfig {
             ring_capacity_chunks: 1,
@@ -1464,10 +1469,10 @@ mod tests {
         let mut stream = Stream::open(config, backend).expect("open");
         stream.start().expect("start");
 
-        // poll_chunk せずに待つことでチャンクリングを溢れさせる。
+        // Let the chunk ring overflow by waiting without calling poll_chunk.
         let got_drop = wait_until(
             || {
-                // poll_event だけを回す（poll_chunk しない＝リングを詰まらせる）。
+                // Call only poll_event (not poll_chunk, so the ring fills up).
                 while let Some(ev) = stream.poll_event() {
                     if matches!(ev, Event::ChunkDropped { .. }) {
                         return true;
@@ -1478,32 +1483,35 @@ mod tests {
             Duration::from_secs(3),
         );
         stream.stop();
-        assert!(got_drop, "poll_event で ChunkDropped を取得できるはず");
+        assert!(
+            got_drop,
+            "expected to retrieve ChunkDropped through poll_event"
+        );
     }
 
-    /// イベントが無ければ `poll_event` は None を返す（非ブロッキング・空キュー）。
+    /// `poll_event` returns None when there are no events (non-blocking, empty queue).
     #[test]
     fn poll_event_is_none_when_empty() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
-        // start 前はイベントキューが空。
+        // The event queue is empty before start.
         assert!(stream.poll_event().is_none());
     }
 
-    // --- ウォッチドッグ: stall 検知 → 自動復帰 → RECOVERED ---
+    // --- Watchdog: detect stall → auto-recover → RECOVERED ---
 
-    /// StallableMockBackend で「初回セッションが途中で給餌停止 → ウォッチドッグが
-    /// STALL_THRESHOLD 後に失速検知 → backend を再オープン → 復帰後の最初のチャンクへ
-    /// RECOVERED|DISCONTINUITY」を end-to-end で検証する。
+    /// End-to-end verification with StallableMockBackend: the first session stops receiving data,
+    /// the watchdog detects a stall after STALL_THRESHOLD, reopens the backend, and marks the first
+    /// post-recovery chunk RECOVERED|DISCONTINUITY.
     ///
-    /// 観測:
-    /// 1. `Event::StreamStalled` が発火する（失速判定）。
-    /// 2. `Event::StreamRecovered` が発火する（再オープン成功）。
-    /// 3. 復帰後の最初のチャンクに ChunkFlags::RECOVERED が立つ（DISCONTINUITY も伴う）。
-    /// 4. seq は通して単調増加（復帰でリセットされない）。
+    /// Check that:
+    /// 1. `Event::StreamStalled` fires when the stall is detected.
+    /// 2. `Event::StreamRecovered` fires after a successful reopen.
+    /// 3. The first post-recovery chunk has ChunkFlags::RECOVERED (and DISCONTINUITY).
+    /// 4. seq increases monotonically throughout and is not reset on recovery.
     #[test]
     fn watchdog_detects_stall_and_flags_recovered() {
-        // 300ms 給餌してから初回セッションを stall させる。
+        // Feed data for 300 ms, then stall the first session.
         let backend = Box::new(StallableMockBackend::new(
             48_000,
             2,
@@ -1517,7 +1525,7 @@ mod tests {
         let mut saw_stalled = false;
         let mut saw_recovered = false;
 
-        // 失速検知(>=2s) → 再オープン → 復帰チャンクまで十分待つ（最大 8 秒）。
+        // Wait long enough for stall detection (>=2s), reopen, and a recovered chunk (up to 8 s).
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut recovered_chunk_seen = false;
         while Instant::now() < deadline && !recovered_chunk_seen {
@@ -1537,7 +1545,7 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         stream.stop();
-        // stop 後の残りも取り切る。
+        // Drain any remaining chunks after stop.
         while let Some(c) = stream.poll_chunk() {
             if c.flags.contains(ChunkFlags::RECOVERED) {
                 recovered_chunk_seen = true;
@@ -1545,14 +1553,14 @@ mod tests {
             chunks.push(c);
         }
 
-        assert!(saw_stalled, "Event::StreamStalled が発火するはず");
-        assert!(saw_recovered, "Event::StreamRecovered が発火するはず");
+        assert!(saw_stalled, "expected Event::StreamStalled to fire");
+        assert!(saw_recovered, "expected Event::StreamRecovered to fire");
         assert!(
             recovered_chunk_seen,
-            "復帰後の最初のチャンクに RECOVERED が立つはず"
+            "expected RECOVERED on the first post-recovery chunk"
         );
 
-        // RECOVERED が立ったチャンクには DISCONTINUITY も伴う（設計どおり）。
+        // The chunk marked RECOVERED also has DISCONTINUITY, as designed.
         let recovered: Vec<&AudioChunk> = chunks
             .iter()
             .filter(|c| c.flags.contains(ChunkFlags::RECOVERED))
@@ -1561,32 +1569,32 @@ mod tests {
         for c in &recovered {
             assert!(
                 c.flags.contains(ChunkFlags::DISCONTINUITY),
-                "RECOVERED には DISCONTINUITY が伴うはず: flags={:?}",
+                "expected DISCONTINUITY with RECOVERED: flags={:?}",
                 c.flags
             );
         }
 
-        // seq は通して単調増加（復帰でリセットされない）。
+        // seq increases monotonically throughout and is not reset on recovery.
         for w in chunks.windows(2) {
             assert!(
                 w[1].seq > w[0].seq,
-                "seq は復帰をまたいでも単調増加: {} -> {}",
+                "seq should increase monotonically across recovery: {} -> {}",
                 w[0].seq,
                 w[1].seq
             );
         }
     }
 
-    /// 安定給餌（stall しない）なら RECOVERED は一切立たず、StreamStalled も来ない
-    /// （回帰: ウォッチドッグが誤検知しない）。StallableMockBackend を十分小さい
-    /// stall を起こさない値で使うのではなく、通常 MockBackend で短時間確認する。
+    /// With steady input (no stall), RECOVERED is never set and StreamStalled never arrives (regression
+    /// check: the watchdog must not report a false positive). Check briefly with the regular
+    /// MockBackend instead of configuring StallableMockBackend with a small, non-stalling interval.
     #[test]
     fn no_recovered_flag_under_steady_feed() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
         stream.start().expect("start");
 
-        // STALL_THRESHOLD 未満の短時間でフラグ・イベントを確認する。
+        // Check flags and events for a short period, less than STALL_THRESHOLD.
         let chunks = collect_for(&mut stream, Duration::from_millis(500));
         let mut saw_stalled = false;
         while let Some(ev) = stream.poll_event() {
@@ -1596,63 +1604,66 @@ mod tests {
         }
         stream.stop();
 
-        assert!(!chunks.is_empty(), "安定給餌でチャンクが来るはず");
-        assert!(!saw_stalled, "安定給餌では失速判定されないはず");
+        assert!(!chunks.is_empty(), "expected chunks with steady input");
+        assert!(
+            !saw_stalled,
+            "steady input should not be reported as stalled"
+        );
         for c in &chunks {
             assert!(
                 !c.flags.contains(ChunkFlags::RECOVERED),
-                "安定給餌では RECOVERED は立たない: flags={:?}",
+                "RECOVERED should not be set with steady input: flags={:?}",
                 c.flags
             );
         }
     }
 
-    // --- pause / resume（配信だけ止める） ---
+    // --- pause / resume (pause delivery only) ---
 
-    /// ポーズすると新しいチャンクが届かなくなる。ポーズ前に最低 1 個は取れて、ポーズ後の
-    /// 一定窓では新規がゼロであることを確認する。
+    /// No new chunks arrive while paused. Verify that at least one arrives before pausing and none
+    /// arrive during a fixed window afterward.
     #[test]
     fn pause_stops_delivering_chunks() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
         stream.start().expect("start");
 
-        // ポーズ前に少なくとも 1 個チャンクが届くまで待つ。
+        // Wait for at least one chunk before pausing.
         let got_before = wait_until(|| stream.poll_chunk().is_some(), Duration::from_secs(2));
-        assert!(got_before, "ポーズ前にチャンクが届くはず");
+        assert!(got_before, "expected a chunk before pause");
 
-        // ポーズ。直後にリングへ残っていたぶんは取り切っておく。
+        // Pause and drain anything left in the ring immediately afterward.
         stream.pause();
         while stream.poll_chunk().is_some() {}
 
-        // ポーズ後の窓では新規チャンクが来ないこと。
+        // No new chunks should arrive during the post-pause window.
         let after = collect_for(&mut stream, Duration::from_millis(300));
         stream.stop();
         assert!(
             after.is_empty(),
-            "ポーズ中は新しいチャンクが届かないはず: {} 個届いた",
+            "expected no new chunks while paused; received {}",
             after.len()
         );
     }
 
-    /// STALL_THRESHOLD を超える長いポーズでも失速判定されない。配信は止めても OS 側の
-    /// 取り込み（last_sample_ns の更新）は続くので、ウォッチドッグは idle を検出しない。
-    /// ポーズ窓は STALL_THRESHOLD + ウォッチドッグ tick より十分長く取る。
+    /// A pause longer than STALL_THRESHOLD must not trigger a stall. OS-side capture and
+    /// last_sample_ns updates continue while delivery is paused, so the watchdog should not detect
+    /// idle. Make the pause window comfortably longer than STALL_THRESHOLD plus a watchdog tick.
     #[test]
     fn long_pause_does_not_trigger_stall() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
         stream.start().expect("start");
 
-        // ポーズ前に少なくとも 1 個チャンクが届くまで待つ。
+        // Wait for at least one chunk before pausing.
         let got_before = wait_until(|| stream.poll_chunk().is_some(), Duration::from_secs(2));
-        assert!(got_before, "ポーズ前にチャンクが届くはず");
+        assert!(got_before, "expected a chunk before pause");
 
-        // ポーズ。直後にリングへ残っていたぶんは取り切っておく。
+        // Pause and drain anything left in the ring immediately afterward.
         stream.pause();
         while stream.poll_chunk().is_some() {}
 
-        // STALL_THRESHOLD（2s）を確実に超える時間ポーズを保ち、その間イベントを集める。
+        // Stay paused beyond STALL_THRESHOLD (2s) and collect events during that time.
         let mut saw_stalled = false;
         let mut saw_recovered = false;
         let deadline = Instant::now() + Duration::from_millis(2800);
@@ -1664,56 +1675,56 @@ mod tests {
                     _ => {}
                 }
             }
-            // ポーズ中はずっと paused のまま。
+            // Remain paused throughout.
             assert!(
                 stream.is_paused(),
-                "ポーズ窓の間は is_paused が true のはず"
+                "is_paused should remain true during the pause window"
             );
             thread::sleep(Duration::from_millis(20));
         }
 
-        // 長いポーズでも失速判定・復帰は一切起きないこと（これが主眼）。
+        // The key check: no stall detection or recovery during a long pause.
         assert!(
             !saw_stalled,
-            "長いポーズでも StreamStalled は発火しないはず"
+            "StreamStalled should not fire during a long pause"
         );
         assert!(
             !saw_recovered,
-            "失速していないので StreamRecovered も発火しないはず"
+            "StreamRecovered should not fire because there was no stall"
         );
 
-        // resume するとチャンク配信が再開する。
+        // Chunk delivery resumes after resume.
         stream.resume();
         let resumed = wait_until(|| stream.poll_chunk().is_some(), Duration::from_secs(2));
         stream.stop();
-        assert!(resumed, "resume 後にチャンク配信が再開するはず");
+        assert!(resumed, "chunk delivery should resume after resume");
     }
 
-    /// resume 後の最初のチャンクに DISCONTINUITY が立ち、seq はポーズ前後で連続する
-    /// （ポーズ前最後が N なら resume 後最初は N+1）。dropped_before も 0。
+    /// The first chunk after resume has DISCONTINUITY, seq remains continuous across pause (if the
+    /// last before pause was N, the first after resume is N+1), and dropped_before is 0.
     #[test]
     fn resume_flags_discontinuity_and_keeps_seq_continuous() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
         stream.start().expect("start");
 
-        // ポーズ前のチャンクを集めて、最後の seq を控える。
+        // Collect chunks before pausing and save the last seq.
         let before = collect_for(&mut stream, Duration::from_millis(200));
-        assert!(!before.is_empty(), "ポーズ前にチャンクが届くはず");
+        assert!(!before.is_empty(), "expected chunks before pause");
         let last_seq = before.last().unwrap().seq;
 
-        // ポーズして、リングに残ったぶんを取り切る。最後の seq を更新しておく。
+        // Pause and drain the remaining ring contents. Update the last seq.
         stream.pause();
         let mut last_seq = last_seq;
         while let Some(c) = stream.poll_chunk() {
             last_seq = c.seq;
         }
 
-        // ポーズ中は新規が来ないことを軽く確認してから resume。
+        // Briefly confirm there are no new chunks while paused, then resume.
         assert!(collect_for(&mut stream, Duration::from_millis(150)).is_empty());
         stream.resume();
 
-        // resume 後の最初のチャンクを待つ。
+        // Wait for the first chunk after resume.
         let mut first_after: Option<AudioChunk> = None;
         let got = wait_until(
             || match stream.poll_chunk() {
@@ -1726,28 +1737,31 @@ mod tests {
             Duration::from_secs(2),
         );
         stream.stop();
-        assert!(got, "resume 後にチャンクが届くはず");
+        assert!(got, "expected a chunk after resume");
 
         let first = first_after.unwrap();
         assert!(
             first.flags.contains(ChunkFlags::DISCONTINUITY),
-            "resume 後の最初のチャンクに DISCONTINUITY が立つはず: flags={:?}",
+            "expected DISCONTINUITY on the first chunk after resume: flags={:?}",
             first.flags
         );
         assert_eq!(
             first.seq,
             last_seq + 1,
-            "seq はポーズ前後で連続するはず（{last_seq} -> {}）",
+            "seq should remain continuous across pause ({last_seq} -> {})",
             first.seq
         );
-        assert_eq!(first.dropped_before, 0, "ポーズで取りこぼしは出ないはず");
+        assert_eq!(
+            first.dropped_before, 0,
+            "pause should not cause dropped chunks"
+        );
     }
 
-    /// pause 後に両リングを空にしてから resume を繰り返しても、各独立ストリームで
-    /// resume 後の最初のチャンクには必ず DISCONTINUITY が立つ。
+    /// After pausing and emptying both rings, repeatedly resume and verify that the first chunk after
+    /// resume always has DISCONTINUITY in each independent stream.
     ///
-    /// これは resume と intake の競合を狙う負荷試験。主・副は別リング・別 seq の
-    /// ストリームなので、どちらか片方だけを確認してはならない。
+    /// This stress test targets the race between resume and intake. Primary and secondary are streams
+    /// with separate rings and seq values, so both must be checked.
     #[test]
     fn resume_stress_marks_first_chunk_of_each_tap_discontinuous() {
         const ROUNDS: usize = 300;
@@ -1766,8 +1780,8 @@ mod tests {
 
         for round in 0..ROUNDS {
             stream.pause();
-            // pause() は delivery と排他なので、ここで取り切った後に旧チャンクが
-            // 新たに入ることはない。副リングも必ず同時に空にする。
+            // pause() is exclusive with delivery, so no old chunk can arrive after draining here.
+            // Always empty the secondary ring at the same time.
             while stream.poll_chunk().is_some() {}
             while stream.poll_secondary().is_some() {}
 
@@ -1809,39 +1823,38 @@ mod tests {
         stream.stop();
         assert_eq!(
             failures, 0,
-            "{failures} / {ROUNDS} resume 試行で主または副の最初のチャンクに \
-             DISCONTINUITY がなかった"
+            "{failures} / {ROUNDS} resume attempts had no DISCONTINUITY on the first primary or \
+             secondary chunk"
         );
     }
 
-    /// ポーズしていないのに resume を呼んでも、次のチャンクに DISCONTINUITY は立たない
-    /// （no-op）。
+    /// Calling resume while not paused does not set DISCONTINUITY on the next chunk (no-op).
     #[test]
     fn resume_without_pause_is_noop() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
         stream.start().expect("start");
 
-        // 最初のチャンク群を捨てて、起動直後の RECOVERED/DISCONTINUITY を流しておく。
+        // Discard the initial chunks so startup RECOVERED/DISCONTINUITY flags have passed.
         let _ = collect_for(&mut stream, Duration::from_millis(200));
 
-        // ポーズしていない状態で resume。
+        // Resume while not paused.
         stream.resume();
 
-        // 以降のチャンクに DISCONTINUITY が立たないこと。
+        // DISCONTINUITY should not be set on subsequent chunks.
         let after = collect_for(&mut stream, Duration::from_millis(200));
         stream.stop();
-        assert!(!after.is_empty(), "チャンクが届くはず");
+        assert!(!after.is_empty(), "expected chunks to arrive");
         for c in &after {
             assert!(
                 !c.flags.contains(ChunkFlags::DISCONTINUITY),
-                "ポーズなしの resume では DISCONTINUITY は立たない: flags={:?}",
+                "resume without pause should not set DISCONTINUITY: flags={:?}",
                 c.flags
             );
         }
     }
 
-    /// pause を二重に呼んでも、resume 一回で正常に再開する（多重呼び出し安全）。
+    /// Calling pause twice is safe; one resume call should resume normally.
     #[test]
     fn double_pause_then_single_resume_recovers() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
@@ -1849,32 +1862,32 @@ mod tests {
         stream.start().expect("start");
 
         let before = collect_for(&mut stream, Duration::from_millis(200));
-        assert!(!before.is_empty(), "ポーズ前にチャンクが届くはず");
+        assert!(!before.is_empty(), "expected chunks before pause");
 
-        // pause を二重に呼ぶ。
+        // Call pause twice.
         stream.pause();
         stream.pause();
         assert!(stream.is_paused());
         while stream.poll_chunk().is_some() {}
         assert!(collect_for(&mut stream, Duration::from_millis(150)).is_empty());
 
-        // resume は一回。
+        // Call resume once.
         stream.resume();
         assert!(!stream.is_paused());
         let got = wait_until(|| stream.poll_chunk().is_some(), Duration::from_secs(2));
         stream.stop();
-        assert!(got, "resume 一回で配信が再開するはず");
+        assert!(got, "delivery should resume after one resume call");
     }
 
-    // --- 入力ゲイン（config.gain / set_gain） ---
+    // --- Input gain (config.gain / set_gain) ---
 
-    /// config で指定したゲインが完成チャンクの data と peak/rms メーターに反映される。
-    /// MockBackend のサイン波は振幅 0.5 なので、gain 2.0 でチャンクのピークは約 1.0、
-    /// gain 0.5 で約 0.25 になる。peak はゲイン適用後の data から算出されること
-    /// （メーターがゲイン後の実レベルを示すこと）も確認する。
+    /// Verify that the gain from config affects completed chunk data and peak/rms meters. The
+    /// MockBackend sine wave has amplitude 0.5, so gain 2.0 gives a chunk peak of about 1.0 and gain
+    /// 0.5 gives about 0.25. Also verify that peak is computed from data after gain (the meter shows
+    /// the actual post-gain level).
     #[test]
     fn gain_scales_samples_and_meters() {
-        // (gain, 期待ピークの範囲)。サイン振幅 0.5 × gain。
+        // (gain, expected peak range). Sine amplitude 0.5 × gain.
         for (gain, lo, hi) in [(2.0f32, 0.95f32, 1.0f32), (0.5, 0.2, 0.3)] {
             let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
             let config = StreamConfig {
@@ -1885,66 +1898,68 @@ mod tests {
             stream.start().expect("start");
             let chunks = collect_for(&mut stream, Duration::from_millis(300));
             stream.stop();
-            assert!(!chunks.is_empty(), "gain={gain} でチャンクが届くはず");
+            assert!(!chunks.is_empty(), "expected chunks with gain={gain}");
 
-            // peak はゲイン適用後の data と一致する（メーターはゲイン後の実レベル）。
+            // peak matches the data after gain is applied (the meter reports the actual post-gain level).
             let mut max_peak = 0.0f32;
             for c in &chunks {
                 let recomputed = c.data.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
                 assert_eq!(
                     c.peak, recomputed,
-                    "peak はゲイン適用後の data から算出されるはず"
+                    "peak should be computed from data after gain is applied"
                 );
                 max_peak = max_peak.max(c.peak);
             }
             assert!(
                 (lo..=hi).contains(&max_peak),
-                "gain={gain} のピークは {lo}..={hi} のはず: {max_peak}"
+                "expected peak for gain={gain} in {lo}..={hi}: {max_peak}"
             );
         }
     }
 
-    /// 録音中の set_gain が次のチャンクから効く。1.0 で開始してチャンクを受け取ったあと
-    /// set_gain(0.0) すると、以降のチャンクが全サンプル 0・peak 0 になる。
+    /// set_gain takes effect on the next chunk during recording. Start at 1.0, receive a chunk, then
+    /// call set_gain(0.0) and verify that subsequent chunks have all-zero samples and peak 0.
     #[test]
     fn set_gain_takes_effect_mid_stream() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
         stream.start().expect("start");
-        assert_eq!(stream.gain(), 1.0, "既定ゲインは 1.0");
+        assert_eq!(stream.gain(), 1.0, "default gain is 1.0");
 
-        // まず通常のチャンクが届くまで待つ。
+        // First wait for a normal chunk.
         let got_before = wait_until(|| stream.poll_chunk().is_some(), Duration::from_secs(2));
-        assert!(got_before, "set_gain 前にチャンクが届くはず");
+        assert!(got_before, "expected a chunk before set_gain");
 
-        // ゲインを 0.0（無音）へ。次の完成チャンクから効く（20ms 粒度）。
+        // Set gain to 0.0 (silence); it takes effect from the next completed chunk (20 ms granularity).
         stream.set_gain(0.0).expect("set_gain(0.0)");
         assert_eq!(stream.gain(), 0.0);
 
-        // 設定前に完成していたチャンクが流れてくる可能性があるので、無音チャンクの
-        // 到着まで待つ。
+        // Chunks completed before the setting may still arrive, so wait for a silent chunk.
         let got_silent = wait_until(
             || matches!(stream.poll_chunk(), Some(c) if c.peak == 0.0),
             Duration::from_secs(2),
         );
-        assert!(got_silent, "set_gain(0.0) 後に無音チャンクが届くはず");
+        assert!(got_silent, "expected a silent chunk after set_gain(0.0)");
 
-        // 以降のチャンクは全サンプル 0・peak 0・rms 0 のまま。
+        // Subsequent chunks should retain all-zero samples, peak 0, and rms 0.
         let after = collect_for(&mut stream, Duration::from_millis(300));
         stream.stop();
-        assert!(!after.is_empty(), "無音でもチャンクは流れ続けるはず");
+        assert!(
+            !after.is_empty(),
+            "chunks should continue to flow during silence"
+        );
         for c in &after {
             assert!(
                 c.data.iter().all(|&x| x == 0.0),
-                "gain 0.0 では全サンプル 0 のはず"
+                "all samples should be 0 at gain 0.0"
             );
             assert_eq!(c.peak, 0.0);
             assert_eq!(c.rms, 0.0);
         }
     }
 
-    /// 大きなゲインでもサンプルは ±1.0 にクランプされる。サイン振幅 0.5 × gain 100 は
-    /// クランプなしなら 50 に達するが、全サンプルが ±1.0 に収まり、ピークはちょうど 1.0。
+    /// Samples are clamped to ±1.0 even at high gain. With sine amplitude 0.5 × gain 100, samples
+    /// would reach 50 without clamping, but all stay within ±1.0 and the peak is exactly 1.0.
     #[test]
     fn gain_clamps_to_unit_range() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
@@ -1956,23 +1971,23 @@ mod tests {
         stream.start().expect("start");
         let chunks = collect_for(&mut stream, Duration::from_millis(300));
         stream.stop();
-        assert!(!chunks.is_empty(), "チャンクが届くはず");
+        assert!(!chunks.is_empty(), "expected chunks to arrive");
 
         let mut max_peak = 0.0f32;
         for c in &chunks {
             assert!(
                 c.data.iter().all(|&x| (-1.0..=1.0).contains(&x)),
-                "サンプルは ±1.0 を超えないはず"
+                "samples should not exceed ±1.0"
             );
             max_peak = max_peak.max(c.peak);
         }
-        assert_eq!(max_peak, 1.0, "クランプによりピークはちょうど 1.0 のはず");
+        assert_eq!(max_peak, 1.0, "clamping should make the peak exactly 1.0");
     }
 
-    /// 不正なゲイン（負・NaN）は open / set_gain の双方で InvalidArg として弾かれる。
+    /// Invalid gains (negative and NaN) are rejected with InvalidArg by both open and set_gain.
     #[test]
     fn invalid_gain_rejected() {
-        // open: config.gain が負。
+        // open: config.gain is negative.
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         let config = StreamConfig {
             gain: -1.0,
@@ -1981,10 +1996,10 @@ mod tests {
         let err = open_err(Stream::open(config, backend), "gain=-1.0");
         assert!(
             matches!(err, Error::InvalidArg(_)),
-            "InvalidArg のはず: {err:?}"
+            "expected InvalidArg: {err:?}"
         );
 
-        // open: config.gain が NaN。
+        // open: config.gain is NaN.
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         let config = StreamConfig {
             gain: f32::NAN,
@@ -1993,10 +2008,10 @@ mod tests {
         let err = open_err(Stream::open(config, backend), "gain=NaN");
         assert!(
             matches!(err, Error::InvalidArg(_)),
-            "InvalidArg のはず: {err:?}"
+            "expected InvalidArg: {err:?}"
         );
 
-        // set_gain: 負・NaN は InvalidArg で、現在値は変わらない。
+        // set_gain: negative and NaN values return InvalidArg and leave the current value unchanged.
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         let stream = Stream::open(StreamConfig::default(), backend).expect("open");
         assert!(matches!(stream.set_gain(-1.0), Err(Error::InvalidArg(_))));
@@ -2007,20 +2022,19 @@ mod tests {
         assert_eq!(
             stream.gain(),
             1.0,
-            "失敗した set_gain は現在値を変えないはず"
+            "failed set_gain should not change the current value"
         );
     }
 
-    // --- 堅牢性: backend の panic で無言死しない（poison 連鎖 panic 防止） ---
+    // --- Robustness: backend panics do not cause silent death (prevent poison-related panic cascades) ---
     //
-    // これらのテストは「テストプロセス自体が panic で落ちない」こと自体が
-    // 「無言死しない／連鎖 panic しない」ことの証明になる（落ちれば test result が
-    // FAILED になる）。加えて、panic が Err / Event::Error として観測できることを
-    // アサートし、握りつぶし（panic を黙って消すだけ）でないことを確かめる。
+    // These tests prove there is no silent death or panic cascade by verifying that the test process
+    // itself does not panic (a panic would make the test result FAILED). They also assert that the
+    // panic is observable as Err / Event::Error, so it is not merely swallowed and hidden.
 
-    /// backend の `start()` が panic してもプロセスは落ちず、`start()` が
-    /// `Err(Error::Backend)` を返す（catch_unwind が mutex poison 前に変換するため、
-    /// 取り込み/ウォッチドッグスレッドは起動すらされず連鎖 panic も起きない）。
+    /// If backend `start()` panics, the process stays alive and `start()` returns
+    /// `Err(Error::Backend)`. catch_unwind converts the panic before mutex poisoning, so the intake
+    /// and watchdog threads never start and no panic cascade occurs.
     #[test]
     fn backend_panic_in_start_returns_err_not_silent_death() {
         let backend = Box::new(PanickingMockBackend::new(
@@ -2031,56 +2045,56 @@ mod tests {
         ));
         let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
 
-        // start() は panic を伝播させず Err(Error::Backend) を返さねばならない。
+        // start() must return Err(Error::Backend) without propagating the panic.
         let result = stream.start();
         match result {
-            Ok(()) => panic!("backend が start で panic したのに start() が Ok を返した"),
+            Ok(()) => panic!("backend panicked in start, but start() returned Ok"),
             Err(Error::Backend(msg)) => {
                 assert!(
                     msg.contains("panicked"),
-                    "Error::Backend は panic 由来と分かるメッセージのはず: {msg}"
+                    "expected Error::Backend with a message identifying the panic: {msg}"
                 );
             }
-            Err(other) => panic!("Error::Backend を期待したが別のエラー: {other:?}"),
+            Err(other) => panic!("expected Error::Backend, got a different error: {other:?}"),
         }
 
-        // start 失敗後は未開始状態。stop しても（スレッド未起動でも）panic しない。
+        // After start fails, the stream is not started. stop must not panic, even though no threads started.
         stream.stop();
     }
 
-    /// backend の `stop()` が panic してもプロセスは落ちず、`stop()` は正常に戻る
-    /// （catch_unwind が握りつぶし、backend mutex を poison させないので、それまで
-    /// 動いていた取り込み/ウォッチドッグスレッドが連鎖 panic しない）。
+    /// If backend `stop()` panics, the process stays alive and `stop()` returns normally. catch_unwind
+    /// swallows the panic without poisoning the backend mutex, preventing cascaded panics in the
+    /// intake and watchdog threads that were running.
     #[test]
     fn backend_panic_in_stop_does_not_kill_process() {
         let backend = Box::new(PanickingMockBackend::new(48_000, 2, 440.0, PanicMode::Stop));
         let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
         stream.start().expect("start");
 
-        // 少し回して、取り込み/ウォッチドッグスレッドが実際に動いている状態を作る
-        // （チャンクが流れることを確認＝happy path は不変）。
+        // Let the stream run briefly so the intake and watchdog threads are active
+        // (confirm chunks flow, so the happy path is unchanged).
         let chunks = collect_for(&mut stream, Duration::from_millis(300));
         assert!(
             !chunks.is_empty(),
-            "stop 前に通常どおりチャンクが流れるはず（happy path 不変）"
+            "chunks should flow normally before stop (happy path unchanged)"
         );
 
-        // stop() 内で backend.stop() が panic するが、catch_unwind で握りつぶされ
-        // mutex を poison させない。このテストが panic で落ちないこと自体が証明。
+        // backend.stop() panics inside stop(), but catch_unwind swallows it without poisoning the
+        // mutex. The fact that this test does not panic is itself proof.
         stream.stop();
 
-        // stop 後も poll は連鎖 panic せず使える（poison していないことの追加確認）。
+        // Poll still works after stop without a panic cascade (additional check that the mutex was not poisoned).
         let _ = stream.poll_chunk();
         let _ = stream.poll_event();
     }
 
-    /// ウォッチドッグの再オープン時に backend が panic しても、ウォッチドッグ
-    /// スレッドは連鎖無言死せず、`Event::Error`（"reopen failed: ..."）として表に
-    /// 出る。プロセスは落ちない（catch_unwind が mutex poison を防ぎ、reopen の
-    /// 失敗を `open_backend_once` の `Err` 経由で Event::Error 化する）。
+    /// If the backend panics during watchdog reopen, the watchdog thread does not die silently in a
+    /// panic cascade; the failure is surfaced as `Event::Error` ("reopen failed: ..."). The process
+    /// stays alive because catch_unwind prevents mutex poisoning and the reopen failure becomes
+    /// Event::Error through `open_backend_once`'s Err.
     #[test]
     fn backend_panic_on_watchdog_reopen_surfaces_event_error() {
-        // 300ms 給餌 → 失速 → ウォッチドッグ再オープンで panic。
+        // Feed for 300 ms → stall → panic during watchdog reopen.
         let backend = Box::new(StallThenPanicOnReopenBackend::new(
             48_000,
             2,
@@ -2090,12 +2104,12 @@ mod tests {
         let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
         stream.start().expect("start");
 
-        // 失速検知(>=2s) → 再オープン試行(panic→Event::Error) まで十分待つ（最大 8 秒）。
+        // Wait long enough for stall detection (>=2s) and a reopen attempt (panic → Event::Error), up to 8 s.
         let mut saw_stalled = false;
         let mut saw_reopen_error = false;
         let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline && !saw_reopen_error {
-            // poll_chunk も回す（リング詰まりで他経路が止まらないように）。
+            // Also call poll_chunk so a full ring does not block other paths.
             while stream.poll_chunk().is_some() {}
             while let Some(ev) = stream.poll_event() {
                 match ev {
@@ -2110,17 +2124,20 @@ mod tests {
         }
         stream.stop();
 
-        assert!(saw_stalled, "失速は検知されるはず（Event::StreamStalled）");
+        assert!(
+            saw_stalled,
+            "expected stall detection (Event::StreamStalled)"
+        );
         assert!(
             saw_reopen_error,
-            "再オープンでの backend panic は Event::Error(\"reopen failed: ...\") として\
-             表に出るはず（無言死しない）"
+            "backend panic during reopen should surface as Event::Error(\"reopen failed: ...\") \
+             (no silent death)"
         );
     }
 
-    // --- 絶対クロック（録音 0 起点） ---
+    // --- Absolute clock (recording starts at zero) ---
 
-    /// 最初に配信されるチャンクの pts_ns は録音エポックそのものなので厳密に 0 で始まる。
+    /// The first delivered chunk's pts_ns is the recording epoch itself, so it starts at exactly 0.
     #[test]
     fn recording_clock_is_zero_based() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
@@ -2139,26 +2156,26 @@ mod tests {
             Duration::from_secs(2),
         );
         stream.stop();
-        assert!(got, "最初のチャンクが届くはず");
+        assert!(got, "expected the first chunk to arrive");
         let first = first.unwrap();
         assert_eq!(
             first.pts_ns, 0,
-            "最初に配信されるチャンクは録音 0 起点（pts_ns == 0）のはず: {}",
+            "the first delivered chunk should start at recording time zero (pts_ns == 0): {}",
             first.pts_ns
         );
     }
 
-    /// pause 跨ぎで pts が pause 継続時間ぶん前進する（キャプチャ実時間の時計）。resume 後の
-    /// 最初のチャンクに DISCONTINUITY・seq 連続・dropped_before 0 も確認する。
+    /// Across pause, PTS advances by the pause duration (capture wall-clock time). Also verify that
+    /// the first chunk after resume has DISCONTINUITY, continuous seq, and dropped_before 0.
     #[test]
     fn pause_preserves_absolute_clock() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
         stream.start().expect("start");
 
-        // pause 前のチャンクを集め、最後の (pts_ns, seq) を控える。
+        // Collect chunks before pause and save the last (pts_ns, seq).
         let before = collect_for(&mut stream, Duration::from_millis(250));
-        assert!(!before.is_empty(), "pause 前にチャンクが届くはず");
+        assert!(!before.is_empty(), "expected chunks before pause");
         let mut last = before.last().cloned().unwrap();
 
         stream.pause();
@@ -2166,7 +2183,7 @@ mod tests {
             last = c;
         }
 
-        // 既知時間 D の pause を保つ（STALL_THRESHOLD 未満）。
+        // Pause for a known duration D (less than STALL_THRESHOLD).
         let d = Duration::from_millis(600);
         thread::sleep(d);
         stream.resume();
@@ -2183,36 +2200,40 @@ mod tests {
             Duration::from_secs(2),
         );
         stream.stop();
-        assert!(got, "resume 後にチャンクが届くはず");
+        assert!(got, "expected a chunk after resume");
         let first = first_after.unwrap();
 
         assert!(
             first.flags.contains(ChunkFlags::DISCONTINUITY),
-            "resume 後の最初のチャンクに DISCONTINUITY が立つはず: {:?}",
+            "expected DISCONTINUITY on the first chunk after resume: {:?}",
             first.flags
         );
-        assert_eq!(first.seq, last.seq + 1, "seq は pause 前後で連続するはず");
-        assert_eq!(first.dropped_before, 0, "pause で取りこぼしは出ない");
+        assert_eq!(
+            first.seq,
+            last.seq + 1,
+            "seq should remain continuous across pause"
+        );
+        assert_eq!(first.dropped_before, 0, "pause should not drop chunks");
 
-        // pts は pause 継続時間 D ぶん前進する（キャプチャ実時間）。CI 揺れを避けるため下限
-        // D*0.8、上限 D + 余裕で挟む。
+        // PTS advances by pause duration D (capture wall-clock time). Bound it below by D*0.8 and
+        // above by D plus a margin to allow for CI timing variation.
         let delta = first.pts_ns - last.pts_ns;
         let d_ns = d.as_nanos() as i64;
         assert!(
             delta >= d_ns * 4 / 5,
-            "pts は pause ぶん（>= {} ns）前進するはず: delta={delta} ns",
+            "pts should advance by at least the pause duration (>= {} ns): delta={delta} ns",
             d_ns * 4 / 5
         );
         assert!(
             delta <= d_ns + 500_000_000,
-            "pts の前進が過大でない（<= D + 500ms）: delta={delta} ns"
+            "pts should not advance too far (<= D + 500ms): delta={delta} ns"
         );
     }
 
-    // --- デュアル出力（主 + 副タップ） ---
+    // --- Dual output (primary + secondary taps) ---
 
-    /// secondary_output を設定すると主（48k/stereo）と副（16k/mono）が同時に配信される。
-    /// 副チャンクは 320 sample、pts は主と同じ 0 起点時計に乗る。
+    /// With secondary_output set, primary (48k/stereo) and secondary (16k/mono) chunks are delivered
+    /// together. A secondary chunk has 320 samples, and its PTS uses the same zero-based clock as the primary.
     #[test]
     fn dual_output_delivers_primary_and_secondary() {
         let config = StreamConfig {
@@ -2220,7 +2241,7 @@ mod tests {
                 sample_rate: 16_000,
                 channels: 1,
             }),
-            // 収集窓の間に DROP_OLDEST で先頭（pts 0）が流れ去らないよう大きめに取る。
+            // Use a larger capacity so DROP_OLDEST does not discard the first chunk (pts 0) during collection.
             ring_capacity_chunks: 200,
             ..Default::default()
         };
@@ -2248,28 +2269,42 @@ mod tests {
             secondary.push(c);
         }
 
-        assert!(!primary.is_empty(), "主チャンクが届くはず");
-        assert!(!secondary.is_empty(), "副チャンクが届くはず");
+        assert!(!primary.is_empty(), "expected primary chunks");
+        assert!(!secondary.is_empty(), "expected secondary chunks");
         for c in &primary {
-            assert_eq!(c.data.len(), 960 * 2, "主は 48k/stereo = 1920 sample");
+            assert_eq!(
+                c.data.len(),
+                960 * 2,
+                "primary is 48k/stereo = 1920 samples"
+            );
         }
         for c in &secondary {
-            assert_eq!(c.samples.len(), 320, "副は 16k/mono = 320 sample");
+            assert_eq!(c.samples.len(), 320, "secondary is 16k/mono = 320 samples");
         }
-        // 両タップとも 0 起点で非減少。主の先頭は 0。
-        assert_eq!(primary[0].pts_ns, 0, "主先頭は 0 起点");
+        // Both taps start at zero and are non-decreasing. The first primary chunk starts at 0.
+        assert_eq!(primary[0].pts_ns, 0, "first primary chunk starts at zero");
         for w in secondary.windows(2) {
-            assert!(w[1].pts_ns >= w[0].pts_ns, "副 pts は非減少");
+            assert!(
+                w[1].pts_ns >= w[0].pts_ns,
+                "secondary PTS should not decrease"
+            );
         }
-        assert!(secondary[0].pts_ns >= 0, "副 pts は非負（主エポック基準）");
-        // 副 seq は独自カウンタで 0 始まり単調。
+        assert!(
+            secondary[0].pts_ns >= 0,
+            "secondary PTS should be non-negative (based on primary epoch)"
+        );
+        // Secondary seq uses its own counter and increases from 0.
         assert_eq!(secondary[0].seq, 0);
         for w in secondary.windows(2) {
-            assert_eq!(w[1].seq, w[0].seq + 1, "副 seq は単調連番");
+            assert_eq!(
+                w[1].seq,
+                w[0].seq + 1,
+                "secondary seq should increase consecutively"
+            );
         }
     }
 
-    /// switch_source では secondary_output を変更できない（open 時固定）。
+    /// secondary_output cannot be changed with switch_source (it is fixed at open).
     #[test]
     fn secondary_output_cannot_change_on_switch() {
         let config = StreamConfig {
@@ -2283,7 +2318,7 @@ mod tests {
         let mut stream = Stream::open(config, backend).expect("open");
         stream.start().expect("start");
 
-        // 副フォーマットを変える切替要求は InvalidArg で弾かれる（backend 構築より前）。
+        // A switch request that changes the secondary format is rejected with InvalidArg before backend construction.
         let new_config = StreamConfig {
             secondary_output: Some(OutputFormat {
                 sample_rate: 8_000,
@@ -2295,14 +2330,14 @@ mod tests {
         stream.stop();
         assert!(
             matches!(err, Err(Error::InvalidArg(_))),
-            "副フォーマット変更は InvalidArg のはず: {err:?}"
+            "expected InvalidArg when changing the secondary format: {err:?}"
         );
     }
 
-    // --- RawRing オーバーフロー → DISCONTINUITY ---
+    // --- RawRing overflow → DISCONTINUITY ---
 
-    /// RawRing を溢れさせる擬似バックエンド。start で 1 バーストがリング容量の 2 倍を
-    /// push し続け、必ず overflow を起こす。テスト専用。
+    /// Test-only mock backend that overflows RawRing. On start, each burst keeps pushing twice the
+    /// ring capacity, guaranteeing overflow.
     struct FloodingMockBackend {
         running: Arc<AtomicBool>,
         handle: Option<thread::JoinHandle<()>>,
@@ -2325,7 +2360,7 @@ mod tests {
             self.running.store(true, Ordering::SeqCst);
             let running = self.running.clone();
             let handle = thread::spawn(move || {
-                // リング容量の 2 倍を毎バースト push（必ず溢れる）。
+                // Push twice the ring capacity per burst (guaranteed overflow).
                 let burst = vec![0.1f32; RAW_RING_SAMPLES * 2];
                 while running.load(Ordering::SeqCst) {
                     sink.push(&burst, 0);
@@ -2343,13 +2378,13 @@ mod tests {
         }
     }
 
-    /// 持続的な RawRing オーバーフローが検知され、いずれかのチャンクに DISCONTINUITY が
-    /// 立つ（フレッシュ start では overflow 以外の不連続源が無いので、DISCONTINUITY =
-    /// overflow 由来）。
+    /// Detect sustained RawRing overflow and set DISCONTINUITY on at least one chunk. On a fresh
+    /// start, overflow is the only possible source of discontinuity, so DISCONTINUITY must be due to
+    /// overflow.
     #[test]
     fn ring_overflow_marks_discontinuity() {
         let backend = Box::new(FloodingMockBackend::new());
-        // ChunkRing を大きめにして DROP_OLDEST で観測前に流れ去るのを避ける。
+        // Use a larger ChunkRing so DROP_OLDEST does not discard chunks before they can be observed.
         let config = StreamConfig {
             ring_capacity_chunks: 200,
             ..Default::default()
@@ -2375,14 +2410,14 @@ mod tests {
         }
         assert!(
             saw_discontinuity,
-            "RawRing オーバーフローで DISCONTINUITY が立つはず"
+            "RawRing overflow should set DISCONTINUITY"
         );
     }
 
-    // --- denoise を内部正規形へ注入（core InnerProcessor 経由） ---
+    // --- Inject denoise into the internal canonical format (through core InnerProcessor) ---
 
-    /// set_denoise(true) 後も主・副の両タップが配信され続ける（denoise 配線のスモーク）。
-    /// 実際の除去効果は core のフラッシュ/処理テストで担保する。
+    /// Verify with a smoke test that both primary and secondary taps continue delivering after
+    /// set_denoise(true). The core flush/processing tests cover actual noise reduction.
     #[test]
     fn denoise_enabled_still_delivers_both_taps() {
         let config = StreamConfig {
@@ -2405,13 +2440,19 @@ mod tests {
                 primary += 1;
             }
             while let Some(c) = stream.poll_secondary() {
-                assert_eq!(c.samples.len(), 320, "副は 16k/mono = 320 sample");
+                assert_eq!(c.samples.len(), 320, "secondary is 16k/mono = 320 samples");
                 secondary += 1;
             }
             thread::sleep(Duration::from_millis(5));
         }
         stream.stop();
-        assert!(primary > 0, "denoise 有効でも主チャンクが届くはず");
-        assert!(secondary > 0, "denoise 有効でも副チャンクが届くはず");
+        assert!(
+            primary > 0,
+            "primary chunks should arrive with denoise enabled"
+        );
+        assert!(
+            secondary > 0,
+            "secondary chunks should arrive with denoise enabled"
+        );
     }
 }
