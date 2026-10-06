@@ -1,14 +1,12 @@
-//! 録れるプロセスの列挙（[`list_processes`]）— PipeWire レジストリから。
+//! Enumerate capturable processes from the PipeWire registry.
 //!
-//! 短命の `MainLoop` を 1 本回してレジストリを 1 往復ぶん読み、
-//! - Client global → `pipewire.sec.pid`（デーモンがソケット資格情報から付与＝詐称不可）と
-//!   `application.name`
-//! - `media.class == "Stream/Output/Audio"` の Node global → `client.id` と
-//!   `application.name`（Node を bind して状態 Running/Idle も受ける）
+//! A short-lived main loop collects Client PIDs, names and `client.api`, plus
+//! output Node ownership, names and protocol provenance. Bound node info
+//! supplies application PIDs and Running/Idle state.
 //!
-//! を集める。PID の解決はプロセス別キャプチャ（[`PwProcessBackend`](crate::PwProcessBackend)）
-//! と同じ [`resolve_node_pid`](crate::resolve_node_pid)（node → client.id → Client の PID）
-//! を使うので、ここに出た PID はそのまま `target_pid` に渡して録れる。
+//! PID resolution shares [`resolve_node_pid`](crate::resolve_node_pid) with
+//! process capture. Pulse nodes require a valid app PID from bound node info;
+//! unresolved nodes are omitted instead of being listed under the proxy's PID.
 //!
 //! 実行ファイル名は PipeWire の自己申告でなくカーネルの `/proc/<pid>/exe`
 //! （読めなければ `/proc/<pid>/comm`）から取る。
@@ -34,7 +32,10 @@ use flexaudio_core::types::{Error, ProcessInfo, Result};
 
 use pipewire as pw;
 
-use crate::{pid_from_props, pw_init_once, resolve_node_pid, NodeEntry};
+use crate::{
+    is_pulse_proxied, pid_from_props, pw_init_once, resolve_node_pid, update_node_info,
+    ClientEntry, NodeEntry,
+};
 
 /// 接続＋レジストリ往復の期限。これを過ぎても集めた分があれば `Ok`、空なら `Err`。
 const LIST_DEADLINE: Duration = Duration::from_millis(2_000);
@@ -56,8 +57,8 @@ struct OutputNode {
 /// レジストリ 1 往復ぶんの収集結果（PipeWire 非依存・テストで組み立てられる）。
 #[derive(Debug, Default)]
 struct RegistrySnapshot {
-    /// Client global id → その Client の `pipewire.sec.pid`。
-    client_pid: HashMap<u32, u32>,
+    /// Client global id -> PID and protocol provenance.
+    client_pid: HashMap<u32, ClientEntry>,
     /// Client global id → その Client の `application.name`。
     client_name: HashMap<u32, String>,
     /// Node global id → アプリ出力ノード。
@@ -185,14 +186,13 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                 };
                 match global.type_ {
                     pw::types::ObjectType::Client => {
-                        let Some(pid) = pid_from_props(
+                        let client = ClientEntry::from_props(
                             props.get(*pw::keys::APP_PROCESS_ID),
                             props.get(*pw::keys::SEC_PID),
-                        ) else {
-                            return;
-                        };
+                            props.get(*pw::keys::CLIENT_API),
+                        );
                         let mut snap = snapshot_for_global.borrow_mut();
-                        snap.client_pid.insert(global.id, pid);
+                        snap.client_pid.insert(global.id, client);
                         if let Some(name) = non_empty(props.get(*pw::keys::APP_NAME)) {
                             snap.client_name.insert(global.id, name);
                         }
@@ -206,13 +206,11 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                                 .get(*pw::keys::CLIENT_ID)
                                 .and_then(|s| s.parse::<u32>().ok()),
                             app_pid: pid_from_props(props.get(*pw::keys::APP_PROCESS_ID), None),
-                            // Not read by anything in this file — `exclude_decidable`
-                            // and Include/Exclude linking are `setup_pw_process`'s
-                            // concern only. `NodeEntry` is shared, so this file just
-                            // needs a value.
+                            app_pid_from_info: false,
+                            pulse_proxied: is_pulse_proxied(props.get(*pw::keys::CLIENT_API)),
                             info_seen: false,
-                            // Same: the declared output-port count is only read by
-                            // `setup_pw_process`'s link planner.
+                            props_seen: false,
+                            // The declared port count is only used by capture's link planner.
                             n_output_ports: None,
                         };
                         snapshot_for_global.borrow_mut().nodes.insert(
@@ -224,8 +222,7 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                             },
                         );
 
-                        // 状態（Running/Idle/Suspended）は global props に無いので、ノードを
-                        // bind して info を受ける。bind できなくても列挙自体は続ける（不明扱い）。
+                        // Bind for state and app PID; unresolved Pulse nodes are omitted.
                         let node: pw::node::Node = match registry_for_global.bind(global) {
                             Ok(node) => node,
                             Err(_) => return,
@@ -235,21 +232,32 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                         let listener = node
                             .add_listener_local()
                             .info(move |info| {
-                                // info コールバックも FFI 越え。state() は不正な UTF-8 の
-                                // エラー文字列で panic し得るので必ず包む。
+                                // Catch unwinding at the FFI boundary; state() may
+                                // panic on an error string containing invalid UTF-8.
                                 let _ = catch_unwind(AssertUnwindSafe(|| {
                                     let running =
                                         matches!(info.state(), pw::node::NodeState::Running);
-                                    let pid = info.props().and_then(|p| {
-                                        pid_from_props(p.get(*pw::keys::APP_PROCESS_ID), None)
+                                    let props_changed = info
+                                        .change_mask()
+                                        .contains(pw::node::NodeChangeMask::PROPS);
+                                    let props = info.props().map(|p| {
+                                        (
+                                            p.get(*pw::keys::APP_PROCESS_ID),
+                                            p.get(*pw::keys::CLIENT_API),
+                                        )
                                     });
-                                    if let Some(entry) =
-                                        snapshot_for_info.borrow_mut().nodes.get_mut(&node_id)
-                                    {
+                                    let mut snap = snapshot_for_info.borrow_mut();
+                                    let RegistrySnapshot {
+                                        nodes, client_pid, ..
+                                    } = &mut *snap;
+                                    if let Some(entry) = nodes.get_mut(&node_id) {
                                         entry.running = Some(running);
-                                        if pid.is_some() {
-                                            entry.entry.app_pid = pid;
-                                        }
+                                        update_node_info(
+                                            &mut entry.entry,
+                                            props_changed,
+                                            props,
+                                            client_pid,
+                                        );
                                     }
                                 }));
                             })
@@ -359,6 +367,7 @@ mod tests {
                 app_pid,
                 info_seen: false,
                 n_output_ports: None,
+                ..NodeEntry::default()
             },
             app_name: name.map(str::to_string),
             running: None,
@@ -368,9 +377,11 @@ mod tests {
     #[test]
     fn build_resolves_pid_through_client_like_the_capture_backend() {
         let mut snap = RegistrySnapshot::default();
-        snap.client_pid.insert(40, 1234);
+        snap.client_pid
+            .insert(40, ClientEntry::from_props(None, Some("1234"), None));
         snap.client_name.insert(40, "Firefox".into());
-        snap.client_pid.insert(41, 5678);
+        snap.client_pid
+            .insert(41, ClientEntry::from_props(None, Some("5678"), None));
         // client 40 のノード（ノード名あり・Running）。
         snap.nodes.insert(
             100,
@@ -409,12 +420,112 @@ mod tests {
     #[test]
     fn build_falls_back_to_client_name() {
         let mut snap = RegistrySnapshot::default();
-        snap.client_pid.insert(40, 10);
+        snap.client_pid
+            .insert(40, ClientEntry::from_props(None, Some("10"), None));
         snap.client_name.insert(40, "mpv".into());
         snap.nodes.insert(1, node(Some(40), None, None));
         let list = build_process_list(&snap, |_| None);
         assert_eq!(list[0].name, "mpv");
         assert_eq!(list[0].executable, None);
+    }
+
+    #[test]
+    fn build_pulse_pid_decision_table() {
+        for (node_api, client_api) in [
+            (None, Some("pipewire-pulse")),
+            (Some("pipewire-pulse"), None),
+            (None, Some("pipewire")),
+        ] {
+            for app_pid in [
+                Some("1028793"),
+                None,
+                Some("0"),
+                Some("-1"),
+                Some("invalid"),
+                Some(""),
+            ] {
+                let mut snap = RegistrySnapshot::default();
+                snap.client_pid
+                    .insert(40, ClientEntry::from_props(None, Some("1584"), client_api));
+                let mut output = node(Some(40), None, Some("Chromium"));
+                update_node_info(
+                    &mut output.entry,
+                    true,
+                    Some((app_pid, node_api)),
+                    &snap.client_pid,
+                );
+                snap.nodes.insert(1, output);
+                let list = build_process_list(&snap, |_| None);
+                let expected = if app_pid == Some("1028793") {
+                    vec![1028793]
+                } else if node_api.is_some() || client_api == Some("pipewire-pulse") {
+                    Vec::new()
+                } else {
+                    vec![1584]
+                };
+                assert_eq!(
+                    list.iter().map(|process| process.pid).collect::<Vec<_>>(),
+                    expected,
+                    "node API={node_api:?}, client API={client_api:?}, app PID={app_pid:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_retains_native_pid_but_clears_missing_pulse_pid() {
+        for (node_api, client_api, expected) in [
+            (None, Some("pipewire"), vec![42]),
+            (None, Some("pipewire-pulse"), Vec::new()),
+            (Some("pipewire-pulse"), None, Vec::new()),
+        ] {
+            for props in [None, Some((None, None)), Some((Some("invalid"), None))] {
+                let mut snap = RegistrySnapshot::default();
+                snap.client_pid
+                    .insert(40, ClientEntry::from_props(None, Some("7"), client_api));
+                let mut output = node(Some(40), Some(42), None);
+                output.entry.app_pid_from_info = true;
+                output.entry.pulse_proxied = is_pulse_proxied(node_api);
+                output.entry.info_seen = true;
+                output.entry.props_seen = true;
+                update_node_info(&mut output.entry, true, props, &snap.client_pid);
+                snap.nodes.insert(1, output);
+                let list = build_process_list(&snap, |_| None);
+                assert_eq!(
+                    list.iter().map(|process| process.pid).collect::<Vec<_>>(),
+                    expected,
+                    "node API={node_api:?}, client API={client_api:?}, props={props:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_omits_stale_bound_pid_when_pulse_client_arrives_late() {
+        for props in [Some((None, None)), None] {
+            let mut snap = RegistrySnapshot::default();
+            let mut output = node(Some(40), None, Some("app"));
+            update_node_info(
+                &mut output.entry,
+                true,
+                Some((Some("42"), None)),
+                &snap.client_pid,
+            );
+            snap.nodes.insert(1, output);
+            assert_eq!(build_process_list(&snap, |_| None)[0].pid, 42);
+
+            let output = snap.nodes.get_mut(&1).expect("output node exists");
+            update_node_info(&mut output.entry, true, props, &snap.client_pid);
+            assert_eq!(output.entry.app_pid, Some(42));
+            assert!(!output.entry.app_pid_from_info);
+            assert_eq!(build_process_list(&snap, |_| None)[0].pid, 42);
+
+            snap.client_pid.insert(
+                40,
+                ClientEntry::from_props(None, Some("7"), Some("pipewire-pulse")),
+            );
+            assert!(build_process_list(&snap, |_| None).is_empty());
+        }
     }
 
     #[test]
@@ -436,7 +547,8 @@ mod tests {
     #[test]
     fn timeout_with_no_output_nodes_is_err_even_if_clients_arrived() {
         let mut snap = RegistrySnapshot::default();
-        snap.client_pid.insert(40, 1234);
+        snap.client_pid
+            .insert(40, ClientEntry::from_props(None, Some("1234"), None));
         snap.client_name.insert(40, "silent-client".into());
         let err = finish_snapshot(false, snap).expect_err("timeout + 0 nodes must be Err");
         assert!(

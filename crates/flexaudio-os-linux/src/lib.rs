@@ -72,8 +72,7 @@ fn pw_init_once() {
     });
 }
 
-// 録れるプロセスの列挙（`list_processes`）。PID 解決はプロセス別キャプチャと同じ
-// `resolve_node_pid` を共有する。
+// Process enumeration shares PID resolution with process capture.
 mod processes;
 pub use processes::list_processes;
 
@@ -611,27 +610,41 @@ struct ProcessKeep {
     _bound_nodes: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, BoundNode>>>,
 }
 
-/// 監視中の Stream/Output/Audio ノード 1 件の登録情報（registry global から拾う）。
-///
-/// PipeWire では PID はノードでなく Client オブジェクトの `pipewire.sec.pid` に載る。
-/// ノード側には通常 PID が無く、`client.id` で所有 Client を指すだけ。なので PID 解決は
-/// 二段（ノード→client.id→Client の PID）。ノードを bind した info から
-/// `application.process.id` が届けばそれを `app_pid` に控える。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// PID and protocol provenance collected from a Client global.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClientEntry {
+    pid: Option<u32>,
+    pulse_proxied: bool,
+}
+
+impl ClientEntry {
+    fn from_props(app_pid: Option<&str>, sec_pid: Option<&str>, api: Option<&str>) -> Self {
+        Self {
+            pid: pid_from_props(app_pid, sec_pid),
+            pulse_proxied: is_pulse_proxied(api),
+        }
+    }
+}
+
+fn is_pulse_proxied(api: Option<&str>) -> bool {
+    api == Some("pipewire-pulse")
+}
+
+/// An output node's PID, provenance and bound-info state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct NodeEntry {
-    /// このノードを所有する Client の registry global id（ノード props の `client.id`）。
-    /// 無いこともある（その場合は `app_pid` も client_pid 解決も当たらない）。
+    /// Owning Client global id, from `client.id`.
     owning_client_id: Option<u32>,
-    /// ノードを bind した info から埋まる PID（`application.process.id`）。
-    /// app_pid is filled from the bound node's info props (application.process.id),
-    /// which the registry global omits.
+    /// `application.process.id`, initially from the global and updated by bound info.
     app_pid: Option<u32>,
-    /// bind したノードの info コールバックが一度でも届いたか（中身の有無は問わない）。
-    /// Exclude リンクの可否判定に使う: false のままのノードは PID 未確定なので、
-    /// 誤って除外対象プロセスをリンクしないよう対象から外す（安全側）。
-    /// Set true by the info callback whether or not it carried `application.process.id`;
-    /// read by `exclude_decidable` to gate Exclude-mode linking.
+    /// Whether the latest bound PROPS update carried a valid application PID.
+    app_pid_from_info: bool,
+    /// Pulse provenance seen on this node; the owning Client is checked as well.
+    pulse_proxied: bool,
+    /// Whether any bound info has arrived, including state-only updates.
     info_seen: bool,
+    /// Whether a bound PROPS update carried a dictionary. Exclude waits for it.
+    props_seen: bool,
     /// How many output ports the node itself declares (`NodeInfoRef::n_output_ports`),
     /// filled from the bound node's info; `None` until that info arrives (and in
     /// `processes.rs`, which does not read it). Port globals trickle in one at a
@@ -751,23 +764,56 @@ fn link_plan_is_complete(
         && pairs_len >= out_ports_len.min(capture_channels)
 }
 
-/// ノードの PID を解決する（PipeWire 非依存・到着順非依存）。
-///
-/// ノード自身に PID があればそれを使い、無ければ `client.id` で所有 Client を引いて
-/// `client_pid` 表（Client global id → その Client の `pipewire.sec.pid`）から解決する。
-/// Client と Node はどちらが先に来てもよく、各 global 到着時にこの関数で再評価すれば、
-/// 両方揃った時点で `Some(pid)` になる。
+/// Resolve a node's app PID, shared by capture and enumeration.
+/// Pulse credentials name the proxy, so only a valid PID from bound node info
+/// can resolve a Pulse node. Native clients retain the credential fallback.
 fn resolve_node_pid(
     entry: &NodeEntry,
-    client_pid: &std::collections::HashMap<u32, u32>,
+    client_pid: &std::collections::HashMap<u32, ClientEntry>,
 ) -> Option<u32> {
-    if let Some(pid) = entry.app_pid {
-        // ノードに直接 PID が載る将来構成。Client を介さず確定。
-        return Some(pid);
+    let client = entry.owning_client_id.and_then(|id| client_pid.get(&id));
+    if node_is_pulse_proxied(entry, client_pid) {
+        return entry.app_pid.filter(|_| entry.app_pid_from_info);
     }
-    // 通常経路: client.id → Client の PID。
-    let client_id = entry.owning_client_id?;
-    client_pid.get(&client_id).copied()
+    entry
+        .app_pid
+        .or_else(|| client.and_then(|client| client.pid))
+}
+
+fn node_is_pulse_proxied(
+    entry: &NodeEntry,
+    client_pid: &std::collections::HashMap<u32, ClientEntry>,
+) -> bool {
+    entry.pulse_proxied
+        || entry
+            .owning_client_id
+            .and_then(|id| client_pid.get(&id))
+            .is_some_and(|client| client.pulse_proxied)
+}
+
+/// Apply bound info without treating state-only updates as PID removal.
+/// For Pulse nodes, a PROPS update with a missing dictionary or unusable app PID
+/// clears the old PID. Native nodes retain it. Pulse provenance is retained.
+/// The latest PROPS update's PID validity is recorded even before provenance arrives.
+fn update_node_info(
+    entry: &mut NodeEntry,
+    props_changed: bool,
+    props: Option<(Option<&str>, Option<&str>)>,
+    client_pid: &std::collections::HashMap<u32, ClientEntry>,
+) -> bool {
+    let previous = *entry;
+    entry.info_seen = true;
+    if props_changed {
+        entry.props_seen |= props.is_some();
+        let (app_pid, api) = props.unwrap_or_default();
+        entry.pulse_proxied |= is_pulse_proxied(api);
+        let app_pid = pid_from_props(app_pid, None);
+        entry.app_pid_from_info = app_pid.is_some();
+        if app_pid.is_some() || node_is_pulse_proxied(entry, client_pid) {
+            entry.app_pid = app_pid;
+        }
+    }
+    *entry != previous
 }
 
 /// Resolve a registry object's owning process from its properties.
@@ -783,14 +829,12 @@ pub(crate) fn pid_from_props(app_process_id: Option<&str>, sec_pid: Option<&str>
     parse(app_process_id).or_else(|| parse(sec_pid))
 }
 
-/// Exclude モードでこのノードをリンク対象として判定してよいか（PipeWire 非依存）。
-///
-/// bind したノードの info コールバックが一度も届いていなければ、PID 解決が client
-/// table 経由の暫定値（pipewire-pulse の pid になりがち）でしかなく、除外対象
-/// プロセスを取り違えてリンクしかねない。`info_seen` が立つまでは判定不能として
-/// 扱い、Exclude の対象から外す（安全側 — 未確認ノードは録らない）。
-fn exclude_decidable(entry: &NodeEntry) -> bool {
-    entry.info_seen
+/// Exclude needs bound props and a usable app PID, never a Pulse proxy PID.
+fn exclude_decidable(
+    entry: &NodeEntry,
+    client_pid: &std::collections::HashMap<u32, ClientEntry>,
+) -> bool {
+    entry.props_seen && resolve_node_pid(entry, client_pid).is_some()
 }
 
 /// 自前キャプチャ stream のノード名。registry で自分の入力ポートを引くための固有名で、
@@ -836,6 +880,18 @@ enum PidSelect {
 }
 
 impl PidSelect {
+    /// Use the same decision when creating links and when revoking stale links.
+    fn selects_node(
+        &self,
+        entry: &NodeEntry,
+        client_pid: &std::collections::HashMap<u32, ClientEntry>,
+    ) -> bool {
+        if matches!(self, Self::Exclude(_)) && !exclude_decidable(entry, client_pid) {
+            return false;
+        }
+        self.selects(resolve_node_pid(entry, client_pid))
+    }
+
     /// Is `pid` one of the pids this predicate is *about* (the included pid, or
     /// a member of the exclusion set)? Used to track those Clients for
     /// `global_remove`.
@@ -975,8 +1031,8 @@ fn setup_pw_process(
 
     // 監視中ノード表: registry node global id → 登録情報（owning client.id / 直 PID）。
     let nodes: Rc<RefCell<HashMap<u32, NodeEntry>>> = Rc::new(RefCell::new(HashMap::new()));
-    // Client 表: Client の registry global id → その Client の pipewire.sec.pid。
-    let client_pid: Rc<RefCell<HashMap<u32, u32>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Client global id -> PID and protocol provenance, even when PID is unknown.
+    let client_pid: Rc<RefCell<HashMap<u32, ClientEntry>>> = Rc::new(RefCell::new(HashMap::new()));
     // Registry global ids of the Clients owned by this predicate's subject pids
     // (the included pid, or any member of the exclusion set). `global_remove`
     // uses it to notice such a Client disappearing. A set, because Exclude can
@@ -995,16 +1051,9 @@ fn setup_pw_process(
     // props omit it, a bound object's `info` carries it.
     let bound_nodes: Rc<RefCell<HashMap<u32, BoundNode>>> = Rc::new(RefCell::new(HashMap::new()));
 
-    // 状態が更新されるたびに、リンクすべき出力ノードのうち未リンクのものを再評価し、
-    // 対象出力ポートと自入力ポートが揃っていれば link-factory でチャンネル対応リンクを張る。
-    // `select` の述語で対象ノード集合を決める:
-    // - Include(pid): 解決済み PID == pid のノード（代表 1 ノードのみ。`linked` が既に
-    //   非空なら何もしない＝単一ノードのまま）。
-    // - Exclude(set): 解決済み PID が set に無い `Stream/Output/Audio` ノードをすべて。
-    //   PID 未解決（None）のノードはまだリンクしない（Client 到着で PID が解けるまで待ち、
-    //   除外プロセスを取り違えない）。
-    // 既に `linked` のキーになっているノードは二重リンクしない。
-    // ループスレッド上で呼ばれる（`!Send` な core/stream を触ってよい）。
+    // Reconcile selection before adding links, including when a Client arrives
+    // after its Node and reveals Pulse provenance. Include keeps one node;
+    // Exclude links all decidable nodes outside the exclusion set.
     #[allow(clippy::too_many_arguments)]
     fn try_link(
         core: &pw::core::CoreRc,
@@ -1012,11 +1061,20 @@ fn setup_pw_process(
         select: &PidSelect,
         self_node_id: &Cell<Option<u32>>,
         nodes: &RefCell<HashMap<u32, NodeEntry>>,
-        client_pid: &RefCell<HashMap<u32, u32>>,
+        client_pid: &RefCell<HashMap<u32, ClientEntry>>,
         ports: &RefCell<HashMap<u32, PortEntry>>,
         linked: &RefCell<HashMap<u32, Vec<pw::link::Link>>>,
     ) {
-        // Include は代表 1 ノードのみ。既にリンク済みなら何もしない。
+        {
+            let nodes = nodes.borrow();
+            let client_pid = client_pid.borrow();
+            linked.borrow_mut().retain(|id, _| {
+                nodes
+                    .get(id)
+                    .is_some_and(|entry| select.selects_node(entry, &client_pid))
+            });
+        }
+        // Include keeps its representative node while it remains selected.
         if matches!(select, PidSelect::Include(_)) && !linked.borrow().is_empty() {
             return;
         }
@@ -1044,17 +1102,7 @@ fn setup_pw_process(
                     if linked.contains_key(id) {
                         return false;
                     }
-                    // info_seen が立つまでは判定不能として保留する（
-                    // exclude_decidable）。bind した info が一度も届いていない
-                    // ノードは client table 経由の暫定 PID（pipewire-pulse の pid
-                    // になりがち）しか持たず、除外対象プロセスを取り違えてリンク
-                    // しかねない。bind 自体に失敗したノードは info が永遠に届かず、
-                    // Exclude では永久にリンクされない — 除外対象を取り違えて
-                    // 録るより安全側。
-                    if matches!(select, PidSelect::Exclude(_)) && !exclude_decidable(entry) {
-                        return false;
-                    }
-                    select.selects(resolve_node_pid(entry, &client_pid))
+                    select.selects_node(entry, &client_pid)
                 })
                 .map(|(&id, _)| id)
                 .collect();
@@ -1198,18 +1246,17 @@ fn setup_pw_process(
                 };
                 match global.type_ {
                     pw::types::ObjectType::Client => {
-                        // PID は Client の pipewire.sec.pid に常在する（デーモンが付与する
-                        // ので詐称できない）。
-                        // application.process.id takes precedence — see pid_from_props.
-                        let Some(pid) = pid_from_props(
+                        let client = ClientEntry::from_props(
                             props.get(*pw::keys::APP_PROCESS_ID),
                             props.get(*pw::keys::SEC_PID),
-                        ) else {
-                            return;
-                        };
-                        client_pid_for_global.borrow_mut().insert(global.id, pid);
-                        // 比較対象 PID の Client を控える（global_remove で消失検知に使う）。
-                        if select_for_global.is_subject_pid(pid) {
+                            props.get(*pw::keys::CLIENT_API),
+                        );
+                        client_pid_for_global.borrow_mut().insert(global.id, client);
+                        // Track subject Clients for disappearance detection.
+                        if client
+                            .pid
+                            .is_some_and(|pid| select_for_global.is_subject_pid(pid))
+                        {
                             target_client_for_global.borrow_mut().insert(global.id);
                         }
                     }
@@ -1223,27 +1270,24 @@ fn setup_pw_process(
                         let owning_client_id = props
                             .get(*pw::keys::CLIENT_ID)
                             .and_then(|s| s.parse::<u32>().ok());
-                        // ノードを bind して info を購読するまで PID は分からない
-                        // ことが多い（registry global の props に
-                        // application.process.id は載らない — 届くのは bound
-                        // info 経由のみ）。
+                        // The global usually omits the app PID; bound info supplies it.
                         let app_pid = pid_from_props(props.get(*pw::keys::APP_PROCESS_ID), None);
                         nodes_for_global.borrow_mut().insert(
                             global.id,
                             NodeEntry {
                                 owning_client_id,
                                 app_pid,
+                                app_pid_from_info: false,
+                                pulse_proxied: is_pulse_proxied(props.get(*pw::keys::CLIENT_API)),
                                 info_seen: false,
+                                props_seen: false,
                                 // Only the bound info carries the declared port count.
                                 n_output_ports: None,
                             },
                         );
 
-                        // bind して info を購読し、届いた時点で app_pid / info_seen を
-                        // 埋めて再評価する。bind 自体に失敗しても enumeration は
-                        // client table 経由で続く（このノードだけ info_seen が
-                        // 永遠に立たず、Exclude では判定不能のまま＝リンクされない —
-                        // 安全側）。
+                        // Bind to learn the app PID. If binding fails, Exclude
+                        // leaves this node undecidable and never links it.
                         let bound: std::result::Result<pw::node::Node, _> =
                             registry_for_global.bind(global);
                         if let Ok(node) = bound {
@@ -1260,10 +1304,13 @@ fn setup_pw_process(
                                 .add_listener_local()
                                 .info(move |info| {
                                     let _ = catch_unwind(AssertUnwindSafe(|| {
-                                        let pid = info.props().and_then(|props| {
-                                            pid_from_props(
+                                        let props_changed = info
+                                            .change_mask()
+                                            .contains(pw::node::NodeChangeMask::PROPS);
+                                        let props = info.props().map(|props| {
+                                            (
                                                 props.get(*pw::keys::APP_PROCESS_ID),
-                                                None,
+                                                props.get(*pw::keys::CLIENT_API),
                                             )
                                         });
 
@@ -1273,62 +1320,42 @@ fn setup_pw_process(
                                         // "mono" in link_plan_is_complete.
                                         let n_out = info.n_output_ports();
 
-                                        // 判定材料が変わったか: info_seen が初めて立つ
-                                        // （これまで判定不能だったノードが判定可能になる）
-                                        // か、app_pid が新しい値に更新されるか。どちらも
-                                        // try_link の対象集合を変え得るので、その場合だけ
-                                        // 以降の unlink 判定 / try_link を行う。
-                                        // A change of the declared output-port count counts
-                                        // too: it changes what link_plan_is_complete will
-                                        // accept for this node, so it must re-run try_link.
-                                        let updated_entry: Option<(NodeEntry, bool)> = {
+                                        // PID/provenance and declared-port changes require
+                                        // reevaluation; unrelated state updates do not.
+                                        let update = {
                                             let mut nodes = nodes_for_info.borrow_mut();
                                             let Some(entry) = nodes.get_mut(&node_id) else {
                                                 return;
                                             };
-                                            let newly_decidable = !entry.info_seen;
-                                            entry.info_seen = true;
-                                            let pid_changed = pid.is_some() && entry.app_pid != pid;
-                                            if pid_changed {
-                                                entry.app_pid = pid;
-                                            }
+                                            let changed = update_node_info(
+                                                entry,
+                                                props_changed,
+                                                props,
+                                                &client_pid_for_info.borrow(),
+                                            );
                                             let n_out_changed = entry.n_output_ports != Some(n_out);
                                             if n_out_changed {
                                                 entry.n_output_ports = Some(n_out);
                                             }
-                                            (newly_decidable || pid_changed || n_out_changed)
-                                                .then_some((*entry, n_out_changed))
+                                            (changed || n_out_changed).then_some(n_out_changed)
                                         };
-                                        let Some((entry, n_out_changed)) = updated_entry else {
+                                        let Some(n_out_changed) = update else {
                                             return;
                                         };
 
-                                        // すでにリンク中で、かつ最新の解決結果ではもう
-                                        // select の対象外なら、try_link に評価させる前に
-                                        // 自分でリンクを外す（try_link は追加のみで、
-                                        // 外れるべきリンクを外してくれない）。
-                                        let resolved = {
-                                            let client_pid = client_pid_for_info.borrow();
-                                            resolve_node_pid(&entry, &client_pid)
-                                        };
                                         // A declared output-port count that changed after we
                                         // already committed a plan means the plan we latched
                                         // was built against the old count and may be
                                         // incomplete (e.g. the node declared 1 port when we
-                                        // linked and now declares 2). `try_link` only adds,
-                                        // so drop the existing links here and let it rebuild
+                                        // linked and now declares 2). Drop the links and rebuild
                                         // the plan against the new count; a plan that became
                                         // incomplete must be revisited.
-                                        let already_linked =
-                                            linked_for_info.borrow().contains_key(&node_id);
-                                        if already_linked
-                                            && (!select_for_info.selects(resolved) || n_out_changed)
-                                        {
+                                        if n_out_changed {
                                             linked_for_info.borrow_mut().remove(&node_id);
                                         }
 
-                                        // ここまでで nodes/client_pid/linked のどの借用も
-                                        // 終わっている（すべて上のブロック内で drop 済み）。
+                                        // All state borrows have ended. Reconciliation also
+                                        // unlinks a Pulse node whose app PID was invalidated.
                                         try_link(
                                             &core_for_info,
                                             &stream_for_info,
@@ -2859,78 +2886,36 @@ mod tests {
         }
     }
 
-    /// `resolve_node_pid` を検証する（PipeWire 非依存）。
-    ///
-    /// 実機 pw-dump で確認した事実: PID は Client に載り、ノードは `client.id` で Client を
-    /// 指すだけ。なので PID 解決は二段（node → client.id → Client の PID）。Client と Node は
-    /// どちらが先に来ても、各到着で再評価すれば正しく解決できる。これを `client_pid` 表に
-    /// 値を入れる前後で確認する。
+    /// Native PID resolution remains independent of registry arrival order.
     #[test]
     fn resolve_node_pid_via_client_table() {
         use std::collections::HashMap;
 
-        // pw-cat の実例: node.id=62 が client.id=60 を指し、client.id=60 の Client が
-        // application.process.id=13394 を持つ。
         let node = NodeEntry {
             owning_client_id: Some(60),
-            app_pid: None,
-            info_seen: false,
-            n_output_ports: None,
+            ..NodeEntry::default()
         };
+        let mut clients = HashMap::new();
+        assert_eq!(resolve_node_pid(&node, &clients), None);
+        clients.insert(60, ClientEntry::from_props(None, Some("13394"), None));
+        assert_eq!(resolve_node_pid(&node, &clients), Some(13394));
 
-        // --- Node が先に来て Client がまだ表に無い状態 → 未解決（None）。
-        let mut client_pid: HashMap<u32, u32> = HashMap::new();
-        assert_eq!(
-            resolve_node_pid(&node, &client_pid),
-            None,
-            "client.id に対応する Client がまだ無ければ PID 未解決"
-        );
-
-        // --- 後から Client(global id=60, pid=13394) が到着して表へ → 解決される。
-        client_pid.insert(60, 13394);
-        assert_eq!(
-            resolve_node_pid(&node, &client_pid),
-            Some(13394),
-            "client.id=60 → Client の pid=13394 を二段で解決"
-        );
-
-        // --- client.id が無いノードは（直 PID も無い限り）解決不能。
-        let orphan = NodeEntry {
-            owning_client_id: None,
-            app_pid: None,
-            info_seen: false,
-            n_output_ports: None,
-        };
-        assert_eq!(resolve_node_pid(&orphan, &client_pid), None);
-
-        // ノードを bind した info から application.process.id が届けば Client を
-        // 介さず直解決でき、client_pid 表が空でも解決できる。
-        let node_with_pid = NodeEntry {
-            owning_client_id: Some(99), // 表に無い client.id でも
+        let orphan = NodeEntry::default();
+        assert_eq!(resolve_node_pid(&orphan, &clients), None);
+        let direct = NodeEntry {
             app_pid: Some(424242),
-            info_seen: true,
-            n_output_ports: None,
+            ..NodeEntry::default()
         };
-        let empty: HashMap<u32, u32> = HashMap::new();
-        assert_eq!(
-            resolve_node_pid(&node_with_pid, &empty),
-            Some(424242),
-            "ノード自身の PID を優先して直解決"
-        );
+        assert_eq!(resolve_node_pid(&direct, &HashMap::new()), Some(424242));
 
-        // --- 別 client.id のノードは別 PID（取り違えないこと）。
-        let other_node = NodeEntry {
+        let other = NodeEntry {
             owning_client_id: Some(61),
-            app_pid: None,
-            info_seen: false,
-            n_output_ports: None,
+            ..NodeEntry::default()
         };
-        // client 61 は未登録なので None、登録すればその PID。
-        assert_eq!(resolve_node_pid(&other_node, &client_pid), None);
-        client_pid.insert(61, 555);
-        assert_eq!(resolve_node_pid(&other_node, &client_pid), Some(555));
-        // node(client 60) の解決は影響を受けない。
-        assert_eq!(resolve_node_pid(&node, &client_pid), Some(13394));
+        assert_eq!(resolve_node_pid(&other, &clients), None);
+        clients.insert(61, ClientEntry::from_props(None, Some("555"), None));
+        assert_eq!(resolve_node_pid(&other, &clients), Some(555));
+        assert_eq!(resolve_node_pid(&node, &clients), Some(13394));
     }
 
     /// libpulse clients reach PipeWire through pipewire-pulse, so their Client's
@@ -2954,57 +2939,384 @@ mod tests {
         assert_eq!(pid_from_props(None, None), None);
     }
 
-    /// `exclude_decidable` はテーブル駆動: `info_seen` 単独で決まり、
-    /// `app_pid`/`owning_client_id` の値には左右されない（PipeWire 非依存）。
+    /// Pulse provenance can come from either the node or its owning Client.
     #[test]
-    fn exclude_decidable_gates_on_info_seen_only() {
-        let cases: &[(NodeEntry, bool, &str)] = &[
+    fn node_pid_decision_table() {
+        use std::collections::{HashMap, HashSet};
+
+        // The measured Chromium/Electron fixture: app PID 1028793, proxy PID 1584.
+        // Columns: node API, client API, info seen, props seen, bound PID, app PID,
+        // resolved PID, Exclude decidable.
+        let cases = [
             (
-                NodeEntry {
-                    owning_client_id: None,
-                    app_pid: None,
-                    info_seen: false,
-                    n_output_ports: None,
-                },
+                None,
+                Some("pipewire-pulse"),
                 false,
-                "info 未到達・PID 未解決 → 判定不能",
-            ),
-            (
-                NodeEntry {
-                    owning_client_id: Some(60),
-                    app_pid: None,
-                    info_seen: false,
-                    n_output_ports: None,
-                },
                 false,
-                "client.id 経由の暫定解決が Some でも、info 未到達なら判定不能\
-                 （race の本体: client table 経由の暫定 PID だけでは Exclude 対象にしない）",
+                false,
+                None,
+                None,
+                false,
             ),
             (
-                NodeEntry {
-                    owning_client_id: None,
-                    app_pid: Some(28551),
-                    info_seen: true,
-                    n_output_ports: None,
-                },
+                None,
+                Some("pipewire-pulse"),
                 true,
-                "info 到達・PID 解決済み → 判定可能",
+                false,
+                false,
+                None,
+                None,
+                false,
             ),
             (
-                NodeEntry {
-                    owning_client_id: Some(60),
-                    app_pid: None,
-                    info_seen: true,
-                    n_output_ports: None,
-                },
+                None,
+                Some("pipewire-pulse"),
                 true,
-                "info は届いたが application.process.id 自体は無かった場合も、\
-                 info_seen が立っていれば判定可能（client table 解決へフォールバック）",
+                true,
+                false,
+                Some(1028793),
+                None,
+                false,
+            ),
+            (
+                None,
+                Some("pipewire-pulse"),
+                true,
+                true,
+                true,
+                Some(1028793),
+                Some(1028793),
+                true,
+            ),
+            (
+                Some("pipewire-pulse"),
+                None,
+                true,
+                true,
+                true,
+                Some(1028793),
+                Some(1028793),
+                true,
+            ),
+            (
+                Some("pipewire-pulse"),
+                None,
+                true,
+                true,
+                false,
+                None,
+                None,
+                false,
+            ),
+            (
+                None,
+                Some("pipewire"),
+                false,
+                false,
+                false,
+                None,
+                Some(1584),
+                false,
+            ),
+            (
+                None,
+                Some("pipewire"),
+                true,
+                false,
+                false,
+                None,
+                Some(1584),
+                false,
+            ),
+            (
+                None,
+                Some("pipewire"),
+                true,
+                true,
+                false,
+                None,
+                Some(1584),
+                true,
+            ),
+            (
+                None,
+                None,
+                true,
+                false,
+                false,
+                Some(1028793),
+                Some(1028793),
+                false,
+            ),
+            (
+                None,
+                None,
+                true,
+                true,
+                true,
+                Some(1028793),
+                Some(1028793),
+                true,
             ),
         ];
-        for (entry, want, msg) in cases {
-            assert_eq!(exclude_decidable(entry), *want, "{msg}");
+        for (
+            node_api,
+            client_api,
+            info_seen,
+            props_seen,
+            app_pid_from_info,
+            app_pid,
+            pid,
+            decidable,
+        ) in cases
+        {
+            let clients =
+                HashMap::from([(40, ClientEntry::from_props(None, Some("1584"), client_api))]);
+            let entry = NodeEntry {
+                owning_client_id: Some(40),
+                app_pid,
+                app_pid_from_info,
+                pulse_proxied: is_pulse_proxied(node_api),
+                info_seen,
+                props_seen,
+                ..NodeEntry::default()
+            };
+            assert_eq!(
+                resolve_node_pid(&entry, &clients),
+                pid,
+                "{entry:?}, {clients:?}"
+            );
+            assert_eq!(
+                exclude_decidable(&entry, &clients),
+                decidable,
+                "{entry:?}, {clients:?}"
+            );
+            let exclude = PidSelect::Exclude(HashSet::from([1028793]));
+            assert_eq!(
+                exclude.selects_node(&entry, &clients),
+                decidable && pid != Some(1028793)
+            );
+            assert_eq!(
+                PidSelect::Include(1028793).selects_node(&entry, &clients),
+                pid == Some(1028793)
+            );
         }
+    }
+
+    /// Invalid or removed Pulse PIDs revoke selection; state-only info retains it.
+    #[test]
+    fn bound_info_pid_update_table() {
+        use std::collections::{HashMap, HashSet};
+
+        // Columns: PROPS mask, dictionary, expected app PID, still selected.
+        let cases = [
+            (false, None, Some(1028793), true),
+            (false, Some((Some("0"), None)), Some(1028793), true),
+            (true, None, None, false),
+            (true, Some((Some("1028793"), None)), Some(1028793), true),
+            (true, Some((Some("42"), None)), Some(42), true),
+            (true, Some((Some("1584"), None)), Some(1584), false),
+            (true, Some((None, None)), None, false),
+            (true, Some((Some("0"), None)), None, false),
+            (true, Some((Some("-1"), None)), None, false),
+            (true, Some((Some("nope"), None)), None, false),
+            (true, Some((Some(""), None)), None, false),
+            (true, Some((Some("4294967296"), None)), None, false),
+        ];
+        let exclude = PidSelect::Exclude(HashSet::from([1584]));
+        for (node_api, client_api) in [
+            (None, Some("pipewire-pulse")),
+            (Some("pipewire-pulse"), None),
+        ] {
+            let clients =
+                HashMap::from([(40, ClientEntry::from_props(None, Some("1584"), client_api))]);
+            for (props_changed, props, expected_pid, selected) in cases {
+                let mut entry = NodeEntry {
+                    owning_client_id: Some(40),
+                    app_pid: Some(1028793),
+                    app_pid_from_info: true,
+                    pulse_proxied: is_pulse_proxied(node_api),
+                    info_seen: true,
+                    props_seen: true,
+                    ..NodeEntry::default()
+                };
+                assert!(exclude.selects_node(&entry, &clients));
+                let previous = entry;
+                let changed = update_node_info(&mut entry, props_changed, props, &clients);
+                assert_eq!(changed, entry != previous);
+                assert_eq!(
+                    entry.app_pid, expected_pid,
+                    "node API={node_api:?}, client API={client_api:?}, mask={props_changed}, props={props:?}"
+                );
+                assert_eq!(resolve_node_pid(&entry, &clients), expected_pid);
+                assert_eq!(exclude.selects_node(&entry, &clients), selected);
+                assert_eq!(exclude_decidable(&entry, &clients), expected_pid.is_some());
+            }
+        }
+    }
+
+    /// Native nodes preserve their previous app PID when a PROPS update omits it.
+    #[test]
+    fn native_bound_info_pid_update_table() {
+        use std::collections::{HashMap, HashSet};
+
+        let clients = HashMap::from([(
+            40,
+            ClientEntry::from_props(None, Some("7"), Some("pipewire")),
+        )]);
+        for app_pid_from_info in [false, true] {
+            for props in [
+                None,
+                Some((None, None)),
+                Some((Some("0"), None)),
+                Some((Some("-1"), None)),
+                Some((Some("nope"), None)),
+                Some((Some(""), None)),
+                Some((Some("4294967296"), None)),
+            ] {
+                let mut entry = NodeEntry {
+                    owning_client_id: Some(40),
+                    app_pid: Some(42),
+                    app_pid_from_info,
+                    info_seen: true,
+                    props_seen: true,
+                    ..NodeEntry::default()
+                };
+                assert_eq!(
+                    update_node_info(&mut entry, true, props, &clients),
+                    app_pid_from_info,
+                );
+                assert_eq!(entry.app_pid, Some(42));
+                assert!(!entry.app_pid_from_info);
+                assert_eq!(resolve_node_pid(&entry, &clients), Some(42));
+                assert!(PidSelect::Include(42).selects_node(&entry, &clients));
+                assert!(!PidSelect::Include(7).selects_node(&entry, &clients));
+                assert!(PidSelect::Exclude(HashSet::from([7])).selects_node(&entry, &clients));
+                assert!(!PidSelect::Exclude(HashSet::from([42])).selects_node(&entry, &clients));
+            }
+        }
+    }
+
+    /// Late Pulse provenance must not accept a PID omitted by the latest PROPS update.
+    #[test]
+    fn late_client_provenance_rejects_stale_bound_pid() {
+        use std::collections::{HashMap, HashSet};
+
+        for props in [Some((None, None)), None] {
+            let mut entry = NodeEntry {
+                owning_client_id: Some(40),
+                ..NodeEntry::default()
+            };
+            let mut clients = HashMap::new();
+            let exclude = PidSelect::Exclude(HashSet::from([7]));
+
+            assert!(update_node_info(
+                &mut entry,
+                true,
+                Some((Some("42"), None)),
+                &clients,
+            ));
+            assert!(entry.app_pid_from_info);
+            assert_eq!(resolve_node_pid(&entry, &clients), Some(42));
+            assert!(exclude.selects_node(&entry, &clients));
+
+            assert!(update_node_info(&mut entry, true, props, &clients));
+            assert_eq!(entry.app_pid, Some(42));
+            assert!(!entry.app_pid_from_info);
+            assert_eq!(resolve_node_pid(&entry, &clients), Some(42));
+            assert!(exclude.selects_node(&entry, &clients));
+
+            clients.insert(
+                40,
+                ClientEntry::from_props(None, Some("7"), Some("pipewire-pulse")),
+            );
+            assert_eq!(resolve_node_pid(&entry, &clients), None);
+            assert!(!exclude_decidable(&entry, &clients));
+            assert!(!exclude.selects_node(&entry, &clients));
+            assert!(!PidSelect::Include(42).selects_node(&entry, &clients));
+        }
+    }
+
+    /// Only a dictionary carried by a PROPS update unlocks Exclude decisions.
+    #[test]
+    fn bound_props_seen_table() {
+        use std::collections::{HashMap, HashSet};
+
+        let clients = HashMap::from([(40, ClientEntry::from_props(None, Some("7"), None))]);
+        for (props_changed, props, props_seen) in [
+            (false, None, false),
+            (false, Some((None, None)), false),
+            (true, None, false),
+            (true, Some((None, None)), true),
+        ] {
+            let mut entry = NodeEntry {
+                owning_client_id: Some(40),
+                ..NodeEntry::default()
+            };
+            assert!(update_node_info(&mut entry, props_changed, props, &clients));
+            assert!(entry.info_seen);
+            assert_eq!(entry.props_seen, props_seen);
+            assert_eq!(exclude_decidable(&entry, &clients), props_seen);
+            assert_eq!(
+                PidSelect::Exclude(HashSet::from([42])).selects_node(&entry, &clients),
+                props_seen,
+            );
+        }
+    }
+
+    /// Fresh Pulse info without a usable PID never allows credential fallback.
+    #[test]
+    fn pulse_missing_or_invalid_bound_pid_table() {
+        use std::collections::HashMap;
+
+        for app_pid in [None, Some("0"), Some("-2"), Some("NaN"), Some("")] {
+            for (node_api, client_api) in [
+                (None, Some("pipewire-pulse")),
+                (Some("pipewire-pulse"), None),
+            ] {
+                let clients =
+                    HashMap::from([(40, ClientEntry::from_props(None, Some("1584"), client_api))]);
+                let mut entry = NodeEntry {
+                    owning_client_id: Some(40),
+                    ..NodeEntry::default()
+                };
+                assert!(update_node_info(
+                    &mut entry,
+                    true,
+                    Some((app_pid, node_api)),
+                    &clients,
+                ));
+                assert_eq!(resolve_node_pid(&entry, &clients), None);
+                assert!(!exclude_decidable(&entry, &clients));
+            }
+        }
+    }
+
+    #[test]
+    fn late_client_provenance_revokes_provisional_global_pid() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut entry = NodeEntry {
+            owning_client_id: Some(40),
+            app_pid: Some(1584),
+            ..NodeEntry::default()
+        };
+        let mut clients = HashMap::new();
+        update_node_info(&mut entry, false, None, &clients);
+        let exclude = PidSelect::Exclude(HashSet::from([1028793]));
+        assert!(entry.info_seen);
+        assert!(!entry.props_seen);
+        assert!(!exclude.selects_node(&entry, &clients));
+        clients.insert(40, ClientEntry::from_props(None, Some("1584"), None));
+        assert!(!exclude.selects_node(&entry, &clients));
+        clients.insert(
+            40,
+            ClientEntry::from_props(None, Some("1584"), Some("pipewire-pulse")),
+        );
+        assert!(!exclude.selects_node(&entry, &clients));
+        update_node_info(&mut entry, true, Some((Some("1028793"), None)), &clients);
+        assert_eq!(resolve_node_pid(&entry, &clients), Some(1028793));
+        assert!(!exclude.selects_node(&entry, &clients));
     }
 
     /// `PidSelect::Exclude` holds a SET of pids (`exclude_self` ∪ `exclude_pids`),

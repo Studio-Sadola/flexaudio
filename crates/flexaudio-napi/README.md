@@ -81,23 +81,38 @@ Server 2022).
 
 ## Excluding your own app (Electron hosts)
 
-`excludeSelf: true` excludes the process the addon runs in. Electron and
-Chromium render audio from a *helper* process, so also pass every pid of your
-process tree:
+`excludeSelf: true` excludes the process the addon runs in. Electron renders
+audio from an audio utility process. On Linux and macOS, pass the audio service
+PIDs from `app.getAppMetrics()` as well. On Windows, use `excludeSelf: true`
+alone: the audio utility process is a direct child of the main process and
+is covered by its excluded process tree.
 
 ```js
-const pids = app.getAppMetrics().map((m) => m.pid);   // main + helpers
+const pids = process.platform === 'win32'
+  ? []
+  : app.getAppMetrics()
+      .filter((m) => m.serviceName === 'audio.mojom.AudioService' || m.type === 'Utility')
+      .map((m) => m.pid);
 const stream = openStream({ kind: 'system', excludeSelf: true, excludePids: pids }, onChunk, onEvent);
 ```
 
-Linux and macOS exclude every listed pid. Windows excludes one process *tree*
-(`excludeSelf` wins, otherwise the first pid) — for an Electron host that is
-the whole app, since helpers are children of the main process.
+`excludePids` entries must be finite positive integers in `1..=4294967295`.
+Invalid values cause an `InvalidArg` error; duplicates are allowed. `processId`
+has the same validation rules.
+
+Linux and macOS exclude every listed PID. Windows can exclude only **one
+process tree**; any other PID fails with an error instead of being silently
+ignored. For Electron, keep `excludePids` empty and use `excludeSelf: true`.
+On macOS, each PID must also fit a positive signed 32-bit integer
+(`1..=2147483647`) or capture fails. On Linux, while exclusion is active, a
+stream relayed through `pipewire-pulse` is not captured until its
+`application.process.id` is known.
 
 On **macOS** each pid is resolved to a Core Audio process object once, when the
 capture starts. A helper that has not yet rendered any audio has no such object
-and is therefore not excluded. Open the capture while the app is already
-playing, or reopen it when a new helper appears.
+and is therefore not excluded: this is a start-time snapshot. A failed PID
+lookup fails the open unless the process is gone. Open the capture while the
+app is already playing, or reopen it when a new helper appears.
 
 ## Chunk delivery shape (primary, secondary, VAD)
 

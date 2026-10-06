@@ -175,11 +175,15 @@ export interface SecondaryOutputOptions {
    */
   encoding?: string
 }
-/** openStream / __openMockStream のオプション。 */
+/** Options for openStream / __openMockStream. */
 export interface OpenOptions {
   /** "mic" | "system" | "process" | "mix" */
   kind: string
   deviceId?: string
+  /**
+   * Target process ID for `process` capture. Must be a finite positive integer
+   * in 1..=4294967295; invalid values fail with InvalidArg.
+   */
   processId?: number
   /**
    * process の対象 PID の扱い（process 専用）。"include"（既定）| "exclude"。
@@ -188,16 +192,26 @@ export interface OpenOptions {
    */
   mode?: string
   /**
-   * システム音から自ホスト（自プロセス）の音を除くか（system 専用。mix では
-   * system 側に適用）。既定 false。mic / process では無視。
-   * Linux / Windows / macOS の 3 OS とも対応。
+   * Exclude the host process from `system` capture (also the system side of
+   * `mix`). Defaults to false; ignored by mic/process. Supported on Linux,
+   * Windows and macOS. Windows excludes the host's entire process tree;
+   * Electron's audio utility process is a direct child and is covered.
    */
   excludeSelf?: boolean
   /**
-   * Pids whose playback is excluded from a `system` capture (also the system
-   * side of `mix`), in addition to `excludeSelf`. An Electron host passes its
-   * whole process tree (`app.getAppMetrics()` pids). Ignored by mic/process.
-   * Windows honours one process tree: `excludeSelf` wins, else the first pid.
+   * Process IDs whose playback is excluded from `system` capture (also the
+   * system side of `mix`), in addition to `excludeSelf`. Each must be a finite
+   * positive integer in 1..=4294967295; invalid values fail with InvalidArg.
+   * On macOS, each PID must also fit a positive signed 32-bit integer
+   * (1..=2147483647), or capture fails.
+   * Duplicates are allowed. Ignored by mic/process after validation.
+   * Linux and macOS exclude every listed PID. macOS resolves audio objects
+   * at capture start: a PID without one is not excluded; a failed lookup
+   * fails the open unless the process is gone.
+   * On Linux, while exclusion is active, a pipewire-pulse-relayed stream
+   * without a known application.process.id is not captured.
+   * Windows can exclude only one process tree. For Electron, use
+   * `excludeSelf: true` alone; any other PID fails with an error.
    */
   excludePids?: Array<number>
   /** 既定 48000 */

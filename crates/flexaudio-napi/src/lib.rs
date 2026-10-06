@@ -554,26 +554,38 @@ pub struct SecondaryOutputOptions {
     pub encoding: Option<String>,
 }
 
-/// openStream / __openMockStream のオプション。
+/// Options for openStream / __openMockStream.
 #[napi(object)]
 pub struct OpenOptions {
     /// "mic" | "system" | "process" | "mix"
     pub kind: String,
     pub device_id: Option<String>,
-    pub process_id: Option<u32>,
+    /// Target process ID for `process` capture. Must be a finite positive integer
+    /// in 1..=4294967295; invalid values fail with InvalidArg.
+    pub process_id: Option<f64>,
     /// process の対象 PID の扱い（process 専用）。"include"（既定）| "exclude"。
     /// include=対象 PID だけ録る / exclude=対象 PID 以外の全システム音（process_id 必須）。
     /// mic / system では無視。Linux / Windows / macOS の 3 OS とも対応。
     pub mode: Option<String>,
-    /// システム音から自ホスト（自プロセス）の音を除くか（system 専用。mix では
-    /// system 側に適用）。既定 false。mic / process では無視。
-    /// Linux / Windows / macOS の 3 OS とも対応。
+    /// Exclude the host process from `system` capture (also the system side of
+    /// `mix`). Defaults to false; ignored by mic/process. Supported on Linux,
+    /// Windows and macOS. Windows excludes the host's entire process tree;
+    /// Electron's audio utility process is a direct child and is covered.
     pub exclude_self: Option<bool>,
-    /// Pids whose playback is excluded from a `system` capture (also the system
-    /// side of `mix`), in addition to `excludeSelf`. An Electron host passes its
-    /// whole process tree (`app.getAppMetrics()` pids). Ignored by mic/process.
-    /// Windows honours one process tree: `excludeSelf` wins, else the first pid.
-    pub exclude_pids: Option<Vec<u32>>,
+    /// Process IDs whose playback is excluded from `system` capture (also the
+    /// system side of `mix`), in addition to `excludeSelf`. Each must be a finite
+    /// positive integer in 1..=4294967295; invalid values fail with InvalidArg.
+    /// On macOS, each PID must also fit a positive signed 32-bit integer
+    /// (1..=2147483647), or capture fails.
+    /// Duplicates are allowed. Ignored by mic/process after validation.
+    /// Linux and macOS exclude every listed PID. macOS resolves audio objects
+    /// at capture start: a PID without one is not excluded; a failed lookup
+    /// fails the open unless the process is gone.
+    /// On Linux, while exclusion is active, a pipewire-pulse-relayed stream
+    /// without a known application.process.id is not captured.
+    /// Windows can exclude only one process tree. For Electron, use
+    /// `excludeSelf: true` alone; any other PID fails with an error.
+    pub exclude_pids: Option<Vec<f64>>,
     /// 既定 48000
     pub output_rate: Option<u32>,
     /// 既定 2
@@ -866,9 +878,33 @@ fn device_event_to_js(ev: DeviceEvent) -> JsDeviceEvent {
     }
 }
 
+/// Validate a JavaScript PID before converting it to the core's integer type.
+fn parse_pid(field: &str, value: f64) -> napi::Result<u32> {
+    if !value.is_finite() || value.fract() != 0.0 || value < 1.0 || value > f64::from(u32::MAX) {
+        return Err(NapiError::new(
+            Status::InvalidArg,
+            format!("{field} must be a finite positive integer in 1..=4294967295, got {value}"),
+        ));
+    }
+    // The checks above guarantee an exact conversion with no truncation.
+    Ok(value as u32)
+}
+
 fn build_config(options: &OpenOptions) -> napi::Result<StreamConfig> {
     let kind = parse_source_kind(&options.kind)?;
     let mode = parse_process_mode(options.mode.as_deref())?;
+    let target_pid = options
+        .process_id
+        .map(|value| parse_pid("processId", value))
+        .transpose()?;
+    let exclude_pids = options
+        .exclude_pids
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(index, &value)| parse_pid(&format!("excludePids[{index}]"), value))
+        .collect::<napi::Result<Vec<u32>>>()?;
     let output = OutputFormat {
         sample_rate: options.output_rate.unwrap_or(48_000),
         channels: options.output_channels.unwrap_or(2),
@@ -884,11 +920,11 @@ fn build_config(options: &OpenOptions) -> napi::Result<StreamConfig> {
         output,
         secondary_output,
         device_id: options.device_id.clone(),
-        target_pid: options.process_id,
-        // mode は process 専用 / exclude_self は system 専用。混ぜないのは facade 側が見る。
+        target_pid,
+        // The facade checks source-specific mode and exclusion semantics.
         mode,
         exclude_self: options.exclude_self.unwrap_or(false),
-        exclude_pids: options.exclude_pids.clone().unwrap_or_default(),
+        exclude_pids,
         gain: options.gain.unwrap_or(1.0) as f32,
         // mix 専用（mic/system/process では facade が無視する）。側別ゲインは未指定 1.0。
         mix_mic_device_id: options.mic_device_id.clone(),
@@ -2385,12 +2421,50 @@ mod tests {
     #[test]
     fn build_config_exclude_pids() {
         let mut opts = options_with_kind("system");
-        opts.exclude_pids = Some(vec![100, 200]);
+        opts.exclude_pids = Some(vec![1.0, 100.0, 200.0, 100.0, f64::from(u32::MAX)]);
         let cfg = build_config(&opts).unwrap();
-        assert_eq!(cfg.exclude_pids, vec![100, 200]);
+        assert_eq!(cfg.exclude_pids, vec![1, 100, 200, 100, u32::MAX]);
         assert!(!cfg.exclude_self);
         let cfg = build_config(&options_with_kind("system")).unwrap();
         assert!(cfg.exclude_pids.is_empty());
+    }
+
+    #[test]
+    fn build_config_process_id() {
+        for (value, expected) in [(1.0, 1), (9999.0, 9999), (f64::from(u32::MAX), u32::MAX)] {
+            let mut opts = options_with_kind("process");
+            opts.process_id = Some(value);
+            let cfg = build_config(&opts).unwrap();
+            assert_eq!(cfg.target_pid, Some(expected));
+        }
+    }
+
+    #[test]
+    fn build_config_rejects_invalid_pids() {
+        for value in [
+            -1.0,
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.0,
+            4294967296.0,
+        ] {
+            let mut opts = options_with_kind("process");
+            opts.process_id = Some(value);
+            let err = build_config(&opts).unwrap_err();
+            assert_eq!(err.status, Status::InvalidArg);
+            assert!(err.reason.contains("processId"));
+            assert!(err.reason.contains(&format!("got {value}")));
+
+            let mut opts = options_with_kind("system");
+            opts.exclude_pids = Some(vec![100.0, value]);
+            let err = build_config(&opts).unwrap_err();
+            assert_eq!(err.status, Status::InvalidArg);
+            assert!(err.reason.contains("excludePids[1]"));
+            assert!(err.reason.contains(&format!("got {value}")));
+        }
     }
 
     #[test]
@@ -2398,7 +2472,7 @@ mod tests {
         let opts = OpenOptions {
             kind: "process".to_string(),
             device_id: Some("dev-x".to_string()),
-            process_id: Some(9999),
+            process_id: Some(9999.0),
             mode: Some("exclude".to_string()),
             exclude_self: Some(true),
             exclude_pids: None,

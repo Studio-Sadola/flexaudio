@@ -279,6 +279,7 @@ impl Stream {
         }
         // 出力フォーマットが対応域か検証（非対応は UnsupportedFormat）。
         config.output.validate()?;
+        crate::validate_exclude_pids(&config)?;
         // 副出力フォーマットも同様に検証する（設定時のみ）。
         if let Some(sec) = config.secondary_output {
             sec.validate()?;
@@ -812,6 +813,7 @@ impl Stream {
             ));
         }
         // 新ソースの backend を構築（失敗時は旧ソース無傷のまま早期 return）。
+        crate::validate_exclude_pids(&new_config)?;
         let backend = crate::build_backend(&new_config)?;
         // 差し替え（連続性は switch_backend が保証）。
         self.switch_backend(backend)?;
@@ -1272,6 +1274,7 @@ mod tests {
         MockBackend, PanicMode, PanickingMockBackend, StallThenPanicOnReopenBackend,
         StallableMockBackend,
     };
+    use flexaudio_core::types::SourceKind;
     use std::time::Instant;
 
     /// 期限まで poll_chunk しながらチャンクを集めるヘルパ。
@@ -1309,6 +1312,65 @@ mod tests {
     }
 
     // --- 入力検証（Stream::open のエラー経路） ---
+
+    #[test]
+    fn open_validates_exclusion_pids_for_system_capture() {
+        for kind in [SourceKind::SystemLoopback, SourceKind::Mix] {
+            let config = StreamConfig {
+                kind,
+                exclude_pids: vec![0],
+                ..Default::default()
+            };
+            let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+            assert!(matches!(
+                Stream::open(config, backend),
+                Err(Error::InvalidArg(message))
+                    if message == "exclude_pids: pid 0 is not a valid process id"
+            ));
+
+            for exclude_pids in [vec![], vec![42]] {
+                let config = StreamConfig {
+                    kind,
+                    exclude_pids,
+                    ..Default::default()
+                };
+                let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+                assert!(Stream::open(config, backend).is_ok());
+            }
+        }
+        for kind in [SourceKind::Mic, SourceKind::ProcessLoopback] {
+            let config = StreamConfig {
+                kind,
+                exclude_pids: vec![0],
+                ..Default::default()
+            };
+            let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+            assert!(Stream::open(config, backend).is_ok());
+        }
+    }
+
+    #[test]
+    fn switch_source_rejects_zero_exclusion_pid_before_replacing_backend() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.start().expect("start mock capture");
+
+        for kind in [SourceKind::SystemLoopback, SourceKind::Mix] {
+            let new_config = StreamConfig {
+                kind,
+                exclude_pids: vec![42, 0],
+                ..Default::default()
+            };
+            assert!(matches!(
+                stream.switch_source(new_config),
+                Err(Error::InvalidArg(message))
+                    if message == "exclude_pids: pid 0 is not a valid process id"
+            ));
+            assert_eq!(stream.config.kind, SourceKind::Mic);
+            assert!(stream.config.exclude_pids.is_empty());
+        }
+        stream.stop();
+    }
 
     /// `ring_capacity_chunks == 0` は InvalidArg で弾かれる（リング容量 0 は不正）。
     #[test]

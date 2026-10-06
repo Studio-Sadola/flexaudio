@@ -16,13 +16,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`StreamConfig::exclude_pids` / N-API `excludePids`.** System-loopback
   capture can exclude a set of pids in addition to `exclude_self`. Electron
   hosts render audio from a helper process, so excluding the addon's own pid
-  was not enough on Linux and macOS. Linux: fan-in over every app output whose
-  pid is outside the set. macOS: every pid is added to the tap's exclude list,
+  was not enough on Linux and macOS. Linux excludes every listed pid. macOS:
+  every pid is added to the tap's exclude list,
   resolved to its Core Audio process object once at capture start — a helper
   that has not yet rendered audio has no object and is not excluded, so open
   the capture while the app is already playing or reopen it when a helper
   appears. Windows: one process tree — `exclude_self` wins, otherwise the first
-  pid.
+  pid; any other listed pid is rejected with `Error::InvalidArg`.
+
+### Changed
+- **Exclusion is fail-closed.** Windows rejects any listed PID outside the
+  single excluded process tree with `Error::InvalidArg`. On macOS, every PID
+  must fit 1..=2147483647 (`i32::MAX`); otherwise capture fails with
+  `Error::InvalidArg`. macOS also fails capture start when a requested PID
+  lookup fails, unless the process is confirmed gone. N-API rejects non-integer, zero, negative, and out-of-range
+  `processId` / `excludePids` values instead of coercing them. On Linux,
+  pulse-proxied streams are matched by `application.process.id` and remain out
+  of exclusion-mode captures until that PID is known.
+
+### Tests
+- The real-PipeWire smoke test checks each channel using distinct left and
+  right tones.
 
 ### Fixed
 - **Linux: fan-in capture no longer latches a half-linked node.** `try_link`
@@ -34,10 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sources came through at half level with one channel missing.
 - **Linux: libpulse clients now resolve to their own pid.** Stream nodes are
   bound and `application.process.id` is read from their info props (the
-  registry `global` event omits it); `pipewire.sec.pid` remains the fallback.
-  For every client speaking the PulseAudio protocol (Electron/Chromium, Zoom,
-  …) `pipewire.sec.pid` is pipewire-pulse's pid, so those apps were listed as
-  one process by `processes()` and could not be excluded individually.
+  registry `global` event omits it). Pulse-proxied streams (`client.api =
+  pipewire-pulse`) are matched only by that property and are not captured in
+  exclude mode until it is known. Native PipeWire clients still fall back to
+  `pipewire.sec.pid`. Previously, PulseAudio clients such as Electron/Chromium
+  and Zoom shared pipewire-pulse's pid in `processes()` and could not be
+  excluded individually.
 
 ## [0.3.0] - not yet released
 

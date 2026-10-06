@@ -817,6 +817,7 @@ version = "0.3.0"
 dependencies = [
  "block2",
  "flexaudio-core",
+ "libc",
  "objc2",
  "objc2-core-audio",
  "objc2-core-audio-types",
