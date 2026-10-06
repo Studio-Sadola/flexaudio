@@ -1,0 +1,13 @@
+English translation of the original Japanese commit message:
+
+fix(napi): recognize plus signs in PE dependency DLL names
+
+Allow '+' in parsed DLL names so llvm-mingw's libc++.dll is readable.
+Move validation into pe-dll-name.mjs, shared by the checker and tests.
+Previously, these valid imports were reported as malformed PE names.
+Keep CLI execution unconditional: guarding it with import.meta.main
+could silently skip checks on Node versions before 22.18.0. Add
+node:test coverage for 31 observed names, malformed names, and CLI
+invocation without inputs, checking its error text with a 10-second
+timeout. Run the tests in the N-API contract CI job. A readable DLL name
+does not imply that the dependency policy allows it.
