@@ -1,0 +1,11 @@
+English translation of the original Japanese commit message:
+
+ci(release-npm): skip lifecycle scripts during publishing
+
+Add --ignore-scripts to real and dry-run npm publish commands in
+.github/workflows/release-npm.yml. Remove the prepublishOnly hook from
+crates/flexaudio-napi/package.json as well. That hook ran napi
+prepublish,
+which attempted to create a GitHub release and publish platform packages
+again, conflicting with the workflow's explicit publishing steps.
+Platform packages are still published before the main package.
