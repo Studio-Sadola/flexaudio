@@ -1,8 +1,8 @@
-// Writes a 16-bit PCM stereo WAV of a pure sine so the smoke test needs no
+// Writes a 16-bit PCM stereo WAV of pure sines so the smoke test needs no
 // external audio tools. Amplitude is linear full-scale (0.5 = -6 dBFS).
 import { writeFileSync } from 'node:fs';
 
-export function writeToneWav(path, { freqHz, seconds, rate = 48000, amplitude = 0.5 }) {
+export function writeToneWav(path, { freqHz, leftHz = freqHz, rightHz = freqHz, seconds, rate = 48000, amplitude = 0.5 }) {
   const channels = 2;
   const frames = Math.round(seconds * rate);
   const dataBytes = frames * channels * 2;
@@ -14,8 +14,9 @@ export function writeToneWav(path, { freqHz, seconds, rate = 48000, amplitude = 
   buf.writeUInt16LE(16, 34); buf.write('data', 36); buf.writeUInt32LE(dataBytes, 40);
   let o = 44;
   for (let i = 0; i < frames; i++) {
-    const s = Math.round(Math.sin((2 * Math.PI * freqHz * i) / rate) * amplitude * 32767);
-    buf.writeInt16LE(s, o); buf.writeInt16LE(s, o + 2); o += 4;
+    const left = Math.round(Math.sin((2 * Math.PI * leftHz * i) / rate) * amplitude * 32767);
+    const right = Math.round(Math.sin((2 * Math.PI * rightHz * i) / rate) * amplitude * 32767);
+    buf.writeInt16LE(left, o); buf.writeInt16LE(right, o + 2); o += 4;
   }
   writeFileSync(path, buf);
 }

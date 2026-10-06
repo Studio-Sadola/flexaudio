@@ -13,9 +13,11 @@
 //! プロセスループバック固定の `(48000, 2)`。エンドポイントに紐づかない機構なので
 //! `device_id` は無視する。
 //!
-//! Since `exclude_pids` was added, that EXCLUDE path is also taken with
-//! `exclude_self == false` when pids were set: WASAPI excludes exactly ONE process
-//! tree, so `exclude_self` wins and otherwise the first pid is the root
+//! With a nonempty `exclude_pids` list, the EXCLUDE path is also taken when
+//! `exclude_self == false`. WASAPI excludes one process tree: `exclude_self`
+//! selects this process as the root; otherwise the first pid selects the root.
+//! Every listed pid must equal that root (duplicates are accepted). A different
+//! pid or pid 0 is rejected with [`Error::InvalidArg`] before capture starts
 //! (see [`WasapiSystemBackend::with_exclude_pids`]).
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,9 +67,8 @@ pub struct WasapiSystemBackend {
     /// 自ホスト除外フラグ。`true` でプロセスループバック EXCLUDE 経路、`false` で古典
     /// loopback 経路。
     exclude_self: bool,
-    /// Extra pids excluded from the system capture (see `StreamConfig::exclude_pids`).
-    /// WASAPI process loopback takes exactly one process tree, so only the root
-    /// returned by [`exclude_root`](WasapiSystemBackend::exclude_root) is honoured.
+    /// Requested exclusion pids (see `StreamConfig::exclude_pids`). Every pid must
+    /// equal the root validated by [`exclude_root`](WasapiSystemBackend::exclude_root).
     exclude_pids: Vec<u32>,
     /// 出力エンドポイントの選択。`None` で既定 render、`Some(id)` で FriendlyName が
     /// `id` と一致する eRender エンドポイント。`exclude_self == true` では使わない。
@@ -107,33 +108,58 @@ impl WasapiSystemBackend {
         }
     }
 
-    /// Exclude a process tree in addition to `exclude_self`. WASAPI process
-    /// loopback takes exactly ONE tree per client, so only one root is honoured:
-    /// `exclude_self` (this process's tree) wins, otherwise the first pid's tree.
-    /// Callers that need several unrelated trees excluded must open several
-    /// captures. Switches the native format to the process-loopback format.
+    /// Request exclusion of a process tree. WASAPI process loopback takes one
+    /// tree per client: `exclude_self` selects this process as the root, otherwise
+    /// the first pid selects the root. Every listed pid must equal that root;
+    /// duplicates are accepted. A different pid or pid 0 causes `start` to return
+    /// [`Error::InvalidArg`] before spawning a thread.
+    /// Excluding unrelated process trees is unsupported; a common ancestor can
+    /// be passed if excluding its whole tree is acceptable.
+    /// Switches the native format to the process-loopback format.
     ///
     /// Idempotent: `native` is recomputed from the resulting exclude root, so
     /// calling this again with an empty list restores the classic-loopback
     /// format instead of leaving the process-loopback one latched.
     pub fn with_exclude_pids(mut self, pids: Vec<u32>) -> Self {
         self.exclude_pids = pids;
-        self.native = if self.exclude_root().is_some() {
-            PROCESS_LOOPBACK_FORMAT
-        } else {
-            query_native_format(self.device_id.as_deref()).unwrap_or(FALLBACK_FORMAT)
+        self.native = match self.exclude_root() {
+            Ok(None) => query_native_format(self.device_id.as_deref()).unwrap_or(FALLBACK_FORMAT),
+            // Invalid requests are rejected by `start`; never use classic loopback.
+            Ok(Some(_)) | Err(_) => PROCESS_LOOPBACK_FORMAT,
         };
         self
     }
 
-    /// The pid whose process tree the EXCLUDE loopback is opened on, if any.
-    pub fn exclude_root(&self) -> Option<u32> {
-        if self.exclude_self {
-            Some(std::process::id())
-        } else {
-            self.exclude_pids.first().copied()
+    /// Validate the request and return the root of the excluded process tree, if any.
+    pub fn exclude_root(&self) -> Result<Option<u32>> {
+        validate_exclusion(self.exclude_self, std::process::id(), &self.exclude_pids)
+    }
+}
+
+/// Validate WASAPI's single-tree exclusion without COM or process-tree guesses.
+fn validate_exclusion(exclude_self: bool, self_pid: u32, pids: &[u32]) -> Result<Option<u32>> {
+    let root = if exclude_self {
+        Some(self_pid)
+    } else {
+        pids.first().copied()
+    };
+    let Some(root) = root else {
+        return Ok(None);
+    };
+
+    for &pid in pids {
+        if pid == 0 {
+            return Err(Error::InvalidArg(
+                "exclude_pids: pid 0 is not a valid process id".into(),
+            ));
+        }
+        if pid != root {
+            return Err(Error::InvalidArg(format!(
+                "exclude_pids: pid {pid} is outside the single process tree WASAPI can exclude (root {root}); Windows supports excluding one process tree per capture"
+            )));
         }
     }
+    Ok(Some(root))
 }
 
 impl Default for WasapiSystemBackend {
@@ -293,6 +319,7 @@ impl CaptureBackend for WasapiSystemBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
+        let exclude_root = self.exclude_root()?;
         // 二重 start に安全: 既にスレッドが生きていれば何もしない。
         if self.handle.is_some() {
             return Ok(());
@@ -301,7 +328,6 @@ impl CaptureBackend for WasapiSystemBackend {
         self.stop_flag.store(false, Ordering::SeqCst);
 
         let stop_flag = self.stop_flag.clone();
-        let exclude_root = self.exclude_root();
         let device_id = self.device_id.clone();
         // setup（COM init〜Initialize〜Start 直前）の成否を同期返却するチャネル。
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
@@ -491,16 +517,20 @@ mod tests {
     }
 
     /// `with_exclude_pids` stores the pids, switches native to the process-loopback
-    /// format, and picks the exclude root (`exclude_self` wins over the first pid).
+    /// format, and validates the exclude root (`exclude_self` selects this process).
     #[test]
     fn exclude_pids_switches_to_process_loopback_format() {
         let be = WasapiSystemBackend::new(false, None).with_exclude_pids(vec![4242]);
         assert_eq!(be.exclude_pids, vec![4242]);
         assert_eq!(be.native, PROCESS_LOOPBACK_FORMAT);
-        assert_eq!(be.exclude_root(), Some(4242));
-        let selfy = WasapiSystemBackend::new(true, None).with_exclude_pids(vec![4242]);
-        assert_eq!(selfy.exclude_root(), Some(std::process::id()));
-        assert_eq!(WasapiSystemBackend::new(false, None).exclude_root(), None);
+        assert!(matches!(be.exclude_root(), Ok(Some(4242))));
+        let self_pid = std::process::id();
+        let selfy = WasapiSystemBackend::new(true, None).with_exclude_pids(vec![self_pid]);
+        assert!(matches!(selfy.exclude_root(), Ok(Some(root)) if root == self_pid));
+        assert!(matches!(
+            WasapiSystemBackend::new(false, None).exclude_root(),
+            Ok(None)
+        ));
 
         // Idempotence: clearing the list drops back out of the exclude path.
         // `native` is recomputed by `query_native_format`, which needs COM and a
@@ -510,8 +540,84 @@ mod tests {
         let cleared = WasapiSystemBackend::new(false, None)
             .with_exclude_pids(vec![4242])
             .with_exclude_pids(vec![]);
-        assert_eq!(cleared.exclude_root(), None);
+        assert!(matches!(cleared.exclude_root(), Ok(None)));
         assert!(cleared.exclude_pids.is_empty());
+    }
+
+    #[test]
+    fn validate_exclusion_accepts_root_only() {
+        assert!(matches!(
+            validate_exclusion(false, 100, &[42]),
+            Ok(Some(42))
+        ));
+    }
+
+    #[test]
+    fn validate_exclusion_accepts_duplicate_root() {
+        assert!(matches!(
+            validate_exclusion(false, 100, &[42, 42]),
+            Ok(Some(42))
+        ));
+    }
+
+    #[test]
+    fn validate_exclusion_accepts_self_pid() {
+        assert!(matches!(
+            validate_exclusion(true, 100, &[100]),
+            Ok(Some(100))
+        ));
+        assert!(matches!(validate_exclusion(true, 100, &[]), Ok(Some(100))));
+    }
+
+    #[test]
+    fn validate_exclusion_rejects_foreign_pid_with_exclude_self() {
+        assert!(matches!(
+            validate_exclusion(true, 100, &[100, 42]),
+            Err(Error::InvalidArg(message))
+                if message.starts_with("exclude_pids: pid 42 ")
+                    && message.contains("root 100")
+        ));
+    }
+
+    #[test]
+    fn validate_exclusion_rejects_second_tree() {
+        assert!(matches!(
+            validate_exclusion(false, 100, &[42, 99]),
+            Err(Error::InvalidArg(message))
+                if message.starts_with("exclude_pids: pid 99 ")
+                    && message.contains("root 42")
+        ));
+    }
+
+    #[test]
+    fn validate_exclusion_rejects_pid_zero() {
+        for (exclude_self, pids) in [(false, vec![0]), (false, vec![42, 0]), (true, vec![0])] {
+            assert!(matches!(
+                validate_exclusion(exclude_self, 100, &pids),
+                Err(Error::InvalidArg(message)) if message.starts_with("exclude_pids: pid 0 ")
+            ));
+        }
+    }
+
+    #[test]
+    fn validate_exclusion_empty_list_has_no_root() {
+        assert!(matches!(validate_exclusion(false, 100, &[]), Ok(None)));
+    }
+
+    #[test]
+    fn start_rejects_invalid_exclusion_before_spawning_thread() {
+        // The self-exclusion constructor and invalid builder avoid COM queries.
+        let mut backend = WasapiSystemBackend::new(true, None).with_exclude_pids(vec![0]);
+        backend.stop_flag.store(true, Ordering::SeqCst);
+        let (prod, _cons) = raw_ring(1);
+        let sink = RawSink::new(prod, PROCESS_LOOPBACK_FORMAT.0, PROCESS_LOOPBACK_FORMAT.1);
+
+        assert!(matches!(
+            backend.start(sink),
+            Err(Error::InvalidArg(message)) if message.starts_with("exclude_pids: pid 0 ")
+        ));
+        assert!(backend.handle.is_none());
+        assert!(backend.stop_flag.load(Ordering::SeqCst));
     }
 
     /// `list_output_devices` が panic しないこと。返ったエントリは loopback 扱い。

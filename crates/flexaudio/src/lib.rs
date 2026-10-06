@@ -160,11 +160,24 @@ pub fn open(config: StreamConfig) -> Result<Stream> {
     // 出力フォーマットを先に弾く（Stream::open でも再検証されるが、backend を構築する
     // 前にエラーを返したい）。
     config.output.validate()?;
+    validate_exclude_pids(&config)?;
 
     let backend = build_backend(&config)?;
 
     // 低レベル入口へ委譲（Normalizer 構成・スレッド配線はここが担う）。
     Stream::open(config, backend)
+}
+
+/// Validate exclusion PIDs only for sources that use system capture.
+pub(crate) fn validate_exclude_pids(config: &StreamConfig) -> Result<()> {
+    if matches!(config.kind, SourceKind::SystemLoopback | SourceKind::Mix)
+        && config.exclude_pids.contains(&0)
+    {
+        return Err(Error::InvalidArg(
+            "exclude_pids: pid 0 is not a valid process id".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// [`StreamConfig`] からソース種別と OS に応じて backend を 1 つ構築する。
@@ -325,6 +338,44 @@ fn build_system_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_rejects_zero_exclusion_pid_for_system_capture() {
+        for kind in [SourceKind::SystemLoopback, SourceKind::Mix] {
+            let config = StreamConfig {
+                kind,
+                exclude_pids: vec![0],
+                ..Default::default()
+            };
+            assert!(matches!(
+                open(config),
+                Err(Error::InvalidArg(message))
+                    if message == "exclude_pids: pid 0 is not a valid process id"
+            ));
+        }
+    }
+
+    #[test]
+    fn exclusion_pid_validation_accepts_positive_and_ignored_pids() {
+        for kind in [SourceKind::SystemLoopback, SourceKind::Mix] {
+            for exclude_pids in [vec![], vec![42]] {
+                let config = StreamConfig {
+                    kind,
+                    exclude_pids,
+                    ..Default::default()
+                };
+                assert!(validate_exclude_pids(&config).is_ok());
+            }
+        }
+        for kind in [SourceKind::Mic, SourceKind::ProcessLoopback] {
+            let config = StreamConfig {
+                kind,
+                exclude_pids: vec![0],
+                ..Default::default()
+            };
+            assert!(validate_exclude_pids(&config).is_ok());
+        }
+    }
 
     /// Mix の側別ゲイン検証: 負・NaN は backend 構築前に InvalidArg で弾かれる
     /// （デバイスには一切触れない）。

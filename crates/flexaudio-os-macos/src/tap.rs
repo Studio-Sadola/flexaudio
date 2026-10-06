@@ -294,6 +294,8 @@ pub(crate) unsafe fn build_tap_chain(
     // 6) start。
     let status = AudioDeviceStart(aggregate_id, io_proc_id);
     if status != NO_ERR {
+        // Mark stopped before teardown so a late IO callback becomes a no-op (ported from rodrigoaddor/flexaudio@671d294).
+        stopped.store(true, Ordering::Release);
         let _ = AudioDeviceDestroyIOProcID(aggregate_id, io_proc_id);
         let _ = AudioHardwareDestroyAggregateDevice(aggregate_id);
         let _ = AudioHardwareDestroyProcessTap(tap_id);

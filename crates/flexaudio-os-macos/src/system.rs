@@ -49,6 +49,44 @@ use flexaudio_core::types::{Error, Result};
 use crate::common::{translate_pid_to_object, FALLBACK_FORMAT};
 use crate::tap::{build_tap_chain, TapChain, TapKind};
 
+fn checked_exclusion_pid(pid: u32) -> Result<i32> {
+    match i32::try_from(pid) {
+        Ok(pid) if pid > 0 => Ok(pid),
+        _ => Err(Error::InvalidArg(format!(
+            "exclude_pids: pid {pid} is not a valid macOS pid"
+        ))),
+    }
+}
+
+/// Resolve the start-time exclusion snapshot; only confirmed process exit can
+/// suppress a translation failure for a non-host pid.
+fn resolve_exclusion(
+    translation: Result<u32>,
+    is_host: bool,
+    probe: impl FnOnce() -> std::io::Result<()>,
+) -> Result<Option<u32>> {
+    match translation {
+        Ok(0) => Ok(None),
+        Ok(object_id) => Ok(Some(object_id)),
+        Err(error) if !is_host => match probe() {
+            Err(probe_error) if probe_error.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+            _ => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+fn probe_process_exists(pid: i32) -> std::io::Result<()> {
+    // SAFETY: The caller validated a positive process ID. Signal 0 checks
+    // existence and permissions without sending a signal or using pointers.
+    let status = unsafe { libc::kill(pid, 0) };
+    if status == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// システム音声出力全体を Process Tap でキャプチャする [`CaptureBackend`]。
 ///
 /// 専用スレッド上で tap チェーン（global tap → aggregate → IOProc）を構築し、IOProc の RT block
@@ -110,12 +148,12 @@ impl MacSystemBackend {
     /// translated to its Core Audio process object at `start`; pids with no
     /// audio object (not producing sound) are skipped, not errors.
     ///
-    /// A translation failure on a caller-supplied pid is also skipped: the
-    /// caller's list races process churn (an Electron helper can exit between
-    /// enumeration and `start`), and losing all system audio over one dead
-    /// helper pid is the wrong trade. Only `exclude_self`'s own pid keeps the
-    /// pre-change contract of failing the capture, because a failure there
-    /// means TCC denied the tap and the capture would echo our own output.
+    /// Pids must be in `1..=i32::MAX`; invalid values fail capture readiness.
+    /// A translation failure for a non-host pid is skipped only when `kill(pid, 0)`
+    /// confirms that the process is gone (`ESRCH`). Existing processes, permission
+    /// failures (`EPERM`), and other probe errors fail readiness with the original
+    /// translation error. A translation failure for the host pid always fails
+    /// readiness, because capturing without excluding it could echo our own output.
     ///
     /// The resolution happens once, when the capture starts: a helper that has
     /// not yet rendered audio has no Core Audio process object and is therefore
@@ -167,27 +205,30 @@ impl CaptureBackend for MacSystemBackend {
                 let kind = if !excluded.is_empty() {
                     // Exclusion beats device_id: a global tap on the default output
                     // minus every excluded process that currently has an audio object.
-                    // PID → AudioObjectID 変換は CoreAudio を叩くので所有スレッド内で行う
-                    // （process.rs と同じ）。
+                    // Resolve PIDs through Core Audio on the owning thread,
+                    // as in process.rs. A missing audio object remains a snapshot
+                    // limitation; translation errors require confirmed process exit.
                     let mut ids = Vec::with_capacity(excluded.len());
+                    let own_pid = std::process::id();
                     for pid in excluded {
-                        match translate_pid_to_object(pid as i32) {
-                            // 対応するオーディオオブジェクトが無い（今は音を出していない等）。
-                            // 除外すべき音が無いので、エラーにせず飛ばす。
-                            Ok(0) => {}
-                            Ok(object_id) => ids.push(object_id),
-                            // Translation failed (TCC etc.). For our own pid this is the
-                            // pre-change contract: fail readiness, because capturing while
-                            // unable to exclude ourselves would echo our own output.
-                            Err(e) if pid == std::process::id() => {
+                        let macos_pid = match checked_exclusion_pid(pid) {
+                            Ok(pid) => pid,
+                            Err(e) => {
                                 let _ = ready_tx.send(Err(e));
                                 return;
                             }
-                            // For a caller-supplied pid, skip it like `Ok(0)`. The caller's
-                            // list races process churn (an Electron helper can exit between
-                            // enumeration and `start`), and losing all system audio over one
-                            // dead helper pid is the wrong trade.
-                            Err(_) => {}
+                        };
+                        match resolve_exclusion(
+                            translate_pid_to_object(macos_pid),
+                            pid == own_pid,
+                            || probe_process_exists(macos_pid),
+                        ) {
+                            Ok(None) => {}
+                            Ok(Some(object_id)) => ids.push(object_id),
+                            Err(e) => {
+                                let _ = ready_tx.send(Err(e));
+                                return;
+                            }
                         }
                     }
                     TapKind::ExcludeProcesses(ids)
@@ -295,6 +336,108 @@ pub(crate) fn run_tap_thread(
 mod tests {
     use super::*;
     use flexaudio_core::raw_ring;
+
+    #[test]
+    fn exclusion_without_audio_object_skips_without_probe() {
+        let result = resolve_exclusion(Ok(0), false, || {
+            panic!("successful translation must not probe the process")
+        });
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn exclusion_with_audio_object_includes_without_probe() {
+        let result = resolve_exclusion(Ok(42), false, || {
+            panic!("successful translation must not probe the process")
+        });
+        assert!(matches!(result, Ok(Some(42))));
+    }
+
+    #[test]
+    fn host_translation_failure_fails_without_probe() {
+        let result = resolve_exclusion(Err(Error::PermissionDenied), true, || {
+            panic!("host translation failure must not probe the process")
+        });
+        assert!(matches!(result, Err(Error::PermissionDenied)));
+    }
+
+    #[test]
+    fn non_host_translation_failure_skips_confirmed_exit() {
+        let result = resolve_exclusion(Err(Error::PermissionDenied), false, || {
+            Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+        });
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn existing_process_preserves_original_translation_error() {
+        let result = resolve_exclusion(
+            Err(Error::Backend("original translation error".into())),
+            false,
+            || Ok(()),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Backend(message)) if message == "original translation error"
+        ));
+    }
+
+    #[test]
+    fn eperm_preserves_original_translation_error() {
+        let result = resolve_exclusion(
+            Err(Error::Backend("original translation error".into())),
+            false,
+            || Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Backend(message)) if message == "original translation error"
+        ));
+    }
+
+    #[test]
+    fn other_probe_errors_preserve_original_translation_error() {
+        for probe_error in [
+            std::io::Error::from_raw_os_error(libc::EINVAL),
+            std::io::Error::other("unknown process probe failure"),
+        ] {
+            let result = resolve_exclusion(
+                Err(Error::Backend("original translation error".into())),
+                false,
+                || Err(probe_error),
+            );
+            assert!(matches!(
+                result,
+                Err(Error::Backend(message)) if message == "original translation error"
+            ));
+        }
+    }
+
+    #[test]
+    fn zero_exclusion_pid_is_invalid() {
+        assert!(matches!(
+            checked_exclusion_pid(0),
+            Err(Error::InvalidArg(message))
+                if message == "exclude_pids: pid 0 is not a valid macOS pid"
+        ));
+    }
+
+    #[test]
+    fn exclusion_pid_above_i32_max_is_invalid() {
+        for pid in [2_147_483_648, u32::MAX] {
+            assert!(matches!(
+                checked_exclusion_pid(pid),
+                Err(Error::InvalidArg(message))
+                    if message == format!("exclude_pids: pid {pid} is not a valid macOS pid")
+            ));
+        }
+    }
+
+    #[test]
+    fn positive_i32_exclusion_pid_boundaries_are_valid() {
+        assert!(matches!(checked_exclusion_pid(1), Ok(1)));
+        assert!(matches!(checked_exclusion_pid(2_147_483_647), Ok(i32::MAX)));
+    }
 
     /// `new` + `native_format` は panic せず妥当な値を返す。
     #[test]

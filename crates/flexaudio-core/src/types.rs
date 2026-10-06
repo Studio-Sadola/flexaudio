@@ -206,10 +206,9 @@ pub enum SourceKind {
 /// - [`Exclude`](ProcessMode::Exclude): 対象 `target_pid`（そのプロセスツリー）以外
 ///   の全システム音を録る（`target_pid` が必須）。
 ///
-/// process ソースはこの `mode` だけを見て [`StreamConfig::exclude_self`] を無視し、
-/// system ソースは `exclude_self` だけを見て `mode` を無視する（mic は両方無関係）。
-/// Since `exclude_pids` was added, the system source reads it alongside
-/// `exclude_self`; it still ignores `mode`.
+/// Process sources use this `mode` and ignore [`StreamConfig::exclude_self`] and
+/// [`StreamConfig::exclude_pids`]. System sources use `exclude_self` and
+/// `exclude_pids` and ignore `mode`; microphone sources ignore all three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProcessMode {
     /// 対象 `target_pid`（そのプロセスツリー）だけを録る（既定）。
@@ -285,11 +284,11 @@ impl Default for OutputFormat {
 /// `mix_mic_device_id = None`, `mix_system_device_id = None`, `mix_mic_gain = 1.0`,
 /// `mix_system_gain = 1.0` を返す。
 ///
-/// process ソースの対象 PID 扱いは [`mode`](Self::mode) だけ、system ソースの自ホスト
-/// 除外は [`exclude_self`](Self::exclude_self) だけが決める。process ソースは
-/// `exclude_self` を、system ソースは `mode` を無視する（mic は両方無関係）。
-/// Since `exclude_pids` was added, the system source's exclusion set is
-/// `exclude_pids ∪ {self if exclude_self}`, not `exclude_self` alone.
+/// Process-source PID handling is controlled by [`mode`](Self::mode). System-source
+/// exclusion is controlled by [`exclude_pids`](Self::exclude_pids) and
+/// [`exclude_self`](Self::exclude_self), with effective set
+/// `exclude_pids ∪ {this process if exclude_self}`. The system side of [`SourceKind::Mix`]
+/// uses the same exclusion set; microphone and process sources ignore both exclusion fields.
 /// `mix_*` の 4 フィールドは [`SourceKind::Mix`] 専用で、それ以外のソースでは無視される。
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamConfig {
@@ -299,6 +298,8 @@ pub struct StreamConfig {
     /// [`Error::DeviceNotFound`]。[`SourceKind::ProcessLoopback`] では無視される
     /// （`target_pid` で対象を決める）。[`SourceKind::Mix`] でも無視される
     /// （代わりに `mix_mic_device_id` / `mix_system_device_id` で各側を選ぶ）。
+    /// Exclusion on a system capture is a known limitation: while exclusion is active,
+    /// the system capture does not honor `device_id`.
     pub device_id: Option<String>,
     /// ソース種別。
     pub kind: SourceKind,
@@ -312,19 +313,36 @@ pub struct StreamConfig {
     /// が既定。[`SourceKind::ProcessLoopback`] 以外では無視される。`Exclude` は
     /// `target_pid` 必須（無ければ facade が [`Error::InvalidArg`]）。
     pub mode: ProcessMode,
-    /// 自ホスト（自プロセス）の再生音をシステム音から除外するか（system ソースのみ。
-    /// フィードバックループ防止）。`true` で self PID（`std::process::id()`）を除外
-    /// する。[`SourceKind::Mix`] では system 側の子キャプチャに適用される。
-    /// それ以外のソースでは無視される。
+    /// Exclude this process's playback from system audio to prevent feedback
+    /// (system source only). When `true`, `std::process::id()` is added to the
+    /// exclusion set. This applies to the system-side child capture of
+    /// [`SourceKind::Mix`] and is ignored by microphone and process sources.
     pub exclude_self: bool,
-    /// Additional pids whose playback is excluded from a system-loopback
-    /// capture (system source only; ignored by mic/process, applied to the
-    /// system side of `Mix`). Combined with [`exclude_self`](Self::exclude_self):
-    /// the effective exclusion set is `exclude_pids ∪ {self if exclude_self}`.
-    /// An Electron host passes its whole helper-process tree here, because the
-    /// process that renders audio is a helper, not the pid the addon runs in.
-    /// Windows honours one process *tree*: `exclude_self` wins, else the first
-    /// entry's tree (see `flexaudio-os-windows::WasapiSystemBackend`).
+    /// Additional process IDs whose playback is excluded from a system capture.
+    /// Applies only to a system source and the system side of [`SourceKind::Mix`];
+    /// microphone and process sources ignore it. The effective exclusion set is
+    /// `exclude_pids ∪ {this process if exclude_self}`. Every PID must be a positive
+    /// integer; zero is rejected.
+    ///
+    /// On Linux, every listed PID is excluded. Pulse-proxied streams (including
+    /// `pipewire-pulse` clients) are matched by `application.process.id`; while
+    /// exclusion is active, such a stream is never captured until its application
+    /// PID is known.
+    ///
+    /// On macOS, each listed PID with a Core Audio process object at capture start
+    /// is excluded. This is a start-time snapshot: a PID with no audio object at
+    /// start is not excluded. If lookup of a requested PID fails, start fails
+    /// unless that process is confirmed to have exited. PIDs must be in
+    /// `1..=i32::MAX`.
+    ///
+    /// On Windows, WASAPI excludes one process tree per capture. The root is this
+    /// process when `exclude_self` is true, otherwise the first listed PID. Any
+    /// other listed PID causes start to fail with [`Error::InvalidArg`]; excluding
+    /// unrelated trees is unsupported. A common ancestor may be listed when
+    /// excluding its entire tree is acceptable.
+    ///
+    /// While exclusion is active, the system capture does not honor
+    /// [`device_id`](Self::device_id) (known limitation).
     pub exclude_pids: Vec<u32>,
     /// 出力チャンクのフォーマット。既定 `{48000, 2}`（パススルー）。
     pub output: OutputFormat,
