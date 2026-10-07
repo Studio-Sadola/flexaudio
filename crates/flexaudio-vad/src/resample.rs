@@ -21,6 +21,24 @@ pub struct PcmFormat {
     pub channels: u16,
 }
 
+impl PcmFormat {
+    /// Validate supported PCM input rates (8,000–192,000 Hz) and nonzero channels.
+    pub fn validate(self) -> Result<(), crate::VadError> {
+        if self.channels == 0 {
+            return Err(crate::VadError::InvalidFormat(
+                "channels must be nonzero".into(),
+            ));
+        }
+        if !(8_000..=192_000).contains(&self.sample_rate) {
+            return Err(crate::VadError::InvalidFormat(format!(
+                "sample rate must be within 8000..=192000 Hz, got {}",
+                self.sample_rate
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Preprocessor that downmixes any number of interleaved channels to mono and resamples to the VAD
 /// rate.
 ///
@@ -37,6 +55,8 @@ pub(crate) struct PcmConverter {
     remainder: Vec<f32>,
     /// Scratch buffer for mono-converted samples (reuse allocations).
     mono: Vec<f32>,
+    #[cfg(test)]
+    fail_conversion: bool,
 }
 
 impl PcmConverter {
@@ -74,7 +94,8 @@ impl PcmConverter {
         target_rate: u32,
         resampler_chunk_in_frames: Option<usize>,
     ) -> Result<Self, String> {
-        let channels = usize::from(format.channels.max(1));
+        format.validate().map_err(|e| e.to_string())?;
+        let channels = usize::from(format.channels);
         let resampler = if format.sample_rate == target_rate {
             None
         } else {
@@ -90,7 +111,14 @@ impl PcmConverter {
             resampler,
             remainder: Vec::new(),
             mono: Vec::new(),
+            #[cfg(test)]
+            fail_conversion: false,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_conversion(&mut self) {
+        self.fail_conversion = true;
     }
 
     /// Whether this converter handles the given input format.
@@ -108,6 +136,10 @@ impl PcmConverter {
         interleaved: &[f32],
         out: &mut Vec<f32>,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_conversion {
+            return Err("injected conversion failure".into());
+        }
         // Append this input to the previous remainder and downmix only complete frames.
         self.remainder.extend_from_slice(interleaved);
         let frames = self.remainder.len() / self.channels;

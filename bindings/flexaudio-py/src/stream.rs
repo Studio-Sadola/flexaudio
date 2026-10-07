@@ -143,6 +143,7 @@ impl Stream {
         if let Some(vad) = self.vad.as_mut() {
             let events: Vec<(bool, u64)> = vad
                 .process_pcm(py_chunk.samples(), self.output_rate, self.output_channels)
+                .map_err(vad_err_to_py)?
                 .into_iter()
                 .map(|ev| match ev {
                     flexaudio_vad::VadEvent::SpeechStart { at_sample } => (true, at_sample),

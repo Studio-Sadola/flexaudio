@@ -324,10 +324,11 @@ mod tests {
 
     #[test]
     fn keepalive_context_preserves_typed_errors() {
-        assert!(matches!(
-            keepalive_error("create keepalive", Error::PermissionDenied),
-            Error::PermissionDenied
-        ));
+        let denied = Error::PermissionDenied {
+            permission: flexaudio_core::types::Permission::SystemAudio,
+            detail: "keepalive access denied".into(),
+        };
+        assert_eq!(keepalive_error("create keepalive", denied.clone()), denied);
         assert!(matches!(
             keepalive_error("create keepalive", Error::DeviceNotFound),
             Error::DeviceNotFound

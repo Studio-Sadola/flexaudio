@@ -93,7 +93,7 @@ fn tract_matches_ort_frame_probs_on_speech_fixture() {
     assert_eq!(expected.len(), 64_000 / 512);
 
     let mut vad = Vad::new(VadConfig::default()).expect("model load");
-    let _events = vad.process(&samples);
+    let _events = vad.process(&samples).unwrap();
     let got = vad.last_frame_probabilities();
     assert_eq!(
         got.len(),
@@ -139,7 +139,7 @@ fn eight_khz_input_emits_events_in_input_rate_units() {
         ..VadConfig::default()
     };
     let mut vad = Vad::new(cfg.clone()).expect("8 kHz model load");
-    let during = vad.process(&samples8);
+    let during = vad.process(&samples8).unwrap();
     let probs = vad.last_frame_probabilities();
     assert_eq!(
         probs.len(),
@@ -150,7 +150,7 @@ fn eight_khz_input_emits_events_in_input_rate_units() {
         assert!((0.0..=1.0).contains(&p), "prob {p} out of [0,1]");
     }
 
-    let flushed = vad.flush();
+    let flushed = vad.flush().unwrap();
     let mut events = during;
     events.extend(flushed);
     assert!(

@@ -58,6 +58,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default endpoint does not leave recovery using a stale rate or channel count.
   Preserve typed permission and device errors from silent-keepalive startup.
 
+### Changed
+
+- VAD `process`, `process_pcm`, `reset`, and `flush` now return typed errors instead
+  of substituting silence or empty events. Inference/conversion execution failures
+  require a successful reset; setup failures preserve existing state. PCM input validates nonzero channels and 8,000–192,000 Hz before mutation.
+- Added `Vad::converted_sample_position()` to anchor timestamps using actual
+  cumulative converted samples. N-API uses it instead of rounding each chunk;
+  Python, N-API, and C VAD callers propagate failures with their original cause.
+
 ## [0.3.1] - 2026-10-08
 
 ### Fixed

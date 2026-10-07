@@ -715,7 +715,13 @@ mod tests {
                     windows::core::Error::from(HRESULT(code as i32)),
                 ),
             );
-            assert!(matches!(error, Error::PermissionDenied));
+            assert!(matches!(
+                error,
+                Error::PermissionDenied {
+                    permission: flexaudio_core::types::Permission::SystemAudio,
+                    detail,
+                } if !detail.is_empty()
+            ));
         }
         for code in [0x88890004u32, 0x80070490] {
             let error = keepalive_error(

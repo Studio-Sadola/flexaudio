@@ -21,7 +21,7 @@ fn main() {
 
     let mut vad = Vad::new(VadConfig::default()).expect("model load");
     // Submit all input at once. Internally, it is batched into 512-sample windows for inference; read raw probabilities.
-    vad.process(&samples);
+    vad.process(&samples).unwrap();
     let probs = vad.last_frame_probabilities();
 
     for p in probs.iter().take(10) {

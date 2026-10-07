@@ -400,14 +400,18 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
         }
         // Write the result after add-ons (denoise → VAD); pass through unchanged if disabled.
         match stream.poll_processed() {
-            Some(chunk) => {
+            Ok(Some(chunk)) => {
                 out.write(chunk);
                 1
             }
-            None => match stream.inner.terminal_error() {
+            Ok(None) => match stream.inner.terminal_error() {
                 Some(error) => fail(error),
                 None => 0,
             },
+            Err(error) => {
+                set_last_error(error.to_string());
+                code::FLEX_FAILURE
+            }
         }
     })
 }
