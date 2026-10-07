@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- FLAC encoding and I/O failures now retain the first error and prevent retries or
+  successful finalization of failed output. Failed writers are never finalized by Drop.
+- Encoder bindings validate chunks before lazy file creation, preserve closed and failed
+  states across rotation, and reject directory or empty-stem destinations. CLI recording
+  also rejects these destinations before opening capture.
+- Python FLAC context managers retain close failures alongside exceptions from the body.
+
 ## [0.3.1] - 2026-10-08
 
 ### Fixed
