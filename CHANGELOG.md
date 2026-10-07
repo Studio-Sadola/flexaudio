@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Linux process discovery now rejects incomplete registry snapshots, bind/sync/callback
+  failures, and output nodes without resolvable process IDs instead of returning partial
+  success. Completed empty queries remain successful; executable and activity metadata
+  remain optional.
+
 ## [0.3.1] - 2026-10-08
 
 ### Fixed
