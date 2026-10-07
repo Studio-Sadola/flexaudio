@@ -10,7 +10,7 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 use flexaudio_core::backend::RawSink;
 use flexaudio_core::clock::monotonic_now_ns;
@@ -26,7 +26,12 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
 use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateEventW, WaitForMultipleObjects, WaitForSingleObject,
+};
+
+use crate::keepalive::SilentRender;
+use crate::lifecycle::{check_wait_result, Session, StreamClient};
 
 /// Classify access-denied and device-unavailable HRESULTs as typed [`Error`] variants.
 ///
@@ -165,106 +170,163 @@ pub(crate) unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32,
     Ok((rate, channels))
 }
 
-/// Event-driven WASAPI capture loop, run on a dedicated thread.
-///
-/// Receive an initialized `client` (shared mode, LOOPBACK|EVENTCALLBACK), its
-/// capture service, event handle, and channel count. Read packets and send them
-/// to [`RawSink::push`] until `stop_flag` is set. On exit, call `client.Stop()`
-/// and close the event handle.
-///
-/// Read packets as interleaved f32 (`channels` channels). WASAPI buffers are
-/// allocated on at least 8-byte boundaries, so casting to `*const f32` is safe.
-/// When `AUDCLNT_BUFFERFLAGS_SILENT` is set, push `frames*channels` zeros to
-/// prevent DC offset.
+/// Close a thread-owned event on every return path.
+pub(crate) struct EventHandle(pub(crate) HANDLE);
+
+impl Drop for EventHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Initialized capture resources; only classic loopback supplies a keepalive.
+pub(crate) struct CaptureSetup {
+    pub(crate) client: IAudioClient,
+    pub(crate) capture: IAudioCaptureClient,
+    pub(crate) event: EventHandle,
+    pub(crate) channels: u16,
+    pub(crate) keepalive: Option<SilentRender>,
+}
+
+impl CaptureSetup {
+    pub(crate) fn process(
+        (client, capture, event, channels): (IAudioClient, IAudioCaptureClient, HANDLE, u16),
+    ) -> Self {
+        Self {
+            client,
+            capture,
+            event: EventHandle(event),
+            channels,
+            keepalive: None,
+        }
+    }
+}
+
+struct CaptureClient<'a>(&'a IAudioClient);
+
+impl StreamClient for CaptureClient<'_> {
+    fn start(&mut self) -> Result<(), Error> {
+        unsafe { self.0.Start() }.map_err(|e| map_hr("IAudioClient::Start(capture)", e))
+    }
+    fn stop(&mut self) -> Result<(), Error> {
+        unsafe { self.0.Stop() }.map_err(|e| map_hr("IAudioClient::Stop(capture)", e))
+    }
+    fn fill_silence(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// Start capture before reporting readiness, then drain device-clocked packets.
+/// Render and capture events share one owner; all runtime failures stop production
+/// and are returned to that owner for the existing watchdog/reopen error path.
 ///
 /// # Safety
-/// `client`, `capture`, and `event` must be valid COM objects/handles initialized
-/// on the same thread. `channels >= 1`.
+/// The setup must have been initialized on this thread with a valid float format.
 pub(crate) unsafe fn capture_loop(
-    client: &IAudioClient,
-    capture: &IAudioCaptureClient,
-    event: HANDLE,
-    channels: u16,
+    setup: CaptureSetup,
     mut sink: RawSink,
     stop_flag: &Arc<AtomicBool>,
-) {
-    let channels = channels.max(1) as usize;
-    // Reusable buffer for silence packets. Allocate the maximum expected size
-    // before entering the RT loop (before Start) to avoid allocations in the
-    // loop. The engine buffer size (`GetBufferSize`) limits the frames in one
-    // packet, so allocating `buffer_frames * channels` makes loop `resize` calls
-    // no-ops within capacity. If `GetBufferSize` fails, leave it empty and fall
-    // back to resizing on the first loop iteration.
-    let mut silence: Vec<f32> = Vec::new();
-    if let Ok(buffer_frames) = client.GetBufferSize() {
-        let max_silence = (buffer_frames as usize).saturating_mul(channels);
-        silence.resize(max_silence, 0.0);
-    }
-
-    if client.Start().is_err() {
-        // Return if Start fails. This normally cannot happen because setup already called Start.
-        let _ = CloseHandle(event);
-        return;
-    }
-
-    while !stop_flag.load(Ordering::SeqCst) {
-        // Wake on event or after 100ms. The timeout ensures a stop request is not missed.
-        let _ = WaitForSingleObject(event, 100);
-        if stop_flag.load(Ordering::SeqCst) {
-            break;
+    ready: mpsc::Sender<Result<(), Error>>,
+) -> Result<(), Error> {
+    let CaptureSetup {
+        client,
+        capture,
+        event,
+        channels,
+        keepalive,
+    } = setup;
+    let channels = usize::from(channels);
+    // Allocate before either client starts; never resize in the packet loop.
+    let buffer_frames = match client.GetBufferSize() {
+        Ok(frames) => frames,
+        Err(e) => {
+            let _ = ready.send(Err(map_hr("IAudioClient::GetBufferSize(capture)", e)));
+            return Ok(());
         }
+    };
+    let silence = vec![0.0f32; buffer_frames as usize * channels];
+    let mut events = [event.0, event.0];
+    let event_count = if let Some(render) = &keepalive {
+        events[1] = render.event.0;
+        2
+    } else {
+        1
+    };
+    let Some(mut session) =
+        Session::start_and_report(CaptureClient(&client), keepalive, |status| {
+            ready.send(status).is_ok()
+        })
+    else {
+        return Ok(());
+    };
 
-        loop {
-            let packet = match capture.GetNextPacketSize() {
-                Ok(p) => p,
-                Err(_e) => {
-                    // The target PID may have exited, invalidating the device. Exit the loop and stop.
-                    stop_flag.store(true, Ordering::SeqCst);
+    let result = (|| {
+        while !stop_flag.load(Ordering::SeqCst) {
+            // Either client event services both clients; timeout bounds stop latency.
+            let wait = WaitForMultipleObjects(&events[..event_count], false, 100);
+            if wait.0 == u32::MAX {
+                return Err(map_hr(
+                    "WASAPI event wait (WAIT_FAILED)",
+                    windows::core::Error::from_win32(),
+                ));
+            }
+            check_wait_result(wait.0, event_count as u32)?;
+            if stop_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            session.service_keepalive()?;
+
+            loop {
+                if stop_flag.load(Ordering::SeqCst) {
                     break;
                 }
-            };
-            if packet == 0 {
-                break;
-            }
-
-            let mut pdata: *mut u8 = std::ptr::null_mut();
-            let mut frames: u32 = 0;
-            let mut flags: u32 = 0;
-            if capture
-                .GetBuffer(&mut pdata, &mut frames, &mut flags, None, None)
-                .is_err()
-            {
-                stop_flag.store(true, Ordering::SeqCst);
-                break;
-            }
-
-            let n = frames as usize * channels;
-            // Wrap push in catch_unwind. This is our own thread, not an FFI
-            // boundary, but catching a panic from `RawSink::push` ensures the
-            // `ReleaseBuffer`, `client.Stop()`, and `CloseHandle` cleanup below
-            // still runs. Continue processing after catching it.
-            let _ = catch_unwind(AssertUnwindSafe(|| {
-                if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
-                    // Silence: push n zeros for downstream gap detection and to prevent DC offset.
-                    if silence.len() < n {
-                        silence.resize(n, 0.0);
-                    }
-                    if n > 0 {
-                        sink.push(&silence[..n], now_ns());
-                    }
-                } else if !pdata.is_null() && n > 0 {
-                    let slice = std::slice::from_raw_parts(pdata as *const f32, n);
-                    sink.push(slice, now_ns());
+                let packet = capture
+                    .GetNextPacketSize()
+                    .map_err(|e| map_hr("IAudioCaptureClient::GetNextPacketSize", e))?;
+                if packet == 0 {
+                    break;
                 }
-            }));
 
-            // Always release the acquired frames, passing frames on success or failure.
-            let _ = capture.ReleaseBuffer(frames);
+                let mut pdata: *mut u8 = std::ptr::null_mut();
+                let mut frames = 0;
+                let mut flags = 0;
+                capture
+                    .GetBuffer(&mut pdata, &mut frames, &mut flags, None, None)
+                    .map_err(|e| map_hr("IAudioCaptureClient::GetBuffer", e))?;
+                let n = frames as usize * channels;
+                // Release every acquired packet, even if validation or the sink fails.
+                let pushed = catch_unwind(AssertUnwindSafe(|| -> Result<(), Error> {
+                    if n > silence.len() {
+                        return Err(Error::Backend(
+                            "WASAPI packet exceeds capture buffer size".into(),
+                        ));
+                    }
+                    if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
+                        sink.push(&silence[..n], now_ns());
+                    } else if n > 0 {
+                        if pdata.is_null() {
+                            return Err(Error::Backend(
+                                "WASAPI returned a null non-silent packet".into(),
+                            ));
+                        }
+                        let slice = std::slice::from_raw_parts(pdata as *const f32, n);
+                        sink.push(slice, now_ns());
+                    }
+                    Ok(())
+                }));
+                capture
+                    .ReleaseBuffer(frames)
+                    .map_err(|e| map_hr("IAudioCaptureClient::ReleaseBuffer", e))?;
+                pushed.map_err(|_| Error::Backend("WASAPI capture sink panicked".into()))??;
+                // Service render during long capture drains as well as on event wakes.
+                session.service_keepalive()?;
+            }
         }
-    }
-
-    let _ = client.Stop();
-    let _ = CloseHandle(event);
+        Ok(())
+    })();
+    let stopped = session.stop();
+    // Session drops before capture/event/COM, and render stops after capture.
+    result.and(stopped)
 }
 
 /// Shared sequence that initializes `client` in shared mode with

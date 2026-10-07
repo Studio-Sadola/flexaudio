@@ -41,7 +41,9 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::Media::Multimedia::WAVE_FORMAT_IEEE_FLOAT;
 use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 
-use crate::common::{capture_loop, init_loopback_capture, map_hr, wait_event_signaled, ComThread};
+use crate::common::{
+    capture_loop, init_loopback_capture, map_hr, wait_event_signaled, CaptureSetup, ComThread,
+};
 use windows::core::PCWSTR;
 
 /// Process loopback has a fixed native format of `(48000, 2)`.
@@ -178,7 +180,9 @@ pub struct WasapiProcessBackend {
     /// Running flag (guards duplicate start, signals stop, and is checked on drop). `Send`.
     stop_flag: Arc<AtomicBool>,
     /// Handle for the thread that owns COM/capture (`Some` after start).
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<Result<()>>>,
+    /// Runtime failure reported once by the next start (watchdog reopen).
+    pending_error: Option<Error>,
     /// Fixed native format `(48000, 2)`.
     native: (u32, u16),
 }
@@ -191,6 +195,7 @@ impl WasapiProcessBackend {
             mode,
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
+            pending_error: None,
             native: (NATIVE_RATE, NATIVE_CHANNELS),
         }
     }
@@ -215,6 +220,9 @@ impl CaptureBackend for WasapiProcessBackend {
         if self.handle.is_some() {
             return Ok(());
         }
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
         self.stop_flag.store(false, Ordering::SeqCst);
 
         let stop_flag = self.stop_flag.clone();
@@ -224,9 +232,7 @@ impl CaptureBackend for WasapiProcessBackend {
 
         let handle = thread::Builder::new()
             .name("flexaudio-wasapi-process".into())
-            .spawn(move || {
-                run_process_thread(target_pid, mode, sink, stop_flag, ready_tx);
-            })
+            .spawn(move || run_process_thread(target_pid, mode, sink, stop_flag, ready_tx))
             .map_err(|e| Error::Backend(format!("spawn wasapi process thread: {e}")))?;
 
         match ready_rx.recv() {
@@ -252,7 +258,13 @@ impl CaptureBackend for WasapiProcessBackend {
     fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            self.pending_error = match h.join() {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(_) => Some(Error::Backend(
+                    "WASAPI process owner thread panicked".into(),
+                )),
+            };
         }
     }
 }
@@ -286,23 +298,19 @@ fn run_process_thread(
     sink: RawSink,
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<()>>,
-) {
+) -> Result<()> {
     let _com = ComThread::new();
 
     let setup = unsafe { setup_process_loopback(target_pid, mode) };
-    let (client, capture, event, channels) = match setup {
-        Ok(t) => t,
+    let setup = match setup {
+        Ok(t) => CaptureSetup::process(t),
         Err(e) => {
             let _ = ready_tx.send(Err(e));
-            return;
+            return Ok(());
         }
     };
 
-    if ready_tx.send(Ok(())).is_err() {
-        return;
-    }
-
-    unsafe { capture_loop(&client, &capture, event, channels, sink, &stop_flag) };
+    unsafe { capture_loop(setup, sink, &stop_flag, ready_tx) }
 }
 
 /// Set up process loopback and return the initialized `IAudioClient` / `IAudioCaptureClient` / event

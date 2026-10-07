@@ -25,7 +25,7 @@
 //!
 //! The backend is gated by `#[cfg(target_os = "windows")]` and compiles to an empty crate elsewhere.
 //! The `windows` dependency is only included in the Windows target section of `Cargo.toml`.
-//! Only the build-number check (a pure function) is compiled and unit-tested on non-Windows platforms.
+//! Build-number and capture lifecycle helpers are unit-tested without devices on non-Windows platforms.
 
 #![warn(missing_docs)]
 
@@ -33,8 +33,16 @@
 /// unit-tested on non-Windows platforms.
 mod version;
 
+#[cfg(any(target_os = "windows", test))]
+mod lifecycle;
+
+#[cfg(any(target_os = "windows", test))]
+mod format;
+
 #[cfg(target_os = "windows")]
 mod common;
+#[cfg(target_os = "windows")]
+mod keepalive;
 #[cfg(target_os = "windows")]
 mod process;
 #[cfg(target_os = "windows")]

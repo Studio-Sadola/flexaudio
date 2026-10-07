@@ -22,6 +22,7 @@
 //! pid or pid 0 is rejected with [`Error::InvalidArg`] before capture starts
 //! (see [`WasapiSystemBackend::with_exclude_pids`]).
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -30,7 +31,6 @@ use std::thread::{self, JoinHandle};
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::types::{DeviceInfo, Error, ProcessMode, Result, SourceKind};
 
-use windows::core::Interface;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -38,7 +38,13 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
 
-use crate::common::{capture_loop, init_loopback_capture, map_hr, parse_mix_format, ComThread};
+use crate::common::{
+    capture_loop, init_loopback_capture, map_hr, parse_mix_format, CaptureSetup, ComThread,
+    EventHandle,
+};
+use crate::format::{native_format_from_source, verify_format};
+use crate::keepalive::SilentRender;
+use crate::lifecycle::keepalive_error;
 
 /// Safe fallback `(48000, 2)` returned by [`native_format`] when the default
 /// render endpoint cannot be obtained. This does not panic. If retrieval fails
@@ -81,9 +87,12 @@ pub struct WasapiSystemBackend {
     /// Running flag (guards duplicate starts, signals stop, and supports drop checks). `Send`.
     stop_flag: Arc<AtomicBool>,
     /// Handle for the thread that owns COM and capture (`Some` after start).
-    handle: Option<JoinHandle<()>>,
-    /// Native format selected and cached by `new`.
-    native: (u32, u16),
+    handle: Option<JoinHandle<Result<()>>>,
+    /// Runtime failure reported once by the next start (watchdog reopen).
+    pending_error: Option<Error>,
+    /// Last queried format, refreshed before constructing each classic-loopback sink.
+    /// While running, retain the format with which that sink was configured.
+    native: Cell<(u32, u16)>,
 }
 
 impl WasapiSystemBackend {
@@ -111,7 +120,8 @@ impl WasapiSystemBackend {
             device_id,
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
-            native,
+            pending_error: None,
+            native: Cell::new(native),
         }
     }
 
@@ -129,11 +139,11 @@ impl WasapiSystemBackend {
     /// format instead of leaving the process-loopback one latched.
     pub fn with_exclude_pids(mut self, pids: Vec<u32>) -> Self {
         self.exclude_pids = pids;
-        self.native = match self.exclude_root() {
+        self.native.set(match self.exclude_root() {
             Ok(None) => query_native_format(self.device_id.as_deref()).unwrap_or(FALLBACK_FORMAT),
             // Invalid requests are rejected by `start`; never use classic loopback.
             Ok(Some(_)) | Err(_) => PROCESS_LOOPBACK_FORMAT,
-        };
+        });
         self
     }
 
@@ -323,7 +333,14 @@ unsafe fn endpoint_mix_format(device: &IMMDevice) -> Option<(u32, u16)> {
 
 impl CaptureBackend for WasapiSystemBackend {
     fn native_format(&self) -> (u32, u16) {
-        self.native
+        // The facade asks before building a sink on every reopen. An endpoint
+        // switch must refresh the format here; start still checks for a race
+        // between this query and Initialize. Process loopback stays fixed.
+        native_format_from_source(
+            &self.native,
+            self.handle.is_none() && matches!(self.exclude_root(), Ok(None)),
+            || query_native_format(self.device_id.as_deref()),
+        )
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
@@ -332,19 +349,20 @@ impl CaptureBackend for WasapiSystemBackend {
         if self.handle.is_some() {
             return Ok(());
         }
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
         // Reset the flag so start can run again after a previous stop.
         self.stop_flag.store(false, Ordering::SeqCst);
 
         let stop_flag = self.stop_flag.clone();
         let device_id = self.device_id.clone();
-        // Channel for synchronously returning setup status (COM init through just before Start).
+        // Channel for synchronously returning setup status (COM init through successful Start).
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
 
         let handle = thread::Builder::new()
             .name("flexaudio-wasapi-system".into())
-            .spawn(move || {
-                run_system_thread(exclude_root, device_id, sink, stop_flag, ready_tx);
-            })
+            .spawn(move || run_system_thread(exclude_root, device_id, sink, stop_flag, ready_tx))
             .map_err(|e| Error::Backend(format!("spawn wasapi system thread: {e}")))?;
 
         match ready_rx.recv() {
@@ -372,7 +390,11 @@ impl CaptureBackend for WasapiSystemBackend {
         // Safe for reentrant and duplicate stop calls.
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            self.pending_error = match h.join() {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(_) => Some(Error::Backend("WASAPI system owner thread panicked".into())),
+            };
         }
     }
 }
@@ -395,15 +417,15 @@ impl Drop for WasapiSystemBackend {
 ///   (and its tree) with [`ProcessMode::Exclude`] to
 ///   [`crate::process::setup_process_loopback`]. `device_id` is unused.
 ///
-/// Both return the same 4-tuple `(IAudioClient, IAudioCaptureClient, HANDLE, u16)`,
-/// then join the shared [`capture_loop`].
+/// Classic loopback also owns a silent render client. Process exclusion never
+/// creates a render client. Both use the shared [`capture_loop`].
 fn run_system_thread(
     exclude_root: Option<u32>,
     device_id: Option<String>,
     sink: RawSink,
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<()>>,
-) {
+) -> Result<()> {
     // Initialize COM on this thread (uninitialize on drop). Declared first, dropped last.
     let _com = ComThread::new();
 
@@ -413,27 +435,20 @@ fn run_system_thread(
         // Exclude the PID root and its tree to capture all system audio without feedback.
         // Reuse the process loopback mechanism from the `process` module.
         unsafe { crate::process::setup_process_loopback(root, ProcessMode::Exclude) }
+            .map(CaptureSetup::process)
     } else {
         // Classic loopback on the render endpoint selected by device_id (None uses default).
         unsafe { setup_system_loopback(device_id.as_deref(), &sink) }
     };
-    let (client, capture, event, channels) = match setup {
+    let setup = match setup {
         Ok(t) => t,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
-            return;
+            return Ok(());
         }
     };
 
-    // Report setup success. The capture loop runs next and calls client.Start().
-    if ready_tx.send(Ok(())).is_err() {
-        // The caller has gone away. Return without starting; COM is cleaned up on drop.
-        return;
-    }
-
-    unsafe { capture_loop(&client, &capture, event, channels, sink, &stop_flag) };
-    // capture_loop calls client.Stop() and CloseHandle(event).
-    // On return, capture, client, then _com are dropped (reverse declaration order).
+    unsafe { capture_loop(setup, sink, &stop_flag, ready_tx) }
 }
 
 /// Set up classic loopback on the render endpoint selected by `device_id` (`None`
@@ -441,21 +456,12 @@ fn run_system_thread(
 /// `IAudioCaptureClient`, event handle, and channel count. Returns
 /// [`Error::DeviceNotFound`] if `device_id` does not match.
 ///
-/// `sink` is only borrowed; it is not used to check the channel count against
-/// native. The caller retains ownership and passes it to the loop.
+/// Verify the endpoint format against the configured sink before initialization.
+/// Keepalive activation failure prevents capture from starting.
 ///
 /// # Safety
 /// COM must be initialized on the calling thread.
-#[allow(clippy::type_complexity)]
-unsafe fn setup_system_loopback(
-    device_id: Option<&str>,
-    _sink: &RawSink,
-) -> Result<(
-    IAudioClient,
-    windows::Win32::Media::Audio::IAudioCaptureClient,
-    windows::Win32::Foundation::HANDLE,
-    u16,
-)> {
+unsafe fn setup_system_loopback(device_id: Option<&str>, sink: &RawSink) -> Result<CaptureSetup> {
     let enumerator: IMMDeviceEnumerator =
         CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
             .map_err(|e| map_hr("CoCreateInstance(MMDeviceEnumerator)", e))?;
@@ -472,26 +478,23 @@ unsafe fn setup_system_loopback(
         .GetMixFormat()
         .map_err(|e| map_hr("IAudioClient::GetMixFormat", e))?;
 
-    // Check format (only IEEE float is passed through). Save rate/channels here.
-    let parsed = parse_mix_format(pwfx as *const WAVEFORMATEX);
-    let (_rate, channels) = match parsed {
-        Ok(v) => v,
-        Err(e) => {
-            CoTaskMemFree(Some(pwfx as *const _ as *const _));
-            return Err(e);
-        }
-    };
-
-    // Initialize (LOOPBACK|EVENTCALLBACK), then create event and capture service.
-    let init = init_loopback_capture(&client, pwfx as *const WAVEFORMATEX, 0);
-    // Initialize copies the format, so pwfx can be freed here.
-    CoTaskMemFree(Some(pwfx as *const _ as *const _));
-    let (capture, event) = init?;
-
-    // Keep the Interface alive for clarity about drop order, though it is not used.
-    let _ = client.as_raw();
-
-    Ok((client, capture, event, channels))
+    // Always free the mix format, including validation/keepalive setup failures.
+    let setup = (|| {
+        let format = parse_mix_format(pwfx)?;
+        verify_format(format, (sink.native_rate(), sink.native_channels()))?;
+        let keepalive = SilentRender::new(&device, pwfx)
+            .map_err(|e| keepalive_error("cannot create classic loopback silent keepalive", e))?;
+        let (capture, event) = init_loopback_capture(&client, pwfx, 0)?;
+        Ok(CaptureSetup {
+            client,
+            capture,
+            event: EventHandle(event),
+            channels: format.1,
+            keepalive: Some(keepalive),
+        })
+    })();
+    CoTaskMemFree(Some(pwfx as *const _));
+    setup
 }
 
 #[cfg(test)]
@@ -532,7 +535,7 @@ mod tests {
     fn exclude_pids_switches_to_process_loopback_format() {
         let be = WasapiSystemBackend::new(false, None).with_exclude_pids(vec![4242]);
         assert_eq!(be.exclude_pids, vec![4242]);
-        assert_eq!(be.native, PROCESS_LOOPBACK_FORMAT);
+        assert_eq!(be.native.get(), PROCESS_LOOPBACK_FORMAT);
         assert!(matches!(be.exclude_root(), Ok(Some(4242))));
         let self_pid = std::process::id();
         let selfy = WasapiSystemBackend::new(true, None).with_exclude_pids(vec![self_pid]);
@@ -658,6 +661,71 @@ mod tests {
                 backend.stop(); // A duplicate stop is also safe.
             }
             Err(_e) => { /* Missing render endpoint, non-float format, etc. are acceptable. */ }
+        }
+    }
+
+    /// A present endpoint must support the complete silent-keepalive startup
+    /// and teardown. Only the absence of a default endpoint permits a skip.
+    #[test]
+    fn classic_loopback_with_default_endpoint_starts_and_stops_cleanly() {
+        {
+            let _com = ComThread::new();
+            let enumerator: IMMDeviceEnumerator = unsafe {
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .expect("create endpoint enumerator for classic-loopback test")
+            };
+            match unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) } {
+                Ok(_endpoint) => {}
+                Err(error) if error.code().0 == 0x80070490u32 as i32 => {
+                    eprintln!(
+                        "Skipping classic loopback lifecycle test: no default render endpoint (headless host): {error}"
+                    );
+                    return;
+                }
+                Err(error) => panic!("query default render endpoint: {error}"),
+            }
+        }
+
+        let mut backend = WasapiSystemBackend::new(false, None);
+        let (rate, channels) = backend.native_format();
+        let (producer, _consumer) = raw_ring(1);
+        let sink = RawSink::new(producer, rate, channels);
+        backend
+            .start(sink)
+            .expect("classic loopback with silent keepalive must start on the default endpoint");
+        backend.stop();
+        assert!(backend.handle.is_none(), "capture owner must be joined");
+        assert!(
+            backend.pending_error.is_none(),
+            "capture and keepalive must stop cleanly: {:?}",
+            backend.pending_error
+        );
+        backend.stop();
+    }
+
+    #[test]
+    fn keepalive_setup_context_preserves_classified_hresult_variants() {
+        use windows::core::HRESULT;
+
+        for code in [0x8889000Au32, 0x8889000E] {
+            let error = keepalive_error(
+                "cannot create classic loopback silent keepalive",
+                map_hr(
+                    "Initialize",
+                    windows::core::Error::from(HRESULT(code as i32)),
+                ),
+            );
+            assert!(matches!(error, Error::PermissionDenied));
+        }
+        for code in [0x88890004u32, 0x80070490] {
+            let error = keepalive_error(
+                "cannot create classic loopback silent keepalive",
+                map_hr(
+                    "Initialize",
+                    windows::core::Error::from(HRESULT(code as i32)),
+                ),
+            );
+            assert!(matches!(error, Error::DeviceNotFound));
         }
     }
 
