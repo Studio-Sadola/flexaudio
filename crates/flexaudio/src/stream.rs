@@ -527,7 +527,9 @@ impl Stream {
             .delivery
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(error) = self.terminal_error() {
+        // Delivery is already held: inspect the recorded cause without acquiring
+        // backend in reverse order. Only terminal_error() waits for OS shutdown.
+        if let Some(error) = self.shared.terminal.error() {
             return Err(error);
         }
         // Advance the generation only if actually paused (resume on an unpaused stream must not add
@@ -606,8 +608,23 @@ impl Stream {
 
     /// Terminal capture failure, retained after stop. Confirmed permission denial
     /// is terminal; a backend mailbox that cannot be reconciled also fails closed.
+    /// Once this returns `Some`, backend shutdown has finished, including both
+    /// children of a Mix source. This may wait for the control thread to finish
+    /// stopping capture; audio delivery is gated immediately when failure is recorded.
     /// Create a new stream after changing OS settings and restarting the app.
     pub fn terminal_error(&self) -> Option<Error> {
+        if !self.shared.terminal.is_failed() {
+            return None;
+        }
+        // Every terminal shutdown holds backend until stop returns. Take the same
+        // lock before exposing the error, without holding delivery or joining any
+        // threads here. Internal callers already holding backend read the stored
+        // cause directly rather than recursively entering this accessor.
+        let _backend = self
+            .shared
+            .backend
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.shared.terminal.error()
     }
 
@@ -776,7 +793,8 @@ impl Stream {
             // Switching and recovery share shutdown reconciliation so neither can
             // discard a denial produced while the previous owner is joining.
             stop_backend_reconciling(&self.shared, &mut be, false);
-            if let Some(error) = self.terminal_error() {
+            // Shutdown has completed and backend is already locked here.
+            if let Some(error) = self.shared.terminal.error() {
                 self.shared.switching.store(false, Ordering::SeqCst);
                 return Err(error);
             }

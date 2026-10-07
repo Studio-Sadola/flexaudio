@@ -1,6 +1,6 @@
-//! C entry-point regressions. Opening a mic stream needs no working device because its
-//! constructor may query devices and recording permission; native-open tests are ignored
-//! by default. Boundary-validation and mock tests never access audio devices.
+//! C entry-point regressions. Native-open tests query device configuration and
+//! recording permission. Typed host microphone denial skips their hardware assertions
+//! on macOS/Windows; boundary-validation and mock tests never access audio devices.
 
 use std::ffi::CStr;
 use std::ptr;
@@ -57,6 +57,24 @@ impl Handle {
     fn new(pointer: *mut FlexStream) -> Self {
         assert!(!pointer.is_null(), "open failed: {}", last_error());
         Self(pointer)
+    }
+
+    fn native(pointer: *mut FlexStream, test: &str) -> Option<Self> {
+        if pointer.is_null() {
+            if let Some(
+                error @ flexaudio::Error::PermissionDenied {
+                    permission: flexaudio::Permission::Microphone,
+                    ..
+                },
+            ) = crate::error::take_open_failure()
+            {
+                if cfg!(any(target_os = "windows", target_os = "macos")) {
+                    eprintln!("Skipping {test}: host microphone permission is denied: {error}");
+                    return None;
+                }
+            }
+        }
+        Some(Self::new(pointer))
     }
 
     fn pids(&self) -> &[u32] {
@@ -172,10 +190,20 @@ fn zero_pid_message_names_index_two_for_every_source() {
 fn empty_null_list_and_legacy_open_succeed() {
     let cfg = config(FlexSourceKind::Mic);
     // SAFETY: A zero length permits a NULL list; cfg is valid for both entry points.
-    let extended = Handle::new(unsafe { flexaudio_open_with_exclude_pids(&cfg, ptr::null(), 0) });
+    let Some(extended) = Handle::native(
+        unsafe { flexaudio_open_with_exclude_pids(&cfg, ptr::null(), 0) },
+        "empty_null_list_and_legacy_open_succeed",
+    ) else {
+        return;
+    };
     assert!(extended.pids().is_empty());
     assert!(flexaudio_last_error().is_null());
-    let legacy = Handle::new(unsafe { flexaudio_open(&cfg) });
+    let Some(legacy) = Handle::native(
+        unsafe { flexaudio_open(&cfg) },
+        "empty_null_list_and_legacy_open_succeed",
+    ) else {
+        return;
+    };
     assert!(legacy.pids().is_empty());
     assert!(flexaudio_last_error().is_null());
 
@@ -198,7 +226,12 @@ fn empty_list_never_checks_or_dereferences_its_pointer() {
     let backing = [123_u32; 2];
     let unaligned = backing.as_ptr().cast::<u8>().wrapping_add(1).cast::<u32>();
     // SAFETY: A zero-length list must not be dereferenced, even if its pointer is unaligned.
-    let handle = Handle::new(unsafe { flexaudio_open_with_exclude_pids(&cfg, unaligned, 0) });
+    let Some(handle) = Handle::native(
+        unsafe { flexaudio_open_with_exclude_pids(&cfg, unaligned, 0) },
+        "empty_list_never_checks_or_dereferences_its_pointer",
+    ) else {
+        return;
+    };
     assert!(handle.pids().is_empty());
     assert_eq!(
         unsafe { flexaudio_switch_source_with_exclude_pids(handle.0, &cfg, unaligned, 0) },
@@ -213,8 +246,12 @@ fn duplicates_order_and_maximum_pid_are_preserved_in_owned_storage() {
     let mut pids = vec![123, u32::MAX, 123, 42];
     let original = pids.clone();
     // SAFETY: All entries are initialized and readable throughout the call.
-    let handle =
-        Handle::new(unsafe { flexaudio_open_with_exclude_pids(&cfg, pids.as_ptr(), pids.len()) });
+    let Some(handle) = Handle::native(
+        unsafe { flexaudio_open_with_exclude_pids(&cfg, pids.as_ptr(), pids.len()) },
+        "duplicates_order_and_maximum_pid_are_preserved_in_owned_storage",
+    ) else {
+        return;
+    };
     pids.fill(0);
     drop(pids);
     assert_eq!(handle.pids(), original);
@@ -240,7 +277,11 @@ fn maximum_length_is_accepted() {
     let cfg = config(FlexSourceKind::Mic);
     let pids = vec![123; 4096];
     // SAFETY: The whole PID allocation is initialized, readable, and within the cap.
-    let handle =
-        Handle::new(unsafe { flexaudio_open_with_exclude_pids(&cfg, pids.as_ptr(), pids.len()) });
+    let Some(handle) = Handle::native(
+        unsafe { flexaudio_open_with_exclude_pids(&cfg, pids.as_ptr(), pids.len()) },
+        "maximum_length_is_accepted",
+    ) else {
+        return;
+    };
     assert_eq!(handle.pids(), pids);
 }

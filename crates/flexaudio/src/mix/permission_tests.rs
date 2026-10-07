@@ -140,13 +140,14 @@ fn busy_child_cannot_starve_other_mailbox() {
 }
 
 #[test]
-fn terminal_gate_is_visible_before_a_mix_child_finishes_stopping() {
+fn terminal_error_waits_until_both_mix_children_have_stopped() {
     use std::sync::mpsc;
 
     struct SlowStopChild {
         event: Option<Event>,
         entered: mpsc::Sender<()>,
         release: Option<mpsc::Receiver<()>>,
+        stops: Arc<AtomicUsize>,
     }
     impl CaptureBackend for SlowStopChild {
         fn native_format(&self) -> (u32, u16) {
@@ -165,18 +166,22 @@ fn terminal_gate_is_visible_before_a_mix_child_finishes_stopping() {
                 // A bounded wait also prevents a failed assertion from hanging Drop.
                 let _ = release.recv_timeout(Duration::from_secs(5));
             }
+            self.stops.fetch_add(1, Ordering::SeqCst);
         }
     }
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
+    let mic_stops = Arc::new(AtomicUsize::new(0));
+    let system_stops = Arc::new(AtomicUsize::new(0));
     let mic = Box::new(SlowStopChild {
         event: Some(denial(Permission::Microphone)),
         entered: entered_tx,
         release: Some(release_rx),
+        stops: mic_stops.clone(),
     });
     let system = Box::new(Child {
         events: VecDeque::new(),
-        stops: Arc::new(AtomicUsize::new(0)),
+        stops: system_stops.clone(),
     });
     let config = StreamConfig {
         secondary_output: Some(OutputFormat::default()),
@@ -190,12 +195,36 @@ fn terminal_gate_is_visible_before_a_mix_child_finishes_stopping() {
     stream.start().unwrap();
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     // Shutdown is still blocked in the child, but neither buffered output can escape.
-    assert!(matches!(
-        stream.terminal_error(),
-        Some(Error::PermissionDenied { .. })
-    ));
     assert!(stream.poll_chunk().is_none());
     assert!(stream.poll_secondary().is_none());
+    let (attempted_tx, attempted_rx) = mpsc::channel();
+    // Resume must reject the recorded failure without reversing backend -> delivery
+    // lock order or waiting for the child that only this test can release.
+    assert!(matches!(
+        stream.resume(),
+        Err(Error::PermissionDenied { .. })
+    ));
+    let (observed_tx, observed_rx) = mpsc::channel();
+    let observer = thread::spawn(move || {
+        attempted_tx.send(()).unwrap();
+        let error = stream.terminal_error();
+        assert!(mic_stops.load(Ordering::SeqCst) > 0);
+        assert!(system_stops.load(Ordering::SeqCst) > 0);
+        observed_tx.send(error).unwrap();
+        stream
+    });
+    attempted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The child cannot finish before our explicit release. Publishing an error
+    // during this window would violate the contract regardless of stop timing.
+    assert_eq!(
+        observed_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    );
     release_tx.send(()).unwrap();
+    assert!(matches!(
+        observed_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Some(Error::PermissionDenied { .. })
+    ));
+    let mut stream = observer.join().unwrap();
     stream.stop();
 }

@@ -172,6 +172,8 @@ unsafe fn open_with_exclude_pids(
                 vad,
             })),
             Err(e) => {
+                #[cfg(test)]
+                error::record_open_failure(e.clone());
                 set_last_error(e.to_string());
                 std::ptr::null_mut()
             }
