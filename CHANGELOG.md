@@ -63,6 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   states across rotation, and reject directory or empty-stem destinations. CLI recording
   also rejects these destinations before opening capture.
 - Python FLAC context managers retain close failures alongside exceptions from the body.
+- Linux process discovery now rejects incomplete registry snapshots, bind/sync/callback
+  failures, and output nodes without resolvable process IDs instead of returning partial
+  success. Completed empty queries remain successful; executable and activity metadata
+  remain optional.
 
 ### Changed
 
