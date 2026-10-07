@@ -707,7 +707,26 @@ mod tests {
     fn keepalive_setup_context_preserves_classified_hresult_variants() {
         use windows::core::HRESULT;
 
-        for code in [0x8889000Au32, 0x8889000E] {
+        // E_ACCESSDENIED is a permission failure and keeps its typed variant.
+        let error = keepalive_error(
+            "cannot create classic loopback silent keepalive",
+            map_hr(
+                "Initialize",
+                windows::core::Error::from(HRESULT(0x80070005u32 as i32)),
+            ),
+        );
+        assert!(matches!(
+            error,
+            Error::PermissionDenied {
+                permission: flexaudio_core::types::Permission::SystemAudio,
+                detail,
+            } if !detail.is_empty()
+        ));
+        // Exclusive-mode conflicts are not permission problems: Backend, with context added.
+        for (code, cause) in [
+            (0x8889000Au32, "exclusive use"),
+            (0x8889000E, "exclusive audio mode is disallowed"),
+        ] {
             let error = keepalive_error(
                 "cannot create classic loopback silent keepalive",
                 map_hr(
@@ -715,13 +734,15 @@ mod tests {
                     windows::core::Error::from(HRESULT(code as i32)),
                 ),
             );
-            assert!(matches!(
-                error,
-                Error::PermissionDenied {
-                    permission: flexaudio_core::types::Permission::SystemAudio,
-                    detail,
-                } if !detail.is_empty()
-            ));
+            assert!(
+                matches!(
+                    &error,
+                    Error::Backend(message)
+                        if message.starts_with("cannot create classic loopback silent keepalive: ")
+                            && message.contains(cause)
+                ),
+                "{code:#x}: {error:?}"
+            );
         }
         for code in [0x88890004u32, 0x80070490] {
             let error = keepalive_error(
