@@ -7,7 +7,10 @@ use flexaudio_core::types::{Error, Event, Permission, Result};
 
 pub(crate) const PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
-pub(crate) const POLL_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const POLL_SLOW_AFTER: Duration = Duration::from_secs(60);
+pub(crate) const POLL_SLOW_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const PENDING_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const PENDING_DETAIL: &str = "Microphone permission has not been decided. macOS delivers silence until microphone permission is granted. If the process was started from ssh, launchd, or another context that cannot show the consent prompt, run it from Terminal or an app bundle with a nonempty NSMicrophoneUsageDescription. Grant access to the responsible app in System Settings > Privacy & Security > Microphone, then retry from that host if necessary.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Status {
@@ -31,32 +34,57 @@ fn denied(detail: &str) -> Error {
 }
 
 #[derive(Default)]
+struct PromptState {
+    result: Option<Result<bool>>,
+    wait_expired: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Decision {
+    Granted,
+    Refused,
+    Pending,
+}
+
+#[derive(Default)]
 struct Prompt {
-    result: Mutex<Option<Result<bool>>>,
+    state: Mutex<PromptState>,
     changed: Condvar,
 }
 
 impl Prompt {
     fn complete(&self, result: Result<bool>) {
-        if let Ok(mut state) = self.result.lock() {
-            if state.is_none() {
-                *state = Some(result);
+        if let Ok(mut state) = self.state.lock() {
+            if state.result.is_none() {
+                state.result = Some(result);
                 self.changed.notify_all();
             }
         }
     }
 
-    fn wait(&self, timeout: Duration) -> Result<bool> {
-        let state = self.result.lock().map_err(|_| poisoned())?;
-        let (state, _) = self
+    fn wait(&self, timeout: Duration) -> Result<Decision> {
+        let state = self.state.lock().map_err(|_| poisoned())?;
+        let (mut state, _) = self
             .changed
-            .wait_timeout_while(state, timeout, |state| state.is_none())
+            .wait_timeout_while(state, timeout, |state| {
+                state.result.is_none() && !state.wait_expired
+            })
             .map_err(|_| poisoned())?;
-        match state.as_ref() {
-            Some(result) => result.clone(),
-            None => Err(denied(
-                "The microphone consent prompt was not answered before the deadline",
-            )),
+        match state.result.as_ref() {
+            Some(result) => result.clone().map(|granted| {
+                if granted {
+                    Decision::Granted
+                } else {
+                    Decision::Refused
+                }
+            }),
+            None => {
+                // Expiration is shared by all openers, including capture startup.
+                // The native request stays outstanding and can complete later.
+                state.wait_expired = true;
+                self.changed.notify_all();
+                Ok(Decision::Pending)
+            }
         }
     }
 }
@@ -72,11 +100,16 @@ pub(crate) struct PromptCoordinator {
 }
 
 impl PromptCoordinator {
-    fn request(&self, provider: &dyn Provider, timeout: Duration) -> Result<bool> {
+    fn request(&self, provider: &dyn Provider, timeout: Duration) -> Result<Decision> {
         let (prompt, should_request) = {
             let mut current = self.current.lock().map_err(|_| poisoned())?;
             if let Some(prompt) = current.as_ref() {
-                let pending = prompt.result.lock().map_err(|_| poisoned())?.is_none();
+                let pending = prompt
+                    .state
+                    .lock()
+                    .map_err(|_| poisoned())?
+                    .result
+                    .is_none();
                 if pending {
                     (prompt.clone(), false)
                 } else {
@@ -84,8 +117,8 @@ impl PromptCoordinator {
                     // first callback completed. Recheck before creating another
                     // native request, rather than prompting twice for that race.
                     match provider.status()? {
-                        Status::Authorized => return Ok(true),
-                        Status::Denied | Status::Restricted => return Ok(false),
+                        Status::Authorized => return Ok(Decision::Granted),
+                        Status::Denied | Status::Restricted => return Ok(Decision::Refused),
                         Status::NotDetermined => {}
                     }
                     let prompt = Arc::new(Prompt::default());
@@ -112,7 +145,7 @@ impl PromptCoordinator {
     }
 }
 
-/// True means the responsible application may prompt during capture startup.
+/// True means consent is undecided and the capture owner must keep polling.
 pub(crate) fn preflight(
     provider: &dyn Provider,
     coordinator: &PromptCoordinator,
@@ -126,7 +159,7 @@ pub(crate) fn preflight(
             if !provider.has_usage_description()? {
                 return Ok(true);
             }
-            if !coordinator.request(provider, timeout)? {
+            if coordinator.request(provider, timeout)? == Decision::Refused {
                 return Err(denied("The microphone consent prompt was refused"));
             }
             match provider.status()? {
@@ -135,9 +168,7 @@ pub(crate) fn preflight(
                 Status::Restricted => Err(denied(
                     "macOS restricted microphone access after the prompt",
                 )),
-                Status::NotDetermined => Err(denied(
-                    "macOS did not confirm microphone authorization after the prompt",
-                )),
+                Status::NotDetermined => Ok(true),
             }
         }
     }
@@ -147,6 +178,7 @@ pub(crate) fn preflight(
 pub(crate) struct ConsentPoll {
     next: Duration,
     finished: bool,
+    pending_emitted: bool,
 }
 
 impl ConsentPoll {
@@ -154,11 +186,16 @@ impl ConsentPoll {
         Self {
             next: POLL_INTERVAL,
             finished: false,
+            pending_emitted: false,
         }
     }
 
     pub(crate) fn active(&self) -> bool {
         !self.finished
+    }
+
+    pub(crate) fn wait_duration(&self, elapsed: Duration) -> Duration {
+        self.next.saturating_sub(elapsed)
     }
 
     pub(crate) fn poll(
@@ -169,11 +206,11 @@ impl ConsentPoll {
         if self.finished || elapsed < self.next {
             return Ok(None);
         }
-        if elapsed > POLL_TIMEOUT {
-            self.finished = true;
-            return Ok(None);
-        }
-        self.next = elapsed.saturating_add(POLL_INTERVAL);
+        self.next = elapsed.saturating_add(if elapsed < POLL_SLOW_AFTER {
+            POLL_INTERVAL
+        } else {
+            POLL_SLOW_INTERVAL
+        });
         let status = match provider.status() {
             Ok(status) => status,
             Err(error) => {
@@ -187,8 +224,12 @@ impl ConsentPoll {
                 Ok(None)
             }
             Status::NotDetermined => {
-                if elapsed == POLL_TIMEOUT {
-                    self.finished = true;
+                if elapsed >= PENDING_GRACE && !self.pending_emitted {
+                    self.pending_emitted = true;
+                    return Ok(Some(Event::PermissionPending {
+                        permission: Permission::Microphone,
+                        detail: PENDING_DETAIL.into(),
+                    }));
                 }
                 Ok(None)
             }

@@ -358,6 +358,13 @@ pub fn event_to_c(ev: Event) -> FlexEvent {
             kind: FlexEventKind::Recovered,
             count: 0,
         },
+        Event::PermissionPending { detail, .. } => {
+            set_last_error(detail);
+            FlexEvent {
+                kind: FlexEventKind::PermissionPending,
+                count: 0,
+            }
+        }
         Event::PermissionDenied { permission, detail } => {
             set_last_error(flexaudio::Error::PermissionDenied { permission, detail }.to_string());
             FlexEvent {
@@ -671,6 +678,31 @@ mod tests {
         assert!(fc.data.is_null());
         assert_eq!(fc.len, 0);
         unsafe { free_chunk_data(&mut fc) };
+    }
+
+    #[test]
+    fn permission_pending_preserves_new_code_and_advisory_message() {
+        for permission in [
+            flexaudio::Permission::Microphone,
+            flexaudio::Permission::SystemAudio,
+        ] {
+            let event = event_to_c(Event::PermissionPending {
+                permission,
+                detail: "Permission is pending; capture may remain silent until granted".into(),
+            });
+            assert_eq!(event.kind as i32, 8);
+            assert_eq!(event.count, 0);
+            // SAFETY: event_to_c stored a live thread-local C string; no call has replaced it.
+            let message = unsafe { CStr::from_ptr(crate::error::last_error_ptr()) }
+                .to_str()
+                .unwrap();
+            assert_eq!(
+                message,
+                "Permission is pending; capture may remain silent until granted"
+            );
+        }
+        assert_eq!(FlexEventKind::PermissionDenied as i32, 3);
+        assert_eq!(FlexEventKind::SilenceWhileSourceActive as i32, 7);
     }
 
     #[test]

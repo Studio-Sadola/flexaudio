@@ -21,7 +21,7 @@ from os import PathLike
 from typing import List, Literal, Optional, Sequence, Tuple, TypedDict, Union
 
 StreamEventType = Literal[
-    "chunkDropped", "stalled", "recovered", "permissionDenied",
+    "chunkDropped", "stalled", "recovered", "permissionDenied", "permissionPending",
     "silenceWhileSourceActive", "deviceLost", "error", "unknown"
 ]
 RecordingPermission = Literal["microphone", "systemAudio"]
@@ -94,9 +94,11 @@ class AudioChunk:
     def rms(self) -> float: ...
 
 class StreamEvent:
-    """Stream notification; silenceWhileSourceActive is advisory, not a denial.
+    """Stream notification; permissionPending and silenceWhileSourceActive are advisories.
 
-    permissionDenied carries permission and actionable message. error carries a
+    permissionPending carries permission and an actionable message; capture
+    continues and may remain silent until granted. permissionDenied is terminal
+    and carries permission and actionable message. error carries a
     message and may represent a terminal backend failure; consult terminal_error.
     """
     def __repr__(self) -> str: ...

@@ -70,6 +70,9 @@ typedef enum FlexEventKind {
     // Exact-zero system capture while eligible output is active; advisory only.
     // Retrieve the explanation with flexaudio_last_error; capture continues.
     FLEX_EVENT_KIND_SILENCE_WHILE_SOURCE_ACTIVE = 7,
+    // Recording consent remains undecided; advisory only, capture continues.
+    // Retrieve guidance with flexaudio_last_error; capture may stay silent until granted.
+    FLEX_EVENT_KIND_PERMISSION_PENDING = 8,
 } FlexEventKind;
 
 // Whether the process is currently outputting audio (corresponds to [`flexaudio::ProcessInfo::is_output_active`]).
@@ -240,8 +243,9 @@ typedef struct FlexChunk {
 
 // One captured event, populated by `flexaudio_poll_event`.
 //
-// For Error, PermissionDenied, and SilenceWhileSourceActive, the message is
-// stored in flexaudio_last_error. PermissionDenied retains kind 3.
+// For Error, PermissionDenied, SilenceWhileSourceActive, and PermissionPending,
+// the message is stored in flexaudio_last_error. PermissionDenied retains kind 3;
+// PermissionPending has kind 8 and does not stop capture.
 typedef struct FlexEvent {
     // Event kind.
     enum FlexEventKind kind;
@@ -452,7 +456,8 @@ void flexaudio_chunk_free(struct FlexChunk *chunk);
 // Retrieve one event and fill `out`.
 //
 // Return 1 when an event is retrieved, 0 when none is available, or a negative value on error.
-// Error, PermissionDenied (kind 3), and SilenceWhileSourceActive (kind 7)
+// Error, PermissionDenied (kind 3), SilenceWhileSourceActive (kind 7), and
+// PermissionPending (kind 8, advisory only: capture continues)
 // store their explanation in last_error. The advisory does not stop capture.
 //
 // # Safety

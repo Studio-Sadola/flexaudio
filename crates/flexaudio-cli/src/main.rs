@@ -889,7 +889,8 @@ fn report_capture_event(event: flexaudio::Event) -> Result<(), Error> {
         flexaudio::Event::PermissionDenied { permission, detail } => {
             Err(Error::PermissionDenied { permission, detail })
         }
-        flexaudio::Event::SilenceWhileSourceActive { detail } => {
+        flexaudio::Event::PermissionPending { detail, .. }
+        | flexaudio::Event::SilenceWhileSourceActive { detail } => {
             eprintln!("Warning: {detail}");
             Ok(())
         }
@@ -1725,7 +1726,17 @@ mod tests {
 
     // --- describe_error ---
 
-    /// Main Error variants are mapped to human-readable messages (one branch per variant).
+    /// Undecided consent is a warning and must not fail the capture loop.
+    #[test]
+    fn permission_pending_warns_and_continues_capture() {
+        report_capture_event(flexaudio::Event::PermissionPending {
+            permission: flexaudio::Permission::Microphone,
+            detail: "Microphone permission is pending; run from Terminal to answer the prompt"
+                .into(),
+        })
+        .expect("pending consent must not terminate capture");
+    }
+
     #[test]
     fn runtime_permission_denial_fails_but_silence_advisory_continues() {
         for permission in [
@@ -1750,6 +1761,7 @@ mod tests {
         .expect("advisory must continue capture");
     }
 
+    /// Main Error variants are mapped to human-readable messages (one branch per variant).
     #[test]
     fn describe_error_maps_known_variants() {
         assert!(describe_error(Error::DeviceNotFound).contains("not found"));

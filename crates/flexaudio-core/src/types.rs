@@ -484,7 +484,14 @@ pub enum Event {
     PermissionDenied {
         /// Recording permission that was not granted.
         permission: Permission,
-        /// Specific cause of the denial, restriction, or unanswered prompt.
+        /// Specific cause of the denial or restriction.
+        detail: String,
+    },
+    /// Recording consent remains undecided. Advisory only: capture continues.
+    PermissionPending {
+        /// Recording permission awaiting a decision.
+        permission: Permission,
+        /// Explanation and instructions for a host that cannot show consent UI.
         detail: String,
     },
     /// Exact-zero capture while an eligible source has output I/O active.
@@ -524,7 +531,7 @@ pub enum Error {
     PermissionDenied {
         /// Recording permission that was not granted.
         permission: Permission,
-        /// Specific cause of the denial, restriction, or unanswered prompt.
+        /// Specific cause of the denial or restriction.
         detail: String,
     },
     /// The running OS version does not meet this feature's requirements.

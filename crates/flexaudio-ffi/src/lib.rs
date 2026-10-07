@@ -432,7 +432,8 @@ pub unsafe extern "C" fn flexaudio_chunk_free(chunk: *mut FlexChunk) {
 /// Retrieve one event and fill `out`.
 ///
 /// Return 1 when an event is retrieved, 0 when none is available, or a negative value on error.
-/// Error, PermissionDenied (kind 3), and SilenceWhileSourceActive (kind 7)
+/// Error, PermissionDenied (kind 3), SilenceWhileSourceActive (kind 7), and
+/// PermissionPending (kind 8, advisory only: capture continues)
 /// store their explanation in last_error. The advisory does not stop capture.
 ///
 /// # Safety

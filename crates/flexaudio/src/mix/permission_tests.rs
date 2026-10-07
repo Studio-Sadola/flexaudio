@@ -109,6 +109,49 @@ fn both_child_advisories_are_forwarded_without_stopping() {
 }
 
 #[test]
+fn microphone_pending_advisory_keeps_both_mix_lanes_running() {
+    let mic_stops = Arc::new(AtomicUsize::new(0));
+    let system_stops = Arc::new(AtomicUsize::new(0));
+    let pending = Event::PermissionPending {
+        permission: Permission::Microphone,
+        detail: "microphone permission has not been decided".into(),
+    };
+    let mic = Box::new(Child {
+        events: VecDeque::from([pending.clone()]),
+        stops: mic_stops.clone(),
+    });
+    let system = Box::new(Child {
+        events: VecDeque::new(),
+        stops: system_stops.clone(),
+    });
+    let mut stream = crate::Stream::open(
+        StreamConfig::default(),
+        Box::new(CompositeBackend::new(mic, system, 1.0, 1.0)),
+    )
+    .unwrap();
+    stream.start().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(event) = stream.poll_event() {
+            assert_eq!(event, pending);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pending advisory was not forwarded"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(stream.terminal_error().is_none());
+    assert_eq!(mic_stops.load(Ordering::SeqCst), 0);
+    assert_eq!(system_stops.load(Ordering::SeqCst), 0);
+    assert!(stream.poll_event().is_none());
+    stream.stop();
+    assert!(mic_stops.load(Ordering::SeqCst) > 0);
+    assert!(system_stops.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
 fn busy_child_cannot_starve_other_mailbox() {
     struct Busy {
         event: Event,
