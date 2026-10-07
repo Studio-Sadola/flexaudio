@@ -1787,9 +1787,12 @@ mod tests {
 
     #[test]
     fn output_path_rejects_directories_and_empty_stems() {
-        for path in ["", ".", "..", "/", "/tmp"] {
+        for path in ["", ".", "..", "/"] {
             assert!(validate_output_path(Path::new(path)).is_err(), "{path:?}");
         }
+        // An existing directory on every OS (a literal "/tmp" is a plain file name on Windows).
+        let dir = std::env::temp_dir();
+        assert!(validate_output_path(&dir).is_err(), "{dir:?}");
         assert!(validate_output_path(Path::new("recording.wav")).is_ok());
     }
 
