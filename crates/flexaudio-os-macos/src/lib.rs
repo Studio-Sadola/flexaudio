@@ -18,24 +18,41 @@
 //! on first capture determines permission. If tap creation is rejected because permission has not
 //! been granted, [`map_os_status`](common::map_os_status) maps the permission-related OSStatus to
 //! [`Error::PermissionDenied`](flexaudio_core::types::Error).
+//! Successful tap creation does not prove consent. Five continuous seconds of exact-zero native
+//! samples while an eligible external process has output I/O active produces an advisory
+//! `Event::SilenceWhileSourceActive`; digital silence can cause the same observation. Unknown
+//! process activity, device routing, missing delivery, or dropped samples disable inference.
 //!
 //! # Non-macOS
-//! macOS only. `#![cfg(target_os = "macos")]` makes this compile as an empty crate on other
-//! platforms, and objc2 dependencies are included only in the `target.'cfg(...macos)'` section of
-//! `Cargo.toml` (Linux/Windows builds are unaffected).
+//! Native adapters are macOS-only. The private capture-health state machine also compiles on
+//! other platforms so its sample, activity, and timing policy can be tested without audio devices.
 
-#![cfg(target_os = "macos")]
 #![warn(missing_docs)]
 
+#[cfg(target_os = "macos")]
+mod activity;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod capture_health;
+#[cfg(target_os = "macos")]
 mod common;
+#[cfg(target_os = "macos")]
 mod devices;
+#[cfg(target_os = "macos")]
 mod process;
+#[cfg(target_os = "macos")]
 mod processes;
+#[cfg(target_os = "macos")]
 mod system;
+#[cfg(target_os = "macos")]
 mod tap;
+#[cfg(target_os = "macos")]
 mod version;
 
+#[cfg(target_os = "macos")]
 pub use devices::list_output_devices;
+#[cfg(target_os = "macos")]
 pub use process::MacProcessBackend;
+#[cfg(target_os = "macos")]
 pub use processes::list_processes;
+#[cfg(target_os = "macos")]
 pub use system::MacSystemBackend;

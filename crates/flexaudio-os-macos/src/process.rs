@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use flexaudio_core::backend::{CaptureBackend, RawSink};
-use flexaudio_core::types::{Error, ProcessMode, Result};
+use flexaudio_core::types::{Error, Event, ProcessMode, Result};
 
 use crate::common::{translate_pid_to_object, FALLBACK_FORMAT};
 use crate::system::run_tap_thread;
@@ -47,6 +47,8 @@ pub struct MacProcessBackend {
     stop_flag: Arc<AtomicBool>,
     /// Handle for the thread that owns the tap chain (`Some` after start).
     handle: Option<JoinHandle<()>>,
+    /// Owner-thread notifications for the current capture generation.
+    events: Option<mpsc::Receiver<Event>>,
     /// Native format `(rate, channels)`. Cache the fallback because the actual format is determined
     /// when the tap is created, following [`MacSystemBackend`].
     native: (u32, u16),
@@ -60,6 +62,7 @@ impl MacProcessBackend {
             mode,
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
+            events: None,
             native: FALLBACK_FORMAT,
         }
     }
@@ -94,6 +97,7 @@ impl CaptureBackend for MacProcessBackend {
 
         let stop_flag = self.stop_flag.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        let (event_tx, event_rx) = mpsc::channel();
         let target_pid = self.target_pid;
         // ProcessMode is Copy, so it can be moved directly into the closure.
         let mode = self.mode;
@@ -119,13 +123,14 @@ impl CaptureBackend for MacProcessBackend {
                         return;
                     }
                 };
-                run_tap_thread(kind, sink, stop_flag, ready_tx);
+                run_tap_thread(kind, sink, stop_flag, ready_tx, event_tx);
             })
             .map_err(|e| Error::Backend(format!("spawn macos process thread: {e}")))?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.handle = Some(handle);
+                self.events = Some(event_rx);
                 Ok(())
             }
             Ok(Err(e)) => {
@@ -148,6 +153,10 @@ impl CaptureBackend for MacProcessBackend {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+
+    fn poll_event(&mut self) -> Option<Event> {
+        self.events.as_ref()?.try_recv().ok()
     }
 }
 

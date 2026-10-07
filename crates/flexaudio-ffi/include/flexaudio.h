@@ -67,6 +67,9 @@ typedef enum FlexEventKind {
     FLEX_EVENT_KIND_ERROR = 5,
     // Event not matching a known kind (reserved for future variants).
     FLEX_EVENT_KIND_UNKNOWN = 6,
+    // Exact-zero system capture while eligible output is active; advisory only.
+    // Retrieve the explanation with flexaudio_last_error; capture continues.
+    FLEX_EVENT_KIND_SILENCE_WHILE_SOURCE_ACTIVE = 7,
 } FlexEventKind;
 
 // Whether the process is currently outputting audio (corresponds to [`flexaudio::ProcessInfo::is_output_active`]).
@@ -237,7 +240,8 @@ typedef struct FlexChunk {
 
 // One captured event, populated by `flexaudio_poll_event`.
 //
-// For `Error`, the message is stored in `flexaudio_last_error`.
+// For Error, PermissionDenied, and SilenceWhileSourceActive, the message is
+// stored in flexaudio_last_error. PermissionDenied retains kind 3.
 typedef struct FlexEvent {
     // Event kind.
     enum FlexEventKind kind;
@@ -424,7 +428,9 @@ uint64_t flexaudio_dropped_chunks(const struct FlexStream *s);
 // Retrieve one chunk and fill `out`.
 //
 // Return 1 when a chunk is retrieved and `out` is filled, 0 when none is available, or a
-// negative value on error. `out.data` is owned by flexaudio; free it with
+// negative value on error. A terminal permission denial returns FLEX_FAILURE (-2)
+// with actionable guidance in flexaudio_last_error, including after stop.
+// `out.data` is owned by flexaudio; free it with
 // `flexaudio_chunk_free` when done.
 //
 // If add-ons are enabled, the chunk passes through denoise → VAD before it is returned. When
@@ -446,7 +452,8 @@ void flexaudio_chunk_free(struct FlexChunk *chunk);
 // Retrieve one event and fill `out`.
 //
 // Return 1 when an event is retrieved, 0 when none is available, or a negative value on error.
-// For an `Error` event, set `out.kind = Error` and store the message in last_error.
+// Error, PermissionDenied (kind 3), and SilenceWhileSourceActive (kind 7)
+// store their explanation in last_error. The advisory does not stop capture.
 //
 // # Safety
 // `s` must be a valid handle, and `out` must point to a valid `FlexEvent` destination.
@@ -488,6 +495,14 @@ int32_t flexaudio_switch_source_with_exclude_pids(struct FlexStream *s,
                                                   const struct FlexConfig *config,
                                                   const uint32_t *exclude_pids,
                                                   uintptr_t exclude_pids_len);
+
+// Return FLEX_OK when no terminal failure is stored, or FLEX_FAILURE (-2) and
+// set flexaudio_last_error to the terminal reason. Does not consume events and
+// remains available after flexaudio_stop.
+//
+// # Safety
+// s must be a valid handle (NULL is InvalidArg).
+int32_t flexaudio_terminal_error(const struct FlexStream *s);
 
 // List available devices, allocate an array, and set `out_array` / `out_count`.
 //

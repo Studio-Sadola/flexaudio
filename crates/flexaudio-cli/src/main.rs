@@ -437,7 +437,7 @@ impl SwitchScheduler {
     }
 
     /// Execute every switch whose boundary has passed by `now`. Warn and continue on failure.
-    fn tick(&mut self, stream: &mut Stream, now: Instant) {
+    fn tick(&mut self, stream: &mut Stream, now: Instant) -> Result<(), Error> {
         while self.next < self.deadlines.len() && now >= self.deadlines[self.next] {
             let label = self.labels[self.next];
             let config = self.configs[self.next].clone();
@@ -445,6 +445,7 @@ impl SwitchScheduler {
                 Ok(()) => {
                     eprintln!("[switch] -> {label}");
                 }
+                Err(e @ Error::PermissionDenied { .. }) => return Err(e),
                 Err(e) => {
                     eprintln!(
                         "[switch] Warning: failed to switch to {label} (recording continues): {e}"
@@ -453,6 +454,7 @@ impl SwitchScheduler {
             }
             self.next += 1;
         }
+        Ok(())
     }
 }
 
@@ -880,6 +882,41 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Report advisory events and return confirmed denial to the caller.
+fn report_capture_event(event: flexaudio::Event) -> Result<(), Error> {
+    match event {
+        flexaudio::Event::TerminalError { error } => Err(error),
+        flexaudio::Event::PermissionDenied { permission, detail } => {
+            Err(Error::PermissionDenied { permission, detail })
+        }
+        flexaudio::Event::SilenceWhileSourceActive { detail } => {
+            eprintln!("Warning: {detail}");
+            Ok(())
+        }
+        other => {
+            eprintln!("  Event: {other:?}");
+            Ok(())
+        }
+    }
+}
+
+/// Both output paths share terminal-failure handling, including final shutdown.
+fn drain_capture_events(stream: &mut Stream) -> std::result::Result<(), String> {
+    let result = (|| {
+        while let Some(event) = stream.poll_event() {
+            report_capture_event(event)?;
+        }
+        match stream.terminal_error() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    })();
+    result.map_err(|error| {
+        stream.stop();
+        describe_error(error)
+    })
+}
+
 /// WAV output path (legacy behavior). Collect N seconds (>0), write a 16-bit WAV, and print a
 /// summary to stdout. `output` is the output format (used for the WAV header rate/ch and captured
 /// duration calculation).
@@ -921,9 +958,13 @@ fn run_wav(
     while Instant::now() < deadline {
         // Switch sources at segment boundaries, independently of output-file rotation.
         if let Some(sch) = scheduler.as_mut() {
-            sch.tick(stream, Instant::now());
+            if let Err(error) = sch.tick(stream, Instant::now()) {
+                stream.stop();
+                return Err(describe_error(error));
+            }
         }
 
+        drain_capture_events(stream)?;
         let mut got_any = false;
         while let Some(chunk) = stream.poll_chunk() {
             got_any = true;
@@ -933,10 +974,7 @@ fn run_wav(
                 return Err(e);
             }
         }
-        // Drain poll_event for display (print events, if any).
-        while let Some(ev) = stream.poll_event() {
-            println!("  Event: {ev:?}");
-        }
+        drain_capture_events(stream)?;
         if !got_any {
             // One chunk is about 20 ms. Sleep briefly to avoid spinning.
             thread::sleep(Duration::from_millis(10));
@@ -945,6 +983,7 @@ fn run_wav(
 
     let dropped = stream.dropped_chunks();
     stream.stop();
+    drain_capture_events(stream)?;
 
     // Write any chunks remaining in the ring after stop (no dropped data).
     while let Some(chunk) = stream.poll_chunk() {
@@ -1089,9 +1128,13 @@ fn run_stdout_stream(
 
         // Switch sources at segment boundaries (keep the same output pipe).
         if let Some(sch) = scheduler.as_mut() {
-            sch.tick(stream, Instant::now());
+            if let Err(error) = sch.tick(stream, Instant::now()) {
+                stream.stop();
+                return Err(describe_error(error));
+            }
         }
 
+        drain_capture_events(stream)?;
         let mut got_any = false;
         while let Some(chunk) = stream.poll_chunk() {
             got_any = true;
@@ -1106,10 +1149,7 @@ fn run_stdout_stream(
             }
         }
 
-        // Send events to stderr (stdout is reserved for PCM).
-        while let Some(ev) = stream.poll_event() {
-            eprintln!("  Event: {ev:?}");
-        }
+        drain_capture_events(stream)?;
 
         if !got_any {
             // One chunk is about 20 ms. Sleep briefly to avoid spinning.
@@ -1119,6 +1159,7 @@ fn run_stdout_stream(
 
     let dropped = stream.dropped_chunks();
     stream.stop();
+    drain_capture_events(stream)?;
 
     // Drain chunks remaining in the ring after stop (skip if the pipe is broken).
     if !broken_pipe {
@@ -1408,9 +1449,7 @@ fn describe_error(err: Error) -> String {
             "The specified device/endpoint was not found. Check the ID with `--list-devices`."
                 .into()
         }
-        Error::PermissionDenied => {
-            "Microphone permission denied. Check the OS microphone permission settings.".into()
-        }
+        error @ Error::PermissionDenied { .. } => error.to_string(),
         Error::DeviceLost => {
             "The input device was lost during capture (for example, disconnected).".into()
         }
@@ -1688,9 +1727,37 @@ mod tests {
 
     /// Main Error variants are mapped to human-readable messages (one branch per variant).
     #[test]
+    fn runtime_permission_denial_fails_but_silence_advisory_continues() {
+        for permission in [
+            flexaudio::Permission::Microphone,
+            flexaudio::Permission::SystemAudio,
+        ] {
+            let error = report_capture_event(flexaudio::Event::PermissionDenied {
+                permission,
+                detail: "denied by user".into(),
+            })
+            .expect_err("confirmed denial must fail the capture loop");
+            let message = describe_error(error);
+            assert!(message.contains(&permission.to_string()));
+            assert!(message.contains("denied by user"));
+            assert!(message.contains("Restart"));
+        }
+        report_capture_event(flexaudio::Event::SilenceWhileSourceActive {
+            detail:
+                "Recording permission may be missing; genuine digital silence can also cause this"
+                    .into(),
+        })
+        .expect("advisory must continue capture");
+    }
+
+    #[test]
     fn describe_error_maps_known_variants() {
         assert!(describe_error(Error::DeviceNotFound).contains("not found"));
-        assert!(describe_error(Error::PermissionDenied).contains("permission"));
+        assert!(describe_error(Error::PermissionDenied {
+            permission: flexaudio::Permission::Microphone,
+            detail: "denied by user".into()
+        })
+        .contains("permission"));
         assert!(describe_error(Error::DeviceLost).contains("lost"));
         // Other variants include the generic message and Display output.
         let msg = describe_error(Error::Unsupported);

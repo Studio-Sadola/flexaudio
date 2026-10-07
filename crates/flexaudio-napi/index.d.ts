@@ -145,8 +145,14 @@ export interface VadOptions {
   /** VAD internal sample rate. Only 8000 or 16000. Default 16000. */
   sampleRate?: number
 }
-/** JS stream event. `type` identifies the kind; `count`/`message` are optional. */
+/**
+ * Stream notification. permissionDenied is terminal, with permission and
+ * actionable message. silenceWhileSourceActive is advisory: capture continues;
+ * missing system-audio permission and genuine digital silence are both possible.
+ */
 export interface JsStreamEvent {
+  /** Present on permissionDenied. */
+  permission?: 'microphone' | 'systemAudio'
   type: string
   count?: number
   message?: string
@@ -284,6 +290,12 @@ export declare function devices(): Array<JsDeviceInfo>
 export declare function processes(): Promise<Array<JsProcessInfo>>
 /**
  * Open and start a stream, returning a `FlexStream` that sends chunks/events to callbacks.
+ * Confirmed microphone/system-audio denial throws actionable permission guidance.
+ * Supply onEvent for runtime denial and silenceWhileSourceActive advisories;
+ * without onEvent, inspect terminalError() and handle stop() rejection.
+ * macOS bundled microphone prompts wait up to 30 s; bare-host opens rely on the
+ * responsible-app prompt and check late denial for up to 60 s. Windows checks
+ * Microphone privacy, including Let desktop apps access your microphone.
  *
  * `options.denoise` enables noise suppression in core (internal canonical form), so both primary
  * and secondary taps receive denoised audio. `options.vad` runs VAD on the tap selected by `vadTap`
@@ -343,8 +355,12 @@ export declare class FlexStream {
    * stop (the last PCM and `frames:0` terminator) have been delivered to JS.
    * Repeated calls await the same completion, or resolve immediately if already complete. Calling
    * inside `onChunk` does not freeze JS because joining happens off the JS thread.
+   * Rejects with actionable permission guidance on terminal denial; further audio
+   * and the terminator are suppressed. Create a new stream after fixing permission.
    */
   stop(): Promise<void>
+  /** Stored terminal failure, including after stop; does not consume onEvent. */
+  terminalError(): JsStreamEvent | undefined
   /**
    * Hot-swap the input source (mic/system/process) without stopping recording.
    *
@@ -363,7 +379,7 @@ export declare class FlexStream {
    * the first chunk afterward has DISCONTINUITY. Throws if `stop()` has already completed.
    */
   pause(): void
-  /** Unpause and resume delivery. Throws if `stop()` has already completed. */
+  /** Unpause delivery. Throws the stored error on terminal failure. */
   resume(): void
   /**
    * Force-finalize integrated VAD's currently open utterance (runtime operation).

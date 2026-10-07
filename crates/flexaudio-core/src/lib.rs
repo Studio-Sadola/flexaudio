@@ -45,6 +45,6 @@ pub use quant::quantize_i16;
 pub use raw_ring::{raw_ring, RawConsumer, RawProducer};
 pub use secondary_ring::{secondary_chunk_ring, SecondaryChunkConsumer, SecondaryChunkProducer};
 pub use types::{
-    AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Error, Event, OutputFormat, ProcessInfo,
-    Result, SecondaryChunk, SourceKind, StreamConfig, CHANNELS, SAMPLE_RATE,
+    AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Error, Event, OutputFormat, Permission,
+    ProcessInfo, Result, SecondaryChunk, SourceKind, StreamConfig, CHANNELS, SAMPLE_RATE,
 };

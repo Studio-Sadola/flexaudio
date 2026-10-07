@@ -12,7 +12,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use flexaudio_core::clock::monotonic_now_ns;
-use flexaudio_core::types::Error;
+use flexaudio_core::types::{Error, Permission};
 
 use objc2_core_audio::{
     kAudioHardwareBadPropertySizeError, kAudioHardwarePropertyTranslatePIDToProcessObject,
@@ -56,7 +56,10 @@ pub(crate) fn map_os_status(ctx: &str, status: i32) -> Error {
     match status {
         // 'nope' (illegal operation) can also mean tap/aggregate creation was denied due to
         // missing permission, so map it to PermissionDenied (typical when the OS prompt is denied).
-        ILLEGAL_OPERATION => Error::PermissionDenied,
+        ILLEGAL_OPERATION => Error::PermissionDenied {
+            permission: Permission::SystemAudio,
+            detail: format!("{ctx}: Core Audio rejected the operation (OSStatus 'nope'); system/process recording access may have been denied"),
+        },
         // '!dev' (invalid device) indicates the requested device or endpoint is missing, so map it
         // to DeviceNotFound.
         BAD_DEVICE => Error::DeviceNotFound,
@@ -290,7 +293,10 @@ mod tests {
     fn map_os_status_maps_known_codes() {
         assert!(matches!(
             map_os_status("x", 0x6e6f7065),
-            Error::PermissionDenied
+            Error::PermissionDenied {
+                permission: Permission::SystemAudio,
+                ..
+            }
         ));
         // '!dev' (invalid device) maps to DeviceNotFound.
         assert!(matches!(

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use flexaudio_core::backend::RawSink;
 use flexaudio_core::clock::monotonic_now_ns;
-use flexaudio_core::types::Error;
+use flexaudio_core::types::{Error, Permission};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
@@ -31,10 +31,10 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 /// Classify access-denied and device-unavailable HRESULTs as typed [`Error`] variants.
 ///
 /// Map common WASAPI/COM HRESULTs to cross-platform error types:
-/// - Access denied → [`Error::PermissionDenied`]: `E_ACCESSDENIED` (for microphone
-///   or audio-capture privacy denial), `AUDCLNT_E_DEVICE_IN_USE` (cannot open
-///   because the device is in exclusive use), and
-///   `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED` (exclusive mode is disallowed).
+/// - Access denied → [`Error::PermissionDenied`]: `E_ACCESSDENIED` for
+///   system/process capture. Microphone consent is checked in `flexaudio-mic`.
+/// - Exclusive-use/policy conflicts → [`Error::Backend`]; these do not establish
+///   a recording-consent denial.
 /// - Device unavailable or invalidated → [`Error::DeviceNotFound`]:
 ///   `AUDCLNT_E_DEVICE_INVALIDATED` (the endpoint/device disappeared or was
 ///   invalidated) and `E_NOTFOUND` (the item/endpoint does not exist).
@@ -53,8 +53,13 @@ pub(crate) fn classify_hr(code: i32) -> Option<Error> {
     const E_NOTFOUND: i32 = 0x80070490u32 as i32;
 
     match code {
-        E_ACCESSDENIED | AUDCLNT_E_DEVICE_IN_USE | AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => {
-            Some(Error::PermissionDenied)
+        E_ACCESSDENIED => Some(Error::PermissionDenied {
+            permission: Permission::SystemAudio,
+            detail: "Windows denied access to system/process audio capture (E_ACCESSDENIED)".into(),
+        }),
+        AUDCLNT_E_DEVICE_IN_USE => Some(Error::Backend("audio device is in exclusive use".into())),
+        AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => {
+            Some(Error::Backend("exclusive audio mode is disallowed".into()))
         }
         AUDCLNT_E_DEVICE_INVALIDATED | E_NOTFOUND => Some(Error::DeviceNotFound),
         _ => None,
@@ -329,17 +334,20 @@ mod tests {
         // E_ACCESSDENIED
         assert!(matches!(
             classify_hr(0x80070005u32 as i32),
-            Some(Error::PermissionDenied)
+            Some(Error::PermissionDenied {
+                permission: Permission::SystemAudio,
+                ..
+            })
         ));
         // AUDCLNT_E_DEVICE_IN_USE
         assert!(matches!(
             classify_hr(0x8889000Au32 as i32),
-            Some(Error::PermissionDenied)
+            Some(Error::Backend(_))
         ));
         // AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED
         assert!(matches!(
             classify_hr(0x8889000Eu32 as i32),
-            Some(Error::PermissionDenied)
+            Some(Error::Backend(_))
         ));
     }
 

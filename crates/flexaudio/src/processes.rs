@@ -412,7 +412,7 @@ mod tests {
                 Error::Backend(_)
                 | Error::Unsupported
                 | Error::UnsupportedOsVersion
-                | Error::PermissionDenied,
+                | Error::PermissionDenied { .. },
             ) => {}
             Err(other) => panic!("unexpected error variant: {other:?}"),
         });

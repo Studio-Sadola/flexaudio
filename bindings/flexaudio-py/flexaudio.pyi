@@ -18,7 +18,13 @@ exception; FlacEncoder propagates finalization errors only on normal exit.
 """
 
 from os import PathLike
-from typing import List, Optional, Sequence, Tuple, TypedDict, Union
+from typing import List, Literal, Optional, Sequence, Tuple, TypedDict, Union
+
+StreamEventType = Literal[
+    "chunkDropped", "stalled", "recovered", "permissionDenied",
+    "silenceWhileSourceActive", "deviceLost", "error", "unknown"
+]
+RecordingPermission = Literal["microphone", "systemAudio"]
 
 class VadSettings(TypedDict, total=False):
     threshold: float
@@ -88,9 +94,16 @@ class AudioChunk:
     def rms(self) -> float: ...
 
 class StreamEvent:
+    """Stream notification; silenceWhileSourceActive is advisory, not a denial.
+
+    permissionDenied carries permission and actionable message. error carries a
+    message and may represent a terminal backend failure; consult terminal_error.
+    """
     def __repr__(self) -> str: ...
     @property
-    def type(self) -> str: ...
+    def type(self) -> StreamEventType: ...
+    @property
+    def permission(self) -> Optional[RecordingPermission]: ...
     @property
     def count(self) -> Optional[int]: ...
     @property
@@ -118,6 +131,13 @@ class Stream:
     def dropped_chunks(self) -> int: ...
     def poll_chunk(self) -> Optional[AudioChunk]: ...
     def poll_event(self) -> Optional[StreamEvent]: ...
+    def terminal_error(self) -> Optional[StreamEvent]:
+        """Retained terminal failure, including after stop; does not consume events.
+
+        poll_chunk, resume and switch_source raise RuntimeError once terminal.
+        A failed stream cannot be restarted; resolve the cause and open a new one.
+        """
+        ...
     def switch_source(
         self, kind: str, *, device_id: Optional[str] = None,
         process_id: Optional[int] = None, mode: str = "include", exclude_self: bool = False,
