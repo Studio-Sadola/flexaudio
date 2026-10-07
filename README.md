@@ -153,6 +153,25 @@ stream.stop();
 
 ---
 
+## Windows system capture at idle
+
+Windows system capture without `exclude_self` / `exclude_pids` keeps delivering
+continuous device-clocked silence when no application is playing audio,
+including idle time at the start of capture. Classic WASAPI loopback keeps a
+shared-mode render stream on the same output endpoint active with silence only,
+using the endpoint's mix format. It does not change endpoint volume or mute.
+Failure to create or start this silent stream fails capture start; a runtime
+failure stops capture production and follows the existing stall/reopen error path.
+Process loopback, including system capture with exclusions, does not use it.
+
+The capturing process can appear as an audio session in Windows Volume Mixer
+while capturing, and possibly briefly afterward. The silent render stream creates
+an active rendering session; Microsoft documents Mixer controls for active and
+recently active rendering sessions in [Audio Sessions](https://learn.microsoft.com/en-us/windows/win32/coreaudio/audio-sessions).
+The exact display and removal timing depend on the Windows Mixer UI.
+
+---
+
 ## Excluding playback by PID
 
 `StreamConfig::exclude_pids` excludes playback from **system capture and the

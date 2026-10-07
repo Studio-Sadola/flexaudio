@@ -12,6 +12,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows classic system loopback:** keep the selected endpoint's audio engine
+  active with an inaudible shared-mode render stream so leading and subsequent
+  idle time is captured as continuous device-clocked silence without idle-triggered
+  watchdog reopens. Exclusion and per-process capture do not use the silent stream.
+  Keepalive startup failures fail capture start; runtime failures stop production
+  and are reported through the existing stall/reopen path. The capturing process
+  can appear in Windows Volume Mixer while the silent rendering session is active.
+- **Windows capture errors and readiness:** report readiness only after capture
+  starts, propagate event-wait and capture-buffer-release failures, and reject a
+  negotiated classic-loopback mix format that differs from the configured sink.
+  Refresh the selected endpoint's mix format before each reopen so a changed
+  default endpoint does not leave recovery using a stale rate or channel count.
+  Preserve typed permission and device errors from silent-keepalive startup.
+
 ## [0.3.1] - 2026-10-08
 
 ### Fixed
