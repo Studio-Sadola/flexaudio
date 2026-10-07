@@ -50,20 +50,70 @@ python3 .github/scripts/check-release-versions.py --version 0.3.1
 python3 -m unittest discover -s .github/scripts -p test_check_release_versions.py -v
 ```
 
-For a dry run, open GitHub Actions, select each release workflow, and choose
-**Run workflow** on the intended release ref. Enter the explicit `version`
-(for example, `0.3.1`, without `v`) and leave `dry_run` checked. It defaults to
-**true** in all three workflows. The selected ref's manifest versions must
-match the input. npm validates packaging for the main and all platform
-packages; PyPI builds and collects wheels and sdist; crates.io performs the
-existing leaf-crate dry runs (dependent crates are validated at real publish).
-None of these dry runs publishes a registry package. npm/PyPI build artifacts
-are still uploaded to GitHub Actions for inspection.
+For npm, **Run workflow** is a publication retry, including when `dry_run` is
+checked. Enter the version (for example, `0.3.1`, without `v`) and select a ref
+containing the updated workflow/helpers. The workflow resolves that version's
+tag to its commit, validates the manifests in that checkout, and selects the
+original tag-push `release-npm.yml` run for that tag and commit. It does not
+require the original run's overall conclusion to be successful: a publish
+failure does not invalidate completed build artifacts.
 
-Uncheck `dry_run` explicitly to publish a manual release. Pushing a valid
-release tag triggers real publishing. An npm platform package is skipped only
-when `npm view name@version version` succeeds for that exact package version;
-any other platform publish failure stops the job before the main package.
+On tag push, the five build jobs upload the existing `bindings-*` artifacts.
+A collection job produces one `npm-release-manifest` artifact containing
+`SHA256SUMS`, with exactly the five expected `.node` filenames. Publication
+checks the downloaded bytes against this manifest before packaging, then
+checks each platform package's embedded `.node` after `napi artifacts` and
+before publishing or dry-run packing. Missing/extra files, duplicate names,
+unsafe manifest paths, symlinks and hash mismatches fail the job.
+
+**Retry a failed npm publish = Re-run failed jobs or workflow_dispatch.**
+Re-running failed jobs after a publish-only failure leaves successful build
+jobs alone and downloads their existing artifacts. Dispatch skips all build
+and manifest jobs, reuses the original artifacts, and never compiles. Leave
+`dry_run` checked to validate packaging; uncheck it to publish. Already
+published platform and main package versions are skipped. Expired, deleted,
+incomplete or pre-change artifacts without `SHA256SUMS` cause a failure;
+there is no rebuild fallback. Do not use **Re-run all jobs** for a publication
+retry: it can execute the tag-push build jobs again (immutable artifact-name
+conflicts then fail rather than replacing the original artifacts).
+
+PyPI and crates.io manual dry runs still use the selected ref and require its
+manifests to match the input version. PyPI builds and collects wheels/sdist;
+crates.io performs leaf-crate dry runs. Leave `dry_run` checked to avoid
+registry publication. Pushing a valid release tag triggers real publishing.
+
+PyPI artifact reuse is a follow-up: its Linux container builds, wheel repair,
+and sdist need their own distribution checksum contract before dispatch can
+safely become a publish-only operation. For a PyPI publish-only failure, use
+**Re-run failed jobs** to retain the original successful wheel/sdist jobs.
+Its current dispatch still rebuilds wheels/sdist.
+
+## Windows release reproducibility
+
+All release workflows pin Rust to CI's `1.98.1` and disable Cargo incremental
+compilation. Cargo/N-API and maturin release builds use `--locked`. MSVC builds
+use `/Brepro` and `/INCREMENTAL:NO`; distributed release binaries additionally
+use `/DEBUG:NONE` and remap workspace, Cargo home and target paths. Debug
+builds retain their debugger symbols. Only Windows N-API release builds opt
+into `+crt-static`, preserving their existing CRT policy; Python retains its
+dynamic CRT policy.
+
+The CI job **Reproducible Windows x64 N-API release** runs on pull requests and
+CI `workflow_dispatch`. It builds the addon twice using separate, fresh target
+directories, caches only Cargo registry downloads, prints both SHA-256 hashes,
+and fails if they differ. This verifies the current runner/toolchain; hosted
+MSVC/SDK image changes and Windows arm64 reproducibility still need observation.
+
+The N-API CLI is pinned to an exact version (`@napi-rs/cli` in
+`crates/flexaudio-napi/package.json`). It has no runtime dependencies, so the
+workflows install it with `npm install --no-package-lock --omit=optional
+--ignore-scripts` from registry.npmjs.org instead of using a lockfile. A
+lockfile is deliberately not committed: it would also pin the per-platform
+`@studio-sadola/flexaudio-*` optional dependencies, which do not exist on the
+registry for a new version until that version is published. To update the CLI,
+change the exact version and check the Windows reproducibility job.
+
+Do not push a release tag until the Windows reproducibility check passes.
 
 ## Publishing authentication
 
