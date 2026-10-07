@@ -19,7 +19,7 @@ documentation = "https://docs.rs/flexaudio-encode"
 flacenc = { version = "0.5", default-features = false }
 thiserror = { workspace = true }
 # Canonical f32→s16 quantization: use core's quantize_i16 so all layers share one implementation.
-flexaudio-core = { path = "../flexaudio-core", version = "0.3.0" }
+flexaudio-core = { path = "../flexaudio-core", version = "0.3.1" }
 
 [dev-dependencies]
 # Pure-Rust FLAC decoder (Apache-2.0) for round-trip verification. Tests only.

@@ -1,21 +1,21 @@
 [build-system]
-requires = ["maturin>=1.5,<2"]
+requires = ["maturin>=1.9.4,<2"]
 build-backend = "maturin"
 
 [project]
 name = "flexaudio"
-version = "0.3.0"
+version = "0.3.1"
 description = "Flexible cross-platform audio capture (microphone, system loopback, per-process) for Python, via native bindings to the flexaudio Rust library."
 readme = "README.md"
 requires-python = ">=3.8"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [{ name = "tubome (Studio Sadola)" }]
 keywords = ["audio", "capture", "loopback", "recording", "pyo3"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
-    "License :: OSI Approved :: MIT License",
 ]
 
 [project.urls]
@@ -28,8 +28,6 @@ Repository = "https://github.com/Studio-Sadola/flexaudio"
 features = ["extension-module"]
 # Fix the import name as `flexaudio` (matching [lib] name).
 module-name = "flexaudio"
-# Include third-party license notices in both the wheel and sdist. Since the VAD addon redistributes
-# pure-Rust tract and the embedded Silero VAD model, their notices must be included in the package.
-# The `license = { file = "LICENSE" }` setting above stores LICENSE in .dist-info.
-# Specify both formats explicitly so source and binary distributions carry the generated notice.
-include = [{ path = "THIRD_PARTY_NOTICES.md", format = ["sdist", "wheel"] }]
+# LICENSE and the generated third-party notices are shipped through PEP 639 `license-files`, so they
+# land in .dist-info/licenses/ instead of the top of site-packages, where same-named files from other
+# packages would overwrite each other.

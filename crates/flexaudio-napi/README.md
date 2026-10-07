@@ -10,7 +10,7 @@ JavaScript: **voice activity detection** (Silero VAD on pure-Rust tract),
 **noise suppression** (RNNoise via nnnoiseless), and streaming **FLAC** encoding. They run fully
 offline — no model files to ship, no network at runtime.
 
-> This package is distributed through npm; first publication pending.
+> This package is published on npm as `@studio-sadola/flexaudio`.
 > It is the **npm** package for flexaudio (the Rust crate `flexaudio-napi`).
 > It is **not** published to crates.io; consume the core library from Rust via
 > the `flexaudio` crate instead.
@@ -21,7 +21,7 @@ offline — no model files to ship, no network at runtime.
 npm install @studio-sadola/flexaudio
 ```
 
-After the first publication, the correct prebuilt native binary for your platform is pulled in automatically
+The correct prebuilt native binary for your platform is pulled in automatically
 via the platform-specific `optionalDependencies` (`@studio-sadola/flexaudio-<triple>`).
 
 ## Usage

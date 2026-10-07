@@ -12,6 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-08
+
+### Fixed
+
+- Python wheel license files now install into `.dist-info/licenses/` through
+  PEP 639 instead of the top of `site-packages`.
+- Documentation now reflects that npm packages are published instead of pending.
+
+### Packaging
+
+- npm publishing moved to Trusted Publishing via GitHub OIDC, removing the
+  need for a long-lived npm token.
+
 ## [0.3.0] - 2026-10-07
 
 ### Added
@@ -316,6 +329,7 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
   publication and interactive approval of new packages in scopes
   requiring 2FA. (1840fbb)
 
-[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Studio-Sadola/flexaudio/releases/tag/v0.2.0
