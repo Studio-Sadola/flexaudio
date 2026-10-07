@@ -128,7 +128,9 @@ impl CpalMicBackend {
     /// usage description. Otherwise the responsible application may prompt during
     /// startup, and the capture owner watches for a later denial. Windows checks
     /// the public microphone capability; unsupported queries defer to capture.
-    /// A refused or unanswered explicit prompt returns [`Error::PermissionDenied`].
+    /// A refused explicit prompt returns [`Error::PermissionDenied`]. An unanswered
+    /// prompt proceeds after 30 seconds; capture emits [`Event::PermissionPending`]
+    /// after five seconds of undecided consent and continues checking until a decision.
     pub fn try_new(device_id: Option<String>) -> Result<Self> {
         permission::preflight()?;
         let native = query_native_format(device_id.as_deref()).unwrap_or(FALLBACK_FORMAT);

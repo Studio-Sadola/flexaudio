@@ -2,7 +2,7 @@
 
 use flexaudio_core::types::{Error, Result};
 
-/// Whether the capture owner must watch a responsible application's pending prompt.
+/// Whether the capture owner must watch undecided microphone consent.
 pub(crate) fn preflight() -> Result<bool> {
     #[cfg(target_os = "macos")]
     {

@@ -147,11 +147,12 @@ export interface VadOptions {
 }
 /**
  * Stream notification. permissionDenied is terminal, with permission and
- * actionable message. silenceWhileSourceActive is advisory: capture continues;
- * missing system-audio permission and genuine digital silence are both possible.
+ * actionable message. permissionPending is advisory: consent remains undecided,
+ * capture continues and may stay silent until granted. silenceWhileSourceActive
+ * is advisory: missing system-audio permission and digital silence are possible.
  */
 export interface JsStreamEvent {
-  /** Present on permissionDenied. */
+  /** Present on permissionDenied and permissionPending. */
   permission?: 'microphone' | 'systemAudio'
   type: string
   count?: number
@@ -291,11 +292,14 @@ export declare function processes(): Promise<Array<JsProcessInfo>>
 /**
  * Open and start a stream, returning a `FlexStream` that sends chunks/events to callbacks.
  * Confirmed microphone/system-audio denial throws actionable permission guidance.
- * Supply onEvent for runtime denial and silenceWhileSourceActive advisories;
- * without onEvent, inspect terminalError() and handle stop() rejection.
- * macOS bundled microphone prompts wait up to 30 s; bare-host opens rely on the
- * responsible-app prompt and check late denial for up to 60 s. Windows checks
- * Microphone privacy, including Let desktop apps access your microphone.
+ * Supply onEvent for runtime denial, permissionPending and silenceWhileSourceActive
+ * advisories. Without onEvent, terminalError() and stop() expose terminal failures
+ * only; they do not expose advisories. macOS bundled microphone prompts wait up to
+ * 30 s; an unanswered prompt proceeds with capture. Undecided consent emits
+ * permissionPending after 5 s of capture. Authorization is checked every 500 ms
+ * for the first 60 s, then every 2 s until resolved or stopped. Bare-host opens rely
+ * on the responsible-app prompt. Windows checks Microphone privacy, including
+ * Let desktop apps access your microphone.
  *
  * `options.denoise` enables noise suppression in core (internal canonical form), so both primary
  * and secondary taps receive denoised audio. `options.vad` runs VAD on the tap selected by `vadTap`

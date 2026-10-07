@@ -28,15 +28,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Reject stale microphone sink formats before building native capture, including
-  after a macOS consent prompt. Authorization-query failures during startup
+  after a macOS consent prompt. Authorization-query failures during consent
   monitoring are terminal, preserve their typed cause, and suppress delivery/retries.
   Permission remedies now reference only the current platform; Windows system/process
   access errors explain access restrictions instead of pointing to macOS settings.
   Python type stubs include terminal errors, permission fields, and the silence advisory.
-- macOS microphone capture checks AVFoundation authorization, shares bounded
-  consent requests between opens, and reports late denial for responsible-app
-  prompts; the mic lane of Mix uses the same policy. Windows microphone capture
-  checks public AppCapability consent and rechecks native stream failures.
+- macOS microphone capture checks AVFoundation authorization and shares consent
+  requests between concurrent opens. An unanswered 30-second consent wait proceeds
+  with capture instead of claiming denial. Undecided consent emits the advisory
+  `PermissionPending` after five seconds of capture, once per generation, with
+  actionable guidance for background hosts. N-API/Python expose `permissionPending`
+  with `permission` and `message`; C adds event kind 8 without changing existing
+  codes; the CLI warns and continues. Consent monitoring runs every 500 ms for
+  the first 60 seconds, then every 2 seconds throughout capture until resolved;
+  late denial remains terminal. The mic lane of Mix uses the same policy.
+  Windows microphone capture checks public AppCapability consent and rechecks
+  native stream failures.
 - Confirmed permission errors and events preserve their cause with OS privacy
   settings and restart/retry guidance across Rust, Node.js, Python, C, and CLI.
   Terminal errors remain queryable after stop; the CLI exits unsuccessfully.

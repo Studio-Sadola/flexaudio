@@ -288,7 +288,7 @@ for Mix), and suppresses further audio and automatic reopening. Create a new
 stream after correcting permission; `start`, `resume`, and `switch_source` on a
 terminally failed stream return its stored error.
 
-If the macOS startup consent monitor cannot query authorization, capture fails
+If the macOS consent monitor cannot query authorization, capture fails
 closed with `Event::TerminalError { error }` and retains the original backend
 error; it does not invent a permission denial. Bindings report this as an `error`
 event and expose the same terminal failure. A microphone configuration that
@@ -311,15 +311,27 @@ permission events keep type `permissionDenied` and add `permission`
   AVFoundation authorization status. Denied or restricted access fails before
   capture. If authorization is not determined and the main app bundle declares
   a non-empty `NSMicrophoneUsageDescription`, flexaudio requests consent and
-  waits up to 30 seconds; refusal or timeout is a permission error. Open on a
-  worker thread when hosting a GUI so waiting does not block its event loop.
+  waits up to 30 seconds. Refusal is a permission error; an unanswered request
+  proceeds with capture and continued authorization monitoring. Open on a worker
+  thread when hosting a GUI so waiting does not block its event loop.
 - A bare CLI running inside Terminal may have no main-bundle microphone usage
   description. flexaudio does not request consent directly in that case; it
   proceeds with opening capture so macOS can prompt for the responsible app.
-  The backend checks authorization every 500 ms for up to 60 seconds. A late
+  While consent remains undecided, the backend checks authorization throughout
+  capture: every 500 ms for the first 60 seconds, then every 2 seconds. A late
   denied/restricted status produces a terminal permission event; authorization
-  stops polling. An unanswered prompt during this polling window is not proof
-  of denial.
+  stops polling. An unanswered prompt is not proof of denial.
+- If microphone consent is still undecided five seconds after capture starts,
+  flexaudio emits `Event::PermissionPending { permission, detail }` once per
+  capture generation, including the mic lane of Mix. This is an advisory:
+  capture continues and may remain silent until permission is granted. Check
+  **System Settings > Privacy & Security > Microphone**. SSH, launchd, or other
+  background contexts may not show a prompt; run from Terminal or use an app
+  bundle with a non-empty `NSMicrophoneUsageDescription`. N-API/Python expose
+  type `permissionPending` with `permission` and `message`; C uses event kind 8
+  with guidance in `flexaudio_last_error()`. The CLI prints a warning and
+  continues. Provide N-API `onEvent`, or poll Rust/Python/C events, to receive
+  advisories; terminal-error accessors report terminal failures only.
 - **System and per-process audio** use Core Audio process taps (macOS 14.4+).
   Add a usage description to your app's `Info.plist`:
   ```xml

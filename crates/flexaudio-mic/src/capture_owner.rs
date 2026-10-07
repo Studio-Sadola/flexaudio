@@ -53,29 +53,41 @@ fn wait_until_stopped(
     _event_tx: &mpsc::Sender<Event>,
 ) {
     #[cfg(target_os = "macos")]
-    let mut monitor = _watch_pending.then(crate::mac_policy::ConsentPoll::new);
-    #[cfg(target_os = "macos")]
-    let started = std::time::Instant::now();
-
+    if _watch_pending {
+        let started = std::time::Instant::now();
+        monitor_until_stopped(
+            &crate::mac_permission::Native,
+            stop_flag,
+            _event_tx,
+            || started.elapsed(),
+            |delay| match delay {
+                Some(delay) => thread::park_timeout(delay),
+                None => thread::park(),
+            },
+        );
+        return;
+    }
     while !stop_flag.load(Ordering::SeqCst) {
-        #[cfg(target_os = "macos")]
-        if let Some(poll) = monitor.as_mut() {
-            if check_pending(
-                poll,
-                started.elapsed(),
-                &crate::mac_permission::Native,
-                stop_flag,
-                _event_tx,
-            ) {
-                break;
-            }
-            if poll.active() {
-                thread::park_timeout(crate::mac_policy::POLL_INTERVAL);
-                continue;
-            }
-            monitor = None;
-        }
         thread::park();
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn monitor_until_stopped(
+    provider: &dyn crate::mac_policy::Provider,
+    stop_flag: &AtomicBool,
+    events: &mpsc::Sender<Event>,
+    elapsed: impl Fn() -> std::time::Duration,
+    mut park: impl FnMut(Option<std::time::Duration>),
+) {
+    let mut poll = crate::mac_policy::ConsentPoll::new();
+    while !stop_flag.load(Ordering::SeqCst) {
+        if check_pending(&mut poll, elapsed(), provider, stop_flag, events) {
+            break;
+        }
+        // The existing owner's park token also wakes a two-second late poll.
+        // After authorization, park without querying until stop/drop unparks us.
+        park(poll.active().then(|| poll.wait_duration(elapsed())));
     }
 }
 
@@ -88,6 +100,10 @@ fn check_pending(
     events: &mpsc::Sender<Event>,
 ) -> bool {
     let event = match poll.poll(elapsed, provider) {
+        Ok(Some(event @ Event::PermissionPending { .. })) => {
+            let _ = events.send(event);
+            return false;
+        }
         Ok(Some(event)) => event,
         Err(error) => Event::TerminalError { error },
         Ok(None) => return false,
@@ -108,6 +124,116 @@ fn terminate(stop_flag: &AtomicBool, events: &mpsc::Sender<Event>, event: Event)
 mod tests {
     use super::*;
     use flexaudio_core::types::Permission;
+    use flexaudio_core::CaptureBackend;
+
+    #[test]
+    fn owner_keeps_polling_past_sixty_seconds_and_terminates_on_late_denial() {
+        use crate::mac_policy::{Provider, Status};
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        struct TimedProvider(Arc<Mutex<Duration>>);
+        impl Provider for TimedProvider {
+            fn status(&self) -> Result<Status> {
+                Ok(if *self.0.lock().unwrap() >= Duration::from_secs(70) {
+                    Status::Denied
+                } else {
+                    Status::NotDetermined
+                })
+            }
+            fn has_usage_description(&self) -> Result<bool> {
+                panic!("monitor must not inspect the bundle")
+            }
+            fn request_access(&self, _: Box<dyn Fn(bool) + Send + Sync>) -> Result<()> {
+                panic!("monitor must not request consent")
+            }
+        }
+
+        let clock = Arc::new(Mutex::new(Duration::ZERO));
+        let stop_flag = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel();
+        monitor_until_stopped(
+            &TimedProvider(clock.clone()),
+            &stop_flag,
+            &tx,
+            || *clock.lock().unwrap(),
+            |delay| {
+                let delay = delay.expect("undecided consent must keep polling");
+                assert!(delay <= Duration::from_secs(2));
+                let mut elapsed = clock.lock().unwrap();
+                *elapsed += delay;
+                assert!(*elapsed <= Duration::from_secs(70));
+            },
+        );
+        assert_eq!(*clock.lock().unwrap(), Duration::from_secs(70));
+        assert!(matches!(rx.try_recv(), Ok(Event::PermissionPending { .. })));
+        assert!(matches!(rx.try_recv(), Ok(Event::PermissionDenied { .. })));
+        assert!(rx.try_recv().is_err());
+        assert!(stop_flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn pending_advisory_does_not_terminate_and_stop_or_drop_joins_the_owner() {
+        use crate::mac_policy::{Provider, Status, POLL_SLOW_INTERVAL};
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        struct Pending(AtomicUsize);
+        impl Provider for Pending {
+            fn status(&self) -> Result<Status> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Status::NotDetermined)
+            }
+            fn has_usage_description(&self) -> Result<bool> {
+                panic!("polling must not inspect the bundle")
+            }
+            fn request_access(&self, _: Box<dyn Fn(bool) + Send + Sync>) -> Result<()> {
+                panic!("polling must not request consent")
+            }
+        }
+
+        for drop_backend in [false, true] {
+            // Inject only the owner monitor into the backend's real stop/drop path.
+            // No CPAL host, configuration query, or native stream is opened.
+            let mut backend = crate::CpalMicBackend::with_format(None, (48_000, 1));
+            let provider = Arc::new(Pending(AtomicUsize::new(0)));
+            let owner_provider = provider.clone();
+            let owner_stop = backend.stop_flag.clone();
+            let events = backend.event_tx.clone();
+            let (parked_tx, parked_rx) = mpsc::channel();
+            let (exited_tx, exited_rx) = mpsc::channel();
+            backend.handle = Some(thread::spawn(move || {
+                monitor_until_stopped(
+                    &*owner_provider,
+                    &owner_stop,
+                    &events,
+                    || Duration::from_secs(70),
+                    |delay| {
+                        assert_eq!(delay, Some(POLL_SLOW_INTERVAL));
+                        assert!(!owner_stop.load(Ordering::SeqCst));
+                        parked_tx.send(()).unwrap();
+                        thread::park_timeout(POLL_SLOW_INTERVAL);
+                    },
+                );
+                exited_tx.send(()).unwrap();
+            }));
+            parked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(
+                backend.events.try_recv(),
+                Ok(Event::PermissionPending { .. })
+            ));
+            assert!(backend.terminal_error.is_none());
+            if drop_backend {
+                drop(backend);
+            } else {
+                backend.stop();
+                assert!(backend.handle.is_none());
+            }
+            // stop/drop returned only after the owner exited; this is not a wait.
+            exited_rx.try_recv().unwrap();
+            assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+        }
+    }
 
     #[test]
     fn consent_query_failure_is_terminal_typed_and_closes_owner_delivery() {

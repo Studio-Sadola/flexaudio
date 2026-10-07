@@ -174,12 +174,16 @@ pub enum FlexEventKind {
     /// Exact-zero system capture while eligible output is active; advisory only.
     /// Retrieve the explanation with flexaudio_last_error; capture continues.
     SilenceWhileSourceActive = 7,
+    /// Recording consent remains undecided; advisory only, capture continues.
+    /// Retrieve guidance with flexaudio_last_error; capture may stay silent until granted.
+    PermissionPending = 8,
 }
 
 /// One captured event, populated by `flexaudio_poll_event`.
 ///
-/// For Error, PermissionDenied, and SilenceWhileSourceActive, the message is
-/// stored in flexaudio_last_error. PermissionDenied retains kind 3.
+/// For Error, PermissionDenied, SilenceWhileSourceActive, and PermissionPending,
+/// the message is stored in flexaudio_last_error. PermissionDenied retains kind 3;
+/// PermissionPending has kind 8 and does not stop capture.
 #[repr(C)]
 pub struct FlexEvent {
     /// Event kind.

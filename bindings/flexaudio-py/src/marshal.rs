@@ -238,7 +238,7 @@ pub(crate) fn chunk_to_py(chunk: AudioChunk) -> PyAudioChunk {
 /// Event emitted while a stream is running. `type` identifies the kind; `count` and `message` are optional by kind.
 #[pyclass(module = "flexaudio", name = "StreamEvent", frozen)]
 pub struct PyStreamEvent {
-    /// Present on permissionDenied: microphone | systemAudio.
+    /// Present on permissionDenied and permissionPending: microphone | systemAudio.
     #[pyo3(get)]
     permission: Option<String>,
     #[pyo3(get, name = "type")]
@@ -279,6 +279,12 @@ pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
             permission: None,
             count: None,
             message: None,
+        },
+        Event::PermissionPending { permission, detail } => PyStreamEvent {
+            kind: "permissionPending".to_string(),
+            permission: Some(permission.as_str().to_string()),
+            count: None,
+            message: Some(detail),
         },
         Event::PermissionDenied { permission, detail } => PyStreamEvent {
             kind: "permissionDenied".to_string(),
@@ -456,6 +462,23 @@ mod tests {
         assert_eq!(event.kind, "error");
         assert_eq!(event.message, Some(error.to_string()));
         assert_eq!(event.permission, None);
+    }
+
+    #[test]
+    fn permission_pending_preserves_permission_and_advisory_message() {
+        for permission in [fa::Permission::Microphone, fa::Permission::SystemAudio] {
+            let mapped = event_to_py(Event::PermissionPending {
+                permission,
+                detail: "Permission is pending; capture may remain silent until granted".into(),
+            });
+            assert_eq!(mapped.kind, "permissionPending");
+            assert_eq!(mapped.permission.as_deref(), Some(permission.as_str()));
+            assert_eq!(mapped.count, None);
+            assert_eq!(
+                mapped.message.as_deref(),
+                Some("Permission is pending; capture may remain silent until granted")
+            );
+        }
     }
 
     #[test]
