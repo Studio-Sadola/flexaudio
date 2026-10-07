@@ -151,6 +151,17 @@ jobs:
         run: npm install --no-package-lock --omit=optional --ignore-scripts --registry=https://registry.npmjs.org/
       - name: Compare independent addon builds
         run: python .github/scripts/check-windows-reproducibility.py
+      # The verified addon, for real-device testing of unreleased changes. Not a release artifact.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: napi-win32-x64-msvc-${{ github.sha }}
+          path: |
+            crates/flexaudio-napi/index.win32-x64-msvc.node
+            crates/flexaudio-napi/index.js
+            crates/flexaudio-napi/index.d.ts
+            crates/flexaudio-napi/package.json
+          if-no-files-found: error
+          retention-days: 7
 
   build-test-macos:
     name: Build & Test (macOS / Core Audio Taps)
