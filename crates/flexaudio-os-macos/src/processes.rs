@@ -118,12 +118,12 @@ fn read_scalar_property<T: Copy + Default>(object: AudioObjectID, selector: u32)
 }
 
 /// Read a `pid_t` (`i32`) property.
-fn read_i32_property(object: AudioObjectID, selector: u32) -> Option<i32> {
+pub(crate) fn read_i32_property(object: AudioObjectID, selector: u32) -> Option<i32> {
     read_scalar_property::<i32>(object, selector)
 }
 
 /// Read a `UInt32` property.
-fn read_u32_property(object: AudioObjectID, selector: u32) -> Option<u32> {
+pub(crate) fn read_u32_property(object: AudioObjectID, selector: u32) -> Option<u32> {
     read_scalar_property::<u32>(object, selector)
 }
 

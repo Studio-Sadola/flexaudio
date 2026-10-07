@@ -19,8 +19,23 @@ cross thread boundaries.
 
 **Platform requirement:** Core Audio Process Taps require **macOS 14.4 or later**.
 Attempting to start a backend on an older OS returns `Error::UnsupportedOsVersion`.
-The crate compiles as an empty stub on non-macOS targets
-(`#![cfg(target_os = "macos")]`).
+Native backends are unavailable on non-macOS targets; the private capture-health
+policy still compiles there for device-free tests.
+
+Tap creation failures with Core Audio's illegal-operation status produce
+`Error::PermissionDenied { permission: Permission::SystemAudio, detail }` with
+privacy-setting guidance. Successful creation does not prove recording consent:
+macOS can deliver zero samples while permission is missing.
+
+The backends emit `Event::SilenceWhileSourceActive { detail }` once per capture
+generation after five continuous seconds of bit-exact zero native samples while
+an eligible external process has output I/O active. This advisory explains where
+to check System Audio Recording permission and continues capture, because genuine
+digital silence can cause the same observation. Process exclusions and selected
+device routing restrict eligibility; query failures, missing delivery, dropped
+samples, and unknown routing reset the observation window. No private TCC APIs
+are used. Call `CaptureBackend::poll_event` to receive backend notifications when
+using a backend directly.
 
 > **Most users should use the [`flexaudio`](https://crates.io/crates/flexaudio)
 > facade crate instead of this one directly.** Depend on `flexaudio-os-macos`

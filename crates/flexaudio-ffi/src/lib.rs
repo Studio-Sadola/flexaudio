@@ -262,8 +262,10 @@ pub unsafe extern "C" fn flexaudio_resume(s: *mut FlexStream) -> i32 {
             set_last_error("flexaudio_resume: stream pointer is null");
             return code::FLEX_INVALID_ARG;
         };
-        stream.inner.resume();
-        code::FLEX_OK
+        match stream.inner.resume() {
+            Ok(()) => code::FLEX_OK,
+            Err(error) => fail(error),
+        }
     })
 }
 
@@ -369,7 +371,9 @@ pub unsafe extern "C" fn flexaudio_dropped_chunks(s: *const FlexStream) -> u64 {
 /// Retrieve one chunk and fill `out`.
 ///
 /// Return 1 when a chunk is retrieved and `out` is filled, 0 when none is available, or a
-/// negative value on error. `out.data` is owned by flexaudio; free it with
+/// negative value on error. A terminal permission denial returns FLEX_FAILURE (-2)
+/// with actionable guidance in flexaudio_last_error, including after stop.
+/// `out.data` is owned by flexaudio; free it with
 /// `flexaudio_chunk_free` when done.
 ///
 /// If add-ons are enabled, the chunk passes through denoise → VAD before it is returned. When
@@ -391,13 +395,19 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
             set_last_error("flexaudio_poll_chunk: out pointer is null");
             return code::FLEX_INVALID_ARG;
         }
+        if let Some(error) = stream.inner.terminal_error() {
+            return fail(error);
+        }
         // Write the result after add-ons (denoise → VAD); pass through unchanged if disabled.
         match stream.poll_processed() {
             Some(chunk) => {
                 out.write(chunk);
                 1
             }
-            None => 0,
+            None => match stream.inner.terminal_error() {
+                Some(error) => fail(error),
+                None => 0,
+            },
         }
     })
 }
@@ -420,7 +430,8 @@ pub unsafe extern "C" fn flexaudio_chunk_free(chunk: *mut FlexChunk) {
 /// Retrieve one event and fill `out`.
 ///
 /// Return 1 when an event is retrieved, 0 when none is available, or a negative value on error.
-/// For an `Error` event, set `out.kind = Error` and store the message in last_error.
+/// Error, PermissionDenied (kind 3), and SilenceWhileSourceActive (kind 7)
+/// store their explanation in last_error. The advisory does not stop capture.
 ///
 /// # Safety
 /// `s` must be a valid handle, and `out` must point to a valid `FlexEvent` destination.
@@ -512,6 +523,9 @@ unsafe fn switch_source_with_exclude_pids(
             set_last_error("flexaudio_switch_source: stream pointer is null");
             return code::FLEX_INVALID_ARG;
         };
+        if let Some(error) = stream.inner.terminal_error() {
+            return fail(error);
+        }
         if !config.is_null() && !config.is_aligned() {
             set_last_error("flexaudio_switch_source: config pointer is not aligned");
             return code::FLEX_INVALID_ARG;
@@ -538,6 +552,28 @@ unsafe fn switch_source_with_exclude_pids(
                 code::FLEX_INVALID_ARG
             }
             Err(e) => fail(e),
+        }
+    })
+}
+
+/// Return FLEX_OK when no terminal failure is stored, or FLEX_FAILURE (-2) and
+/// set flexaudio_last_error to the terminal reason. Does not consume events and
+/// remains available after flexaudio_stop.
+///
+/// # Safety
+/// s must be a valid handle (NULL is InvalidArg).
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_terminal_error(s: *const FlexStream) -> i32 {
+    guard_i32(|| {
+        clear_last_error();
+        // SAFETY: The caller supplies a valid handle or NULL as documented.
+        let Some(stream) = (unsafe { s.as_ref() }) else {
+            set_last_error("flexaudio_terminal_error: stream pointer is null");
+            return code::FLEX_INVALID_ARG;
+        };
+        match stream.inner.terminal_error() {
+            Some(error) => fail(error),
+            None => code::FLEX_OK,
         }
     })
 }
@@ -681,5 +717,94 @@ pub extern "C" fn flexaudio_last_error() -> *const c_char {
     match catch_unwind(last_error_ptr) {
         Ok(p) => p,
         Err(_) => std::ptr::null(),
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+    use flexaudio as fa;
+    use std::ffi::CStr;
+
+    struct DeniedBackend(Option<fa::Event>);
+
+    impl fa::CaptureBackend for DeniedBackend {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 2)
+        }
+        fn start(&mut self, _sink: fa::core::backend::RawSink) -> fa::Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) {}
+        fn poll_event(&mut self) -> Option<fa::Event> {
+            self.0.take()
+        }
+    }
+
+    fn denied_stream() -> fa::Stream {
+        let mut stream = fa::Stream::open(
+            fa::StreamConfig::default(),
+            Box::new(DeniedBackend(Some(fa::Event::PermissionDenied {
+                permission: fa::Permission::Microphone,
+                detail: "denied by user".into(),
+            }))),
+        )
+        .expect("open fake backend");
+        stream.start().expect("start fake backend");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while stream.terminal_error().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal event was not processed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        stream
+    }
+
+    #[test]
+    fn terminal_poll_failure_keeps_code_reason_and_event_after_stop() {
+        let mut stream = FlexStream {
+            inner: denied_stream(),
+            denoiser: None,
+            vad: None,
+        };
+        let mut chunk = std::mem::MaybeUninit::<FlexChunk>::uninit();
+        // SAFETY: stream is live and all output pointers reference writable local destinations.
+        unsafe {
+            assert_eq!(flexaudio_poll_chunk(&mut stream, chunk.as_mut_ptr()), -2);
+            let message = CStr::from_ptr(flexaudio_last_error()).to_str().unwrap();
+            assert!(message.contains("denied by user"));
+            assert!(message.contains(&fa::Permission::Microphone.to_string()));
+            assert!(message.contains(fa::Permission::Microphone.guidance()));
+            let mut event = std::mem::MaybeUninit::<FlexEvent>::uninit();
+            assert_eq!(flexaudio_poll_event(&mut stream, event.as_mut_ptr()), 1);
+            assert_eq!(event.assume_init().kind as i32, 3);
+            assert_eq!(flexaudio_terminal_error(&stream), -2);
+            assert_eq!(flexaudio_stop(&mut stream), 0);
+            assert_eq!(flexaudio_poll_chunk(&mut stream, chunk.as_mut_ptr()), -2);
+            assert_eq!(flexaudio_resume(&mut stream), -2);
+            assert_eq!(flexaudio_terminal_error(&stream), -2);
+        }
+    }
+
+    #[test]
+    fn terminal_accessor_handles_empty_and_null_streams() {
+        let inner = fa::Stream::open(
+            fa::StreamConfig::default(),
+            Box::new(fa::MockBackend::new(48_000, 2, 0.0)),
+        )
+        .expect("open mock");
+        let stream = FlexStream {
+            inner,
+            denoiser: None,
+            vad: None,
+        };
+        // SAFETY: a valid local stream handle and explicitly permitted NULL are supplied.
+        unsafe {
+            assert_eq!(flexaudio_terminal_error(&stream), 0);
+            assert!(flexaudio_last_error().is_null());
+            assert_eq!(flexaudio_terminal_error(std::ptr::null()), -1);
+        }
     }
 }

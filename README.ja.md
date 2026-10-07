@@ -101,6 +101,8 @@ stream.stop();
   まだ開始されていないキャプチャストリームを作成します。
 - `Stream::start` / `Stream::stop` — キャプチャを制御します。
 - `Stream::poll_chunk` / `Stream::poll_event` — `AudioChunk` と `Event` を取り出します。
+- `Stream::terminal_error() -> Option<Error>` — 停止後も保持される終端エラーを確認します。
+  `Stream::resume()` は `Result<()>` を返します。
 - `Stream::switch_source` — ストリームを停止せずに入力ソースを切り替えます。
   チャンクの `seq` は連続性を保ち、切り替え後の最初のチャンクには不連続を示すフラグが付きます。
 - `flexaudio::devices() -> Result<Vec<DeviceInfo>>` — マイク（cpal、全プラットフォーム）と
@@ -116,7 +118,7 @@ stream.stop();
   Linux のみ対応し、Windows/macOS では何も行わないウォッチャーを返します。
 - 再エクスポートされる型: `StreamConfig`, `SourceKind`, `ProcessMode`, `OutputFormat`,
   `AudioChunk`, `SecondaryChunk`, `ChunkFlags`, `DeviceInfo`, `ProcessInfo`,
-  `DeviceEvent`, `Event`, `Error`, `Result`。
+  `DeviceEvent`, `Event`, `Permission`, `Error`, `Result`。
 
 音声区間検出（`flexaudio-vad`）では、`Vad::new` / `Vad::process` でストリーミングの
 `SpeechStart` / `SpeechEnd` イベントを取得し、`get_speech_timestamps` でバッチ処理による区間分割を行います。
@@ -252,36 +254,73 @@ JS のイベントループをブロックしないようにしています。
 
 ## OS ごとの権限要件
 
-flexaudio は音声をキャプチャするため、どのプラットフォームでもユーザーの許可が必要です。
-必要な許可ダイアログの表示やエンタイトルメントの宣言は、アプリケーション側で行ってください。
+アプリケーションは、ホスト OS が必要とする用途説明や機能宣言を行う必要があります。
+録音の許可が拒否されたと確認できた場合は、`Error::PermissionDenied { permission, detail }` を返します。
+メッセージは対象の権限と原因、変更するプライバシー設定、アプリを再起動して再試行する手順を示します。
+キャプチャ中に拒否を検出すると `Event::PermissionDenied { permission, detail }` を発行し、
+キャプチャ（Mix では両方の入力）を終了して、それ以降の音声の配信と自動的な再オープンを抑止します。
+権限を修正した後は新しいストリームを作成してください。終端エラーのあるストリームの
+`start`、`resume`、`switch_source` は保持されたエラーを返します。
+
+macOS の起動時の許可監視で認可状態を照会できない場合は、
+`Event::TerminalError { error }` によりキャプチャを安全側に停止し、元のバックエンドエラーを保持します。
+この場合、権限が拒否されたと推測することはありません。各バインディングはこれを `error`
+イベントとして通知し、同じ終端エラーを参照できます。マイクの構成が事前に通知したネイティブ形式と
+異なる場合は、キャプチャを構築する前に `Error::NativeFormatChanged { advertised, actual }`
+で拒否します。誤った形式でサンプルを解釈して配信せず、現在のデバイス形式を使ってストリームを作り直してください。
+
+Rust では `Stream::terminal_error()`、N-API では `terminalError()` を提供し、N-API の
+`stop()` は終端エラーがあると拒否されます。即時の通知には `onEvent` を渡してください。
+Python の `poll_chunk()` は `RuntimeError` を送出し、`terminal_error()` はイベントを消費せずに
+エラーを確認できます。C の `flexaudio_poll_chunk()` と `flexaudio_terminal_error()` は
+`FLEX_FAILURE` (-2) を返し、説明は `flexaudio_last_error()` で取得できます。
+C の権限イベント種別は引き続き 3 です。N-API/Python の権限イベントの type は
+`permissionDenied` のままで、`permission`（`microphone` または `systemAudio`）と `message` が追加されます。
 
 ### macOS
 
-システム音声とプロセス単位の音声キャプチャには Core Audio の process tap を使います。
-これは、**TCC** プライバシーサブシステムの `kTCCServiceAudioCapture` によって管理されます。
-
-- アプリの `Info.plist` に用途を説明する文字列を追加してください。
+- **マイク**（Mix のマイク入力も含みます）: flexaudio は公開されている AVFoundation の認可状態を確認します。
+  拒否または制限されている場合はキャプチャを開始する前に失敗します。状態が未決定で、メインのアプリバンドルに
+  空でない `NSMicrophoneUsageDescription` があれば、同意を要求して最大 30 秒待ちます。
+  拒否または時間切れは権限エラーになります。GUI アプリではイベントループを止めないよう、
+  ワーカースレッドでオープンしてください。
+- Terminal 内の単体 CLI では、メインバンドルにマイクの用途説明がない場合があります。
+  この場合、flexaudio は直接同意を要求せず、macOS が責任を持つアプリのためにダイアログを表示できるよう
+  キャプチャのオープンを進めます。バックエンドは 500 ms ごとに最大 60 秒間、認可状態を確認します。
+  遅れて拒否／制限が確認されると終端の権限イベントを発行し、許可を確認するとポーリングを終了します。
+  この確認期間中にダイアログが未回答であることだけでは、拒否と判断できません。
+- **システム音声とプロセス単位の音声**には Core Audio の process tap（macOS 14.4 以降）を使います。
+  アプリの `Info.plist` に用途説明を追加してください。
   ```xml
   <key>NSAudioCaptureUsageDescription</key>
   <string>This app records system and application audio.</string>
   ```
-  （マイクのみのキャプチャには、さらに `NSMicrophoneUsageDescription` が必要です。）
-- OS は初回に同意を求めるダイアログを表示します。ユーザーが許可するまでは、
-  キャプチャ時に `PermissionDenied` イベント／エラーが返ります。
-- process tap には macOS 14.4 以降が必要です。
+  同意ダイアログは OS が管理します。システム音声の権限状態を取得する公開 API はなく、
+  flexaudio は非公開の TCC API を使いません。ネイティブの illegal operation は最善努力による診断として
+  `SystemAudio` の権限エラーに変換しますが、このネイティブの結果は同意の失敗に限定されません。
+- tap はネイティブの権限エラーを返さずにゼロを配信する場合があります。ビット単位で完全なゼロのネイティブサンプルが
+  5 秒間連続し、Core Audio がキャプチャ対象の適格なプロセスの出力が動作中と報告すると、
+  `Event::SilenceWhileSourceActive { detail }` をキャプチャ世代ごとに 1 回発行します
+  （N-API/Python の type は `silenceWhileSourceActive`、C のイベント種別は 7）。
+  自分自身を除き、キャプチャ対象の選択条件を反映します。実際のデジタル無音でも同じ観測結果になるため、
+  キャプチャは継続します。問い合わせの失敗、不明なデバイスの経路、非動作中の音源、サンプルの欠落、
+  ゼロ以外または負のゼロのサンプルでは、この助言は発行されません。助言がないことは権限が許可された証拠にはなりません。
+- マイクのアクセスは **システム設定 > プライバシーとセキュリティ > マイク**、システム音声は
+  **画面収録とシステムオーディオ録音**の **システムオーディオ録音**を確認してください。
+  責任を持つホストアプリ（例えば Terminal）のアクセスを有効にし、そのアプリを再起動して新しいストリームで再試行してください。
 
 ### Windows
 
-- マイクのキャプチャは、**マイク**のプライバシー設定
-  （設定 → プライバシーとセキュリティ → マイク）で制御されます。
-  キャプチャに失敗した場合は、アプリのアクセスが有効になっているか確認してください。
-  cpal のマイクバックエンドでは、デバイスやデフォルトの入力設定が利用できない場合は `Error::DeviceNotFound`、
-  入力ストリームの構築に失敗した場合は `Error::Backend` が返ります。
-  プライバシー設定による拒否を `Error::PermissionDenied` には変換しません。
-- システム出力（WASAPI ループバック）とプロセス単位のループバックキャプチャは、
-  標準の WASAPI 再生エンドポイントのループバック／プロセスループバック API（Windows 10/11）を使います。
-  デスクトップアプリには特別なマニフェストの機能宣言は不要ですが、
-  マイクのキャプチャには引き続きマイクのプライバシー設定が適用されます。
+- マイクのキャプチャ（Mix のマイク入力も含みます）は公開されている `AppCapability` の同意 API を確認します。
+  ユーザーまたはシステムによる拒否は `Microphone` の権限エラーになります。ネイティブストリームの構築／開始に失敗した後も
+  同意を再確認します。未対応／曖昧な状態または問い合わせの失敗ではネイティブのキャプチャを試みますが、
+  アクセスが認可された証拠としては扱いません。
+- **設定 > プライバシーとセキュリティ > マイク**で **デスクトップ アプリにマイクへのアクセスを許可する**も
+  有効にし、ホストアプリを再起動して新しいストリームで再試行してください。
+  管理者が設定した制限は、管理者によるポリシー変更が必要な場合があります。
+- システム出力（WASAPI ループバック）とプロセス単位のループバックは、標準の WASAPI 再生エンドポイントの
+  ループバック／プロセスループバック API（Windows 10/11）を使います。
+  デスクトップのループバックキャプチャにはマイクの同意の事前確認を適用しません。
 
 ### Linux
 

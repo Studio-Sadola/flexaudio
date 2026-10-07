@@ -34,12 +34,24 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, SampleFormat};
 
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::clock::monotonic_now_ns;
-use flexaudio_core::types::{DeviceInfo, Error, Result, SourceKind};
+use flexaudio_core::types::{DeviceInfo, Error, Event, Result, SourceKind};
+
+mod capture_owner;
+mod input_config;
+#[cfg(target_os = "macos")]
+mod mac_permission;
+#[cfg(any(target_os = "macos", test))]
+mod mac_policy;
+mod permission;
+#[cfg(target_os = "windows")]
+mod windows_permission;
+#[cfg(any(target_os = "windows", test))]
+mod windows_policy;
 
 #[cfg(windows)]
 mod windows_keeper;
@@ -79,6 +91,11 @@ pub struct CpalMicBackend {
     native: (u32, u16),
     /// ID (device name) of the selected input device. `None` uses the default input device.
     device_id: Option<String>,
+    /// Notifications from the capture owner; callbacks never query consent.
+    events: mpsc::Receiver<Event>,
+    event_tx: mpsc::Sender<Event>,
+    /// A confirmed runtime denial cannot be restarted on this backend instance.
+    terminal_error: Option<Error>,
 }
 
 impl CpalMicBackend {
@@ -92,14 +109,42 @@ impl CpalMicBackend {
     /// Query and cache the selected device's native format. If the device is missing, does
     /// not match, or the query fails, cache `FALLBACK_FORMAT` (`(48000, 1)`). `new` always
     /// succeeds without panicking or returning an error; if device_id does not match,
-    /// [`start`](Self::start) returns [`Error::DeviceNotFound`].
+    /// [`start`](Self::start) returns [`Error::DeviceNotFound`]. If consent or a device
+    /// change reveals a different format, `start` returns [`Error::NativeFormatChanged`]
+    /// before building capture, and refreshes [`native_format`](Self::native_format).
+    /// Prefer [`try_new`](Self::try_new) to discover the format after consent.
     pub fn new(device_id: Option<String>) -> Self {
+        let native = if permission::can_query_format() {
+            query_native_format(device_id.as_deref()).unwrap_or(FALLBACK_FORMAT)
+        } else {
+            FALLBACK_FORMAT
+        };
+        Self::with_format(device_id, native)
+    }
+
+    /// Check OS microphone permission before discovering the device format.
+    ///
+    /// macOS prompts only when the main bundle declares a nonempty microphone
+    /// usage description. Otherwise the responsible application may prompt during
+    /// startup, and the capture owner watches for a later denial. Windows checks
+    /// the public microphone capability; unsupported queries defer to capture.
+    /// A refused or unanswered explicit prompt returns [`Error::PermissionDenied`].
+    pub fn try_new(device_id: Option<String>) -> Result<Self> {
+        permission::preflight()?;
         let native = query_native_format(device_id.as_deref()).unwrap_or(FALLBACK_FORMAT);
+        Ok(Self::with_format(device_id, native))
+    }
+
+    fn with_format(device_id: Option<String>, native: (u32, u16)) -> Self {
+        let (event_tx, events) = mpsc::channel();
         Self {
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
             native,
             device_id,
+            events,
+            event_tx,
+            terminal_error: None,
         }
     }
 }
@@ -203,6 +248,9 @@ impl CaptureBackend for CpalMicBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
+        if let Some(error) = self.terminal_error.as_ref() {
+            return Err(error.clone());
+        }
         // Do nothing if the owner thread is already alive (safe for repeated start calls).
         if self.handle.is_some() {
             return Ok(());
@@ -213,13 +261,14 @@ impl CaptureBackend for CpalMicBackend {
         let stop_flag = self.stop_flag.clone();
         // cpal::Device is !Send, so pass only the device_id string and resolve it on the thread.
         let device_id = self.device_id.clone();
+        let event_tx = self.event_tx.clone();
         // Ready channel reports build/play success or failure from the owner thread to start().
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
 
         let handle = thread::Builder::new()
             .name("flexaudio-mic-cpal".into())
             .spawn(move || {
-                run_capture_thread(sink, device_id, stop_flag, ready_tx);
+                capture_owner::run(sink, device_id, stop_flag, ready_tx, event_tx);
             })
             .map_err(|e| Error::Backend(format!("spawn cpal mic thread: {e}")))?;
 
@@ -232,6 +281,9 @@ impl CaptureBackend for CpalMicBackend {
             Ok(Err(e)) => {
                 // Build/play failed. The owner thread exits after sending ready, so join it.
                 let _ = handle.join();
+                if let Error::NativeFormatChanged { actual, .. } = &e {
+                    self.native = *actual;
+                }
                 Err(e)
             }
             // The owner thread died before sending ready (should not normally happen).
@@ -253,49 +305,28 @@ impl CaptureBackend for CpalMicBackend {
             let _ = h.join();
         }
     }
+
+    fn poll_event(&mut self) -> Option<Event> {
+        let event = self.events.try_recv().ok()?;
+        let terminal = match &event {
+            Event::PermissionDenied { permission, detail } => Some(Error::PermissionDenied {
+                permission: *permission,
+                detail: detail.clone(),
+            }),
+            Event::TerminalError { error } => Some(error.clone()),
+            _ => None,
+        };
+        if self.terminal_error.is_none() {
+            self.terminal_error = terminal;
+        }
+        Some(event)
+    }
 }
 
 impl Drop for CpalMicBackend {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-/// Owner-thread body. Builds and plays the cpal input stream, then parks until stopped.
-///
-/// Reports build/play success or failure to [`CpalMicBackend::start`] through `ready_tx`.
-/// After success, parks with `stream` alive until `stop_flag` is set, then exits and drops
-/// `stream` to stop capture.
-fn run_capture_thread(
-    sink: RawSink,
-    device_id: Option<String>,
-    stop_flag: Arc<AtomicBool>,
-    ready_tx: mpsc::Sender<Result<()>>,
-) {
-    let stream = match build_stream(sink, device_id.as_deref()) {
-        Ok(s) => s,
-        Err(e) => {
-            // Report the failure and exit immediately.
-            let _ = ready_tx.send(Err(e));
-            return;
-        }
-    };
-
-    if let Err(e) = stream.play() {
-        let _ = ready_tx.send(Err(Error::Backend(format!("cpal play: {e}"))));
-        return;
-    }
-
-    // The stream has started successfully.
-    let _ = ready_tx.send(Ok(()));
-
-    // Keep the stream alive while parked until the stop signal arrives.
-    // Check stop_flag each time in case of a spurious wakeup.
-    while !stop_flag.load(Ordering::SeqCst) {
-        thread::park();
-    }
-    // Leaving this scope drops the stream and stops capture.
-    drop(stream);
 }
 
 /// Maximum expected block duration (seconds) used to preallocate scratch for RT conversion callbacks.
@@ -392,7 +423,11 @@ impl TransientGuard {
 /// Select a callback for each sample format: pass F32 through directly and convert I16/U16/I32
 /// to `f32` in `[-1.0, 1.0]` before sending to [`RawSink::push`]. [`TransientGuard`] discards
 /// priming transient buffers after startup (for the PipeWire ALSA bridge).
-fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> {
+fn build_stream(
+    sink: RawSink,
+    device_id: Option<&str>,
+    stop_flag: Arc<AtomicBool>,
+) -> Result<cpal::Stream> {
     let host = cpal_default_host()?;
     // None selects default; Some selects the first name match. A mismatch is DeviceNotFound.
     let device = resolve_input_device(&host, device_id)?;
@@ -400,9 +435,17 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
     // If the default input config is unavailable, the advertised device cannot actually be
     // opened (including ALSA "default" PCM on a server without a sound card). Treat this as
     // having no usable input device and map it to DeviceNotFound.
-    let supported = device
-        .default_input_config()
-        .map_err(|_| Error::DeviceNotFound)?;
+    // The same checked configuration is passed to CPAL below. Never feed a sink
+    // configured from a fallback or stale device format with different samples.
+    let supported = input_config::checked(
+        || {
+            device
+                .default_input_config()
+                .map_err(|_| Error::DeviceNotFound)
+        },
+        |config| (config.sample_rate().0, config.channels()),
+        (sink.native_rate(), sink.native_channels()),
+    )?;
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
 
@@ -434,6 +477,9 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let _ = catch_unwind(AssertUnwindSafe(|| {
+                        if stop_flag.load(Ordering::SeqCst) {
+                            return;
+                        }
                         // Already interleaved f32. Discard if this is a priming transient.
                         if guard.should_drop(data) {
                             return;
@@ -454,6 +500,9 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
                 &config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     let _ = catch_unwind(AssertUnwindSafe(|| {
+                        if stop_flag.load(Ordering::SeqCst) {
+                            return;
+                        }
                         fill_scratch(&mut scratch, data, |s| s as f32 / -(i16::MIN as f32));
                         if guard.should_drop(&scratch) {
                             return;
@@ -473,6 +522,9 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
                 &config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
                     let _ = catch_unwind(AssertUnwindSafe(|| {
+                        if stop_flag.load(Ordering::SeqCst) {
+                            return;
+                        }
                         // Map u16 [0, 65535] to [-1, 1) around midpoint 32768.
                         fill_scratch(&mut scratch, data, |s| (s as f32 - 32_768.0) / 32_768.0);
                         if guard.should_drop(&scratch) {
@@ -493,6 +545,9 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
                 &config,
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
                     let _ = catch_unwind(AssertUnwindSafe(|| {
+                        if stop_flag.load(Ordering::SeqCst) {
+                            return;
+                        }
                         fill_scratch(&mut scratch, data, |s| s as f32 / -(i32::MIN as f32));
                         if guard.should_drop(&scratch) {
                             return;
@@ -518,6 +573,41 @@ fn build_stream(sink: RawSink, device_id: Option<&str>) -> Result<cpal::Stream> 
 mod tests {
     use super::*;
     use flexaudio_core::raw_ring;
+
+    #[test]
+    fn backend_terminal_query_failure_preserves_cause_and_rejects_restart() {
+        let mut backend = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
+        let error = Error::Backend("injected authorization query failure".into());
+        let event = Event::TerminalError {
+            error: error.clone(),
+        };
+        backend.event_tx.send(event.clone()).unwrap();
+        assert_eq!(backend.poll_event(), Some(event));
+        backend.stop();
+        let (prod, _cons) = raw_ring(16);
+        assert_eq!(
+            backend.start(RawSink::new(prod, FALLBACK_FORMAT.0, FALLBACK_FORMAT.1)),
+            Err(error)
+        );
+    }
+
+    #[test]
+    fn backend_permission_event_retains_terminal_cause_and_rejects_restart() {
+        let mut backend = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
+        let event = Event::PermissionDenied {
+            permission: flexaudio_core::types::Permission::Microphone,
+            detail: "injected late denial".into(),
+        };
+        backend.event_tx.send(event.clone()).unwrap();
+        assert_eq!(backend.poll_event(), Some(event));
+        backend.stop();
+        let (prod, _cons) = raw_ring(16);
+        let result = backend.start(RawSink::new(prod, FALLBACK_FORMAT.0, FALLBACK_FORMAT.1));
+        assert!(
+            matches!(result, Err(Error::PermissionDenied { permission: flexaudio_core::types::Permission::Microphone, detail }) if detail == "injected late denial")
+        );
+        assert_eq!(backend.poll_event(), None);
+    }
 
     /// Generate `frames` of interleaved stereo f32 samples.
     /// Samples alternate between `±peak` (a square wave with peak amplitude `peak`).

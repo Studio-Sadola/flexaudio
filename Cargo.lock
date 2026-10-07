@@ -786,8 +786,12 @@ dependencies = [
 name = "flexaudio-mic"
 version = "0.3.1"
 dependencies = [
+ "block2",
  "cpal",
  "flexaudio-core",
+ "objc2",
+ "objc2-foundation",
+ "windows",
 ]
 
 [[package]]

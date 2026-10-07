@@ -5,7 +5,7 @@
 //! → [`ChunkRing`](mod@crate::chunk_ring)). This module only defines backend contract types.
 
 use crate::raw_ring::RawProducer;
-use crate::types::Result;
+use crate::types::{Event, Result};
 
 /// Sink for passing raw interleaved f32 frames from a backend to the core.
 ///
@@ -84,6 +84,16 @@ pub trait CaptureBackend: Send {
 
     /// Stop capture.
     fn stop(&mut self);
+
+    /// Poll a backend notification on the control thread. Confirmed permission
+    /// denial and [`Event::TerminalError`] are terminal; the stream stops capture
+    /// and suppresses recovery.
+    /// Return promptly and return `None` when empty. After `stop`, final owner
+    /// notifications must remain pollable until drained; do not discard denial
+    /// when stopping or replacing a capture generation.
+    fn poll_event(&mut self) -> Option<Event> {
+        None
+    }
 }
 
 #[cfg(test)]

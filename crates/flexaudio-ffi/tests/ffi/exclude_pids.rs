@@ -1,5 +1,6 @@
 //! C entry-point regressions. Opening a mic stream needs no working device because its
-//! constructor has a fallback native format; these tests never start audio capture.
+//! constructor may query devices and recording permission; native-open tests are ignored
+//! by default. Boundary-validation and mock tests never access audio devices.
 
 use std::ffi::CStr;
 use std::ptr;

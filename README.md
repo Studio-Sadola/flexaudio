@@ -103,6 +103,8 @@ The facade crate `flexaudio` re-exports everything you need:
   OS and build a (not-yet-started) capture stream.
 - `Stream::start` / `Stream::stop` — control capture.
 - `Stream::poll_chunk` / `Stream::poll_event` — pull `AudioChunk`s and `Event`s.
+- `Stream::terminal_error() -> Option<Error>` — inspect a stored terminal failure,
+  including after stop. `Stream::resume()` returns `Result<()>`.
 - `Stream::switch_source` — hot-swap the input source without stopping the
   stream (chunk `seq` stays continuous; the first chunk after a switch carries a
   discontinuity flag).
@@ -120,7 +122,7 @@ The facade crate `flexaudio` re-exports everything you need:
   return a no-op watcher).
 - Re-exported types: `StreamConfig`, `SourceKind`, `ProcessMode`, `OutputFormat`,
   `AudioChunk`, `SecondaryChunk`, `ChunkFlags`, `DeviceInfo`, `ProcessInfo`,
-  `DeviceEvent`, `Event`, `Error`, `Result`.
+  `DeviceEvent`, `Event`, `Permission`, `Error`, `Result`.
 
 Voice activity detection (`flexaudio-vad`): `Vad::new` / `Vad::process` for
 streaming `SpeechStart` / `SpeechEnd` events, and `get_speech_timestamps` for
@@ -257,37 +259,87 @@ JS event loop.
 
 ## OS-specific permission requirements
 
-flexaudio captures audio; every platform gates this behind user permission. Your
-application is responsible for triggering the relevant prompt / declaring the
-required entitlements.
+Applications must declare the usage descriptions or capabilities required by
+their host OS. Confirmed recording denial returns
+`Error::PermissionDenied { permission, detail }`; the message identifies the
+permission, explains the cause, and tells the user which privacy setting to
+change and to restart the app and retry. A denial detected during capture emits
+`Event::PermissionDenied { permission, detail }`, terminates capture (both lanes
+for Mix), and suppresses further audio and automatic reopening. Create a new
+stream after correcting permission; `start`, `resume`, and `switch_source` on a
+terminally failed stream return its stored error.
+
+If the macOS startup consent monitor cannot query authorization, capture fails
+closed with `Event::TerminalError { error }` and retains the original backend
+error; it does not invent a permission denial. Bindings report this as an `error`
+event and expose the same terminal failure. A microphone configuration that
+differs from its advertised native format is rejected before capture builds with
+`Error::NativeFormatChanged { advertised, actual }`; recreate the stream using the
+current device format instead of delivering incorrectly interpreted samples.
+
+Rust exposes `Stream::terminal_error()`. N-API exposes `terminalError()` and
+rejects `stop()` on terminal failure; provide `onEvent` for immediate
+notifications. Python `poll_chunk()` raises `RuntimeError` and exposes
+`terminal_error()` without consuming events. C `flexaudio_poll_chunk()` and
+`flexaudio_terminal_error()` return `FLEX_FAILURE` (-2) with the explanation in
+`flexaudio_last_error()`. Permission event kind remains 3 in C. N-API/Python
+permission events keep type `permissionDenied` and add `permission`
+(`microphone` or `systemAudio`) and `message`.
 
 ### macOS
 
-System and per-process audio capture use Core Audio process taps, which are
-gated by the **TCC** privacy subsystem under `kTCCServiceAudioCapture`.
-
-- Add a usage-description string to your app's `Info.plist`:
+- **Microphone** (including the mic lane of Mix): flexaudio checks the public
+  AVFoundation authorization status. Denied or restricted access fails before
+  capture. If authorization is not determined and the main app bundle declares
+  a non-empty `NSMicrophoneUsageDescription`, flexaudio requests consent and
+  waits up to 30 seconds; refusal or timeout is a permission error. Open on a
+  worker thread when hosting a GUI so waiting does not block its event loop.
+- A bare CLI running inside Terminal may have no main-bundle microphone usage
+  description. flexaudio does not request consent directly in that case; it
+  proceeds with opening capture so macOS can prompt for the responsible app.
+  The backend checks authorization every 500 ms for up to 60 seconds. A late
+  denied/restricted status produces a terminal permission event; authorization
+  stops polling. An unanswered prompt during this polling window is not proof
+  of denial.
+- **System and per-process audio** use Core Audio process taps (macOS 14.4+).
+  Add a usage description to your app's `Info.plist`:
   ```xml
   <key>NSAudioCaptureUsageDescription</key>
   <string>This app records system and application audio.</string>
   ```
-  (Microphone-only capture additionally requires `NSMicrophoneUsageDescription`.)
-- The OS shows a one-time consent prompt; until the user approves, capture
-  surfaces as a `PermissionDenied` event / error.
-- Process taps require macOS 14.4 or later.
+  The OS controls the consent prompt. There is no public system-audio permission
+  status API, and flexaudio does not use private TCC APIs. A native illegal
+  operation is mapped to a `SystemAudio` permission error as a best-effort
+  diagnosis; this native result is not exclusive to consent failures.
+- A tap may deliver zeros without a native permission error. After five
+  continuous seconds of bit-exact zero native samples while Core Audio reports
+  an eligible captured process with output active (excluding ourselves and
+  honoring capture selection), flexaudio emits
+  `Event::SilenceWhileSourceActive { detail }` once per capture generation
+  (N-API/Python type `silenceWhileSourceActive`; C event kind 7). Capture
+  continues: genuine digital silence can produce the same observation. Query
+  failures, unknown device routing, inactive sources, absent samples, or
+  nonzero/negative-zero samples prevent the advisory. Absence of the advisory
+  does not establish that permission was granted.
+- Check **System Settings > Privacy & Security > Microphone** for microphone
+  access and **Screen & System Audio Recording** for **System Audio Recording**.
+  Enable access for the responsible host app (for example Terminal), restart
+  that app, and retry with a new stream.
 
 ### Windows
 
-- Microphone capture is gated by the **Microphone** privacy setting
-  (Settings → Privacy & security → Microphone). If capture fails, check that
-  access is enabled for your app. The cpal microphone backend maps an unavailable
-  device or default input configuration to `Error::DeviceNotFound`, and input
-  stream construction failures to `Error::Backend`; it does not map privacy
-  denial to `Error::PermissionDenied`.
+- Microphone capture, including the mic lane of Mix, checks the public
+  `AppCapability` consent API. User/system denial becomes a `Microphone`
+  permission error. Consent is checked again after native stream build/play
+  failures. Unsupported/ambiguous statuses or query failures permit the native
+  capture attempt but are not treated as proof that access is authorized.
+- Enable **Settings > Privacy & security > Microphone**, including
+  **Let desktop apps access your microphone**, then restart the host app and
+  retry with a new stream. An administrator-controlled restriction may require
+  the administrator to change the policy.
 - System (WASAPI loopback) and per-process loopback capture use the standard
-  WASAPI render-endpoint loopback / process-loopback APIs (Windows 10/11). No
-  special manifest capability is required for a desktop app, but the microphone
-  privacy gate still applies to mic capture.
+  WASAPI render-endpoint loopback / process-loopback APIs (Windows 10/11).
+  Desktop loopback capture does not use the microphone consent preflight.
 
 ### Linux
 

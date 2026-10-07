@@ -179,6 +179,77 @@ fn resolve_undefined(env: sys::napi_env, deferred: SendDeferred) {
     let _ = unsafe { sys::napi_resolve_deferred(env, deferred.0, undefined) };
 }
 
+/// Settle on the JS thread after delivery has drained. Terminal failures reject
+/// every waiter, including subsequent stop calls.
+fn settle_stop(
+    env: sys::napi_env,
+    deferred: SendDeferred,
+    terminal: &Mutex<Option<flexaudio::Error>>,
+) {
+    let error = terminal.lock().unwrap_or_else(lock_poisoned).clone();
+    match error {
+        None => resolve_undefined(env, deferred),
+        Some(error) => {
+            let message = error.to_string();
+            let mut value = ptr::null_mut();
+            let mut exception = ptr::null_mut();
+            // SAFETY: This runs on the live JS thread; message bytes stay valid
+            // for creation and all output pointers refer to local N-API values.
+            unsafe {
+                let status = sys::napi_create_string_utf8(
+                    env,
+                    message.as_ptr().cast(),
+                    message.len(),
+                    &mut value,
+                );
+                if status == sys::Status::napi_ok {
+                    let status =
+                        sys::napi_create_error(env, ptr::null_mut(), value, &mut exception);
+                    if status == sys::Status::napi_ok {
+                        let _ = sys::napi_reject_deferred(env, deferred.0, exception);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn terminal_event(error: flexaudio::Error) -> JsStreamEvent {
+    match error {
+        flexaudio::Error::PermissionDenied { permission, detail } => {
+            event_to_js(Event::PermissionDenied { permission, detail })
+        }
+        other => event_to_js(Event::Error(other.to_string())),
+    }
+}
+
+/// One notification path for normal polling and final stop, including hosts
+/// without an event callback. The durable terminal snapshot precedes JS delivery.
+fn forward_stream_events(
+    stream: &mut flexaudio::Stream,
+    callback: Option<&EventTsfn>,
+    terminal: &Mutex<Option<flexaudio::Error>>,
+) {
+    if let Some(error) = stream.terminal_error() {
+        *terminal.lock().unwrap_or_else(lock_poisoned) = Some(error);
+    }
+    while let Some(event) = stream.poll_event() {
+        if let Event::PermissionDenied { permission, detail } = &event {
+            *terminal.lock().unwrap_or_else(lock_poisoned) =
+                Some(flexaudio::Error::PermissionDenied {
+                    permission: *permission,
+                    detail: detail.clone(),
+                });
+        }
+        if let Event::TerminalError { error } = &event {
+            *terminal.lock().unwrap_or_else(lock_poisoned) = Some(error.clone());
+        }
+        if let Some(callback) = callback {
+            callback.call(event_to_js(event), ThreadsafeFunctionCallMode::NonBlocking);
+        }
+    }
+}
+
 fn take_stop_waiters(phase: &Mutex<StopPhase>) -> Vec<SendDeferred> {
     let mut g = phase.lock().unwrap_or_else(lock_poisoned);
     match std::mem::replace(&mut *g, StopPhase::Stopped) {
@@ -187,6 +258,9 @@ fn take_stop_waiters(phase: &Mutex<StopPhase>) -> Vec<SendDeferred> {
         StopPhase::Running => vec![],
     }
 }
+
+/// Durable copy of the core's terminal failure, retained after the bridge exits.
+type TerminalError = Arc<Mutex<Option<flexaudio::Error>>>;
 
 /// Weak reference to the chunk TSFN. `StopFlushed` / settlement use it to unref after resolving
 /// (inserted later because the TSFN does not exist at creation time).
@@ -233,6 +307,7 @@ fn make_chunk_tsfn(
     stop_phase: Arc<Mutex<StopPhase>>,
     user: Arc<UserChunkCb>,
     chunk_weak: ChunkTsfnWeakCell,
+    terminal: TerminalError,
 ) -> napi::Result<Arc<ChunkTsfn>> {
     let pump =
         env.create_function_from_closure("flexaudioChunkPump", |ctx| ctx.env.get_undefined())?;
@@ -242,6 +317,9 @@ fn make_chunk_tsfn(
             let chunk_weak = chunk_weak.clone();
             move |ctx: ThreadSafeCallContext<ChunkEmit>| match ctx.value {
                 ChunkEmit::Chunk(chunk) => {
+                    if terminal.lock().unwrap_or_else(lock_poisoned).is_some() {
+                        return Ok(Vec::new());
+                    }
                     let refer = user.refer();
                     if refer.is_null() {
                         return Ok(Vec::<Unknown>::new());
@@ -257,7 +335,7 @@ fn make_chunk_tsfn(
                 }
                 ChunkEmit::StopFlushed => {
                     for deferred in take_stop_waiters(&stop_phase) {
-                        resolve_undefined(ctx.env.raw(), deferred);
+                        settle_stop(ctx.env.raw(), deferred, &terminal);
                     }
                     // Release the event-loop reference after termination and resolution (ordering contract).
                     unref_chunk_weak(&chunk_weak, &ctx.env);
@@ -282,13 +360,14 @@ fn make_settle_tsfn(
     stop_phase: Arc<Mutex<StopPhase>>,
     chunk_weak: ChunkTsfnWeakCell,
     user: Arc<UserChunkCb>,
+    terminal: TerminalError,
 ) -> napi::Result<SettleTsfn> {
     let pump =
         env.create_function_from_closure("flexaudioStopSettle", |ctx| ctx.env.get_undefined())?;
     let mut tsfn = pump.create_threadsafe_function::<(), Unknown, _, ErrorStrategy::Fatal>(0, {
         move |ctx: ThreadSafeCallContext<()>| {
             for deferred in take_stop_waiters(&stop_phase) {
-                resolve_undefined(ctx.env.raw(), deferred);
+                settle_stop(ctx.env.raw(), deferred, &terminal);
             }
             unref_chunk_weak(&chunk_weak, &ctx.env);
             user.release();
@@ -520,9 +599,14 @@ pub struct VadOptions {
     pub sample_rate: Option<u32>,
 }
 
-/// JS stream event. `type` identifies the kind; `count`/`message` are optional.
+/// Stream notification. permissionDenied is terminal, with permission and
+/// actionable message. silenceWhileSourceActive is advisory: capture continues;
+/// missing system-audio permission and genuine digital silence are both possible.
 #[napi(object)]
 pub struct JsStreamEvent {
+    /// Present on permissionDenied: microphone | systemAudio.
+    #[napi(ts_type = "'microphone' | 'systemAudio'")]
+    pub permission: Option<String>,
     #[napi(js_name = "type")]
     pub kind: String,
     pub count: Option<i64>,
@@ -807,33 +891,46 @@ fn split_flac_path(base: &Path, index: u64) -> PathBuf {
 
 fn event_to_js(ev: Event) -> JsStreamEvent {
     match ev {
+        Event::TerminalError { error } => event_to_js(Event::Error(error.to_string())),
         Event::ChunkDropped { count } => JsStreamEvent {
             kind: "chunkDropped".to_string(),
+            permission: None,
             count: Some(count as i64),
             message: None,
         },
         Event::StreamStalled => JsStreamEvent {
             kind: "stalled".to_string(),
+            permission: None,
             count: None,
             message: None,
         },
         Event::StreamRecovered => JsStreamEvent {
             kind: "recovered".to_string(),
+            permission: None,
             count: None,
             message: None,
         },
-        Event::PermissionDenied => JsStreamEvent {
+        Event::PermissionDenied { permission, detail } => JsStreamEvent {
             kind: "permissionDenied".to_string(),
+            permission: Some(permission.as_str().to_string()),
             count: None,
-            message: None,
+            message: Some(flexaudio::Error::PermissionDenied { permission, detail }.to_string()),
+        },
+        Event::SilenceWhileSourceActive { detail } => JsStreamEvent {
+            kind: "silenceWhileSourceActive".to_string(),
+            permission: None,
+            count: None,
+            message: Some(detail),
         },
         Event::DeviceLost => JsStreamEvent {
             kind: "deviceLost".to_string(),
+            permission: None,
             count: None,
             message: None,
         },
         Event::Error(msg) => JsStreamEvent {
             kind: "error".to_string(),
+            permission: None,
             count: None,
             message: Some(msg),
         },
@@ -841,6 +938,7 @@ fn event_to_js(ev: Event) -> JsStreamEvent {
         // with their debug representation (do not swallow them).
         other => JsStreamEvent {
             kind: "error".to_string(),
+            permission: None,
             count: None,
             message: Some(format!("unknown event: {other:?}")),
         },
@@ -979,7 +1077,7 @@ enum BridgeCmd {
     /// Pause delivery.
     Pause,
     /// Resume delivery.
-    Resume,
+    Resume(mpsc::Sender<flexaudio::Result<()>>),
     /// Change input gain (linear multiplier). napi validates the value before sending.
     SetGain(f32),
     /// Return a current-value snapshot synchronously (for getters).
@@ -1319,6 +1417,7 @@ pub struct FlexStream {
     stop_phase: Arc<Mutex<StopPhase>>,
     chunk_tsfn: Arc<ChunkTsfn>,
     settle_tsfn: SettleTsfn,
+    terminal: TerminalError,
 }
 
 impl FlexStream {
@@ -1331,9 +1430,11 @@ impl FlexStream {
         on_event: Option<EventTsfn>,
         chunk_tsfn: Arc<ChunkTsfn>,
         settle_tsfn: SettleTsfn,
+        terminal: TerminalError,
     ) -> Self {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_stop = stop_flag.clone();
+        let thread_terminal = terminal.clone();
         let stop_phase = bridge.stop_phase.clone();
         let settle_for_bridge = settle_tsfn.clone();
         let (cmd_tx, cmd_rx) = mpsc::channel::<BridgeCmd>();
@@ -1352,7 +1453,9 @@ impl FlexStream {
                             let _ = sw.result_tx.send(r);
                         }
                         BridgeCmd::Pause => stream.pause(),
-                        BridgeCmd::Resume => stream.resume(),
+                        BridgeCmd::Resume(result_tx) => {
+                            let _ = result_tx.send(stream.resume());
+                        }
                         BridgeCmd::SetGain(g) => {
                             // napi validates before sending, so Err is not expected.
                             // Even an unexpected Err does not become an event (the result is discarded).
@@ -1375,6 +1478,12 @@ impl FlexStream {
                         BridgeCmd::FlushVad => bridge.flush_vad(),
                     }
                 }
+                if let Some(error) = stream.terminal_error() {
+                    *thread_terminal.lock().unwrap_or_else(lock_poisoned) = Some(error);
+                    bridge.primary_fifo.clear();
+                    bridge.secondary_fifo.clear();
+                    bridge.pending_flush_events.clear();
+                }
                 // Drain all arriving primary/secondary chunks into the bridge. Run VAD/quantization, pair within
                 // the pts window, and deliver to onChunk.
                 while let Some(chunk) = stream.poll_chunk() {
@@ -1384,12 +1493,7 @@ impl FlexStream {
                     bridge.on_secondary(chunk);
                 }
                 bridge.drain_pairs();
-                // Process events too.
-                while let Some(ev) = stream.poll_event() {
-                    if let Some(cb) = &on_event {
-                        cb.call(event_to_js(ev), ThreadsafeFunctionCallMode::NonBlocking);
-                    }
-                }
+                forward_stream_events(&mut stream, on_event.as_ref(), &thread_terminal);
                 thread::sleep(POLL_INTERVAL);
             }
             // Drain chunks remaining in the rings before stopping, then deliver pairs.
@@ -1409,6 +1513,15 @@ impl FlexStream {
             // This delivers both trailing recorded audio (2) and final speechEnd (3). Audio stop-flush and
             // flushVad are separate (audio samples versus VAD events).
             stream.stop(); // ①
+                           // Stop can discover a pending backend denial. Preserve its event and
+                           // terminal state before queuing any tail audio or settlement.
+            forward_stream_events(&mut stream, on_event.as_ref(), &thread_terminal);
+            if let Some(error) = stream.terminal_error() {
+                *thread_terminal.lock().unwrap_or_else(lock_poisoned) = Some(error);
+                bridge.primary_fifo.clear();
+                bridge.secondary_fifo.clear();
+                bridge.pending_flush_events.clear();
+            }
             while let Some(chunk) = stream.poll_chunk() {
                 bridge.on_primary(chunk); // 2 (primary tap VAD also consumes the tail here)
             }
@@ -1416,10 +1529,17 @@ impl FlexStream {
                 bridge.on_secondary(chunk); // 2 (secondary tap VAD also consumes the tail here)
             }
             bridge.drain_pairs(); // 2 Deliver trailing audio
-            bridge.flush_vad_final(); // 3 Final events + frames:0 terminator
-                                      // 4. End signal in the same TSFN queue. Processing it in JS resolves stop()'s Promise
-                                      // (AsyncTask / another TSFN could resolve before onChunk).
-                                      // If the chunk TSFN fails (Closing / QueueFull, etc.), use the settlement TSFN.
+            if let Some(error) = stream.terminal_error() {
+                *thread_terminal.lock().unwrap_or_else(lock_poisoned) = Some(error);
+                bridge.primary_fifo.clear();
+                bridge.secondary_fifo.clear();
+                bridge.pending_flush_events.clear();
+            } else {
+                bridge.flush_vad_final(); // Final events + frames:0 terminator.
+            }
+            // 4. End signal in the same TSFN queue. Processing it in JS resolves stop()'s Promise
+            // (AsyncTask / another TSFN could resolve before onChunk).
+            // If the chunk TSFN fails (Closing / QueueFull, etc.), use the settlement TSFN.
             post_stop_flushed(&bridge.on_chunk, &settle_for_bridge, &bridge.stop_phase);
         });
 
@@ -1432,6 +1552,7 @@ impl FlexStream {
             stop_phase,
             chunk_tsfn,
             settle_tsfn,
+            terminal,
         }
     }
 
@@ -1494,6 +1615,8 @@ impl FlexStream {
     /// stop (the last PCM and `frames:0` terminator) have been delivered to JS.
     /// Repeated calls await the same completion, or resolve immediately if already complete. Calling
     /// inside `onChunk` does not freeze JS because joining happens off the JS thread.
+    /// Rejects with the stored permission error on terminal failure; queued audio
+    /// and the terminator are suppressed after confirmed denial.
     #[napi(ts_return_type = "Promise<void>")]
     pub fn stop(&self, env: Env) -> napi::Result<JsObject> {
         let (deferred, promise) = create_js_promise(&env)?;
@@ -1504,7 +1627,7 @@ impl FlexStream {
         match &mut *phase {
             StopPhase::Stopped => {
                 drop(phase);
-                resolve_undefined(env.raw(), deferred);
+                settle_stop(env.raw(), deferred, &self.terminal);
                 unref_chunk_tsfn(self.chunk_tsfn.as_ref(), &env);
                 return Ok(promise);
             }
@@ -1526,7 +1649,7 @@ impl FlexStream {
                 // No join handle (e.g. taken by Drop's reaper). Callbacks to deliver are being
                 // cleaned up through another path, or are gone. Resolve immediately on the JS thread.
                 for d in take_stop_waiters(&self.stop_phase) {
-                    resolve_undefined(env.raw(), d);
+                    settle_stop(env.raw(), d, &self.terminal);
                 }
                 unref_chunk_tsfn(self.chunk_tsfn.as_ref(), &env);
             }
@@ -1546,13 +1669,24 @@ impl FlexStream {
                         let _ = h.join();
                     });
                 for d in take_stop_waiters(&self.stop_phase) {
-                    resolve_undefined(env.raw(), d);
+                    settle_stop(env.raw(), d, &self.terminal);
                 }
                 unref_chunk_tsfn(self.chunk_tsfn.as_ref(), &env);
             }
             Some(h) => self.spawn_stop_worker(h),
         }
         Ok(promise)
+    }
+
+    /// Stored terminal failure, or undefined when capture has not terminally failed.
+    /// Remains available after stop and does not consume onEvent notifications.
+    #[napi]
+    pub fn terminal_error(&self) -> Option<JsStreamEvent> {
+        self.terminal
+            .lock()
+            .unwrap_or_else(lock_poisoned)
+            .clone()
+            .map(terminal_event)
     }
 
     /// Hot-swap the input source (mic/system/process) without stopping recording.
@@ -1567,6 +1701,9 @@ impl FlexStream {
     /// Throws if `stop()` has already completed (the bridge thread has stopped).
     #[napi]
     pub fn switch_source(&self, options: OpenOptions) -> napi::Result<()> {
+        if let Some(error) = self.terminal.lock().unwrap_or_else(lock_poisoned).clone() {
+            return Err(to_napi_err(error));
+        }
         // As in openStream, build_config converts options → StreamConfig.
         let config = build_config(&options)?;
 
@@ -1619,19 +1756,31 @@ impl FlexStream {
     /// Unpause and resume delivery. Throws if `stop()` has already completed.
     #[napi]
     pub fn resume(&self) -> napi::Result<()> {
+        if let Some(error) = self.terminal.lock().unwrap_or_else(lock_poisoned).clone() {
+            return Err(to_napi_err(error));
+        }
         let cmd_tx = {
             let g = self.inner.lock().unwrap_or_else(lock_poisoned);
             g.cmd_tx.clone().ok_or_else(|| {
                 NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
             })?
         };
-        cmd_tx.send(BridgeCmd::Resume).map_err(|_| {
+        let (result_tx, result_rx) = mpsc::channel();
+        cmd_tx.send(BridgeCmd::Resume(result_tx)).map_err(|_| {
             NapiError::new(
                 Status::GenericFailure,
                 "bridge thread is not running".to_string(),
             )
         })?;
-        Ok(())
+        result_rx
+            .recv()
+            .map_err(|_| {
+                NapiError::new(
+                    Status::GenericFailure,
+                    "bridge thread dropped before responding",
+                )
+            })?
+            .map_err(to_napi_err)
     }
 
     /// Force-finalize integrated VAD's currently open utterance (runtime operation).
@@ -1813,6 +1962,12 @@ pub fn processes() -> AsyncTask<ProcessesTask> {
 }
 
 /// Open and start a stream, returning a `FlexStream` that sends chunks/events to callbacks.
+/// Confirmed microphone/system-audio denial throws actionable permission guidance.
+/// Supply onEvent for runtime denial and silenceWhileSourceActive advisories;
+/// without onEvent, inspect terminalError() and handle stop() rejection.
+/// macOS bundled microphone prompts wait up to 30 s; bare-host opens rely on the
+/// responsible-app prompt and check late denial for up to 60 s. Windows checks
+/// Microphone privacy, including Let desktop apps access your microphone.
 ///
 /// `options.denoise` enables noise suppression in core (internal canonical form), so both primary
 /// and secondary taps receive denoised audio. `options.vad` runs VAD on the tap selected by `vadTap`
@@ -1895,10 +2050,18 @@ pub fn open_stream(
     stream.start().map_err(to_napi_err)?;
 
     let stop_phase = Arc::new(Mutex::new(StopPhase::Running));
+    let terminal: TerminalError = Arc::new(Mutex::new(None));
     let user = make_user_chunk_cb(&env, &on_chunk)?;
     let chunk_weak: ChunkTsfnWeakCell = Arc::new(OnceLock::new());
-    let on_chunk = make_chunk_tsfn(&env, stop_phase.clone(), user.clone(), chunk_weak.clone())?;
-    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user)?;
+    let on_chunk = make_chunk_tsfn(
+        &env,
+        stop_phase.clone(),
+        user.clone(),
+        chunk_weak.clone(),
+        terminal.clone(),
+    )?;
+    let settle_tsfn =
+        make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user, terminal.clone())?;
     let bridge = PairingBridge {
         on_chunk: on_chunk.as_ref().clone(),
         stop_phase,
@@ -1923,6 +2086,7 @@ pub fn open_stream(
         on_event,
         on_chunk,
         settle_tsfn,
+        terminal,
     ))
 }
 
@@ -2050,10 +2214,18 @@ pub fn open_mock_stream(
     // The mock path bypasses integrated denoise. VAD runs only when `vadThreshold` is specified (for
     // verification of flushVad, vadEvents, and pairing paths).
     let stop_phase = Arc::new(Mutex::new(StopPhase::Running));
+    let terminal: TerminalError = Arc::new(Mutex::new(None));
     let user = make_user_chunk_cb(&env, &on_chunk)?;
     let chunk_weak: ChunkTsfnWeakCell = Arc::new(OnceLock::new());
-    let on_chunk = make_chunk_tsfn(&env, stop_phase.clone(), user.clone(), chunk_weak.clone())?;
-    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user)?;
+    let on_chunk = make_chunk_tsfn(
+        &env,
+        stop_phase.clone(),
+        user.clone(),
+        chunk_weak.clone(),
+        terminal.clone(),
+    )?;
+    let settle_tsfn =
+        make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user, terminal.clone())?;
     let bridge = PairingBridge {
         on_chunk: on_chunk.as_ref().clone(),
         stop_phase,
@@ -2078,6 +2250,7 @@ pub fn open_mock_stream(
         None,
         on_chunk,
         settle_tsfn,
+        terminal,
     ))
 }
 
@@ -2328,6 +2501,17 @@ mod tests {
     // --- source kind round trip ---
 
     #[test]
+    fn terminal_backend_events_keep_error_kind_and_cause() {
+        let error = flexaudio::Error::Backend("authorization query failed".into());
+        let event = event_to_js(Event::TerminalError {
+            error: error.clone(),
+        });
+        assert_eq!(event.kind, "error");
+        assert_eq!(event.message, Some(error.to_string()));
+        assert_eq!(event.permission, None);
+    }
+
+    #[test]
     fn source_kind_roundtrips() {
         for (s, k) in [
             ("mic", SourceKind::Mic),
@@ -2526,6 +2710,27 @@ mod tests {
     // --- to_napi_err ---
 
     #[test]
+    fn terminal_permission_errors_use_existing_napi_status_and_event_shape() {
+        for permission in [
+            flexaudio::Permission::Microphone,
+            flexaudio::Permission::SystemAudio,
+        ] {
+            let error = flexaudio::Error::PermissionDenied {
+                permission,
+                detail: "denied by user".into(),
+            };
+            let expected = error.to_string();
+            let mapped = to_napi_err(error.clone());
+            assert_eq!(mapped.status, Status::GenericFailure);
+            assert_eq!(mapped.reason, expected);
+            let event = terminal_event(error);
+            assert_eq!(event.kind, "permissionDenied");
+            assert_eq!(event.permission.as_deref(), Some(permission.as_str()));
+            assert_eq!(event.message.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
     fn to_napi_err_carries_message_and_status() {
         let err = to_napi_err(flexaudio::Error::DeviceNotFound);
         assert_eq!(err.status, Status::GenericFailure);
@@ -2537,6 +2742,36 @@ mod tests {
     // --- event_to_js ---
 
     #[test]
+    fn permission_events_preserve_cause_and_advisory_kind() {
+        for permission in [
+            flexaudio::Permission::Microphone,
+            flexaudio::Permission::SystemAudio,
+        ] {
+            let expected = flexaudio::Error::PermissionDenied {
+                permission,
+                detail: "denied by user".into(),
+            }
+            .to_string();
+            let mapped = event_to_js(Event::PermissionDenied {
+                permission,
+                detail: "denied by user".into(),
+            });
+            assert_eq!(mapped.kind, "permissionDenied");
+            assert_eq!(mapped.permission.as_deref(), Some(permission.as_str()));
+            assert_eq!(mapped.message.as_deref(), Some(expected.as_str()));
+        }
+        let advisory = event_to_js(Event::SilenceWhileSourceActive {
+            detail: "check recording privacy settings".into(),
+        });
+        assert_eq!(advisory.kind, "silenceWhileSourceActive");
+        assert_eq!(advisory.permission, None);
+        assert_eq!(
+            advisory.message.as_deref(),
+            Some("check recording privacy settings")
+        );
+    }
+
+    #[test]
     fn event_to_js_maps_each_variant() {
         let dropped = event_to_js(Event::ChunkDropped { count: 7 });
         assert_eq!(dropped.kind, "chunkDropped");
@@ -2546,7 +2781,11 @@ mod tests {
         assert_eq!(event_to_js(Event::StreamStalled).kind, "stalled");
         assert_eq!(event_to_js(Event::StreamRecovered).kind, "recovered");
         assert_eq!(
-            event_to_js(Event::PermissionDenied).kind,
+            event_to_js(Event::PermissionDenied {
+                permission: flexaudio::Permission::Microphone,
+                detail: "denied by user".into()
+            })
+            .kind,
             "permissionDenied"
         );
         assert_eq!(event_to_js(Event::DeviceLost).kind, "deviceLost");

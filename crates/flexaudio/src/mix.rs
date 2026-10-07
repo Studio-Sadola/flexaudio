@@ -27,9 +27,12 @@ use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::clock::monotonic_now_ns;
 use flexaudio_core::normalizer::Normalizer;
 use flexaudio_core::raw_ring::{raw_ring, RawConsumer};
-use flexaudio_core::types::{Error, OutputFormat, Result, CHANNELS, SAMPLE_RATE};
+use flexaudio_core::types::{Error, Event, OutputFormat, Result, CHANNELS, SAMPLE_RATE};
 
 use crate::stream::RAW_RING_SAMPLES;
+
+#[cfg(test)]
+mod permission_tests;
 
 /// If one side supplies nothing for longer than this, continue mixing and fill the
 /// missing samples with silence (0.0). Normalization emits only 20 ms chunks, so arrival
@@ -93,6 +96,8 @@ pub(crate) struct CompositeBackend {
     stopping: Arc<AtomicBool>,
     /// Mixer thread handle. `Some` means it is running.
     mixer: Option<JoinHandle<()>>,
+    /// Alternate mailbox priority so a busy child cannot starve the other lane.
+    poll_system_first: bool,
 }
 
 impl CompositeBackend {
@@ -111,6 +116,7 @@ impl CompositeBackend {
             system_gain,
             stopping: Arc::new(AtomicBool::new(false)),
             mixer: None,
+            poll_system_first: false,
         }
     }
 }
@@ -176,6 +182,18 @@ impl CaptureBackend for CompositeBackend {
         }
         stop_child(&mut self.mic);
         stop_child(&mut self.system);
+    }
+
+    fn poll_event(&mut self) -> Option<Event> {
+        self.poll_system_first = !self.poll_system_first;
+        let event = if self.poll_system_first {
+            self.system.poll_event().or_else(|| self.mic.poll_event())
+        } else {
+            self.mic.poll_event().or_else(|| self.system.poll_event())
+        };
+        // The stream closes delivery before invoking stop on this composite.
+        // Joining children here would allow buffered delivery during shutdown.
+        event
     }
 }
 

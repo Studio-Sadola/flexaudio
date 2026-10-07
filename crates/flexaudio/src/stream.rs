@@ -20,7 +20,7 @@
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -33,8 +33,15 @@ use flexaudio_core::secondary_ring::{
     secondary_chunk_ring, SecondaryChunkConsumer, SecondaryChunkProducer,
 };
 use flexaudio_core::types::{
-    AudioChunk, ChunkFlags, Error, Event, OutputFormat, Result, SecondaryChunk, StreamConfig,
+    AudioChunk, ChunkFlags, Error, Event, OutputFormat, Permission, Result, SecondaryChunk,
+    StreamConfig,
 };
+
+mod terminal;
+use terminal::TerminalFailure;
+
+#[cfg(test)]
+mod permission_tests;
 
 /// Wraps [`flexaudio_denoise::Denoiser`] as a core [`InnerProcessor`] so the
 /// core stays independent of the concrete noise-suppression implementation.
@@ -109,6 +116,11 @@ pub(crate) const RAW_RING_SAMPLES: usize = 48_000;
 /// Watchdog tick interval.
 const WATCHDOG_TICK: Duration = Duration::from_millis(250);
 
+/// Bound mailbox work so a noisy custom backend cannot monopolize the control thread.
+const MAX_BACKEND_EVENTS_PER_TICK: usize = 64;
+/// Final reconciliation is finite even for a backend that violates mailbox semantics.
+const MAX_FINAL_EVENT_BATCHES: usize = 64;
+
 /// Default threshold for treating a sample gap this long as a stall.
 const STALL_THRESHOLD: Duration = Duration::from_secs(2);
 
@@ -164,6 +176,9 @@ struct SharedState {
 
     /// Stop request for all threads.
     stopping: AtomicBool,
+
+    /// Confirmed denial persists after all capture threads have stopped.
+    terminal: TerminalFailure,
 
     /// Post-recovery flag. The watchdog sets it to true on recovery; the intake thread marks the next
     /// chunk RECOVERED|DISCONTINUITY and resets it to false.
@@ -229,6 +244,34 @@ impl SharedState {
         // Recover the VecDeque and continue even if poisoned; events are not torn.
         let mut q = self.events.lock().unwrap_or_else(|e| e.into_inner());
         q.push_back(ev);
+    }
+
+    /// Close both delivery paths before publishing the terminal event. The caller
+    /// stops the backend directly, without joining the watchdog from itself.
+    fn deny_permission(&self, permission: Permission, detail: String) {
+        let delivery = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
+        self.deny_permission_locked(permission, detail, &delivery);
+    }
+
+    fn deny_permission_locked(
+        &self,
+        permission: Permission,
+        detail: String,
+        delivery: &MutexGuard<'_, ()>,
+    ) {
+        self.fail_terminal_locked(Error::PermissionDenied { permission, detail }, delivery);
+    }
+
+    fn fail_terminal_locked(&self, error: Error, _delivery: &MutexGuard<'_, ()>) {
+        if self.terminal.record(error.clone()) {
+            self.stopping.store(true, Ordering::SeqCst);
+            self.push_event(match error {
+                Error::PermissionDenied { permission, detail } => {
+                    Event::PermissionDenied { permission, detail }
+                }
+                error => Event::TerminalError { error },
+            });
+        }
     }
 }
 
@@ -306,6 +349,7 @@ impl Stream {
             raw_generation: AtomicU64::new(0),
             last_sample_ns: AtomicI64::new(0),
             stopping: AtomicBool::new(false),
+            terminal: TerminalFailure::default(),
             recovered_pending: AtomicBool::new(false),
             events: events.clone(),
             chunk_producer: Mutex::new(Some(chunk_producer)),
@@ -338,6 +382,9 @@ impl Stream {
     /// Create RawRing, start the backend, and start the intake/processing and watchdog threads. Does
     /// nothing if already started.
     pub fn start(&mut self) -> Result<()> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         if self.started {
             return Ok(());
         }
@@ -418,9 +465,6 @@ impl Stream {
     /// Safe for reentry and repeated stop calls. After stop, drain chunks already buffered in the
     /// ring with [`poll_chunk`](Self::poll_chunk).
     pub fn stop(&mut self) {
-        // Set the stop flag; all threads exit at the next loop head.
-        self.shared.stopping.store(true, Ordering::SeqCst);
-
         // Stop the backend to end its producer thread (stop RT pushes).
         // Recover even if poisoned and attempt stop. If stop panics, catch_unwind swallows it so the
         // mutex is not poisoned again and we can proceed to join (no silent death).
@@ -430,7 +474,7 @@ impl Stream {
                 .backend
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let _ = stop_backend_catching(&mut be);
+            stop_backend_reconciling(&self.shared, &mut be, true);
         }
 
         // Join threads.
@@ -473,7 +517,8 @@ impl Stream {
     /// [`ChunkFlags::DISCONTINUITY`] to signal the time gap to consumers. Each stream's `seq` remains
     /// continuous across the pause; no silence is inserted for the paused interval. Does nothing if
     /// not paused (safe to call repeatedly).
-    pub fn resume(&self) {
+    /// Returns the stored permission error if capture has terminally failed.
+    pub fn resume(&self) -> Result<()> {
         // Hold delivery while advancing the generation and setting paused=false, making this one
         // enqueue boundary. Intake reads the generation under the same lock, so the first chunk for
         // each tap after resume is reliably marked DISCONTINUITY.
@@ -482,12 +527,16 @@ impl Stream {
             .delivery
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         // Advance the generation only if actually paused (resume on an unpaused stream must not add
         // an unnecessary DISCONTINUITY).
         if self.shared.paused.load(Ordering::SeqCst) {
             self.shared.resume_generation.fetch_add(1, Ordering::SeqCst);
             self.shared.paused.store(false, Ordering::SeqCst);
         }
+        Ok(())
     }
 
     /// Whether currently paused.
@@ -525,6 +574,14 @@ impl Stream {
     /// `frames == 960` (`data.len() == 1920`). `peak`/`rms` are computed from final data. `seq`
     /// increases monotonically.
     pub fn poll_chunk(&mut self) -> Option<AudioChunk> {
+        let _delivery = self
+            .shared
+            .delivery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.shared.terminal.is_failed() {
+            return None;
+        }
         self.chunk_consumer.try_pop()
     }
 
@@ -536,7 +593,22 @@ impl Stream {
     /// in the secondary Stage2 resampler. Match primary and secondary by `pts_ns` (time), since each
     /// tap has its own `seq` counter.
     pub fn poll_secondary(&mut self) -> Option<SecondaryChunk> {
+        let _delivery = self
+            .shared
+            .delivery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.shared.terminal.is_failed() {
+            return None;
+        }
         self.secondary_consumer.as_mut().and_then(|c| c.try_pop())
+    }
+
+    /// Terminal capture failure, retained after stop. Confirmed permission denial
+    /// is terminal; a backend mailbox that cannot be reconciled also fails closed.
+    /// Create a new stream after changing OS settings and restarting the app.
+    pub fn terminal_error(&self) -> Option<Error> {
+        self.shared.terminal.error()
     }
 
     /// Enable or disable noise suppression (RNNoise) in the internal canonical format.
@@ -621,7 +693,16 @@ impl Stream {
             // Error::Backend before mutex poisoning, so `?` returns it to the caller (start() returns
             // Err / watchdog emits Event::Error).
             let mut be = shared.backend.lock().unwrap_or_else(|e| e.into_inner());
-            start_backend_catching(&mut be, sink)?;
+            if let Some(error) = shared.terminal.error() {
+                return Err(error);
+            }
+            if let Err(error) = start_backend_catching(&mut be, sink) {
+                if let Error::PermissionDenied { permission, detail } = &error {
+                    shared.deny_permission(*permission, detail.clone());
+                    let _ = stop_backend_catching(&mut be);
+                }
+                return Err(error);
+            }
         }
 
         // Install the new consumer in shared state and advance the generation (drop the old consumer).
@@ -670,6 +751,9 @@ impl Stream {
     /// tests in another crate (`tests/integration.rs`) to call this with a MockBackend.
     #[doc(hidden)]
     pub fn switch_backend(&mut self, new_backend: Box<dyn CaptureBackend>) -> Result<()> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         if !self.started {
             return Err(Error::InvalidState(
                 "switch_backend is only available on a started stream".into(),
@@ -689,9 +773,13 @@ impl Stream {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
 
-            // Stop the old backend (stop RT pushes). If it panics, catch_unwind swallows it so the
-            // switch can continue without mutex poisoning or panic cascades.
-            let _ = stop_backend_catching(&mut be);
+            // Switching and recovery share shutdown reconciliation so neither can
+            // discard a denial produced while the previous owner is joining.
+            stop_backend_reconciling(&self.shared, &mut be, false);
+            if let Some(error) = self.terminal_error() {
+                self.shared.switching.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
 
             // Native format of the new backend.
             let (rate, channels) = new_backend.native_format();
@@ -749,18 +837,27 @@ impl Stream {
                     }
                 }
                 Err(e) => {
+                    let _ = stop_backend_catching(&mut new_backend);
+                    if let Error::PermissionDenied { permission, detail } = &e {
+                        self.shared.deny_permission(*permission, detail.clone());
+                        self.shared.switching.store(false, Ordering::SeqCst);
+                        return Err(e);
+                    }
                     // New source startup failed → restart the old backend (still `*be`) and continue.
                     // Release the backend lock before restoring it, or open_backend_once will lock it
                     // again and deadlock.
                     drop(be);
                     // Reopen the old backend (native_format returns to the old backend's value).
-                    let _ = Self::open_backend_once(&self.shared);
+                    let restored = Self::open_backend_once(&self.shared);
                     // Resuming the old source is also discontinuous (it was interrupted briefly).
                     self.shared
                         .discontinuity_pending
                         .store(true, Ordering::SeqCst);
                     // open_backend_once already incremented generation. Reset switching and return Err.
                     self.shared.switching.store(false, Ordering::SeqCst);
+                    if let Err(error @ Error::PermissionDenied { .. }) = restored {
+                        return Err(error);
+                    }
                     return Err(e);
                 }
             }
@@ -794,6 +891,9 @@ impl Stream {
     /// - New backend start fails → [`switch_backend`](Self::switch_backend) restores the old source
     ///   and returns the error.
     pub fn switch_source(&mut self, new_config: StreamConfig) -> Result<()> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         if !self.started {
             return Err(Error::InvalidState(
                 "switch_source is only available on a started stream".into(),
@@ -812,7 +912,21 @@ impl Stream {
         }
         // Build the new source backend (on failure, return early with the old source untouched).
         crate::validate_exclude_pids(&new_config)?;
-        let backend = crate::build_backend(&new_config)?;
+        let backend = match crate::build_backend(&new_config) {
+            Ok(backend) => backend,
+            Err(error) => {
+                if let Error::PermissionDenied { permission, detail } = &error {
+                    let mut be = self
+                        .shared
+                        .backend
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    self.shared.deny_permission(*permission, detail.clone());
+                    let _ = stop_backend_catching(&mut be);
+                }
+                return Err(error);
+            }
+        };
         // Swap it in (switch_backend guarantees continuity).
         self.switch_backend(backend)?;
         // Update mutable config fields only on success (keep output and other fields unchanged).
@@ -927,6 +1041,9 @@ fn run_intake(
     let mut scratch = vec![0.0f32; RAW_RING_SAMPLES];
 
     loop {
+        if shared.terminal.is_failed() {
+            break;
+        }
         let stopping = shared.stopping.load(Ordering::SeqCst);
 
         // Detect a generation change (reopen/source switch) and reset for the new source. Since
@@ -1059,7 +1176,7 @@ fn run_intake(
             // push to finish before returning.
             {
                 let _g = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
-                if shared.paused.load(Ordering::SeqCst) {
+                if shared.paused.load(Ordering::SeqCst) || shared.terminal.is_failed() {
                     continue;
                 }
                 let resume_generation = shared.resume_generation.load(Ordering::SeqCst);
@@ -1116,7 +1233,7 @@ fn run_intake(
                 };
                 {
                     let _g = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
-                    if shared.paused.load(Ordering::SeqCst) {
+                    if shared.paused.load(Ordering::SeqCst) || shared.terminal.is_failed() {
                         continue;
                     }
                     let resume_generation = shared.resume_generation.load(Ordering::SeqCst);
@@ -1173,6 +1290,17 @@ fn run_watchdog(shared: Arc<SharedState>) {
             continue;
         }
 
+        // Notifications take precedence over stall recovery, including while audio
+        // is flowing or delivery is paused. A denial never enters the reopen loop.
+        if drain_backend_events(&shared) == MailboxDrain::BudgetExhausted {
+            // More events may include a denial. Process them on the next tick
+            // before any reopen can replace this generation's mailbox.
+            continue;
+        }
+        if shared.stopping.load(Ordering::SeqCst) {
+            break;
+        }
+
         let now = monotonic_now_ns();
         let last = shared.last_sample_ns.load(Ordering::SeqCst);
         let idle_ns = now.saturating_sub(last);
@@ -1193,7 +1321,7 @@ fn run_watchdog(shared: Arc<SharedState>) {
         // watchdog can proceed to reopen instead of dying silently.
         {
             let mut be = shared.backend.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = stop_backend_catching(&mut be);
+            stop_backend_reconciling(&shared, &mut be, false);
         }
 
         if shared.stopping.load(Ordering::SeqCst) {
@@ -1203,6 +1331,9 @@ fn run_watchdog(shared: Arc<SharedState>) {
         let reopened = match Stream::open_backend_once(&shared) {
             Ok(()) => true,
             Err(e) => {
+                if shared.terminal.is_failed() {
+                    break;
+                }
                 shared.push_event(Event::Error(format!("reopen failed: {e}")));
                 false
             }
@@ -1223,6 +1354,104 @@ fn run_watchdog(shared: Arc<SharedState>) {
             backoff = (backoff * 2).min(BACKOFF_MAX);
         }
     }
+}
+
+/// Drain the backend's control mailbox with the same serialization as start/stop.
+/// A backend poll panic is observable and cannot poison the backend mutex.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MailboxDrain {
+    Empty,
+    Terminal,
+    BudgetExhausted,
+}
+
+fn drain_backend_events(shared: &SharedState) -> MailboxDrain {
+    let mut be = shared.backend.lock().unwrap_or_else(|e| e.into_inner());
+    if shared.switching.load(Ordering::SeqCst) || shared.stopping.load(Ordering::SeqCst) {
+        return MailboxDrain::Empty;
+    }
+    drain_backend_events_locked(shared, &mut be, None)
+}
+
+/// Also used at shutdown/source replacement so final owner notifications cannot
+/// be lost. Shutdown holds delivery across the owner's join to suppress a tail
+/// if a denial arrives while capture is stopping.
+fn drain_backend_events_locked(
+    shared: &SharedState,
+    be: &mut Box<dyn CaptureBackend>,
+    delivery: Option<&MutexGuard<'_, ()>>,
+) -> MailboxDrain {
+    for _ in 0..MAX_BACKEND_EVENTS_PER_TICK {
+        if shared.terminal.is_failed() {
+            return MailboxDrain::Terminal;
+        }
+        let event = match std::panic::catch_unwind(AssertUnwindSafe(|| be.poll_event())) {
+            Ok(event) => event,
+            Err(_) => {
+                shared.push_event(Event::Error("backend panicked during poll_event()".into()));
+                return MailboxDrain::BudgetExhausted;
+            }
+        };
+        match event {
+            Some(Event::PermissionDenied { permission, detail }) => {
+                if let Some(delivery) = delivery {
+                    shared.deny_permission_locked(permission, detail, delivery);
+                } else {
+                    shared.deny_permission(permission, detail);
+                }
+                let _ = stop_backend_catching(be);
+                return MailboxDrain::Terminal;
+            }
+            Some(Event::TerminalError { error }) => {
+                if let Some(delivery) = delivery {
+                    shared.fail_terminal_locked(error, delivery);
+                } else {
+                    let delivery = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
+                    shared.fail_terminal_locked(error, &delivery);
+                }
+                let _ = stop_backend_catching(be);
+                return MailboxDrain::Terminal;
+            }
+            Some(event) => shared.push_event(event),
+            None => return MailboxDrain::Empty,
+        }
+    }
+    MailboxDrain::BudgetExhausted
+}
+
+fn drain_final_backend_events(
+    shared: &SharedState,
+    be: &mut Box<dyn CaptureBackend>,
+    delivery: &MutexGuard<'_, ()>,
+) {
+    for _ in 0..MAX_FINAL_EVENT_BATCHES {
+        if drain_backend_events_locked(shared, be, Some(delivery)) != MailboxDrain::BudgetExhausted
+        {
+            return;
+        }
+    }
+    shared.fail_terminal_locked(
+        Error::Backend("backend event mailbox could not be reconciled; capture terminated before delivering buffered audio".into()),
+        delivery,
+    );
+    let _ = stop_backend_catching(be);
+}
+
+/// One shutdown path for explicit stop, source replacement, and recovery.
+/// Hold delivery across the owner's join and reconcile both sides of it, so a
+/// queued or final denial suppresses the tail and prevents reopening.
+fn stop_backend_reconciling(
+    shared: &SharedState,
+    be: &mut Box<dyn CaptureBackend>,
+    stop_intake: bool,
+) {
+    let delivery = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
+    drain_final_backend_events(shared, be, &delivery);
+    if stop_intake {
+        shared.stopping.store(true, Ordering::SeqCst);
+    }
+    let _ = stop_backend_catching(be);
+    drain_final_backend_events(shared, be, &delivery);
 }
 
 /// Compute peak (maximum absolute sample value) and RMS (root mean square, linear) from the final
@@ -1694,7 +1923,7 @@ mod tests {
         );
 
         // Chunk delivery resumes after resume.
-        stream.resume();
+        stream.resume().expect("resume");
         let resumed = wait_until(|| stream.poll_chunk().is_some(), Duration::from_secs(2));
         stream.stop();
         assert!(resumed, "chunk delivery should resume after resume");
@@ -1722,7 +1951,7 @@ mod tests {
 
         // Briefly confirm there are no new chunks while paused, then resume.
         assert!(collect_for(&mut stream, Duration::from_millis(150)).is_empty());
-        stream.resume();
+        stream.resume().expect("resume");
 
         // Wait for the first chunk after resume.
         let mut first_after: Option<AudioChunk> = None;
@@ -1785,7 +2014,7 @@ mod tests {
             while stream.poll_chunk().is_some() {}
             while stream.poll_secondary().is_some() {}
 
-            stream.resume();
+            stream.resume().expect("resume");
 
             let mut primary = None;
             let got_primary = wait_until(
@@ -1873,7 +2102,7 @@ mod tests {
                 last_secondary_seq = Some(chunk.seq);
             }
             // Keep the lock only across resume, without a sleep that could overflow RawRing.
-            stream.resume();
+            stream.resume().expect("resume");
             drop(raw);
         }
 
@@ -1934,7 +2163,7 @@ mod tests {
         let _ = collect_for(&mut stream, Duration::from_millis(200));
 
         // Resume while not paused.
-        stream.resume();
+        stream.resume().expect("resume");
 
         // DISCONTINUITY should not be set on subsequent chunks.
         let after = collect_for(&mut stream, Duration::from_millis(200));
@@ -1967,7 +2196,7 @@ mod tests {
         assert!(collect_for(&mut stream, Duration::from_millis(150)).is_empty());
 
         // Call resume once.
-        stream.resume();
+        stream.resume().expect("resume");
         assert!(!stream.is_paused());
         let got = wait_until(|| stream.poll_chunk().is_some(), Duration::from_secs(2));
         stream.stop();
@@ -2281,7 +2510,7 @@ mod tests {
         // Pause for a known duration D (less than STALL_THRESHOLD).
         let d = Duration::from_millis(600);
         thread::sleep(d);
-        stream.resume();
+        stream.resume().expect("resume");
 
         let mut first_after: Option<AudioChunk> = None;
         let got = wait_until(

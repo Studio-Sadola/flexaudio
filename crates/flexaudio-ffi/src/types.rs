@@ -171,11 +171,15 @@ pub enum FlexEventKind {
     Error = 5,
     /// Event not matching a known kind (reserved for future variants).
     Unknown = 6,
+    /// Exact-zero system capture while eligible output is active; advisory only.
+    /// Retrieve the explanation with flexaudio_last_error; capture continues.
+    SilenceWhileSourceActive = 7,
 }
 
 /// One captured event, populated by `flexaudio_poll_event`.
 ///
-/// For `Error`, the message is stored in `flexaudio_last_error`.
+/// For Error, PermissionDenied, and SilenceWhileSourceActive, the message is
+/// stored in flexaudio_last_error. PermissionDenied retains kind 3.
 #[repr(C)]
 pub struct FlexEvent {
     /// Event kind.

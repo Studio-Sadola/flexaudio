@@ -42,8 +42,10 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use flexaudio_core::backend::{CaptureBackend, RawSink};
-use flexaudio_core::types::{Error, Result};
+use flexaudio_core::types::{Error, Event, Result};
 
+use crate::activity::ActivityQuery;
+use crate::capture_health::{SilenceDetector, ADVISORY_DETAIL};
 use crate::common::{translate_pid_to_object, FALLBACK_FORMAT};
 use crate::tap::{build_tap_chain, TapChain, TapKind};
 
@@ -124,6 +126,8 @@ pub struct MacSystemBackend {
     stop_flag: Arc<AtomicBool>,
     /// Handle to the thread that owns the tap chain (`Some` after start).
     handle: Option<JoinHandle<()>>,
+    /// Owner-thread notifications for the current capture generation.
+    events: Option<mpsc::Receiver<Event>>,
     /// Native format `(rate, channels)`. The actual values are determined after tap creation
     /// through `start`, but `native_format` returns the cached fallback beforehand.
     native: (u32, u16),
@@ -151,6 +155,7 @@ impl MacSystemBackend {
             device_id,
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
+            events: None,
             native: FALLBACK_FORMAT,
         }
     }
@@ -201,6 +206,7 @@ impl CaptureBackend for MacSystemBackend {
 
         let stop_flag = self.stop_flag.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        let (event_tx, event_rx) = mpsc::channel();
         // Effective exclusion set: `exclude_pids ∪ {self if exclude_self}`. Built here
         // and moved into the closure (PID→object translation happens on that thread).
         let mut excluded: Vec<u32> = self.exclude_pids.clone();
@@ -257,13 +263,14 @@ impl CaptureBackend for MacSystemBackend {
                     None
                 };
                 let kind = system_tap_kind(ids, device_uid);
-                run_tap_thread(kind, sink, stop_flag, ready_tx);
+                run_tap_thread(kind, sink, stop_flag, ready_tx, event_tx);
             })
             .map_err(|e| Error::Backend(format!("spawn macos system thread: {e}")))?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.handle = Some(handle);
+                self.events = Some(event_rx);
                 Ok(())
             }
             Ok(Err(e)) => {
@@ -287,6 +294,10 @@ impl CaptureBackend for MacSystemBackend {
             let _ = h.join();
         }
     }
+
+    fn poll_event(&mut self) -> Option<Event> {
+        self.events.as_ref()?.try_recv().ok()
+    }
 }
 
 impl Drop for MacSystemBackend {
@@ -306,7 +317,9 @@ pub(crate) fn run_tap_thread(
     sink: RawSink,
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<()>>,
+    event_tx: mpsc::Sender<Event>,
 ) {
+    let activity = ActivityQuery::new(&kind);
     // CATapDescription / aggregate display name (private, so collisions are harmless; debug only).
     let label = match &kind {
         TapKind::IncludeProcesses(_) => "flexaudio-process-tap",
@@ -328,9 +341,29 @@ pub(crate) fn run_tap_thread(
         return;
     }
 
-    // IOProc runs on CoreAudio's RT thread. This thread waits until stop.
+    let origin = std::time::Instant::now();
+    let mut detector = chain
+        .observed_format
+        .map(|(rate, channels)| SilenceDetector::new(rate, channels));
+    // Process queries and message allocation stay on this owner thread, never in the IOProc.
     while !stop_flag.load(Ordering::SeqCst) {
         thread::park_timeout(std::time::Duration::from_millis(100));
+        if stop_flag.load(Ordering::SeqCst) {
+            break;
+        }
+        let emit = if let Some(detector) = detector.as_mut() {
+            let active = activity.poll();
+            detector.update(origin.elapsed(), chain.observations.snapshot(), active)
+        } else {
+            false
+        };
+        if emit {
+            let _ = event_tx.send(Event::SilenceWhileSourceActive {
+                detail: ADVISORY_DETAIL.into(),
+            });
+            // One advisory per generation; no further process queries are needed.
+            detector = None;
+        }
     }
 
     // Stop. Dropping the chain tears down Stop→IOProc→aggregate→tap in order.
@@ -394,17 +427,27 @@ mod tests {
 
     #[test]
     fn host_translation_failure_fails_without_probe() {
-        let result = resolve_exclusion(Err(Error::PermissionDenied), true, || {
-            panic!("host translation failure must not probe the process")
-        });
-        assert!(matches!(result, Err(Error::PermissionDenied)));
+        let result = resolve_exclusion(
+            Err(Error::PermissionDenied {
+                permission: flexaudio_core::types::Permission::SystemAudio,
+                detail: "test denial".into(),
+            }),
+            true,
+            || panic!("host translation failure must not probe the process"),
+        );
+        assert!(matches!(result, Err(Error::PermissionDenied { .. })));
     }
 
     #[test]
     fn non_host_translation_failure_skips_confirmed_exit() {
-        let result = resolve_exclusion(Err(Error::PermissionDenied), false, || {
-            Err(std::io::Error::from_raw_os_error(libc::ESRCH))
-        });
+        let result = resolve_exclusion(
+            Err(Error::PermissionDenied {
+                permission: flexaudio_core::types::Permission::SystemAudio,
+                detail: "test denial".into(),
+            }),
+            false,
+            || Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+        );
         assert!(matches!(result, Ok(None)));
     }
 
