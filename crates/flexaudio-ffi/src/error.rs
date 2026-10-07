@@ -34,6 +34,23 @@ thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
+// Native-open regression tests must distinguish a typed host denial from every
+// other NULL result without interpreting a localized or display-only message.
+#[cfg(test)]
+thread_local! {
+    static LAST_OPEN_FAILURE: RefCell<Option<flexaudio::Error>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn record_open_failure(error: flexaudio::Error) {
+    LAST_OPEN_FAILURE.with(|slot| *slot.borrow_mut() = Some(error));
+}
+
+#[cfg(test)]
+pub(crate) fn take_open_failure() -> Option<flexaudio::Error> {
+    LAST_OPEN_FAILURE.with(|slot| slot.borrow_mut().take())
+}
+
 /// Records the most recent error message for the current thread.
 ///
 /// CString rejects embedded NUL bytes, so replace such messages with a fixed string.
@@ -47,6 +64,8 @@ pub fn set_last_error(msg: impl Into<String>) {
 /// Clears the most recent error so successful operations do not leave stale messages.
 pub fn clear_last_error() {
     LAST_ERROR.with(|slot| *slot.borrow_mut() = None);
+    #[cfg(test)]
+    LAST_OPEN_FAILURE.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// Returns a pointer to the most recent error message for the current thread.

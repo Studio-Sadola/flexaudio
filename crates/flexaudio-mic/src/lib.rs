@@ -706,8 +706,8 @@ mod tests {
     }
 
     /// `start` with a nonexistent device_id returns [`Error::DeviceNotFound`] without
-    /// panicking (consistent with cold-start/TransientGuard behavior). A mismatched ID always
-    /// yields DeviceNotFound, regardless of default-device availability.
+    /// panicking (consistent with cold-start/TransientGuard behavior). Host microphone
+    /// denial can precede device resolution on macOS/Windows and skips this hardware assertion.
     #[test]
     fn start_with_unknown_device_id_yields_device_not_found() {
         let mut backend = CpalMicBackend::new(Some("__no_such_device__".into()));
@@ -718,6 +718,15 @@ mod tests {
 
         match backend.start(sink) {
             Err(Error::DeviceNotFound) => {}
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            Err(
+                error @ Error::PermissionDenied {
+                    permission: flexaudio_core::types::Permission::Microphone,
+                    ..
+                },
+            ) => {
+                eprintln!("Skipping start_with_unknown_device_id_yields_device_not_found: host microphone permission is denied: {error}");
+            }
             other => panic!("unknown device_id should return DeviceNotFound: {other:?}"),
         }
     }
@@ -741,8 +750,8 @@ mod tests {
     }
 
     /// `start` may return `Err(DeviceNotFound)` where no input device exists (servers/CI).
-    /// Both Ok and Err(DeviceNotFound) are acceptable; panicking is not. Where an input device
-    /// exists, capture starts and stops on stop.
+    /// Host microphone denial is also an environment outcome on macOS/Windows. Where
+    /// an input device is accessible, capture starts and stops on stop.
     #[test]
     fn start_then_stop_tolerates_missing_device() {
         let mut backend = CpalMicBackend::new(None);
@@ -760,6 +769,15 @@ mod tests {
             }
             Err(Error::DeviceNotFound) => {
                 // Accept this when no input device is present (CI/server).
+            }
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            Err(
+                error @ Error::PermissionDenied {
+                    permission: flexaudio_core::types::Permission::Microphone,
+                    ..
+                },
+            ) => {
+                eprintln!("Skipping start_then_stop_tolerates_missing_device: host microphone permission is denied: {error}");
             }
             Err(other) => panic!("unexpected error from start(): {other:?}"),
         }

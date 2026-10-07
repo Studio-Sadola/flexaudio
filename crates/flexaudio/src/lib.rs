@@ -422,7 +422,20 @@ mod tests {
             mix_system_gain: 2.0,
             ..Default::default()
         };
-        let stream = open(config).expect("valid Mix config should open successfully");
+        let stream = match open(config) {
+            Ok(stream) => stream,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            Err(
+                error @ Error::PermissionDenied {
+                    permission: Permission::Microphone,
+                    ..
+                },
+            ) => {
+                eprintln!("Skipping mix_config_with_valid_gains_opens: host microphone permission is denied: {error}");
+                return;
+            }
+            Err(error) => panic!("valid Mix config should open successfully: {error:?}"),
+        };
         // The composite backend reports its internal canonical format (Stream's first stage is pass-through).
         assert_eq!(stream.native_format(), (48_000, 2));
     }
