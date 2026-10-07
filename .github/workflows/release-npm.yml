@@ -27,55 +27,60 @@ on:
         type: string
         required: true
       dry_run:
-        description: "Build all platforms but skip the npm publish step"
+        description: "Reuse original artifacts and validate packaging without publishing"
         type: boolean
         default: true
 
 permissions:
   contents: read
+  actions: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 # All napi commands run inside the addon crate directory.
 defaults:
   run:
-    working-directory: crates/flexaudio-napi
+    working-directory: source/crates/flexaudio-napi
 
 jobs:
   version-gate:
     name: Validate release versions
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.check.outputs.version }}
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      run_id: ${{ steps.resolve.outputs.run_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Check tag or explicit dispatch version
-        id: check
-        shell: bash
+      - name: Resolve original tag-push release
+        id: resolve
         working-directory: .
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
-            python3 .github/scripts/check-release-versions.py --tag "$REF_NAME"
-            VERSION="${REF_NAME#v}"
-          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            python3 .github/scripts/check-release-versions.py --version "$INPUT_VERSION"
-            VERSION="$INPUT_VERSION"
-          else
-            echo "::error::Unsupported release trigger."
-            exit 1
-          fi
-          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+        run: python3 .github/scripts/resolve-npm-release.py
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+          path: source
+      - name: Validate the resolved tag manifests
+        working-directory: .
+        env:
+          RELEASE_VERSION: ${{ steps.resolve.outputs.version }}
+        run: python3 .github/scripts/check-release-versions.py --repo-root source --version "$RELEASE_VERSION"
 
   build:
     name: Build addon (${{ matrix.target }})
     needs: version-gate
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -105,18 +110,22 @@ jobs:
             target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version-gate.outputs.sha }}
+          path: source
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: . -> target
+          workspaces: source -> target
 
       # Linux native deps (same set as ci.yml). Both linux targets build
       # natively on their own runner (x64 on ubuntu-latest, arm64 on the hosted
@@ -128,7 +137,15 @@ jobs:
           sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
 
       - name: Install npm dependencies (@napi-rs/cli)
-        run: npm ci || npm install
+        run: npm install --no-package-lock --omit=optional --ignore-scripts --registry=https://registry.npmjs.org/
+
+      - name: Configure reproducible MSVC release (N-API static CRT)
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: .
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: python .github/scripts/configure-msvc-release.py --workspace source --target "$BUILD_TARGET" --target-dir source/target --static-crt
 
       # napi build --platform writes the .node next to index.js and emits the
       # per-platform package suffix from package.json's "napi" config.
@@ -137,17 +154,16 @@ jobs:
         shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
-        run: npx napi build --platform --release --target "$BUILD_TARGET"
+        run: npx --no-install napi build --platform --release --target "$BUILD_TARGET" --cargo-flags="--locked"
 
       - name: Build native addon (Windows, static CRT)
         if: runner.os == 'Windows'
         shell: bash
         env:
-          RUSTFLAGS: -C target-feature=+crt-static
           BUILD_TARGET: ${{ matrix.target }}
-        run: npx napi build --platform --release --target "$BUILD_TARGET"
+        run: npx --no-install napi build --platform --release --target "$BUILD_TARGET" --cargo-flags="--locked"
 
-      # The addon is built with the static CRT (see RUSTFLAGS above), so it must
+      # The addon is built with the static CRT (see target-specific configuration above), so it must
       # not pull in an MSVC redistributable DLL (msvcp*/vcruntime*/vcomp*) or an
       # inference runtime that would have to ship next to it (DirectML / onnxruntime).
       # Those names are rejected outright, even if someone adds them to the allowlist.
@@ -182,16 +198,48 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bindings-${{ matrix.target }}
-          # The *.node files (named flexaudio.<platform>.node) are the build
+          # The *.node files (named index.<platform>.node) are the build
           # outputs we hand to the publish job.
-          path: crates/flexaudio-napi/*.node
+          path: source/crates/flexaudio-napi/*.node
+          if-no-files-found: error
+
+  manifest:
+    name: Seal npm addon checksums
+    needs: [version-gate, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bindings-*
+          path: bindings
+          # Keep separate directories so duplicate filenames cannot be overwritten.
+          merge-multiple: false
+      - name: Create exact five-file manifest
+        run: python3 .github/scripts/npm-release-manifest.py create --artifacts bindings --manifest manifest/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-release-manifest
+          path: manifest/SHA256SUMS
           if-no-files-found: error
 
   publish:
     name: Publish to npm
-    needs: [version-gate, build]
+    needs: [version-gate, build, manifest]
+    if: >-
+      always() && needs.version-gate.result == 'success' &&
+      ((github.event_name == 'push' && needs.build.result == 'success' && needs.manifest.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' && needs.build.result == 'skipped' && needs.manifest.result == 'skipped'))
     permissions:
       contents: read
+      actions: read
       # Only publishing requires OIDC for Trusted Publishing and provenance.
       id-token: write
     env:
@@ -199,9 +247,13 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: crates/flexaudio-napi
+        working-directory: source/crates/flexaudio-napi
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version-gate.outputs.sha }}
+          path: source
 
       - uses: actions/setup-python@v5
         with:
@@ -216,7 +268,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm install -g npm@latest
+          npm install -g npm@latest --ignore-scripts
           NPM_VERSION="$(npm --version)"
           echo "npm version: $NPM_VERSION"
           node - "$NPM_VERSION" <<'JAVASCRIPT'
@@ -232,15 +284,29 @@ jobs:
           JAVASCRIPT
 
       - name: Install npm dependencies (@napi-rs/cli)
-        run: npm ci || npm install
+        run: npm install --no-package-lock --omit=optional --ignore-scripts --registry=https://registry.npmjs.org/
+
+      - name: Download original checksum manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-release-manifest
+          run-id: ${{ needs.version-gate.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: release-manifest
 
       # Pull every per-platform .node back into the crate dir.
       - name: Download all addon artifacts
         uses: actions/download-artifact@v4
         with:
-          path: crates/flexaudio-napi/artifacts
+          path: source/crates/flexaudio-napi/artifacts
           pattern: bindings-*
-          merge-multiple: true
+          merge-multiple: false
+          run-id: ${{ needs.version-gate.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify original addon bytes before packaging
+        working-directory: .
+        run: python3 .github/scripts/npm-release-manifest.py verify --artifacts source/crates/flexaudio-napi/artifacts --manifest release-manifest/SHA256SUMS
 
       # napi creates one npm package dir per platform under npm/ and moves each
       # downloaded .node into it. The root package.json already declares the
@@ -253,9 +319,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npx napi create-npm-dir -t .
-          npx napi artifacts --dir artifacts
-          python3 ../../.github/scripts/check-release-versions.py --version "$RELEASE_VERSION" --require-platforms
+          npx --no-install napi create-npm-dir -t .
+          npx --no-install napi artifacts --dir artifacts
+          python3 ../../../.github/scripts/check-release-versions.py --repo-root ../.. --version "$RELEASE_VERSION" --require-platforms
           python3 - <<'PYTHON'
           import json
           import shutil
@@ -290,6 +356,10 @@ jobs:
                       raise SystemExit(f"Missing packaged license file: {directory / name}")
           PYTHON
 
+      - name: Verify embedded addon bytes after napi artifacts
+        working-directory: .
+        run: python3 .github/scripts/npm-release-manifest.py packages --artifacts source/crates/flexaudio-napi/npm --manifest release-manifest/SHA256SUMS
+
       - name: Publish (root + per-platform packages)
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         shell: bash
@@ -312,7 +382,12 @@ jobs:
             )
           done
           # ...then the main package that depends on them.
-          npm publish --ignore-scripts --access public --provenance
+          PACKAGE_SPEC="$(node -e 'const p = require("./package.json"); process.stdout.write(`${p.name}@${p.version}`)')"
+          if npm view "$PACKAGE_SPEC" version >/dev/null 2>&1; then
+            echo "$PACKAGE_SPEC already published — skipping."
+          else
+            npm publish --ignore-scripts --access public --provenance
+          fi
 
       - name: Dry run (validate packaging, skip publish)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}

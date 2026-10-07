@@ -17,6 +17,7 @@ on:
   push:
     branches: [redesign/flexaudio-rust, main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -118,6 +119,38 @@ jobs:
       # a long-lived keeper thread; the Windows tests below guard against regressions.
       - name: Test (ignored real-audio tests auto-skip)
         run: cargo test -p flexaudio -p flexaudio-os-windows -p flexaudio-mic -p flexaudio-core -p flexaudio-cli
+
+  windows-napi-reproducibility:
+    name: Reproducible Windows x64 N-API release
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Downloads only: neither target objects nor git dependency build products.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+          key: windows-repro-registry-${{ hashFiles('Cargo.lock') }}
+      - name: Install locked N-API CLI
+        working-directory: crates/flexaudio-napi
+        run: npm install --no-package-lock --omit=optional --ignore-scripts --registry=https://registry.npmjs.org/
+      - name: Compare independent addon builds
+        run: python .github/scripts/check-windows-reproducibility.py
 
   build-test-macos:
     name: Build & Test (macOS / Core Audio Taps)
