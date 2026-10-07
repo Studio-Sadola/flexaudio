@@ -15,9 +15,10 @@
 //!
 //! No network communication occurs at runtime (napi is only the N-API bridge).
 
+mod flac_encoder;
+
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::mpsc;
@@ -43,7 +44,6 @@ use flexaudio::{
 
 // Core types for the three addons. Import aliases to avoid the `#[napi]` wrappers (Vad / Denoiser).
 use flexaudio_denoise::{DenoiseError, Denoiser as CoreDenoiser};
-use flexaudio_encode::{EncodeError, FlacWriter};
 use flexaudio_vad::{Vad as CoreVad, VadConfig, VadError, VadEvent};
 
 /// pts window for pairing the secondary tap (60ms = 3 chunks). The secondary trails by 20–60ms,
@@ -451,14 +451,13 @@ fn denoise_err(err: DenoiseError) -> NapiError {
     NapiError::new(Status::InvalidArg, err.to_string())
 }
 
-/// EncodeError → napi::Error. Unsupported parameters map to InvalidArg; IO/encoder internals to
-/// GenericFailure. As it is `#[non_exhaustive]`, `_` also handles future variants.
-fn encode_err(err: EncodeError) -> NapiError {
-    let status = match err {
-        EncodeError::Unsupported(_) => Status::InvalidArg,
-        _ => Status::GenericFailure,
+/// Convert pure encoder diagnostics only at the Node boundary.
+fn encode_err(err: flac_encoder::EncoderError) -> NapiError {
+    let status = match err.kind {
+        flac_encoder::ErrorKind::InvalidArgument => Status::InvalidArg,
+        flac_encoder::ErrorKind::Failure => Status::GenericFailure,
     };
-    NapiError::new(status, err.to_string())
+    NapiError::new(status, err.reason)
 }
 
 // ---------------------------------------------------------------------------
@@ -875,23 +874,6 @@ fn check_denoise_rate(enabled: bool, output_rate: u32) -> napi::Result<()> {
         ));
     }
     Ok(())
-}
-
-/// Build the path for FLAC rotation `index` (1-based; pure function).
-///
-/// Same convention as CLI `split_file_path`: `rec.flac` becomes `rec-001.flac, rec-002.flac, …`
-/// with a three-digit zero-padded sequence before the extension. Digits grow naturally from file
-/// 1000 onward. Paths without extensions append the sequence. The parent directory is preserved.
-fn split_flac_path(base: &Path, index: u64) -> PathBuf {
-    let stem = base
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let name = match base.extension() {
-        Some(ext) => format!("{stem}-{index:03}.{}", ext.to_string_lossy()),
-        None => format!("{stem}-{index:03}"),
-    };
-    base.with_file_name(name)
 }
 
 fn event_to_js(ev: Event) -> JsStreamEvent {
@@ -2363,26 +2345,13 @@ impl Vad {
 /// by up to one chunk; chunks are never split and no data is dropped. Omitted/0 `splitSeconds` uses one file.
 #[napi]
 pub struct FlacEncoder {
-    /// Output base path (sequence naming base when split; used unchanged for a single file).
-    base: PathBuf,
-    sample_rate: u32,
-    channels: u16,
-    /// Frame threshold per file (splitSeconds × sampleRate). 0 = single file.
-    frames_per_file: u64,
-    /// Current writer. None immediately after rotation (lazily created on the next chunk).
-    writer: Option<FlacWriter>,
-    /// Frames written to the current file (reset to 0 on rotation).
-    frames_in_current: u64,
-    /// Sequence number of the next file to open (1-based; meaningful only when splitting).
-    file_index: u64,
+    inner: flac_encoder::RotatingFlacEncoder,
 }
 
 #[napi]
 impl FlacEncoder {
     /// Create a FLAC writer. Omitted/0 `splitSeconds` uses one file; at least 1 enables timed rotation.
-    ///
-    /// `channels` must be 1..=2, `sampleRate` 1..=96000 Hz (otherwise InvalidArg). When splitting,
-    /// the first file (`name-001.flac`) is created immediately.
+    /// `channels` must be 1..=2, `sampleRate` 1..=96000 Hz (otherwise InvalidArg).
     #[napi(factory)]
     pub fn create(
         path: String,
@@ -2390,75 +2359,28 @@ impl FlacEncoder {
         channels: u16,
         split_seconds: Option<u32>,
     ) -> napi::Result<FlacEncoder> {
-        let base = PathBuf::from(path);
-        let frames_per_file = u64::from(split_seconds.unwrap_or(0)) * u64::from(sample_rate);
-        let file_index = 1;
-        // Open base for a single file, or name-001.ext as the first split file.
-        let first_path = if frames_per_file > 0 {
-            split_flac_path(&base, file_index)
-        } else {
-            base.clone()
-        };
-        let writer = FlacWriter::create(&first_path, sample_rate, channels).map_err(encode_err)?;
-        Ok(FlacEncoder {
-            base,
+        let inner = flac_encoder::RotatingFlacEncoder::create(
+            path.into(),
             sample_rate,
             channels,
-            frames_per_file,
-            writer: Some(writer),
-            frames_in_current: 0,
-            file_index,
-        })
-    }
-
-    /// Path of the next file to open when splitting.
-    fn next_path(&self) -> PathBuf {
-        if self.frames_per_file > 0 {
-            split_flac_path(&self.base, self.file_index)
-        } else {
-            self.base.clone()
-        }
+            split_seconds,
+        )
+        .map_err(encode_err)?;
+        Ok(Self { inner })
     }
 
     /// Append interleaved f32 (length must be a multiple of `channels`, otherwise InvalidArg).
-    ///
-    /// After writing, if the current file's frame count reaches the threshold, finalize immediately and
-    /// rotate to the next file (the next `writeChunk` starts the new file).
+    /// Reaching the split threshold finalizes the current file; the next chunk opens the next file.
     #[napi]
     pub fn write_chunk(&mut self, samples: Float32Array) -> napi::Result<()> {
-        // writer=None immediately after rotation. Open the next file here (lazy creation).
-        if self.writer.is_none() {
-            let path = self.next_path();
-            self.writer = Some(
-                FlacWriter::create(&path, self.sample_rate, self.channels).map_err(encode_err)?,
-            );
-        }
-        let writer = self.writer.as_mut().expect("opened immediately above");
-        writer.write_chunk(&samples[..]).map_err(encode_err)?;
-
-        // Frame count = sample count / channel count. write_chunk validated divisibility.
-        let frames = samples.len() as u64 / u64::from(self.channels);
-        self.frames_in_current += frames;
-
-        if self.frames_per_file > 0 && self.frames_in_current >= self.frames_per_file {
-            // Threshold reached. Finalize the current file; the next chunk starts the next file.
-            let done = self.writer.take().expect("written immediately above");
-            done.finalize().map_err(encode_err)?;
-            self.file_index += 1;
-            self.frames_in_current = 0;
-        }
-        Ok(())
+        self.inner.write_chunk(&samples).map_err(encode_err)
     }
 
-    /// Write out the remainder, finalize the header, and close the open file. Safe to call repeatedly
-    /// (subsequent calls are no-ops). Dropping without calling this still closes through `FlacWriter`'s
-    /// best-effort Drop, but call this to detect write errors.
+    /// Finalize and close the file. Repeated successful calls are no-ops; failures remain errors.
+    /// Dropping still makes a best-effort close, but finalize reports write errors.
     #[napi]
     pub fn finalize(&mut self) -> napi::Result<()> {
-        if let Some(writer) = self.writer.take() {
-            writer.finalize().map_err(encode_err)?;
-        }
-        Ok(())
+        self.inner.finalize().map_err(encode_err)
     }
 }
 
@@ -2527,6 +2449,7 @@ mod tests {
     //! read back through `Deref<[f32]>` / `get_u64()` without a JS runtime (napi 2.16).
 
     use super::*;
+    use flexaudio_encode::EncodeError;
 
     // --- source kind round trip ---
 
@@ -3031,36 +2954,6 @@ mod tests {
         assert!(check_denoise_rate(false, 48_000).is_ok());
     }
 
-    // --- split_flac_path (sequence naming; same convention as CLI) ---
-
-    #[test]
-    fn split_flac_path_numbering() {
-        // With an extension, insert a three-digit zero-padded sequence before it.
-        assert_eq!(
-            split_flac_path(Path::new("rec.flac"), 1),
-            PathBuf::from("rec-001.flac")
-        );
-        assert_eq!(
-            split_flac_path(Path::new("rec.flac"), 12),
-            PathBuf::from("rec-012.flac")
-        );
-        // Digits grow naturally from file 1000 onward.
-        assert_eq!(
-            split_flac_path(Path::new("rec.flac"), 1000),
-            PathBuf::from("rec-1000.flac")
-        );
-        // Without an extension, append the sequence.
-        assert_eq!(
-            split_flac_path(Path::new("rec"), 3),
-            PathBuf::from("rec-003")
-        );
-        // The parent directory is preserved.
-        assert_eq!(
-            split_flac_path(Path::new("/tmp/out/meeting.flac"), 2),
-            PathBuf::from("/tmp/out/meeting-002.flac")
-        );
-    }
-
     // --- Error mapping for each addon ---
 
     #[test]
@@ -3069,10 +2962,10 @@ mod tests {
         let e = denoise_err(DenoiseError::InvalidChannels(3));
         assert_eq!(e.status, Status::InvalidArg);
         // encode: unsupported parameters yield InvalidArg.
-        let e = encode_err(EncodeError::Unsupported("bad".to_string()));
+        let e = encode_err(EncodeError::Unsupported("bad".to_string()).into());
         assert_eq!(e.status, Status::InvalidArg);
         // encode: encoder internals yield GenericFailure.
-        let e = encode_err(EncodeError::Encoder("boom".to_string()));
+        let e = encode_err(EncodeError::Encoder("boom".to_string()).into());
         assert_eq!(e.status, Status::GenericFailure);
         // vad: invalid settings yield InvalidArg.
         let e = vad_err(VadError::InvalidConfig("nope".to_string()));

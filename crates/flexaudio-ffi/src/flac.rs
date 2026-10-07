@@ -38,6 +38,55 @@ fn split_file_path(base: &Path, index: u64) -> PathBuf {
     base.with_file_name(name)
 }
 
+/// Terminal state is retained even when rotation consumed the current writer.
+enum EncoderState {
+    Open,
+    Finalized,
+    Failed(StoredFailure),
+}
+
+enum StoredFailure {
+    Io {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    Unsupported(String),
+    Encoder(String),
+}
+
+impl StoredFailure {
+    fn capture(error: &EncodeError) -> Self {
+        match error {
+            EncodeError::Io(error) => Self::Io {
+                message: error.to_string(),
+                kind: error.kind(),
+            },
+            EncodeError::Unsupported(message) => Self::Unsupported(message.clone()),
+            EncodeError::Encoder(message) => Self::Encoder(message.clone()),
+            _ => Self::Encoder(error.to_string()),
+        }
+    }
+
+    fn error(&self) -> EncodeError {
+        match self {
+            Self::Io { kind, message } => {
+                EncodeError::Io(std::io::Error::new(*kind, message.clone()))
+            }
+            Self::Unsupported(message) => EncodeError::Unsupported(message.clone()),
+            Self::Encoder(message) => EncodeError::Encoder(message.clone()),
+        }
+    }
+}
+
+fn validate_destination(base: &Path) -> Result<(), EncodeError> {
+    if base.is_dir() || base.file_stem().is_none_or(|stem| stem.is_empty()) {
+        return Err(EncodeError::Unsupported(
+            "destination must have a nonempty file stem and must not be a directory".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// FLAC writer with file rotation. `split_seconds = 0` writes a single file.
 ///
 /// Files are opened lazily on the first chunk, so finishing exactly at a boundary does not leave
@@ -56,8 +105,8 @@ struct RotatingFlac {
     frames_in_current: u64,
     /// Sequence number for the next split file to open (1-based).
     file_index: u64,
-    /// Reject writes after finalize.
-    finalized: bool,
+    /// Retain the first failure and reject writes after finalize.
+    state: EncoderState,
 }
 
 impl RotatingFlac {
@@ -70,7 +119,7 @@ impl RotatingFlac {
             writer: None,
             frames_in_current: 0,
             file_index: 1,
-            finalized: false,
+            state: EncoderState::Open,
         }
     }
 
@@ -86,6 +135,15 @@ impl RotatingFlac {
     /// Write interleaved f32. Length must be a multiple of the channel count. On reaching the
     /// boundary, finalize the current file and advance the sequence number.
     fn write(&mut self, samples: &[f32]) -> Result<(), EncodeError> {
+        match &self.state {
+            EncoderState::Failed(error) => return Err(error.error()),
+            EncoderState::Finalized => {
+                return Err(EncodeError::Unsupported(
+                    "writer is already finalized".into(),
+                ))
+            }
+            EncoderState::Open => {}
+        }
         let ch = self.channels as usize;
         if samples.is_empty() {
             // Empty input is a no-op (do not open or create an empty file).
@@ -98,6 +156,15 @@ impl RotatingFlac {
             )));
         }
 
+        let result = self.write_validated(samples);
+        if let Err(error) = &result {
+            self.state = EncoderState::Failed(StoredFailure::capture(error));
+        }
+        result
+    }
+
+    fn write_validated(&mut self, samples: &[f32]) -> Result<(), EncodeError> {
+        let ch = usize::from(self.channels);
         // Lazy creation: open the current file for the first time with this chunk.
         if self.writer.is_none() {
             let path = self.current_path();
@@ -124,11 +191,19 @@ impl RotatingFlac {
 
     /// Write any remaining data, finalize and close the current file. Further writes are rejected.
     fn finalize(&mut self) -> Result<(), EncodeError> {
+        match &self.state {
+            EncoderState::Failed(error) => return Err(error.error()),
+            EncoderState::Finalized => return Ok(()),
+            EncoderState::Open => {}
+        }
         let result = match self.writer.take() {
             Some(w) => w.finalize(),
             None => Ok(()),
         };
-        self.finalized = true;
+        self.state = match &result {
+            Ok(()) => EncoderState::Finalized,
+            Err(error) => EncoderState::Failed(StoredFailure::capture(error)),
+        };
         result
     }
 }
@@ -192,6 +267,10 @@ pub unsafe extern "C" fn flexaudio_flac_create(
             ));
             return std::ptr::null_mut();
         }
+        if let Err(error) = validate_destination(&path) {
+            set_last_error(error.to_string());
+            return std::ptr::null_mut();
+        }
         let inner = RotatingFlac::new(path, sr, ch, split_seconds);
         Box::into_raw(Box::new(FlexFlac { inner }))
     })
@@ -217,9 +296,12 @@ pub unsafe extern "C" fn flexaudio_flac_write(
             set_last_error("flexaudio_flac_write: flac pointer is null");
             return code::FLEX_INVALID_ARG;
         };
-        if flac.inner.finalized {
+        if matches!(flac.inner.state, EncoderState::Finalized) {
             set_last_error("flexaudio_flac_write: writer is already finalized");
             return code::FLEX_INVALID_STATE;
+        }
+        if let EncoderState::Failed(error) = &flac.inner.state {
+            return flac_err(error.error());
         }
         let input: &[f32] = if len == 0 {
             &[]
@@ -238,7 +320,9 @@ pub unsafe extern "C" fn flexaudio_flac_write(
 
 /// Write any remaining data, finalize and close the current file. Further writes return InvalidState.
 ///
-/// Calling finalize more than once is safe (no-op returning 0). Returns 0 on success and a negative value on error.
+/// Calling finalize more than once after success is safe (no-op returning 0). A failed write or
+/// finalize retains its first error for all later writes and finalization attempts.
+/// Returns 0 on success and a negative value on error.
 ///
 /// # Safety
 /// `f` must be a valid handle (NULL is InvalidArg).
@@ -250,7 +334,7 @@ pub unsafe extern "C" fn flexaudio_flac_finalize(f: *mut FlexFlac) -> i32 {
             set_last_error("flexaudio_flac_finalize: flac pointer is null");
             return code::FLEX_INVALID_ARG;
         };
-        if flac.inner.finalized {
+        if matches!(flac.inner.state, EncoderState::Finalized) {
             // Already finalized; do nothing (idempotent).
             return code::FLEX_OK;
         }
@@ -285,6 +369,47 @@ mod tests {
     use super::*;
     use std::ffi::CString;
     use std::fs;
+
+    #[test]
+    fn invalid_lazy_chunk_preserves_existing_destination() {
+        let path = temp_path("invalid_lazy");
+        fs::write(&path, b"existing data").unwrap();
+        let mut writer = RotatingFlac::new(path.clone(), 48_000, 2, 0);
+        assert!(writer.write(&[0.0]).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"existing data");
+        writer.finalize().unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rotation_open_failure_is_sticky_even_after_path_is_repaired() {
+        let base = temp_path("sticky_rotation");
+        let first = split_file_path(&base, 1);
+        let second = split_file_path(&base, 2);
+        let mut writer = RotatingFlac::new(base, 48_000, 1, 1);
+        writer.write(&vec![0.0; 48_000]).unwrap();
+        fs::create_dir(&second).unwrap();
+        let cause = writer.write(&[0.0]).unwrap_err().to_string();
+        fs::remove_dir(&second).unwrap();
+        assert_eq!(writer.write(&[0.0]).unwrap_err().to_string(), cause);
+        assert_eq!(writer.finalize().unwrap_err().to_string(), cause);
+        assert!(!second.exists());
+        fs::remove_file(first).unwrap();
+    }
+
+    #[test]
+    fn destination_rejects_directories_and_missing_stems() {
+        for path in [
+            Path::new(""),
+            Path::new("."),
+            Path::new(".."),
+            Path::new("/"),
+        ] {
+            assert!(validate_destination(path).is_err());
+        }
+        assert!(validate_destination(&std::env::temp_dir()).is_err());
+        assert!(validate_destination(Path::new("recording.flac")).is_ok());
+    }
 
     // split_file_path follows the CLI numbering rule (pin representative cases to prevent regressions).
     #[test]

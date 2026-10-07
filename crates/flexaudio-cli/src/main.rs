@@ -496,6 +496,9 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     }
 
     let stdout_stream = cli.is_stdout_stream();
+    if !stdout_stream {
+        validate_output_path(&cli.out).map_err(|error| error.to_string())?;
+    }
 
     // `--split-seconds` is only for WAV files. Stdout streaming (`--out -`) has no file boundaries,
     // so reject this combination before opening the stream.
@@ -1247,6 +1250,17 @@ struct Stats {
     rms: f64,
 }
 
+/// Reject invalid destinations before capture or file creation.
+fn validate_output_path(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() || path.file_stem().is_none_or(|stem| stem.is_empty()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "output destination must have a nonempty file stem and must not be a directory",
+        ));
+    }
+    Ok(())
+}
+
 /// Create the path for the `index`th split recording file (1-based; pure function).
 ///
 /// For `rec.wav`, insert a three-digit zero-padded index before the extension, as in
@@ -1352,6 +1366,7 @@ impl RotatingWavWriter {
     /// threshold, finalize immediately and rotate to the next file, where the next chunk will begin.
     /// Return the finalized file path for rotation progress display, or None if no rotation occurred.
     fn write_chunk(&mut self, chunk: &AudioChunk) -> hound::Result<Option<PathBuf>> {
+        validate_output_path(&self.base)?;
         // Open the file when a chunk arrives (lazy creation).
         if self.writer.is_none() {
             let path = self.next_path();
@@ -1388,6 +1403,7 @@ impl RotatingWavWriter {
     /// as before (numbered file 1 when splitting), so the returned `files` contains at least one
     /// entry. Also return whole-recording statistics and total frames.
     fn finish(mut self) -> hound::Result<WavSummary> {
+        validate_output_path(&self.base)?;
         if let Some(writer) = self.writer.take() {
             writer.finalize()?;
         } else if self.files.is_empty() {
@@ -1834,6 +1850,17 @@ mod tests {
         let jp = truncate("éøåæœ", 3);
         assert_eq!(jp.chars().count(), 3);
         assert!(jp.ends_with('…'));
+    }
+
+    #[test]
+    fn output_path_rejects_directories_and_empty_stems() {
+        for path in ["", ".", "..", "/"] {
+            assert!(validate_output_path(Path::new(path)).is_err(), "{path:?}");
+        }
+        // An existing directory on every OS (a literal "/tmp" is a plain file name on Windows).
+        let dir = std::env::temp_dir();
+        assert!(validate_output_path(&dir).is_err(), "{dir:?}");
+        assert!(validate_output_path(Path::new("recording.wav")).is_ok());
     }
 
     // --- split_file_path ---
