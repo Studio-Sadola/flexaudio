@@ -336,7 +336,7 @@ into compatible updates only. See [`CHANGELOG.md`](CHANGELOG.md).
 | `flexaudio-encode` | ✅ | Streaming FLAC encoding (flacenc). |
 | `flexaudio-denoise` | ✅ | RNNoise noise suppression (nnnoiseless). |
 | `flexaudio-cli` | — | Reference CLI / streaming capture tool. |
-| `flexaudio-napi` | — (npm) | Node.js N-API addon (distributed through npm; first publication pending). |
+| `flexaudio-napi` | — (npm) | Node.js N-API addon (published on npm as `@studio-sadola/flexaudio`). |
 | `flexaudio-ffi` | — | C ABI (pull-based capture, VAD / FLAC / denoise, `flexaudio_processes`). |
 | `bindings/flexaudio-py` | — | PyO3 Python binding (`open` / `devices` / `processes` / add-ons). |
 

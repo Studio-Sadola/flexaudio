@@ -18,7 +18,7 @@ documentation = "https://docs.rs/flexaudio-os-macos"
 #
 # Versions match the existing pins in Cargo.lock (the objc2 family pulled by cpal) to avoid duplicate compilation.
 [target.'cfg(target_os = "macos")'.dependencies]
-flexaudio-core = { path = "../flexaudio-core", version = "0.3.0" }
+flexaudio-core = { path = "../flexaudio-core", version = "0.3.1" }
 libc = "=0.2.186"
 objc2 = "=0.6.4"
 objc2-foundation = { version = "=0.3.2", features = [

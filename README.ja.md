@@ -330,7 +330,7 @@ SemVer に従い、**マイナー**バージョンの更新（`0.2 → 0.3`）�
 | `flexaudio-encode` | ✅ | ストリーミング FLAC エンコード（flacenc）です。 |
 | `flexaudio-denoise` | ✅ | RNNoise によるノイズ除去（nnnoiseless）です。 |
 | `flexaudio-cli` | — | 参考実装の CLI／ストリーミングキャプチャツールです。 |
-| `flexaudio-napi` | — (npm) | Node.js N-API アドオンです（npm を通じて配布します。初回公開はまだ行われていません）。 |
+| `flexaudio-napi` | — (npm) | Node.js N-API アドオンです（npm で `@studio-sadola/flexaudio` として公開されています）。 |
 | `flexaudio-ffi` | — | C ABI です（ポーリングによるキャプチャ、VAD / FLAC / ノイズ除去、`flexaudio_processes`）。 |
 | `bindings/flexaudio-py` | — | PyO3 による Python バインディングです（`open` / `devices` / `processes` / アドオン）。 |
 

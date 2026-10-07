@@ -3,13 +3,14 @@
 # optional package, the standard napi-rs distribution model).
 #
 # === What the maintainer must set up ===
-#  - Add a repository secret named NPM_TOKEN
-#    (Settings → Secrets and variables → Actions → New repository secret).
-#    Create an automation token at https://www.npmjs.com/settings/<user>/tokens
-#    with publish rights to the `@studio-sadola` scope.
-#  - Packages are published with `--access public` and `--provenance`. Provenance
-#    needs a public repository and `id-token: write` (both set below); it signs
-#    the packages with a verifiable link back to this workflow run.
+#  - Configure Trusted Publishing on npmjs.com for the main package and all five
+#    platform packages: GitHub Actions, repo Studio-Sadola/flexaudio, workflow
+#    release-npm.yml, no environment, allowed action npm publish only.
+#  - Publishing authenticates with GitHub OIDC; no long-lived npm token is needed.
+#    Re-create each package's Trusted Publisher if this workflow file is renamed.
+#  - Packages are published with `--access public` and `--provenance`. OIDC auth
+#    and provenance require `id-token: write` on the publish job; provenance also
+#    requires a public repository and links packages to this workflow run.
 #
 # Triggered by a version tag (e.g. v0.2.0) or run manually. No-op on PRs.
 
@@ -191,7 +192,7 @@ jobs:
     needs: [version-gate, build]
     permissions:
       contents: read
-      # Only publishing requires the OIDC token used by --provenance.
+      # Only publishing requires OIDC for Trusted Publishing and provenance.
       id-token: write
     env:
       RELEASE_VERSION: ${{ needs.version-gate.outputs.version }}
@@ -209,13 +210,26 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: "https://registry.npmjs.org"
 
-      # Staged publishing (new packages under a 2FA-required scope submit to a
-      # staging area for interactive approval, instead of failing) needs a recent
-      # npm CLI. Upgrade to the latest before publishing.
-      - name: Upgrade npm CLI (staging support)
-        run: npm install -g npm@latest && npm --version
+      # Trusted Publishing requires npm 11.5.1 or newer.
+      - name: Upgrade npm CLI and verify Trusted Publishing support
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g npm@latest
+          NPM_VERSION="$(npm --version)"
+          echo "npm version: $NPM_VERSION"
+          node - "$NPM_VERSION" <<'JAVASCRIPT'
+          const version = process.argv[2];
+          const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
+          const parts = match ? match.slice(1).map(Number) : [];
+          const [major, minor, patch] = parts;
+          if (!match || !parts.every(Number.isSafeInteger) ||
+              !(major > 11 || (major === 11 && (minor > 5 || (minor === 5 && patch >= 1))))) {
+            console.error('::error::Trusted Publishing requires npm >= 11.5.1.');
+            process.exit(1);
+          }
+          JAVASCRIPT
 
       - name: Install npm dependencies (@napi-rs/cli)
         run: npm ci || npm install
@@ -279,9 +293,6 @@ jobs:
       - name: Publish (root + per-platform packages)
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         shell: bash
-        env:
-          # setup-node wrote an .npmrc that reads NODE_AUTH_TOKEN.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           # Publish each per-platform package first...
