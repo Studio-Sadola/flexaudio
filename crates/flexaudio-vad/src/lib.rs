@@ -8,7 +8,7 @@
 //! use flexaudio_vad::{Vad, VadConfig, VadEvent};
 //! let mut vad = Vad::new(VadConfig::default()).unwrap();
 //! for chunk in some_audio_chunks() {
-//!     for ev in vad.process(chunk) {
+//!     for ev in vad.process(chunk).unwrap() {
 //!         match ev {
 //!             VadEvent::SpeechStart { at_sample } => println!("start @ {at_sample}"),
 //!             VadEvent::SpeechEnd { at_sample } => println!("end @ {at_sample}"),
@@ -67,6 +67,12 @@ pub enum VadError {
     Inference(String),
     /// Invalid configuration.
     InvalidConfig(String),
+    /// Invalid input PCM format; no state was changed.
+    InvalidFormat(String),
+    /// PCM conversion failed.
+    Resample(String),
+    /// Reset failed; the instance cannot process until reset succeeds.
+    Reset(String),
 }
 
 impl std::fmt::Display for VadError {
@@ -75,18 +81,38 @@ impl std::fmt::Display for VadError {
             VadError::ModelLoad(m) => write!(f, "model load error: {m}"),
             VadError::Inference(m) => write!(f, "inference error: {m}"),
             VadError::InvalidConfig(m) => write!(f, "invalid config: {m}"),
+            VadError::InvalidFormat(m) => write!(f, "invalid PCM format: {m}"),
+            VadError::Resample(m) => write!(f, "resampling error: {m}"),
+            VadError::Reset(m) => write!(f, "reset error: {m}"),
         }
     }
 }
 
 impl std::error::Error for VadError {}
 
+trait InferenceBackend: Send {
+    fn infer(&mut self, frame: &[f32]) -> Result<f32, VadError>;
+    fn reset(&mut self) -> Result<(), VadError>;
+}
+
+impl InferenceBackend for SileroEngine {
+    fn infer(&mut self, frame: &[f32]) -> Result<f32, VadError> {
+        self.infer_16k_frame(frame)
+    }
+    fn reset(&mut self) -> Result<(), VadError> {
+        SileroEngine::reset(self);
+        Ok(())
+    }
+}
+
 /// Streaming VAD. Each instance owns one optimized tract plan (not shared).
 ///
 /// Pass any-length `&[f32]` input to [`Vad::process`]. It buffers samples into frames (16k=512 / 8k=256),
 /// runs Silero inference, advances the segment state machine, and returns finalized events.
 pub struct Vad {
-    engine: SileroEngine,
+    engine: Box<dyn InferenceBackend>,
+    converted_sample_position: u64,
+    failure: Option<VadError>,
     config: VadConfig,
     segmenter: Segmenter,
 
@@ -100,9 +126,11 @@ pub struct Vad {
     /// Not created for formats that need no conversion (mono at the VAD rate). Recreate it when the
     /// input format changes.
     converter: Option<PcmConverter>,
+    converter_factory: fn(PcmFormat, u32) -> Result<PcmConverter, String>,
     /// Continuous 8→16 kHz rubato converter for 8 kHz configuration. Only model input is upsampled to 16 kHz;
     /// public frame counts and positions in `pending` and `segmenter` remain based on 8 kHz.
     upsampler_8k: Option<PcmConverter>,
+    upsampler_factory: fn() -> Result<PcmConverter, String>,
 }
 
 impl Vad {
@@ -121,13 +149,17 @@ impl Vad {
         };
 
         Ok(Vad {
-            engine,
+            engine: Box::new(engine),
+            converted_sample_position: 0,
+            failure: None,
             config,
             segmenter,
             pending: Vec::new(),
             last_probs: Vec::new(),
             converter: None,
+            converter_factory: PcmConverter::new,
             upsampler_8k,
+            upsampler_factory: PcmConverter::new_8k_to_16k_frame_resampler,
         })
     }
 
@@ -135,7 +167,14 @@ impl Vad {
     ///
     /// Internally buffers input into frame_size units and holds any remainder for the next call. Sample positions
     /// are continuous across calls (cumulative).
-    pub fn process(&mut self, samples: &[f32]) -> Vec<VadEvent> {
+    ///
+    /// Returns inference/conversion errors with their cause. After a processing failure,
+    /// processing and flush return that error until reset succeeds.
+    pub fn process(&mut self, samples: &[f32]) -> Result<Vec<VadEvent>, VadError> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        self.converted_sample_position += samples.len() as u64;
         let frame_size = self.config.frame_size();
         self.last_probs.clear();
 
@@ -151,8 +190,13 @@ impl Vad {
         let mut frame_buf = vec![0.0f32; frame_size];
         while offset + frame_size <= self.pending.len() {
             frame_buf.copy_from_slice(&self.pending[offset..offset + frame_size]);
-            // On inference failure, use silence (0.0) and continue.
-            let prob = self.infer_frame(&frame_buf).unwrap_or(0.0);
+            let prob = match self.infer_frame(&frame_buf) {
+                Ok(prob) => prob,
+                Err(error) => {
+                    self.failure = Some(error.clone());
+                    return Err(error);
+                }
+            };
             self.last_probs.push(prob);
             self.segmenter.feed(prob, &mut segments_out);
             offset += frame_size;
@@ -168,7 +212,7 @@ impl Vad {
                 at_sample: seg.end_sample,
             });
         }
-        events
+        Ok(events)
     }
 
     /// Self-contained entry point that accepts a recording chunk as-is. Converts any format (`input_sample_rate` /
@@ -176,6 +220,7 @@ impl Vad {
     /// using the same path as [`Vad::process`].
     ///
     /// This lets language bindings pass recording chunks (such as 48 kHz/stereo) without conversion.
+    /// Input rates from 8,000 through 192,000 Hz and nonzero channel counts are supported.
     /// `samples` must be interleaved and its length should be a multiple of `input_channels`
     /// (partial frames are carried over, so input may be split at any point).
     ///
@@ -190,51 +235,41 @@ impl Vad {
     /// `at_sample as f64 / config().sample_rate as f64`; estimate the input sample position with
     /// `at_sample * input_sample_rate / config().sample_rate`.
     ///
-    /// If resampler setup or execution fails (for example, with an extreme rate ratio), discard that call's input
-    /// and return no events (do not stop ingestion with a panic). This follows [`Vad::process`], which treats
-    /// inference failures as silence.
+    /// Invalid formats are rejected before changing any state. Processing failures require a
+    /// successful reset before processing resumes. Converter setup errors preserve existing state.
     pub fn process_pcm(
         &mut self,
         samples: &[f32],
         input_sample_rate: u32,
         input_channels: u16,
-    ) -> Vec<VadEvent> {
+    ) -> Result<Vec<VadEvent>, VadError> {
         let target = self.config.sample_rate;
         let format = PcmFormat {
             sample_rate: input_sample_rate,
             channels: input_channels,
         };
 
-        // Discard the converter if the input format changed (recreate it below if needed).
-        if let Some(c) = &self.converter {
-            if !c.matches(format) {
-                self.converter = None;
-            }
+        format.validate()?;
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
         }
-
-        // If conversion is unnecessary (already mono at the VAD rate), use the existing path without extra copies or resampling.
-        if input_sample_rate == target && input_channels <= 1 {
+        // Prepare replacement before modifying the existing converter.
+        if self.converter.as_ref().is_none_or(|c| !c.matches(format)) {
+            let replacement = if input_sample_rate == target && input_channels == 1 {
+                None
+            } else {
+                Some((self.converter_factory)(format, target).map_err(VadError::Resample)?)
+            };
+            self.converter = replacement;
+        }
+        let Some(conv) = self.converter.as_mut() else {
             return self.process(samples);
-        }
-
-        // Create the converter on first use or after a format change. On failure, discard this call and continue.
-        if self.converter.is_none() {
-            match PcmConverter::new(format, target) {
-                Ok(c) => self.converter = Some(c),
-                Err(_) => return Vec::new(),
-            }
-        }
-
-        // Downmix and resample to mono at the VAD rate, then use the existing path.
+        };
         let mut converted = Vec::new();
-        {
-            let conv = self
-                .converter
-                .as_mut()
-                .expect("converter was initialized immediately above");
-            if conv.convert(samples, &mut converted).is_err() {
-                return Vec::new();
-            }
+        if let Err(message) = conv.convert(samples, &mut converted) {
+            let error = VadError::Resample(message);
+            self.failure = Some(error.clone());
+            return Err(error);
         }
         self.process(&converted)
     }
@@ -258,7 +293,7 @@ impl Vad {
         );
         if self.config.sample_rate == MODEL_SAMPLE_RATE {
             debug_assert_eq!(frame.len(), MODEL_FRAME_SIZE);
-            self.engine.infer_16k_frame(frame)
+            self.engine.infer(frame)
         } else {
             let upsampler = self
                 .upsampler_8k
@@ -274,7 +309,7 @@ impl Vad {
                     up.len()
                 )));
             }
-            self.engine.infer_16k_frame(&up)
+            self.engine.infer(&up)
         }
     }
 
@@ -300,7 +335,11 @@ impl Vad {
     ///
     /// Returns an empty vector when no speech segment is open (or the open segment
     /// is shorter than `min_speech_ms` and is discarded, matching the segmenter).
-    pub fn flush(&mut self) -> Vec<VadEvent> {
+    /// Returns a latched processing error or a reset error instead of successful events.
+    pub fn flush(&mut self) -> Result<Vec<VadEvent>, VadError> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
         let mut segments_out = Vec::new();
         self.segmenter.flush(&mut segments_out);
         let mut events = Vec::new();
@@ -313,24 +352,46 @@ impl Vad {
             });
         }
         // Start the next input in a fresh context (reset cumulative position, state, and remainder).
-        self.reset();
-        events
+        self.reset()?;
+        Ok(events)
     }
 
     /// Reset state, context, state machine, sample position, remainder buffer, and resampler state.
-    pub fn reset(&mut self) {
-        self.engine.reset();
+    /// Returns [`VadError::Reset`] if rebuilding the resampler or resetting inference fails.
+    /// Buffers and position are cleared only after those operations succeed.
+    pub fn reset(&mut self) -> Result<(), VadError> {
+        let replacement = if self.config.sample_rate == 8_000 {
+            match (self.upsampler_factory)() {
+                Ok(converter) => Some(converter),
+                Err(message) => {
+                    let error = VadError::Reset(message);
+                    self.failure = Some(error.clone());
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(cause) = self.engine.reset() {
+            let error = VadError::Reset(cause.to_string());
+            self.failure = Some(error.clone());
+            return Err(error);
+        }
+        self.upsampler_8k = replacement;
         self.pending.clear();
         self.last_probs.clear();
         self.segmenter.reset();
-        // Discard the converter. The next process_pcm call recreates it for the input format,
-        // resetting resampler latency and remainder as well.
         self.converter = None;
-        if self.config.sample_rate == 8_000 {
-            // The dedicated constructor includes pre-roll. Rebuilding it as a generic converter would
-            // produce 508 samples on the first call and break public frame alignment; always use this constructor.
-            self.upsampler_8k = PcmConverter::new_8k_to_16k_frame_resampler().ok();
-        }
+        self.converted_sample_position = 0;
+        self.failure = None;
+        Ok(())
+    }
+
+    /// Actual cumulative mono samples delivered by conversion at the configured VAD rate.
+    /// Includes samples buffered below one inference frame. Reset and flush return this to zero.
+    /// Read before processing a chunk to anchor its event timestamps without per-call rounding.
+    pub fn converted_sample_position(&self) -> u64 {
+        self.converted_sample_position
     }
 
     /// Borrow the current configuration.
@@ -367,6 +428,179 @@ mod tests {
     use super::*;
     use crate::config::VadConfig;
     use crate::segmenter::{Segment, Segmenter};
+
+    struct TestBackend {
+        fail_infer: bool,
+        fail_reset: bool,
+    }
+    impl InferenceBackend for TestBackend {
+        fn infer(&mut self, _: &[f32]) -> Result<f32, VadError> {
+            if self.fail_infer {
+                Err(VadError::Inference("injected inference failure".into()))
+            } else {
+                Ok(0.9)
+            }
+        }
+        fn reset(&mut self) -> Result<(), VadError> {
+            if self.fail_reset {
+                Err(VadError::Reset("injected reset failure".into()))
+            } else {
+                self.fail_infer = false;
+                Ok(())
+            }
+        }
+    }
+    fn test_vad(fail_infer: bool, fail_reset: bool) -> Vad {
+        let config = VadConfig::default();
+        Vad {
+            engine: Box::new(TestBackend {
+                fail_infer,
+                fail_reset,
+            }),
+            segmenter: Segmenter::new(&config),
+            config,
+            converted_sample_position: 0,
+            failure: None,
+            pending: Vec::new(),
+            last_probs: Vec::new(),
+            converter: None,
+            converter_factory: PcmConverter::new,
+            upsampler_8k: None,
+            upsampler_factory: PcmConverter::new_8k_to_16k_frame_resampler,
+        }
+    }
+
+    #[test]
+    fn inference_failure_is_not_silence_and_requires_reset() {
+        let mut vad = test_vad(true, false);
+        let error = vad.process(&[0.0; 512]).unwrap_err();
+        assert!(matches!(error, VadError::Inference(_)));
+        assert!(vad.last_frame_probabilities().is_empty());
+        assert_eq!(vad.process(&[]).unwrap_err(), error);
+        assert_eq!(vad.flush().unwrap_err(), error);
+        vad.reset().unwrap();
+        assert_eq!(vad.converted_sample_position(), 0);
+        vad.process(&[0.0; 512]).unwrap();
+        assert_eq!(vad.last_frame_probabilities(), &[0.9]);
+    }
+
+    #[test]
+    fn converter_construction_failure_preserves_existing_state() {
+        let mut vad = test_vad(false, false);
+        vad.process_pcm(&[0.0; 220], 11_025, 1).unwrap();
+        let position = vad.converted_sample_position();
+        vad.converter_factory = |_, _| Err("injected converter construction failure".into());
+        let error = vad.process_pcm(&[0.0; 512], 48_000, 2).unwrap_err();
+        assert!(matches!(error, VadError::Resample(_)));
+        assert!(error
+            .to_string()
+            .contains("injected converter construction"));
+        assert_eq!(vad.converted_sample_position(), position);
+        assert!(vad.converter.as_ref().unwrap().matches(PcmFormat {
+            sample_rate: 11_025,
+            channels: 1
+        }));
+        // Setup failure did not mutate state, so the existing format can continue without reset.
+        vad.process_pcm(&[0.0; 220], 11_025, 1).unwrap();
+    }
+
+    #[test]
+    fn conversion_failure_is_typed_and_requires_reset() {
+        let mut vad = test_vad(false, false);
+        vad.process_pcm(&[0.0; 220], 11_025, 1).unwrap();
+        vad.converter.as_mut().unwrap().fail_conversion();
+        let error = vad.process_pcm(&[0.0; 220], 11_025, 1).unwrap_err();
+        assert!(matches!(error, VadError::Resample(_)));
+        assert!(error.to_string().contains("injected conversion failure"));
+        assert_eq!(vad.process_pcm(&[], 11_025, 1).unwrap_err(), error);
+        assert_eq!(vad.flush().unwrap_err(), error);
+        vad.reset().unwrap();
+        vad.process_pcm(&[0.0; 220], 11_025, 1).unwrap();
+    }
+
+    #[test]
+    fn reset_failure_is_typed_and_blocks_processing() {
+        let mut vad = test_vad(false, true);
+        vad.process(&[0.0; 100]).unwrap();
+        let error = vad.reset().unwrap_err();
+        assert!(matches!(error, VadError::Reset(_)));
+        assert!(error.to_string().contains("injected reset failure"));
+        assert_eq!(vad.converted_sample_position(), 100);
+        assert_eq!(vad.process(&[]).unwrap_err(), error);
+    }
+
+    #[test]
+    fn reset_propagates_8k_resampler_construction_failure() {
+        let mut vad = test_vad(false, false);
+        vad.config.sample_rate = 8_000;
+        vad.upsampler_8k = Some(PcmConverter::new_8k_to_16k_frame_resampler().unwrap());
+        vad.upsampler_factory = || Err("injected 8 kHz reset construction failure".into());
+        let error = vad.reset().unwrap_err();
+        assert!(matches!(error, VadError::Reset(_)));
+        assert!(error.to_string().contains("injected 8 kHz"));
+        assert!(vad.upsampler_8k.is_some());
+        assert_eq!(vad.flush().unwrap_err(), error);
+        vad.upsampler_factory = PcmConverter::new_8k_to_16k_frame_resampler;
+        vad.reset().unwrap();
+        vad.process(&[0.0; 256]).unwrap();
+    }
+
+    #[test]
+    fn flush_propagates_reset_failure() {
+        let mut vad = test_vad(false, true);
+        vad.process(&[0.0; 512]).unwrap();
+        assert!(matches!(vad.flush(), Err(VadError::Reset(_))));
+    }
+
+    #[test]
+    fn invalid_pcm_does_not_mutate_state() {
+        let mut vad = test_vad(false, false);
+        vad.process_pcm(&[0.0; 220], 11_025, 2).unwrap();
+        let position = vad.converted_sample_position();
+        let pending = vad.pending.clone();
+        for (rate, channels) in [(16_000, 0), (0, 1), (7_999, 1), (192_001, 1), (u32::MAX, 1)] {
+            assert!(matches!(
+                vad.process_pcm(&[1.0; 512], rate, channels),
+                Err(VadError::InvalidFormat(_))
+            ));
+            assert_eq!(vad.converted_sample_position(), position);
+            assert_eq!(vad.pending, pending);
+            assert!(vad.converter.as_ref().unwrap().matches(PcmFormat {
+                sample_rate: 11_025,
+                channels: 2
+            }));
+        }
+    }
+
+    #[test]
+    fn cumulative_converted_position_has_no_chunk_rounding_drift() {
+        let mut vad = test_vad(false, false);
+        let mut converter = PcmConverter::new(
+            PcmFormat {
+                sample_rate: 11_025,
+                channels: 1,
+            },
+            16_000,
+        )
+        .unwrap();
+        let mut actual = Vec::new();
+        for _ in 0..1_000 {
+            let anchor = vad.converted_sample_position();
+            assert_eq!(anchor, actual.len() as u64);
+            converter.convert(&[0.0; 220], &mut actual).unwrap();
+            vad.process_pcm(&[0.0; 220], 11_025, 1).unwrap();
+            assert_eq!(vad.converted_sample_position(), actual.len() as u64);
+        }
+        assert!(vad.converted_sample_position() > 319 * 1_000 + 100);
+        let mut bulk = test_vad(false, false);
+        bulk.process_pcm(&vec![0.0; 220_000], 11_025, 1).unwrap();
+        assert_eq!(
+            bulk.converted_sample_position(),
+            vad.converted_sample_position()
+        );
+        vad.flush().unwrap();
+        assert_eq!(vad.converted_sample_position(), 0);
+    }
 
     /// Helper that feeds probabilities to the segmenter and returns segments (assumes frame_size=512 at 16 kHz).
     fn run_probs(config: &VadConfig, probs: &[f32]) -> Vec<Segment> {
@@ -436,7 +670,7 @@ mod tests {
         }
 
         let mut vad16 = Vad::new(VadConfig::default()).expect("16 kHz model load");
-        let _ = vad16.process(&reference16);
+        let _ = vad16.process(&reference16).unwrap();
         let probs16 = vad16.last_frame_probabilities();
 
         let cfg8 = VadConfig {
@@ -444,7 +678,7 @@ mod tests {
             ..VadConfig::default()
         };
         let mut vad8 = Vad::new(cfg8).expect("8 kHz model load");
-        let _ = vad8.process(&samples8);
+        let _ = vad8.process(&samples8).unwrap();
         let probs8 = vad8.last_frame_probabilities().to_vec();
 
         assert_eq!(probs8.len(), samples8.len() / 256);
@@ -463,8 +697,8 @@ mod tests {
 
         // After reset, the dedicated constructor still starts with pre-roll, so each 512-sample frame
         // and probability sequence match the initial run.
-        vad8.reset();
-        let _ = vad8.process(&samples8);
+        vad8.reset().unwrap();
+        let _ = vad8.process(&samples8).unwrap();
         assert_eq!(vad8.last_frame_probabilities(), probs8);
     }
 
@@ -653,7 +887,7 @@ mod tests {
     fn zeros_produce_low_prob_no_speech() {
         let mut vad = Vad::new(VadConfig::default()).unwrap();
         let zeros = vec![0.0f32; 16000];
-        let events = vad.process(&zeros);
+        let events = vad.process(&zeros).unwrap();
         // Silent input does not produce SpeechStart.
         assert!(
             !events
@@ -680,7 +914,7 @@ mod tests {
         let mut total_probs = 0usize;
         while fed < total {
             let take = chunk.len().min(total - fed);
-            vad.process(&chunk[..take]);
+            vad.process(&chunk[..take]).unwrap();
             total_probs += vad.last_frame_probabilities().len();
             fed += take;
         }
@@ -694,8 +928,8 @@ mod tests {
     #[test]
     fn reset_clears_state() {
         let mut vad = Vad::new(VadConfig::default()).unwrap();
-        vad.process(&vec![0.0f32; 1000]); // Leave a remainder in pending.
-        vad.reset();
+        vad.process(&vec![0.0f32; 1000]).unwrap(); // Leave a remainder in pending.
+        vad.reset().unwrap();
         assert_eq!(vad.last_frame_probabilities().len(), 0);
         assert_eq!(vad.config().sample_rate, 16000);
     }
@@ -736,13 +970,13 @@ mod tests {
         let mut vad = Vad::new(cfg).unwrap();
         // Feed one second. No silence arrives, so process does not finalize the segment.
         let sig = vec![0.1f32; 16_000];
-        let during = vad.process(&sig);
+        let during = vad.process(&sig).unwrap();
         assert!(
             during.is_empty(),
             "Without silence, process does not finalize the segment: {during:?}"
         );
         // flush finalizes the open segment → speechStart + speechEnd pair.
-        let flushed = vad.flush();
+        let flushed = vad.flush().unwrap();
         assert_eq!(
             flushed.len(),
             2,
@@ -752,12 +986,12 @@ mod tests {
         assert!(matches!(flushed[1], VadEvent::SpeechEnd { .. }));
 
         // flush resets state, starting a fresh context. The same input starts again at 0.
-        let after = vad.process(&sig);
+        let after = vad.process(&sig).unwrap();
         assert!(
             after.is_empty(),
             "After reset, the new segment is not finalized: {after:?}"
         );
-        let flushed2 = vad.flush();
+        let flushed2 = vad.flush().unwrap();
         assert_eq!(flushed2.len(), 2);
         assert_eq!(
             flushed[0], flushed2[0],
@@ -770,8 +1004,8 @@ mod tests {
     fn flush_on_idle_returns_empty() {
         let mut vad = Vad::new(VadConfig::default()).unwrap();
         let zeros = vec![0.0f32; 16_000];
-        vad.process(&zeros);
-        let flushed = vad.flush();
+        vad.process(&zeros).unwrap();
+        let flushed = vad.flush().unwrap();
         assert!(
             flushed.is_empty(),
             "flush is empty when no speech is open: {flushed:?}"
@@ -793,8 +1027,8 @@ mod tests {
         let mut vad = Vad::new(cfg).unwrap();
         // Feed only 300 ms (< min_speech 1000 ms), then flush.
         let sig = vec![0.1f32; 16_000 * 300 / 1000];
-        vad.process(&sig);
-        let flushed = vad.flush();
+        vad.process(&sig).unwrap();
+        let flushed = vad.flush().unwrap();
         assert!(
             flushed.is_empty(),
             "Open segments shorter than min_speech are discarded by flush too: {flushed:?}"
@@ -836,11 +1070,11 @@ mod tests {
         let sig = harmonics(16_000, 16_000);
         let mut vad = Vad::new(VadConfig::default()).unwrap();
 
-        let e_pcm = vad.process_pcm(&sig, 16_000, 1);
+        let e_pcm = vad.process_pcm(&sig, 16_000, 1).unwrap();
         let p_pcm = vad.last_frame_probabilities().to_vec();
 
-        vad.reset();
-        let e_proc = vad.process(&sig);
+        vad.reset().unwrap();
+        let e_proc = vad.process(&sig).unwrap();
         let p_proc = vad.last_frame_probabilities().to_vec();
 
         assert_eq!(
@@ -877,16 +1111,16 @@ mod tests {
         let mut vad = Vad::new(cfg).unwrap();
 
         // Submit as one batch.
-        let bulk_events = vad.process_pcm(&stereo, 48_000, 2);
+        let bulk_events = vad.process_pcm(&stereo, 48_000, 2).unwrap();
         let bulk_probs = vad.last_frame_probabilities().to_vec();
 
-        vad.reset();
+        vad.reset().unwrap();
 
         // Submit in chunks of 777 samples (odd length, crossing frame boundaries).
         let mut split_events = Vec::new();
         let mut split_probs = Vec::new();
         for chunk in stereo.chunks(777) {
-            let evs = vad.process_pcm(chunk, 48_000, 2);
+            let evs = vad.process_pcm(chunk, 48_000, 2).unwrap();
             split_events.extend(evs);
             split_probs.extend_from_slice(vad.last_frame_probabilities());
         }
@@ -912,11 +1146,11 @@ mod tests {
         let stereo = to_stereo(&harmonics(48_000, 24_000));
 
         let mut vad = Vad::new(VadConfig::default()).unwrap();
-        let e1 = vad.process_pcm(&stereo, 48_000, 2);
+        let e1 = vad.process_pcm(&stereo, 48_000, 2).unwrap();
         let p1 = vad.last_frame_probabilities().to_vec();
 
-        vad.reset();
-        let e2 = vad.process_pcm(&stereo, 48_000, 2);
+        vad.reset().unwrap();
+        let e2 = vad.process_pcm(&stereo, 48_000, 2).unwrap();
         let p2 = vad.last_frame_probabilities().to_vec();
 
         assert_eq!(e1, e2, "same input after reset produced different events");
@@ -935,11 +1169,11 @@ mod tests {
         let stereo48 = to_stereo(&harmonics(48_000, n16 * 3));
 
         let mut ref_vad = Vad::new(VadConfig::default()).unwrap();
-        let ref_events = ref_vad.process(&ref16);
+        let ref_events = ref_vad.process(&ref16).unwrap();
         let ref_probs = ref_vad.last_frame_probabilities().to_vec();
 
         let mut pcm_vad = Vad::new(VadConfig::default()).unwrap();
-        let pcm_events = pcm_vad.process_pcm(&stereo48, 48_000, 2);
+        let pcm_events = pcm_vad.process_pcm(&stereo48, 48_000, 2).unwrap();
         let pcm_probs = pcm_vad.last_frame_probabilities().to_vec();
 
         // Resampler latency can change frame count by at most one. Compare probabilities in the shared middle region.

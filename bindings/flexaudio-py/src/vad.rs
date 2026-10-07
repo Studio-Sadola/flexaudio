@@ -73,16 +73,18 @@ impl Vad {
         samples: Vec<f32>,
         input_sample_rate: u32,
         input_channels: u16,
-    ) -> Vec<PyVadEvent> {
-        self.inner
+    ) -> PyResult<Vec<PyVadEvent>> {
+        Ok(self
+            .inner
             .process_pcm(&samples, input_sample_rate, input_channels)
+            .map_err(vad_err_to_py)?
             .into_iter()
             .map(vad_event_to_py)
-            .collect()
+            .collect())
     }
 
     /// Reset all state, the remainder buffer, and the resampler (so another stream can be processed).
-    fn reset(&mut self) {
-        self.inner.reset();
+    fn reset(&mut self) -> PyResult<()> {
+        self.inner.reset().map_err(vad_err_to_py)
     }
 }

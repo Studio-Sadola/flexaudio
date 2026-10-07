@@ -16,7 +16,7 @@ use flexaudio_vad::{Vad, VadConfig, VadEvent};
 
 let mut vad = Vad::new(VadConfig::default()).unwrap();
 for chunk in some_audio_chunks() {
-    for ev in vad.process(chunk) {
+    for ev in vad.process(chunk).unwrap() {
         match ev {
             VadEvent::SpeechStart { at_sample } => println!("start @ {at_sample}"),
             VadEvent::SpeechEnd { at_sample }   => println!("end @ {at_sample}"),

@@ -116,8 +116,10 @@ impl Stream {
     /// If integrated addons are enabled, process the chunk here before returning it (denoise → VAD).
     /// denoise overwrites the chunk audio in place. VAD detects speech boundaries from the processed
     /// audio and attaches them to `chunk.vad_events`. If both are disabled, pass the chunk through.
-    fn poll_chunk(&mut self) -> Option<PyAudioChunk> {
-        let chunk = self.inner.poll_chunk()?;
+    fn poll_chunk(&mut self) -> PyResult<Option<PyAudioChunk>> {
+        let Some(chunk) = self.inner.poll_chunk() else {
+            return Ok(None);
+        };
         let mut py_chunk = chunk_to_py(chunk);
 
         // 1) denoise: overwrite chunk audio in place. Its length is always divisible by the number of
@@ -132,6 +134,7 @@ impl Stream {
         if let Some(vad) = self.vad.as_mut() {
             let events: Vec<(bool, u64)> = vad
                 .process_pcm(py_chunk.samples(), self.output_rate, self.output_channels)
+                .map_err(vad_err_to_py)?
                 .into_iter()
                 .map(|ev| match ev {
                     flexaudio_vad::VadEvent::SpeechStart { at_sample } => (true, at_sample),
@@ -141,7 +144,7 @@ impl Stream {
             py_chunk.set_vad_events(events);
         }
 
-        Some(py_chunk)
+        Ok(Some(py_chunk))
     }
 
     /// Return an event if one is available. Otherwise return `None` (non-blocking).

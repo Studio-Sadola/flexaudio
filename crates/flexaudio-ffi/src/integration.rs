@@ -66,8 +66,10 @@ impl FlexStream {
     /// - denoise: process interleaved data in place (48 kHz is guaranteed by open).
     /// - VAD: pass data in the output format (after denoise) to `process_pcm` and append finalized
     ///   events to `FlexChunk::vad_events`.
-    pub(crate) fn poll_processed(&mut self) -> Option<FlexChunk> {
-        let mut chunk = self.inner.poll_chunk()?;
+    pub(crate) fn poll_processed(&mut self) -> Result<Option<FlexChunk>, flexaudio_vad::VadError> {
+        let Some(mut chunk) = self.inner.poll_chunk() else {
+            return Ok(None);
+        };
 
         // 1) denoise (in place). Length is frames×channels, hence divisible by channel count,
         //    so this should not fail; if it does, pass through the original data.
@@ -79,7 +81,7 @@ impl FlexStream {
         //    output is Copy, so save it before borrowing mutably.
         let output = self.inner.config().output;
         let vad_events = match self.vad.as_mut() {
-            Some(vad) => vad.process_pcm(&chunk.data, output.sample_rate, output.channels),
+            Some(vad) => vad.process_pcm(&chunk.data, output.sample_rate, output.channels)?,
             None => Vec::new(),
         };
 
@@ -87,7 +89,7 @@ impl FlexStream {
         let (ev_ptr, ev_len) = vad_events_to_c(vad_events);
         fc.vad_events = ev_ptr;
         fc.vad_events_len = ev_len;
-        Some(fc)
+        Ok(Some(fc))
     }
 }
 

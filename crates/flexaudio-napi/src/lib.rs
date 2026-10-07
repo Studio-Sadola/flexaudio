@@ -92,6 +92,7 @@ type DeviceTsfn = ThreadsafeFunction<JsDeviceEvent, ErrorStrategy::Fatal>;
 enum ChunkEmit {
     Chunk(Box<JsAudioChunk>),
     StopFlushed,
+    VadError(String),
 }
 
 /// `napi_deferred` is a raw pointer. Created on the JS thread and resolved through TSFN.
@@ -255,6 +256,10 @@ fn make_chunk_tsfn(
                     let _ = func.call(*chunk);
                     Ok(Vec::<Unknown>::new())
                 }
+                ChunkEmit::VadError(message) => {
+                    ctx.env.throw_error(&message, None)?;
+                    Ok(Vec::<Unknown>::new())
+                }
                 ChunkEmit::StopFlushed => {
                     for deferred in take_stop_waiters(&stop_phase) {
                         resolve_undefined(ctx.env.raw(), deferred);
@@ -356,7 +361,7 @@ impl Task for ProcessesTask {
 /// Model loading/inference failures are environmental: GenericFailure.
 fn vad_err(err: VadError) -> NapiError {
     let status = match err {
-        VadError::InvalidConfig(_) => Status::InvalidArg,
+        VadError::InvalidConfig(_) | VadError::InvalidFormat(_) => Status::InvalidArg,
         _ => Status::GenericFailure,
     };
     NapiError::new(status, err.to_string())
@@ -1011,8 +1016,6 @@ struct PairingBridge {
     vad_tap: VadTap,
     /// VAD internal rate (denominator for absolute time calculation; 8000/16000).
     vad_rate: i64,
-    /// Cumulative samples fed at VAD's internal rate (`reset` returns it to 0). Anchor for absolute time.
-    vad_samples_fed: i64,
     /// Previous VAD tap chunk's `dropped_before` (detects newly dropped data).
     vad_last_dropped: u32,
     /// Anchor of the most recent chunk fed to VAD (`(vad_sample_base, pts_base)`). Retained so
@@ -1037,6 +1040,13 @@ struct PairingBridge {
 }
 
 impl PairingBridge {
+    fn report_vad_error(&self, message: String) {
+        self.on_chunk.call(
+            ChunkEmit::VadError(message),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+    }
+
     /// Feed the bound tap's pre-quantization f32 to VAD and return finalized events with absolute time
     /// from recording zero. Reset and re-anchor on discontinuity flags / `dropped_before` increments.
     /// Returns `None` when VAD is not configured.
@@ -1055,12 +1065,21 @@ impl PairingBridge {
         self.vad_last_dropped = dropped_before;
         let vad_rate = self.vad_rate;
         if discontinuity || dropped_jump {
-            self.vad.as_mut().unwrap().reset();
-            self.vad_samples_fed = 0;
+            if let Err(error) = self.vad.as_mut().unwrap().reset() {
+                self.report_vad_error(error.to_string());
+                return None;
+            }
         }
         // Record (vad_sample_base, pts_base) for this chunk's start. Also retain it on self so flushVad
         // can calculate absolute times for final events without a new chunk.
-        let vad_sample_base = self.vad_samples_fed;
+        let vad_sample_base =
+            match i64::try_from(self.vad.as_ref().unwrap().converted_sample_position()) {
+                Ok(position) => position,
+                Err(_) => {
+                    self.report_vad_error("VAD sample position exceeds the timestamp range".into());
+                    return None;
+                }
+            };
         let pts_base = pts_ns;
         self.vad_anchor_sample = vad_sample_base;
         self.vad_anchor_pts = pts_base;
@@ -1069,9 +1088,13 @@ impl PairingBridge {
             .as_mut()
             .unwrap()
             .process_pcm(samples, in_rate, in_channels);
-        // Add the approximate count of VAD internal-rate samples fed by this chunk to the cumulative count.
-        let frames = samples.len() / (in_channels.max(1) as usize);
-        self.vad_samples_fed += (frames as i64 * vad_rate) / (in_rate.max(1) as i64);
+        let events = match events {
+            Ok(events) => events,
+            Err(error) => {
+                self.report_vad_error(error.to_string());
+                return None;
+            }
+        };
 
         let js = events
             .into_iter()
@@ -1106,9 +1129,14 @@ impl PairingBridge {
         let Some(vad) = self.vad.as_mut() else {
             return Vec::new();
         };
-        let events = vad.flush();
+        let events = match vad.flush() {
+            Ok(events) => events,
+            Err(error) => {
+                self.report_vad_error(error.to_string());
+                return Vec::new();
+            }
+        };
         // flush() reset VAD, so the cumulative position returns to zero.
-        self.vad_samples_fed = 0;
         let vad_rate = self.vad_rate;
         let anchor_sample = self.vad_anchor_sample;
         let anchor_pts = self.vad_anchor_pts;
@@ -1905,7 +1933,6 @@ pub fn open_stream(
         vad,
         vad_tap,
         vad_rate: vad_rate as i64,
-        vad_samples_fed: 0,
         vad_last_dropped: 0,
         vad_anchor_sample: 0,
         vad_anchor_pts: 0,
@@ -2060,7 +2087,6 @@ pub fn open_mock_stream(
         vad,
         vad_tap,
         vad_rate: 16_000,
-        vad_samples_fed: 0,
         vad_last_dropped: 0,
         vad_anchor_sample: 0,
         vad_anchor_pts: 0,
@@ -2117,12 +2143,14 @@ impl Vad {
         samples: Float32Array,
         input_sample_rate: u32,
         input_channels: u16,
-    ) -> Vec<JsVadEvent> {
-        self.inner
+    ) -> napi::Result<Vec<JsVadEvent>> {
+        Ok(self
+            .inner
             .process_pcm(&samples[..], input_sample_rate, input_channels)
+            .map_err(vad_err)?
             .into_iter()
             .map(vad_event_to_js)
-            .collect()
+            .collect())
     }
 
     /// Force-finalize the currently open utterance and return finalized [`JsVadEvent`] values (same behavior
@@ -2132,18 +2160,20 @@ impl Vad {
     /// Standalone `Vad` has no pts context, so `atNs` is `undefined` (`atSample` remains the raw cumulative
     /// position at VAD's internal rate). Returns an empty array when no utterance is open.
     #[napi]
-    pub fn flush(&mut self) -> Vec<JsVadEvent> {
-        self.inner
+    pub fn flush(&mut self) -> napi::Result<Vec<JsVadEvent>> {
+        Ok(self
+            .inner
             .flush()
+            .map_err(vad_err)?
             .into_iter()
             .map(vad_event_to_js)
-            .collect()
+            .collect())
     }
 
     /// Initialize internal state (state / context / state machine / sample position / resampler).
     #[napi]
-    pub fn reset(&mut self) {
-        self.inner.reset();
+    pub fn reset(&mut self) -> napi::Result<()> {
+        self.inner.reset().map_err(vad_err)
     }
 }
 
