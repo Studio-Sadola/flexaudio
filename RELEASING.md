@@ -11,7 +11,7 @@ git push origin v0.3.1
 ## Registry status — 0.3.0
 
 Verified on 2026-10-07: version 0.3.0 is published on all three registries.
-The next patch release is 0.3.1.
+The next release is 0.4.0, which includes breaking API changes.
 
 | Registry | Status | Notes |
 |---|---|---|

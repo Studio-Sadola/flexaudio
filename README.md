@@ -52,13 +52,13 @@ Three capture sources × three operating systems. ✅ = implemented and verified
 
 ```toml
 [dependencies]
-flexaudio = "0.3"
+flexaudio = "0.4"
 ```
 
 or:
 
 ```sh
-cargo add flexaudio@0.3
+cargo add flexaudio@0.4
 ```
 
 The Voice Activity Detection add-on is a separate crate:
@@ -415,7 +415,7 @@ The workspace pins MSRV via `rust-version` in each crate.
 flexaudio follows [Semantic Versioning](https://semver.org/). While the crate is
 in the **0.x** series, the public API is **not yet stable**: per SemVer, a bump
 of the **minor** version (`0.2 → 0.3`) may contain breaking changes, while
-**patch** bumps (`0.2.0 → 0.2.1`) are backward-compatible. Pin to `0.3` to opt
+**patch** bumps (`0.2.0 → 0.2.1`) are backward-compatible. Pin to `0.4` to opt
 into compatible updates only. See [`CHANGELOG.md`](CHANGELOG.md).
 
 ---

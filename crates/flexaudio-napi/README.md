@@ -18,7 +18,7 @@ offline — no model files to ship, no network at runtime.
 ## Install
 
 ```sh
-npm install @studio-sadola/flexaudio
+npm install @studio-sadola/flexaudio@0.4
 ```
 
 The correct prebuilt native binary for your platform is pulled in automatically

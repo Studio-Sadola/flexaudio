@@ -55,7 +55,7 @@ stream.stop();
 ## Install
 
 ```sh
-cargo add flexaudio@0.3
+cargo add flexaudio@0.4
 ```
 
 ## Permissions

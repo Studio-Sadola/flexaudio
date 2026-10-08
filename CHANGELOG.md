@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-08
+
 ### Breaking
 
 - Added `Error::NativeFormatChanged { advertised, actual }` and
@@ -90,6 +92,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `Vad::converted_sample_position()` to anchor timestamps using actual
   cumulative converted samples. N-API uses it instead of rounding each chunk;
   Python, N-API, and C VAD callers propagate failures with their original cause.
+
+### Packaging
+
+- Windows MSVC release builds are reproducible with `/Brepro`, no incremental
+  compilation or PDBs, path remapping, and pinned Rust toolchain and N-API CLI.
+  The npm release CI builds each tag once; `workflow_dispatch` retries reuse and
+  verify that run's artifacts via `SHA256SUMS` instead of recompiling. CI checks
+  that two independent Windows builds have identical hashes.
+
 ## [0.3.1] - 2026-10-08
 
 ### Fixed
@@ -407,7 +418,8 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
   publication and interactive approval of new packages in scopes
   requiring 2FA. (1840fbb)
 
-[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Studio-Sadola/flexaudio/releases/tag/v0.2.0
