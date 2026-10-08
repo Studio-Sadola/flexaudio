@@ -25,8 +25,8 @@ pub use stream::Stream;
 // use `flexaudio::{StreamConfig, SourceKind, ...}` without going through `flexaudio::core`.
 pub use flexaudio_core::backend::CaptureBackend;
 pub use flexaudio_core::types::{
-    AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Error, Event, OutputFormat, ProcessInfo,
-    ProcessMode, Result, SecondaryChunk, SourceKind, StreamConfig,
+    AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Error, Event, OutputFormat, Permission,
+    ProcessInfo, ProcessMode, Result, SecondaryChunk, SourceKind, StreamConfig,
 };
 
 /// Return audio devices for all sources in one list.
@@ -217,7 +217,9 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
         // Microphone input is common to all OSes (cpal). device_id selects an input device
         // (None=default input; id is the stable device-name key returned by devices()). The
         // same device_id selects the output endpoint for system capture.
-        SourceKind::Mic => Box::new(flexaudio_mic::CpalMicBackend::new(config.device_id.clone())),
+        SourceKind::Mic => Box::new(flexaudio_mic::CpalMicBackend::try_new(
+            config.device_id.clone(),
+        )?),
 
         // System output loopback is supported on Linux / Windows / macOS.
         // Pass exclude_self (exclude this process) and device_id (select output endpoint)
@@ -273,9 +275,9 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
                     )));
                 }
             }
-            let mic = Box::new(flexaudio_mic::CpalMicBackend::new(
+            let mic = Box::new(flexaudio_mic::CpalMicBackend::try_new(
                 config.mix_mic_device_id.clone(),
-            ));
+            )?);
             // For Mix, apply exclude_self to the system side (same feedback-prevention intent
             // as standalone system capture). Unsupported OSes return Unsupported here.
             let system = build_system_backend(
@@ -409,8 +411,8 @@ mod tests {
         }
     }
 
-    /// A valid Mix config passes backend construction (open). Since it is not started, no real
-    /// devices are touched, so this also works in headless environments.
+    /// A valid Mix config passes backend construction (open), including permission
+    /// checks and native microphone format discovery on the host.
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     #[test]
     fn mix_config_with_valid_gains_opens() {
@@ -420,7 +422,20 @@ mod tests {
             mix_system_gain: 2.0,
             ..Default::default()
         };
-        let stream = open(config).expect("valid Mix config should open successfully");
+        let stream = match open(config) {
+            Ok(stream) => stream,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            Err(
+                error @ Error::PermissionDenied {
+                    permission: Permission::Microphone,
+                    ..
+                },
+            ) => {
+                eprintln!("Skipping mix_config_with_valid_gains_opens: host microphone permission is denied: {error}");
+                return;
+            }
+            Err(error) => panic!("valid Mix config should open successfully: {error:?}"),
+        };
         // The composite backend reports its internal canonical format (Stream's first stage is pass-through).
         assert_eq!(stream.native_format(), (48_000, 2));
     }

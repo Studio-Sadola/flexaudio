@@ -12,13 +12,14 @@ keywords = ["audio", "coreaudio", "loopback", "capture", "macos"]
 categories = ["multimedia::audio", "os::macos-apis"]
 documentation = "https://docs.rs/flexaudio-os-macos"
 
-# macOS only. On other platforms, lib.rs compiles to an empty crate via
-# `#![cfg(target_os = "macos")]`, and objc2 dependencies below are target-specific
-# (Linux and Windows builds are unaffected).
+# Native adapters and objc2 dependencies are macOS-only. The private capture-health
+# policy compiles on every platform for device-free tests.
 #
 # Versions match the existing pins in Cargo.lock (the objc2 family pulled by cpal) to avoid duplicate compilation.
+[dependencies]
+flexaudio-core = { path = "../flexaudio-core", version = "0.4.0" }
+
 [target.'cfg(target_os = "macos")'.dependencies]
-flexaudio-core = { path = "../flexaudio-core", version = "0.3.1" }
 libc = "=0.2.186"
 objc2 = "=0.6.4"
 objc2-foundation = { version = "=0.3.2", features = [

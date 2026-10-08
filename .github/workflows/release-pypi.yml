@@ -35,6 +35,8 @@ permissions:
   contents: read
 
 env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
   # All maturin commands target the PyO3 binding crate.
   MANIFEST: bindings/flexaudio-py/Cargo.toml
 
@@ -93,6 +95,7 @@ jobs:
       - name: Build wheels (unrepaired)
         uses: PyO3/maturin-action@v1
         with:
+          rust-toolchain: "1.98.1"
           target: ${{ matrix.target }}
           # Pick the manylinux_2_34 (AlmaLinux 9) container explicitly with
           # `container:` instead of the `manylinux:` input on purpose: the
@@ -111,7 +114,7 @@ jobs:
           # iterate over Python versions. `--auditwheel skip` leaves the wheel
           # unrepaired (no libs grafted); the repair step below does the grafting
           # with the right exclusions.
-          args: --release --out dist-unrepaired --manifest-path ${{ env.MANIFEST }} --auditwheel skip
+          args: --locked --release --out dist-unrepaired --manifest-path ${{ env.MANIFEST }} --auditwheel skip
           # The manylinux container is RHEL-based (dnf/yum). flexaudio-os-linux
           # links PipeWire and flexaudio-mic links ALSA, so install the dev
           # packages before the Rust build runs. clang is needed by pipewire-rs
@@ -193,8 +196,9 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          rust-toolchain: "1.98.1"
           target: ${{ matrix.target }}
-          args: --release --out dist --manifest-path ${{ env.MANIFEST }}
+          args: --locked --release --out dist --manifest-path ${{ env.MANIFEST }}
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.target }}
@@ -208,11 +212,20 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Configure reproducible MSVC release (dynamic CRT)
+        run: python .github/scripts/configure-msvc-release.py --target x86_64-pc-windows-msvc --target-dir target
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          rust-toolchain: "1.98.1"
           target: x64
-          args: --release --out dist --manifest-path ${{ env.MANIFEST }}
+          args: --locked --release --out dist --manifest-path ${{ env.MANIFEST }}
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-x64
@@ -229,6 +242,7 @@ jobs:
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
+          rust-toolchain: "1.98.1"
           command: sdist
           args: --out dist --manifest-path ${{ env.MANIFEST }}
       - uses: actions/upload-artifact@v4

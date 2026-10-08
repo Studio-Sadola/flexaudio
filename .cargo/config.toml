@@ -1,0 +1,5 @@
+# These linker controls also apply to non-release MSVC builds.
+# Release-only /DEBUG:NONE and runtime path remapping are added by
+# .github/scripts/configure-msvc-release.py; static CRT is N-API only.
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/Brepro", "-C", "link-arg=/INCREMENTAL:NO"]

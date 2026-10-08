@@ -22,11 +22,13 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use flexaudio_core::backend::{CaptureBackend, RawSink};
-use flexaudio_core::types::{Error, ProcessMode, Result};
+use flexaudio_core::types::{Error, Event, ProcessMode, Result};
 
 use crate::common::{translate_pid_to_object, FALLBACK_FORMAT};
+use crate::probe::PublicationGate;
 use crate::system::run_tap_thread;
 use crate::tap::TapKind;
+use crate::terminal::{StartAction, TerminalFailure};
 
 /// A [`CaptureBackend`] that captures audio for a specific PID using a process-specific Process Tap.
 ///
@@ -45,8 +47,14 @@ pub struct MacProcessBackend {
     mode: ProcessMode,
     /// Running flag (guards duplicate starts, signals stop, and tracks drop state). `Send`.
     stop_flag: Arc<AtomicBool>,
+    /// Probe publication and stop are ordered; the lock is released before joining.
+    publication: Arc<PublicationGate>,
+    /// Owner-reported terminal failure, retained after stop and mailbox consumption.
+    terminal: Arc<TerminalFailure>,
     /// Handle for the thread that owns the tap chain (`Some` after start).
     handle: Option<JoinHandle<()>>,
+    /// Owner-thread notifications for the current capture generation.
+    events: Option<mpsc::Receiver<Event>>,
     /// Native format `(rate, channels)`. Cache the fallback because the actual format is determined
     /// when the tap is created, following [`MacSystemBackend`].
     native: (u32, u16),
@@ -59,7 +67,10 @@ impl MacProcessBackend {
             target_pid,
             mode,
             stop_flag: Arc::new(AtomicBool::new(false)),
+            publication: Arc::new(PublicationGate::default()),
+            terminal: Arc::new(TerminalFailure::default()),
             handle: None,
+            events: None,
             native: FALLBACK_FORMAT,
         }
     }
@@ -81,7 +92,7 @@ impl CaptureBackend for MacProcessBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
-        if self.handle.is_some() {
+        if self.terminal.check_start(self.handle.is_some())? == StartAction::AlreadyRunning {
             return Ok(());
         }
 
@@ -93,7 +104,10 @@ impl CaptureBackend for MacProcessBackend {
         self.stop_flag.store(false, Ordering::SeqCst);
 
         let stop_flag = self.stop_flag.clone();
+        let publication = self.publication.clone();
+        let terminal = self.terminal.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        let (event_tx, event_rx) = mpsc::channel();
         let target_pid = self.target_pid;
         // ProcessMode is Copy, so it can be moved directly into the closure.
         let mode = self.mode;
@@ -119,16 +133,28 @@ impl CaptureBackend for MacProcessBackend {
                         return;
                     }
                 };
-                run_tap_thread(kind, sink, stop_flag, ready_tx);
+                run_tap_thread(
+                    kind,
+                    sink,
+                    stop_flag,
+                    publication,
+                    terminal,
+                    ready_tx,
+                    event_tx,
+                );
             })
             .map_err(|e| Error::Backend(format!("spawn macos process thread: {e}")))?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.handle = Some(handle);
+                self.events = Some(event_rx);
                 Ok(())
             }
             Ok(Err(e)) => {
+                if matches!(e, Error::PermissionDenied { .. }) {
+                    self.terminal.record(e.clone());
+                }
                 self.stop_flag.store(false, Ordering::SeqCst);
                 let _ = handle.join();
                 Err(e)
@@ -144,10 +170,15 @@ impl CaptureBackend for MacProcessBackend {
     }
 
     fn stop(&mut self) {
-        self.stop_flag.store(true, Ordering::SeqCst);
+        // Poison still sets cancellation, so shutdown remains fail-closed.
+        let _ = self.publication.cancel(&self.stop_flag);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+
+    fn poll_event(&mut self) -> Option<Event> {
+        self.events.as_ref()?.try_recv().ok()
     }
 }
 
@@ -161,6 +192,32 @@ impl Drop for MacProcessBackend {
 mod tests {
     use super::*;
     use flexaudio_core::raw_ring;
+
+    #[test]
+    fn repeated_start_returns_terminal_cause_before_running_noop_and_after_stop() {
+        for cause in [
+            Error::PermissionDenied {
+                permission: flexaudio_core::types::Permission::SystemAudio,
+                detail: "controlled diagnostic capture stayed zero".into(),
+            },
+            Error::Backend("self-probe publication gate poisoned".into()),
+        ] {
+            let mut backend = MacProcessBackend::new(1234, ProcessMode::Include);
+            // Only a completed Rust thread and in-memory ring are needed to
+            // exercise the native-free early start and stop paths.
+            backend.handle = Some(thread::spawn(|| {}));
+            let sink = || {
+                let (producer, _consumer) = raw_ring(16);
+                RawSink::new(producer, 48_000, 2)
+            };
+            assert_eq!(backend.start(sink()), Ok(()));
+            backend.terminal.record(cause.clone());
+            assert_eq!(backend.start(sink()), Err(cause.clone()));
+            assert_eq!(backend.start(sink()), Err(cause.clone()));
+            backend.stop();
+            assert_eq!(backend.start(sink()), Err(cause));
+        }
+    }
 
     /// `new` and `native_format` return valid values without panicking.
     #[test]

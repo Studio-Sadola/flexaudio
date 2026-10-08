@@ -18,7 +18,13 @@ exception; FlacEncoder propagates finalization errors only on normal exit.
 """
 
 from os import PathLike
-from typing import List, Optional, Sequence, Tuple, TypedDict, Union
+from typing import List, Literal, Optional, Sequence, Tuple, TypedDict, Union
+
+StreamEventType = Literal[
+    "chunkDropped", "stalled", "recovered", "permissionDenied", "permissionPending",
+    "silenceWhileSourceActive", "deviceLost", "error", "unknown"
+]
+RecordingPermission = Literal["microphone", "systemAudio"]
 
 class VadSettings(TypedDict, total=False):
     threshold: float
@@ -88,9 +94,26 @@ class AudioChunk:
     def rms(self) -> float: ...
 
 class StreamEvent:
+    """Stream notification; permissionPending and silenceWhileSourceActive are advisories.
+
+    permissionPending carries permission and an actionable message; capture
+    continues and may remain silent until granted. permissionDenied is terminal
+    and carries permission and a cause/remedy message. silenceWhileSourceActive
+    means the system-audio diagnosis is inconclusive; capture continues because
+    missing permission and genuine digital silence remain possible. error carries
+    a message and may represent a terminal backend failure; consult terminal_error.
+
+    On macOS, system/process capture can confirm SystemAudio denial with an active
+    self-probe after sustained exact zeros and eligible external output activity.
+    Its separate private tap captures our own diagnostic output; this signal may
+    also enter user capture if our process is included. An inconclusive probe is
+    advisory only. Stopping cancels the probe without a late event.
+    """
     def __repr__(self) -> str: ...
     @property
-    def type(self) -> str: ...
+    def type(self) -> StreamEventType: ...
+    @property
+    def permission(self) -> Optional[RecordingPermission]: ...
     @property
     def count(self) -> Optional[int]: ...
     @property
@@ -118,6 +141,13 @@ class Stream:
     def dropped_chunks(self) -> int: ...
     def poll_chunk(self) -> Optional[AudioChunk]: ...
     def poll_event(self) -> Optional[StreamEvent]: ...
+    def terminal_error(self) -> Optional[StreamEvent]:
+        """Retained terminal failure, including after stop; does not consume events.
+
+        poll_chunk, resume and switch_source raise RuntimeError once terminal.
+        A failed stream cannot be restarted; resolve the cause and open a new one.
+        """
+        ...
     def switch_source(
         self, kind: str, *, device_id: Optional[str] = None,
         process_id: Optional[int] = None, mode: str = "include", exclude_self: bool = False,

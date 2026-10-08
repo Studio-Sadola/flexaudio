@@ -304,7 +304,7 @@ mod tests {
 
         assert!(matches!(
             all_device_ids(permission_denied_reader),
-            Err(Error::PermissionDenied)
+            Err(Error::PermissionDenied { .. })
         ));
     }
 

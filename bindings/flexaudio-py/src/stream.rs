@@ -78,8 +78,8 @@ impl Stream {
     }
 
     /// End the pause and resume delivery.
-    fn resume(&self) {
-        self.inner.resume();
+    fn resume(&self) -> PyResult<()> {
+        self.inner.resume().map_err(to_py_err)
     }
 
     /// Return whether delivery is paused.
@@ -113,11 +113,22 @@ impl Stream {
 
     /// Return a chunk if one is available. Otherwise return `None` (non-blocking).
     ///
+    /// Raise RuntimeError on a terminal permission denial, even after stop.
+    /// The permission event remains available through poll_event.
+    ///
     /// If integrated addons are enabled, process the chunk here before returning it (denoise → VAD).
     /// denoise overwrites the chunk audio in place. VAD detects speech boundaries from the processed
     /// audio and attaches them to `chunk.vad_events`. If both are disabled, pass the chunk through.
-    fn poll_chunk(&mut self) -> Option<PyAudioChunk> {
-        let chunk = self.inner.poll_chunk()?;
+    fn poll_chunk(&mut self) -> PyResult<Option<PyAudioChunk>> {
+        if let Some(error) = self.inner.terminal_error() {
+            return Err(to_py_err(error));
+        }
+        let Some(chunk) = self.inner.poll_chunk() else {
+            return match self.inner.terminal_error() {
+                Some(error) => Err(to_py_err(error)),
+                None => Ok(None),
+            };
+        };
         let mut py_chunk = chunk_to_py(chunk);
 
         // 1) denoise: overwrite chunk audio in place. Its length is always divisible by the number of
@@ -132,6 +143,7 @@ impl Stream {
         if let Some(vad) = self.vad.as_mut() {
             let events: Vec<(bool, u64)> = vad
                 .process_pcm(py_chunk.samples(), self.output_rate, self.output_channels)
+                .map_err(vad_err_to_py)?
                 .into_iter()
                 .map(|ev| match ev {
                     flexaudio_vad::VadEvent::SpeechStart { at_sample } => (true, at_sample),
@@ -141,7 +153,18 @@ impl Stream {
             py_chunk.set_vad_events(events);
         }
 
-        Some(py_chunk)
+        Ok(Some(py_chunk))
+    }
+
+    /// Return the stored terminal failure as an event, including after stop.
+    /// None means no terminal failure; this does not consume poll_event.
+    fn terminal_error(&self) -> Option<PyStreamEvent> {
+        self.inner.terminal_error().map(|error| match error {
+            fa::Error::PermissionDenied { permission, detail } => {
+                event_to_py(fa::Event::PermissionDenied { permission, detail })
+            }
+            other => event_to_py(fa::Event::Error(other.to_string())),
+        })
     }
 
     /// Return an event if one is available. Otherwise return `None` (non-blocking).
@@ -203,6 +226,9 @@ impl Stream {
         vad: Option<Bound<'_, PyDict>>,
         denoise: bool,
     ) -> PyResult<()> {
+        if let Some(error) = self.inner.terminal_error() {
+            return Err(to_py_err(error));
+        }
         let exclude_pids = parse_exclude_pids(exclude_pids.as_ref())?;
 
         // Addons depend on output format. Since a switch cannot change it, validate and build using
@@ -352,6 +378,87 @@ pub fn open(
 mod tests {
     use super::*;
     use pyo3::ffi::c_str;
+
+    struct DeniedBackend(Option<fa::Event>);
+
+    impl fa::CaptureBackend for DeniedBackend {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 2)
+        }
+        fn start(&mut self, _sink: fa::core::backend::RawSink) -> fa::Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) {}
+        fn poll_event(&mut self) -> Option<fa::Event> {
+            self.0.take()
+        }
+    }
+
+    fn denied_stream() -> fa::Stream {
+        let mut stream = fa::Stream::open(
+            fa::StreamConfig::default(),
+            Box::new(DeniedBackend(Some(fa::Event::PermissionDenied {
+                permission: fa::Permission::Microphone,
+                detail: "denied by user".into(),
+            }))),
+        )
+        .expect("open fake backend");
+        stream.start().expect("start fake backend");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while stream.terminal_error().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal event was not processed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        stream
+    }
+
+    #[test]
+    fn polling_raises_terminal_error_without_consuming_event_after_stop() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut stream = Stream {
+                inner: denied_stream(),
+                denoiser: None,
+                vad: None,
+                output_rate: 48_000,
+                output_channels: 2,
+            };
+            let error = match stream.poll_chunk() {
+                Err(error) => error,
+                Ok(_) => panic!("terminal polling must raise"),
+            };
+            assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            assert!(error.to_string().contains("denied by user"));
+            assert!(stream.poll_event().is_some());
+            assert!(stream.terminal_error().is_some());
+            stream.stop();
+            assert!(stream.poll_chunk().is_err());
+            assert!(stream.resume().is_err());
+            assert!(stream.terminal_error().is_some());
+            let locals = PyDict::new(py);
+            locals
+                .set_item("stream", Py::new(py, stream).expect("Python stream"))
+                .expect("fixture");
+            py.run(
+                c_str!(
+                    r#"
+try:
+    stream.switch_source("invalid", exclude_pids=[False], denoise=True)
+except RuntimeError as error:
+    assert "denied by user" in str(error), str(error)
+else:
+    raise AssertionError("terminal error must precede source validation")
+"#
+                ),
+                None,
+                Some(&locals),
+            )
+            .expect("terminal failure precedence");
+        });
+    }
 
     #[test]
     fn switch_exclusion_validation_needs_no_hardware() {

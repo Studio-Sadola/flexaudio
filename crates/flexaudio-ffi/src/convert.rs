@@ -345,6 +345,7 @@ pub unsafe fn free_vad_events(ptr: *mut FlexVadEvent, len: usize) {
 /// carries only the kind and count).
 pub fn event_to_c(ev: Event) -> FlexEvent {
     match ev {
+        Event::TerminalError { error } => event_to_c(Event::Error(error.to_string())),
         Event::ChunkDropped { count } => FlexEvent {
             kind: FlexEventKind::ChunkDropped,
             count: count as i64,
@@ -357,10 +358,27 @@ pub fn event_to_c(ev: Event) -> FlexEvent {
             kind: FlexEventKind::Recovered,
             count: 0,
         },
-        Event::PermissionDenied => FlexEvent {
-            kind: FlexEventKind::PermissionDenied,
-            count: 0,
-        },
+        Event::PermissionPending { detail, .. } => {
+            set_last_error(detail);
+            FlexEvent {
+                kind: FlexEventKind::PermissionPending,
+                count: 0,
+            }
+        }
+        Event::PermissionDenied { permission, detail } => {
+            set_last_error(flexaudio::Error::PermissionDenied { permission, detail }.to_string());
+            FlexEvent {
+                kind: FlexEventKind::PermissionDenied,
+                count: 0,
+            }
+        }
+        Event::SilenceWhileSourceActive { detail } => {
+            set_last_error(detail);
+            FlexEvent {
+                kind: FlexEventKind::SilenceWhileSourceActive,
+                count: 0,
+            }
+        }
         Event::DeviceLost => FlexEvent {
             kind: FlexEventKind::DeviceLost,
             count: 0,
@@ -487,6 +505,20 @@ pub unsafe fn free_process_array(arr: *mut FlexProcessInfo, count: usize) {
 mod tests {
     use super::*;
     use flexaudio::ChunkFlags;
+
+    #[test]
+    fn terminal_backend_events_keep_error_code_and_cause() {
+        let error = flexaudio::Error::Backend("authorization query failed".into());
+        let event = event_to_c(Event::TerminalError {
+            error: error.clone(),
+        });
+        assert_eq!(event.kind, FlexEventKind::Error);
+        // SAFETY: event_to_c just stored a live thread-local C string; no call has replaced it.
+        let message = unsafe { CStr::from_ptr(crate::error::last_error_ptr()) }
+            .to_str()
+            .unwrap();
+        assert_eq!(message, error.to_string());
+    }
 
     // All-zero fields in FlexVadConfig mean all defaults.
     fn zero_vad_config() -> FlexVadConfig {
@@ -649,6 +681,69 @@ mod tests {
     }
 
     #[test]
+    fn permission_pending_preserves_new_code_and_advisory_message() {
+        for permission in [
+            flexaudio::Permission::Microphone,
+            flexaudio::Permission::SystemAudio,
+        ] {
+            let event = event_to_c(Event::PermissionPending {
+                permission,
+                detail: "Permission is pending; capture may remain silent until granted".into(),
+            });
+            assert_eq!(event.kind as i32, 8);
+            assert_eq!(event.count, 0);
+            // SAFETY: event_to_c stored a live thread-local C string; no call has replaced it.
+            let message = unsafe { CStr::from_ptr(crate::error::last_error_ptr()) }
+                .to_str()
+                .unwrap();
+            assert_eq!(
+                message,
+                "Permission is pending; capture may remain silent until granted"
+            );
+        }
+        assert_eq!(FlexEventKind::PermissionDenied as i32, 3);
+        assert_eq!(FlexEventKind::SilenceWhileSourceActive as i32, 7);
+    }
+
+    #[test]
+    fn permission_and_advisory_messages_preserve_c_codes() {
+        use crate::error::last_error_ptr;
+        for permission in [
+            flexaudio::Permission::Microphone,
+            flexaudio::Permission::SystemAudio,
+        ] {
+            let expected = flexaudio::Error::PermissionDenied {
+                permission,
+                detail: "denied by user".into(),
+            }
+            .to_string();
+            let event = event_to_c(Event::PermissionDenied {
+                permission,
+                detail: "denied by user".into(),
+            });
+            assert_eq!(event.kind as i32, 3);
+            // SAFETY: last_error_ptr points to a live thread-local C string.
+            let message = unsafe { CStr::from_ptr(last_error_ptr()) }
+                .to_str()
+                .unwrap();
+            assert_eq!(message, expected);
+        }
+        let advisory = event_to_c(Event::SilenceWhileSourceActive {
+            detail: "check recording privacy settings".into(),
+        });
+        assert_eq!(advisory.kind as i32, 7);
+        // SAFETY: No intervening call has changed the thread-local C string.
+        assert_eq!(
+            unsafe { CStr::from_ptr(last_error_ptr()) }
+                .to_str()
+                .unwrap(),
+            "check recording privacy settings"
+        );
+        assert_eq!(FlexEventKind::Unknown as i32, 6);
+        assert_eq!(crate::error::code::FLEX_FAILURE, -2);
+    }
+
+    #[test]
     fn event_to_c_maps_each_variant() {
         assert_eq!(
             event_to_c(Event::ChunkDropped { count: 5 }).kind,
@@ -664,7 +759,11 @@ mod tests {
             FlexEventKind::Recovered
         );
         assert_eq!(
-            event_to_c(Event::PermissionDenied).kind,
+            event_to_c(Event::PermissionDenied {
+                permission: flexaudio::Permission::Microphone,
+                detail: "denied by user".into()
+            })
+            .kind,
             FlexEventKind::PermissionDenied
         );
         assert_eq!(

@@ -64,10 +64,13 @@ pub(crate) fn to_py_err(err: fa::Error) -> PyErr {
 pub(crate) fn vad_err_to_py(err: flexaudio_vad::VadError) -> PyErr {
     let msg = err.to_string();
     match err {
-        flexaudio_vad::VadError::InvalidConfig(_) => PyValueError::new_err(msg),
-        flexaudio_vad::VadError::ModelLoad(_) | flexaudio_vad::VadError::Inference(_) => {
-            PyRuntimeError::new_err(msg)
+        flexaudio_vad::VadError::InvalidConfig(_) | flexaudio_vad::VadError::InvalidFormat(_) => {
+            PyValueError::new_err(msg)
         }
+        flexaudio_vad::VadError::ModelLoad(_)
+        | flexaudio_vad::VadError::Inference(_)
+        | flexaudio_vad::VadError::Reset(_)
+        | flexaudio_vad::VadError::Resample(_) => PyRuntimeError::new_err(msg),
     }
 }
 

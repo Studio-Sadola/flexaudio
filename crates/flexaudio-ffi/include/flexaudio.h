@@ -59,7 +59,8 @@ typedef enum FlexEventKind {
     FLEX_EVENT_KIND_STALLED = 1,
     // Data resumed after a stall.
     FLEX_EVENT_KIND_RECOVERED = 2,
-    // A required permission was denied.
+    // A required permission was denied; terminal, including a confirmed macOS self-probe failure.
+    // Retrieve the cause and remedy with flexaudio_last_error; capture stops.
     FLEX_EVENT_KIND_PERMISSION_DENIED = 3,
     // The capture device was lost.
     FLEX_EVENT_KIND_DEVICE_LOST = 4,
@@ -67,6 +68,13 @@ typedef enum FlexEventKind {
     FLEX_EVENT_KIND_ERROR = 5,
     // Event not matching a known kind (reserved for future variants).
     FLEX_EVENT_KIND_UNKNOWN = 6,
+    // Exact-zero system capture with an inconclusive permission diagnosis; advisory only.
+    // Missing permission and genuine digital silence remain possible.
+    // Retrieve the explanation with flexaudio_last_error; capture continues.
+    FLEX_EVENT_KIND_SILENCE_WHILE_SOURCE_ACTIVE = 7,
+    // Recording consent remains undecided; advisory only, capture continues.
+    // Retrieve guidance with flexaudio_last_error; capture may stay silent until granted.
+    FLEX_EVENT_KIND_PERMISSION_PENDING = 8,
 } FlexEventKind;
 
 // Whether the process is currently outputting audio (corresponds to [`flexaudio::ProcessInfo::is_output_active`]).
@@ -237,7 +245,9 @@ typedef struct FlexChunk {
 
 // One captured event, populated by `flexaudio_poll_event`.
 //
-// For `Error`, the message is stored in `flexaudio_last_error`.
+// For Error, PermissionDenied, SilenceWhileSourceActive, and PermissionPending,
+// the message is stored in flexaudio_last_error. PermissionDenied retains kind 3;
+// PermissionPending has kind 8 and does not stop capture.
 typedef struct FlexEvent {
     // Event kind.
     enum FlexEventKind kind;
@@ -424,7 +434,9 @@ uint64_t flexaudio_dropped_chunks(const struct FlexStream *s);
 // Retrieve one chunk and fill `out`.
 //
 // Return 1 when a chunk is retrieved and `out` is filled, 0 when none is available, or a
-// negative value on error. `out.data` is owned by flexaudio; free it with
+// negative value on error. A terminal permission denial returns FLEX_FAILURE (-2)
+// with actionable guidance in flexaudio_last_error, including after stop.
+// `out.data` is owned by flexaudio; free it with
 // `flexaudio_chunk_free` when done.
 //
 // If add-ons are enabled, the chunk passes through denoise → VAD before it is returned. When
@@ -446,7 +458,11 @@ void flexaudio_chunk_free(struct FlexChunk *chunk);
 // Retrieve one event and fill `out`.
 //
 // Return 1 when an event is retrieved, 0 when none is available, or a negative value on error.
-// For an `Error` event, set `out.kind = Error` and store the message in last_error.
+// Error, PermissionDenied (kind 3), SilenceWhileSourceActive (kind 7), and
+// PermissionPending (kind 8, advisory only: capture continues)
+// store their explanation in last_error. PermissionDenied is terminal, including
+// a confirmed macOS self-probe failure. SilenceWhileSourceActive means the
+// permission diagnosis is inconclusive; both advisory kinds continue capture.
 //
 // # Safety
 // `s` must be a valid handle, and `out` must point to a valid `FlexEvent` destination.
@@ -488,6 +504,14 @@ int32_t flexaudio_switch_source_with_exclude_pids(struct FlexStream *s,
                                                   const struct FlexConfig *config,
                                                   const uint32_t *exclude_pids,
                                                   uintptr_t exclude_pids_len);
+
+// Return FLEX_OK when no terminal failure is stored, or FLEX_FAILURE (-2) and
+// set flexaudio_last_error to the terminal reason. Does not consume events and
+// remains available after flexaudio_stop.
+//
+// # Safety
+// s must be a valid handle (NULL is InvalidArg).
+int32_t flexaudio_terminal_error(const struct FlexStream *s);
 
 // List available devices, allocate an array, and set `out_array` / `out_count`.
 //

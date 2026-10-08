@@ -15,9 +15,10 @@
 //!
 //! No network communication occurs at runtime (napi is only the N-API bridge).
 
+mod flac_encoder;
+
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::mpsc;
@@ -43,7 +44,6 @@ use flexaudio::{
 
 // Core types for the three addons. Import aliases to avoid the `#[napi]` wrappers (Vad / Denoiser).
 use flexaudio_denoise::{DenoiseError, Denoiser as CoreDenoiser};
-use flexaudio_encode::{EncodeError, FlacWriter};
 use flexaudio_vad::{Vad as CoreVad, VadConfig, VadError, VadEvent};
 
 /// pts window for pairing the secondary tap (60ms = 3 chunks). The secondary trails by 20–60ms,
@@ -92,6 +92,7 @@ type DeviceTsfn = ThreadsafeFunction<JsDeviceEvent, ErrorStrategy::Fatal>;
 enum ChunkEmit {
     Chunk(Box<JsAudioChunk>),
     StopFlushed,
+    VadError(String),
 }
 
 /// `napi_deferred` is a raw pointer. Created on the JS thread and resolved through TSFN.
@@ -179,6 +180,77 @@ fn resolve_undefined(env: sys::napi_env, deferred: SendDeferred) {
     let _ = unsafe { sys::napi_resolve_deferred(env, deferred.0, undefined) };
 }
 
+/// Settle on the JS thread after delivery has drained. Terminal failures reject
+/// every waiter, including subsequent stop calls.
+fn settle_stop(
+    env: sys::napi_env,
+    deferred: SendDeferred,
+    terminal: &Mutex<Option<flexaudio::Error>>,
+) {
+    let error = terminal.lock().unwrap_or_else(lock_poisoned).clone();
+    match error {
+        None => resolve_undefined(env, deferred),
+        Some(error) => {
+            let message = error.to_string();
+            let mut value = ptr::null_mut();
+            let mut exception = ptr::null_mut();
+            // SAFETY: This runs on the live JS thread; message bytes stay valid
+            // for creation and all output pointers refer to local N-API values.
+            unsafe {
+                let status = sys::napi_create_string_utf8(
+                    env,
+                    message.as_ptr().cast(),
+                    message.len(),
+                    &mut value,
+                );
+                if status == sys::Status::napi_ok {
+                    let status =
+                        sys::napi_create_error(env, ptr::null_mut(), value, &mut exception);
+                    if status == sys::Status::napi_ok {
+                        let _ = sys::napi_reject_deferred(env, deferred.0, exception);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn terminal_event(error: flexaudio::Error) -> JsStreamEvent {
+    match error {
+        flexaudio::Error::PermissionDenied { permission, detail } => {
+            event_to_js(Event::PermissionDenied { permission, detail })
+        }
+        other => event_to_js(Event::Error(other.to_string())),
+    }
+}
+
+/// One notification path for normal polling and final stop, including hosts
+/// without an event callback. The durable terminal snapshot precedes JS delivery.
+fn forward_stream_events(
+    stream: &mut flexaudio::Stream,
+    callback: Option<&EventTsfn>,
+    terminal: &Mutex<Option<flexaudio::Error>>,
+) {
+    if let Some(error) = stream.terminal_error() {
+        *terminal.lock().unwrap_or_else(lock_poisoned) = Some(error);
+    }
+    while let Some(event) = stream.poll_event() {
+        if let Event::PermissionDenied { permission, detail } = &event {
+            *terminal.lock().unwrap_or_else(lock_poisoned) =
+                Some(flexaudio::Error::PermissionDenied {
+                    permission: *permission,
+                    detail: detail.clone(),
+                });
+        }
+        if let Event::TerminalError { error } = &event {
+            *terminal.lock().unwrap_or_else(lock_poisoned) = Some(error.clone());
+        }
+        if let Some(callback) = callback {
+            callback.call(event_to_js(event), ThreadsafeFunctionCallMode::NonBlocking);
+        }
+    }
+}
+
 fn take_stop_waiters(phase: &Mutex<StopPhase>) -> Vec<SendDeferred> {
     let mut g = phase.lock().unwrap_or_else(lock_poisoned);
     match std::mem::replace(&mut *g, StopPhase::Stopped) {
@@ -187,6 +259,9 @@ fn take_stop_waiters(phase: &Mutex<StopPhase>) -> Vec<SendDeferred> {
         StopPhase::Running => vec![],
     }
 }
+
+/// Durable copy of the core's terminal failure, retained after the bridge exits.
+type TerminalError = Arc<Mutex<Option<flexaudio::Error>>>;
 
 /// Weak reference to the chunk TSFN. `StopFlushed` / settlement use it to unref after resolving
 /// (inserted later because the TSFN does not exist at creation time).
@@ -233,6 +308,7 @@ fn make_chunk_tsfn(
     stop_phase: Arc<Mutex<StopPhase>>,
     user: Arc<UserChunkCb>,
     chunk_weak: ChunkTsfnWeakCell,
+    terminal: TerminalError,
 ) -> napi::Result<Arc<ChunkTsfn>> {
     let pump =
         env.create_function_from_closure("flexaudioChunkPump", |ctx| ctx.env.get_undefined())?;
@@ -242,6 +318,9 @@ fn make_chunk_tsfn(
             let chunk_weak = chunk_weak.clone();
             move |ctx: ThreadSafeCallContext<ChunkEmit>| match ctx.value {
                 ChunkEmit::Chunk(chunk) => {
+                    if terminal.lock().unwrap_or_else(lock_poisoned).is_some() {
+                        return Ok(Vec::new());
+                    }
                     let refer = user.refer();
                     if refer.is_null() {
                         return Ok(Vec::<Unknown>::new());
@@ -255,9 +334,13 @@ fn make_chunk_tsfn(
                     let _ = func.call(*chunk);
                     Ok(Vec::<Unknown>::new())
                 }
+                ChunkEmit::VadError(message) => {
+                    ctx.env.throw_error(&message, None)?;
+                    Ok(Vec::<Unknown>::new())
+                }
                 ChunkEmit::StopFlushed => {
                     for deferred in take_stop_waiters(&stop_phase) {
-                        resolve_undefined(ctx.env.raw(), deferred);
+                        settle_stop(ctx.env.raw(), deferred, &terminal);
                     }
                     // Release the event-loop reference after termination and resolution (ordering contract).
                     unref_chunk_weak(&chunk_weak, &ctx.env);
@@ -282,13 +365,14 @@ fn make_settle_tsfn(
     stop_phase: Arc<Mutex<StopPhase>>,
     chunk_weak: ChunkTsfnWeakCell,
     user: Arc<UserChunkCb>,
+    terminal: TerminalError,
 ) -> napi::Result<SettleTsfn> {
     let pump =
         env.create_function_from_closure("flexaudioStopSettle", |ctx| ctx.env.get_undefined())?;
     let mut tsfn = pump.create_threadsafe_function::<(), Unknown, _, ErrorStrategy::Fatal>(0, {
         move |ctx: ThreadSafeCallContext<()>| {
             for deferred in take_stop_waiters(&stop_phase) {
-                resolve_undefined(ctx.env.raw(), deferred);
+                settle_stop(ctx.env.raw(), deferred, &terminal);
             }
             unref_chunk_weak(&chunk_weak, &ctx.env);
             user.release();
@@ -356,7 +440,7 @@ impl Task for ProcessesTask {
 /// Model loading/inference failures are environmental: GenericFailure.
 fn vad_err(err: VadError) -> NapiError {
     let status = match err {
-        VadError::InvalidConfig(_) => Status::InvalidArg,
+        VadError::InvalidConfig(_) | VadError::InvalidFormat(_) => Status::InvalidArg,
         _ => Status::GenericFailure,
     };
     NapiError::new(status, err.to_string())
@@ -367,14 +451,13 @@ fn denoise_err(err: DenoiseError) -> NapiError {
     NapiError::new(Status::InvalidArg, err.to_string())
 }
 
-/// EncodeError → napi::Error. Unsupported parameters map to InvalidArg; IO/encoder internals to
-/// GenericFailure. As it is `#[non_exhaustive]`, `_` also handles future variants.
-fn encode_err(err: EncodeError) -> NapiError {
-    let status = match err {
-        EncodeError::Unsupported(_) => Status::InvalidArg,
-        _ => Status::GenericFailure,
+/// Convert pure encoder diagnostics only at the Node boundary.
+fn encode_err(err: flac_encoder::EncoderError) -> NapiError {
+    let status = match err.kind {
+        flac_encoder::ErrorKind::InvalidArgument => Status::InvalidArg,
+        flac_encoder::ErrorKind::Failure => Status::GenericFailure,
     };
-    NapiError::new(status, err.to_string())
+    NapiError::new(status, err.reason)
 }
 
 // ---------------------------------------------------------------------------
@@ -520,9 +603,16 @@ pub struct VadOptions {
     pub sample_rate: Option<u32>,
 }
 
-/// JS stream event. `type` identifies the kind; `count`/`message` are optional.
+/// Stream notification. permissionDenied is terminal, with permission and
+/// cause/remedy in message. permissionPending is advisory: consent remains undecided,
+/// capture continues and may stay silent until granted. silenceWhileSourceActive
+/// is advisory: the system-audio diagnosis is inconclusive and capture continues.
+/// Missing permission and genuine digital silence remain possible in that case.
 #[napi(object)]
 pub struct JsStreamEvent {
+    /// Present on permissionDenied and permissionPending: microphone | systemAudio.
+    #[napi(ts_type = "'microphone' | 'systemAudio'")]
+    pub permission: Option<String>,
     #[napi(js_name = "type")]
     pub kind: String,
     pub count: Option<i64>,
@@ -788,52 +878,54 @@ fn check_denoise_rate(enabled: bool, output_rate: u32) -> napi::Result<()> {
     Ok(())
 }
 
-/// Build the path for FLAC rotation `index` (1-based; pure function).
-///
-/// Same convention as CLI `split_file_path`: `rec.flac` becomes `rec-001.flac, rec-002.flac, …`
-/// with a three-digit zero-padded sequence before the extension. Digits grow naturally from file
-/// 1000 onward. Paths without extensions append the sequence. The parent directory is preserved.
-fn split_flac_path(base: &Path, index: u64) -> PathBuf {
-    let stem = base
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let name = match base.extension() {
-        Some(ext) => format!("{stem}-{index:03}.{}", ext.to_string_lossy()),
-        None => format!("{stem}-{index:03}"),
-    };
-    base.with_file_name(name)
-}
-
 fn event_to_js(ev: Event) -> JsStreamEvent {
     match ev {
+        Event::TerminalError { error } => event_to_js(Event::Error(error.to_string())),
         Event::ChunkDropped { count } => JsStreamEvent {
             kind: "chunkDropped".to_string(),
+            permission: None,
             count: Some(count as i64),
             message: None,
         },
         Event::StreamStalled => JsStreamEvent {
             kind: "stalled".to_string(),
+            permission: None,
             count: None,
             message: None,
         },
         Event::StreamRecovered => JsStreamEvent {
             kind: "recovered".to_string(),
+            permission: None,
             count: None,
             message: None,
         },
-        Event::PermissionDenied => JsStreamEvent {
-            kind: "permissionDenied".to_string(),
+        Event::PermissionPending { permission, detail } => JsStreamEvent {
+            kind: "permissionPending".to_string(),
+            permission: Some(permission.as_str().to_string()),
             count: None,
-            message: None,
+            message: Some(detail),
+        },
+        Event::PermissionDenied { permission, detail } => JsStreamEvent {
+            kind: "permissionDenied".to_string(),
+            permission: Some(permission.as_str().to_string()),
+            count: None,
+            message: Some(flexaudio::Error::PermissionDenied { permission, detail }.to_string()),
+        },
+        Event::SilenceWhileSourceActive { detail } => JsStreamEvent {
+            kind: "silenceWhileSourceActive".to_string(),
+            permission: None,
+            count: None,
+            message: Some(detail),
         },
         Event::DeviceLost => JsStreamEvent {
             kind: "deviceLost".to_string(),
+            permission: None,
             count: None,
             message: None,
         },
         Event::Error(msg) => JsStreamEvent {
             kind: "error".to_string(),
+            permission: None,
             count: None,
             message: Some(msg),
         },
@@ -841,6 +933,7 @@ fn event_to_js(ev: Event) -> JsStreamEvent {
         // with their debug representation (do not swallow them).
         other => JsStreamEvent {
             kind: "error".to_string(),
+            permission: None,
             count: None,
             message: Some(format!("unknown event: {other:?}")),
         },
@@ -979,7 +1072,7 @@ enum BridgeCmd {
     /// Pause delivery.
     Pause,
     /// Resume delivery.
-    Resume,
+    Resume(mpsc::Sender<flexaudio::Result<()>>),
     /// Change input gain (linear multiplier). napi validates the value before sending.
     SetGain(f32),
     /// Return a current-value snapshot synchronously (for getters).
@@ -1011,8 +1104,6 @@ struct PairingBridge {
     vad_tap: VadTap,
     /// VAD internal rate (denominator for absolute time calculation; 8000/16000).
     vad_rate: i64,
-    /// Cumulative samples fed at VAD's internal rate (`reset` returns it to 0). Anchor for absolute time.
-    vad_samples_fed: i64,
     /// Previous VAD tap chunk's `dropped_before` (detects newly dropped data).
     vad_last_dropped: u32,
     /// Anchor of the most recent chunk fed to VAD (`(vad_sample_base, pts_base)`). Retained so
@@ -1037,6 +1128,13 @@ struct PairingBridge {
 }
 
 impl PairingBridge {
+    fn report_vad_error(&self, message: String) {
+        self.on_chunk.call(
+            ChunkEmit::VadError(message),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+    }
+
     /// Feed the bound tap's pre-quantization f32 to VAD and return finalized events with absolute time
     /// from recording zero. Reset and re-anchor on discontinuity flags / `dropped_before` increments.
     /// Returns `None` when VAD is not configured.
@@ -1055,12 +1153,21 @@ impl PairingBridge {
         self.vad_last_dropped = dropped_before;
         let vad_rate = self.vad_rate;
         if discontinuity || dropped_jump {
-            self.vad.as_mut().unwrap().reset();
-            self.vad_samples_fed = 0;
+            if let Err(error) = self.vad.as_mut().unwrap().reset() {
+                self.report_vad_error(error.to_string());
+                return None;
+            }
         }
         // Record (vad_sample_base, pts_base) for this chunk's start. Also retain it on self so flushVad
         // can calculate absolute times for final events without a new chunk.
-        let vad_sample_base = self.vad_samples_fed;
+        let vad_sample_base =
+            match i64::try_from(self.vad.as_ref().unwrap().converted_sample_position()) {
+                Ok(position) => position,
+                Err(_) => {
+                    self.report_vad_error("VAD sample position exceeds the timestamp range".into());
+                    return None;
+                }
+            };
         let pts_base = pts_ns;
         self.vad_anchor_sample = vad_sample_base;
         self.vad_anchor_pts = pts_base;
@@ -1069,9 +1176,13 @@ impl PairingBridge {
             .as_mut()
             .unwrap()
             .process_pcm(samples, in_rate, in_channels);
-        // Add the approximate count of VAD internal-rate samples fed by this chunk to the cumulative count.
-        let frames = samples.len() / (in_channels.max(1) as usize);
-        self.vad_samples_fed += (frames as i64 * vad_rate) / (in_rate.max(1) as i64);
+        let events = match events {
+            Ok(events) => events,
+            Err(error) => {
+                self.report_vad_error(error.to_string());
+                return None;
+            }
+        };
 
         let js = events
             .into_iter()
@@ -1106,9 +1217,14 @@ impl PairingBridge {
         let Some(vad) = self.vad.as_mut() else {
             return Vec::new();
         };
-        let events = vad.flush();
+        let events = match vad.flush() {
+            Ok(events) => events,
+            Err(error) => {
+                self.report_vad_error(error.to_string());
+                return Vec::new();
+            }
+        };
         // flush() reset VAD, so the cumulative position returns to zero.
-        self.vad_samples_fed = 0;
         let vad_rate = self.vad_rate;
         let anchor_sample = self.vad_anchor_sample;
         let anchor_pts = self.vad_anchor_pts;
@@ -1319,6 +1435,7 @@ pub struct FlexStream {
     stop_phase: Arc<Mutex<StopPhase>>,
     chunk_tsfn: Arc<ChunkTsfn>,
     settle_tsfn: SettleTsfn,
+    terminal: TerminalError,
 }
 
 impl FlexStream {
@@ -1331,9 +1448,11 @@ impl FlexStream {
         on_event: Option<EventTsfn>,
         chunk_tsfn: Arc<ChunkTsfn>,
         settle_tsfn: SettleTsfn,
+        terminal: TerminalError,
     ) -> Self {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_stop = stop_flag.clone();
+        let thread_terminal = terminal.clone();
         let stop_phase = bridge.stop_phase.clone();
         let settle_for_bridge = settle_tsfn.clone();
         let (cmd_tx, cmd_rx) = mpsc::channel::<BridgeCmd>();
@@ -1352,7 +1471,9 @@ impl FlexStream {
                             let _ = sw.result_tx.send(r);
                         }
                         BridgeCmd::Pause => stream.pause(),
-                        BridgeCmd::Resume => stream.resume(),
+                        BridgeCmd::Resume(result_tx) => {
+                            let _ = result_tx.send(stream.resume());
+                        }
                         BridgeCmd::SetGain(g) => {
                             // napi validates before sending, so Err is not expected.
                             // Even an unexpected Err does not become an event (the result is discarded).
@@ -1375,6 +1496,12 @@ impl FlexStream {
                         BridgeCmd::FlushVad => bridge.flush_vad(),
                     }
                 }
+                if let Some(error) = stream.terminal_error() {
+                    *thread_terminal.lock().unwrap_or_else(lock_poisoned) = Some(error);
+                    bridge.primary_fifo.clear();
+                    bridge.secondary_fifo.clear();
+                    bridge.pending_flush_events.clear();
+                }
                 // Drain all arriving primary/secondary chunks into the bridge. Run VAD/quantization, pair within
                 // the pts window, and deliver to onChunk.
                 while let Some(chunk) = stream.poll_chunk() {
@@ -1384,12 +1511,7 @@ impl FlexStream {
                     bridge.on_secondary(chunk);
                 }
                 bridge.drain_pairs();
-                // Process events too.
-                while let Some(ev) = stream.poll_event() {
-                    if let Some(cb) = &on_event {
-                        cb.call(event_to_js(ev), ThreadsafeFunctionCallMode::NonBlocking);
-                    }
-                }
+                forward_stream_events(&mut stream, on_event.as_ref(), &thread_terminal);
                 thread::sleep(POLL_INTERVAL);
             }
             // Drain chunks remaining in the rings before stopping, then deliver pairs.
@@ -1409,6 +1531,15 @@ impl FlexStream {
             // This delivers both trailing recorded audio (2) and final speechEnd (3). Audio stop-flush and
             // flushVad are separate (audio samples versus VAD events).
             stream.stop(); // ①
+                           // Stop can discover a pending backend denial. Preserve its event and
+                           // terminal state before queuing any tail audio or settlement.
+            forward_stream_events(&mut stream, on_event.as_ref(), &thread_terminal);
+            if let Some(error) = stream.terminal_error() {
+                *thread_terminal.lock().unwrap_or_else(lock_poisoned) = Some(error);
+                bridge.primary_fifo.clear();
+                bridge.secondary_fifo.clear();
+                bridge.pending_flush_events.clear();
+            }
             while let Some(chunk) = stream.poll_chunk() {
                 bridge.on_primary(chunk); // 2 (primary tap VAD also consumes the tail here)
             }
@@ -1416,10 +1547,17 @@ impl FlexStream {
                 bridge.on_secondary(chunk); // 2 (secondary tap VAD also consumes the tail here)
             }
             bridge.drain_pairs(); // 2 Deliver trailing audio
-            bridge.flush_vad_final(); // 3 Final events + frames:0 terminator
-                                      // 4. End signal in the same TSFN queue. Processing it in JS resolves stop()'s Promise
-                                      // (AsyncTask / another TSFN could resolve before onChunk).
-                                      // If the chunk TSFN fails (Closing / QueueFull, etc.), use the settlement TSFN.
+            if let Some(error) = stream.terminal_error() {
+                *thread_terminal.lock().unwrap_or_else(lock_poisoned) = Some(error);
+                bridge.primary_fifo.clear();
+                bridge.secondary_fifo.clear();
+                bridge.pending_flush_events.clear();
+            } else {
+                bridge.flush_vad_final(); // Final events + frames:0 terminator.
+            }
+            // 4. End signal in the same TSFN queue. Processing it in JS resolves stop()'s Promise
+            // (AsyncTask / another TSFN could resolve before onChunk).
+            // If the chunk TSFN fails (Closing / QueueFull, etc.), use the settlement TSFN.
             post_stop_flushed(&bridge.on_chunk, &settle_for_bridge, &bridge.stop_phase);
         });
 
@@ -1432,6 +1570,7 @@ impl FlexStream {
             stop_phase,
             chunk_tsfn,
             settle_tsfn,
+            terminal,
         }
     }
 
@@ -1494,6 +1633,8 @@ impl FlexStream {
     /// stop (the last PCM and `frames:0` terminator) have been delivered to JS.
     /// Repeated calls await the same completion, or resolve immediately if already complete. Calling
     /// inside `onChunk` does not freeze JS because joining happens off the JS thread.
+    /// Rejects with the stored permission error on terminal failure; queued audio
+    /// and the terminator are suppressed after confirmed denial.
     #[napi(ts_return_type = "Promise<void>")]
     pub fn stop(&self, env: Env) -> napi::Result<JsObject> {
         let (deferred, promise) = create_js_promise(&env)?;
@@ -1504,7 +1645,7 @@ impl FlexStream {
         match &mut *phase {
             StopPhase::Stopped => {
                 drop(phase);
-                resolve_undefined(env.raw(), deferred);
+                settle_stop(env.raw(), deferred, &self.terminal);
                 unref_chunk_tsfn(self.chunk_tsfn.as_ref(), &env);
                 return Ok(promise);
             }
@@ -1526,7 +1667,7 @@ impl FlexStream {
                 // No join handle (e.g. taken by Drop's reaper). Callbacks to deliver are being
                 // cleaned up through another path, or are gone. Resolve immediately on the JS thread.
                 for d in take_stop_waiters(&self.stop_phase) {
-                    resolve_undefined(env.raw(), d);
+                    settle_stop(env.raw(), d, &self.terminal);
                 }
                 unref_chunk_tsfn(self.chunk_tsfn.as_ref(), &env);
             }
@@ -1546,13 +1687,24 @@ impl FlexStream {
                         let _ = h.join();
                     });
                 for d in take_stop_waiters(&self.stop_phase) {
-                    resolve_undefined(env.raw(), d);
+                    settle_stop(env.raw(), d, &self.terminal);
                 }
                 unref_chunk_tsfn(self.chunk_tsfn.as_ref(), &env);
             }
             Some(h) => self.spawn_stop_worker(h),
         }
         Ok(promise)
+    }
+
+    /// Stored terminal failure, or undefined when capture has not terminally failed.
+    /// Remains available after stop and does not consume onEvent notifications.
+    #[napi]
+    pub fn terminal_error(&self) -> Option<JsStreamEvent> {
+        self.terminal
+            .lock()
+            .unwrap_or_else(lock_poisoned)
+            .clone()
+            .map(terminal_event)
     }
 
     /// Hot-swap the input source (mic/system/process) without stopping recording.
@@ -1567,6 +1719,9 @@ impl FlexStream {
     /// Throws if `stop()` has already completed (the bridge thread has stopped).
     #[napi]
     pub fn switch_source(&self, options: OpenOptions) -> napi::Result<()> {
+        if let Some(error) = self.terminal.lock().unwrap_or_else(lock_poisoned).clone() {
+            return Err(to_napi_err(error));
+        }
         // As in openStream, build_config converts options → StreamConfig.
         let config = build_config(&options)?;
 
@@ -1619,19 +1774,31 @@ impl FlexStream {
     /// Unpause and resume delivery. Throws if `stop()` has already completed.
     #[napi]
     pub fn resume(&self) -> napi::Result<()> {
+        if let Some(error) = self.terminal.lock().unwrap_or_else(lock_poisoned).clone() {
+            return Err(to_napi_err(error));
+        }
         let cmd_tx = {
             let g = self.inner.lock().unwrap_or_else(lock_poisoned);
             g.cmd_tx.clone().ok_or_else(|| {
                 NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
             })?
         };
-        cmd_tx.send(BridgeCmd::Resume).map_err(|_| {
+        let (result_tx, result_rx) = mpsc::channel();
+        cmd_tx.send(BridgeCmd::Resume(result_tx)).map_err(|_| {
             NapiError::new(
                 Status::GenericFailure,
                 "bridge thread is not running".to_string(),
             )
         })?;
-        Ok(())
+        result_rx
+            .recv()
+            .map_err(|_| {
+                NapiError::new(
+                    Status::GenericFailure,
+                    "bridge thread dropped before responding",
+                )
+            })?
+            .map_err(to_napi_err)
     }
 
     /// Force-finalize integrated VAD's currently open utterance (runtime operation).
@@ -1813,6 +1980,23 @@ pub fn processes() -> AsyncTask<ProcessesTask> {
 }
 
 /// Open and start a stream, returning a `FlexStream` that sends chunks/events to callbacks.
+/// Confirmed microphone/system-audio denial throws actionable permission guidance.
+/// Supply onEvent for runtime denial, permissionPending and silenceWhileSourceActive
+/// advisories. Without onEvent, terminalError() and stop() expose terminal failures
+/// only; they do not expose advisories. macOS bundled microphone prompts wait up to
+/// 30 s; an unanswered prompt proceeds with capture. Undecided consent emits
+/// permissionPending after 5 s of capture. Authorization is checked every 500 ms
+/// for the first 60 s, then every 2 s until resolved or stopped. Bare-host opens rely
+/// on the responsible-app prompt. Windows checks Microphone privacy, including
+/// Let desktop apps access your microphone.
+///
+/// macOS system/process capture runs a once-per-generation self-probe after 5 s of
+/// exact-zero samples with eligible external output active. It renders a roughly
+/// 300 ms diagnostic signal on the default output and captures only our own process
+/// in a separate private tap. A confirmed failure emits terminal permissionDenied
+/// with permission systemAudio; an inconclusive result emits silenceWhileSourceActive
+/// and continues. The signal may enter capture when our own process is included
+/// (e.g. excludeSelf: false). Stopping cancels the probe without a late event.
 ///
 /// `options.denoise` enables noise suppression in core (internal canonical form), so both primary
 /// and secondary taps receive denoised audio. `options.vad` runs VAD on the tap selected by `vadTap`
@@ -1895,17 +2079,24 @@ pub fn open_stream(
     stream.start().map_err(to_napi_err)?;
 
     let stop_phase = Arc::new(Mutex::new(StopPhase::Running));
+    let terminal: TerminalError = Arc::new(Mutex::new(None));
     let user = make_user_chunk_cb(&env, &on_chunk)?;
     let chunk_weak: ChunkTsfnWeakCell = Arc::new(OnceLock::new());
-    let on_chunk = make_chunk_tsfn(&env, stop_phase.clone(), user.clone(), chunk_weak.clone())?;
-    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user)?;
+    let on_chunk = make_chunk_tsfn(
+        &env,
+        stop_phase.clone(),
+        user.clone(),
+        chunk_weak.clone(),
+        terminal.clone(),
+    )?;
+    let settle_tsfn =
+        make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user, terminal.clone())?;
     let bridge = PairingBridge {
         on_chunk: on_chunk.as_ref().clone(),
         stop_phase,
         vad,
         vad_tap,
         vad_rate: vad_rate as i64,
-        vad_samples_fed: 0,
         vad_last_dropped: 0,
         vad_anchor_sample: 0,
         vad_anchor_pts: 0,
@@ -1923,6 +2114,7 @@ pub fn open_stream(
         on_event,
         on_chunk,
         settle_tsfn,
+        terminal,
     ))
 }
 
@@ -2050,17 +2242,24 @@ pub fn open_mock_stream(
     // The mock path bypasses integrated denoise. VAD runs only when `vadThreshold` is specified (for
     // verification of flushVad, vadEvents, and pairing paths).
     let stop_phase = Arc::new(Mutex::new(StopPhase::Running));
+    let terminal: TerminalError = Arc::new(Mutex::new(None));
     let user = make_user_chunk_cb(&env, &on_chunk)?;
     let chunk_weak: ChunkTsfnWeakCell = Arc::new(OnceLock::new());
-    let on_chunk = make_chunk_tsfn(&env, stop_phase.clone(), user.clone(), chunk_weak.clone())?;
-    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user)?;
+    let on_chunk = make_chunk_tsfn(
+        &env,
+        stop_phase.clone(),
+        user.clone(),
+        chunk_weak.clone(),
+        terminal.clone(),
+    )?;
+    let settle_tsfn =
+        make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user, terminal.clone())?;
     let bridge = PairingBridge {
         on_chunk: on_chunk.as_ref().clone(),
         stop_phase,
         vad,
         vad_tap,
         vad_rate: 16_000,
-        vad_samples_fed: 0,
         vad_last_dropped: 0,
         vad_anchor_sample: 0,
         vad_anchor_pts: 0,
@@ -2078,6 +2277,7 @@ pub fn open_mock_stream(
         None,
         on_chunk,
         settle_tsfn,
+        terminal,
     ))
 }
 
@@ -2117,12 +2317,14 @@ impl Vad {
         samples: Float32Array,
         input_sample_rate: u32,
         input_channels: u16,
-    ) -> Vec<JsVadEvent> {
-        self.inner
+    ) -> napi::Result<Vec<JsVadEvent>> {
+        Ok(self
+            .inner
             .process_pcm(&samples[..], input_sample_rate, input_channels)
+            .map_err(vad_err)?
             .into_iter()
             .map(vad_event_to_js)
-            .collect()
+            .collect())
     }
 
     /// Force-finalize the currently open utterance and return finalized [`JsVadEvent`] values (same behavior
@@ -2132,18 +2334,20 @@ impl Vad {
     /// Standalone `Vad` has no pts context, so `atNs` is `undefined` (`atSample` remains the raw cumulative
     /// position at VAD's internal rate). Returns an empty array when no utterance is open.
     #[napi]
-    pub fn flush(&mut self) -> Vec<JsVadEvent> {
-        self.inner
+    pub fn flush(&mut self) -> napi::Result<Vec<JsVadEvent>> {
+        Ok(self
+            .inner
             .flush()
+            .map_err(vad_err)?
             .into_iter()
             .map(vad_event_to_js)
-            .collect()
+            .collect())
     }
 
     /// Initialize internal state (state / context / state machine / sample position / resampler).
     #[napi]
-    pub fn reset(&mut self) {
-        self.inner.reset();
+    pub fn reset(&mut self) -> napi::Result<()> {
+        self.inner.reset().map_err(vad_err)
     }
 }
 
@@ -2160,26 +2364,13 @@ impl Vad {
 /// by up to one chunk; chunks are never split and no data is dropped. Omitted/0 `splitSeconds` uses one file.
 #[napi]
 pub struct FlacEncoder {
-    /// Output base path (sequence naming base when split; used unchanged for a single file).
-    base: PathBuf,
-    sample_rate: u32,
-    channels: u16,
-    /// Frame threshold per file (splitSeconds × sampleRate). 0 = single file.
-    frames_per_file: u64,
-    /// Current writer. None immediately after rotation (lazily created on the next chunk).
-    writer: Option<FlacWriter>,
-    /// Frames written to the current file (reset to 0 on rotation).
-    frames_in_current: u64,
-    /// Sequence number of the next file to open (1-based; meaningful only when splitting).
-    file_index: u64,
+    inner: flac_encoder::RotatingFlacEncoder,
 }
 
 #[napi]
 impl FlacEncoder {
     /// Create a FLAC writer. Omitted/0 `splitSeconds` uses one file; at least 1 enables timed rotation.
-    ///
-    /// `channels` must be 1..=2, `sampleRate` 1..=96000 Hz (otherwise InvalidArg). When splitting,
-    /// the first file (`name-001.flac`) is created immediately.
+    /// `channels` must be 1..=2, `sampleRate` 1..=96000 Hz (otherwise InvalidArg).
     #[napi(factory)]
     pub fn create(
         path: String,
@@ -2187,75 +2378,28 @@ impl FlacEncoder {
         channels: u16,
         split_seconds: Option<u32>,
     ) -> napi::Result<FlacEncoder> {
-        let base = PathBuf::from(path);
-        let frames_per_file = u64::from(split_seconds.unwrap_or(0)) * u64::from(sample_rate);
-        let file_index = 1;
-        // Open base for a single file, or name-001.ext as the first split file.
-        let first_path = if frames_per_file > 0 {
-            split_flac_path(&base, file_index)
-        } else {
-            base.clone()
-        };
-        let writer = FlacWriter::create(&first_path, sample_rate, channels).map_err(encode_err)?;
-        Ok(FlacEncoder {
-            base,
+        let inner = flac_encoder::RotatingFlacEncoder::create(
+            path.into(),
             sample_rate,
             channels,
-            frames_per_file,
-            writer: Some(writer),
-            frames_in_current: 0,
-            file_index,
-        })
-    }
-
-    /// Path of the next file to open when splitting.
-    fn next_path(&self) -> PathBuf {
-        if self.frames_per_file > 0 {
-            split_flac_path(&self.base, self.file_index)
-        } else {
-            self.base.clone()
-        }
+            split_seconds,
+        )
+        .map_err(encode_err)?;
+        Ok(Self { inner })
     }
 
     /// Append interleaved f32 (length must be a multiple of `channels`, otherwise InvalidArg).
-    ///
-    /// After writing, if the current file's frame count reaches the threshold, finalize immediately and
-    /// rotate to the next file (the next `writeChunk` starts the new file).
+    /// Reaching the split threshold finalizes the current file; the next chunk opens the next file.
     #[napi]
     pub fn write_chunk(&mut self, samples: Float32Array) -> napi::Result<()> {
-        // writer=None immediately after rotation. Open the next file here (lazy creation).
-        if self.writer.is_none() {
-            let path = self.next_path();
-            self.writer = Some(
-                FlacWriter::create(&path, self.sample_rate, self.channels).map_err(encode_err)?,
-            );
-        }
-        let writer = self.writer.as_mut().expect("opened immediately above");
-        writer.write_chunk(&samples[..]).map_err(encode_err)?;
-
-        // Frame count = sample count / channel count. write_chunk validated divisibility.
-        let frames = samples.len() as u64 / u64::from(self.channels);
-        self.frames_in_current += frames;
-
-        if self.frames_per_file > 0 && self.frames_in_current >= self.frames_per_file {
-            // Threshold reached. Finalize the current file; the next chunk starts the next file.
-            let done = self.writer.take().expect("written immediately above");
-            done.finalize().map_err(encode_err)?;
-            self.file_index += 1;
-            self.frames_in_current = 0;
-        }
-        Ok(())
+        self.inner.write_chunk(&samples).map_err(encode_err)
     }
 
-    /// Write out the remainder, finalize the header, and close the open file. Safe to call repeatedly
-    /// (subsequent calls are no-ops). Dropping without calling this still closes through `FlacWriter`'s
-    /// best-effort Drop, but call this to detect write errors.
+    /// Finalize and close the file. Repeated successful calls are no-ops; failures remain errors.
+    /// Dropping still makes a best-effort close, but finalize reports write errors.
     #[napi]
     pub fn finalize(&mut self) -> napi::Result<()> {
-        if let Some(writer) = self.writer.take() {
-            writer.finalize().map_err(encode_err)?;
-        }
-        Ok(())
+        self.inner.finalize().map_err(encode_err)
     }
 }
 
@@ -2324,8 +2468,20 @@ mod tests {
     //! read back through `Deref<[f32]>` / `get_u64()` without a JS runtime (napi 2.16).
 
     use super::*;
+    use flexaudio_encode::EncodeError;
 
     // --- source kind round trip ---
+
+    #[test]
+    fn terminal_backend_events_keep_error_kind_and_cause() {
+        let error = flexaudio::Error::Backend("authorization query failed".into());
+        let event = event_to_js(Event::TerminalError {
+            error: error.clone(),
+        });
+        assert_eq!(event.kind, "error");
+        assert_eq!(event.message, Some(error.to_string()));
+        assert_eq!(event.permission, None);
+    }
 
     #[test]
     fn source_kind_roundtrips() {
@@ -2526,6 +2682,27 @@ mod tests {
     // --- to_napi_err ---
 
     #[test]
+    fn terminal_permission_errors_use_existing_napi_status_and_event_shape() {
+        for permission in [
+            flexaudio::Permission::Microphone,
+            flexaudio::Permission::SystemAudio,
+        ] {
+            let error = flexaudio::Error::PermissionDenied {
+                permission,
+                detail: "denied by user".into(),
+            };
+            let expected = error.to_string();
+            let mapped = to_napi_err(error.clone());
+            assert_eq!(mapped.status, Status::GenericFailure);
+            assert_eq!(mapped.reason, expected);
+            let event = terminal_event(error);
+            assert_eq!(event.kind, "permissionDenied");
+            assert_eq!(event.permission.as_deref(), Some(permission.as_str()));
+            assert_eq!(event.message.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
     fn to_napi_err_carries_message_and_status() {
         let err = to_napi_err(flexaudio::Error::DeviceNotFound);
         assert_eq!(err.status, Status::GenericFailure);
@@ -2537,6 +2714,56 @@ mod tests {
     // --- event_to_js ---
 
     #[test]
+    fn permission_pending_preserves_permission_and_advisory_message() {
+        for permission in [
+            flexaudio::Permission::Microphone,
+            flexaudio::Permission::SystemAudio,
+        ] {
+            let mapped = event_to_js(Event::PermissionPending {
+                permission,
+                detail: "Permission is pending; capture may remain silent until granted".into(),
+            });
+            assert_eq!(mapped.kind, "permissionPending");
+            assert_eq!(mapped.permission.as_deref(), Some(permission.as_str()));
+            assert_eq!(mapped.count, None);
+            assert_eq!(
+                mapped.message.as_deref(),
+                Some("Permission is pending; capture may remain silent until granted")
+            );
+        }
+    }
+
+    #[test]
+    fn permission_events_preserve_cause_and_advisory_kind() {
+        for permission in [
+            flexaudio::Permission::Microphone,
+            flexaudio::Permission::SystemAudio,
+        ] {
+            let expected = flexaudio::Error::PermissionDenied {
+                permission,
+                detail: "denied by user".into(),
+            }
+            .to_string();
+            let mapped = event_to_js(Event::PermissionDenied {
+                permission,
+                detail: "denied by user".into(),
+            });
+            assert_eq!(mapped.kind, "permissionDenied");
+            assert_eq!(mapped.permission.as_deref(), Some(permission.as_str()));
+            assert_eq!(mapped.message.as_deref(), Some(expected.as_str()));
+        }
+        let advisory = event_to_js(Event::SilenceWhileSourceActive {
+            detail: "check recording privacy settings".into(),
+        });
+        assert_eq!(advisory.kind, "silenceWhileSourceActive");
+        assert_eq!(advisory.permission, None);
+        assert_eq!(
+            advisory.message.as_deref(),
+            Some("check recording privacy settings")
+        );
+    }
+
+    #[test]
     fn event_to_js_maps_each_variant() {
         let dropped = event_to_js(Event::ChunkDropped { count: 7 });
         assert_eq!(dropped.kind, "chunkDropped");
@@ -2546,7 +2773,11 @@ mod tests {
         assert_eq!(event_to_js(Event::StreamStalled).kind, "stalled");
         assert_eq!(event_to_js(Event::StreamRecovered).kind, "recovered");
         assert_eq!(
-            event_to_js(Event::PermissionDenied).kind,
+            event_to_js(Event::PermissionDenied {
+                permission: flexaudio::Permission::Microphone,
+                detail: "denied by user".into()
+            })
+            .kind,
             "permissionDenied"
         );
         assert_eq!(event_to_js(Event::DeviceLost).kind, "deviceLost");
@@ -2762,36 +2993,6 @@ mod tests {
         assert!(check_denoise_rate(false, 48_000).is_ok());
     }
 
-    // --- split_flac_path (sequence naming; same convention as CLI) ---
-
-    #[test]
-    fn split_flac_path_numbering() {
-        // With an extension, insert a three-digit zero-padded sequence before it.
-        assert_eq!(
-            split_flac_path(Path::new("rec.flac"), 1),
-            PathBuf::from("rec-001.flac")
-        );
-        assert_eq!(
-            split_flac_path(Path::new("rec.flac"), 12),
-            PathBuf::from("rec-012.flac")
-        );
-        // Digits grow naturally from file 1000 onward.
-        assert_eq!(
-            split_flac_path(Path::new("rec.flac"), 1000),
-            PathBuf::from("rec-1000.flac")
-        );
-        // Without an extension, append the sequence.
-        assert_eq!(
-            split_flac_path(Path::new("rec"), 3),
-            PathBuf::from("rec-003")
-        );
-        // The parent directory is preserved.
-        assert_eq!(
-            split_flac_path(Path::new("/tmp/out/meeting.flac"), 2),
-            PathBuf::from("/tmp/out/meeting-002.flac")
-        );
-    }
-
     // --- Error mapping for each addon ---
 
     #[test]
@@ -2800,10 +3001,10 @@ mod tests {
         let e = denoise_err(DenoiseError::InvalidChannels(3));
         assert_eq!(e.status, Status::InvalidArg);
         // encode: unsupported parameters yield InvalidArg.
-        let e = encode_err(EncodeError::Unsupported("bad".to_string()));
+        let e = encode_err(EncodeError::Unsupported("bad".to_string()).into());
         assert_eq!(e.status, Status::InvalidArg);
         // encode: encoder internals yield GenericFailure.
-        let e = encode_err(EncodeError::Encoder("boom".to_string()));
+        let e = encode_err(EncodeError::Encoder("boom".to_string()).into());
         assert_eq!(e.status, Status::GenericFailure);
         // vad: invalid settings yield InvalidArg.
         let e = vad_err(VadError::InvalidConfig("nope".to_string()));

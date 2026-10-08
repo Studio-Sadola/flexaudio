@@ -238,6 +238,9 @@ pub(crate) fn chunk_to_py(chunk: AudioChunk) -> PyAudioChunk {
 /// Event emitted while a stream is running. `type` identifies the kind; `count` and `message` are optional by kind.
 #[pyclass(module = "flexaudio", name = "StreamEvent", frozen)]
 pub struct PyStreamEvent {
+    /// Present on permissionDenied and permissionPending: microphone | systemAudio.
+    #[pyo3(get)]
+    permission: Option<String>,
     #[pyo3(get, name = "type")]
     kind: String,
     #[pyo3(get)]
@@ -258,33 +261,52 @@ impl PyStreamEvent {
 
 pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
     match ev {
+        Event::TerminalError { error } => event_to_py(Event::Error(error.to_string())),
         Event::ChunkDropped { count } => PyStreamEvent {
             kind: "chunkDropped".to_string(),
+            permission: None,
             count: Some(count),
             message: None,
         },
         Event::StreamStalled => PyStreamEvent {
             kind: "stalled".to_string(),
+            permission: None,
             count: None,
             message: None,
         },
         Event::StreamRecovered => PyStreamEvent {
             kind: "recovered".to_string(),
+            permission: None,
             count: None,
             message: None,
         },
-        Event::PermissionDenied => PyStreamEvent {
-            kind: "permissionDenied".to_string(),
+        Event::PermissionPending { permission, detail } => PyStreamEvent {
+            kind: "permissionPending".to_string(),
+            permission: Some(permission.as_str().to_string()),
             count: None,
-            message: None,
+            message: Some(detail),
+        },
+        Event::PermissionDenied { permission, detail } => PyStreamEvent {
+            kind: "permissionDenied".to_string(),
+            permission: Some(permission.as_str().to_string()),
+            count: None,
+            message: Some(fa::Error::PermissionDenied { permission, detail }.to_string()),
+        },
+        Event::SilenceWhileSourceActive { detail } => PyStreamEvent {
+            kind: "silenceWhileSourceActive".to_string(),
+            permission: None,
+            count: None,
+            message: Some(detail),
         },
         Event::DeviceLost => PyStreamEvent {
             kind: "deviceLost".to_string(),
+            permission: None,
             count: None,
             message: None,
         },
         Event::Error(msg) => PyStreamEvent {
             kind: "error".to_string(),
+            permission: None,
             count: None,
             message: Some(msg),
         },
@@ -292,6 +314,7 @@ pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
         // plus their debug representation (do not swallow them).
         other => PyStreamEvent {
             kind: "unknown".to_string(),
+            permission: None,
             count: None,
             message: Some(format!("unknown event: {other:?}")),
         },
@@ -431,6 +454,61 @@ mod tests {
     use fa::SourceKind;
 
     #[test]
+    fn terminal_backend_events_keep_error_kind_and_cause() {
+        let error = fa::Error::Backend("authorization query failed".into());
+        let event = event_to_py(Event::TerminalError {
+            error: error.clone(),
+        });
+        assert_eq!(event.kind, "error");
+        assert_eq!(event.message, Some(error.to_string()));
+        assert_eq!(event.permission, None);
+    }
+
+    #[test]
+    fn permission_pending_preserves_permission_and_advisory_message() {
+        for permission in [fa::Permission::Microphone, fa::Permission::SystemAudio] {
+            let mapped = event_to_py(Event::PermissionPending {
+                permission,
+                detail: "Permission is pending; capture may remain silent until granted".into(),
+            });
+            assert_eq!(mapped.kind, "permissionPending");
+            assert_eq!(mapped.permission.as_deref(), Some(permission.as_str()));
+            assert_eq!(mapped.count, None);
+            assert_eq!(
+                mapped.message.as_deref(),
+                Some("Permission is pending; capture may remain silent until granted")
+            );
+        }
+    }
+
+    #[test]
+    fn permission_events_preserve_cause_and_advisory_kind() {
+        for permission in [fa::Permission::Microphone, fa::Permission::SystemAudio] {
+            let expected = fa::Error::PermissionDenied {
+                permission,
+                detail: "denied by user".into(),
+            }
+            .to_string();
+            let mapped = event_to_py(Event::PermissionDenied {
+                permission,
+                detail: "denied by user".into(),
+            });
+            assert_eq!(mapped.kind, "permissionDenied");
+            assert_eq!(mapped.permission.as_deref(), Some(permission.as_str()));
+            assert_eq!(mapped.message.as_deref(), Some(expected.as_str()));
+        }
+        let advisory = event_to_py(Event::SilenceWhileSourceActive {
+            detail: "check recording privacy settings".into(),
+        });
+        assert_eq!(advisory.kind, "silenceWhileSourceActive");
+        assert_eq!(advisory.permission, None);
+        assert_eq!(
+            advisory.message.as_deref(),
+            Some("check recording privacy settings")
+        );
+    }
+
+    #[test]
     fn event_to_py_maps_each_variant() {
         let dropped = event_to_py(Event::ChunkDropped { count: 7 });
         assert_eq!(dropped.kind, "chunkDropped");
@@ -438,7 +516,11 @@ mod tests {
         assert_eq!(event_to_py(Event::StreamStalled).kind, "stalled");
         assert_eq!(event_to_py(Event::StreamRecovered).kind, "recovered");
         assert_eq!(
-            event_to_py(Event::PermissionDenied).kind,
+            event_to_py(Event::PermissionDenied {
+                permission: fa::Permission::Microphone,
+                detail: "denied by user".into()
+            })
+            .kind,
             "permissionDenied"
         );
         assert_eq!(event_to_py(Event::DeviceLost).kind, "deviceLost");

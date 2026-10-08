@@ -402,6 +402,69 @@ impl Default for StreamConfig {
     }
 }
 
+/// OS recording permission required by a capture source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Permission {
+    /// Permission to record microphone input.
+    Microphone,
+    /// Permission to record system or process output.
+    SystemAudio,
+}
+
+impl Permission {
+    /// Stable identifier used by language bindings.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Microphone => "microphone",
+            Self::SystemAudio => "systemAudio",
+        }
+    }
+
+    /// Actionable privacy guidance for the platform running the capture backend.
+    pub fn guidance(self) -> &'static str {
+        permission_guidance(self, PermissionPlatform::current())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PermissionPlatform {
+    MacOs,
+    Windows,
+    Other,
+}
+
+impl PermissionPlatform {
+    fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            Self::Other
+        }
+    }
+}
+
+fn permission_guidance(permission: Permission, platform: PermissionPlatform) -> &'static str {
+    match (platform, permission) {
+        (PermissionPlatform::MacOs, Permission::Microphone) => "Allow access in macOS System Settings > Privacy & Security > Microphone. Restart the app and retry with a new stream",
+        (PermissionPlatform::MacOs, Permission::SystemAudio) => "Check macOS System Settings > Privacy & Security > Screen & System Audio Recording and allow System Audio Recording. Restart the app and retry with a new stream",
+        (PermissionPlatform::Windows, Permission::Microphone) => "Allow access in Windows Settings > Privacy & security > Microphone (including 'Let desktop apps access your microphone'). Restart the app and retry with a new stream",
+        (PermissionPlatform::Windows, Permission::SystemAudio) => "Windows denied access to system or process audio. Check the target process's access restrictions and your organization's security policy; use a capture source your account is allowed to access. Restart the app and retry with a new stream",
+        (PermissionPlatform::Other, _) => "Check the operating system's recording permissions and capture-source access policy. Restart the app and retry with a new stream",
+    }
+}
+
+impl std::fmt::Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Microphone => "microphone",
+            Self::SystemAudio => "system audio",
+        })
+    }
+}
+
 /// Asynchronous event delivered to the consumer while the stream runs.
 ///
 /// Mark `#[non_exhaustive]` to allow future variants (external matches must include `_ =>`).
@@ -418,17 +481,40 @@ pub enum Event {
     /// Data resumed after the stall.
     StreamRecovered,
     /// A required permission was denied.
-    PermissionDenied,
+    PermissionDenied {
+        /// Recording permission that was not granted.
+        permission: Permission,
+        /// Specific cause of the denial or restriction.
+        detail: String,
+    },
+    /// Recording consent remains undecided. Advisory only: capture continues.
+    PermissionPending {
+        /// Recording permission awaiting a decision.
+        permission: Permission,
+        /// Explanation and instructions for a host that cannot show consent UI.
+        detail: String,
+    },
+    /// Exact-zero capture while an eligible source has output I/O active.
+    /// This is advisory: genuine digital silence can produce the same observation.
+    SilenceWhileSourceActive {
+        /// Explanation and privacy-setting guidance.
+        detail: String,
+    },
     /// The capture device was lost (for example, disconnected).
     DeviceLost,
     /// Other backend error (with description).
     Error(String),
+    /// Unrecoverable backend failure. Delivery and automatic recovery must stop.
+    TerminalError {
+        /// Original typed failure, retained by the stream after capture stops.
+        error: Error,
+    },
 }
 
 /// Errors that can occur during flexaudio-core operations.
 ///
 /// Mark `#[non_exhaustive]` to allow future variants (external matches must include `_ =>`).
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// Invalid argument.
@@ -441,8 +527,13 @@ pub enum Error {
     #[error("device not found")]
     DeviceNotFound,
     /// Permission was denied.
-    #[error("permission denied")]
-    PermissionDenied,
+    #[error("{permission} recording permission denied or not granted: {detail}. {guidance}", guidance = permission.guidance())]
+    PermissionDenied {
+        /// Recording permission that was not granted.
+        permission: Permission,
+        /// Specific cause of the denial or restriction.
+        detail: String,
+    },
     /// The running OS version does not meet this feature's requirements.
     #[error("unsupported OS version")]
     UnsupportedOsVersion,
@@ -455,6 +546,14 @@ pub enum Error {
     /// Requested output format (rate / channels) is unsupported.
     #[error("unsupported output format: {0}")]
     UnsupportedFormat(String),
+    /// The device configuration differs from the sink's advertised native format.
+    #[error("native input format changed from {advertised:?} to {actual:?} (Hz, channels); recreate the stream using the current device format")]
+    NativeFormatChanged {
+        /// Format used to configure the sink and normalizer.
+        advertised: (u32, u16),
+        /// Actual device configuration selected for capture.
+        actual: (u32, u16),
+    },
     /// Operation is unsupported in this environment.
     #[error("unsupported")]
     Unsupported,
@@ -466,6 +565,52 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_errors_name_cause_settings_and_recovery() {
+        for permission in [Permission::Microphone, Permission::SystemAudio] {
+            let error = Error::PermissionDenied {
+                permission,
+                detail: "authorization is restricted".into(),
+            };
+            let message = error.to_string();
+            assert!(message.contains(&permission.to_string()));
+            assert!(message.contains("authorization is restricted"));
+            assert!(message.contains(permission.guidance()));
+            assert!(message.contains("Restart the app"));
+            assert!(message.contains("retry"));
+        }
+        assert_eq!(Permission::Microphone.as_str(), "microphone");
+        assert_eq!(Permission::SystemAudio.as_str(), "systemAudio");
+    }
+
+    #[test]
+    fn macos_permission_remedies_never_reference_windows() {
+        for (permission, setting) in [
+            (Permission::Microphone, "Privacy & Security > Microphone"),
+            (Permission::SystemAudio, "Screen & System Audio Recording"),
+        ] {
+            let remedy = permission_guidance(permission, PermissionPlatform::MacOs);
+            assert!(remedy.contains(setting));
+            assert!(remedy.contains("Restart the app"));
+            assert!(!remedy.contains("Windows"));
+        }
+    }
+
+    #[test]
+    fn windows_permission_remedies_never_reference_macos() {
+        let microphone = permission_guidance(Permission::Microphone, PermissionPlatform::Windows);
+        assert!(microphone.contains("Windows Settings > Privacy & security > Microphone"));
+        assert!(microphone.contains("Let desktop apps access your microphone"));
+        let system = permission_guidance(Permission::SystemAudio, PermissionPlatform::Windows);
+        assert!(system.contains("target process's access restrictions"));
+        assert!(system.contains("security policy"));
+        for remedy in [microphone, system] {
+            assert!(remedy.contains("Restart the app"));
+            assert!(!remedy.contains("macOS"));
+            assert!(!remedy.contains("System Settings"));
+        }
+    }
 
     #[test]
     fn default_stream_config_matches_contract() {

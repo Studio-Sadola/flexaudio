@@ -437,7 +437,7 @@ impl SwitchScheduler {
     }
 
     /// Execute every switch whose boundary has passed by `now`. Warn and continue on failure.
-    fn tick(&mut self, stream: &mut Stream, now: Instant) {
+    fn tick(&mut self, stream: &mut Stream, now: Instant) -> Result<(), Error> {
         while self.next < self.deadlines.len() && now >= self.deadlines[self.next] {
             let label = self.labels[self.next];
             let config = self.configs[self.next].clone();
@@ -445,6 +445,7 @@ impl SwitchScheduler {
                 Ok(()) => {
                     eprintln!("[switch] -> {label}");
                 }
+                Err(e @ Error::PermissionDenied { .. }) => return Err(e),
                 Err(e) => {
                     eprintln!(
                         "[switch] Warning: failed to switch to {label} (recording continues): {e}"
@@ -453,6 +454,7 @@ impl SwitchScheduler {
             }
             self.next += 1;
         }
+        Ok(())
     }
 }
 
@@ -494,6 +496,9 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     }
 
     let stdout_stream = cli.is_stdout_stream();
+    if !stdout_stream {
+        validate_output_path(&cli.out).map_err(|error| error.to_string())?;
+    }
 
     // `--split-seconds` is only for WAV files. Stdout streaming (`--out -`) has no file boundaries,
     // so reject this combination before opening the stream.
@@ -880,6 +885,42 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Report advisory events and return confirmed denial to the caller.
+fn report_capture_event(event: flexaudio::Event) -> Result<(), Error> {
+    match event {
+        flexaudio::Event::TerminalError { error } => Err(error),
+        flexaudio::Event::PermissionDenied { permission, detail } => {
+            Err(Error::PermissionDenied { permission, detail })
+        }
+        flexaudio::Event::PermissionPending { detail, .. }
+        | flexaudio::Event::SilenceWhileSourceActive { detail } => {
+            eprintln!("Warning: {detail}");
+            Ok(())
+        }
+        other => {
+            eprintln!("  Event: {other:?}");
+            Ok(())
+        }
+    }
+}
+
+/// Both output paths share terminal-failure handling, including final shutdown.
+fn drain_capture_events(stream: &mut Stream) -> std::result::Result<(), String> {
+    let result = (|| {
+        while let Some(event) = stream.poll_event() {
+            report_capture_event(event)?;
+        }
+        match stream.terminal_error() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    })();
+    result.map_err(|error| {
+        stream.stop();
+        describe_error(error)
+    })
+}
+
 /// WAV output path (legacy behavior). Collect N seconds (>0), write a 16-bit WAV, and print a
 /// summary to stdout. `output` is the output format (used for the WAV header rate/ch and captured
 /// duration calculation).
@@ -921,9 +962,13 @@ fn run_wav(
     while Instant::now() < deadline {
         // Switch sources at segment boundaries, independently of output-file rotation.
         if let Some(sch) = scheduler.as_mut() {
-            sch.tick(stream, Instant::now());
+            if let Err(error) = sch.tick(stream, Instant::now()) {
+                stream.stop();
+                return Err(describe_error(error));
+            }
         }
 
+        drain_capture_events(stream)?;
         let mut got_any = false;
         while let Some(chunk) = stream.poll_chunk() {
             got_any = true;
@@ -933,10 +978,7 @@ fn run_wav(
                 return Err(e);
             }
         }
-        // Drain poll_event for display (print events, if any).
-        while let Some(ev) = stream.poll_event() {
-            println!("  Event: {ev:?}");
-        }
+        drain_capture_events(stream)?;
         if !got_any {
             // One chunk is about 20 ms. Sleep briefly to avoid spinning.
             thread::sleep(Duration::from_millis(10));
@@ -945,6 +987,7 @@ fn run_wav(
 
     let dropped = stream.dropped_chunks();
     stream.stop();
+    drain_capture_events(stream)?;
 
     // Write any chunks remaining in the ring after stop (no dropped data).
     while let Some(chunk) = stream.poll_chunk() {
@@ -1089,9 +1132,13 @@ fn run_stdout_stream(
 
         // Switch sources at segment boundaries (keep the same output pipe).
         if let Some(sch) = scheduler.as_mut() {
-            sch.tick(stream, Instant::now());
+            if let Err(error) = sch.tick(stream, Instant::now()) {
+                stream.stop();
+                return Err(describe_error(error));
+            }
         }
 
+        drain_capture_events(stream)?;
         let mut got_any = false;
         while let Some(chunk) = stream.poll_chunk() {
             got_any = true;
@@ -1106,10 +1153,7 @@ fn run_stdout_stream(
             }
         }
 
-        // Send events to stderr (stdout is reserved for PCM).
-        while let Some(ev) = stream.poll_event() {
-            eprintln!("  Event: {ev:?}");
-        }
+        drain_capture_events(stream)?;
 
         if !got_any {
             // One chunk is about 20 ms. Sleep briefly to avoid spinning.
@@ -1119,6 +1163,7 @@ fn run_stdout_stream(
 
     let dropped = stream.dropped_chunks();
     stream.stop();
+    drain_capture_events(stream)?;
 
     // Drain chunks remaining in the ring after stop (skip if the pipe is broken).
     if !broken_pipe {
@@ -1204,6 +1249,17 @@ struct Stats {
     peak: f32,
     /// Root mean square across all samples (linear).
     rms: f64,
+}
+
+/// Reject invalid destinations before capture or file creation.
+fn validate_output_path(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() || path.file_stem().is_none_or(|stem| stem.is_empty()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "output destination must have a nonempty file stem and must not be a directory",
+        ));
+    }
+    Ok(())
 }
 
 /// Create the path for the `index`th split recording file (1-based; pure function).
@@ -1311,6 +1367,7 @@ impl RotatingWavWriter {
     /// threshold, finalize immediately and rotate to the next file, where the next chunk will begin.
     /// Return the finalized file path for rotation progress display, or None if no rotation occurred.
     fn write_chunk(&mut self, chunk: &AudioChunk) -> hound::Result<Option<PathBuf>> {
+        validate_output_path(&self.base)?;
         // Open the file when a chunk arrives (lazy creation).
         if self.writer.is_none() {
             let path = self.next_path();
@@ -1347,6 +1404,7 @@ impl RotatingWavWriter {
     /// as before (numbered file 1 when splitting), so the returned `files` contains at least one
     /// entry. Also return whole-recording statistics and total frames.
     fn finish(mut self) -> hound::Result<WavSummary> {
+        validate_output_path(&self.base)?;
         if let Some(writer) = self.writer.take() {
             writer.finalize()?;
         } else if self.files.is_empty() {
@@ -1408,9 +1466,7 @@ fn describe_error(err: Error) -> String {
             "The specified device/endpoint was not found. Check the ID with `--list-devices`."
                 .into()
         }
-        Error::PermissionDenied => {
-            "Microphone permission denied. Check the OS microphone permission settings.".into()
-        }
+        error @ Error::PermissionDenied { .. } => error.to_string(),
         Error::DeviceLost => {
             "The input device was lost during capture (for example, disconnected).".into()
         }
@@ -1686,11 +1742,50 @@ mod tests {
 
     // --- describe_error ---
 
+    /// Undecided consent is a warning and must not fail the capture loop.
+    #[test]
+    fn permission_pending_warns_and_continues_capture() {
+        report_capture_event(flexaudio::Event::PermissionPending {
+            permission: flexaudio::Permission::Microphone,
+            detail: "Microphone permission is pending; run from Terminal to answer the prompt"
+                .into(),
+        })
+        .expect("pending consent must not terminate capture");
+    }
+
+    #[test]
+    fn runtime_permission_denial_fails_but_silence_advisory_continues() {
+        for permission in [
+            flexaudio::Permission::Microphone,
+            flexaudio::Permission::SystemAudio,
+        ] {
+            let error = report_capture_event(flexaudio::Event::PermissionDenied {
+                permission,
+                detail: "denied by user".into(),
+            })
+            .expect_err("confirmed denial must fail the capture loop");
+            let message = describe_error(error);
+            assert!(message.contains(&permission.to_string()));
+            assert!(message.contains("denied by user"));
+            assert!(message.contains("Restart"));
+        }
+        report_capture_event(flexaudio::Event::SilenceWhileSourceActive {
+            detail:
+                "Recording permission may be missing; genuine digital silence can also cause this"
+                    .into(),
+        })
+        .expect("advisory must continue capture");
+    }
+
     /// Main Error variants are mapped to human-readable messages (one branch per variant).
     #[test]
     fn describe_error_maps_known_variants() {
         assert!(describe_error(Error::DeviceNotFound).contains("not found"));
-        assert!(describe_error(Error::PermissionDenied).contains("permission"));
+        assert!(describe_error(Error::PermissionDenied {
+            permission: flexaudio::Permission::Microphone,
+            detail: "denied by user".into()
+        })
+        .contains("permission"));
         assert!(describe_error(Error::DeviceLost).contains("lost"));
         // Other variants include the generic message and Display output.
         let msg = describe_error(Error::Unsupported);
@@ -1767,6 +1862,17 @@ mod tests {
         let jp = truncate("éøåæœ", 3);
         assert_eq!(jp.chars().count(), 3);
         assert!(jp.ends_with('…'));
+    }
+
+    #[test]
+    fn output_path_rejects_directories_and_empty_stems() {
+        for path in ["", ".", "..", "/"] {
+            assert!(validate_output_path(Path::new(path)).is_err(), "{path:?}");
+        }
+        // An existing directory on every OS (a literal "/tmp" is a plain file name on Windows).
+        let dir = std::env::temp_dir();
+        assert!(validate_output_path(&dir).is_err(), "{dir:?}");
+        assert!(validate_output_path(Path::new("recording.wav")).is_ok());
     }
 
     // --- split_file_path ---

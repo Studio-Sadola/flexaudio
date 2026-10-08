@@ -12,6 +12,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-08
+
+### Breaking
+
+- Added `Error::NativeFormatChanged { advertised, actual }` and
+  `Event::TerminalError { error }` for format safety and typed terminal backend failures.
+- Rust `Error::PermissionDenied` and `Event::PermissionDenied` now carry
+  `permission: Permission` (`Microphone` / `SystemAudio`) and `detail: String`.
+  Update unit-variant matches to struct-variant matches. `Stream::resume()` now
+  returns `Result<()>`; a terminally failed stream also rejects start/resume/source
+  switching with its stored error.
+- Runtime permission denial terminates capture and suppresses buffered/tail audio
+  and automatic retries. N-API `stop()` rejects on terminal failure; Python chunk
+  polling raises `RuntimeError`; C chunk polling returns `FLEX_FAILURE` (-2).
+
+### Fixed
+
+- Reject stale microphone sink formats before building native capture, including
+  after a macOS consent prompt. Authorization-query failures during consent
+  monitoring are terminal, preserve their typed cause, and suppress delivery/retries.
+  Permission remedies now reference only the current platform; Windows system/process
+  access errors explain access restrictions instead of pointing to macOS settings.
+  Python type stubs include terminal errors, permission fields, and the silence advisory.
+- macOS microphone capture checks AVFoundation authorization and shares consent
+  requests between concurrent opens. An unanswered 30-second consent wait proceeds
+  with capture instead of claiming denial. Undecided consent emits the advisory
+  `PermissionPending` after five seconds of capture, once per generation, with
+  actionable guidance for background hosts. N-API/Python expose `permissionPending`
+  with `permission` and `message`; C adds event kind 8 without changing existing
+  codes; the CLI warns and continues. Consent monitoring runs every 500 ms for
+  the first 60 seconds, then every 2 seconds throughout capture until resolved;
+  late denial remains terminal. The mic lane of Mix uses the same policy.
+  Windows microphone capture checks public AppCapability consent and rechecks
+  native stream failures.
+- Confirmed permission errors and events preserve their cause with OS privacy
+  settings and restart/retry guidance across Rust, Node.js, Python, C, and CLI.
+  Terminal errors remain queryable after stop; the CLI exits unsuccessfully.
+- macOS system/process taps run one active self-probe per capture generation
+  after five continuous seconds of exact-zero samples with another eligible
+  process's output active. A separate private own-process tap checks a roughly
+  300 ms, phase-coded 1 kHz diagnostic signal at amplitude `1e-5`, designed to be
+  inaudible, on the default output. Capturing the signal suppresses the warning;
+  proven rendering with continuous exact-zero diagnostic capture produces a
+  terminal `SystemAudio` permission denial. Setup failures, missing render/capture
+  evidence, and timeout retain the `SilenceWhileSourceActive` advisory and
+  continue capture. Stopping cancels the probe without late events. The diagnostic
+  signal may enter recordings that include our own process. No public events or
+  binding codes were added, and no private TCC APIs are used.
+- **Windows classic system loopback:** keep the selected endpoint's audio engine
+  active with an inaudible shared-mode render stream so leading and subsequent
+  idle time is captured as continuous device-clocked silence without idle-triggered
+  watchdog reopens. Exclusion and per-process capture do not use the silent stream.
+  Keepalive startup failures fail capture start; runtime failures stop production
+  and are reported through the existing stall/reopen path. The capturing process
+  can appear in Windows Volume Mixer while the silent rendering session is active.
+- **Windows capture errors and readiness:** report readiness only after capture
+  starts, propagate event-wait and capture-buffer-release failures, and reject a
+  negotiated classic-loopback mix format that differs from the configured sink.
+  Refresh the selected endpoint's mix format before each reopen so a changed
+  default endpoint does not leave recovery using a stale rate or channel count.
+  Preserve typed permission and device errors from silent-keepalive startup.
+- FLAC encoding and I/O failures now retain the first error and prevent retries or
+  successful finalization of failed output. Failed writers are never finalized by Drop.
+- Encoder bindings validate chunks before lazy file creation, preserve closed and failed
+  states across rotation, and reject directory or empty-stem destinations. CLI recording
+  also rejects these destinations before opening capture.
+- Python FLAC context managers retain close failures alongside exceptions from the body.
+- Linux process discovery now rejects incomplete registry snapshots, bind/sync/callback
+  failures, and output nodes without resolvable process IDs instead of returning partial
+  success. Completed empty queries remain successful; executable and activity metadata
+  remain optional.
+
+### Changed
+
+- VAD `process`, `process_pcm`, `reset`, and `flush` now return typed errors instead
+  of substituting silence or empty events. Inference/conversion execution failures
+  require a successful reset; setup failures preserve existing state. PCM input validates nonzero channels and 8,000–192,000 Hz before mutation.
+- Added `Vad::converted_sample_position()` to anchor timestamps using actual
+  cumulative converted samples. N-API uses it instead of rounding each chunk;
+  Python, N-API, and C VAD callers propagate failures with their original cause.
+
+### Packaging
+
+- Windows MSVC release builds are reproducible with `/Brepro`, no incremental
+  compilation or PDBs, path remapping, and pinned Rust toolchain and N-API CLI.
+  The npm release CI builds each tag once; `workflow_dispatch` retries reuse and
+  verify that run's artifacts via `SHA256SUMS` instead of recompiling. CI checks
+  that two independent Windows builds have identical hashes.
+
 ## [0.3.1] - 2026-10-08
 
 ### Fixed
@@ -329,7 +418,8 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
   publication and interactive approval of new packages in scopes
   requiring 2FA. (1840fbb)
 
-[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Studio-Sadola/flexaudio/releases/tag/v0.2.0

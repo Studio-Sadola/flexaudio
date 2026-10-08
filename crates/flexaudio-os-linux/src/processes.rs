@@ -6,17 +6,15 @@
 //!
 //! PID resolution shares [`resolve_node_pid`](crate::resolve_node_pid) with
 //! process capture. Pulse nodes require a valid app PID from bound node info;
-//! unresolved nodes are omitted instead of being listed under the proxy's PID.
+//! unresolved output nodes fail the query instead of being listed under the proxy's PID.
 //!
 //! Get executable names from the kernel's `/proc/<pid>/exe`, not PipeWire's self-reported value
 //! (fall back to `/proc/<pid>/comm` if unreadable).
 //!
 //! # Deadline
 //! Use the same [`LIST_DEADLINE`] for the connection (`connect`) and registry round trip. Always
-//! return, even if there is no response. If the deadline expires after collecting any output nodes,
-//! return those nodes in `Ok` (their playback state is unknown, so use `None`). If no output nodes
-//! were collected, return `Err` (do not treat an empty list containing only Clients as "available,
-//! but none now"). If the request completes on time and there really are no nodes, return `Ok([])`.
+//! return, even if there is no response. Incomplete snapshots always return an error, including
+//! when output nodes have already arrived. A completed query with no output nodes returns `Ok([])`.
 //!
 //! Return a raw list (multiple nodes with the same PID may appear more than once). The facade merges
 //! duplicates, excludes the current process, and sorts the results.
@@ -37,8 +35,7 @@ use crate::{
     ClientEntry, NodeEntry,
 };
 
-/// Deadline for connection + registry round trip. Return `Ok` if anything was collected by then;
-/// otherwise return `Err`.
+/// Deadline for connection + registry round trip; incomplete queries return `Err`.
 const LIST_DEADLINE: Duration = Duration::from_millis(2_000);
 
 /// `media.class` for application output nodes targeted by process capture.
@@ -66,36 +63,114 @@ struct RegistrySnapshot {
     nodes: HashMap<u32, OutputNode>,
 }
 
-/// List processes with an audio output stream (`Stream/Output/Audio`) as a raw list.
-///
-/// Returns [`Error::Backend`] if it cannot connect to PipeWire (daemon missing, `XDG_RUNTIME_DIR`
-/// unset, etc.) or if no output nodes are collected before the deadline. If the deadline expires
-/// after collecting any output nodes, return those nodes in `Ok` (their playback state is unknown,
-/// so use `None`). If it completes on time and there are truly no nodes, return `Ok([])`. Process
-/// capture is unavailable in the same environment, so an `Err`, rather than an empty list, signals
-/// that process capture cannot be used here.
-pub fn list_processes() -> Result<Vec<ProcessInfo>> {
-    let snapshot = collect_snapshot().map_err(Error::Backend)?;
-    Ok(build_process_list(&snapshot, read_executable))
+/// Typed internal failures, rendered at the existing public `Error::Backend` boundary.
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotError {
+    Query {
+        operation: &'static str,
+        cause: String,
+    },
+    Bind {
+        node_id: u32,
+        cause: String,
+    },
+    Callback {
+        callback: &'static str,
+        cause: String,
+    },
+    Core {
+        object_id: u32,
+        code: i32,
+        cause: String,
+    },
+    Incomplete,
+    MissingPid {
+        node_id: u32,
+    },
 }
 
-/// Convert collection results to a raw list of [`ProcessInfo`]. Skip nodes whose PID cannot be resolved.
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Query { operation, cause } => write!(f, "pipewire {operation} failed: {cause}"),
+            Self::Bind { node_id, cause } => {
+                write!(f, "pipewire bind output node {node_id} failed: {cause}")
+            }
+            Self::Callback { callback, cause } => {
+                write!(f, "pipewire {callback} callback panicked: {cause}")
+            }
+            Self::Core {
+                object_id,
+                code,
+                cause,
+            } => write!(f, "pipewire object {object_id} error {code}: {cause}"),
+            Self::Incomplete => write!(
+                f,
+                "pipewire registry sync did not complete within {} ms",
+                LIST_DEADLINE.as_millis()
+            ),
+            Self::MissingPid { node_id } => write!(
+                f,
+                "pipewire output node {node_id} has no resolvable mandatory process ID"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+/// Preserve the first cause even if later events or the deadline also fail.
+fn record_failure(failure: &RefCell<Option<SnapshotError>>, error: SnapshotError) {
+    failure.borrow_mut().get_or_insert(error);
+}
+
+/// Guard the FFI boundary without silently discarding a failed callback.
+fn run_callback(
+    failure: &RefCell<Option<SnapshotError>>,
+    callback: &'static str,
+    body: impl FnOnce(),
+) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(body)) {
+        let cause = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_string())
+            })
+            .unwrap_or_else(|| "non-string panic payload".into());
+        record_failure(failure, SnapshotError::Callback { callback, cause });
+    }
+}
+
+/// List processes with an audio output stream (`Stream/Output/Audio`) as a raw list.
+///
+/// Returns [`Error::Backend`] for connection, sync, bind or callback failures and unresolved
+/// mandatory output-node PIDs. Only a completed empty query returns `Ok([])`. Executable names
+/// and activity remain optional metadata.
+pub fn list_processes() -> Result<Vec<ProcessInfo>> {
+    let snapshot = collect_snapshot().map_err(|error| Error::Backend(error.to_string()))?;
+    build_process_list(&snapshot, read_executable)
+        .map_err(|error| Error::Backend(error.to_string()))
+}
+
+/// Convert collection results to a raw list, rejecting unresolved mandatory PIDs.
 ///
 /// Display name preference: node `application.name`, then Client `application.name` (empty if neither
 /// exists; the facade fills in an executable name, etc.). Sort deterministically by node ID.
 fn build_process_list(
     snapshot: &RegistrySnapshot,
     executable_of: impl Fn(u32) -> Option<String>,
-) -> Vec<ProcessInfo> {
+) -> std::result::Result<Vec<ProcessInfo>, SnapshotError> {
     let mut node_ids: Vec<u32> = snapshot.nodes.keys().copied().collect();
     node_ids.sort_unstable();
 
     let mut out = Vec::with_capacity(node_ids.len());
     for node_id in node_ids {
         let node = &snapshot.nodes[&node_id];
-        let Some(pid) = resolve_node_pid(&node.entry, &snapshot.client_pid) else {
-            continue;
-        };
+        let pid = resolve_node_pid(&node.entry, &snapshot.client_pid)
+            .ok_or(SnapshotError::MissingPid { node_id })?;
         let client_name = node
             .entry
             .owning_client_id
@@ -108,7 +183,7 @@ fn build_process_list(
             is_output_active: node.running,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Basename of `/proc/<pid>/exe` (strip ` (deleted)` for a replaced binary). If unreadable (for
@@ -139,7 +214,7 @@ fn non_empty(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Read the PipeWire registry for one round trip. Returns `Err(String)` on failure (does not panic).
+/// Read the PipeWire registry for one round trip. Returns a typed error on failure (does not panic).
 ///
 /// Create, use, and drop the `!Send` `MainLoop`/`Context`/`Core`/`Registry`/`Node` proxies only
 /// inside this function. The facade calls it from a dedicated thread.
@@ -147,35 +222,41 @@ fn non_empty(value: Option<&str>) -> Option<String> {
 /// Wait for completion with the same two-phase sync→done barrier as `enumerate_pw` (phase 1 collects
 /// all globals; phase 2 waits for info/state from bound nodes). A deadline timer also guarantees the
 /// loop exits.
-fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
+fn collect_snapshot() -> std::result::Result<RegistrySnapshot, SnapshotError> {
     pw_init_once();
     let started = std::time::Instant::now();
 
-    let main_loop = pw::main_loop::MainLoopRc::new(None)
-        .map_err(|e| format!("create pipewire main loop failed: {e}"))?;
-    let context = pw::context::ContextRc::new(&main_loop, None)
-        .map_err(|e| format!("create pipewire context failed: {e}"))?;
+    let main_loop = pw::main_loop::MainLoopRc::new(None).map_err(|e| SnapshotError::Query {
+        operation: "create main loop",
+        cause: e.to_string(),
+    })?;
+    let context =
+        pw::context::ContextRc::new(&main_loop, None).map_err(|e| SnapshotError::Query {
+            operation: "create context",
+            cause: e.to_string(),
+        })?;
     // The connection is also inside the deadline. connect itself cannot be interrupted, so if it
     // returns after the deadline, stop without waiting for the registry. If it hangs, the facade's
     // 3-second limit (single-flight) releases the caller.
-    let core = context
-        .connect_rc(None)
-        .map_err(|e| format!("connect to pipewire daemon failed (is PipeWire running?): {e}"))?;
+    let core = context.connect_rc(None).map_err(|e| SnapshotError::Query {
+        operation: "connect to daemon",
+        cause: e.to_string(),
+    })?;
     if started.elapsed() >= LIST_DEADLINE {
-        return Err(format!(
-            "pipewire connect did not finish within {} ms",
-            LIST_DEADLINE.as_millis()
-        ));
+        return Err(SnapshotError::Incomplete);
     }
-    let registry = core
-        .get_registry_rc()
-        .map_err(|e| format!("get pipewire registry failed: {e}"))?;
+    let registry = core.get_registry_rc().map_err(|e| SnapshotError::Query {
+        operation: "get registry",
+        cause: e.to_string(),
+    })?;
 
     let snapshot = Rc::new(RefCell::new(RegistrySnapshot::default()));
+    let failure = Rc::new(RefCell::new(None));
     // Storage for bound node proxies and listeners (dropping it ends info subscriptions).
     type BoundNode = (pw::node::Node, pw::node::NodeListener);
     let bound_nodes: Rc<RefCell<Vec<BoundNode>>> = Rc::new(RefCell::new(Vec::new()));
 
+    let failure_for_global = failure.clone();
     let snapshot_for_global = snapshot.clone();
     let registry_for_global = registry.clone();
     let bound_for_global = bound_nodes.clone();
@@ -183,7 +264,7 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
         .add_listener_local()
         .global(move |global| {
             // A panic across FFI is UB, so wrap the body in catch_unwind.
-            let _ = catch_unwind(AssertUnwindSafe(|| {
+            run_callback(&failure_for_global, "registry global", || {
                 let Some(props) = global.props else {
                     return;
                 };
@@ -225,11 +306,21 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                             },
                         );
 
-                        // Bind for state and app PID; unresolved Pulse nodes are omitted.
+                        // Bind for state and mandatory application PID information.
                         let node: pw::node::Node = match registry_for_global.bind(global) {
                             Ok(node) => node,
-                            Err(_) => return,
+                            Err(error) => {
+                                record_failure(
+                                    &failure_for_global,
+                                    SnapshotError::Bind {
+                                        node_id: global.id,
+                                        cause: error.to_string(),
+                                    },
+                                );
+                                return;
+                            }
                         };
+                        let failure_for_info = failure_for_global.clone();
                         let snapshot_for_info = snapshot_for_global.clone();
                         let node_id = global.id;
                         let listener = node
@@ -237,7 +328,7 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                             .info(move |info| {
                                 // Catch unwinding at the FFI boundary; state() may
                                 // panic on an error string containing invalid UTF-8.
-                                let _ = catch_unwind(AssertUnwindSafe(|| {
+                                run_callback(&failure_for_info, "node info", || {
                                     let running =
                                         matches!(info.state(), pw::node::NodeState::Running);
                                     let props_changed = info
@@ -262,25 +353,29 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
                                             client_pid,
                                         );
                                     }
-                                }));
+                                });
                             })
                             .register();
                         bound_for_global.borrow_mut().push((node, listener));
                     }
                     _ => {}
                 }
-            }));
+            });
         })
         .register();
 
     // Two-phase sync→done barrier (same as enumerate_pw).
     let done = Rc::new(Cell::new(false));
     let stage = Rc::new(Cell::new(0u8));
-    let pending = core
-        .sync(0)
-        .map_err(|e| format!("pipewire sync failed: {e}"))?;
+    let pending = core.sync(0).map_err(|e| SnapshotError::Query {
+        operation: "initial sync",
+        cause: e.to_string(),
+    })?;
     let pending = Rc::new(Cell::new(pending.seq()));
 
+    let failure_for_done = failure.clone();
+    let failure_for_core = failure.clone();
+    let loop_for_error = main_loop.clone();
     let done_for_cb = done.clone();
     let stage_for_cb = stage.clone();
     let pending_for_cb = pending.clone();
@@ -289,30 +384,53 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
     let _core_listener = core
         .add_listener_local()
         .done(move |id, seq| {
-            if id != pw::core::PW_ID_CORE {
-                return;
-            }
-            let seq = seq.seq();
-            match stage_for_cb.get() {
-                0 if seq == pending_for_cb.get() => {
-                    // Phase 1 complete (all globals collected) → phase 2 waits for bound node info.
-                    stage_for_cb.set(1);
-                    let second = core_weak.upgrade().map(|core| core.sync(0));
-                    match second {
-                        Some(Ok(p)) => pending_for_cb.set(p.seq()),
-                        _ => {
-                            // Cannot start phase 2: state is unknown, so return what was collected.
-                            done_for_cb.set(true);
-                            loop_for_cb.quit();
+            run_callback(&failure_for_done, "core done", || {
+                if id != pw::core::PW_ID_CORE {
+                    return;
+                }
+                let seq = seq.seq();
+                match stage_for_cb.get() {
+                    0 if seq == pending_for_cb.get() => {
+                        // Phase 1 complete (all globals collected) → phase 2 waits for bound node info.
+                        stage_for_cb.set(1);
+                        let second = core_weak.upgrade().map(|core| core.sync(0));
+                        match second {
+                            Some(Ok(p)) => pending_for_cb.set(p.seq()),
+                            failed => {
+                                let cause = match failed {
+                                    Some(Err(error)) => error.to_string(),
+                                    None => "core disconnected before second sync".into(),
+                                    Some(Ok(_)) => unreachable!(),
+                                };
+                                record_failure(
+                                    &failure_for_done,
+                                    SnapshotError::Query {
+                                        operation: "second sync",
+                                        cause,
+                                    },
+                                );
+                                loop_for_cb.quit();
+                            }
                         }
                     }
+                    1 if seq == pending_for_cb.get() => {
+                        done_for_cb.set(true);
+                        loop_for_cb.quit();
+                    }
+                    _ => {}
                 }
-                1 if seq == pending_for_cb.get() => {
-                    done_for_cb.set(true);
-                    loop_for_cb.quit();
-                }
-                _ => {}
-            }
+            });
+        })
+        .error(move |object_id, _seq, code, cause| {
+            record_failure(
+                &failure_for_core,
+                SnapshotError::Core {
+                    object_id,
+                    code,
+                    cause: cause.to_string(),
+                },
+            );
+            loop_for_error.quit();
         })
         .register();
 
@@ -332,30 +450,35 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, String> {
         deadline
             .update_timer(Some(remaining), None)
             .into_result()
-            .map_err(|e| format!("arm pipewire deadline timer failed: {e}"))?;
+            .map_err(|e| SnapshotError::Query {
+                operation: "arm deadline timer",
+                cause: e.to_string(),
+            })?;
         Some(deadline)
     };
 
-    while !done.get() && !timed_out.get() {
+    while !done.get() && !timed_out.get() && failure.borrow().is_none() {
         main_loop.run();
     }
 
-    finish_snapshot(done.get(), snapshot.take())
+    finish_snapshot(
+        done.get() && !timed_out.get(),
+        failure.take(),
+        snapshot.take(),
+    )
 }
 
-/// Finish registry collection. `complete` is true if PipeWire's done arrived before the deadline.
-/// If the deadline expired with no output nodes, return Err (do not turn an empty list of Clients
-/// only into `Ok([])`, which means "available, but none now"). If it completed on time with truly no
-/// nodes, return an empty `Ok` snapshot.
+/// Pure completion gate shared by live collection and synthetic event tests.
 fn finish_snapshot(
     complete: bool,
+    failure: Option<SnapshotError>,
     collected: RegistrySnapshot,
-) -> std::result::Result<RegistrySnapshot, String> {
-    if !complete && collected.nodes.is_empty() {
-        return Err(format!(
-            "pipewire registry did not answer within {} ms",
-            LIST_DEADLINE.as_millis()
-        ));
+) -> std::result::Result<RegistrySnapshot, SnapshotError> {
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if !complete {
+        return Err(SnapshotError::Incomplete);
     }
     Ok(collected)
 }
@@ -399,16 +522,10 @@ mod tests {
         // Configuration where the node itself has a PID (no Client needed).
         snap.nodes
             .insert(102, node(None, Some(999), Some("direct")));
-        // Skip a node whose PID cannot be resolved (unknown Client).
-        snap.nodes.insert(103, node(Some(77), None, Some("orphan")));
 
-        let list = build_process_list(&snap, |pid| Some(format!("exe-{pid}")));
+        let list = build_process_list(&snap, |pid| Some(format!("exe-{pid}"))).unwrap();
         let pids: Vec<u32> = list.iter().map(|p| p.pid).collect();
-        assert_eq!(
-            pids,
-            vec![1234, 5678, 999],
-            "sorted by node id, orphan dropped"
-        );
+        assert_eq!(pids, vec![1234, 5678, 999], "sorted by node id");
 
         let firefox = &list[0];
         assert_eq!(firefox.name, "Firefox Audio", "node application.name wins");
@@ -428,7 +545,7 @@ mod tests {
             .insert(40, ClientEntry::from_props(None, Some("10"), None));
         snap.client_name.insert(40, "mpv".into());
         snap.nodes.insert(1, node(Some(40), None, None));
-        let list = build_process_list(&snap, |_| None);
+        let list = build_process_list(&snap, |_| None).unwrap();
         assert_eq!(list[0].name, "mpv");
         assert_eq!(list[0].executable, None);
     }
@@ -459,7 +576,7 @@ mod tests {
                     &snap.client_pid,
                 );
                 snap.nodes.insert(1, output);
-                let list = build_process_list(&snap, |_| None);
+                let result = build_process_list(&snap, |_| None);
                 let expected = if app_pid == Some("1028793") {
                     vec![1028793]
                 } else if node_api.is_some() || client_api == Some("pipewire-pulse") {
@@ -467,9 +584,15 @@ mod tests {
                 } else {
                     vec![1584]
                 };
+                let actual =
+                    result.map(|list| list.iter().map(|process| process.pid).collect::<Vec<_>>());
+                let expected = if expected.is_empty() {
+                    Err(SnapshotError::MissingPid { node_id: 1 })
+                } else {
+                    Ok(expected.clone())
+                };
                 assert_eq!(
-                    list.iter().map(|process| process.pid).collect::<Vec<_>>(),
-                    expected,
+                    actual, expected,
                     "node API={node_api:?}, client API={client_api:?}, app PID={app_pid:?}"
                 );
             }
@@ -494,10 +617,16 @@ mod tests {
                 output.entry.props_seen = true;
                 update_node_info(&mut output.entry, true, props, &snap.client_pid);
                 snap.nodes.insert(1, output);
-                let list = build_process_list(&snap, |_| None);
+                let result = build_process_list(&snap, |_| None);
+                let actual =
+                    result.map(|list| list.iter().map(|process| process.pid).collect::<Vec<_>>());
+                let expected = if expected.is_empty() {
+                    Err(SnapshotError::MissingPid { node_id: 1 })
+                } else {
+                    Ok(expected.clone())
+                };
                 assert_eq!(
-                    list.iter().map(|process| process.pid).collect::<Vec<_>>(),
-                    expected,
+                    actual, expected,
                     "node API={node_api:?}, client API={client_api:?}, props={props:?}"
                 );
             }
@@ -505,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn build_omits_stale_bound_pid_when_pulse_client_arrives_late() {
+    fn build_rejects_stale_bound_pid_when_pulse_client_arrives_late() {
         for props in [Some((None, None)), None] {
             let mut snap = RegistrySnapshot::default();
             let mut output = node(Some(40), None, Some("app"));
@@ -516,19 +645,22 @@ mod tests {
                 &snap.client_pid,
             );
             snap.nodes.insert(1, output);
-            assert_eq!(build_process_list(&snap, |_| None)[0].pid, 42);
+            assert_eq!(build_process_list(&snap, |_| None).unwrap()[0].pid, 42);
 
             let output = snap.nodes.get_mut(&1).expect("output node exists");
             update_node_info(&mut output.entry, true, props, &snap.client_pid);
             assert_eq!(output.entry.app_pid, Some(42));
             assert!(!output.entry.app_pid_from_info);
-            assert_eq!(build_process_list(&snap, |_| None)[0].pid, 42);
+            assert_eq!(build_process_list(&snap, |_| None).unwrap()[0].pid, 42);
 
             snap.client_pid.insert(
                 40,
                 ClientEntry::from_props(None, Some("7"), Some("pipewire-pulse")),
             );
-            assert!(build_process_list(&snap, |_| None).is_empty());
+            assert_eq!(
+                build_process_list(&snap, |_| None).unwrap_err(),
+                SnapshotError::MissingPid { node_id: 1 }
+            );
         }
     }
 
@@ -554,25 +686,24 @@ mod tests {
         snap.client_pid
             .insert(40, ClientEntry::from_props(None, Some("1234"), None));
         snap.client_name.insert(40, "silent-client".into());
-        let err = finish_snapshot(false, snap).expect_err("timeout + 0 nodes must be Err");
-        assert!(
-            err.contains("did not answer"),
-            "timeout error should mention the deadline, got {err}"
-        );
+        let err = finish_snapshot(false, None, snap).expect_err("timeout + 0 nodes must be Err");
+        assert_eq!(err, SnapshotError::Incomplete);
     }
 
     #[test]
-    fn timeout_with_output_nodes_keeps_the_partial_list() {
+    fn timeout_with_output_nodes_rejects_the_partial_list() {
         let mut snap = RegistrySnapshot::default();
         snap.nodes.insert(1, node(Some(40), None, Some("app")));
-        let got = finish_snapshot(false, snap).expect("timeout + some nodes is Ok");
-        assert_eq!(got.nodes.len(), 1);
+        assert_eq!(
+            finish_snapshot(false, None, snap).unwrap_err(),
+            SnapshotError::Incomplete
+        );
     }
 
     #[test]
     fn complete_with_zero_nodes_is_empty_ok() {
         let snap = RegistrySnapshot::default();
-        let got = finish_snapshot(true, snap).expect("in-time empty is Ok");
+        let got = finish_snapshot(true, None, snap).expect("in-time empty is Ok");
         assert!(got.nodes.is_empty());
     }
 
@@ -582,22 +713,95 @@ mod tests {
         assert!(!exe.is_empty());
     }
 
-    /// Never panics, whether PipeWire is present or not; returns either `Ok` or `Err(Backend)`.
     #[test]
-    fn list_processes_is_graceful() {
-        let started = std::time::Instant::now();
-        match list_processes() {
-            Ok(list) => {
-                for p in &list {
-                    assert_ne!(p.pid, 0);
-                }
+    fn complete_populated_snapshot_keeps_optional_metadata_absent() {
+        let mut snap = RegistrySnapshot::default();
+        snap.nodes.insert(1, node(None, Some(42), None));
+        let snap = finish_snapshot(true, None, snap).unwrap();
+        let list = build_process_list(&snap, |_| None).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].pid, 42);
+        assert_eq!(list[0].executable, None);
+        assert_eq!(list[0].is_output_active, None);
+    }
+
+    #[test]
+    fn missing_mandatory_pid_rejects_entire_populated_snapshot() {
+        let mut snap = RegistrySnapshot::default();
+        snap.nodes.insert(1, node(None, Some(42), None));
+        snap.nodes.insert(2, node(Some(77), None, Some("orphan")));
+        assert_eq!(
+            build_process_list(&snap, |_| None).unwrap_err(),
+            SnapshotError::MissingPid { node_id: 2 }
+        );
+    }
+
+    #[test]
+    fn failed_sync_preserves_cause_even_after_done() {
+        let mut snap = RegistrySnapshot::default();
+        snap.nodes.insert(1, node(None, Some(42), None));
+        let failure = SnapshotError::Query {
+            operation: "second sync",
+            cause: "disconnected".into(),
+        };
+        assert_eq!(
+            finish_snapshot(true, Some(failure), snap).unwrap_err(),
+            SnapshotError::Query {
+                operation: "second sync",
+                cause: "disconnected".into()
             }
-            Err(Error::Backend(_)) => {}
-            Err(other) => panic!("unexpected error variant: {other:?}"),
-        }
-        assert!(
-            started.elapsed() < LIST_DEADLINE + Duration::from_secs(1),
-            "enumeration must be bounded by the deadline"
+        );
+    }
+
+    #[test]
+    fn bind_failure_preserves_node_and_cause() {
+        let failure = RefCell::new(None);
+        record_failure(
+            &failure,
+            SnapshotError::Bind {
+                node_id: 7,
+                cause: "permission denied".into(),
+            },
+        );
+        run_callback(&failure, "node info", || panic!("later failure"));
+        assert_eq!(
+            finish_snapshot(true, failure.take(), RegistrySnapshot::default()).unwrap_err(),
+            SnapshotError::Bind {
+                node_id: 7,
+                cause: "permission denied".into()
+            }
+        );
+    }
+
+    #[test]
+    fn callback_failure_rejects_populated_snapshot() {
+        let failure = RefCell::new(None);
+        let mut snap = RegistrySnapshot::default();
+        run_callback(&failure, "registry global", || {
+            snap.nodes.insert(1, node(None, Some(42), None));
+            panic!("synthetic callback failure");
+        });
+        assert_eq!(
+            finish_snapshot(true, failure.take(), snap).unwrap_err(),
+            SnapshotError::Callback {
+                callback: "registry global",
+                cause: "synthetic callback failure".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn core_error_rejects_even_an_empty_completed_snapshot() {
+        let error = SnapshotError::Core {
+            object_id: 9,
+            code: -5,
+            cause: "I/O failure".into(),
+        };
+        assert_eq!(
+            finish_snapshot(true, Some(error), RegistrySnapshot::default())
+                .unwrap_err()
+                .to_string(),
+            "pipewire object 9 error -5: I/O failure"
         );
     }
 }

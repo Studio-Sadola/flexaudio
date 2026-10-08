@@ -88,7 +88,19 @@ pub unsafe extern "C" fn flexaudio_vad_process(
             slice::from_raw_parts(samples, len)
         };
 
-        let events = vad.inner.process_pcm(input, in_rate, in_ch);
+        out.write(std::ptr::null_mut());
+        out_len.write(0);
+        let events = match vad.inner.process_pcm(input, in_rate, in_ch) {
+            Ok(events) => events,
+            Err(error) => {
+                set_last_error(error.to_string());
+                return match error {
+                    flexaudio_vad::VadError::InvalidFormat(_)
+                    | flexaudio_vad::VadError::InvalidConfig(_) => code::FLEX_INVALID_ARG,
+                    _ => code::FLEX_FAILURE,
+                };
+            }
+        };
         let (ptr, ev_len) = vad_events_to_c(events);
         out.write(ptr);
         out_len.write(ev_len);
@@ -120,7 +132,10 @@ pub unsafe extern "C" fn flexaudio_vad_reset(v: *mut FlexVad) -> i32 {
             set_last_error("flexaudio_vad_reset: vad pointer is null");
             return code::FLEX_INVALID_ARG;
         };
-        vad.inner.reset();
+        if let Err(error) = vad.inner.reset() {
+            set_last_error(error.to_string());
+            return code::FLEX_FAILURE;
+        }
         code::FLEX_OK
     })
 }
@@ -183,6 +198,27 @@ mod tests {
         assert_eq!(out_len, 0);
 
         assert_eq!(unsafe { flexaudio_vad_reset(v) }, code::FLEX_OK);
+        unsafe { flexaudio_vad_free(v) };
+    }
+
+    #[test]
+    fn vad_invalid_format_returns_failure_detail() {
+        let v = unsafe { flexaudio_vad_new(std::ptr::null()) };
+        assert!(!v.is_null());
+        let mut out = std::ptr::null_mut();
+        let mut len = 123;
+        for (rate, channels, reason) in [(16_000, 0, "channels"), (0, 1, "sample rate")] {
+            let result = unsafe {
+                flexaudio_vad_process(v, std::ptr::null(), 0, rate, channels, &mut out, &mut len)
+            };
+            assert_eq!(result, code::FLEX_INVALID_ARG);
+            assert!(out.is_null());
+            assert_eq!(len, 0);
+            let message = unsafe { std::ffi::CStr::from_ptr(crate::error::last_error_ptr()) }
+                .to_str()
+                .unwrap();
+            assert!(message.contains(reason));
+        }
         unsafe { flexaudio_vad_free(v) };
     }
 

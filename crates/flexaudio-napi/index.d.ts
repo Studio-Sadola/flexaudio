@@ -145,8 +145,16 @@ export interface VadOptions {
   /** VAD internal sample rate. Only 8000 or 16000. Default 16000. */
   sampleRate?: number
 }
-/** JS stream event. `type` identifies the kind; `count`/`message` are optional. */
+/**
+ * Stream notification. permissionDenied is terminal, with permission and
+ * cause/remedy in message. permissionPending is advisory: consent remains undecided,
+ * capture continues and may stay silent until granted. silenceWhileSourceActive
+ * is advisory: the system-audio diagnosis is inconclusive and capture continues.
+ * Missing permission and genuine digital silence remain possible in that case.
+ */
 export interface JsStreamEvent {
+  /** Present on permissionDenied and permissionPending. */
+  permission?: 'microphone' | 'systemAudio'
   type: string
   count?: number
   message?: string
@@ -284,6 +292,23 @@ export declare function devices(): Array<JsDeviceInfo>
 export declare function processes(): Promise<Array<JsProcessInfo>>
 /**
  * Open and start a stream, returning a `FlexStream` that sends chunks/events to callbacks.
+ * Confirmed microphone/system-audio denial throws actionable permission guidance.
+ * Supply onEvent for runtime denial, permissionPending and silenceWhileSourceActive
+ * advisories. Without onEvent, terminalError() and stop() expose terminal failures
+ * only; they do not expose advisories. macOS bundled microphone prompts wait up to
+ * 30 s; an unanswered prompt proceeds with capture. Undecided consent emits
+ * permissionPending after 5 s of capture. Authorization is checked every 500 ms
+ * for the first 60 s, then every 2 s until resolved or stopped. Bare-host opens rely
+ * on the responsible-app prompt. Windows checks Microphone privacy, including
+ * Let desktop apps access your microphone.
+ *
+ * macOS system/process capture runs a once-per-generation self-probe after 5 s of
+ * exact-zero samples with eligible external output active. It renders a roughly
+ * 300 ms diagnostic signal on the default output and captures only our own process
+ * in a separate private tap. A confirmed failure emits terminal permissionDenied
+ * with permission systemAudio; an inconclusive result emits silenceWhileSourceActive
+ * and continues. The signal may enter capture when our own process is included
+ * (e.g. excludeSelf: false). Stopping cancels the probe without a late event.
  *
  * `options.denoise` enables noise suppression in core (internal canonical form), so both primary
  * and secondary taps receive denoised audio. `options.vad` runs VAD on the tap selected by `vadTap`
@@ -343,8 +368,12 @@ export declare class FlexStream {
    * stop (the last PCM and `frames:0` terminator) have been delivered to JS.
    * Repeated calls await the same completion, or resolve immediately if already complete. Calling
    * inside `onChunk` does not freeze JS because joining happens off the JS thread.
+   * Rejects with actionable permission guidance on terminal denial; further audio
+   * and the terminator are suppressed. Create a new stream after fixing permission.
    */
   stop(): Promise<void>
+  /** Stored terminal failure, including after stop; does not consume onEvent. */
+  terminalError(): JsStreamEvent | undefined
   /**
    * Hot-swap the input source (mic/system/process) without stopping recording.
    *
@@ -363,7 +392,7 @@ export declare class FlexStream {
    * the first chunk afterward has DISCONTINUITY. Throws if `stop()` has already completed.
    */
   pause(): void
-  /** Unpause and resume delivery. Throws if `stop()` has already completed. */
+  /** Unpause delivery. Throws the stored error on terminal failure. */
   resume(): void
   /**
    * Force-finalize integrated VAD's currently open utterance (runtime operation).

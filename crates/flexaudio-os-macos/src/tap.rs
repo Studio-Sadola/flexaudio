@@ -35,6 +35,7 @@ use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSObject, NSString};
 use flexaudio_core::backend::RawSink;
 use flexaudio_core::types::Error;
 
+use crate::capture_health::SampleMailbox;
 use crate::common::{
     map_os_status, now_ns, tap_format_is_float, tap_native_format, FALLBACK_FORMAT, NO_ERR,
 };
@@ -80,6 +81,10 @@ pub(crate) struct TapChain {
     /// after `AudioDeviceStop` returns. Apple does not document that CoreAudio calls the IOProc
     /// on one thread without reentrancy, so guard against it. Shared with the block via `Arc`.
     stopped: Arc<AtomicBool>,
+    /// Atomic native-sample observations read by the owner thread.
+    pub(crate) observations: Arc<SampleMailbox>,
+    /// Confirmed native format for the advisory duration, or unknown (no inference).
+    pub(crate) observed_format: Option<(u32, u16)>,
     /// Block passed to the IOProc (must live until `DestroyIOProcID`). Dropped last.
     _block: RcBlock<
         dyn Fn(
@@ -121,6 +126,13 @@ impl Drop for TapChain {
             }
         }
         // On exit, `_block` → `_desc` are dropped in declaration order.
+    }
+}
+
+impl TapChain {
+    /// Close user delivery before publishing a terminal permission failure.
+    pub(crate) fn gate_delivery(&self) {
+        self.stopped.store(true, Ordering::Release);
     }
 }
 
@@ -237,11 +249,12 @@ pub(crate) unsafe fn build_tap_chain(
     // Preallocate the largest expected planar→interleaved scratch buffer during setup (outside
     // RT). This avoids the first or growth heap allocation in the IOProc. Estimate capacity from
     // the tap's native format (or FALLBACK if unavailable) for about 100 ms of frames × channels.
-    // IOProc buffers are usually 10–20 ms, so resize is a no-op within capacity during steady
-    // state (and remains safe if it grows beyond that). Move it into a `RefCell<Vec<f32>>` owned
+    // IOProc buffers are usually 10–20 ms. Larger-than-capacity buffers are dropped and invalidate
+    // health observations rather than allocating on the RT path. Move it into a `RefCell<Vec<f32>>` owned
     // only by the block; do not use thread_local, so it stays alive with the block even when the
     // owner and RT threads differ.
-    let (native_rate, native_ch) = tap_native_format(tap_id).unwrap_or(FALLBACK_FORMAT);
+    let observed_format = tap_native_format(tap_id);
+    let (native_rate, native_ch) = observed_format.unwrap_or(FALLBACK_FORMAT);
     let max_scratch = ((native_rate as usize / 10).max(1)) * (native_ch as usize).max(1);
     let scratch_cell = RefCell::new({
         let mut v: Vec<f32> = Vec::new();
@@ -253,6 +266,8 @@ pub(crate) unsafe fn build_tap_chain(
     // to true (Release) before `AudioDeviceStop`; the block loads it with Acquire at entry.
     let stopped = Arc::new(AtomicBool::new(false));
     let stopped_for_block = stopped.clone();
+    let observations = Arc::new(SampleMailbox::default());
+    let observations_for_block = observations.clone();
 
     let block = RcBlock::new(
         move |_in_now: NonNull<AudioTimeStamp>,
@@ -263,7 +278,7 @@ pub(crate) unsafe fn build_tap_chain(
             // CoreAudio calls this block as an FFI boundary callback. A panic crossing the
             // boundary is UB, so wrap the body in catch_unwind to prevent a panic from
             // RawSink::push or elsewhere from unwinding into CoreAudio.
-            let _ = catch_unwind(AssertUnwindSafe(|| {
+            let result = catch_unwind(AssertUnwindSafe(|| {
                 // Late-callback guard. Load with Acquire the stop flag set by stop/Drop before
                 // `AudioDeviceStop`. If set, return without touching `RefCell<RawSink>` to prevent
                 // an in-flight callback from accessing the sink after `AudioDeviceStop` returns.
@@ -274,10 +289,24 @@ pub(crate) unsafe fn build_tap_chain(
                 if let Ok(mut sink) = sink_cell.try_borrow_mut() {
                     if let Ok(mut scratch) = scratch_cell.try_borrow_mut() {
                         // SAFETY: `in_input` is a valid AudioBufferList provided by CoreAudio.
-                        unsafe { push_buffer_list(&mut sink, &mut scratch, in_input.as_ptr()) };
+                        unsafe {
+                            push_buffer_list(
+                                &mut sink,
+                                &mut scratch,
+                                in_input.as_ptr(),
+                                &observations_for_block,
+                            )
+                        };
+                    } else {
+                        observations_for_block.invalidate();
                     }
+                } else {
+                    observations_for_block.invalidate();
                 }
             }));
+            if result.is_err() {
+                observations_for_block.invalidate();
+            }
         },
     );
 
@@ -312,6 +341,8 @@ pub(crate) unsafe fn build_tap_chain(
         io_proc_id,
         tap_id,
         stopped,
+        observations,
+        observed_format,
         _block: block,
         _desc: desc,
     })
@@ -323,7 +354,10 @@ pub(crate) unsafe fn build_tap_chain(
 /// `{ Name, UID(generated UUID), IsPrivate:true, IsStacked:false, TapAutoStart:true,
 ///    TapList:[{SubTapUID: tap UUID, SubTapDriftCompensation:true}] }`.
 /// Build it with NSDictionary and pass it as `&CFDictionary` via toll-free bridging.
-fn create_aggregate_device(name: &str, sub_tap_uid: &NSString) -> Result<AudioObjectID, Error> {
+pub(crate) fn create_aggregate_device(
+    name: &str,
+    sub_tap_uid: &NSString,
+) -> Result<AudioObjectID, Error> {
     // Sub-tap dictionary: { uid: <tap uuid>, drift: true }.
     let drift_true = NSNumber::numberWithBool(true);
     let sub_tap: Retained<NSDictionary<NSString, NSObject>> = NSDictionary::from_slices::<NSString>(
@@ -395,8 +429,7 @@ fn new_uuid_string() -> String {
 /// - Treat size 0 / null as silence and do not push.
 ///
 /// `scratch` is a Vec allocated by the block during setup (outside RT). During steady state,
-/// `resize` is a no-op within capacity, avoiding heap allocations on the RT path (it only grows
-/// if capacity is exceeded).
+/// `resize` stays within capacity. Oversized buffers are dropped and invalidate the observation.
 ///
 /// # Safety
 /// `list` must point to a valid `AudioBufferList` (provided by CoreAudio to the IOProc).
@@ -404,16 +437,17 @@ unsafe fn push_buffer_list(
     sink: &mut RawSink,
     scratch: &mut Vec<f32>,
     list: *const AudioBufferList,
+    observations: &SampleMailbox,
 ) {
     if list.is_null() {
+        observations.invalidate();
         return;
     }
     let num_buffers = (*list).mNumberBuffers as usize;
     if num_buffers == 0 {
+        observations.invalidate();
         return;
     }
-    // Log whether buffers are interleaved or planar once (when FLEXAUDIO_DEBUG is set).
-    log_buffer_shape_once(num_buffers);
     // mBuffers is the start of a variable-length array. Read `num_buffers` entries as a slice.
     let buffers = std::slice::from_raw_parts((*list).mBuffers.as_ptr(), num_buffers);
 
@@ -422,10 +456,12 @@ unsafe fn push_buffer_list(
         let buf = &buffers[0];
         let n = buf.mDataByteSize as usize / core::mem::size_of::<f32>();
         if n == 0 || buf.mData.is_null() {
+            observations.invalidate();
             return;
         }
         let slice = std::slice::from_raw_parts(buf.mData as *const f32, n);
-        sink.push(slice, now_ns());
+        let delivered = sink.push(slice, now_ns());
+        observations.observe(slice, delivered);
         return;
     }
 
@@ -434,18 +470,25 @@ unsafe fn push_buffer_list(
     let mut min_frames = usize::MAX;
     for b in buffers.iter() {
         if b.mData.is_null() {
+            observations.invalidate();
             return;
         }
         let frames = b.mDataByteSize as usize / core::mem::size_of::<f32>();
         min_frames = min_frames.min(frames);
     }
     if min_frames == 0 || min_frames == usize::MAX {
+        observations.invalidate();
         return;
     }
 
     // Reuse preallocated scratch to interleave (avoiding allocations on the RT path).
     // Since channels == num_buffers == buffers.len(), enumerate `buffers` directly.
     let total = min_frames * channels;
+    if total > scratch.capacity() {
+        // Observation loss is preferable to allocating from Core Audio's real-time callback.
+        observations.invalidate();
+        return;
+    }
     scratch.resize(total, 0.0);
     for (ch, buf) in buffers.iter().enumerate() {
         let src = std::slice::from_raw_parts(buf.mData as *const f32, min_frames);
@@ -455,33 +498,8 @@ unsafe fn push_buffer_list(
             idx += channels;
         }
     }
-    sink.push(&scratch[..total], now_ns());
-}
-
-thread_local! {
-    /// RT-thread-local flag to log the buffer layout only once.
-    static LOGGED_SHAPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// On the first IOProc callback only, log to stderr whether buffers are interleaved
-/// (mNumberBuffers==1) or planar (>=2), when `FLEXAUDIO_DEBUG` is set.
-fn log_buffer_shape_once(num_buffers: usize) {
-    if std::env::var_os("FLEXAUDIO_DEBUG").is_none() {
-        return;
-    }
-    LOGGED_SHAPE.with(|c| {
-        if !c.get() {
-            c.set(true);
-            let kind = if num_buffers == 1 {
-                "interleaved"
-            } else {
-                "planar"
-            };
-            eprintln!(
-                "[flexaudio-os-macos] IOProc buffer shape: mNumberBuffers={num_buffers} ({kind})"
-            );
-        }
-    });
+    let delivered = sink.push(&scratch[..total], now_ns());
+    observations.observe(&scratch[..total], delivered);
 }
 
 #[cfg(test)]
