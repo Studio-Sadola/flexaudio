@@ -18,10 +18,16 @@
 //! on first capture determines permission. If tap creation is rejected because permission has not
 //! been granted, [`map_os_status`](common::map_os_status) maps the permission-related OSStatus to
 //! [`Error::PermissionDenied`](flexaudio_core::types::Error).
-//! Successful tap creation does not prove consent. Five continuous seconds of exact-zero native
-//! samples while an eligible external process has output I/O active produces an advisory
-//! `Event::SilenceWhileSourceActive`; digital silence can cause the same observation. Unknown
-//! process activity, device routing, missing delivery, or dropped samples disable inference.
+//! Successful tap creation does not prove consent. There is no public system-audio permission
+//! status API. Five continuous seconds of exact-zero native samples with eligible external output
+//! activity trigger one active self-probe per generation. It renders a roughly 300 ms diagnostic
+//! signal on the default output and captures our own process in a separate private tap. Recognizing
+//! that signal suppresses the warning; proven rendering with continuous exact-zero diagnostic
+//! capture produces terminal `Event::PermissionDenied` for `SystemAudio`. Inconclusive setup,
+//! rendering, capture, or timeout produces `Event::SilenceWhileSourceActive` and continues capture.
+//! The signal may enter user capture when our own process is included. Stop cancels the probe
+//! without late notifications. Unknown activity/routing, missing delivery, or dropped samples
+//! disable the trigger; genuine digital silence alone never establishes permission denial.
 //!
 //! # Non-macOS
 //! Native adapters are macOS-only. The private capture-health state machine also compiles on
@@ -38,6 +44,12 @@ mod common;
 #[cfg(target_os = "macos")]
 mod devices;
 #[cfg(target_os = "macos")]
+mod native_probe;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod probe;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod probe_signal;
+#[cfg(target_os = "macos")]
 mod process;
 #[cfg(target_os = "macos")]
 mod processes;
@@ -45,6 +57,8 @@ mod processes;
 mod system;
 #[cfg(target_os = "macos")]
 mod tap;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod terminal;
 #[cfg(target_os = "macos")]
 mod version;
 

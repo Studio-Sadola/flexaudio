@@ -163,7 +163,8 @@ pub enum FlexEventKind {
     Stalled = 1,
     /// Data resumed after a stall.
     Recovered = 2,
-    /// A required permission was denied.
+    /// A required permission was denied; terminal, including a confirmed macOS self-probe failure.
+    /// Retrieve the cause and remedy with flexaudio_last_error; capture stops.
     PermissionDenied = 3,
     /// The capture device was lost.
     DeviceLost = 4,
@@ -171,7 +172,8 @@ pub enum FlexEventKind {
     Error = 5,
     /// Event not matching a known kind (reserved for future variants).
     Unknown = 6,
-    /// Exact-zero system capture while eligible output is active; advisory only.
+    /// Exact-zero system capture with an inconclusive permission diagnosis; advisory only.
+    /// Missing permission and genuine digital silence remain possible.
     /// Retrieve the explanation with flexaudio_last_error; capture continues.
     SilenceWhileSourceActive = 7,
     /// Recording consent remains undecided; advisory only, capture continues.

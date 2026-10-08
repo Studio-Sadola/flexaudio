@@ -434,7 +434,9 @@ pub unsafe extern "C" fn flexaudio_chunk_free(chunk: *mut FlexChunk) {
 /// Return 1 when an event is retrieved, 0 when none is available, or a negative value on error.
 /// Error, PermissionDenied (kind 3), SilenceWhileSourceActive (kind 7), and
 /// PermissionPending (kind 8, advisory only: capture continues)
-/// store their explanation in last_error. The advisory does not stop capture.
+/// store their explanation in last_error. PermissionDenied is terminal, including
+/// a confirmed macOS self-probe failure. SilenceWhileSourceActive means the
+/// permission diagnosis is inconclusive; both advisory kinds continue capture.
 ///
 /// # Safety
 /// `s` must be a valid handle, and `out` must point to a valid `FlexEvent` destination.

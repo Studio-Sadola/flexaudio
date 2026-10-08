@@ -27,15 +27,25 @@ Tap creation failures with Core Audio's illegal-operation status produce
 privacy-setting guidance. Successful creation does not prove recording consent:
 macOS can deliver zero samples while permission is missing.
 
-The backends emit `Event::SilenceWhileSourceActive { detail }` once per capture
-generation after five continuous seconds of bit-exact zero native samples while
-an eligible external process has output I/O active. This advisory explains where
-to check System Audio Recording permission and continues capture, because genuine
-digital silence can cause the same observation. Process exclusions and selected
-device routing restrict eligibility; query failures, missing delivery, dropped
-samples, and unknown routing reset the observation window. No private TCC APIs
-are used. Call `CaptureBackend::poll_event` to receive backend notifications when
-using a backend directly.
+There is no public system-audio permission-status API, and no private TCC APIs
+are used. After five continuous seconds of bit-exact zero native samples while
+another eligible process has `IsRunningOutput` true, the backend runs one active
+self-probe per capture generation. Process exclusions and selected-device routing
+restrict eligibility; query failures, missing delivery, dropped samples, negative
+zero, nonzero samples, and unknown routing reset the observation window.
+
+The probe renders a roughly 300 ms, phase-coded 1 kHz signal at amplitude `1e-5`
+on the default output, designed to be inaudible, and captures only our own process
+through a separate private tap. Recognizing the signal suppresses the warning.
+Proven rendering with continuously exact-zero diagnostic capture produces terminal
+`Event::PermissionDenied { permission: Permission::SystemAudio, detail }` with
+System Audio Recording privacy-setting and restart/retry guidance. Setup failures,
+missing render/capture evidence, or timeout produce the existing
+`Event::SilenceWhileSourceActive { detail }` advisory and continue capture because
+missing permission and genuine digital silence remain possible. The signal may
+appear in user capture when our own process is included. Stop cancels the probe
+and suppresses late notifications. Call `CaptureBackend::poll_event` to receive
+backend notifications when using a backend directly.
 
 > **Most users should use the [`flexaudio`](https://crates.io/crates/flexaudio)
 > facade crate instead of this one directly.** Depend on `flexaudio-os-macos`

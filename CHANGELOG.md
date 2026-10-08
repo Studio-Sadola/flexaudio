@@ -47,10 +47,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Confirmed permission errors and events preserve their cause with OS privacy
   settings and restart/retry guidance across Rust, Node.js, Python, C, and CLI.
   Terminal errors remain queryable after stop; the CLI exits unsuccessfully.
-- macOS system/process taps emit the typed `SilenceWhileSourceActive` advisory
-  after sustained exact-zero samples with eligible active output. The advisory
-  explains possible missing permission and genuine digital silence; capture
-  continues, and failed activity queries do not infer denial.
+- macOS system/process taps run one active self-probe per capture generation
+  after five continuous seconds of exact-zero samples with another eligible
+  process's output active. A separate private own-process tap checks a roughly
+  300 ms, phase-coded 1 kHz diagnostic signal at amplitude `1e-5`, designed to be
+  inaudible, on the default output. Capturing the signal suppresses the warning;
+  proven rendering with continuous exact-zero diagnostic capture produces a
+  terminal `SystemAudio` permission denial. Setup failures, missing render/capture
+  evidence, and timeout retain the `SilenceWhileSourceActive` advisory and
+  continue capture. Stopping cancels the probe without late events. The diagnostic
+  signal may enter recordings that include our own process. No public events or
+  binding codes were added, and no private TCC APIs are used.
 
 ## [0.3.1] - 2026-10-08
 

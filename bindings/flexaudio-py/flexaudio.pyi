@@ -98,8 +98,16 @@ class StreamEvent:
 
     permissionPending carries permission and an actionable message; capture
     continues and may remain silent until granted. permissionDenied is terminal
-    and carries permission and actionable message. error carries a
-    message and may represent a terminal backend failure; consult terminal_error.
+    and carries permission and a cause/remedy message. silenceWhileSourceActive
+    means the system-audio diagnosis is inconclusive; capture continues because
+    missing permission and genuine digital silence remain possible. error carries
+    a message and may represent a terminal backend failure; consult terminal_error.
+
+    On macOS, system/process capture can confirm SystemAudio denial with an active
+    self-probe after sustained exact zeros and eligible external output activity.
+    Its separate private tap captures our own diagnostic output; this signal may
+    also enter user capture if our process is included. An inconclusive probe is
+    advisory only. Stopping cancels the probe without a late event.
     """
     def __repr__(self) -> str: ...
     @property

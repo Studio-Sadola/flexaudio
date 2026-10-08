@@ -325,14 +325,29 @@ permission events keep type `permissionDenied` and add `permission`
   diagnosis; this native result is not exclusive to consent failures.
 - A tap may deliver zeros without a native permission error. After five
   continuous seconds of bit-exact zero native samples while Core Audio reports
-  an eligible captured process with output active (excluding ourselves and
-  honoring capture selection), flexaudio emits
-  `Event::SilenceWhileSourceActive { detail }` once per capture generation
-  (N-API/Python type `silenceWhileSourceActive`; C event kind 7). Capture
-  continues: genuine digital silence can produce the same observation. Query
-  failures, unknown device routing, inactive sources, absent samples, or
-  nonzero/negative-zero samples prevent the advisory. Absence of the advisory
-  does not establish that permission was granted.
+  another eligible captured process with `IsRunningOutput` true (honoring
+  exclusions and device selection), flexaudio runs an active self-probe once per
+  capture generation. Zero samples plus output activity alone cannot distinguish
+  missing recording permission from genuine digital silence.
+- The self-probe renders a roughly 300 ms, phase-coded 1 kHz signal at amplitude
+  `1e-5` on the default output, designed to be inaudible. A separate private tap
+  captures only our own process to check for that diagnostic signal. Recognizing
+  the signal suppresses the silence warning. If native output callbacks prove
+  the signal was submitted while the diagnostic tap continuously captures only
+  exact zeros, flexaudio emits `Event::PermissionDenied` for `SystemAudio` and
+  terminates capture, including both lanes of Mix. The existing binding denial
+  event and terminal-error APIs retain the cause and privacy-setting remedy.
+  The diagnostic signal can appear in your recording if your capture includes
+  our own process (for example, system capture with `excludeSelf: false`).
+- If the self-probe cannot establish either outcome (for example, setup failure,
+  missing render/capture callbacks, or timeout), flexaudio emits
+  `Event::SilenceWhileSourceActive { detail }` once for that generation
+  (N-API/Python type `silenceWhileSourceActive`; C event kind 7) and continues
+  capture. This advisory explains that permission may be missing or the source
+  may be genuinely silent. Query failures, unknown device routing, inactive
+  sources, absent samples, or nonzero/negative-zero samples prevent the initial
+  trigger. Stopping capture cancels the probe and suppresses late notifications.
+  Absence of a denial or advisory does not establish that permission was granted.
 - Check **System Settings > Privacy & Security > Microphone** for microphone
   access and **Screen & System Audio Recording** for **System Audio Recording**.
   Enable access for the responsible host app (for example Terminal), restart
