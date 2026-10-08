@@ -66,16 +66,16 @@ checks each platform package's embedded `.node` after `napi artifacts` and
 before publishing or dry-run packing. Missing/extra files, duplicate names,
 unsafe manifest paths, symlinks and hash mismatches fail the job.
 
-**Retry a failed npm publish = Re-run failed jobs or workflow_dispatch.**
-Re-running failed jobs after a publish-only failure leaves successful build
-jobs alone and downloads their existing artifacts. Dispatch skips all build
-and manifest jobs, reuses the original artifacts, and never compiles. Leave
-`dry_run` checked to validate packaging; uncheck it to publish. Already
-published platform and main package versions are skipped. Expired, deleted,
-incomplete or pre-change artifacts without `SHA256SUMS` cause a failure;
-there is no rebuild fallback. Do not use **Re-run all jobs** for a publication
-retry: it can execute the tag-push build jobs again (immutable artifact-name
-conflicts then fail rather than replacing the original artifacts).
+**Retry a failed npm release with workflow_dispatch.**
+Dispatch skips builds and reseals the original tag-push run's five `bindings-*`
+artifacts into a new `npm-release-manifest` in the current run, even if the
+original seal failed. Only integer `run_attempt=1` is accepted for the original
+run; if it was re-run, resealing is forbidden and a new patch version is required.
+Publication verifies those original bytes before and
+after packaging. Leave `dry_run` checked to validate packaging; uncheck it to
+publish. Already published versions are skipped; expired, deleted or incomplete
+addons fail without rebuilding. Do not use **Re-run all jobs** for a retry,
+because it can execute the tag-push builds again.
 
 PyPI and crates.io manual dry runs still use the selected ref and require its
 manifests to match the input version. PyPI builds and collects wheels/sdist;

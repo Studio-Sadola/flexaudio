@@ -175,8 +175,8 @@ class ResolverTests(unittest.TestCase):
             output = Path(directory) / "output"
             environment = dict(EVENT_NAME="workflow_dispatch", INPUT_VERSION="0.3.1", GITHUB_REPOSITORY="owner/repo",
                                GH_TOKEN="unused-test-token", GITHUB_OUTPUT=str(output), GITHUB_RUN_ID="99", GITHUB_SHA=self.sha,
-                               REF_TYPE="tag", REF_NAME=self.tag)
-            with patch.dict(os.environ, environment), patch.object(resolver.GitHub, "tag_commit", return_value=self.sha), patch.object(resolver.GitHub, "original_run", return_value=10):
+                               REF_TYPE="tag", REF_NAME=self.tag, GITHUB_RUN_ATTEMPT="1")
+            with patch.dict(os.environ, environment), patch.object(resolver.GitHub, "tag_commit", return_value=self.sha), patch.object(resolver.GitHub, "original_run", return_value=10), patch.object(resolver.GitHub, "get", return_value={"run_attempt": 1}):
                 resolver.main()
                 self.assertIn("run_id=10", output.read_text())
                 os.environ["EVENT_NAME"] = "push"
@@ -184,6 +184,33 @@ class ResolverTests(unittest.TestCase):
                     resolver.main()
                 os.environ["GITHUB_RUN_ID"] = "10"
                 resolver.main()
+                for attempt in ("2", "", "01", "1.0", None):
+                    with self.subTest(push_attempt=attempt):
+                        if attempt is None:
+                            os.environ.pop("GITHUB_RUN_ATTEMPT", None)
+                        else:
+                            os.environ["GITHUB_RUN_ATTEMPT"] = attempt
+                        with self.assertRaisesRegex(ValueError, "resealing is forbidden"):
+                            resolver.main()
+
+    def test_original_run_attempt_guard(self):
+        for record in ({"run_attempt": 1}, {"run_attempt": 2}, {},
+                       {"run_attempt": "1"}, {"run_attempt": 1.0},
+                       {"run_attempt": True}, {"run_attempt": None}):
+            with self.subTest(record=record), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "output"
+                environment = dict(EVENT_NAME="workflow_dispatch", INPUT_VERSION="0.3.1",
+                                   GITHUB_REPOSITORY="owner/repo", GH_TOKEN="unused-test-token",
+                                   GITHUB_OUTPUT=str(output), GITHUB_RUN_ATTEMPT="2")
+                with patch.dict(os.environ, environment), patch.object(resolver.GitHub, "tag_commit", return_value=self.sha), patch.object(resolver.GitHub, "original_run", return_value=10), patch.object(resolver.GitHub, "get", return_value=record) as get:
+                    if type(record.get("run_attempt")) is int and record["run_attempt"] == 1:
+                        resolver.main()
+                        self.assertIn("run_id=10", output.read_text())
+                    else:
+                        with self.assertRaisesRegex(ValueError, "original tag-push run was re-run; resealing is forbidden — cut a new patch version"):
+                            resolver.main()
+                        self.assertFalse(output.exists(), "Rejected runs must not emit release outputs")
+                    get.assert_called_once_with("/actions/runs/10")
 
 
 class MsvcTests(unittest.TestCase):

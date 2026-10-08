@@ -101,6 +101,10 @@ def main() -> None:
     api = GitHub(os.environ["GITHUB_REPOSITORY"], os.environ["GH_TOKEN"])
     sha = api.tag_commit(tag)
     run_id = api.original_run(sha, tag)
+    attempt = api.get(f"/actions/runs/{run_id}").get("run_attempt")
+    if (type(attempt) is not int or attempt != 1 or
+            (event == "push" and os.environ.get("GITHUB_RUN_ATTEMPT") != "1")):
+        raise ValueError("original tag-push run was re-run; resealing is forbidden — cut a new patch version")
     if event == "push" and (str(run_id) != os.environ["GITHUB_RUN_ID"] or sha != os.environ["GITHUB_SHA"]):
         raise ValueError("Only the original tag-push run may build this release")
     with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:

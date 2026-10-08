@@ -206,7 +206,10 @@ jobs:
   manifest:
     name: Seal npm addon checksums
     needs: [version-gate, build]
-    if: github.event_name == 'push'
+    if: >-
+      always() && needs.version-gate.result == 'success' &&
+      ((github.event_name == 'push' && needs.build.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' && needs.build.result == 'skipped'))
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -216,18 +219,33 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Require a fresh artifact directory
+        working-directory: .
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          root = Path(".release-artifacts")
+          if root.exists() or root.is_symlink():
+              raise SystemExit("Artifact directory already exists before download: .release-artifacts")
+          root.mkdir()
+          PYTHON
       - uses: actions/download-artifact@v4
         with:
+          run-id: ${{ needs.version-gate.outputs.run_id }}
+          github-token: ${{ github.token }}
           pattern: bindings-*
-          path: bindings
+          path: .release-artifacts/addons
           # Keep separate directories so duplicate filenames cannot be overwritten.
           merge-multiple: false
       - name: Create exact five-file manifest
-        run: python3 .github/scripts/npm-release-manifest.py create --artifacts bindings --manifest manifest/SHA256SUMS
+        run: python3 .github/scripts/npm-release-manifest.py create --artifacts .release-artifacts/addons --manifest .release-artifacts/manifest/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: npm-release-manifest
-          path: manifest/SHA256SUMS
+          path: .release-artifacts/manifest/SHA256SUMS
+          # The explicitly selected checksum file lives under a hidden directory.
+          include-hidden-files: true
           if-no-files-found: error
 
   publish:
@@ -236,7 +254,7 @@ jobs:
     if: >-
       always() && needs.version-gate.result == 'success' &&
       ((github.event_name == 'push' && needs.build.result == 'success' && needs.manifest.result == 'success') ||
-       (github.event_name == 'workflow_dispatch' && needs.build.result == 'skipped' && needs.manifest.result == 'skipped'))
+       (github.event_name == 'workflow_dispatch' && needs.build.result == 'skipped' && needs.manifest.result == 'success'))
     permissions:
       contents: read
       actions: read
@@ -286,19 +304,28 @@ jobs:
       - name: Install npm dependencies (@napi-rs/cli)
         run: npm install --no-package-lock --omit=optional --ignore-scripts --registry=https://registry.npmjs.org/
 
-      - name: Download original checksum manifest
+      - name: Require a fresh artifact directory
+        working-directory: .
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          root = Path(".release-artifacts")
+          if root.exists() or root.is_symlink():
+              raise SystemExit("Artifact directory already exists before download: .release-artifacts")
+          root.mkdir()
+          PYTHON
+      - name: Download current checksum manifest
         uses: actions/download-artifact@v4
         with:
           name: npm-release-manifest
-          run-id: ${{ needs.version-gate.outputs.run_id }}
-          github-token: ${{ github.token }}
-          path: release-manifest
+          path: .release-artifacts/manifest
 
-      # Pull every per-platform .node back into the crate dir.
+      # Reuse only the original tag-push addons, including on dispatch.
       - name: Download all addon artifacts
         uses: actions/download-artifact@v4
         with:
-          path: source/crates/flexaudio-napi/artifacts
+          path: .release-artifacts/addons
           pattern: bindings-*
           merge-multiple: false
           run-id: ${{ needs.version-gate.outputs.run_id }}
@@ -306,7 +333,7 @@ jobs:
 
       - name: Verify original addon bytes before packaging
         working-directory: .
-        run: python3 .github/scripts/npm-release-manifest.py verify --artifacts source/crates/flexaudio-napi/artifacts --manifest release-manifest/SHA256SUMS
+        run: python3 .github/scripts/npm-release-manifest.py verify --artifacts .release-artifacts/addons --manifest .release-artifacts/manifest/SHA256SUMS
 
       # napi creates one npm package dir per platform under npm/ and moves each
       # downloaded .node into it. The root package.json already declares the
@@ -320,7 +347,7 @@ jobs:
         run: |
           set -euo pipefail
           npx --no-install napi create-npm-dir -t .
-          npx --no-install napi artifacts --dir artifacts
+          npx --no-install napi artifacts --dir ../../../.release-artifacts/addons
           python3 ../../../.github/scripts/check-release-versions.py --repo-root ../.. --version "$RELEASE_VERSION" --require-platforms
           python3 - <<'PYTHON'
           import json
@@ -358,7 +385,7 @@ jobs:
 
       - name: Verify embedded addon bytes after napi artifacts
         working-directory: .
-        run: python3 .github/scripts/npm-release-manifest.py packages --artifacts source/crates/flexaudio-napi/npm --manifest release-manifest/SHA256SUMS
+        run: python3 .github/scripts/npm-release-manifest.py packages --artifacts source/crates/flexaudio-napi/npm --manifest .release-artifacts/manifest/SHA256SUMS
 
       - name: Publish (root + per-platform packages)
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
