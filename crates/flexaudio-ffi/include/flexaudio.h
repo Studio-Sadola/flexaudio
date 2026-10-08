@@ -59,7 +59,8 @@ typedef enum FlexEventKind {
     FLEX_EVENT_KIND_STALLED = 1,
     // Data resumed after a stall.
     FLEX_EVENT_KIND_RECOVERED = 2,
-    // A required permission was denied.
+    // A required permission was denied; terminal, including a confirmed macOS self-probe failure.
+    // Retrieve the cause and remedy with flexaudio_last_error; capture stops.
     FLEX_EVENT_KIND_PERMISSION_DENIED = 3,
     // The capture device was lost.
     FLEX_EVENT_KIND_DEVICE_LOST = 4,
@@ -67,7 +68,8 @@ typedef enum FlexEventKind {
     FLEX_EVENT_KIND_ERROR = 5,
     // Event not matching a known kind (reserved for future variants).
     FLEX_EVENT_KIND_UNKNOWN = 6,
-    // Exact-zero system capture while eligible output is active; advisory only.
+    // Exact-zero system capture with an inconclusive permission diagnosis; advisory only.
+    // Missing permission and genuine digital silence remain possible.
     // Retrieve the explanation with flexaudio_last_error; capture continues.
     FLEX_EVENT_KIND_SILENCE_WHILE_SOURCE_ACTIVE = 7,
     // Recording consent remains undecided; advisory only, capture continues.
@@ -458,7 +460,9 @@ void flexaudio_chunk_free(struct FlexChunk *chunk);
 // Return 1 when an event is retrieved, 0 when none is available, or a negative value on error.
 // Error, PermissionDenied (kind 3), SilenceWhileSourceActive (kind 7), and
 // PermissionPending (kind 8, advisory only: capture continues)
-// store their explanation in last_error. The advisory does not stop capture.
+// store their explanation in last_error. PermissionDenied is terminal, including
+// a confirmed macOS self-probe failure. SilenceWhileSourceActive means the
+// permission diagnosis is inconclusive; both advisory kinds continue capture.
 //
 // # Safety
 // `s` must be a valid handle, and `out` must point to a valid `FlexEvent` destination.

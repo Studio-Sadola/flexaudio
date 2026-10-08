@@ -604,9 +604,10 @@ pub struct VadOptions {
 }
 
 /// Stream notification. permissionDenied is terminal, with permission and
-/// actionable message. permissionPending is advisory: consent remains undecided,
+/// cause/remedy in message. permissionPending is advisory: consent remains undecided,
 /// capture continues and may stay silent until granted. silenceWhileSourceActive
-/// is advisory: missing system-audio permission and digital silence are possible.
+/// is advisory: the system-audio diagnosis is inconclusive and capture continues.
+/// Missing permission and genuine digital silence remain possible in that case.
 #[napi(object)]
 pub struct JsStreamEvent {
     /// Present on permissionDenied and permissionPending: microphone | systemAudio.
@@ -1988,6 +1989,14 @@ pub fn processes() -> AsyncTask<ProcessesTask> {
 /// for the first 60 s, then every 2 s until resolved or stopped. Bare-host opens rely
 /// on the responsible-app prompt. Windows checks Microphone privacy, including
 /// Let desktop apps access your microphone.
+///
+/// macOS system/process capture runs a once-per-generation self-probe after 5 s of
+/// exact-zero samples with eligible external output active. It renders a roughly
+/// 300 ms diagnostic signal on the default output and captures only our own process
+/// in a separate private tap. A confirmed failure emits terminal permissionDenied
+/// with permission systemAudio; an inconclusive result emits silenceWhileSourceActive
+/// and continues. The signal may enter capture when our own process is included
+/// (e.g. excludeSelf: false). Stopping cancels the probe without a late event.
 ///
 /// `options.denoise` enables noise suppression in core (internal canonical form), so both primary
 /// and secondary taps receive denoised audio. `options.vad` runs VAD on the tap selected by `vadTap`

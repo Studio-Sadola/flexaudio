@@ -129,6 +129,13 @@ impl Drop for TapChain {
     }
 }
 
+impl TapChain {
+    /// Close user delivery before publishing a terminal permission failure.
+    pub(crate) fn gate_delivery(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+}
+
 /// Convert `AudioObjectID`s to `NSArray<NSNumber>` (u32 values).
 fn object_ids_to_nsarray(ids: &[AudioObjectID]) -> Retained<NSArray<NSNumber>> {
     let numbers: Vec<Retained<NSNumber>> = ids
@@ -347,7 +354,10 @@ pub(crate) unsafe fn build_tap_chain(
 /// `{ Name, UID(generated UUID), IsPrivate:true, IsStacked:false, TapAutoStart:true,
 ///    TapList:[{SubTapUID: tap UUID, SubTapDriftCompensation:true}] }`.
 /// Build it with NSDictionary and pass it as `&CFDictionary` via toll-free bridging.
-fn create_aggregate_device(name: &str, sub_tap_uid: &NSString) -> Result<AudioObjectID, Error> {
+pub(crate) fn create_aggregate_device(
+    name: &str,
+    sub_tap_uid: &NSString,
+) -> Result<AudioObjectID, Error> {
     // Sub-tap dictionary: { uid: <tap uuid>, drift: true }.
     let drift_true = NSNumber::numberWithBool(true);
     let sub_tap: Retained<NSDictionary<NSString, NSObject>> = NSDictionary::from_slices::<NSString>(
