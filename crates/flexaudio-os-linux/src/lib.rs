@@ -59,6 +59,46 @@ const MAX_WATCH_EVENTS: usize = 1024;
 /// not. On timeout, stop and return the data collected so far.
 const ENUMERATE_DEADLINE_MS: u128 = 2_000;
 
+/// Deadline (milliseconds) for [`run_pw_loop`]'s capture stream to negotiate its format.
+///
+/// Readiness is reported only once `param_changed` stores a negotiated format. A stream that
+/// never negotiates (for example the sink disappeared mid-setup) must not block `start()`
+/// forever, so a one-shot timer reports failure and quits the loop at this deadline.
+const NEGOTIATE_DEADLINE_MS: u128 = 2_000;
+
+/// Single-shot readiness report from the capture loop thread back to `start()`.
+///
+/// The loop thread reports success only after the stream has negotiated its format (see
+/// [`add_capture_listener`]'s `param_changed`), or failure from the negotiation deadline timer.
+/// `sent` makes the report single-shot, so a late deadline cannot overwrite a successful report.
+struct Readiness {
+    /// Channel back to `start()`.
+    tx: mpsc::Sender<std::result::Result<(), String>>,
+    /// Whether a report (success or failure) has already been sent.
+    sent: std::cell::Cell<bool>,
+}
+
+impl Readiness {
+    /// Report that the stream is set up and its format negotiated. No-op if already reported.
+    fn report_ready(&self) {
+        if !self.sent.replace(true) {
+            let _ = self.tx.send(Ok(()));
+        }
+    }
+
+    /// Report a setup failure. No-op if a report has already been sent.
+    fn report_failure(&self, msg: String) {
+        if !self.sent.replace(true) {
+            let _ = self.tx.send(Err(msg));
+        }
+    }
+
+    /// Whether a report has already been sent (success or failure).
+    fn is_reported(&self) -> bool {
+        self.sent.get()
+    }
+}
+
 /// Call [`pipewire::init`] once per process.
 ///
 /// `pw::init()` performs library-wide global initialization and may be called concurrently from
@@ -372,7 +412,8 @@ impl Drop for PwSystemBackend {
 ///
 /// # `mode`: Include / Exclude
 ///
-/// - [`ProcessMode::Include`] (default): Capture only the target PID's node (fan-out link, typically one node).
+/// - [`ProcessMode::Include`] (default): Capture every `Stream/Output/Audio` node owned by the
+///   target PID (fan-out links; one process can own several output streams).
 /// - [`ProcessMode::Exclude`]: Fan-in link all app outputs (`Stream/Output/Audio`) except the target
 ///   PID to our capture input (the Include predicate inverted across multiple nodes). Keep nodes
 ///   with unresolved PIDs pending until their Client arrives, so the wrong process is not excluded.
@@ -450,7 +491,8 @@ impl CaptureBackend for PwProcessBackend {
         }
 
         // Convert mode to a node-selection predicate.
-        // - Include: Link only the target PID's node (typically one node).
+        // - Include: Link every Stream/Output/Audio node owned by the target PID (a process can
+        //   own several output streams).
         // - Exclude: Link all Stream/Output/Audio nodes except the target PID (fan-in).
         let select = match self.mode {
             ProcessMode::Include => PidSelect::Include(self.target_pid),
@@ -872,7 +914,8 @@ fn effective_exclusion(
 /// `exclude_pids`).
 #[derive(Clone, PartialEq, Eq)]
 enum PidSelect {
-    /// Link only nodes whose resolved PID matches this PID (Include; typically one node).
+    /// Link every `Stream/Output/Audio` node whose resolved PID matches this PID (Include; a
+    /// process can own several output streams).
     Include(u32),
     /// Link every `Stream/Output/Audio` node whose resolved pid is not in this
     /// set (Exclude / `exclude_self` / `exclude_pids`). The set holds the pids
@@ -1000,6 +1043,9 @@ fn setup_pw_process(
     let user_data = UserData {
         format: spa::param::audio::AudioInfoRaw::new(),
         sink,
+        // The fan-out path reports readiness at connect time (see run_pw_process_loop) and does
+        // not wait for negotiation on this listener.
+        readiness: None,
     };
     // Register callbacks (shared helper; same param_changed/process behavior as system capture).
     let listener = add_capture_listener(&stream, user_data)?;
@@ -1542,6 +1588,10 @@ struct UserData {
     format: spa::param::audio::AudioInfoRaw,
     /// Destination for raw frames. `process` pushes through `&mut`.
     sink: RawSink,
+    /// Readiness report for the system-monitor path: `param_changed` reports success once a
+    /// format is negotiated. `None` for the process fan-out path, which reports readiness at
+    /// connect time and does not wait for negotiation on this listener.
+    readiness: Option<std::rc::Rc<Readiness>>,
 }
 
 /// Register `param_changed` / `process` callbacks on a capture stream.
@@ -1590,9 +1640,14 @@ fn add_capture_listener(
                 if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
                     return;
                 }
-                // Store the negotiated format (used by process for the channel count).
-                if user_data.format.parse(param).is_err() {
-                    // Keep the previous value if parsing fails.
+                // Store the negotiated format (used by process for the channel count and frame
+                // layout), then report readiness: a successful format negotiation is what makes
+                // the capture stream ready to receive data. Keep the previous value if parsing
+                // fails.
+                if user_data.format.parse(param).is_ok() {
+                    if let Some(readiness) = &user_data.readiness {
+                        readiness.report_ready();
+                    }
                 }
             }));
         })
@@ -1609,11 +1664,15 @@ fn add_capture_listener(
                     return;
                 }
                 let data = &mut datas[0];
-                // Save the valid byte count and offset (ring position) before borrowing data().
+                // Save the chunk fields before borrowing data(). `flags` and `stride` come from
+                // the SPA chunk and describe the validity and layout of the bytes.
                 let chunk = data.chunk();
                 let size = chunk.size() as usize;
                 let offset = chunk.offset() as usize;
-                if size == 0 {
+                let stride = chunk.stride();
+                // A CORRUPTED chunk flag means the producer marked the data invalid. Treat it as
+                // no-data instead of decoding garbage into the sink.
+                if size == 0 || chunk.flags().contains(pw::spa::buffer::ChunkFlags::CORRUPTED) {
                     return;
                 }
                 let Some(bytes) = data.data() else {
@@ -1625,9 +1684,21 @@ fn add_capture_listener(
                     return;
                 }
                 let valid = &bytes[offset..end];
-                // Read only whole f32 values (ignore trailing bytes).
-                let n_floats = valid.len() / std::mem::size_of::<f32>();
-                if n_floats == 0 {
+                // Interleaved f32: `channels` samples per frame. The negotiated channel count
+                // (see param_changed) decides the audio bytes actually carried by each frame.
+                let channels = user_data.format.channels().max(1) as usize;
+                let frame_bytes = channels * std::mem::size_of::<f32>();
+                // spa_chunk.stride is the byte distance between consecutive frames. It can be
+                // larger than the audio frame when the producer pads each frame; a non-positive
+                // or too-small stride means the frames are tightly packed.
+                let step = if stride > 0 && (stride as usize) > frame_bytes {
+                    stride as usize
+                } else {
+                    frame_bytes
+                };
+                let n_frames = valid.len() / step;
+                let n_floats = n_frames * channels;
+                if n_frames == 0 {
                     return;
                 }
                 // Read the bytes as interleaved f32. `data` alignment is not guaranteed, so use
@@ -1643,15 +1714,19 @@ fn add_capture_listener(
                         scratch.reserve(n_floats - cap);
                     }
                     scratch.clear();
-                    for i in 0..n_floats {
-                        let b = i * 4;
-                        let v = f32::from_le_bytes([
-                            valid[b],
-                            valid[b + 1],
-                            valid[b + 2],
-                            valid[b + 3],
-                        ]);
-                        scratch.push(v);
+                    for frame in 0..n_frames {
+                        // Audio bytes of this frame; any trailing padding up to `step` is skipped.
+                        let base = frame * step;
+                        for i in 0..channels {
+                            let b = base + i * 4;
+                            let v = f32::from_le_bytes([
+                                valid[b],
+                                valid[b + 1],
+                                valid[b + 2],
+                                valid[b + 3],
+                            ]);
+                            scratch.push(v);
+                        }
                     }
                     // PTS: currently use the monotonic arrival time (`monotonic_now_ns`) as a
                     // substitute. This monotonic approximation works because the downstream
@@ -1694,16 +1769,24 @@ fn build_format_pod_bytes() -> std::result::Result<Vec<u8>, String> {
 /// PipeWire loop thread body.
 ///
 /// Creates, runs, and destroys `MainLoop`/`Context`/`Core`/`Stream` (all `!Send`) only inside this
-/// function, without crossing thread boundaries. Reports setup success or failure to the caller
-/// through `ready_tx`, then runs `main_loop.run()` until a stop request on success.
+/// function, without crossing thread boundaries. Reports readiness to the caller through
+/// `ready_tx` once the stream has negotiated its format, then runs `main_loop.run()` until a stop
+/// request on success.
 fn run_pw_loop(
     device_id: Option<String>,
     sink: RawSink,
     stop_rx: pw::channel::Receiver<Terminate>,
     ready_tx: &mpsc::Sender<std::result::Result<(), String>>,
 ) {
+    // Single-shot readiness report. It is filled by `param_changed` (success) or by the
+    // negotiation deadline timer below (failure).
+    let readiness = std::rc::Rc::new(Readiness {
+        tx: ready_tx.clone(),
+        sent: std::cell::Cell::new(false),
+    });
+
     // Setup is in a separate function. Keep its return values alive for the whole run (dropping them stops it).
-    let (main_loop, _stream, _listener) = match setup_pw(device_id, sink) {
+    let (main_loop, _stream, _listener) = match setup_pw(device_id, sink, readiness.clone()) {
         Ok(t) => t,
         Err(msg) => {
             // Report setup failure and exit (without panicking).
@@ -1721,16 +1804,27 @@ fn run_pw_loop(
         main_loop_for_quit.quit();
     });
 
-    // Report setup success. run() now blocks.
-    if ready_tx.send(Ok(())).is_err() {
-        // The caller is gone (e.g. start was dropped). Do not run.
-        return;
-    }
+    // Readiness is reported only once the format is negotiated (see `param_changed`), never at
+    // connect time: reporting at connect time told the caller capture was running even if the
+    // stream never negotiated. A one-shot timer bounds the wait, so a stream that never
+    // negotiates cannot block `start()` forever; if a report was already sent, it is a no-op.
+    let readiness_for_timer = readiness.clone();
+    let main_loop_for_timeout = main_loop.clone();
+    let _timer = main_loop.loop_().add_timer(move |_expirations| {
+        if !readiness_for_timer.is_reported() {
+            readiness_for_timer.report_failure("pipewire format negotiation timed out".into());
+            main_loop_for_timeout.quit();
+        }
+    });
+    let _ = _timer.update_timer(
+        Some(std::time::Duration::from_millis(NEGOTIATE_DEADLINE_MS as u64)),
+        None,
+    );
 
-    // Run until Terminate or process exit.
+    // Run until Terminate, the negotiation deadline, or process exit.
     main_loop.run();
-    // On exit, drop _attached → _listener → _stream → main_loop in reverse declaration order,
-    // destroying the PipeWire resources on this thread.
+    // On exit, drop _timer → _attached → _listener → _stream → main_loop in reverse declaration
+    // order, destroying the PipeWire resources on this thread.
 }
 
 /// PipeWire setup. Returns `Err(String)` on failure (does not panic).
@@ -1745,10 +1839,14 @@ fn run_pw_loop(
 ///
 /// The caller ([`run_pw_loop`]) attaches the stop channel receiver to the loop. This avoids making
 /// `AttachedReceiver` a self-referential struct borrowing the return tuple (which contains `MainLoopRc`).
+///
+/// `readiness` is stored in the stream's [`UserData`] so `param_changed` can report success once
+/// the format is negotiated (readiness must not be reported at connect time, see [`run_pw_loop`]).
 #[allow(clippy::type_complexity)]
 fn setup_pw(
     device_id: Option<String>,
     sink: RawSink,
+    readiness: std::rc::Rc<Readiness>,
 ) -> std::result::Result<
     (
         pw::main_loop::MainLoopRc,
@@ -1798,6 +1896,8 @@ fn setup_pw(
     let user_data = UserData {
         format: spa::param::audio::AudioInfoRaw::new(),
         sink,
+        // `param_changed` reports readiness through this handle once the format is negotiated.
+        readiness: Some(readiness),
     };
 
     // Register callbacks. Store the negotiated format in `param_changed` and send buffers
@@ -2066,21 +2166,33 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
         })
         .register();
 
-    // Run until done (both sync round trips complete). `run()` returns only after
-    // `quit()`: either the completion callback set `done`, or the second sync was
-    // refused and the callback quit without completing. If `done` is still unset
-    // then, no further completion can arrive, so stop instead of re-entering
-    // `run()`. The deadline additionally bounds a run() that keeps returning
-    // spuriously without done, so enumeration cannot hang. It is best-effort and
-    // must not panic.
+    // Wait for done (both sync round trips complete). `run()` blocks until `quit()` and would
+    // hang forever when no event ever arrives, so iterate with a finite timeout instead: each
+    // iteration returns within its timeout, and the loop stops once the deadline passes even if
+    // `done` never arrives. `iterate` also dispatches the core `done` callback, which sets
+    // `done` and calls `quit()` on the normal path. It is best-effort and must not panic.
     let deadline = std::time::Instant::now();
     while !done.get() {
-        main_loop.run();
-        if !done.get() || deadline.elapsed().as_millis() >= ENUMERATE_DEADLINE_MS {
-            // No completion remains to wait for, or the deadline was exceeded.
-            // Stop and return what has been collected.
+        let elapsed_ms = deadline.elapsed().as_millis();
+        if elapsed_ms >= ENUMERATE_DEADLINE_MS {
+            // Deadline exceeded; stop waiting for a completion that may never arrive.
             break;
         }
+        let remaining =
+            std::time::Duration::from_millis((ENUMERATE_DEADLINE_MS - elapsed_ms) as u64);
+        main_loop.loop_().iterate(pw::loop_::Timeout::Finite(remaining));
+    }
+
+    // Known silent-partial case, pending a shared error contract: if `done` is still false here,
+    // registry enumeration never confirmed completion (the deadline expired, or the second sync
+    // was refused), so `out` may be incomplete. This function returns `Result<Vec<..>, String>`,
+    // which cannot express a partial result without a new error type shared across backends, so
+    // the partial list is still returned as if enumeration had finished. Surface it on the
+    // existing FLEXAUDIO_DEBUG diagnostic path until that contract exists.
+    if !done.get() && std::env::var_os("FLEXAUDIO_DEBUG").is_some() {
+        eprintln!(
+            "[flexaudio-os-linux] enumerate_pw: registry enumeration did not complete (done=false); returning a possibly partial device list"
+        );
     }
 
     // Build DeviceInfo values from the collected raw nodes.
