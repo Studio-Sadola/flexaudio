@@ -1048,7 +1048,7 @@ fn setup_pw_process(
         readiness: None,
     };
     // Register callbacks (shared helper; same param_changed/process behavior as system capture).
-    let listener = add_capture_listener(&stream, user_data)?;
+    let listener = add_capture_listener(&stream, user_data, &main_loop)?;
 
     // Connect our stream once (Direction::Input, target=None, no AUTOCONNECT). This creates input
     // ports (input_FL/FR); data does not arrive until linked (link establishment negotiates the
@@ -1606,6 +1606,7 @@ struct UserData {
 fn add_capture_listener(
     stream: &pw::stream::StreamRc,
     user_data: UserData,
+    main_loop: &pw::main_loop::MainLoopRc,
 ) -> std::result::Result<pw::stream::StreamListener<UserData>, String> {
     // Preallocate the thread-local scratch buffer used by the real-time process callback to
     // convert data to f32, up to the maximum expected block size, during stream setup on this
@@ -1620,34 +1621,43 @@ fn add_capture_listener(
         }
     });
 
+    let loop_for_format = main_loop.clone();
     stream
         .add_local_listener_with_user_data(user_data)
-        .param_changed(|_stream, user_data, id, param| {
+        .param_changed(move |_stream, user_data, id, param| {
             // A panic crossing FFI is UB, so wrap the callback body in catch_unwind.
             let _ = catch_unwind(AssertUnwindSafe(|| {
-                // NULL clears the format.
-                let Some(param) = param else {
-                    return;
-                };
                 if id != pw::spa::param::ParamType::Format.as_raw() {
                     return;
                 }
-                let (media_type, media_subtype) = match format_utils::parse_format(param) {
-                    Ok(v) => v,
-                    Err(_) => return,
+                // NULL clears the format; it is not successful negotiation.
+                let Some(param) = param else {
+                    user_data.format = spa::param::audio::AudioInfoRaw::new();
+                    return;
                 };
-                // Accept raw audio only.
-                if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
+                // Parsing may mutate its destination even on failure. Validate a fresh value
+                // before replacing the format used by the process callback.
+                let mut format = spa::param::audio::AudioInfoRaw::new();
+                let accepted = matches!(
+                    format_utils::parse_format(param),
+                    Ok((MediaType::Audio, MediaSubtype::Raw))
+                ) && format.parse(param).is_ok()
+                    && format.format() == spa::param::audio::AudioFormat::F32LE
+                    && format.channels() != 0
+                    && format.channels() == u32::from(user_data.sink.native_channels())
+                    && format.rate() != 0;
+                if !accepted {
+                    if let Some(readiness) = &user_data.readiness {
+                        if !readiness.is_reported() {
+                            readiness.report_failure("unacceptable pipewire capture format".into());
+                            loop_for_format.quit();
+                        }
+                    }
                     return;
                 }
-                // Store the negotiated format (used by process for the channel count and frame
-                // layout), then report readiness: a successful format negotiation is what makes
-                // the capture stream ready to receive data. Keep the previous value if parsing
-                // fails.
-                if user_data.format.parse(param).is_ok() {
-                    if let Some(readiness) = &user_data.readiness {
-                        readiness.report_ready();
-                    }
+                user_data.format = format;
+                if let Some(readiness) = &user_data.readiness {
+                    readiness.report_ready();
                 }
             }));
         })
@@ -1672,31 +1682,52 @@ fn add_capture_listener(
                 let stride = chunk.stride();
                 // A CORRUPTED chunk flag means the producer marked the data invalid. Treat it as
                 // no-data instead of decoding garbage into the sink.
-                if size == 0 || chunk.flags().contains(pw::spa::buffer::ChunkFlags::CORRUPTED) {
+                if size == 0
+                    || chunk
+                        .flags()
+                        .contains(pw::spa::buffer::ChunkFlags::CORRUPTED)
+                {
                     return;
                 }
                 let Some(bytes) = data.data() else {
                     return;
                 };
-                // [offset, offset+size) is the valid region. Reject out-of-range values defensively.
-                let end = offset.saturating_add(size);
-                if end > bytes.len() {
+                // Data::data() spans maxsize. SPA offsets are modulo maxsize and chunk sizes
+                // are clamped to maxsize; still reject a region that exceeds mapped memory.
+                if bytes.is_empty() {
                     return;
                 }
+                let offset = offset % bytes.len();
+                let size = size.min(bytes.len());
+                let Some(end) = offset.checked_add(size).filter(|end| *end <= bytes.len()) else {
+                    return;
+                };
                 let valid = &bytes[offset..end];
                 // Interleaved f32: `channels` samples per frame. The negotiated channel count
                 // (see param_changed) decides the audio bytes actually carried by each frame.
-                let channels = user_data.format.channels().max(1) as usize;
+                let channels = user_data.format.channels() as usize;
+                if channels == 0 {
+                    return;
+                }
                 let frame_bytes = channels * std::mem::size_of::<f32>();
                 // spa_chunk.stride is the byte distance between consecutive frames. It can be
-                // larger than the audio frame when the producer pads each frame; a non-positive
-                // or too-small stride means the frames are tightly packed.
-                let step = if stride > 0 && (stride as usize) > frame_bytes {
+                // larger than the audio frame when the producer pads each frame.
+                if stride > 0 && (stride as usize) < frame_bytes {
+                    // Incompatible layouts are skipped like CORRUPTED chunks. Reporting this
+                    // loss belongs to the shared loss contract.
+                    return;
+                }
+                let step = if stride > 0 {
                     stride as usize
                 } else {
                     frame_bytes
                 };
-                let n_frames = valid.len() / step;
+                // The last complete frame need not include trailing padding.
+                let n_frames = if valid.len() >= frame_bytes {
+                    1 + (valid.len() - frame_bytes) / step
+                } else {
+                    0
+                };
                 let n_floats = n_frames * channels;
                 if n_frames == 0 {
                     return;
@@ -1816,10 +1847,19 @@ fn run_pw_loop(
             main_loop_for_timeout.quit();
         }
     });
-    let _ = _timer.update_timer(
-        Some(std::time::Duration::from_millis(NEGOTIATE_DEADLINE_MS as u64)),
-        None,
-    );
+    if let Err(e) = _timer
+        .update_timer(
+            Some(std::time::Duration::from_millis(
+                NEGOTIATE_DEADLINE_MS as u64,
+            )),
+            None,
+        )
+        .into_result()
+    {
+        readiness.report_failure(format!("arm pipewire negotiation deadline failed: {e}"));
+        main_loop.quit();
+        return;
+    }
 
     // Run until Terminate, the negotiation deadline, or process exit.
     main_loop.run();
@@ -1902,7 +1942,7 @@ fn setup_pw(
 
     // Register callbacks. Store the negotiated format in `param_changed` and send buffers
     // dequeued by `process` to RawSink (shared helper).
-    let listener = add_capture_listener(&stream, user_data)?;
+    let listener = add_capture_listener(&stream, user_data, &main_loop)?;
 
     // Requested format params: f32 / 48000 / 2 channels. Since rate/channels are explicit,
     // PipeWire automatically inserts audioconvert to convert mismatched graphs to 48 kHz/stereo/f32.
@@ -2118,6 +2158,7 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
     // again and quit on the second done. This waits for both global enumeration and default
     // metadata properties. done is guaranteed, so the loop cannot run forever.
     let done = Rc::new(std::cell::Cell::new(false));
+    let aborted = Rc::new(std::cell::Cell::new(false));
     let stage = Rc::new(std::cell::Cell::new(0u8));
     let pending1 = core
         .sync(0)
@@ -2125,6 +2166,7 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
     let pending1 = Rc::new(std::cell::Cell::new(pending1.seq()));
 
     let done_for_cb = done.clone();
+    let aborted_for_cb = aborted.clone();
     let stage_for_cb = stage.clone();
     let pending1_for_cb = pending1.clone();
     let loop_for_cb = main_loop.clone();
@@ -2144,6 +2186,7 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
                         // Without the core the second sync cannot be issued, so
                         // enumeration is incomplete. Do not report completion;
                         // quit so the wait loop stops instead of waiting forever.
+                        aborted_for_cb.set(true);
                         loop_for_cb.quit();
                         return;
                     };
@@ -2152,6 +2195,7 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
                         Err(_) => {
                             // The second sync was refused: enumeration did not
                             // complete, so `done` stays unset. Quit the wait loop.
+                            aborted_for_cb.set(true);
                             loop_for_cb.quit();
                         }
                     }
@@ -2172,7 +2216,7 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
     // `done` never arrives. `iterate` also dispatches the core `done` callback, which sets
     // `done` and calls `quit()` on the normal path. It is best-effort and must not panic.
     let deadline = std::time::Instant::now();
-    while !done.get() {
+    while !done.get() && !aborted.get() {
         let elapsed_ms = deadline.elapsed().as_millis();
         if elapsed_ms >= ENUMERATE_DEADLINE_MS {
             // Deadline exceeded; stop waiting for a completion that may never arrive.
@@ -2180,7 +2224,13 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
         }
         let remaining =
             std::time::Duration::from_millis((ENUMERATE_DEADLINE_MS - elapsed_ms) as u64);
-        main_loop.loop_().iterate(pw::loop_::Timeout::Finite(remaining));
+        if main_loop
+            .loop_()
+            .iterate(pw::loop_::Timeout::Finite(remaining))
+            < 0
+        {
+            aborted.set(true);
+        }
     }
 
     // Known silent-partial case, pending a shared error contract: if `done` is still false here,
