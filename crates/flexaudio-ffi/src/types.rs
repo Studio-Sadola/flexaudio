@@ -148,6 +148,10 @@ pub struct FlexChunk {
     /// Events finalized by VAD for this chunk. NULL when VAD is disabled or there are no events
     /// (`vad_events_len = 0`). When non-NULL, `flexaudio_chunk_free` releases it
     /// together with `data`.
+    /// On DISCONTINUITY, flushed pre-gap events precede any post-gap events. The core's fixed
+    /// 20 ms chunks are shorter than a fresh 32 ms VAD frame, so this chunk contains only pre-gap
+    /// events; all events on subsequent chunks use the new sample clock, restarted at zero.
+    /// SpeechStart and SpeechEnd are delivered together when a segment is finalized.
     pub vad_events: *mut FlexVadEvent,
     /// Number of `vad_events`. 0 when VAD is disabled or there are no events.
     pub vad_events_len: usize,

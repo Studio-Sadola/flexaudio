@@ -72,6 +72,14 @@ impl FlexStream {
     ///   events to `FlexChunk::vad_events` (after any events flushed for the discontinuity).
     /// - Metrics (`peak` / `rms`) are recomputed from the delivered data, which denoise rewrote.
     pub(crate) fn poll_processed(&mut self) -> Result<Option<FlexChunk>, flexaudio_vad::VadError> {
+        self.poll_processed_with_flush(Vad::flush)
+    }
+
+    /// Keep the flush boundary injectable so recovery can be tested without changing the VAD API.
+    fn poll_processed_with_flush(
+        &mut self,
+        flush: impl FnOnce(&mut Vad) -> Result<Vec<flexaudio_vad::VadEvent>, flexaudio_vad::VadError>,
+    ) -> Result<Option<FlexChunk>, flexaudio_vad::VadError> {
         let Some(mut chunk) = self.inner.poll_chunk() else {
             return Ok(None);
         };
@@ -83,17 +91,30 @@ impl FlexStream {
         // which is the existing signal for "reset your state" (the N-API binding resets its VAD the
         // same way).
         //
-        // Flush VAD before clearing it. A bare `reset()` discards an open speech segment (it clears
-        // `triggered` without emitting events), leaving the caller with a SpeechStart that never gets
-        // its SpeechEnd. `flush()` finalizes the open segment, returns its events, and resets, so those
-        // events can be delivered attached to this chunk exactly like normal VAD events.
+        // Flush VAD before clearing it. A bare reset discards an unreported open segment: both
+        // SpeechStart and SpeechEnd are emitted only when that segment is finalized. Flush returns
+        // that pair on the old sample clock and resets before processing post-gap audio.
         let mut vad_events = Vec::new();
         if chunk.flags.contains(ChunkFlags::DISCONTINUITY) {
+            let mut flush_error = None;
             if let Some(vad) = self.vad.as_mut() {
-                vad_events = vad.flush()?;
+                match flush(vad) {
+                    Ok(events) => vad_events = events,
+                    Err(error) => {
+                        // A latched failure makes flush return before resetting. Attempt recovery
+                        // anyway; if reset also fails, VAD retains that failure for later polls.
+                        let _ = vad.reset();
+                        flush_error = Some(error);
+                    }
+                }
             }
             if let Some(dn) = self.denoiser.as_mut() {
                 dn.reset();
+            }
+            // Report the original flush error once, after both reset attempts. This poll consumes
+            // the discontinuity chunk; the next poll starts with fresh state if reset succeeded.
+            if let Some(error) = flush_error {
+                return Err(error);
             }
         }
 
@@ -178,22 +199,34 @@ mod tests {
         FlexStream,
         Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>,
     ) {
+        vad_stream_with_max(threshold, 0)
+    }
+
+    fn vad_stream_with_max(
+        threshold: f32,
+        max_speech_ms: u32,
+    ) -> (
+        FlexStream,
+        Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>,
+    ) {
         let sink = Arc::new(Mutex::new(None));
         let mut config = flexaudio::StreamConfig::default();
         config.output.channels = 1;
         let mut inner =
             flexaudio::Stream::open(config, Box::new(PushBackend(sink.clone()))).expect("open");
-        inner.start().expect("start");
         let vad = Vad::new(flexaudio_vad::VadConfig {
             threshold,
             neg_threshold: Some(threshold),
             min_speech_ms: 0,
             min_silence_ms: 0,
             speech_pad_ms: 0,
-            max_speech_ms: 0,
+            max_speech_ms,
             sample_rate: 16_000,
         })
         .expect("build vad");
+        // Model construction can exceed the watchdog's idle limit under parallel tests. Start
+        // capture only when the fixture is ready to supply PCM, avoiding unrelated recovery flags.
+        inner.start().expect("start");
         (
             FlexStream {
                 inner,
@@ -290,6 +323,139 @@ mod tests {
         stream.inner.stop();
         assert_eq!(len, 0, "no segment was open, so no event should be emitted");
         assert!(null);
+    }
+
+    fn events(chunk: &FlexChunk) -> Vec<(i32, i64)> {
+        if chunk.vad_events_len == 0 {
+            return Vec::new();
+        }
+        // SAFETY: poll_processed owns this live event array until free is called.
+        unsafe { std::slice::from_raw_parts(chunk.vad_events, chunk.vad_events_len) }
+            .iter()
+            .map(|event| (event.kind, event.at_sample))
+            .collect()
+    }
+
+    #[test]
+    fn discontinuity_chunk_separates_old_and_new_vad_timelines() {
+        let (mut stream, sink) = vad_stream_with_max(0.0, 32);
+        for _ in 0..2 {
+            let chunk = push_and_poll(&mut stream, &sink);
+            assert!(
+                events(&chunk).is_empty(),
+                "open segment is not yet reported"
+            );
+            free(chunk);
+        }
+        stream.inner.pause();
+        stream.inner.resume().unwrap();
+        let chunk = push_and_poll(&mut stream, &sink);
+        assert_ne!(chunk.flags & ChunkFlags::DISCONTINUITY.bits(), 0);
+        assert_eq!(chunk.frames, 960, "the core delivers a 20 ms chunk");
+        assert_eq!(events(&chunk), [(0, 0), (1, 512)], "old timeline only");
+        assert_eq!(
+            stream.vad.as_ref().unwrap().converted_sample_position(),
+            319
+        );
+        free(chunk);
+
+        // Post-gap speech starts inside the same chunk, but 319 converted samples cannot complete
+        // a fresh 512-sample frame. Its boundaries are finalized and delivered on a later chunk.
+        for index in 0..3 {
+            let chunk = push_and_poll(&mut stream, &sink);
+            assert_eq!(chunk.flags & ChunkFlags::DISCONTINUITY.bits(), 0);
+            if index == 2 {
+                assert_eq!(events(&chunk), [(0, 0), (1, 1024)], "new timeline only");
+            } else {
+                assert!(events(&chunk).is_empty());
+            }
+            free(chunk);
+        }
+        stream.inner.stop();
+    }
+
+    #[test]
+    fn discontinuity_flush_error_resets_both_addons_and_is_reported_once() {
+        use std::cell::Cell;
+
+        // Inject at the flush boundary: a latched core failure returns this error without resetting.
+        // The no-error case uses the real flush as a control for the same reset/processing path.
+        for fail_flush in [false, true] {
+            let (mut stream, sink) = vad_stream(0.0);
+            free(push_and_poll(&mut stream, &sink));
+            free(push_and_poll(&mut stream, &sink));
+            let old_position = stream.vad.as_ref().unwrap().converted_sample_position();
+            let mut denoiser = Denoiser::new(1).unwrap();
+            denoiser.process(&mut [0.8; 137]).unwrap();
+            stream.denoiser = Some(denoiser);
+            stream.inner.pause();
+            stream.inner.resume().unwrap();
+            assert_eq!(
+                sink.lock().unwrap().as_mut().unwrap().push(&[0.0; 960], 0),
+                960
+            );
+            let error = flexaudio_vad::VadError::Inference("injected latched VAD failure".into());
+            let flush_calls = Cell::new(0);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut reference = Denoiser::new(1).unwrap();
+            let mut error_count = 0;
+            loop {
+                let result = stream.poll_processed_with_flush(|vad| {
+                    flush_calls.set(flush_calls.get() + 1);
+                    assert_eq!(vad.converted_sample_position(), old_position);
+                    if fail_flush {
+                        Err(error.clone())
+                    } else {
+                        vad.flush()
+                    }
+                });
+                match result {
+                    Err(actual) => {
+                        assert!(fail_flush);
+                        assert_eq!(actual, error, "preserve the original flush error");
+                        error_count += 1;
+                        assert_eq!(stream.vad.as_ref().unwrap().converted_sample_position(), 0);
+                        break;
+                    }
+                    Ok(Some(chunk)) => {
+                        assert!(!fail_flush);
+                        assert_eq!(events(&chunk), [(0, 0), (1, 512)]);
+                        let mut expected = [0.0; 960];
+                        reference.process(&mut expected).unwrap();
+                        // SAFETY: the chunk's PCM allocation is live until free below.
+                        assert_eq!(
+                            unsafe { std::slice::from_raw_parts(chunk.data, chunk.len) },
+                            expected
+                        );
+                        free(chunk);
+                        break;
+                    }
+                    Ok(None) => {
+                        assert!(Instant::now() < deadline, "mock chunk timed out");
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+            }
+            assert_eq!(flush_calls.get(), 1);
+            for _ in 0..3 {
+                let chunk = push_and_poll(&mut stream, &sink);
+                let mut expected = [0.0; 960];
+                reference.process(&mut expected).unwrap();
+                // SAFETY: the chunk's PCM allocation is live until free below.
+                assert_eq!(
+                    unsafe { std::slice::from_raw_parts(chunk.data, chunk.len) },
+                    expected
+                );
+                free(chunk);
+            }
+            assert_eq!(error_count, usize::from(fail_flush));
+            assert_eq!(
+                stream.vad.as_ref().unwrap().converted_sample_position(),
+                if fail_flush { 959 } else { 1279 }
+            );
+            assert!(stream.poll_processed().unwrap().is_none());
+            stream.inner.stop();
+        }
     }
 
     fn zero_vad() -> FlexVadConfig {

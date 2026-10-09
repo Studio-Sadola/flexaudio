@@ -139,7 +139,18 @@ class Stream:
     def gain(self) -> float: ...
     def native_format(self) -> Tuple[int, int]: ...
     def dropped_chunks(self) -> int: ...
-    def poll_chunk(self) -> Optional[AudioChunk]: ...
+    def poll_chunk(self) -> Optional[AudioChunk]:
+        """Poll PCM and finalized VAD boundary pairs (start and end together).
+
+        On DISCONTINUITY (flags & 1), flushed pre-gap events come first and
+        retain the old at_sample clock. Fixed 20 ms chunks cannot complete a
+        fresh 32 ms VAD frame: every event on that chunk is pre-gap, and events
+        on later chunks use the new clock, restarted at zero. A timestamp
+        decrease is not a reliable timeline marker. Flush errors still reset
+        VAD and denoise before being raised; that poll consumes the chunk.
+        After a successful reset, later polls do not repeat the flush error.
+        """
+        ...
     def poll_event(self) -> Optional[StreamEvent]: ...
     def terminal_error(self) -> Optional[StreamEvent]:
         """Retained terminal failure, including after stop; does not consume events.
