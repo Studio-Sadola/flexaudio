@@ -181,8 +181,10 @@ struct SharedState {
     /// Confirmed denial persists after all capture threads have stopped.
     terminal: TerminalFailure,
 
-    /// Post-recovery flag. The watchdog sets it to true on recovery; the intake thread marks the next
-    /// chunk RECOVERED|DISCONTINUITY and resets it to false.
+    /// Post-recovery flag. The watchdog sets it to true after a successful reopen; the intake thread
+    /// marks the next chunk RECOVERED|DISCONTINUITY, resets it to false, and only then announces
+    /// [`Event::StreamRecovered`]. A reopen that never delivers samples therefore produces no recovery
+    /// event (no false recovery).
     recovered_pending: AtomicBool,
 
     /// Event queue shared by producer and consumer.
@@ -1173,6 +1175,9 @@ fn run_intake(
         // --- Primary tap: drain all completed chunks into ChunkRing. ---
         let gain = f32::from_bits(shared.gain_bits.load(Ordering::Relaxed));
         let mut emitted_any = false;
+        // Set when the first post-reopen primary chunk is actually enqueued. The recovery event is
+        // announced only after that delivery, so a reopen with no data never looks like a recovery.
+        let mut announce_recovery = false;
         while let Some((mut data, raw_pts)) = normalizer.pop_chunk() {
             // Discard while paused (out_frame_origin advances on pop, so PTS still progresses).
             // Keep pending flags for the first chunk after resume.
@@ -1219,6 +1224,7 @@ fn run_intake(
                 if resume_generation != primary_resume_generation {
                     chunk.flags |= ChunkFlags::DISCONTINUITY;
                 }
+                announce_recovery |= chunk.flags.contains(ChunkFlags::RECOVERED);
                 rec_primary = false;
                 disc_primary = false;
                 seq += 1;
@@ -1231,6 +1237,12 @@ fn run_intake(
                 primary_resume_generation = resume_generation;
                 emitted_any = true;
             }
+        }
+        // Confirm the recovery only now: the first post-reopen chunk has been enqueued, so real
+        // samples from the new generation were delivered. Emitted outside the delivery lock. The
+        // watchdog does not emit this event on reopen, so a silent reopen is never announced.
+        if announce_recovery {
+            shared.push_event(Event::StreamRecovered);
         }
 
         // --- Secondary tap: only when configured; pop, discard, and add flags like the primary. ---
@@ -1305,7 +1317,9 @@ fn run_intake(
 ///
 /// Check the last sample arrival time on ~250 ms ticks. If samples stop for longer than
 /// [`STALL_THRESHOLD`], reopen the backend with exponential backoff. Fire
-/// [`Event::StreamStalled`] on a stall and [`Event::StreamRecovered`] on recovery.
+/// [`Event::StreamStalled`] on a stall. On a successful reopen, set `recovered_pending` so the
+/// intake thread announces [`Event::StreamRecovered`] only once real samples from the new
+/// generation have been delivered (a silent reopen is not a recovery).
 fn run_watchdog(shared: Arc<SharedState>) {
     let mut stalled = false;
     let mut backoff = BACKOFF_MIN;
@@ -1378,10 +1392,12 @@ fn run_watchdog(shared: Arc<SharedState>) {
         if reopened {
             // open_backend_once has updated last_sample_ns to now and incremented the generation.
             // Set recovered_pending so the intake thread marks the first post-recovery chunk with
-            // RECOVERED|DISCONTINUITY. Confirm the recovery on the next tick by checking for idle.
+            // RECOVERED|DISCONTINUITY and announces Event::StreamRecovered once that chunk is
+            // actually delivered. Do not announce recovery here: a successful reopen that never
+            // produces samples must not be reported as recovered. If no data arrives, the stall
+            // check fires again on a later tick and reopens/retries as before.
             shared.recovered_pending.store(true, Ordering::SeqCst);
             stalled = false;
-            shared.push_event(Event::StreamRecovered);
             backoff = BACKOFF_MIN;
         } else {
             // On failure, wait with exponential backoff and jitter before retrying.
