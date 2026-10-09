@@ -280,7 +280,6 @@ fn scan_sync(fail: bool) -> bool {
     inspect.get()
 }
 #[test]
-#[ignore = "repro: F24"]
 fn repro_p7_failed_sync_completion() {
     assert!(!scan_sync(true), "F24: refused second sync marked enumeration done=true");
 }
@@ -382,7 +381,6 @@ impl LinkFixture {
     }
 }
 #[test]
-#[ignore = "repro: F29"]
 fn repro_p7_multinode_include() {
     let f = LinkFixture::new(2, false);
     f.link(); f.link();

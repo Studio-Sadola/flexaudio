@@ -598,8 +598,7 @@ type BoundNode = (pw::node::Node, pw::node::NodeListener);
 /// - `links`: Map of [`pw::link::Link`] proxies created by link-factory, grouped by the registry
 ///   global id of each linked output node. Keep them alive on the loop thread because dropping
 ///   them breaks the links. Registry callbacks insert/remove/clear entries, so share the map via
-///   `Rc<RefCell<…>>`. Include has at most one entry; Exclude may have many (dropping an entry
-///   disconnects its links).
+///   `Rc<RefCell<…>>`. Either mode may have many entries (dropping an entry disconnects its links).
 /// - `_bound_nodes`: bound Node proxies + their info listeners, keyed by registry global id — dropping an entry unregisters that node's info listener.
 #[allow(clippy::type_complexity)]
 struct ProcessKeep {
@@ -867,9 +866,10 @@ fn effective_exclusion(
 
 /// Node-selection predicate for the fan-in capture loop.
 ///
-/// `Include(pid)` links the one output node owned by `pid`; `Exclude(set)`
-/// links every resolved output node whose pid is NOT in `set` (used by
-/// `ProcessMode::Exclude`, `exclude_self`, and `exclude_pids`).
+/// `Include(pid)` links every output node owned by `pid` (a process can own
+/// several streams); `Exclude(set)` links every resolved output node whose pid
+/// is NOT in `set` (used by `ProcessMode::Exclude`, `exclude_self`, and
+/// `exclude_pids`).
 #[derive(Clone, PartialEq, Eq)]
 enum PidSelect {
     /// Link only nodes whose resolved PID matches this PID (Include; typically one node).
@@ -940,7 +940,7 @@ impl PidSelect {
 ///   Client PID; see [`resolve_node_pid`]). Reevaluate on each global event, regardless of
 ///   whether Client or Node arrives first.
 ///   application.process.id takes precedence — see pid_from_props.
-/// - The [`PidSelect`] predicate chooses nodes to link. Include selects one Stream/Output/Audio
+/// - The [`PidSelect`] predicate chooses nodes to link. Include selects every Stream/Output/Audio
 ///   node owned by the target PID; Exclude selects every such node with a resolved PID outside
 ///   the excluded set (unresolved PIDs wait for their Client). Once a target's output ports and
 ///   our input ports are available, the loop-thread registry callback creates channel-matched
@@ -1043,9 +1043,9 @@ fn setup_pw_process(
     // Ports: registry port global id → registration data (owning node.id / direction / channel).
     let ports: Rc<RefCell<HashMap<u32, PortEntry>>> = Rc::new(RefCell::new(HashMap::new()));
     // Currently linked output nodes: registry global id → Link proxies created for that node.
-    // Keep them for the entire run because dropping them disconnects the links. Include has at
-    // most one entry; Exclude may have many. Remove an entry to disconnect one node or clear the
-    // map to disconnect all.
+    // Keep them for the entire run because dropping them disconnects the links. Either mode may
+    // have many entries (a process can own several output streams). Remove an entry to disconnect
+    // one node or clear the map to disconnect all.
     let linked: Rc<RefCell<HashMap<u32, Vec<pw::link::Link>>>> =
         Rc::new(RefCell::new(HashMap::new()));
     // Bound Node proxies + their info listeners, keyed by registry global id.
@@ -1054,8 +1054,9 @@ fn setup_pw_process(
     let bound_nodes: Rc<RefCell<HashMap<u32, BoundNode>>> = Rc::new(RefCell::new(HashMap::new()));
 
     // Reconcile selection before adding links, including when a Client arrives
-    // after its Node and reveals Pulse provenance. Include keeps one node;
-    // Exclude links all decidable nodes outside the exclusion set.
+    // after its Node and reveals Pulse provenance. Both Include and Exclude link
+    // every matching node: one process can own several output streams, and each
+    // must be recorded.
     #[allow(clippy::too_many_arguments)]
     fn try_link(
         core: &pw::core::CoreRc,
@@ -1076,11 +1077,6 @@ fn setup_pw_process(
                     .is_some_and(|entry| select.selects_node(entry, &client_pid))
             });
         }
-        // Include keeps its representative node while it remains selected.
-        if matches!(select, PidSelect::Include(_)) && !linked.borrow().is_empty() {
-            return;
-        }
-
         // Reread our node id from the stream (it may be unset just after connect).
         // When unset, this returns SPA_ID_INVALID (=ID_ANY=u32::MAX) or 0.
         let sid = stream.node_id();
@@ -1092,13 +1088,14 @@ fn setup_pw_process(
         };
 
         // Use the predicate to select output node ids to link.
-        // - Include: one node whose resolved PID equals pid.
+        // - Include: every node whose resolved PID equals pid (one process can
+        //   own several output streams).
         // - Exclude: every node with a resolved PID outside the excluded set (unresolved PIDs excluded).
         let targets: Vec<u32> = {
             let nodes = nodes.borrow();
             let client_pid = client_pid.borrow();
             let linked = linked.borrow();
-            let mut ids: Vec<u32> = nodes
+            nodes
                 .iter()
                 .filter(|(id, entry)| {
                     if linked.contains_key(id) {
@@ -1107,11 +1104,7 @@ fn setup_pw_process(
                     select.selects_node(entry, &client_pid)
                 })
                 .map(|(&id, _)| id)
-                .collect();
-            if matches!(select, PidSelect::Include(_)) {
-                ids.truncate(1); // Include links one representative node
-            }
-            ids
+                .collect()
         };
 
         if targets.is_empty() {
@@ -2047,18 +2040,20 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
                 0 if seq == pending1_for_cb.get() => {
                     // Stage 1 complete → issue a second sync to wait for metadata properties.
                     stage_for_cb.set(1);
-                    if let Some(core) = core_weak.upgrade() {
-                        match core.sync(0) {
-                            Ok(p) => pending1_for_cb.set(p.seq()),
-                            Err(_) => {
-                                // Stop here if the second sync cannot be issued.
-                                done_for_cb.set(true);
-                                loop_for_cb.quit();
-                            }
-                        }
-                    } else {
-                        done_for_cb.set(true);
+                    let Some(core) = core_weak.upgrade() else {
+                        // Without the core the second sync cannot be issued, so
+                        // enumeration is incomplete. Do not report completion;
+                        // quit so the wait loop stops instead of waiting forever.
                         loop_for_cb.quit();
+                        return;
+                    };
+                    match core.sync(0) {
+                        Ok(p) => pending1_for_cb.set(p.seq()),
+                        Err(_) => {
+                            // The second sync was refused: enumeration did not
+                            // complete, so `done` stays unset. Quit the wait loop.
+                            loop_for_cb.quit();
+                        }
                     }
                 }
                 1 if seq == pending1_for_cb.get() => {
@@ -2071,15 +2066,19 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
         })
         .register();
 
-    // Run until done (both sync round trips complete). If run() repeatedly returns immediately
-    // without done (e.g. spurious quit), stop at the deadline to avoid a busy loop or hang and
-    // return what has been collected. Enumeration is best-effort and must not panic or hang if
-    // incomplete.
+    // Run until done (both sync round trips complete). `run()` returns only after
+    // `quit()`: either the completion callback set `done`, or the second sync was
+    // refused and the callback quit without completing. If `done` is still unset
+    // then, no further completion can arrive, so stop instead of re-entering
+    // `run()`. The deadline additionally bounds a run() that keeps returning
+    // spuriously without done, so enumeration cannot hang. It is best-effort and
+    // must not panic.
     let deadline = std::time::Instant::now();
     while !done.get() {
         main_loop.run();
-        if deadline.elapsed().as_millis() >= ENUMERATE_DEADLINE_MS {
-            // Deadline exceeded before done. Stop and return what has been collected.
+        if !done.get() || deadline.elapsed().as_millis() >= ENUMERATE_DEADLINE_MS {
+            // No completion remains to wait for, or the deadline was exceeded.
+            // Stop and return what has been collected.
             break;
         }
     }

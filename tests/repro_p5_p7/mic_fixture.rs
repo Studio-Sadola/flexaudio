@@ -159,7 +159,6 @@ fn repro_p5_format_guard_control() {
     assert_eq!(consumer.pop_slice(&mut [0.0]), 1);
 }
 #[test]
-#[ignore = "repro: M25"]
 fn repro_p5_priming_loss() {
     let (mut backend, stream, mut consumer) = callback_fixture();
     for _ in 0..100 { stream.data.borrow_mut()(&[1.1]); }
