@@ -42,6 +42,8 @@ use terminal::TerminalFailure;
 
 #[cfg(test)]
 mod permission_tests;
+#[cfg(test)]
+mod recovery_tests;
 
 /// Wraps [`flexaudio_denoise::Denoiser`] as a core [`InnerProcessor`] so the
 /// core stays independent of the concrete noise-suppression implementation.
@@ -164,7 +166,7 @@ struct SharedState {
     backend: Mutex<Box<dyn CaptureBackend>>,
 
     /// Currently active RawConsumer. Replaced by the watchdog on reopen.
-    /// This lock also guards publication and snapshots of native format and generation.
+    /// This lock also guards publication and snapshots of native format, generation and recovery.
     /// The intake thread does not pop while this is `None` (during reopen).
     raw_consumer: Mutex<Option<RawConsumer>>,
 
@@ -181,10 +183,9 @@ struct SharedState {
     /// Confirmed denial persists after all capture threads have stopped.
     terminal: TerminalFailure,
 
-    /// Post-recovery flag. The watchdog sets it to true after a successful reopen; the intake thread
-    /// marks the next chunk RECOVERED|DISCONTINUITY, resets it to false, and only then announces
-    /// [`Event::StreamRecovered`]. A reopen that never delivers samples therefore produces no recovery
-    /// event (no false recovery).
+    /// Recovery for the current raw generation, published and consumed under `raw_consumer`.
+    /// Intake consumes it only with captured samples; replacing the generation or stopping clears
+    /// it. The first delivered data chunk carries RECOVERED|DISCONTINUITY and announces recovery.
     recovered_pending: AtomicBool,
 
     /// Event queue shared by producer and consumer.
@@ -252,6 +253,14 @@ struct RawSnapshot {
     discontinuity: bool,
 }
 
+/// Flags published atomically with a new raw generation.
+#[derive(Clone, Copy)]
+enum GenerationChange {
+    Initial,
+    Recovery,
+    Switch,
+}
+
 impl SharedState {
     fn snapshot_raw(&self, scratch: &mut [f32]) -> RawSnapshot {
         let mut consumer = self.raw_consumer.lock().unwrap_or_else(|e| e.into_inner());
@@ -265,8 +274,8 @@ impl SharedState {
             native_format,
             samples,
             overflows,
-            // Metadata-only snapshots must leave delivery flags for intake.
-            recovered: !scratch.is_empty() && self.recovered_pending.swap(false, Ordering::SeqCst),
+            // Empty generations must leave recovery pending until captured samples arrive.
+            recovered: samples > 0 && self.recovered_pending.swap(false, Ordering::SeqCst),
             discontinuity: !scratch.is_empty()
                 && self.discontinuity_pending.swap(false, Ordering::SeqCst),
         }
@@ -278,10 +287,24 @@ impl SharedState {
         consumer: &mut MutexGuard<'_, Option<RawConsumer>>,
         new_consumer: RawConsumer,
         native_format: (u32, u16),
+        change: GenerationChange,
     ) {
         *self.native_format.lock().unwrap_or_else(|e| e.into_inner()) = native_format;
         **consumer = Some(new_consumer);
         self.raw_generation.fetch_add(1, Ordering::SeqCst);
+        self.recovered_pending.store(
+            matches!(change, GenerationChange::Recovery) && !self.stopping.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        self.discontinuity_pending
+            .store(matches!(change, GenerationChange::Switch), Ordering::SeqCst);
+    }
+
+    /// Stop and recovery publication share the raw lock; delivery cannot announce after this.
+    fn begin_stopping(&self, _delivery: &MutexGuard<'_, ()>) {
+        let _consumer = self.raw_consumer.lock().unwrap_or_else(|e| e.into_inner());
+        self.stopping.store(true, Ordering::SeqCst);
+        self.recovered_pending.store(false, Ordering::SeqCst);
     }
 
     fn push_event(&self, ev: Event) {
@@ -306,9 +329,9 @@ impl SharedState {
         self.fail_terminal_locked(Error::PermissionDenied { permission, detail }, delivery);
     }
 
-    fn fail_terminal_locked(&self, error: Error, _delivery: &MutexGuard<'_, ()>) {
+    fn fail_terminal_locked(&self, error: Error, delivery: &MutexGuard<'_, ()>) {
         if self.terminal.record(error.clone()) {
-            self.stopping.store(true, Ordering::SeqCst);
+            self.begin_stopping(delivery);
             self.push_event(match error {
                 Error::PermissionDenied { permission, detail } => {
                     Event::PermissionDenied { permission, detail }
@@ -459,7 +482,7 @@ impl Stream {
             .store(i64::MIN, Ordering::SeqCst);
 
         // First backend startup: create RawRing and pass its sink to the backend.
-        if let Err(error) = Self::open_backend_once(&self.shared) {
+        if let Err(error) = Self::open_backend_once(&self.shared, GenerationChange::Initial) {
             // Permission denial already closes delivery and stops the backend
             // in open_backend_once. Other failures still need startup cleanup.
             if !matches!(error, Error::PermissionDenied { .. }) {
@@ -749,13 +772,13 @@ impl Stream {
     /// 2. Create a new RawRing with that rate/ch (do not carry over format residue from the old ring,
     ///    which would damage phase).
     /// 3. Start the backend.
-    /// 4. Publish native format, RawConsumer and generation under the raw-consumer lock.
+    /// 4. Publish native format, RawConsumer, generation and flags under the raw-consumer lock.
     /// 5. Set `last_sample_ns` to now to avoid an immediate stall check.
     ///
     /// Acquire the backend lock only while starting (the caller must not hold the lock). The
     /// low-level switch ([`switch_backend`](Self::switch_backend)) directly replaces the backend and
     /// does not use this function, except when restoring the old source after a failed switch.
-    fn open_backend_once(shared: &Arc<SharedState>) -> Result<()> {
+    fn open_backend_once(shared: &Arc<SharedState>, change: GenerationChange) -> Result<()> {
         // Keep the backend stable from format lookup through raw-ring publication.
         let mut be = shared.backend.lock().unwrap_or_else(|e| e.into_inner());
         let (rate, channels) = be.native_format();
@@ -787,7 +810,7 @@ impl Stream {
                 .raw_consumer
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            shared.publish_raw(&mut rc, consumer, (rate, channels));
+            shared.publish_raw(&mut rc, consumer, (rate, channels), change);
         }
 
         // Treat startup as the last sample arrival to avoid an immediate stall check.
@@ -875,17 +898,18 @@ impl Stream {
                         .raw_consumer
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    // Intentional switch: set DISCONTINUITY only, not RECOVERED.
-                    self.shared
-                        .discontinuity_pending
-                        .store(true, Ordering::SeqCst);
                     // Treat startup as the last arrival time (avoid an immediate stall check).
                     self.shared
                         .last_sample_ns
                         .store(monotonic_now_ns(), Ordering::SeqCst);
                     // Replace with the new backend (drop the old backend).
                     *be = new_backend;
-                    self.shared.publish_raw(&mut rc, consumer, (rate, channels));
+                    self.shared.publish_raw(
+                        &mut rc,
+                        consumer,
+                        (rate, channels),
+                        GenerationChange::Switch,
+                    );
                 }
                 Err(e) => {
                     let _ = stop_backend_catching(&mut new_backend);
@@ -899,11 +923,8 @@ impl Stream {
                     // again and deadlock.
                     drop(be);
                     // Reopen the old backend (native_format returns to the old backend's value).
-                    let restored = Self::open_backend_once(&self.shared);
                     // Resuming the old source is also discontinuous (it was interrupted briefly).
-                    self.shared
-                        .discontinuity_pending
-                        .store(true, Ordering::SeqCst);
+                    let restored = Self::open_backend_once(&self.shared, GenerationChange::Switch);
                     // open_backend_once already incremented generation. Reset switching and return Err.
                     self.shared.switching.store(false, Ordering::SeqCst);
                     if let Err(error @ Error::PermissionDenied { .. }) = restored {
@@ -1106,6 +1127,9 @@ fn run_intake(
         let gen = snapshot.generation;
         if gen != current_generation {
             current_generation = gen;
+            // Pending delivery flags belong to the discarded normalizer, never its replacement.
+            rec_primary = false;
+            rec_secondary = false;
             let (rate, channels) = snapshot.native_format;
             normalizer = match build_normalizer(&shared, rate, channels, output, secondary_output) {
                 Ok(n) => n,
@@ -1175,9 +1199,6 @@ fn run_intake(
         // --- Primary tap: drain all completed chunks into ChunkRing. ---
         let gain = f32::from_bits(shared.gain_bits.load(Ordering::Relaxed));
         let mut emitted_any = false;
-        // Set when the first post-reopen primary chunk is actually enqueued. The recovery event is
-        // announced only after that delivery, so a reopen with no data never looks like a recovery.
-        let mut announce_recovery = false;
         while let Some((mut data, raw_pts)) = normalizer.pop_chunk() {
             // Discard while paused (out_frame_origin advances on pop, so PTS still progresses).
             // Keep pending flags for the first chunk after resume.
@@ -1220,16 +1241,25 @@ fn run_intake(
                 if shared.paused.load(Ordering::SeqCst) || shared.terminal.is_failed() {
                     continue;
                 }
+                // Stop tails and padding must never confirm recovery, even if a data snapshot
+                // latched the flag before shutdown acquired delivery.
+                if shared.stopping.load(Ordering::SeqCst) {
+                    chunk.flags.remove(ChunkFlags::RECOVERED);
+                }
                 let resume_generation = shared.resume_generation.load(Ordering::SeqCst);
                 if resume_generation != primary_resume_generation {
                     chunk.flags |= ChunkFlags::DISCONTINUITY;
                 }
-                announce_recovery |= chunk.flags.contains(ChunkFlags::RECOVERED);
+                let announce_recovery = chunk.flags.contains(ChunkFlags::RECOVERED);
                 rec_primary = false;
                 disc_primary = false;
                 seq += 1;
                 if let Some(total) = chunk_producer.push(chunk) {
                     shared.push_event(Event::ChunkDropped { count: total });
+                }
+                // Terminal publication holds this same lock, so it cannot overtake recovery.
+                if announce_recovery {
+                    shared.push_event(Event::StreamRecovered);
                 }
                 // Advance the observed generation only in the same critical section as a successful
                 // push. Discarded chunks while paused do not advance it, so the flag carries over to
@@ -1238,13 +1268,6 @@ fn run_intake(
                 emitted_any = true;
             }
         }
-        // Confirm the recovery only now: the first post-reopen chunk has been enqueued, so real
-        // samples from the new generation were delivered. Emitted outside the delivery lock. The
-        // watchdog does not emit this event on reopen, so a silent reopen is never announced.
-        if announce_recovery {
-            shared.push_event(Event::StreamRecovered);
-        }
-
         // --- Secondary tap: only when configured; pop, discard, and add flags like the primary. ---
         if let Some(sec_prod) = secondary_producer.as_mut() {
             while let Some((mut samples, raw_pts)) = normalizer.pop_secondary() {
@@ -1283,6 +1306,9 @@ fn run_intake(
                     let _g = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
                     if shared.paused.load(Ordering::SeqCst) || shared.terminal.is_failed() {
                         continue;
+                    }
+                    if shared.stopping.load(Ordering::SeqCst) {
+                        chunk.flags.remove(ChunkFlags::RECOVERED);
                     }
                     let resume_generation = shared.resume_generation.load(Ordering::SeqCst);
                     if resume_generation != secondary_resume_generation {
@@ -1378,7 +1404,7 @@ fn run_watchdog(shared: Arc<SharedState>) {
             break;
         }
 
-        let reopened = match Stream::open_backend_once(&shared) {
+        let reopened = match Stream::open_backend_once(&shared, GenerationChange::Recovery) {
             Ok(()) => true,
             Err(e) => {
                 if shared.terminal.is_failed() {
@@ -1390,13 +1416,8 @@ fn run_watchdog(shared: Arc<SharedState>) {
         };
 
         if reopened {
-            // open_backend_once has updated last_sample_ns to now and incremented the generation.
-            // Set recovered_pending so the intake thread marks the first post-recovery chunk with
-            // RECOVERED|DISCONTINUITY and announces Event::StreamRecovered once that chunk is
-            // actually delivered. Do not announce recovery here: a successful reopen that never
-            // produces samples must not be reported as recovered. If no data arrives, the stall
-            // check fires again on a later tick and reopens/retries as before.
-            shared.recovered_pending.store(true, Ordering::SeqCst);
+            // The recovery flag was published with the generation before intake could pop it.
+            // Only delivery announces recovery; a silent reopen remains pending until data arrives.
             stalled = false;
             backoff = BACKOFF_MIN;
         } else {
@@ -1500,7 +1521,7 @@ fn stop_backend_reconciling(
     let delivery = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
     drain_final_backend_events(shared, be, &delivery);
     if stop_intake {
-        shared.stopping.store(true, Ordering::SeqCst);
+        shared.begin_stopping(&delivery);
     }
     let _ = stop_backend_catching(be);
     drain_final_backend_events(shared, be, &delivery);

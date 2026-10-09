@@ -138,7 +138,12 @@ fn recovery(feed: bool) {
     if feed {
         be.samples = vec![0.25; 1920];
     }
+    let starts = be.starts.clone();
     let mut stream = open(be);
+    if !feed {
+        // A silent generation still flushes the denoiser's primed delay line on stop.
+        stream.set_denoise(true);
+    }
     stream.start().unwrap();
     // Advance only the health timestamp to trigger the actual watchdog promptly.
     stream
@@ -168,12 +173,19 @@ fn recovery(feed: bool) {
             }
             thread::sleep(Duration::from_millis(1));
         }
+        assert!(
+            starts.load(Ordering::SeqCst) > 1,
+            "fixture must actually reopen the stalled backend"
+        );
     }
     let mut delivered = 0;
     while let Some(c) = stream.poll_chunk() {
         delivered += c.frames;
     }
     stream.stop();
+    while let Some(event) = stream.poll_event() {
+        recovered |= matches!(event, Event::StreamRecovered);
+    }
     // A recovery is legitimate only when samples were actually delivered afterwards.
     assert!(
         !recovered || delivered > 0,
