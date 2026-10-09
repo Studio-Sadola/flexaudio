@@ -249,3 +249,35 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+    use flexaudio_core::raw_ring;
+
+    #[test]
+    #[ignore = "repro: D L4 unchecked target PID"]
+    fn repro_p7mac_oversized_target_pid_is_invalid_arg() {
+        // On macOS 14.4+, this must fail before any native PID translation or tap creation.
+        let mut backend = MacProcessBackend::new(u32::MAX, ProcessMode::Include);
+        let (producer, _consumer) = raw_ring(16);
+        let result = backend.start(RawSink::new(producer, 48_000, 2));
+        backend.stop();
+        assert!(
+            matches!(result, Err(Error::InvalidArg(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "repro: C F37 / D L13 owner panic"]
+    fn repro_p7mac_stop_reports_owner_panic() {
+        let mut backend = MacProcessBackend::new(1, ProcessMode::Include);
+        backend.handle = Some(thread::spawn(|| panic!("injected owner failure")));
+        backend.stop();
+        assert!(
+            backend.poll_event().is_some(),
+            "explicit stop must expose the owner panic"
+        );
+    }
+}

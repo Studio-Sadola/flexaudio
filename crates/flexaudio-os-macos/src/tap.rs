@@ -521,3 +521,107 @@ mod tests {
         assert_eq!(arr.count(), 3);
     }
 }
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+    use flexaudio_core::raw_ring;
+    use objc2_core_audio_types::AudioBuffer;
+
+    // The native trailing array is represented by two full AudioBuffer entries.
+    // repr(C) gives the same header, padding, and array offset as AudioBufferList.
+    #[repr(C)]
+    struct TwoBuffers {
+        count: u32,
+        buffers: [AudioBuffer; 2],
+    }
+
+    fn buffer(samples: &mut [f32], channels: u32) -> AudioBuffer {
+        AudioBuffer {
+            mNumberChannels: channels,
+            mDataByteSize: u32::try_from(std::mem::size_of_val(samples)).unwrap(),
+            mData: samples.as_mut_ptr().cast(),
+        }
+    }
+
+    #[test]
+    #[ignore = "repro: C F35 grouped buffers"]
+    fn repro_p7mac_grouped_channels_preserve_frame_order() {
+        let mut front = [0.001, 0.002, 0.011, 0.012];
+        let mut rear = [0.003, 0.004, 0.013, 0.014];
+        let list = TwoBuffers {
+            count: 2,
+            buffers: [buffer(&mut front, 2), buffer(&mut rear, 2)],
+        };
+        let (producer, mut consumer) = raw_ring(32);
+        let mut sink = RawSink::new(producer, 48_000, 4);
+        let mut scratch = Vec::with_capacity(32);
+        // SAFETY: repr(C) header and two entries match a two-buffer native list;
+        // sample storage is aligned, initialized, and alive throughout the call.
+        unsafe {
+            push_buffer_list(
+                &mut sink,
+                &mut scratch,
+                std::ptr::from_ref(&list).cast(),
+                &SampleMailbox::default(),
+            );
+        }
+        let mut actual = [0.0; 8];
+        let copied = consumer.pop_slice(&mut actual);
+        // An unsupported grouping may be rejected instead of converted. It must
+        // never be published as a different channel order.
+        if copied != 0 {
+            assert_eq!(copied, 8);
+            assert_eq!(
+                actual,
+                [0.001, 0.002, 0.003, 0.004, 0.011, 0.012, 0.013, 0.014]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "repro: C F35 unequal planes"]
+    fn repro_p7mac_unequal_planes_do_not_silently_truncate() {
+        let mut left = [0.001, 0.002, 0.003];
+        let mut right = [0.004, 0.005];
+        let list = TwoBuffers {
+            count: 2,
+            buffers: [buffer(&mut left, 1), buffer(&mut right, 1)],
+        };
+        let (producer, mut consumer) = raw_ring(32);
+        let mut sink = RawSink::new(producer, 48_000, 2);
+        let mut scratch = Vec::with_capacity(32);
+        // SAFETY: same layout and storage invariants as the grouped-buffer fixture.
+        unsafe {
+            push_buffer_list(
+                &mut sink,
+                &mut scratch,
+                std::ptr::from_ref(&list).cast(),
+                &SampleMailbox::default(),
+            );
+        }
+        // Reject this inconsistent frame layout; do not publish a shortened valid-looking block.
+        assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    #[ignore = "repro: C F04 / C F34 sink channel agreement"]
+    fn repro_p7mac_buffer_channels_must_match_sink() {
+        let mut samples = [0.001, 0.002];
+        let list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer(&mut samples, 2)],
+        };
+        let (producer, mut consumer) = raw_ring(16);
+        let mut sink = RawSink::new(producer, 48_000, 1);
+        // SAFETY: valid single-buffer list and live, aligned f32 storage.
+        unsafe {
+            push_buffer_list(&mut sink, &mut Vec::new(), &list, &SampleMailbox::default());
+        }
+        assert_eq!(
+            consumer.pop(),
+            None,
+            "stereo bytes must not enter a mono sink"
+        );
+    }
+}
