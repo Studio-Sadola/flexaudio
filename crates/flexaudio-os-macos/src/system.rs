@@ -687,3 +687,20 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "repro: C F28 / D M6 unresolved host exclusion"]
+    fn repro_p7mac_unresolved_host_exclusion_fails_closed() {
+        assert!(resolve_exclusion(Ok(0), true, || Ok(())).is_err());
+    }
+
+    #[test]
+    #[ignore = "repro: C F28 / D M6 unresolved live exclusion"]
+    fn repro_p7mac_unresolved_live_exclusion_fails_closed() {
+        assert!(resolve_exclusion(Ok(0), false, || Ok(())).is_err());
+    }
+}

@@ -315,3 +315,17 @@ mod tests {
         assert_eq!(FALLBACK_FORMAT, (48_000, 2));
     }
 }
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "repro: C F17 / D M7 native context"]
+    fn repro_p7mac_bad_device_retains_operation_and_status() {
+        let error = map_os_status("AudioDeviceStart", 0x21646576);
+        let message = error.to_string();
+        assert!(message.contains("AudioDeviceStart"));
+        assert!(message.contains("!dev") || message.contains("560227702"));
+    }
+}
