@@ -644,6 +644,21 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         ))));
     }
 
+    // Validate that the recording deadline (`start + total duration`) is representable before
+    // opening the stream, so an unsatisfiable duration (for example `--seconds` near u64::MAX)
+    // fails with a typed argument error before any device access or capture start. `Instant::now()
+    // .checked_add` is enough to prove representability. The later `checked_add` calls in run_wav /
+    // run_stdout_stream remain as defensive guards (they must not panic).
+    let total_duration = match &segments {
+        Some(segs) => SwitchScheduler::total_duration(segs),
+        None => Duration::from_secs(cli.seconds),
+    };
+    if Instant::now().checked_add(total_duration).is_none() {
+        return Err(describe_error(Error::InvalidArg(
+            "the recording duration is too large: its deadline overflows the clock".into(),
+        )));
+    }
+
     // Open the stream. `open` selects a `Box<dyn CaptureBackend>` internally based on config.kind.
     // Do not start it yet (two-stage flow). Read native_format from the opened Stream.
     let config = config_for_kind(cli, kind);
@@ -2287,6 +2302,16 @@ mod tests {
         let err = run(&cli).expect_err("must be rejected");
         assert!(err.contains("--split-seconds"), "err: {err}");
         assert!(err.contains("cannot be combined"), "err: {err}");
+    }
+
+    /// A recording deadline that no clock can reach (--seconds near u64::MAX) is rejected by `run`
+    /// with the overflow InvalidArg *before* the stream is opened/started: the returned message is
+    /// the preflight overflow error, not a device/open error, and no device is required here.
+    #[test]
+    fn run_rejects_duration_overflow_before_opening_stream() {
+        let cli = cli_from(&["--seconds", "18446744073709551615"]);
+        let err = run(&cli).expect_err("overflow must be rejected before open");
+        assert!(err.contains("deadline overflows the clock"), "err: {err}");
     }
 
     /// s16 quantization in `write_chunk`: f32 -> i16. Uses the shared canonical `quantize_i16`

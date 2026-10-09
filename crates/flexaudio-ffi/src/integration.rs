@@ -64,10 +64,12 @@ impl FlexStream {
     /// Poll one chunk, run enabled add-ons in **denoise → VAD** order, then convert it to
     /// `FlexChunk`. Return `None` if there is no chunk.
     ///
-    /// - A chunk flagged DISCONTINUITY first resets the add-on state (no audio continuity across it).
+    /// - A chunk flagged DISCONTINUITY first flushes and clears the add-on state (no audio continuity
+    ///   across it): VAD is flushed so an open speech segment is finalized and its events are delivered
+    ///   with this chunk, then the denoiser is reset.
     /// - denoise: process interleaved data in place (48 kHz is guaranteed by open).
     /// - VAD: pass data in the output format (after denoise) to `process_pcm` and append finalized
-    ///   events to `FlexChunk::vad_events`.
+    ///   events to `FlexChunk::vad_events` (after any events flushed for the discontinuity).
     /// - Metrics (`peak` / `rms`) are recomputed from the delivered data, which denoise rewrote.
     pub(crate) fn poll_processed(&mut self) -> Result<Option<FlexChunk>, flexaudio_vad::VadError> {
         let Some(mut chunk) = self.inner.poll_chunk() else {
@@ -80,12 +82,18 @@ impl FlexStream {
         // timeline that restarted. The core marks the first chunk after such a gap with this flag,
         // which is the existing signal for "reset your state" (the N-API binding resets its VAD the
         // same way).
+        //
+        // Flush VAD before clearing it. A bare `reset()` discards an open speech segment (it clears
+        // `triggered` without emitting events), leaving the caller with a SpeechStart that never gets
+        // its SpeechEnd. `flush()` finalizes the open segment, returns its events, and resets, so those
+        // events can be delivered attached to this chunk exactly like normal VAD events.
+        let mut vad_events = Vec::new();
         if chunk.flags.contains(ChunkFlags::DISCONTINUITY) {
+            if let Some(vad) = self.vad.as_mut() {
+                vad_events = vad.flush()?;
+            }
             if let Some(dn) = self.denoiser.as_mut() {
                 dn.reset();
-            }
-            if let Some(vad) = self.vad.as_mut() {
-                vad.reset()?;
             }
         }
 
@@ -102,12 +110,12 @@ impl FlexStream {
         chunk.rms = rms;
 
         // 2) VAD. Pass the unchanged output format (guaranteed after open) to process_pcm.
-        //    output is Copy, so save it before borrowing mutably.
+        //    output is Copy, so save it before borrowing mutably. New events follow any events the
+        //    discontinuity flush above already produced (pre-gap segment first, then this chunk).
         let output = self.inner.config().output;
-        let vad_events = match self.vad.as_mut() {
-            Some(vad) => vad.process_pcm(&chunk.data, output.sample_rate, output.channels)?,
-            None => Vec::new(),
-        };
+        if let Some(vad) = self.vad.as_mut() {
+            vad_events.extend(vad.process_pcm(&chunk.data, output.sample_rate, output.channels)?);
+        }
 
         let mut fc = convert::chunk_to_c(chunk);
         let (ev_ptr, ev_len) = vad_events_to_c(vad_events);
@@ -143,6 +151,146 @@ mod tests {
     use super::*;
     use crate::types::FlexVadConfig;
     use std::ptr;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// A backend whose `RawSink` is driven directly by the test (no audio hardware).
+    struct PushBackend(Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>);
+
+    impl flexaudio::CaptureBackend for PushBackend {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 1)
+        }
+        fn start(&mut self, sink: flexaudio::core::backend::RawSink) -> flexaudio::Result<()> {
+            *self.0.lock().unwrap() = Some(sink);
+            Ok(())
+        }
+        fn stop(&mut self) {
+            self.0.lock().unwrap().take();
+        }
+    }
+
+    /// Build a 48 kHz mono stream with integrated VAD using `threshold` for both the speech and
+    /// silence thresholds, plus a sink the test can push into.
+    fn vad_stream(
+        threshold: f32,
+    ) -> (
+        FlexStream,
+        Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>,
+    ) {
+        let sink = Arc::new(Mutex::new(None));
+        let mut config = flexaudio::StreamConfig::default();
+        config.output.channels = 1;
+        let mut inner =
+            flexaudio::Stream::open(config, Box::new(PushBackend(sink.clone()))).expect("open");
+        inner.start().expect("start");
+        let vad = Vad::new(flexaudio_vad::VadConfig {
+            threshold,
+            neg_threshold: Some(threshold),
+            min_speech_ms: 0,
+            min_silence_ms: 0,
+            speech_pad_ms: 0,
+            max_speech_ms: 0,
+            sample_rate: 16_000,
+        })
+        .expect("build vad");
+        (
+            FlexStream {
+                inner,
+                denoiser: None,
+                vad: Some(vad),
+            },
+            sink,
+        )
+    }
+
+    /// Push one 960-frame (20 ms) chunk and return the processed chunk.
+    fn push_and_poll(
+        stream: &mut FlexStream,
+        sink: &Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>,
+    ) -> FlexChunk {
+        assert_eq!(
+            sink.lock().unwrap().as_mut().unwrap().push(&[0.0; 960], 0),
+            960
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(chunk) = stream.poll_processed().expect("poll") {
+                return chunk;
+            }
+            assert!(Instant::now() < deadline, "mock chunk timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Release a `FlexChunk` returned by `poll_processed`.
+    fn free(mut chunk: FlexChunk) {
+        // SAFETY: this chunk is live and released exactly once.
+        unsafe { crate::flexaudio_chunk_free(&mut chunk) };
+    }
+
+    /// A DISCONTINUITY chunk must flush an open VAD speech segment: the caller receives exactly one
+    /// SpeechEnd (with its matching SpeechStart) attached to that chunk, and no later event refers to
+    /// the old segment (it is finalized before the new timeline starts).
+    #[test]
+    fn discontinuity_flushes_open_vad_segment() {
+        // threshold 0 makes every frame "speech"; min_speech 0 keeps the flushed segment.
+        let (mut stream, sink) = vad_stream(0.0);
+        // Two chunks (~639 converted 16k frames) exceed one 512-sample inference frame, so the
+        // segmenter is triggered before the discontinuity.
+        free(push_and_poll(&mut stream, &sink));
+        free(push_and_poll(&mut stream, &sink));
+        // pause + resume marks the next chunk DISCONTINUITY.
+        stream.inner.pause();
+        stream.inner.resume().expect("resume");
+        let mut chunk = push_and_poll(&mut stream, &sink);
+        assert_ne!(chunk.flags & ChunkFlags::DISCONTINUITY.bits(), 0);
+        let events: Vec<(i32, i64)> = unsafe {
+            std::slice::from_raw_parts(chunk.vad_events, chunk.vad_events_len)
+                .iter()
+                .map(|ev| (ev.kind, ev.at_sample))
+                .collect()
+        };
+        unsafe { crate::flexaudio_chunk_free(&mut chunk) };
+        stream.inner.stop();
+        // Exactly one SpeechEnd (kind 1) and it is the last event, so nothing after it refers to the
+        // flushed segment.
+        assert_eq!(
+            events.iter().filter(|(kind, _)| *kind == 1).count(),
+            1,
+            "flushed events: {events:?}"
+        );
+        assert_eq!(
+            events.last().map(|(kind, _)| *kind),
+            Some(1),
+            "events: {events:?}"
+        );
+        // The matching SpeechStart precedes its SpeechEnd.
+        let end_index = events
+            .iter()
+            .position(|(kind, _)| *kind == 1)
+            .expect("one SpeechEnd");
+        assert_eq!(events[end_index - 1].0, 0, "events: {events:?}");
+    }
+
+    /// Control: with no open segment, a DISCONTINUITY chunk emits no VAD event (the flush is a no-op).
+    #[test]
+    fn discontinuity_without_open_segment_emits_nothing() {
+        // threshold 1 is unreachable for a sigmoid probability, so the segmenter never triggers.
+        let (mut stream, sink) = vad_stream(1.0);
+        free(push_and_poll(&mut stream, &sink));
+        free(push_and_poll(&mut stream, &sink));
+        stream.inner.pause();
+        stream.inner.resume().expect("resume");
+        let mut chunk = push_and_poll(&mut stream, &sink);
+        assert_ne!(chunk.flags & ChunkFlags::DISCONTINUITY.bits(), 0);
+        let len = chunk.vad_events_len;
+        let null = chunk.vad_events.is_null();
+        unsafe { crate::flexaudio_chunk_free(&mut chunk) };
+        stream.inner.stop();
+        assert_eq!(len, 0, "no segment was open, so no event should be emitted");
+        assert!(null);
+    }
 
     fn zero_vad() -> FlexVadConfig {
         FlexVadConfig {
