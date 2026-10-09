@@ -76,6 +76,10 @@ pub trait InnerProcessor: Send {
 pub struct Normalizer {
     in_sample_rate: u32,
     in_channels: usize,
+    /// Interleaved input awaiting a complete native frame.
+    pending_input: Vec<f32>,
+    /// Timestamp of the first sample retained in `pending_input`.
+    pending_input_pts: Option<i64>,
 
     // --- Stage 1 (internal normalization: → 48k/stereo, shared by all output taps) ---
     /// Passthrough when the input is 48000 Hz (no resampler).
@@ -180,6 +184,8 @@ impl Normalizer {
         Ok(Self {
             in_sample_rate,
             in_channels,
+            pending_input: Vec::new(),
+            pending_input_pts: None,
             stage1_resampler,
             inner_scratch: Vec::with_capacity(CHUNK_FRAMES * INNER_CH * 4),
             total_inner_frames: 0,
@@ -237,8 +243,8 @@ impl Normalizer {
 
     /// Accumulate interleaved input samples.
     ///
-    /// `interleaved` must have a length divisible by `in_channels`. `device_pts_ns` is the
-    /// device-provided PTS for the first frame in this push.
+    /// Incomplete trailing frames are retained until a later push completes them.
+    /// `device_pts_ns` is the device-provided PTS for the first frame in this push.
     ///
     /// Returns [`Error::Backend`] if rubato's `process` fails. This avoids silently stopping the
     /// capture thread with a panic and lets the caller stop the stream explicitly.
@@ -246,10 +252,15 @@ impl Normalizer {
         if interleaved.is_empty() {
             return Ok(());
         }
-        let in_frames = interleaved.len() / self.in_channels;
+        if self.pending_input.is_empty() {
+            self.pending_input_pts = Some(device_pts_ns);
+        }
+        self.pending_input.extend_from_slice(interleaved);
+        let in_frames = self.pending_input.len() / self.in_channels;
         if in_frames == 0 {
             return Ok(());
         }
+        let device_pts_ns = self.pending_input_pts.unwrap_or(device_pts_ns);
 
         // Approximate the future output frame position for the start of this push by the sample-rate
         // ratio and update each tap's PTS anchor. This is approximate because the resampler retains
@@ -264,7 +275,20 @@ impl Normalizer {
         // generates in inner_scratch.
         self.inner_scratch.clear();
         let mut stereo = Vec::with_capacity(in_frames * INNER_CH);
-        Self::mix_to_stereo(interleaved, self.in_channels, in_frames, &mut stereo);
+        Self::mix_to_stereo(
+            &self.pending_input,
+            self.in_channels,
+            in_frames,
+            &mut stereo,
+        );
+        self.pending_input.drain(..in_frames * self.in_channels);
+        self.pending_input_pts = if self.pending_input.is_empty() {
+            None
+        } else {
+            Some(device_pts_ns.saturating_add(
+                (in_frames as i64).saturating_mul(1_000_000_000) / self.in_sample_rate as i64,
+            ))
+        };
         match &mut self.stage1_resampler {
             None => {
                 // Sample-rate passthrough. Use directly as the internal canonical form.
@@ -1106,6 +1130,30 @@ mod tests {
             "partial input alone must not produce a chunk"
         );
         assert_eq!(n.buffered_out_frames(), 0);
+    }
+
+    #[test]
+    fn fragmented_frames_preserve_samples_in_both_taps() {
+        let mut normalizer = Normalizer::new(48_000, 2, default_out())
+            .expect("normalizer")
+            .with_secondary(default_out())
+            .expect("secondary");
+        let input: Vec<f32> = (0..CHUNK_FRAMES * 2)
+            .map(|sample| sample as f32 / 2048.0)
+            .collect();
+        // Odd sample counts split stereo frames both at the beginning and end
+        // of successive pushes. Empty pushes must preserve the retained tail.
+        for (index, fragment) in input.chunks(3).enumerate() {
+            let pts = (index * 3 / 2) as i64 * 1_000_000_000 / 48_000;
+            normalizer.push(fragment, pts).expect("fragment");
+            normalizer.push(&[], pts).expect("empty push");
+        }
+        let (primary, _) = normalizer.pop_chunk().expect("primary chunk");
+        let (secondary, _) = normalizer.pop_secondary().expect("secondary chunk");
+        assert_eq!(primary, input);
+        assert_eq!(secondary, input);
+        assert!(normalizer.pop_chunk().is_none());
+        assert!(normalizer.pop_secondary().is_none());
     }
 
     /// Zero-frequency (silent DC) input produces all-zero output (verifies the peak/RMS-zero path).

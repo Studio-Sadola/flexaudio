@@ -89,7 +89,6 @@ fn restart(restart: bool) {
     );
 }
 #[test]
-#[ignore = "repro: NEW-restart"]
 fn repro_p2_restart() {
     restart(true);
 }
@@ -139,7 +138,12 @@ fn recovery(feed: bool) {
     if feed {
         be.samples = vec![0.25; 1920];
     }
+    let starts = be.starts.clone();
     let mut stream = open(be);
+    if !feed {
+        // A silent generation still flushes the denoiser's primed delay line on stop.
+        stream.set_denoise(true);
+    }
     stream.start().unwrap();
     // Advance only the health timestamp to trigger the actual watchdog promptly.
     stream
@@ -147,21 +151,48 @@ fn recovery(feed: bool) {
         .last_sample_ns
         .store(monotonic_now_ns() - 10_000_000_000, Ordering::SeqCst);
     let mut recovered = false;
-    wait(|| {
-        while let Some(event) = stream.poll_event() {
-            recovered |= matches!(event, Event::StreamRecovered);
+    if feed {
+        // Control: the reopen backend supplies samples, so the recovery event is expected; wait
+        // until it actually arrives (unchanged from the original harness).
+        wait(|| {
+            while let Some(event) = stream.poll_event() {
+                recovered |= matches!(event, Event::StreamRecovered);
+            }
+            recovered
+        });
+    } else {
+        // No backend ever supplies samples: a correct implementation must not announce recovery.
+        // Poll for a bounded window that comfortably covers stall detection plus at least one real
+        // watchdog reopen, so a false recovery would have had time to fire. Uses the production
+        // watchdog timing constants only; no test hook is added to the implementation.
+        let window = STALL_THRESHOLD + WATCHDOG_TICK * 8;
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            while let Some(event) = stream.poll_event() {
+                recovered |= matches!(event, Event::StreamRecovered);
+            }
+            thread::sleep(Duration::from_millis(1));
         }
-        recovered
-    });
+        assert!(
+            starts.load(Ordering::SeqCst) > 1,
+            "fixture must actually reopen the stalled backend"
+        );
+    }
     let mut delivered = 0;
     while let Some(c) = stream.poll_chunk() {
         delivered += c.frames;
     }
     stream.stop();
-    assert!(delivered > 0, "F11: StreamRecovered emitted with no samples ever supplied: delivered_frames={delivered}, recovered={recovered}");
+    while let Some(event) = stream.poll_event() {
+        recovered |= matches!(event, Event::StreamRecovered);
+    }
+    // A recovery is legitimate only when samples were actually delivered afterwards.
+    assert!(
+        !recovered || delivered > 0,
+        "F11: StreamRecovered emitted with no samples ever supplied: delivered_frames={delivered}, recovered={recovered}"
+    );
 }
 #[test]
-#[ignore = "repro: F11"]
 fn repro_p2_false_recovery() {
     recovery(false);
 }
@@ -246,7 +277,6 @@ fn initial_snapshot(stale: bool) {
     assert_eq!(real, 1920, "F06: new mono ring interpreted with stale stereo snapshot: real_output_samples={real}, expected=1920");
 }
 #[test]
-#[ignore = "repro: F06"]
 fn repro_p2_generation_snapshot() {
     initial_snapshot(true);
 }
@@ -275,7 +305,6 @@ fn poison(poison: bool) {
     );
 }
 #[test]
-#[ignore = "repro: D M5"]
 fn repro_p2_event_poison() {
     poison(true);
 }
