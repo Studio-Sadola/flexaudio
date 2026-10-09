@@ -2313,3 +2313,151 @@ mod tests {
         assert!(fmt_dbfs(f64::NEG_INFINITY).contains("silence"));
     }
 }
+
+#[cfg(test)]
+mod reproduction_tests {
+    use super::*;
+    fn cli_from(args: &[&str]) -> Cli {
+        let mut full = vec!["flexaudio-cli"];
+        full.extend_from_slice(args);
+        Cli::try_parse_from(full).unwrap()
+    }
+    fn test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("flexaudio-repro-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    // Offline audit reproductions. These exercise the existing CLI paths without devices.
+    struct ReproFinalEventBackend {
+        inner: flexaudio::MockBackend,
+        stopped: bool,
+        final_event: Option<flexaudio::Event>,
+    }
+
+    impl flexaudio::core::CaptureBackend for ReproFinalEventBackend {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 1)
+        }
+        fn start(&mut self, sink: flexaudio::core::RawSink) -> flexaudio::core::Result<()> {
+            self.inner.start(sink)
+        }
+        fn stop(&mut self) {
+            self.inner.stop();
+            self.stopped = true;
+        }
+        fn poll_event(&mut self) -> Option<flexaudio::Event> {
+            if self.stopped {
+                self.final_event.take()
+            } else {
+                None
+            }
+        }
+    }
+
+    fn repro_wav_capture(final_event: Option<flexaudio::Event>) -> std::result::Result<(), String> {
+        let name = match &final_event {
+            Some(flexaudio::Event::Error(_)) => "repro_final_legacy",
+            Some(_) => "repro_final_typed",
+            None => "repro_final_control",
+        };
+        let dir = test_dir(name);
+        let mut cli = cli_from(&["--seconds", "1"]);
+        cli.out = dir.join("rec.wav");
+        let config = StreamConfig::default();
+        let output = config.output;
+        let backend = ReproFinalEventBackend {
+            inner: flexaudio::MockBackend::new(48_000, 1, 440.0),
+            stopped: false,
+            final_event,
+        };
+        let mut stream = Stream::open(config, Box::new(backend)).expect("mock open");
+        stream.start().expect("mock start");
+        let result = run_wav(&cli, &mut stream, output, None);
+        stream.stop();
+        std::fs::remove_dir_all(dir).expect("remove test output");
+        result
+    }
+
+    #[test]
+    #[ignore = "repro: C F48"]
+    fn repro_p12_f48_legacy_fatal_final_event() {
+        let result = repro_wav_capture(Some(flexaudio::Event::Error(
+            "normalizer push failed: injected fatal DSP failure".into(),
+        )));
+        assert!(
+            result.is_err(),
+            "fatal final event was reported but recording returned success"
+        );
+    }
+
+    #[test]
+    fn repro_p12_f48_control_and_typed_terminal() {
+        assert!(repro_wav_capture(None).is_ok());
+        let result = repro_wav_capture(Some(flexaudio::Event::TerminalError {
+            error: Error::Backend("injected terminal failure".into()),
+        }));
+        assert!(result
+            .expect_err("typed final error must fail")
+            .contains("injected terminal failure"));
+    }
+
+    #[test]
+    #[ignore = "repro: C F50"]
+    fn repro_p12_f50_split_overflow() {
+        let cli = cli_from(&["--split-seconds", "18446744073709551615"]);
+        let result = std::panic::catch_unwind(|| {
+            RotatingWavWriter::new(
+                Path::new("unused.wav"),
+                cli.output_format(),
+                cli.split_seconds,
+            )
+        });
+        assert!(result.is_ok(), "accepted split duration must not panic");
+    }
+
+    #[test]
+    #[ignore = "repro: C F50"]
+    fn repro_p12_f50_deadline_overflow() {
+        let cli = cli_from(&["--seconds", "18446744073709551615"]);
+        let config = StreamConfig::default();
+        let output = config.output;
+        let mut stream = Stream::open(
+            config,
+            Box::new(flexaudio::MockBackend::new(48_000, 1, 0.0)),
+        )
+        .expect("mock open");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_wav(&cli, &mut stream, output, None)
+        }));
+        stream.stop();
+        assert!(result.is_ok(), "accepted recording duration must not panic");
+    }
+
+    #[test]
+    fn repro_p12_f50_control() {
+        let cli = cli_from(&["--split-seconds", "1"]);
+        let writer = RotatingWavWriter::new(
+            Path::new("unused.wav"),
+            cli.output_format(),
+            cli.split_seconds,
+        );
+        assert_eq!(writer.frames_per_file, u64::from(cli.output_rate));
+        assert!(Instant::now()
+            .checked_add(Duration::from_secs(cli.seconds))
+            .is_some());
+    }
+
+    #[test]
+    fn repro_p12_split_path_and_permission_controls() {
+        assert!(validate_output_path(Path::new(".")).is_err());
+        assert!(validate_output_path(Path::new("recording.wav")).is_ok());
+        let message = describe_error(Error::PermissionDenied {
+            permission: flexaudio::Permission::SystemAudio,
+            detail: "target process access restricted".into(),
+        });
+        assert!(message.contains("system audio"));
+        assert!(message.contains("target process access restricted"));
+        assert!(!message.contains("Microphone permission denied"));
+    }
+}

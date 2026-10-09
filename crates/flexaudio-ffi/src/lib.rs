@@ -817,3 +817,7 @@ mod permission_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/ffi/repro_p11.rs"]
+mod repro_p11_tests;
