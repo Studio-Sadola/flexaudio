@@ -68,7 +68,6 @@ fn partial_frame(split: bool) {
     );
 }
 #[test]
-#[ignore = "repro: D H8"]
 fn repro_p1_partial_frames() {
     partial_frame(true);
 }

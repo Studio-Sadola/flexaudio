@@ -164,6 +164,7 @@ struct SharedState {
     backend: Mutex<Box<dyn CaptureBackend>>,
 
     /// Currently active RawConsumer. Replaced by the watchdog on reopen.
+    /// This lock also guards publication and snapshots of native format and generation.
     /// The intake thread does not pop while this is `None` (during reopen).
     raw_consumer: Mutex<Option<RawConsumer>>,
 
@@ -239,7 +240,48 @@ struct SharedState {
     secondary_producer: Mutex<Option<SecondaryChunkProducer>>,
 }
 
+/// Metadata and samples observed together under the raw-consumer lock.
+struct RawSnapshot {
+    generation: u64,
+    native_format: (u32, u16),
+    samples: usize,
+    overflows: u64,
+    recovered: bool,
+    discontinuity: bool,
+}
+
 impl SharedState {
+    fn snapshot_raw(&self, scratch: &mut [f32]) -> RawSnapshot {
+        let mut consumer = self.raw_consumer.lock().unwrap_or_else(|e| e.into_inner());
+        let native_format = *self.native_format.lock().unwrap_or_else(|e| e.into_inner());
+        let (samples, overflows) = match consumer.as_mut() {
+            Some(consumer) => (consumer.pop_slice(scratch), consumer.overflow_count()),
+            None => (0, 0),
+        };
+        RawSnapshot {
+            generation: self.raw_generation.load(Ordering::SeqCst),
+            native_format,
+            samples,
+            overflows,
+            // Metadata-only snapshots must leave delivery flags for intake.
+            recovered: !scratch.is_empty() && self.recovered_pending.swap(false, Ordering::SeqCst),
+            discontinuity: !scratch.is_empty()
+                && self.discontinuity_pending.swap(false, Ordering::SeqCst),
+        }
+    }
+
+    /// Require the raw-consumer guard across this entire publication.
+    fn publish_raw(
+        &self,
+        consumer: &mut MutexGuard<'_, Option<RawConsumer>>,
+        new_consumer: RawConsumer,
+        native_format: (u32, u16),
+    ) {
+        *self.native_format.lock().unwrap_or_else(|e| e.into_inner()) = native_format;
+        **consumer = Some(new_consumer);
+        self.raw_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
     fn push_event(&self, ev: Event) {
         // Recover the VecDeque and continue even if poisoned; events are not torn.
         let mut q = self.events.lock().unwrap_or_else(|e| e.into_inner());
@@ -388,6 +430,21 @@ impl Stream {
         if self.started {
             return Ok(());
         }
+        // The intake owns these producers for its lifetime. Reject a spent
+        // stream before changing state or starting the backend.
+        let chunk_producer = self
+            .shared
+            .chunk_producer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| Error::InvalidState("chunk producer already taken".into()))?;
+        let secondary_producer = self
+            .shared
+            .secondary_producer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         self.shared.stopping.store(false, Ordering::SeqCst);
 
         // A new start does not carry over a paused state (even if the previous run was stopped while
@@ -400,28 +457,27 @@ impl Stream {
             .store(i64::MIN, Ordering::SeqCst);
 
         // First backend startup: create RawRing and pass its sink to the backend.
-        Self::open_backend_once(&self.shared)?;
+        if let Err(error) = Self::open_backend_once(&self.shared) {
+            // Permission denial already closes delivery and stops the backend
+            // in open_backend_once. Other failures still need startup cleanup.
+            if !matches!(error, Error::PermissionDenied { .. }) {
+                self.stop();
+            }
+            *self
+                .shared
+                .chunk_producer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(chunk_producer);
+            *self
+                .shared
+                .secondary_producer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = secondary_producer;
+            return Err(error);
+        }
 
-        // Take chunk_producer to move it to the intake/processing thread.
-        // Recover even if poisoned (only takes the inner Option).
-        let chunk_producer = self
-            .shared
-            .chunk_producer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .ok_or_else(|| Error::InvalidState("chunk producer already taken".into()))?;
-
-        // If the secondary tap is configured, take its producer too and move it to the intake thread.
-        let secondary_producer = self
-            .shared
-            .secondary_producer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-
-        // Intake/processing thread. Read the initial native_format from shared state; run_intake
-        // rereads it after each generation change.
+        // Intake takes its own snapshot when scheduled, since this format hint
+        // can become stale before the worker starts.
         let worker_shared = self.shared.clone();
         // Recover and continue even if poisoned (only reads the inner (u32, u16)).
         let initial_native = *self
@@ -431,7 +487,7 @@ impl Stream {
             .unwrap_or_else(|e| e.into_inner());
         let output = self.config.output;
         let secondary_output = self.config.secondary_output;
-        let worker = thread::Builder::new()
+        let worker = match thread::Builder::new()
             .name("flexaudio-intake".into())
             .spawn(move || {
                 run_intake(
@@ -442,18 +498,28 @@ impl Stream {
                     output,
                     secondary_output,
                 );
-            })
-            .map_err(|e| Error::Backend(format!("spawn intake thread: {e}")))?;
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.stop();
+                return Err(Error::Backend(format!("spawn intake thread: {error}")));
+            }
+        };
         self.worker = Some(worker);
 
         // Watchdog thread.
         let wd_shared = self.shared.clone();
-        let watchdog = thread::Builder::new()
+        let watchdog = match thread::Builder::new()
             .name("flexaudio-watchdog".into())
             .spawn(move || {
                 run_watchdog(wd_shared);
-            })
-            .map_err(|e| Error::Backend(format!("spawn watchdog thread: {e}")))?;
+            }) {
+            Ok(watchdog) => watchdog,
+            Err(error) => {
+                self.stop();
+                return Err(Error::Backend(format!("spawn watchdog thread: {error}")));
+            }
+        };
         self.watchdog = Some(watchdog);
 
         self.started = true;
@@ -641,7 +707,10 @@ impl Stream {
 
     /// Retrieve one undelivered event (non-blocking). Returns `None` if none is available.
     pub fn poll_event(&mut self) -> Option<Event> {
-        self.events.lock().ok().and_then(|mut q| q.pop_front())
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
     }
 
     /// Total chunks discarded by the chunk ring through DROP_OLDEST.
@@ -674,32 +743,20 @@ impl Stream {
     /// advance the generation. Used for both initial startup and watchdog reopen.
     ///
     /// Steps:
-    /// 1. Read the current backend's [`native_format`](CaptureBackend::native_format) and update
-    ///    `shared.native_format` (unchanged when reopening the same backend, but this also handles a
-    ///    different backend if called that way in the future).
+    /// 1. Read the current backend's [`native_format`](CaptureBackend::native_format).
     /// 2. Create a new RawRing with that rate/ch (do not carry over format residue from the old ring,
     ///    which would damage phase).
     /// 3. Start the backend.
-    /// 4. Install the new RawConsumer in shared state (drop the old consumer) and increment generation.
+    /// 4. Publish native format, RawConsumer and generation under the raw-consumer lock.
     /// 5. Set `last_sample_ns` to now to avoid an immediate stall check.
     ///
     /// Acquire the backend lock only while starting (the caller must not hold the lock). The
     /// low-level switch ([`switch_backend`](Self::switch_backend)) directly replaces the backend and
     /// does not use this function, except when restoring the old source after a failed switch.
     fn open_backend_once(shared: &Arc<SharedState>) -> Result<()> {
-        // Read the current backend's native format and update shared state.
-        // Recover and continue if poisoned (the backend lock spans start and may be poisoned).
-        let (rate, channels) = {
-            let be = shared.backend.lock().unwrap_or_else(|e| e.into_inner());
-            be.native_format()
-        };
-        {
-            let mut nf = shared
-                .native_format
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *nf = (rate, channels);
-        }
+        // Keep the backend stable from format lookup through raw-ring publication.
+        let mut be = shared.backend.lock().unwrap_or_else(|e| e.into_inner());
+        let (rate, channels) = be.native_format();
 
         // New RawRing (do not carry over residue from the old format).
         let (producer, consumer) = raw_ring(RAW_RING_SAMPLES);
@@ -709,7 +766,6 @@ impl Stream {
             // Recover even if poisoned. If backend start() panics, catch_unwind converts it to
             // Error::Backend before mutex poisoning, so `?` returns it to the caller (start() returns
             // Err / watchdog emits Event::Error).
-            let mut be = shared.backend.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(error) = shared.terminal.error() {
                 return Err(error);
             }
@@ -729,9 +785,8 @@ impl Stream {
                 .raw_consumer
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            *rc = Some(consumer);
+            shared.publish_raw(&mut rc, consumer, (rate, channels));
         }
-        shared.raw_generation.fetch_add(1, Ordering::SeqCst);
 
         // Treat startup as the last sample arrival to avoid an immediate stall check.
         shared
@@ -811,24 +866,13 @@ impl Stream {
             let mut new_backend = new_backend;
             match start_backend_catching(&mut new_backend, sink) {
                 Ok(()) => {
-                    // Ordering matters. Intake loads generation outside the lock, then locks
-                    // raw_consumer and pops. Installing the new consumer first could feed native
-                    // samples from the new source into the old Normalizer before generation advances,
-                    // corrupting phase. Therefore update native_format → increment generation (and
-                    // set DISCONTINUITY, etc.) → replace consumer/backend last. When intake observes
-                    // the new consumer, the new generation is visible and it rebuilds Normalizer
-                    // before popping.
-                    //
-                    // Update shared.native_format to the new source's value.
-                    {
-                        // Recover even if poisoned (only update the inner (u32, u16)).
-                        let mut nf = self
-                            .shared
-                            .native_format
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        *nf = (rate, channels);
-                    }
+                    // Publish the format, ring, generation and pending flag as one
+                    // operation with respect to intake snapshots.
+                    let mut rc = self
+                        .shared
+                        .raw_consumer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     // Intentional switch: set DISCONTINUITY only, not RECOVERED.
                     self.shared
                         .discontinuity_pending
@@ -837,22 +881,9 @@ impl Stream {
                     self.shared
                         .last_sample_ns
                         .store(monotonic_now_ns(), Ordering::SeqCst);
-                    // Advance generation once, before replacing the consumer, so the new generation
-                    // is visible when the new consumer is observed.
-                    self.shared.raw_generation.fetch_add(1, Ordering::SeqCst);
-
                     // Replace with the new backend (drop the old backend).
                     *be = new_backend;
-                    // Install the new consumer in shared state (drop the old consumer). Do this last.
-                    {
-                        // Recover even if poisoned (only replace the Option).
-                        let mut rc = self
-                            .shared
-                            .raw_consumer
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        *rc = Some(consumer);
-                    }
+                    self.shared.publish_raw(&mut rc, consumer, (rate, channels));
                 }
                 Err(e) => {
                     let _ = stop_backend_catching(&mut new_backend);
@@ -882,8 +913,7 @@ impl Stream {
         }
 
         // --- Switch succeeded ---
-        // Generation increment, native_format update, and flags were handled under the backend lock
-        // (ordered so the new generation is visible before the new consumer). Only reset switching here.
+        // The new generation was published under the backend and raw-consumer locks.
         self.shared.switching.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -1006,11 +1036,13 @@ fn run_intake(
     shared: Arc<SharedState>,
     mut chunk_producer: ChunkProducer,
     mut secondary_producer: Option<SecondaryChunkProducer>,
-    initial_native: (u32, u16),
+    _initial_native: (u32, u16),
     output: OutputFormat,
     secondary_output: Option<OutputFormat>,
 ) {
-    let (mut rate, mut channels) = initial_native;
+    // Startup arguments can become stale before this thread is scheduled.
+    let initial = shared.snapshot_raw(&mut []);
+    let (rate, channels) = initial.native_format;
     // If Normalizer construction fails (for example, rubato setup), emit Event::Error and exit rather
     // than dying silently.
     let mut normalizer = match build_normalizer(&shared, rate, channels, output, secondary_output) {
@@ -1023,7 +1055,7 @@ fn run_intake(
     let mut clock = ClockNormalizer::new();
     let mut seq: u64 = 0; // Primary tap sequence number.
     let mut sec_seq: u64 = 0; // Secondary tap sequence number (separate from primary).
-    let mut current_generation = shared.raw_generation.load(Ordering::SeqCst);
+    let mut current_generation = initial.generation;
     // Observe resume generations independently per tap. The secondary tap has a separate ring and
     // consumer, so reusing the primary's observed generation could miss marking its first chunk.
     // A new intake starts at generation 0. If resume() occurs between start() and worker startup, it
@@ -1068,15 +1100,11 @@ fn run_intake(
         // native_format may change, reread shared state and rebuild the native-dependent Stage 1
         // Normalizer. Do not reset the recording epoch here; timestamps stay continuous from zero
         // across generations.
-        let gen = shared.raw_generation.load(Ordering::SeqCst);
+        let snapshot = shared.snapshot_raw(&mut scratch);
+        let gen = snapshot.generation;
         if gen != current_generation {
             current_generation = gen;
-            let nf = *shared
-                .native_format
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            rate = nf.0;
-            channels = nf.1;
+            let (rate, channels) = snapshot.native_format;
             normalizer = match build_normalizer(&shared, rate, channels, output, secondary_output) {
                 Ok(n) => n,
                 Err(e) => {
@@ -1094,11 +1122,11 @@ fn run_intake(
         // Fan out shared pending flags to each tap's local state. The watchdog is stopped by
         // switching during a source switch, so both flags should not be set together; if they are,
         // they are combined with OR.
-        if shared.recovered_pending.swap(false, Ordering::SeqCst) {
+        if snapshot.recovered {
             rec_primary = true;
             rec_secondary = true;
         }
-        if shared.discontinuity_pending.swap(false, Ordering::SeqCst) {
+        if snapshot.discontinuity {
             disc_primary = true;
             disc_secondary = true;
         }
@@ -1106,29 +1134,19 @@ fn run_intake(
         // Drain RawRing into the Normalizer and observe overflows (capture-side data loss).
         let mut produced_any = false;
         let mut push_err: Option<Error> = None;
-        let mut overflow_now = overflow_baseline;
-        {
-            let mut rc_guard = shared
-                .raw_consumer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(rc) = rc_guard.as_mut() {
-                let got = rc.pop_slice(&mut scratch);
-                overflow_now = rc.overflow_count();
-                if got > 0 {
-                    let samples = &scratch[..got];
-                    // Device PTS: monotonic approximation based on the native sample rate (arrival time).
-                    let device_pts = monotonic_now_ns();
-                    let norm_pts = clock.normalize(device_pts);
-                    if let Err(e) = normalizer.push(samples, norm_pts) {
-                        push_err = Some(e);
-                    } else {
-                        shared
-                            .last_sample_ns
-                            .store(monotonic_now_ns(), Ordering::SeqCst);
-                        produced_any = true;
-                    }
-                }
+        let overflow_now = snapshot.overflows;
+        if snapshot.samples > 0 {
+            let samples = &scratch[..snapshot.samples];
+            // Device PTS: monotonic approximation based on the native sample rate (arrival time).
+            let device_pts = monotonic_now_ns();
+            let norm_pts = clock.normalize(device_pts);
+            if let Err(e) = normalizer.push(samples, norm_pts) {
+                push_err = Some(e);
+            } else {
+                shared
+                    .last_sample_ns
+                    .store(monotonic_now_ns(), Ordering::SeqCst);
+                produced_any = true;
             }
         }
 

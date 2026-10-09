@@ -89,7 +89,6 @@ fn restart(restart: bool) {
     );
 }
 #[test]
-#[ignore = "repro: NEW-restart"]
 fn repro_p2_restart() {
     restart(true);
 }
@@ -246,7 +245,6 @@ fn initial_snapshot(stale: bool) {
     assert_eq!(real, 1920, "F06: new mono ring interpreted with stale stereo snapshot: real_output_samples={real}, expected=1920");
 }
 #[test]
-#[ignore = "repro: F06"]
 fn repro_p2_generation_snapshot() {
     initial_snapshot(true);
 }
@@ -275,7 +273,6 @@ fn poison(poison: bool) {
     );
 }
 #[test]
-#[ignore = "repro: D M5"]
 fn repro_p2_event_poison() {
     poison(true);
 }
