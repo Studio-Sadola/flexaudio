@@ -91,7 +91,6 @@ fn repro_ffi_stop_no_addons_control() {
     assert!(stream.poll_processed().unwrap().is_none());
 }
 #[test]
-#[ignore = "repro: C F43"]
 fn repro_ffi_resume_resets_denoise() {
     let (mut stream, sink) = stream(true);
     let prior: Vec<f32> = (0..960).map(|i| (i as f32 * 0.1).sin() * 0.5).collect();
@@ -146,7 +145,6 @@ fn repro_ffi_error_control() {
     );
 }
 #[test]
-#[ignore = "repro: D L14"]
 fn repro_ffi_metrics_after_denoise() {
     let (mut stream, sink) = stream(true);
     push(&sink, &[0.5; 960]);
