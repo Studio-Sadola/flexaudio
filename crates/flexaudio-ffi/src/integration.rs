@@ -5,6 +5,7 @@
 //! construction ([`build_addons`]) and processing ([`FlexStream::poll_processed`]); add-on logic
 //! remains in each crate (avoiding a god class).
 
+use flexaudio::ChunkFlags;
 use flexaudio_denoise::Denoiser;
 use flexaudio_vad::Vad;
 
@@ -63,19 +64,42 @@ impl FlexStream {
     /// Poll one chunk, run enabled add-ons in **denoise → VAD** order, then convert it to
     /// `FlexChunk`. Return `None` if there is no chunk.
     ///
+    /// - A chunk flagged DISCONTINUITY first resets the add-on state (no audio continuity across it).
     /// - denoise: process interleaved data in place (48 kHz is guaranteed by open).
     /// - VAD: pass data in the output format (after denoise) to `process_pcm` and append finalized
     ///   events to `FlexChunk::vad_events`.
+    /// - Metrics (`peak` / `rms`) are recomputed from the delivered data, which denoise rewrote.
     pub(crate) fn poll_processed(&mut self) -> Result<Option<FlexChunk>, flexaudio_vad::VadError> {
         let Some(mut chunk) = self.inner.poll_chunk() else {
             return Ok(None);
         };
+
+        // A DISCONTINUITY chunk (resume after pause, source switch, or dropped audio) is not
+        // contiguous with what came before, so clear the add-ons' history: otherwise the denoise
+        // delay line replays pre-gap audio into the first samples and VAD keeps counting across a
+        // timeline that restarted. The core marks the first chunk after such a gap with this flag,
+        // which is the existing signal for "reset your state" (the N-API binding resets its VAD the
+        // same way).
+        if chunk.flags.contains(ChunkFlags::DISCONTINUITY) {
+            if let Some(dn) = self.denoiser.as_mut() {
+                dn.reset();
+            }
+            if let Some(vad) = self.vad.as_mut() {
+                vad.reset()?;
+            }
+        }
 
         // 1) denoise (in place). Length is frames×channels, hence divisible by channel count,
         //    so this should not fail; if it does, pass through the original data.
         if let Some(dn) = self.denoiser.as_mut() {
             let _ = dn.process(&mut chunk.data);
         }
+        // Denoise rewrote the samples, so the core's peak / RMS describe pre-denoise audio while the
+        // C API documents them as metrics of the delivered PCM. Recompute them from the final data
+        // (same one-pass formula the core uses; VAD below only reads the samples).
+        let (peak, rms) = peak_rms(&chunk.data);
+        chunk.peak = peak;
+        chunk.rms = rms;
 
         // 2) VAD. Pass the unchanged output format (guaranteed after open) to process_pcm.
         //    output is Copy, so save it before borrowing mutably.
@@ -91,6 +115,27 @@ impl FlexStream {
         fc.vad_events_len = ev_len;
         Ok(Some(fc))
     }
+}
+
+/// Peak (maximum absolute sample) and RMS (root mean square, linear) of interleaved `data`.
+///
+/// Mirrors the facade's private `peak_rms` so the C metrics are bit-identical to the core's for an
+/// unchanged chunk. Empty data returns `(0.0, 0.0)`.
+fn peak_rms(data: &[f32]) -> (f32, f32) {
+    if data.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut peak = 0.0f32;
+    let mut sum_sq = 0.0f64;
+    for &x in data {
+        let a = x.abs();
+        if a > peak {
+            peak = a;
+        }
+        sum_sq += (x as f64) * (x as f64);
+    }
+    let rms = (sum_sq / data.len() as f64).sqrt() as f32;
+    (peak, rms)
 }
 
 #[cfg(test)]

@@ -628,6 +628,22 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     let out_rate = output.sample_rate;
     let out_ch = output.channels;
 
+    // `--split-seconds × output rate` is the per-file frame threshold. Reject a product that
+    // overflows u64 here, before any device access, so the writer never has to fall back on a
+    // saturated threshold (`parse_sources` has already bounded the `--sources` alternative).
+    if cli.split_seconds > 0
+        && cli
+            .split_seconds
+            .checked_mul(u64::from(cli.output_rate))
+            .is_none()
+    {
+        return Err(describe_error(Error::InvalidArg(format!(
+            "--split-seconds {} is too large for --output-rate {} (the per-file frame count \
+             overflows)",
+            cli.split_seconds, cli.output_rate
+        ))));
+    }
+
     // Open the stream. `open` selects a `Box<dyn CaptureBackend>` internally based on config.kind.
     // Do not start it yet (two-stage flow). Read native_format from the opened Stream.
     let config = config_for_kind(cli, kind);
@@ -957,8 +973,14 @@ fn run_wav(
     let mut writer = RotatingWavWriter::new(&cli.out, output, cli.split_seconds);
     let mut chunk_count: u64 = 0;
 
-    // Poll chunks for the full recording duration and write them all.
-    let deadline = start + total;
+    // Poll chunks for the full recording duration and write them all. A duration that no clock can
+    // reach (for example `--seconds` near u64::MAX) is a typed argument error, not a panic.
+    let Some(deadline) = start.checked_add(total) else {
+        stream.stop();
+        return Err(describe_error(Error::InvalidArg(
+            "the recording duration is too large: its deadline overflows the clock".into(),
+        )));
+    };
     while Instant::now() < deadline {
         // Switch sources at segment boundaries, independently of output-file rotation.
         if let Some(sch) = scheduler.as_mut() {
@@ -1102,6 +1124,8 @@ fn run_stdout_stream(
 
     let start = Instant::now();
     // Finite recording deadline: sum of segment durations with `--sources`, otherwise `--seconds`.
+    // A duration that no clock can reach (for example `--seconds` near u64::MAX) is a typed argument
+    // error, not a panic.
     let deadline = if infinite {
         None
     } else {
@@ -1109,7 +1133,15 @@ fn run_stdout_stream(
             Some(segs) => SwitchScheduler::total_duration(segs),
             None => Duration::from_secs(cli.seconds),
         };
-        Some(start + dur)
+        match start.checked_add(dur) {
+            Some(deadline) => Some(deadline),
+            None => {
+                stream.stop();
+                return Err(describe_error(Error::InvalidArg(
+                    "the recording duration is too large: its deadline overflows the clock".into(),
+                )));
+            }
+        }
     };
     // Hot-swap scheduler (only with `--sources`; stdout remains one pipe).
     let mut scheduler = segments.map(|segs| SwitchScheduler::new(cli, segs, start));
@@ -1338,7 +1370,10 @@ impl RotatingWavWriter {
         Self {
             base: out.to_path_buf(),
             spec,
-            frames_per_file: split_seconds * output.sample_rate as u64,
+            // Saturating, never panicking: `run` rejects a `--split-seconds` whose product with the
+            // output rate overflows u64 before this is constructed, and a saturated threshold only
+            // means "no file ever reaches the boundary".
+            frames_per_file: split_seconds.saturating_mul(u64::from(output.sample_rate)),
             writer: None,
             frames_in_current: 0,
             files: Vec::new(),
@@ -2403,7 +2438,6 @@ mod reproduction_tests {
     }
 
     #[test]
-    #[ignore = "repro: C F50"]
     fn repro_p12_f50_split_overflow() {
         let cli = cli_from(&["--split-seconds", "18446744073709551615"]);
         let result = std::panic::catch_unwind(|| {
@@ -2417,7 +2451,6 @@ mod reproduction_tests {
     }
 
     #[test]
-    #[ignore = "repro: C F50"]
     fn repro_p12_f50_deadline_overflow() {
         let cli = cli_from(&["--seconds", "18446744073709551615"]);
         let config = StreamConfig::default();

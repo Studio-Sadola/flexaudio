@@ -129,7 +129,20 @@ impl Stream {
                 None => Ok(None),
             };
         };
+        // The core marks the first chunk after a pause/resume, a source switch, or dropped audio with
+        // DISCONTINUITY: it is not contiguous with what came before, so clear the add-on history and
+        // start a fresh timeline at this chunk. Otherwise the denoise delay line replays pre-gap
+        // audio and VAD keeps its sample clock and resampler across the gap.
+        let discontinuity = chunk.flags.contains(fa::ChunkFlags::DISCONTINUITY);
         let mut py_chunk = chunk_to_py(chunk);
+        if discontinuity {
+            if let Some(dn) = self.denoiser.as_mut() {
+                dn.reset();
+            }
+            if let Some(vad) = self.vad.as_mut() {
+                vad.reset().map_err(vad_err_to_py)?;
+            }
+        }
 
         // 1) denoise: overwrite chunk audio in place. Its length is always divisible by the number of
         //    output channels (frames * channels), so errors are not expected. If one occurs (length
@@ -596,7 +609,6 @@ mod repro_tests {
         );
     }
     #[test]
-    #[ignore = "repro: C F43"]
     fn repro_p10_f43_resume_keeps_vad_history() {
         Python::initialize();
         Python::attach(|py| {

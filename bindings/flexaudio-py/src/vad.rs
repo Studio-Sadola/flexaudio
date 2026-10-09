@@ -83,6 +83,17 @@ impl Vad {
             .collect())
     }
 
+    /// Close the active speech segment (if any) and return its remaining events; resets state for reuse.
+    fn flush(&mut self) -> PyResult<Vec<PyVadEvent>> {
+        Ok(self
+            .inner
+            .flush()
+            .map_err(vad_err_to_py)?
+            .into_iter()
+            .map(vad_event_to_py)
+            .collect())
+    }
+
     /// Reset all state, the remainder buffer, and the resampler (so another stream can be processed).
     fn reset(&mut self) -> PyResult<()> {
         self.inner.reset().map_err(vad_err_to_py)
@@ -93,7 +104,6 @@ impl Vad {
 mod repro_tests {
     use super::*;
     #[test]
-    #[ignore = "repro: C F42"]
     fn repro_p10_f42_standalone_vad_has_flush() {
         Python::initialize();
         Python::attach(|py| {
