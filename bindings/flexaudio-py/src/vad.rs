@@ -88,3 +88,48 @@ impl Vad {
         self.inner.reset().map_err(vad_err_to_py)
     }
 }
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+    #[test]
+    #[ignore = "repro: C F42"]
+    fn repro_p10_f42_standalone_vad_has_flush() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut vad = Vad::new(0.0, 0, 0, 0, 0, 16_000, Some(0.0)).unwrap();
+            assert!(vad
+                .process(vec![0.1; 16_000], 16_000, 1)
+                .unwrap()
+                .is_empty());
+            let vad = Py::new(py, vad).unwrap();
+            assert!(
+                vad.bind(py).hasattr("flush").unwrap(),
+                "active standalone VAD segment has no Python flush method"
+            );
+        });
+    }
+    #[test]
+    fn repro_p10_control_f39_invalid_vad_format_raises() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut vad = Vad::new(0.5, 250, 100, 30, 0, 16_000, None).unwrap();
+            let error = match vad.process(vec![0.0; 512], 16_000, 0) {
+                Err(error) => error,
+                Ok(_) => panic!("zero channels must fail"),
+            };
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert_eq!(vad.inner.converted_sample_position(), 0);
+            assert!(vad.process(vec![0.0; 512], 16_000, 1).unwrap().is_empty());
+        });
+    }
+    #[test]
+    fn repro_p10_control_core_vad_flush_closes_speech() {
+        let mut vad = CoreVad::new(make_vad_config(0.0, Some(0.0), 0, 0, 0, 0, 16_000)).unwrap();
+        assert!(vad
+            .process_pcm(&vec![0.1; 16_000], 16_000, 1)
+            .unwrap()
+            .is_empty());
+        assert_eq!(vad.flush().unwrap().len(), 2);
+    }
+}

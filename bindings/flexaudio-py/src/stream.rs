@@ -520,3 +520,122 @@ stream.stop()
         });
     }
 }
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct ManualBackend(Arc<Mutex<Option<fa::core::backend::RawSink>>>);
+    impl fa::CaptureBackend for ManualBackend {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 1)
+        }
+        fn start(&mut self, sink: fa::core::backend::RawSink) -> fa::Result<()> {
+            *self.0.lock().unwrap() = Some(sink);
+            Ok(())
+        }
+        fn stop(&mut self) {
+            self.0.lock().unwrap().take();
+        }
+    }
+    fn fixture(
+        denoise: bool,
+        vad: bool,
+    ) -> (Stream, Arc<Mutex<Option<fa::core::backend::RawSink>>>) {
+        let sink = Arc::new(Mutex::new(None));
+        let mut config = fa::StreamConfig::default();
+        config.output.channels = 1;
+        let mut inner = fa::Stream::open(config, Box::new(ManualBackend(sink.clone()))).unwrap();
+        inner.start().unwrap();
+        (
+            Stream {
+                inner,
+                denoiser: denoise.then(|| CoreDenoiser::new(1).unwrap()),
+                vad: vad.then(|| CoreVad::new(Default::default()).unwrap()),
+                output_rate: 48_000,
+                output_channels: 1,
+            },
+            sink,
+        )
+    }
+    fn send(
+        stream: &mut Stream,
+        sink: &Arc<Mutex<Option<fa::core::backend::RawSink>>>,
+    ) -> PyAudioChunk {
+        assert_eq!(
+            sink.lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .push(&vec![0.0; 960], 0),
+            960
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(chunk) = stream.poll_chunk().unwrap() {
+                return chunk;
+            }
+            assert!(std::time::Instant::now() < deadline, "mock chunk timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    #[test]
+    #[ignore = "repro: C F42"]
+    fn repro_p10_f42_stop_retains_denoise_tail() {
+        let (mut stream, sink) = fixture(true, false);
+        let mut delivered = send(&mut stream, &sink).samples().len();
+        stream.stop();
+        while let Some(chunk) = stream.poll_chunk().unwrap() {
+            delivered += chunk.samples().len();
+        }
+        assert_eq!(
+            delivered,
+            960 + 480,
+            "stop omitted the 480-sample denoiser latency tail"
+        );
+    }
+    #[test]
+    #[ignore = "repro: C F43"]
+    fn repro_p10_f43_resume_keeps_vad_history() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (mut stream, sink) = fixture(false, true);
+            send(&mut stream, &sink);
+            let before = stream.vad.as_ref().unwrap().converted_sample_position();
+            // 319, not 320: `converted_sample_position` counts the frames rubato actually emitted
+            // (flexaudio-vad/src/lib.rs:177), and the sinc resampler emits 319 frames for the first
+            // fixed 960-frame chunk at 48k->16k (resample.rs:198 chunk = 48000/50 = 960;
+            // rubato 3.0 asynchro.rs:383-386 floors (960-129-(-127))*1/3 = 319 for FixedAsync::Input
+            // with asynchro_sinc.rs:518-520 last_index = -(sinc_len-1)). Later chunks emit 320.
+            assert_eq!(before, 319);
+            stream.pause();
+            stream.resume().unwrap();
+            let chunk = send(&mut stream, &sink);
+            let chunk = Py::new(py, chunk).unwrap();
+            let flags: u32 = chunk.bind(py).getattr("flags").unwrap().extract().unwrap();
+            assert_ne!(flags & fa::ChunkFlags::DISCONTINUITY.bits(), 0);
+            assert_eq!(
+                stream.vad.as_ref().unwrap().converted_sample_position(),
+                before,
+                "VAD sample history should restart at the resumed discontinuity"
+            );
+            stream.stop();
+        });
+    }
+    #[test]
+    fn repro_p10_control_plain_stop_and_continuous_vad() {
+        let (mut stream, sink) = fixture(false, true);
+        send(&mut stream, &sink);
+        send(&mut stream, &sink);
+        // Two 960-frame chunks yield 319 + 320 = 639 actual resampler frames, not 640; see the
+        // note in repro_p10_f43_resume_keeps_vad_history.
+        assert_eq!(
+            stream.vad.as_ref().unwrap().converted_sample_position(),
+            639
+        );
+        stream.stop();
+        while stream.poll_chunk().unwrap().is_some() {}
+        assert!(stream.denoiser.is_none());
+    }
+}
