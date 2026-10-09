@@ -1383,3 +1383,6 @@ mod tests {
         let _ = before;
     }
 }
+
+#[cfg(test)]
+mod repro_tests;
