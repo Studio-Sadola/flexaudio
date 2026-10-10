@@ -38,6 +38,7 @@ use fa::{ProcessMode, SourceKind};
 mod config;
 mod denoise;
 mod encode;
+mod errors;
 mod marshal;
 mod stream;
 mod vad;
@@ -52,15 +53,7 @@ use marshal::{device_info_to_py, process_info_to_py};
 // Error conversion
 // ---------------------------------------------------------------------------
 
-/// Convert flexaudio::Error to a Python exception. Argument errors become `ValueError`; others become `RuntimeError`.
-/// Both preserve the message from Display.
-pub(crate) fn to_py_err(err: fa::Error) -> PyErr {
-    let msg = err.to_string();
-    match err {
-        fa::Error::InvalidArg(_) | fa::Error::UnsupportedFormat(_) => PyValueError::new_err(msg),
-        _ => PyRuntimeError::new_err(msg),
-    }
-}
+pub(crate) use errors::to_py_err;
 
 /// Convert VadError to a Python exception. Invalid configuration becomes `ValueError`; model loading and inference failures
 /// become `RuntimeError`.
@@ -174,6 +167,7 @@ fn processes(py: Python<'_>) -> PyResult<Vec<marshal::PyProcessInfo>> {
 /// Python module `flexaudio`.
 #[pymodule]
 fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    errors::register(m)?;
     // Functions.
     m.add_function(wrap_pyfunction!(devices, m)?)?;
     m.add_function(wrap_pyfunction!(processes, m)?)?;
@@ -257,6 +251,7 @@ mod tests {
 
     #[test]
     fn to_py_err_maps_variants_without_panic() {
+        Python::initialize();
         // Type selection needs no Python runtime (match only). The message comes from Display.
         let err = fa::Error::DeviceNotFound;
         assert!(err.to_string().contains("device not found"));
@@ -279,14 +274,13 @@ mod tests {
 mod repro_tests {
     use super::*;
     #[test]
-    #[ignore = "repro: C F44"]
     fn repro_p10_f44_device_errors_keep_distinct_kinds() {
         Python::initialize();
         Python::attach(|py| {
             let missing = to_py_err(fa::Error::DeviceNotFound);
             let lost = to_py_err(fa::Error::DeviceLost);
             assert!(
-                !missing.get_type(py).is(&lost.get_type(py)),
+                !missing.get_type(py).is(lost.get_type(py)),
                 "DeviceNotFound and DeviceLost both map to RuntimeError with no typed kind"
             );
         });
@@ -298,6 +292,41 @@ mod repro_tests {
             let error = to_py_err(fa::Error::InvalidArg("benign validation".into()));
             assert!(error.is_instance_of::<PyValueError>(py));
             assert!(error.to_string().contains("benign validation"));
+        });
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use pyo3::types::PyDict;
+
+    #[test]
+    fn non_twenty_chunk_duration_rejects_before_addons_or_device_access() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "flexaudio").unwrap();
+            flexaudio(&module).unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("flexaudio", module).unwrap();
+            py.run(
+                pyo3::ffi::c_str!(
+                    r#"
+for duration in (0, 10, 40, 4294967295):
+    try:
+        flexaudio.open('mic', chunk_ms=duration, denoise=True, output_rate=16000,
+                       vad={'threshold': 'invalid'})
+    except flexaudio.InvalidArgumentError as error:
+        assert error.audio_error.kind == 'invalidArg'
+        assert 'chunk_ms' in str(error)
+    else:
+        raise AssertionError('unsupported chunk duration was accepted')
+"#
+                ),
+                None,
+                Some(&locals),
+            )
+            .unwrap();
         });
     }
 }

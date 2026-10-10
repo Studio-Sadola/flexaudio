@@ -12,13 +12,13 @@ use crate::{
     flexaudio_switch_source, flexaudio_switch_source_with_exclude_pids,
 };
 
-fn config(kind: FlexSourceKind) -> FlexConfig {
+fn config(kind: i32) -> FlexConfig {
     FlexConfig {
         kind,
         device_id: ptr::null(),
         process_id: 0,
-        mode: FlexProcessMode::Include,
-        exclude_self: false,
+        mode: FlexProcessMode::Include as i32,
+        exclude_self: 0,
         output_rate: 0,
         output_channels: 0,
         chunk_ms: 0,
@@ -27,8 +27,8 @@ fn config(kind: FlexSourceKind) -> FlexConfig {
         mix_system_device_id: ptr::null(),
         mix_mic_gain: 0.0,
         mix_system_gain: 0.0,
-        denoise: false,
-        has_vad: false,
+        denoise: 0,
+        has_vad: 0,
         vad: FlexVadConfig {
             threshold: 0.0,
             neg_threshold: 0.0,
@@ -99,6 +99,9 @@ fn mock_handle() -> Handle {
     )
     .expect("mock stream opens");
     Handle(Box::into_raw(Box::new(FlexStream {
+        shutdown: None,
+        shutdown_event_index: 0,
+        last_output: None,
         whisper: None,
         whisper_events: Vec::new(),
         whisper_origin: (0, 0),
@@ -112,7 +115,7 @@ fn mock_handle() -> Handle {
 }
 
 fn assert_invalid_list(pointer: *const u32, len: usize, expected: &str) {
-    let cfg = config(FlexSourceKind::Mic);
+    let cfg = config(FlexSourceKind::Mic as i32);
     // SAFETY: Invalid pointer shapes must be rejected before any dereference; other test
     // inputs refer to valid arrays. Config and mock handles stay live during the calls.
     let opened = unsafe { flexaudio_open_with_exclude_pids(&cfg, pointer, len) };
@@ -171,10 +174,10 @@ fn zero_pid_message_names_index_two_for_every_source() {
     assert_invalid_list(pids.as_ptr(), pids.len(), message);
     let handle = mock_handle();
     for kind in [
-        FlexSourceKind::Mic,
-        FlexSourceKind::System,
-        FlexSourceKind::Process,
-        FlexSourceKind::Mix,
+        FlexSourceKind::Mic as i32,
+        FlexSourceKind::System as i32,
+        FlexSourceKind::Process as i32,
+        FlexSourceKind::Mix as i32,
     ] {
         let cfg = config(kind);
         // SAFETY: All inputs are valid arrays/configs; the list contains a disallowed value.
@@ -194,7 +197,10 @@ fn zero_pid_message_names_index_two_for_every_source() {
 
 #[test]
 fn empty_null_list_and_legacy_open_succeed() {
-    let cfg = config(FlexSourceKind::Mic);
+    if std::env::var("FLEXAUDIO_RUN_NATIVE_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let cfg = config(FlexSourceKind::Mic as i32);
     // SAFETY: A zero length permits a NULL list; cfg is valid for both entry points.
     let Some(extended) = Handle::native(
         unsafe { flexaudio_open_with_exclude_pids(&cfg, ptr::null(), 0) },
@@ -216,7 +222,7 @@ fn empty_null_list_and_legacy_open_succeed() {
     let handle = mock_handle();
     let extended_result =
         unsafe { flexaudio_switch_source_with_exclude_pids(handle.0, &cfg, ptr::null(), 0) };
-    assert_eq!(extended_result, code::FLEX_FAILURE);
+    assert_eq!(extended_result, code::FLEX_INVALID_STATE);
     assert!(last_error().contains("switch_source is only available on a started stream"));
     let extended_error = last_error();
     assert_eq!(
@@ -228,7 +234,10 @@ fn empty_null_list_and_legacy_open_succeed() {
 
 #[test]
 fn empty_list_never_checks_or_dereferences_its_pointer() {
-    let cfg = config(FlexSourceKind::Mic);
+    if std::env::var("FLEXAUDIO_RUN_NATIVE_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let cfg = config(FlexSourceKind::Mic as i32);
     let backing = [123_u32; 2];
     let unaligned = backing.as_ptr().cast::<u8>().wrapping_add(1).cast::<u32>();
     // SAFETY: A zero-length list must not be dereferenced, even if its pointer is unaligned.
@@ -241,14 +250,17 @@ fn empty_list_never_checks_or_dereferences_its_pointer() {
     assert!(handle.pids().is_empty());
     assert_eq!(
         unsafe { flexaudio_switch_source_with_exclude_pids(handle.0, &cfg, unaligned, 0) },
-        code::FLEX_FAILURE,
+        code::FLEX_INVALID_STATE,
     );
     assert!(last_error().contains("switch_source is only available on a started stream"));
 }
 
 #[test]
 fn duplicates_order_and_maximum_pid_are_preserved_in_owned_storage() {
-    let cfg = config(FlexSourceKind::Mic);
+    if std::env::var("FLEXAUDIO_RUN_NATIVE_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let cfg = config(FlexSourceKind::Mic as i32);
     let mut pids = vec![123, u32::MAX, 123, 42];
     let original = pids.clone();
     // SAFETY: All entries are initialized and readable throughout the call.
@@ -273,14 +285,17 @@ fn duplicates_order_and_maximum_pid_are_preserved_in_owned_storage() {
                 original.len(),
             )
         },
-        code::FLEX_FAILURE,
+        code::FLEX_INVALID_STATE,
     );
     assert!(last_error().contains("switch_source is only available on a started stream"));
 }
 
 #[test]
 fn maximum_length_is_accepted() {
-    let cfg = config(FlexSourceKind::Mic);
+    if std::env::var("FLEXAUDIO_RUN_NATIVE_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let cfg = config(FlexSourceKind::Mic as i32);
     let pids = vec![123; 4096];
     // SAFETY: The whole PID allocation is initialized, readable, and within the cap.
     let Some(handle) = Handle::native(

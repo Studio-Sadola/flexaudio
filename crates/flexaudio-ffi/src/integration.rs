@@ -24,7 +24,7 @@ use crate::types::{FlexChunk, FlexConfig, FlexStream};
 pub(crate) fn build_addons(config: &FlexConfig) -> Result<(Option<Denoiser>, Option<Vad>), ()> {
     let output = resolve_output(config);
 
-    let denoiser = if config.denoise {
+    let denoiser = if config.denoise != 0 {
         // RNNoise requires 48 kHz. Reject other output rates during open.
         if output.sample_rate != 48_000 {
             set_last_error(format!(
@@ -36,7 +36,7 @@ pub(crate) fn build_addons(config: &FlexConfig) -> Result<(Option<Denoiser>, Opt
         match Denoiser::new(output.channels) {
             Ok(d) => Some(d),
             Err(e) => {
-                set_last_error(e.to_string());
+                crate::error::set_audio_error(flexaudio::Error::InvalidArg(e.to_string()));
                 return Err(());
             }
         }
@@ -44,12 +44,19 @@ pub(crate) fn build_addons(config: &FlexConfig) -> Result<(Option<Denoiser>, Opt
         None
     };
 
-    let vad = if config.has_vad {
+    let vad = if config.has_vad != 0 {
         let vad_config = vad_config_from_c(&config.vad);
         match Vad::new(vad_config) {
             Ok(v) => Some(v),
             Err(e) => {
-                set_last_error(e.to_string());
+                let kind = match e {
+                    flexaudio_vad::VadError::InvalidConfig(_)
+                    | flexaudio_vad::VadError::InvalidFormat(_) => {
+                        flexaudio::Error::InvalidArg("invalid VAD configuration".into())
+                    }
+                    _ => flexaudio::Error::Backend("VAD construction failed".into()),
+                };
+                crate::error::set_audio_error(kind);
                 return Err(());
             }
         }
@@ -80,6 +87,11 @@ impl FlexStream {
         &mut self,
         flush: impl FnOnce(&mut Vad) -> Result<Vec<flexaudio_vad::VadEvent>, flexaudio_vad::VadError>,
     ) -> Result<Option<FlexChunk>, flexaudio_vad::VadError> {
+        if self.whisper.is_none() {
+            if let Some(chunk) = self.ready_chunks.pop_front() {
+                return Ok(Some(chunk.chunk));
+            }
+        }
         let Some(mut chunk) = self.inner.poll_chunk() else {
             return Ok(None);
         };
@@ -123,7 +135,9 @@ impl FlexStream {
         // 1) denoise (in place). Length is frames×channels, hence divisible by channel count,
         //    so this should not fail; if it does, pass through the original data.
         if let Some(dn) = self.denoiser.as_mut() {
-            let _ = dn.process(&mut chunk.data);
+            dn.process(&mut chunk.data).map_err(|_| {
+                flexaudio_vad::VadError::Inference("denoise processing failed".into())
+            })?;
         }
         // Denoise rewrote the samples, so the core's peak / RMS describe pre-denoise audio while the
         // C API documents them as metrics of the delivered PCM. Recompute them from the final data
@@ -140,6 +154,15 @@ impl FlexStream {
             vad_events.extend(vad.process_pcm(&chunk.data, output.sample_rate, output.channels)?);
         }
 
+        self.last_output = Some((
+            chunk
+                .frame_index
+                .saturating_add(chunk.frames as u64 * 48_000 / u64::from(output.sample_rate)),
+            chunk.pts_ns.saturating_add(
+                chunk.frames as i64 * 1_000_000_000 / i64::from(output.sample_rate),
+            ),
+            chunk.seq.saturating_add(1),
+        ));
         let mut fc = convert::chunk_to_c(chunk);
         let (ev_ptr, ev_len) = vad_events_to_c(vad_events);
         fc.vad_events = ev_ptr;
@@ -152,7 +175,7 @@ impl FlexStream {
 ///
 /// Mirrors the facade's private `peak_rms` so the C metrics are bit-identical to the core's for an
 /// unchanged chunk. Empty data returns `(0.0, 0.0)`.
-fn peak_rms(data: &[f32]) -> (f32, f32) {
+pub(crate) fn peak_rms(data: &[f32]) -> (f32, f32) {
     if data.is_empty() {
         return (0.0, 0.0);
     }
@@ -231,6 +254,9 @@ mod tests {
         inner.start().expect("start");
         (
             FlexStream {
+                shutdown: None,
+                shutdown_event_index: 0,
+                last_output: None,
                 whisper: None,
                 whisper_events: Vec::new(),
                 whisper_origin: (0, 0),
@@ -480,11 +506,11 @@ mod tests {
 
     fn base_config() -> FlexConfig {
         FlexConfig {
-            kind: crate::types::FlexSourceKind::Mic,
+            kind: crate::types::FlexSourceKind::Mic as i32,
             device_id: ptr::null(),
             process_id: 0,
-            mode: crate::types::FlexProcessMode::Include,
-            exclude_self: false,
+            mode: crate::types::FlexProcessMode::Include as i32,
+            exclude_self: 0,
             output_rate: 0,
             output_channels: 0,
             chunk_ms: 0,
@@ -493,8 +519,8 @@ mod tests {
             mix_system_device_id: ptr::null(),
             mix_mic_gain: 0.0,
             mix_system_gain: 0.0,
-            denoise: false,
-            has_vad: false,
+            denoise: 0,
+            has_vad: 0,
             vad: zero_vad(),
         }
     }

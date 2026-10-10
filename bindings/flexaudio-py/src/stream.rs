@@ -4,6 +4,8 @@
 //! invokes `poll_chunk` / `poll_event`. Integrated VAD / denoise processing also runs when
 //! poll_chunk is called (under the GIL; process on demand).
 
+#[path = "stream_stop.rs"]
+mod shutdown;
 #[path = "stream_whisper.rs"]
 mod whisper_capture;
 
@@ -35,6 +37,9 @@ use crate::{denoise_err_to_py, to_py_err, vad_err_to_py};
 #[pyclass(module = "flexaudio", unsendable)]
 pub struct Stream {
     inner: fa::Stream,
+    shutdown: Option<fa::ShutdownReport>,
+    local_events: std::collections::VecDeque<fa::Event>,
+    output_end: Option<(u64, i64, u64, u32)>,
     whisper: Option<flexaudio_vad::WhisperVadTap>,
     whisper_events: Vec<flexaudio_vad::AttachedWhisperVadEvent>,
     whisper_origin: (u64, i64),
@@ -99,6 +104,16 @@ impl Stream {
         // SpeechStart and SpeechEnd are emitted only when that segment is finalized. Flush returns
         // that pair on the old sample clock and resets before processing post-gap audio.
         let discontinuity = chunk.flags.contains(fa::ChunkFlags::DISCONTINUITY);
+        self.output_end = Some((
+            chunk
+                .frame_index
+                .saturating_add((chunk.frames as u64 * 48_000) / u64::from(self.output_rate)),
+            chunk.pts_ns.saturating_add(
+                (chunk.frames as i64 * 1_000_000_000) / i64::from(self.output_rate),
+            ),
+            chunk.seq.saturating_add(1),
+            chunk.dropped_before,
+        ));
         self.whisper_origin.1 = self.whisper_origin.1.max(chunk.pts_ns);
         let mut py_chunk = chunk_to_py(chunk);
         let mut vad_events: Vec<(bool, u64)> = Vec::new();
@@ -125,12 +140,13 @@ impl Stream {
             }
         }
 
-        // 1) denoise: overwrite chunk audio in place. Its length is always divisible by the number of
-        //    output channels (frames * channels), so errors are not expected. If one occurs (length
-        //    mismatch), pass through on a best-effort basis so polling continues.
+        // Denoise before measuring or detecting speech in delivered PCM.
         if let Some(dn) = self.denoiser.as_mut() {
-            let _ = dn.process(py_chunk.samples_mut());
+            dn.process(py_chunk.samples_mut())
+                .map_err(denoise_err_to_py)?;
         }
+
+        py_chunk.update_metrics();
 
         // 2) VAD: detect speech boundaries from processed audio and attach them. process_pcm converts
         //    to mono and resamples to the VAD rate internally, so pass the output format as is. New
@@ -154,20 +170,14 @@ impl Stream {
 
 #[pymethods]
 impl Stream {
-    /// Stop recording. Safe to call repeatedly (flexaudio is idempotent).
+    /// Stop once, drain graceful addon tails, and raise any retained capture or cleanup failure.
     fn stop(&mut self) -> PyResult<()> {
-        self.inner.stop();
-        if self.whisper.is_none() {
-            return Ok(());
-        }
-        self.drain_capture();
-        let drained = self.drain_output();
-        if let Some(whisper) = self.whisper.as_mut() {
-            let result = whisper.stop();
-            self.accept_whisper(result);
-            self.whisper_carrier();
-        }
-        drained
+        self.finish_shutdown().map_err(to_py_err)
+    }
+
+    /// Final capture primary and ordered cleanup failures; absent until shutdown completes.
+    fn shutdown_report(&self) -> Option<crate::errors::ShutdownReport> {
+        self.shutdown.clone().map(crate::errors::ShutdownReport)
     }
 
     /// Flush an attached whisper epoch. Disabled attachment is a no-op.
@@ -283,20 +293,17 @@ impl Stream {
         Ok(None)
     }
 
-    /// Return the stored terminal failure as an event, including after stop.
-    /// None means no terminal failure; this does not consume poll_event.
-    fn terminal_error(&self) -> Option<PyStreamEvent> {
-        self.inner.terminal_error().map(|error| match error {
-            fa::Error::PermissionDenied { permission, detail } => {
-                event_to_py(fa::Event::PermissionDenied { permission, detail })
-            }
-            other => event_to_py(fa::Event::Error(other.to_string())),
-        })
+    /// Retained typed capture primary, including after stop; does not consume events.
+    fn terminal_error(&self) -> Option<crate::errors::AudioError> {
+        self.inner.terminal_error().map(crate::errors::AudioError)
     }
 
     /// Return an event if one is available. Otherwise return `None` (non-blocking).
     fn poll_event(&mut self) -> Option<PyStreamEvent> {
-        self.inner.poll_event().map(event_to_py)
+        self.inner
+            .poll_event()
+            .or_else(|| self.local_events.pop_front())
+            .map(event_to_py)
     }
 
     /// Hot-swap the input source (mic/system/process/mix) without stopping recording.
@@ -358,6 +365,23 @@ impl Stream {
         }
         let exclude_pids = parse_exclude_pids(exclude_pids.as_ref())?;
 
+        let config = build_config(
+            kind,
+            device_id,
+            process_id,
+            &mode,
+            exclude_self,
+            exclude_pids,
+            output_rate,
+            output_channels,
+            chunk_ms,
+            gain,
+            mic_device_id,
+            system_device_id,
+            mic_gain,
+            system_gain,
+        )?;
+
         // Addons depend on output format. Since a switch cannot change it, validate and build using
         // output_rate/output_channels from open (the output_rate argument is used by core's
         // switch_source to check that formats match).
@@ -377,22 +401,6 @@ impl Stream {
             self.output_channels,
         )?;
 
-        let config = build_config(
-            kind,
-            device_id,
-            process_id,
-            &mode,
-            exclude_self,
-            exclude_pids,
-            output_rate,
-            output_channels,
-            chunk_ms,
-            gain,
-            mic_device_id,
-            system_device_id,
-            mic_gain,
-            system_gain,
-        )?;
         if self.whisper.is_some() {
             self.inner
                 .switch_source_with_denoise(config, denoise)
@@ -416,14 +424,21 @@ impl Stream {
         slf
     }
 
-    /// Calls stop when leaving the `with` block. Does not swallow exceptions (returns False).
+    /// Keep an active body exception primary and attach any shutdown failure as context.
     fn __exit__(
         &mut self,
         _exc_type: Option<Bound<'_, PyAny>>,
-        _exc_value: Option<Bound<'_, PyAny>>,
+        exc_value: Option<Bound<'_, PyAny>>,
         _traceback: Option<Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
-        self.stop()?;
+        if let Err(error) = self.stop() {
+            if let Some(body) = exc_value {
+                let py = body.py();
+                body.setattr("__context__", error.value(py))?;
+            } else {
+                return Err(error);
+            }
+        }
         Ok(false)
     }
 }
@@ -500,24 +515,7 @@ pub fn open(
     whisper_vad: Option<&crate::whisper_vad::WhisperVadStreamOptions>,
 ) -> PyResult<Stream> {
     crate::whisper_vad::validate_attachment(whisper_vad, vad.is_some())?;
-    let whisper = whisper_vad
-        .map(|options| {
-            flexaudio_vad::WhisperVadTap::new(
-                options.params.inner.clone(),
-                flexaudio_vad::WhisperVadOptions {
-                    provisional: options.provisional,
-                },
-            )
-        })
-        .transpose()
-        .map_err(crate::whisper_vad::tap_error)?;
     let exclude_pids = parse_exclude_pids(exclude_pids.as_ref())?;
-
-    // Validate and build addons first. Reject denoise unless the output rate is 48 kHz, and reject
-    // invalid VAD settings, before acquiring a device.
-    let (vad_state, denoiser) =
-        Stream::build_addons(vad.as_ref(), denoise, output_rate, output_channels)?;
-
     let config = build_config(
         kind,
         device_id,
@@ -534,6 +532,23 @@ pub fn open(
         mic_gain,
         system_gain,
     )?;
+    let whisper = whisper_vad
+        .map(|options| {
+            flexaudio_vad::WhisperVadTap::new(
+                options.params.inner.clone(),
+                flexaudio_vad::WhisperVadOptions {
+                    provisional: options.provisional,
+                },
+            )
+        })
+        .transpose()
+        .map_err(crate::whisper_vad::tap_error)?;
+
+    // Validate and build addons before acquiring a device. Reject denoise unless the output rate is 48 kHz, and reject
+    // invalid VAD settings, before acquiring a device.
+    let (vad_state, denoiser) =
+        Stream::build_addons(vad.as_ref(), denoise, output_rate, output_channels)?;
+
     let mut stream = fa::open(config).map_err(to_py_err)?;
     if whisper.is_some() {
         stream.enable_capture_tap().map_err(to_py_err)?;
@@ -548,6 +563,9 @@ pub fn open(
         whisper_error_reported: false,
         ready_chunks: std::collections::VecDeque::new(),
         inner: stream,
+        shutdown: None,
+        local_events: Default::default(),
+        output_end: None,
         denoiser: if whisper_vad.is_some() {
             None
         } else {
@@ -612,6 +630,9 @@ mod tests {
                 whisper_error_reported: false,
                 ready_chunks: std::collections::VecDeque::new(),
                 inner: denied_stream(),
+                shutdown: None,
+                local_events: Default::default(),
+                output_end: None,
                 denoiser: None,
                 vad: None,
                 output_rate: 48_000,
@@ -683,6 +704,9 @@ else:
                     whisper_error_reported: false,
                     ready_chunks: std::collections::VecDeque::new(),
                     inner,
+                    shutdown: None,
+                    local_events: Default::default(),
+                    output_end: None,
                     denoiser: None,
                     vad: None,
                     output_rate: 48_000,
@@ -783,6 +807,9 @@ mod repro_tests {
                 whisper_error_reported: false,
                 ready_chunks: std::collections::VecDeque::new(),
                 inner,
+                shutdown: None,
+                local_events: Default::default(),
+                output_end: None,
                 denoiser: denoise.then(|| CoreDenoiser::new(1).unwrap()),
                 vad: vad.then(|| CoreVad::new(Default::default()).unwrap()),
                 output_rate: 48_000,
@@ -813,7 +840,6 @@ mod repro_tests {
         }
     }
     #[test]
-    #[ignore = "repro: C F42"]
     fn repro_p10_f42_stop_retains_denoise_tail() {
         let (mut stream, sink) = fixture(true, false);
         let mut delivered = send(&mut stream, &sink).samples().len();
@@ -826,7 +852,98 @@ mod repro_tests {
             960 + 480,
             "stop omitted the 480-sample denoiser latency tail"
         );
+        stream.stop().unwrap();
+        assert!(stream.poll_chunk().unwrap().is_none());
+        let report = stream.shutdown_report().unwrap().0;
+        assert!(report.primary().is_none());
+        assert!(report.cleanup().is_empty());
     }
+    #[test]
+    fn metrics_match_delivered_denoise_pcm_and_tail() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (mut stream, sink) = fixture(true, false);
+            sink.lock().unwrap().as_mut().unwrap().push(&[1.0; 960], 0);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let chunk = loop {
+                if let Some(chunk) = stream.poll_chunk().unwrap() {
+                    break chunk;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            };
+            let verify = |chunk: PyAudioChunk| {
+                let expected_peak = chunk
+                    .samples()
+                    .iter()
+                    .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+                let expected_rms = (chunk
+                    .samples()
+                    .iter()
+                    .map(|&s| f64::from(s).powi(2))
+                    .sum::<f64>()
+                    / chunk.samples().len() as f64)
+                    .sqrt() as f32;
+                let object = Py::new(py, chunk).unwrap();
+                assert_eq!(
+                    object
+                        .bind(py)
+                        .getattr("peak")
+                        .unwrap()
+                        .extract::<f32>()
+                        .unwrap(),
+                    expected_peak
+                );
+                assert_eq!(
+                    object
+                        .bind(py)
+                        .getattr("rms")
+                        .unwrap()
+                        .extract::<f32>()
+                        .unwrap(),
+                    expected_rms
+                );
+                (
+                    object
+                        .bind(py)
+                        .getattr("seq")
+                        .unwrap()
+                        .extract::<u64>()
+                        .unwrap(),
+                    object
+                        .bind(py)
+                        .getattr("pts_ns")
+                        .unwrap()
+                        .extract::<i64>()
+                        .unwrap(),
+                    object
+                        .bind(py)
+                        .getattr("frame_index")
+                        .unwrap()
+                        .extract::<u64>()
+                        .unwrap(),
+                    object
+                        .bind(py)
+                        .getattr("frames")
+                        .unwrap()
+                        .extract::<usize>()
+                        .unwrap(),
+                )
+            };
+            assert!(chunk.samples()[..480].iter().all(|&s| s == 0.0));
+            let (seq, pts, frame_index, frames) = verify(chunk);
+            stream.stop().unwrap();
+            let tail = stream.poll_chunk().unwrap().unwrap();
+            assert_eq!(tail.samples().len(), 480);
+            let (tail_seq, tail_pts, tail_index, tail_frames) = verify(tail);
+            assert_eq!(tail_seq, seq + 1);
+            assert_eq!(tail_pts, pts + frames as i64 * 1_000_000_000 / 48_000);
+            assert_eq!(tail_index, frame_index + frames as u64);
+            assert_eq!(tail_frames, 480);
+            assert!(stream.poll_chunk().unwrap().is_none());
+        });
+    }
+
     #[test]
     fn repro_p10_f43_resume_keeps_vad_history() {
         Python::initialize();
@@ -906,6 +1023,9 @@ mod repro_tests {
                 whisper_error_reported: false,
                 ready_chunks: std::collections::VecDeque::new(),
                 inner,
+                shutdown: None,
+                local_events: Default::default(),
+                output_end: None,
                 denoiser: None,
                 vad: Some(vad),
                 output_rate: 48_000,

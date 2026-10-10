@@ -33,7 +33,7 @@ impl DeviceWatcher {
         self.inner.poll_event().map(device_event_to_py)
     }
 
-    /// Stop monitoring (`poll_event` returns `None` afterward). Safe to call more than once.
+    /// Stop monitoring and retain queued events for draining. Safe to call more than once.
     fn stop(&mut self) {
         self.inner.stop();
     }
@@ -57,9 +57,8 @@ impl DeviceWatcher {
 
 /// Start monitoring device hotplug and default-device changes, and return a [`DeviceWatcher`].
 ///
-/// On Linux, continuously monitor the PipeWire registry. If PipeWire is unavailable or on another
-/// OS, degrade to a watcher that always returns `None`: hotplug events do not arrive; it does not
-/// panic or raise.
+/// On Linux, monitor the PipeWire registry; startup failure raises a typed exception.
+/// Other operating systems retain the intentional no-op watcher.
 #[pyfunction]
 pub fn watch_devices() -> PyResult<DeviceWatcher> {
     let inner = fa::watch_devices().map_err(to_py_err)?;
