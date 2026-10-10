@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-11
+
+### Fixed
+
+- Fix the npm release workflow failing on the original tag push when GitHub's
+  run listing had not indexed the current run yet. It now validates the current
+  run directly and retries the listing with bounded backoff, failing closed if
+  the run remains unlisted. No library code changed. Version 0.5.0 was published
+  to crates.io and PyPI, but not npm.
+
 ## [0.5.0] - 2026-10-11
 
 ### Added
@@ -548,7 +558,8 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
   publication and interactive approval of new packages in scopes
   requiring 2FA. (1840fbb)
 
-[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.0...v0.3.1
