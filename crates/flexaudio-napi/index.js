@@ -320,5 +320,6 @@ module.exports.openStream = openStream
 module.exports.watchDevices = watchDevices
 module.exports.__openMockStream = __openMockStream
 module.exports.Vad = Vad
+module.exports.WhisperVad = nativeBinding.WhisperVad
 module.exports.FlacEncoder = FlacEncoder
 module.exports.Denoiser = Denoiser

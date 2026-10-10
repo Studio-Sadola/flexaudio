@@ -1041,6 +1041,10 @@ mod tests {
             assert_eq!(c.frames, 960, "20ms@48k = 960 frame");
             assert_eq!(c.data.len(), 960 * 2, "stereo interleaved");
             if i > 0 {
+                assert_eq!(
+                    c.frame_index - chunks[i - 1].frame_index,
+                    (c.seq - chunks[i - 1].seq) * 960
+                );
                 assert!(
                     c.seq > chunks[i - 1].seq,
                     "seq should increase monotonically"

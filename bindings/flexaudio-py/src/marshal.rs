@@ -147,6 +147,9 @@ pub struct PyAudioChunk {
     // Events finalized by integrated VAD (start/end and absolute sample position). The getter
     // converts them to PyVadEvent. Empty when disabled.
     vad_events: Vec<(bool, u64)>,
+    whisper_events: Option<Vec<flexaudio_vad::AttachedWhisperVadEvent>>,
+    #[pyo3(get)]
+    frame_index: u64,
     #[pyo3(get)]
     frames: usize,
     #[pyo3(get)]
@@ -176,6 +179,21 @@ impl PyAudioChunk {
         PyBytes::new(py, &buf)
     }
 
+    /// New-mode events are absent when whisper attachment is disabled.
+    #[getter]
+    fn whisper_vad_events(&self, py: Python<'_>) -> PyResult<Option<Vec<Py<PyAny>>>> {
+        self.whisper_events
+            .as_ref()
+            .map(|events| {
+                events
+                    .iter()
+                    .cloned()
+                    .map(|event| crate::whisper_marshal::attached_to_py(py, event))
+                    .collect()
+            })
+            .transpose()
+    }
+
     /// Integrated VAD events finalized for this chunk. Empty when VAD is disabled.
     #[getter]
     fn vad_events(&self) -> Vec<PyVadEvent> {
@@ -201,6 +219,13 @@ impl PyAudioChunk {
 }
 
 impl PyAudioChunk {
+    pub(crate) fn set_whisper_events(
+        &mut self,
+        events: Vec<flexaudio_vad::AttachedWhisperVadEvent>,
+    ) {
+        self.whisper_events = Some(events);
+    }
+
     /// Mutable sample reference for in-place denoising (used during poll).
     pub(crate) fn samples_mut(&mut self) -> &mut [f32] {
         &mut self.samples
@@ -219,6 +244,8 @@ impl PyAudioChunk {
 
 pub(crate) fn chunk_to_py(chunk: AudioChunk) -> PyAudioChunk {
     PyAudioChunk {
+        frame_index: chunk.frame_index,
+        whisper_events: None,
         frames: chunk.frames,
         pts_ns: chunk.pts_ns,
         seq: chunk.seq,
@@ -532,6 +559,7 @@ mod tests {
     #[test]
     fn chunk_to_py_carries_fields() {
         let chunk = AudioChunk {
+            frame_index: 0,
             data: vec![0.0, 1.0, -1.0, 0.5],
             frames: 2,
             pts_ns: 123,

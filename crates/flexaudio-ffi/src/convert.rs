@@ -201,9 +201,7 @@ pub unsafe fn build_config(
 
 /// Convert [`AudioChunk`] to `FlexChunk`.
 ///
-/// Transfer ownership of `data` (`Vec<f32>`) to C through `into_boxed_slice` → `Box::into_raw`.
-/// Keep the pointer and `len` derived from the same slice so `flexaudio_chunk_free` can call
-/// `Box::from_raw` with the same `len`.
+/// Retain PCM ownership and frame metadata in library storage until chunk_free.
 pub fn chunk_to_c(chunk: AudioChunk) -> FlexChunk {
     let frames = chunk.frames as u32;
     let flags = chunk.flags.bits();
@@ -213,11 +211,7 @@ pub fn chunk_to_c(chunk: AudioChunk) -> FlexChunk {
     let seq = chunk.seq;
     let dropped_before = chunk.dropped_before;
 
-    // Convert Vec to a boxed slice and take its pointer and length. Even when empty, do not
-    // return null (Box::into_raw returns a non-null dangling pointer), consistent with len=0.
-    let boxed: Box<[f32]> = chunk.data.into_boxed_slice();
-    let len = boxed.len();
-    let data = Box::into_raw(boxed) as *mut f32;
+    let (data, len) = crate::chunk_storage::store(chunk.data, chunk.frame_index);
 
     FlexChunk {
         data,
@@ -243,9 +237,7 @@ pub fn chunk_to_c(chunk: AudioChunk) -> FlexChunk {
 /// `chunk` must point to a valid `FlexChunk`. `data` must be allocated by `chunk_to_c` (or NULL).
 pub unsafe fn free_chunk_data(chunk: &mut FlexChunk) {
     if !chunk.data.is_null() {
-        // Reconstruct and drop the boxed slice using the same len allocated by chunk_to_c.
-        let slice = slice::from_raw_parts_mut(chunk.data, chunk.len);
-        drop(Box::from_raw(slice as *mut [f32]));
+        crate::chunk_storage::release(chunk.data, chunk.len);
         chunk.data = ptr::null_mut();
         chunk.len = 0;
     }
@@ -655,6 +647,7 @@ mod tests {
     #[test]
     fn chunk_to_c_keeps_ptr_and_len_consistent() {
         let chunk = AudioChunk {
+            frame_index: 9_007_199_254_740_993,
             data: vec![0.1, -0.2, 0.3, -0.4],
             frames: 2,
             pts_ns: 123,
@@ -665,6 +658,12 @@ mod tests {
             rms: 0.25,
         };
         let mut fc = chunk_to_c(chunk);
+        unsafe {
+            assert_eq!(
+                crate::flexaudio_chunk_frame_index(&fc),
+                9_007_199_254_740_993
+            );
+        }
         assert_eq!(fc.len, 4);
         assert_eq!(fc.frames, 2);
         assert_eq!(fc.flags, ChunkFlags::DISCONTINUITY.bits());
@@ -678,6 +677,47 @@ mod tests {
         assert!(fc.data.is_null());
         assert_eq!(fc.len, 0);
         unsafe { free_chunk_data(&mut fc) };
+    }
+
+    #[test]
+    fn caller_built_chunk_frame_index_fails_closed() {
+        // The preceding words are caller data, never library metadata. A zero
+        // offset data pointer must also be safe: the accessor may not read PCM.
+        let mut caller_data = [f32::from_bits(123), f32::from_bits(456), 0.25];
+        let mut chunk: FlexChunk = unsafe { std::mem::zeroed() };
+        chunk.data = unsafe { caller_data.as_mut_ptr().add(2) };
+        chunk.len = 1;
+        assert_eq!(unsafe { crate::flexaudio_chunk_frame_index(&chunk) }, 0);
+        chunk.data = caller_data.as_mut_ptr();
+        assert_eq!(unsafe { crate::flexaudio_chunk_frame_index(&chunk) }, 0);
+    }
+
+    #[test]
+    fn empty_chunk_allocations_have_distinct_indices_and_free_invalidates_them() {
+        fn empty(index: u64) -> FlexChunk {
+            chunk_to_c(AudioChunk {
+                data: Vec::new(),
+                frames: 0,
+                frame_index: index,
+                pts_ns: 0,
+                seq: 0,
+                flags: flexaudio::ChunkFlags::empty(),
+                dropped_before: 0,
+                peak: 0.0,
+                rms: 0.0,
+            })
+        }
+        let mut first = empty(123);
+        let mut second = empty(456);
+        assert_ne!(first.data, second.data);
+        unsafe {
+            assert_eq!(crate::flexaudio_chunk_frame_index(&first), 123);
+            assert_eq!(crate::flexaudio_chunk_frame_index(&second), 456);
+            free_chunk_data(&mut first);
+            assert_eq!(crate::flexaudio_chunk_frame_index(&first), 0);
+            free_chunk_data(&mut second);
+            assert_eq!(crate::flexaudio_chunk_frame_index(&second), 0);
+        }
     }
 
     #[test]
@@ -952,6 +992,7 @@ mod tests {
         // Allocate both data from chunk_to_c and appended vad_events; verify free_chunk_data
         // releases both and resets them to NULL/0 (double-free is safe too).
         let chunk = AudioChunk {
+            frame_index: 0,
             data: vec![0.0, 0.1, 0.2, 0.3],
             frames: 2,
             pts_ns: 0,

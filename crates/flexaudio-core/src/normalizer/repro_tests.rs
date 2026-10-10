@@ -1,6 +1,116 @@
 //! Offline audit reproductions. No devices are opened.
 use super::*;
 
+#[test]
+fn legacy_pts_arithmetic_is_pinned_across_rebuild() {
+    let secondary = OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    };
+    let mut n = Normalizer::new(48_000, 2, output())
+        .unwrap()
+        .with_secondary(secondary)
+        .unwrap();
+    n.push(&vec![0.25; 480 * 2], 0).unwrap();
+    n.push(&vec![0.25; 2400 * 2], 10_000_000).unwrap();
+    let mut primary: Vec<_> = std::iter::from_fn(|| n.pop_chunk())
+        .map(|(_, pts)| pts)
+        .collect();
+    let mut second: Vec<_> = std::iter::from_fn(|| n.pop_secondary())
+        .map(|(_, pts)| pts.max(0))
+        .collect();
+    n = Normalizer::new(48_000, 2, output())
+        .unwrap()
+        .with_secondary(secondary)
+        .unwrap();
+    n.push(&vec![0.25; 2880 * 2], 100_000_000).unwrap();
+    primary.extend(std::iter::from_fn(|| n.pop_chunk()).map(|(_, pts)| pts));
+    second.extend(std::iter::from_fn(|| n.pop_secondary()).map(|(_, pts)| pts));
+    // aecdc40: frame_delta * (1_000_000_000 / rate), with each push's
+    // projected output anchor. Stream clock normalization subtracts the
+    // first primary timestamp (160 ns), shared by both output taps.
+    let epoch = primary[0];
+    primary.iter_mut().for_each(|pts| *pts -= epoch);
+    second
+        .iter_mut()
+        .for_each(|pts| *pts = (*pts - epoch).max(0));
+    assert_eq!(
+        primary,
+        [
+            0,
+            19_999_680,
+            39_999_360,
+            99_999_840,
+            119_999_520,
+            139_999_200
+        ]
+    );
+    assert_eq!(second, [0, 19_999_840, 99_999_840, 119_999_840]);
+}
+
+#[test]
+fn capture_failure_restores_scratch_and_still_feeds_secondary() {
+    let mut n = Normalizer::new(48_000, 2, output())
+        .unwrap()
+        .with_secondary(output())
+        .unwrap()
+        .with_capture_tap()
+        .unwrap();
+    let mut failing = OutputTap::new(OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    })
+    .unwrap();
+    failing
+        .stage2
+        .as_mut()
+        .unwrap()
+        .resampler
+        .as_mut()
+        .unwrap()
+        .out_scratch
+        .clear();
+    n.capture = Some(failing);
+    n.inner_scratch = vec![0.25; 1920];
+    let capacity = n.inner_scratch.capacity();
+    assert!(n.distribute_inner().is_err());
+    assert_eq!(n.inner_scratch.capacity(), capacity);
+    assert_eq!(n.pop_secondary().unwrap().0, vec![0.25; 1920]);
+}
+
+#[test]
+fn flush_drains_capture_converter_without_transport_padding() {
+    let mut n = Normalizer::new(48_000, 2, output())
+        .unwrap()
+        .with_capture_tap()
+        .unwrap();
+    n.capture = Some(
+        OutputTap::new(OutputFormat {
+            sample_rate: 16_000,
+            channels: 2,
+        })
+        .unwrap(),
+    );
+    n.push(&[0.25; 200], 0).unwrap();
+    n.flush();
+    assert!(n.capture.as_ref().unwrap().buffered_out_frames() > 0);
+}
+
+#[test]
+fn canonical_anchor_overflow_returns_a_typed_error() {
+    let mut tap = OutputTap::new(OutputFormat {
+        sample_rate: 192_000,
+        channels: 2,
+    })
+    .unwrap();
+    tap.canonical_clock = true;
+    assert!(matches!(
+        tap.update_pts_anchor(u64::MAX, 0),
+        Err(Error::InvalidState(_))
+    ));
+    assert!(tap.pts_anchor.is_none());
+}
+
 fn output() -> OutputFormat {
     OutputFormat {
         sample_rate: 48_000,

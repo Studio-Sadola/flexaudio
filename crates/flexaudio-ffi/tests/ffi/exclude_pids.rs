@@ -99,6 +99,12 @@ fn mock_handle() -> Handle {
     )
     .expect("mock stream opens");
     Handle(Box::into_raw(Box::new(FlexStream {
+        whisper: None,
+        whisper_events: Vec::new(),
+        whisper_origin: (0, 0),
+        whisper_error: None,
+        whisper_error_reported: false,
+        ready_chunks: std::collections::VecDeque::new(),
         inner,
         denoiser: None,
         vad: None,

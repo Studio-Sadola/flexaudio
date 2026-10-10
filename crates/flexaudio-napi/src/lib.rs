@@ -16,6 +16,8 @@
 //! No network communication occurs at runtime (napi is only the N-API bridge).
 
 mod flac_encoder;
+mod whisper_integration;
+mod whisper_vad;
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -91,6 +93,8 @@ type DeviceTsfn = ThreadsafeFunction<JsDeviceEvent, ErrorStrategy::Fatal>;
 /// an end signal in the same queue (not exposed to JS onChunk).
 enum ChunkEmit {
     Chunk(Box<JsAudioChunk>),
+    WhisperFlushed(SendDeferred, Option<flexaudio_vad::WhisperVadTapError>),
+    WhisperError(flexaudio_vad::WhisperVadTapError),
     StopFlushed,
     VadError(String),
 }
@@ -155,7 +159,7 @@ impl Drop for UserChunkCb {
 }
 
 /// flexaudio::Error → napi::Error. Convert the message to a string with GenericFailure.
-fn to_napi_err(err: flexaudio::Error) -> NapiError {
+fn to_napi_err(err: impl std::fmt::Display) -> NapiError {
     NapiError::new(Status::GenericFailure, err.to_string())
 }
 
@@ -185,9 +189,15 @@ fn resolve_undefined(env: sys::napi_env, deferred: SendDeferred) {
 fn settle_stop(
     env: sys::napi_env,
     deferred: SendDeferred,
-    terminal: &Mutex<Option<flexaudio::Error>>,
+    terminal: &Mutex<Option<StreamTerminal>>,
 ) {
     let error = terminal.lock().unwrap_or_else(lock_poisoned).clone();
+    if let Some(StreamTerminal::Whisper(error)) = &error {
+        // SAFETY: settlement runs on the live JS thread owning this environment.
+        let env = unsafe { Env::from_raw(env) };
+        let _ = whisper_integration::settle_flush(&env, deferred, Some(error.clone()));
+        return;
+    }
     match error {
         None => resolve_undefined(env, deferred),
         Some(error) => {
@@ -229,21 +239,23 @@ fn terminal_event(error: flexaudio::Error) -> JsStreamEvent {
 fn forward_stream_events(
     stream: &mut flexaudio::Stream,
     callback: Option<&EventTsfn>,
-    terminal: &Mutex<Option<flexaudio::Error>>,
+    terminal: &Mutex<Option<StreamTerminal>>,
 ) {
     if let Some(error) = stream.terminal_error() {
-        *terminal.lock().unwrap_or_else(lock_poisoned) = Some(error);
+        *terminal.lock().unwrap_or_else(lock_poisoned) = Some(StreamTerminal::Capture(error));
     }
     while let Some(event) = stream.poll_event() {
         if let Event::PermissionDenied { permission, detail } = &event {
-            *terminal.lock().unwrap_or_else(lock_poisoned) =
-                Some(flexaudio::Error::PermissionDenied {
+            *terminal.lock().unwrap_or_else(lock_poisoned) = Some(StreamTerminal::Capture(
+                flexaudio::Error::PermissionDenied {
                     permission: *permission,
                     detail: detail.clone(),
-                });
+                },
+            ));
         }
         if let Event::TerminalError { error } = &event {
-            *terminal.lock().unwrap_or_else(lock_poisoned) = Some(error.clone());
+            *terminal.lock().unwrap_or_else(lock_poisoned) =
+                Some(StreamTerminal::Capture(error.clone()));
         }
         if let Some(callback) = callback {
             callback.call(event_to_js(event), ThreadsafeFunctionCallMode::NonBlocking);
@@ -261,7 +273,20 @@ fn take_stop_waiters(phase: &Mutex<StopPhase>) -> Vec<SendDeferred> {
 }
 
 /// Durable copy of the core's terminal failure, retained after the bridge exits.
-type TerminalError = Arc<Mutex<Option<flexaudio::Error>>>;
+#[derive(Clone)]
+enum StreamTerminal {
+    Capture(flexaudio::Error),
+    Whisper(flexaudio_vad::WhisperVadTapError),
+}
+impl std::fmt::Display for StreamTerminal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Capture(error) => error.fmt(formatter),
+            Self::Whisper(error) => error.fmt(formatter),
+        }
+    }
+}
+type TerminalError = Arc<Mutex<Option<StreamTerminal>>>;
 
 /// Weak reference to the chunk TSFN. `StopFlushed` / settlement use it to unref after resolving
 /// (inserted later because the TSFN does not exist at creation time).
@@ -318,7 +343,18 @@ fn make_chunk_tsfn(
             let chunk_weak = chunk_weak.clone();
             move |ctx: ThreadSafeCallContext<ChunkEmit>| match ctx.value {
                 ChunkEmit::Chunk(chunk) => {
-                    if terminal.lock().unwrap_or_else(lock_poisoned).is_some() {
+                    let denied = matches!(
+                        *terminal.lock().unwrap_or_else(lock_poisoned),
+                        Some(StreamTerminal::Capture(_))
+                    );
+                    if denied
+                        && !(chunk.frames == 0
+                            && (chunk.whisper_vad_events.is_some()
+                                || chunk
+                                    .secondary
+                                    .as_ref()
+                                    .is_some_and(|tap| tap.whisper_vad_events.is_some())))
+                    {
                         return Ok(Vec::new());
                     }
                     let refer = user.refer();
@@ -332,6 +368,15 @@ fn make_chunk_tsfn(
                     let func: Function<JsAudioChunk, Unknown> =
                         unsafe { Function::from_napi_value(ctx.env.raw(), value)? };
                     let _ = func.call(*chunk);
+                    Ok(Vec::<Unknown>::new())
+                }
+                ChunkEmit::WhisperFlushed(deferred, error) => {
+                    whisper_integration::settle_flush(&ctx.env, deferred, error)?;
+                    Ok(Vec::<Unknown>::new())
+                }
+                ChunkEmit::WhisperError(error) => {
+                    let error = whisper_integration::js_error(&ctx.env, &error)?;
+                    ctx.env.throw(error)?;
                     Ok(Vec::<Unknown>::new())
                 }
                 ChunkEmit::VadError(message) => {
@@ -507,9 +552,10 @@ pub struct JsProcessInfo {
 ///
 /// `vadEvents` is populated only when `vad` is specified in `openStream`. When VAD is disabled,
 /// it is unset (`undefined`). When enabled with no finalized events in this chunk, it is an empty array.
-#[napi(object)]
+#[napi(object, object_from_js = false)]
 pub struct JsAudioChunk {
     pub data: Float32Array,
+    pub frame_index: BigInt,
     pub frames: u32,
     pub pts_ns: i64,
     pub seq: BigInt,
@@ -519,6 +565,9 @@ pub struct JsAudioChunk {
     pub rms: f64,
     /// VAD events finalized in this chunk (only when `vadTap` is 'primary').
     pub vad_events: Option<Vec<JsVadEvent>>,
+    /// Attached whisper-compatible events on the selected tap only.
+    #[napi(ts_type = "AttachedWhisperVadEvent[]")]
+    pub whisper_vad_events: Option<Vec<whisper_vad::JsWhisperVadEvent>>,
     /// Timestamp-matched secondary tap chunk (only with `secondaryOutput`). Delivered as a pair in
     /// the same callback (`primary.secondary` in `onChunk(primary)`, not a second argument). It is
     /// `undefined` when the secondary has not arrived. Match primary↔secondary by `ptsNs` (time);
@@ -532,11 +581,12 @@ pub struct JsAudioChunk {
 /// `Float32Array` for `'f32'`). Sample values use host native endianness. Serialization to s16le
 /// wire format is the receiver's (consumer's) responsibility. `ptsNs` uses the same recording-zero
 /// clock as the primary but is independent, trailing by 20–60ms due to secondary Stage2 resampler group delay.
-#[napi(object)]
+#[napi(object, object_from_js = false)]
 pub struct JsSecondaryChunk {
     pub data: Either<Int16Array, Float32Array>,
     /// 'f32' | 's16' (discriminator for narrowing the type of `data`).
     pub encoding: String,
+    pub frame_index: BigInt,
     pub frames: u32,
     pub pts_ns: i64,
     pub seq: BigInt,
@@ -547,6 +597,9 @@ pub struct JsSecondaryChunk {
     pub rms: f64,
     /// VAD events finalized in this chunk (only when `vadTap` is 'secondary').
     pub vad_events: Option<Vec<JsVadEvent>>,
+    /// Attached whisper-compatible events on the selected tap only.
+    #[napi(ts_type = "AttachedWhisperVadEvent[]")]
+    pub whisper_vad_events: Option<Vec<whisper_vad::JsWhisperVadEvent>>,
 }
 
 /// JS VAD event (speech segment start/end).
@@ -696,6 +749,10 @@ pub struct OpenOptions {
     /// Integrated VAD settings. When specified, the tap selected by `vadTap` passes through VAD and
     /// finalized events attach to that tap's chunk `vadEvents` (audio is unchanged). Omission disables VAD.
     pub vad: Option<VadOptions>,
+    /// Whisper-compatible VAD options. Validated before any device is opened.
+    /// Requires the shared canonical capture feed with exact producer provenance.
+    #[napi(ts_type = "WhisperVadStreamOptions")]
+    pub whisper_vad: Option<napi::JsUnknown>,
     /// Tap to run VAD on. 'primary' (default) | 'secondary'. 'secondary' requires
     /// `secondaryOutput`; a 16k/mono secondary avoids resampling for efficiency.
     pub vad_tap: Option<String>,
@@ -774,6 +831,7 @@ fn chunk_to_js(chunk: AudioChunk) -> JsAudioChunk {
     let frames = chunk.frames as u32;
     JsAudioChunk {
         // Convert Vec<f32> to Float32Array (leave no ownership on the thread).
+        frame_index: BigInt::from(chunk.frame_index),
         data: Float32Array::new(chunk.data),
         frames,
         pts_ns: chunk.pts_ns,
@@ -784,6 +842,7 @@ fn chunk_to_js(chunk: AudioChunk) -> JsAudioChunk {
         rms: chunk.rms as f64,
         // Unset by default. The bridge overwrites it when integrated VAD is enabled on the primary tap.
         vad_events: None,
+        whisper_vad_events: None,
         // The pairing bridge inserts a timestamp-matched secondary chunk (undefined if none).
         secondary: None,
     }
@@ -1081,6 +1140,7 @@ enum BridgeCmd {
     /// change config (`secondaryOutput` / encoding are fixed at open). Unlike audio
     /// stop-flush, it attaches the final speechEnd to the next tap chunk.
     FlushVad,
+    FlushWhisperVad(SendDeferred),
 }
 
 /// Secondary tap marshaling configuration (rate/channels/encoding).
@@ -1098,6 +1158,7 @@ struct SecondaryTapCfg {
 /// is bound to one tap (`vad_tap`), consuming pre-quantization f32 in Rust. Secondary s16 conversion follows VAD.
 struct PairingBridge {
     on_chunk: ChunkTsfn,
+    whisper: Option<whisper_integration::WhisperBridge>,
     stop_phase: Arc<Mutex<StopPhase>>,
     /// Integrated VAD (only when configured). One instance, one tap.
     vad: Option<CoreVad>,
@@ -1263,6 +1324,7 @@ impl PairingBridge {
         // Preserve non-decreasing primary pts: carrier pts is the greater of the latest anchor and last delivered pts.
         let pts = self.vad_anchor_pts.max(self.last_emitted_primary_pts);
         let mut carrier = JsAudioChunk {
+            frame_index: BigInt::from(0u64),
             data: Float32Array::new(Vec::new()),
             frames: 0,
             pts_ns: pts,
@@ -1272,6 +1334,7 @@ impl PairingBridge {
             peak: 0.0,
             rms: 0.0,
             vad_events: None,
+            whisper_vad_events: None,
             secondary: None,
         };
         match self.vad_tap {
@@ -1284,6 +1347,7 @@ impl PairingBridge {
                     _ => (Either::B(Float32Array::new(Vec::new())), "f32"),
                 };
                 carrier.secondary = Some(JsSecondaryChunk {
+                    frame_index: BigInt::from(0u64),
                     data,
                     encoding: encoding.to_string(),
                     frames: 0,
@@ -1294,6 +1358,7 @@ impl PairingBridge {
                     peak: 0.0,
                     rms: 0.0,
                     vad_events: Some(events),
+                    whisper_vad_events: None,
                 });
             }
         }
@@ -1325,6 +1390,11 @@ impl PairingBridge {
         }
         let mut js = chunk_to_js(chunk);
         js.vad_events = vad_events;
+        if let Some(whisper) = self.whisper.as_mut() {
+            if whisper.tap == VadTap::Primary {
+                js.whisper_vad_events = Some(whisper.take_events());
+            }
+        }
         self.primary_fifo.push_back(js);
     }
 
@@ -1375,6 +1445,7 @@ impl PairingBridge {
             ),
         };
         let js = JsSecondaryChunk {
+            frame_index: BigInt::from(chunk.frame_index),
             data,
             encoding,
             frames,
@@ -1385,6 +1456,11 @@ impl PairingBridge {
             peak,
             rms,
             vad_events,
+            whisper_vad_events: self
+                .whisper
+                .as_mut()
+                .filter(|owner| owner.tap == VadTap::Secondary)
+                .map(|_| Vec::new()),
         };
         self.secondary_fifo.push_back(js);
     }
@@ -1417,6 +1493,16 @@ impl PairingBridge {
             };
             let mut p = self.primary_fifo.pop_front().unwrap();
             self.last_emitted_primary_pts = p.pts_ns.max(self.last_emitted_primary_pts);
+            let mut matched = matched;
+            if let Some(secondary) = matched.as_mut() {
+                if let Some(whisper) = self
+                    .whisper
+                    .as_mut()
+                    .filter(|owner| owner.tap == VadTap::Secondary)
+                {
+                    secondary.whisper_vad_events = Some(whisper.take_events());
+                }
+            }
             p.secondary = matched;
             self.on_chunk.call(
                 ChunkEmit::Chunk(Box::new(p)),
@@ -1459,9 +1545,6 @@ impl FlexStream {
 
         let handle = thread::spawn(move || {
             loop {
-                if thread_stop.load(Ordering::SeqCst) {
-                    break;
-                }
                 // Process commands together in the same iteration as polling.
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
@@ -1494,16 +1577,49 @@ impl FlexStream {
                         // Runtime flushVad: finalize the open utterance and attach final events to the next
                         // VAD tap chunk (pending).
                         BridgeCmd::FlushVad => bridge.flush_vad(),
+                        BridgeCmd::FlushWhisperVad(deferred) => {
+                            bridge.drain_capture(&mut stream);
+                            while let Some(chunk) = stream.poll_chunk() {
+                                bridge.on_primary(chunk);
+                            }
+                            while let Some(chunk) = stream.poll_secondary() {
+                                bridge.on_secondary(chunk);
+                            }
+                            bridge.drain_pairs();
+                            bridge.flush_whisper(false);
+                            let error = bridge
+                                .whisper
+                                .as_ref()
+                                .and_then(|owner| owner.error.clone());
+                            if matches!(
+                                *thread_terminal.lock().unwrap_or_else(lock_poisoned),
+                                Some(StreamTerminal::Whisper(_))
+                            ) {
+                                *thread_terminal.lock().unwrap_or_else(lock_poisoned) =
+                                    error.clone().map(StreamTerminal::Whisper);
+                            }
+                            bridge.on_chunk.call(
+                                ChunkEmit::WhisperFlushed(deferred, error),
+                                ThreadsafeFunctionCallMode::NonBlocking,
+                            );
+                        }
                     }
                 }
+                // A stop request may race an already accepted flush command.
+                // Drain accepted commands before exiting so their promises settle.
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
                 if let Some(error) = stream.terminal_error() {
-                    *thread_terminal.lock().unwrap_or_else(lock_poisoned) = Some(error);
+                    *thread_terminal.lock().unwrap_or_else(lock_poisoned) =
+                        Some(StreamTerminal::Capture(error));
                     bridge.primary_fifo.clear();
                     bridge.secondary_fifo.clear();
                     bridge.pending_flush_events.clear();
                 }
                 // Drain all arriving primary/secondary chunks into the bridge. Run VAD/quantization, pair within
                 // the pts window, and deliver to onChunk.
+                bridge.drain_capture(&mut stream);
                 while let Some(chunk) = stream.poll_chunk() {
                     bridge.on_primary(chunk);
                 }
@@ -1511,10 +1627,20 @@ impl FlexStream {
                     bridge.on_secondary(chunk);
                 }
                 bridge.drain_pairs();
+                bridge.report_whisper_failure();
+                if let Some(error) = bridge
+                    .whisper
+                    .as_ref()
+                    .and_then(|owner| owner.error.clone())
+                {
+                    *thread_terminal.lock().unwrap_or_else(lock_poisoned) =
+                        Some(StreamTerminal::Whisper(error));
+                }
                 forward_stream_events(&mut stream, on_event.as_ref(), &thread_terminal);
                 thread::sleep(POLL_INTERVAL);
             }
             // Drain chunks remaining in the rings before stopping, then deliver pairs.
+            bridge.drain_capture(&mut stream);
             while let Some(chunk) = stream.poll_chunk() {
                 bridge.on_primary(chunk);
             }
@@ -1535,11 +1661,13 @@ impl FlexStream {
                            // terminal state before queuing any tail audio or settlement.
             forward_stream_events(&mut stream, on_event.as_ref(), &thread_terminal);
             if let Some(error) = stream.terminal_error() {
-                *thread_terminal.lock().unwrap_or_else(lock_poisoned) = Some(error);
+                *thread_terminal.lock().unwrap_or_else(lock_poisoned) =
+                    Some(StreamTerminal::Capture(error));
                 bridge.primary_fifo.clear();
                 bridge.secondary_fifo.clear();
                 bridge.pending_flush_events.clear();
             }
+            bridge.drain_capture(&mut stream);
             while let Some(chunk) = stream.poll_chunk() {
                 bridge.on_primary(chunk); // 2 (primary tap VAD also consumes the tail here)
             }
@@ -1548,12 +1676,24 @@ impl FlexStream {
             }
             bridge.drain_pairs(); // 2 Deliver trailing audio
             if let Some(error) = stream.terminal_error() {
-                *thread_terminal.lock().unwrap_or_else(lock_poisoned) = Some(error);
+                *thread_terminal.lock().unwrap_or_else(lock_poisoned) =
+                    Some(StreamTerminal::Capture(error));
                 bridge.primary_fifo.clear();
                 bridge.secondary_fifo.clear();
                 bridge.pending_flush_events.clear();
-            } else {
-                bridge.flush_vad_final(); // Final events + frames:0 terminator.
+            }
+            if bridge.whisper.is_some() {
+                bridge.flush_whisper(true);
+                if let Some(error) = bridge
+                    .whisper
+                    .as_ref()
+                    .and_then(|owner| owner.error.clone())
+                {
+                    *thread_terminal.lock().unwrap_or_else(lock_poisoned) =
+                        Some(StreamTerminal::Whisper(error));
+                }
+            } else if stream.terminal_error().is_none() {
+                bridge.flush_vad_final();
             }
             // 4. End signal in the same TSFN queue. Processing it in JS resolves stop()'s Promise
             // (AsyncTask / another TSFN could resolve before onChunk).
@@ -1704,7 +1844,10 @@ impl FlexStream {
             .lock()
             .unwrap_or_else(lock_poisoned)
             .clone()
-            .map(terminal_event)
+            .map(|error| match error {
+                StreamTerminal::Capture(error) => terminal_event(error),
+                StreamTerminal::Whisper(error) => event_to_js(Event::Error(error.to_string())),
+            })
     }
 
     /// Hot-swap the input source (mic/system/process) without stopping recording.
@@ -1828,6 +1971,23 @@ impl FlexStream {
             )
         })?;
         Ok(())
+    }
+
+    /// Drain an attached epoch and deliver its closing carrier before promise settlement.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn flush_whisper_vad(&self, env: Env) -> napi::Result<JsObject> {
+        let sender = self
+            .inner
+            .lock()
+            .unwrap_or_else(lock_poisoned)
+            .cmd_tx
+            .clone()
+            .ok_or_else(|| NapiError::new(Status::GenericFailure, "stream already stopped"))?;
+        let (deferred, promise) = create_js_promise(&env)?;
+        sender
+            .send(BridgeCmd::FlushWhisperVad(deferred))
+            .map_err(|_| NapiError::new(Status::GenericFailure, "bridge thread is not running"))?;
+        Ok(promise)
     }
 
     /// Change input gain (linear multiplier). 1.0=unchanged, 2.0=about +6dB, 0.0=silence. Callable
@@ -2034,6 +2194,25 @@ pub fn open_stream(
         EventTsfn,
     >,
 ) -> napi::Result<FlexStream> {
+    let whisper_options = options
+        .whisper_vad
+        .as_ref()
+        .map(|value| {
+            // SAFETY: borrow the live JS value during synchronous parsing only.
+            let value = unsafe { napi::JsUnknown::from_raw_unchecked(env.raw(), value.raw()) };
+            whisper_vad::stream_options(
+                value,
+                options.vad.is_some(),
+                options.vad_tap.is_some(),
+                options.secondary_output.is_some(),
+            )
+        })
+        .transpose()
+        .map_err(|error| whisper_vad::throw_boundary(&env, error))?;
+    let whisper = whisper_options
+        .map(|(params, options, tap)| whisper_integration::WhisperBridge::new(params, options, tap))
+        .transpose()
+        .map_err(|error| whisper_integration::throw_error(&env, error))?;
     let config = build_config(&options)?;
     let output_rate = config.output.sample_rate;
     let output_channels = config.output.channels;
@@ -2076,6 +2255,9 @@ pub fn open_stream(
     if denoise_enabled {
         stream.set_denoise(true);
     }
+    if whisper.is_some() {
+        stream.enable_capture_tap().map_err(to_napi_err)?;
+    }
     stream.start().map_err(to_napi_err)?;
 
     let stop_phase = Arc::new(Mutex::new(StopPhase::Running));
@@ -2092,6 +2274,7 @@ pub fn open_stream(
     let settle_tsfn =
         make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user, terminal.clone())?;
     let bridge = PairingBridge {
+        whisper,
         on_chunk: on_chunk.as_ref().clone(),
         stop_phase,
         vad,
@@ -2182,7 +2365,23 @@ pub fn open_mock_stream(
     secondary_encoding: Option<String>,
     vad_threshold: Option<f64>,
     vad_tap: Option<String>,
+    whisper_vad: Option<napi::JsUnknown>,
 ) -> napi::Result<FlexStream> {
+    let whisper_options = whisper_vad
+        .map(|value| {
+            whisper_vad::stream_options(
+                value,
+                vad_threshold.is_some(),
+                vad_tap.is_some(),
+                secondary_rate.is_some(),
+            )
+        })
+        .transpose()
+        .map_err(|error| whisper_vad::throw_boundary(&env, error))?;
+    let whisper = whisper_options
+        .map(|(params, options, tap)| whisper_integration::WhisperBridge::new(params, options, tap))
+        .transpose()
+        .map_err(|error| whisper_integration::throw_error(&env, error))?;
     // Secondary tap (only when configured). Validate encoding and build marshaling settings.
     let secondary_cfg = match secondary_rate {
         Some(rate) => {
@@ -2238,6 +2437,9 @@ pub fn open_mock_stream(
         freq_hz as f32,
     ));
     let mut stream = flexaudio::Stream::open(config, backend).map_err(to_napi_err)?;
+    if whisper.is_some() {
+        stream.enable_capture_tap().map_err(to_napi_err)?;
+    }
     stream.start().map_err(to_napi_err)?;
     // The mock path bypasses integrated denoise. VAD runs only when `vadThreshold` is specified (for
     // verification of flushVad, vadEvents, and pairing paths).
@@ -2255,6 +2457,7 @@ pub fn open_mock_stream(
     let settle_tsfn =
         make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user, terminal.clone())?;
     let bridge = PairingBridge {
+        whisper,
         on_chunk: on_chunk.as_ref().clone(),
         stop_phase,
         vad,
@@ -2546,6 +2749,7 @@ mod tests {
             system_gain: None,
             vad: None,
             vad_tap: None,
+            whisper_vad: None,
             denoise: None,
             secondary_output: None,
         }
@@ -2643,6 +2847,7 @@ mod tests {
             vad: None,
             vad_tap: None,
             denoise: None,
+            whisper_vad: None,
             secondary_output: None,
         };
         let cfg = build_config(&opts).unwrap();
@@ -3157,7 +3362,11 @@ mod reproduction_bridge {
     unsafe fn export_bridge(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
         let env = Env::from_raw(raw_env);
         let function = env.create_function_from_closure("__reproP9Bridge", |ctx| {
-            let scenario = ctx.get::<napi::JsString>(0)?.into_utf8()?.as_str()?.to_owned();
+            let scenario = ctx
+                .get::<napi::JsString>(0)?
+                .into_utf8()?
+                .as_str()?
+                .to_owned();
             let callback = ctx.get::<napi::JsFunction>(1)?;
             let callback = unsafe { Function::from_napi_value(ctx.env.raw(), callback.raw())? };
             let stream = repro_p9_bridge(*ctx.env, scenario, callback)?;
@@ -3175,8 +3384,9 @@ mod reproduction_bridge {
             let frequency = ctx.get::<napi::JsNumber>(2)?.get_double()?;
             let callback = ctx.get::<napi::JsFunction>(3)?;
             let callback = unsafe { Function::from_napi_value(ctx.env.raw(), callback.raw())? };
-            let stream = open_mock_stream(*ctx.env, rate, channels, frequency, callback,
-                None, None, None, None, None)?;
+            let stream = open_mock_stream(
+                *ctx.env, rate, channels, frequency, callback, None, None, None, None, None, None,
+            )?;
             js_stream(ctx.env, stream)
         })?;
         Ok(function.raw())
@@ -3201,6 +3411,7 @@ mod reproduction_bridge {
         )?;
         let settle = make_settle_tsfn(&env, phase.clone(), weak, user, terminal.clone())?;
         let mut bridge = PairingBridge {
+            whisper: None,
             on_chunk: chunk.as_ref().clone(),
             stop_phase: phase.clone(),
             vad: None,
@@ -3269,6 +3480,7 @@ mod reproduction_bridge {
                 0
             };
             bridge.on_secondary(SecondaryChunk {
+                frame_index: 0,
                 samples: vec![0.25; 960],
                 frames: 960,
                 pts_ns: secondary_pts,
@@ -3284,6 +3496,7 @@ mod reproduction_bridge {
                 at_ns: Some(20_000_000),
             }]);
             bridge.on_primary(AudioChunk {
+                frame_index: 0,
                 data: vec![0.25; 960],
                 frames: 960,
                 pts_ns: primary_pts,

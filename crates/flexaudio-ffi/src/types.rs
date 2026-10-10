@@ -263,8 +263,24 @@ pub struct FlexProcessInfo {
 /// addons retain their configuration from open (same as gain).
 pub struct FlexStream {
     pub(crate) inner: flexaudio::Stream,
+    pub(crate) whisper: Option<flexaudio_vad::WhisperVadTap>,
+    pub(crate) whisper_events: Vec<flexaudio_vad::AttachedWhisperVadEvent>,
+    pub(crate) whisper_origin: (u64, i64),
+    pub(crate) whisper_error: Option<flexaudio_vad::WhisperVadTapError>,
+    pub(crate) whisper_error_reported: bool,
+    pub(crate) ready_chunks: std::collections::VecDeque<crate::whisper_integration::FlexChunkV2>,
     /// Noise suppressor when enabled (requires 48 kHz; constructed at open). `None` when disabled.
     pub(crate) denoiser: Option<Denoiser>,
     /// VAD when enabled (constructed at open). `None` when disabled.
     pub(crate) vad: Option<Vad>,
+}
+
+impl Drop for FlexStream {
+    fn drop(&mut self) {
+        for mut chunk in self.ready_chunks.drain(..) {
+            unsafe {
+                crate::whisper_integration::flexaudio_chunk_free_v2(&mut chunk);
+            }
+        }
+    }
 }

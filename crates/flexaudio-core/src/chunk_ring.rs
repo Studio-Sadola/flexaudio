@@ -128,6 +128,7 @@ mod tests {
 
     fn chunk(seq: u64) -> AudioChunk {
         AudioChunk {
+            frame_index: seq * 960,
             data: vec![0.0; 1920],
             frames: 960,
             pts_ns: seq as i64 * 20_000_000,
@@ -248,5 +249,19 @@ mod tests {
         p.push(chunk(2)); // Discard seq0.
         assert_eq!(p.dropped_count(), 1);
         assert_eq!(c.dropped_count(), 1, "consumer sees the same dropped count");
+    }
+    #[test]
+    fn dropped_chunk_preserves_its_exact_frame_gap() {
+        let (mut producer, mut consumer) = chunk_ring(1);
+        producer.push(chunk(0));
+        let first = consumer.try_pop().unwrap();
+        producer.push(chunk(1));
+        producer.push(chunk(2));
+        let next = consumer.try_pop().unwrap();
+        assert_eq!(
+            next.frame_index - first.frame_index - first.frames as u64,
+            960
+        );
+        assert_eq!(next.dropped_before, 1);
     }
 }

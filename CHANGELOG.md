@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking in 0.5
+
+- Rust `AudioChunk` and `SecondaryChunk` add the public `frame_index: u64` field.
+  Update struct literals for both types to include the first frame's index on
+  that tap's canonical 48 kHz timeline. Legacy output PCM and PTS semantics
+  stay unchanged; the C `FlexChunk` v1 ABI remains unchanged.
+
 ## [0.4.0] - 2026-10-08
 
 ### Breaking

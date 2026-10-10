@@ -42,6 +42,9 @@ mod marshal;
 mod stream;
 mod vad;
 mod watcher;
+mod whisper_vad;
+mod whisper_marshal;
+mod whisper_buffer;
 
 use marshal::{device_info_to_py, process_info_to_py};
 
@@ -187,6 +190,7 @@ fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<marshal::PyDeviceEvent>()?;
 
     // Standalone addons and monitoring.
+    whisper_vad::register(m)?;
     m.add_class::<vad::Vad>()?;
     m.add_class::<denoise::Denoiser>()?;
     m.add_class::<encode::FlacEncoder>()?;

@@ -65,7 +65,20 @@ impl PcmConverter {
     /// rubato construction can fail for extreme rate ratios, so return an error string for the
     /// caller to handle without panicking.
     pub(crate) fn new(format: PcmFormat, target_rate: u32) -> Result<Self, String> {
-        Self::new_with_resampler_chunk(format, target_rate, None)
+        Self::new_with_resampler_chunk(format, target_rate, None, false)
+    }
+
+    /// Use the shared DSP with an integer-centered startup phase for canonical capture.
+    pub(crate) fn new_capture_48k() -> Result<Self, String> {
+        Self::new_with_resampler_chunk(
+            PcmFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            16_000,
+            None,
+            true,
+        )
     }
 
     /// Create a dedicated converter that maps VAD's 8 kHz frames (256 samples) to 16 kHz frames
@@ -78,6 +91,7 @@ impl PcmConverter {
             },
             16_000,
             Some(256),
+            false,
         )?;
 
         // rubato's sinc waits for future taps at startup, so the first real frame would produce
@@ -93,16 +107,18 @@ impl PcmConverter {
         format: PcmFormat,
         target_rate: u32,
         resampler_chunk_in_frames: Option<usize>,
+        capture_phase: bool,
     ) -> Result<Self, String> {
         format.validate().map_err(|e| e.to_string())?;
         let channels = usize::from(format.channels);
         let resampler = if format.sample_rate == target_rate {
             None
         } else {
-            Some(MonoResampler::new(
+            Some(MonoResampler::new_with_phase(
                 format.sample_rate,
                 target_rate,
                 resampler_chunk_in_frames,
+                capture_phase,
             )?)
         };
         Ok(PcmConverter {
@@ -192,7 +208,12 @@ struct MonoResampler {
 }
 
 impl MonoResampler {
-    fn new(in_sr: u32, out_sr: u32, input_chunk_frames: Option<usize>) -> Result<Self, String> {
+    fn new_with_phase(
+        in_sr: u32,
+        out_sr: u32,
+        input_chunk_frames: Option<usize>,
+        capture_phase: bool,
+    ) -> Result<Self, String> {
         let ratio = out_sr as f64 / in_sr as f64;
         // A fixed input chunk corresponds to 20 ms of input frames (rubato retains any remainder).
         let chunk_in_frames = input_chunk_frames.unwrap_or_else(|| (in_sr as usize / 50).max(64));
@@ -205,9 +226,16 @@ impl MonoResampler {
             window: WindowFunction::BlackmanHarris2,
         };
 
+        // Only silent initialization may vary the ratio; real capture always uses 1/3.
+        let phase_ratio = 128.0 / 383.0;
+        let ratio_limit = if capture_phase {
+            phase_ratio / ratio
+        } else {
+            1.0
+        };
         let inner = Async::<f32>::new_sinc(
             ratio,
-            1.0, // Fixed ratio.
+            ratio_limit,
             &params,
             chunk_in_frames,
             1, // mono
@@ -217,13 +245,51 @@ impl MonoResampler {
 
         let max_out_frames = inner.output_frames_max();
 
-        Ok(MonoResampler {
+        let mut resampler = MonoResampler {
             inner,
             chunk_in_frames,
             max_out_frames,
             in_accum: Vec::with_capacity(chunk_in_frames * 4),
             out_scratch: vec![0.0; max_out_frames],
-        })
+        };
+        if capture_phase {
+            resampler.align_capture_phase(phase_ratio)?;
+        }
+        Ok(resampler)
+    }
+
+    fn align_capture_phase(&mut self, phase_ratio: f64) -> Result<(), String> {
+        // rubato 3.0.0: init_last_index = -127; each output first advances idx.
+        // make_sincs stores subindex s with center 63 + (s+1)/128. Thus an
+        // integer idx would have a fractional kernel center of 63 + 1/128.
+        // One silent output advances by 383/128, then consumes five input frames:
+        // last_index = -127 + 383/128 - 5 = -129 - 1/128 (exact in binary).
+        // Restore step=3: first real idx = -126 - 1/128, selecting subindex 127,
+        // whose kernel center is exactly 64. Raw q therefore represents -63+3*q.
+        // Trim ceil(63/3)=21 outputs: retained j represents exactly 3*j.
+        // This derives phase from the engine, independently of output_delay's floor.
+        if 1.0 / phase_ratio != 383.0 / 128.0 || self.inner.output_delay() != 21 {
+            return Err("unsupported capture conversion clock".into());
+        }
+        self.inner.set_chunk_size(5).map_err(|e| e.to_string())?;
+        self.inner
+            .set_resample_ratio(phase_ratio, false)
+            .map_err(|e| e.to_string())?;
+        if self.inner.output_frames_next() != 1 {
+            return Err("unsupported capture conversion clock".into());
+        }
+        let mut discarded = Vec::new();
+        self.process_block(&[0.0; 5], &mut discarded)?;
+        self.inner
+            .set_resample_ratio(1.0 / 3.0, false)
+            .map_err(|e| e.to_string())?;
+        self.inner
+            .set_chunk_size(self.chunk_in_frames)
+            .map_err(|e| e.to_string())?;
+        if self.inner.output_delay() != 21 || self.inner.output_frames_next() != 320 {
+            return Err("unsupported capture conversion clock".into());
+        }
+        Ok(())
     }
 
     /// Accumulate mono input, resample as many `chunk_in_frames` chunks as possible, and append
@@ -233,27 +299,36 @@ impl MonoResampler {
         let step = self.chunk_in_frames; // For mono, frame count equals sample count.
 
         while self.in_accum.len() >= step {
-            let in_adapter = InterleavedSlice::new(&self.in_accum[..step], 1, self.chunk_in_frames)
-                .map_err(|e| format!("rubato interleaved input adapter failed: {e}"))?;
-            let mut out_adapter =
-                InterleavedSlice::new_mut(&mut self.out_scratch[..], 1, self.max_out_frames)
-                    .map_err(|e| format!("rubato interleaved output adapter failed: {e}"))?;
-
-            let indexing = Indexing {
-                input_offset: 0,
-                output_offset: 0,
-                partial_len: None,
-                active_channels_mask: None,
-            };
-
-            let (_in_used, out_written) = self
-                .inner
-                .process_into_buffer(&in_adapter, &mut out_adapter, Some(&indexing))
-                .map_err(|e| format!("rubato process_into_buffer failed: {e}"))?;
-
-            out.extend_from_slice(&self.out_scratch[..out_written]); // Mono.
+            // Temporarily move the accumulator so the shared processing method can borrow self.
+            let input = std::mem::take(&mut self.in_accum);
+            let result = self.process_block(&input[..step], out);
+            self.in_accum = input;
+            result?;
             self.in_accum.drain(..step);
         }
+        Ok(())
+    }
+
+    fn process_block(&mut self, input: &[f32], out: &mut Vec<f32>) -> Result<(), String> {
+        let in_adapter = InterleavedSlice::new(input, 1, input.len())
+            .map_err(|e| format!("rubato interleaved input adapter failed: {e}"))?;
+        let mut out_adapter =
+            InterleavedSlice::new_mut(&mut self.out_scratch[..], 1, self.max_out_frames)
+                .map_err(|e| format!("rubato interleaved output adapter failed: {e}"))?;
+
+        let indexing = Indexing {
+            input_offset: 0,
+            output_offset: 0,
+            partial_len: None,
+            active_channels_mask: None,
+        };
+
+        let (_in_used, out_written) = self
+            .inner
+            .process_into_buffer(&in_adapter, &mut out_adapter, Some(&indexing))
+            .map_err(|e| format!("rubato process_into_buffer failed: {e}"))?;
+
+        out.extend_from_slice(&self.out_scratch[..out_written]); // Mono.
         Ok(())
     }
 }

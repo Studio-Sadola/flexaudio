@@ -17,6 +17,13 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+# cargo test --workspace builds this live addon for the Node integration test.
+[[example]]
+name = "capture_test_addon"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+test = false
+
 [dependencies]
 flexaudio = { path = "../flexaudio" }
 
