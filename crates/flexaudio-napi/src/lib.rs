@@ -16,6 +16,7 @@
 //! No network communication occurs at runtime (napi is only the N-API bridge).
 
 mod flac_encoder;
+mod whisper_vad;
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -507,7 +508,7 @@ pub struct JsProcessInfo {
 ///
 /// `vadEvents` is populated only when `vad` is specified in `openStream`. When VAD is disabled,
 /// it is unset (`undefined`). When enabled with no finalized events in this chunk, it is an empty array.
-#[napi(object)]
+#[napi(object, object_from_js = false)]
 pub struct JsAudioChunk {
     pub data: Float32Array,
     pub frames: u32,
@@ -519,6 +520,9 @@ pub struct JsAudioChunk {
     pub rms: f64,
     /// VAD events finalized in this chunk (only when `vadTap` is 'primary').
     pub vad_events: Option<Vec<JsVadEvent>>,
+    /// Attached whisper-compatible events on the selected tap only.
+    #[napi(ts_type = "AttachedWhisperVadEvent[]")]
+    pub whisper_vad_events: Option<Vec<whisper_vad::JsWhisperVadEvent>>,
     /// Timestamp-matched secondary tap chunk (only with `secondaryOutput`). Delivered as a pair in
     /// the same callback (`primary.secondary` in `onChunk(primary)`, not a second argument). It is
     /// `undefined` when the secondary has not arrived. Match primary↔secondary by `ptsNs` (time);
@@ -532,7 +536,7 @@ pub struct JsAudioChunk {
 /// `Float32Array` for `'f32'`). Sample values use host native endianness. Serialization to s16le
 /// wire format is the receiver's (consumer's) responsibility. `ptsNs` uses the same recording-zero
 /// clock as the primary but is independent, trailing by 20–60ms due to secondary Stage2 resampler group delay.
-#[napi(object)]
+#[napi(object, object_from_js = false)]
 pub struct JsSecondaryChunk {
     pub data: Either<Int16Array, Float32Array>,
     /// 'f32' | 's16' (discriminator for narrowing the type of `data`).
@@ -547,6 +551,9 @@ pub struct JsSecondaryChunk {
     pub rms: f64,
     /// VAD events finalized in this chunk (only when `vadTap` is 'secondary').
     pub vad_events: Option<Vec<JsVadEvent>>,
+    /// Attached whisper-compatible events on the selected tap only.
+    #[napi(ts_type = "AttachedWhisperVadEvent[]")]
+    pub whisper_vad_events: Option<Vec<whisper_vad::JsWhisperVadEvent>>,
 }
 
 /// JS VAD event (speech segment start/end).
@@ -696,6 +703,10 @@ pub struct OpenOptions {
     /// Integrated VAD settings. When specified, the tap selected by `vadTap` passes through VAD and
     /// finalized events attach to that tap's chunk `vadEvents` (audio is unchanged). Omission disables VAD.
     pub vad: Option<VadOptions>,
+    /// Whisper-compatible VAD options. Validated before any device is opened.
+    /// Requires the shared canonical capture feed with exact producer provenance.
+    #[napi(ts_type = "WhisperVadStreamOptions")]
+    pub whisper_vad: Option<napi::JsUnknown>,
     /// Tap to run VAD on. 'primary' (default) | 'secondary'. 'secondary' requires
     /// `secondaryOutput`; a 16k/mono secondary avoids resampling for efficiency.
     pub vad_tap: Option<String>,
@@ -784,6 +795,7 @@ fn chunk_to_js(chunk: AudioChunk) -> JsAudioChunk {
         rms: chunk.rms as f64,
         // Unset by default. The bridge overwrites it when integrated VAD is enabled on the primary tap.
         vad_events: None,
+        whisper_vad_events: None,
         // The pairing bridge inserts a timestamp-matched secondary chunk (undefined if none).
         secondary: None,
     }
@@ -1272,6 +1284,7 @@ impl PairingBridge {
             peak: 0.0,
             rms: 0.0,
             vad_events: None,
+            whisper_vad_events: None,
             secondary: None,
         };
         match self.vad_tap {
@@ -1294,6 +1307,7 @@ impl PairingBridge {
                     peak: 0.0,
                     rms: 0.0,
                     vad_events: Some(events),
+                    whisper_vad_events: None,
                 });
             }
         }
@@ -1385,6 +1399,7 @@ impl PairingBridge {
             peak,
             rms,
             vad_events,
+            whisper_vad_events: None,
         };
         self.secondary_fifo.push_back(js);
     }
@@ -2034,6 +2049,23 @@ pub fn open_stream(
         EventTsfn,
     >,
 ) -> napi::Result<FlexStream> {
+    if let Some(value) = options.whisper_vad.as_ref() {
+        // SAFETY: borrow the existing live JS value during synchronous validation only.
+        let value = unsafe { napi::JsUnknown::from_raw_unchecked(env.raw(), value.raw()) };
+        whisper_vad::stream_options(
+            value,
+            options.vad.is_some(),
+            options.vad_tap.is_some(),
+            options.secondary_output.is_some(),
+        )
+        .map_err(|error| whisper_vad::throw_boundary(&env, error))?;
+        // Output chunks cannot establish the producer's exact canonical frame origin or valid
+        // tail. Fail closed until the shared stream owner supplies that capture provenance.
+        return Err(whisper_vad::throw_boundary(
+            &env,
+            whisper_vad::BoundaryError::UnsupportedConversionClock,
+        ));
+    }
     let config = build_config(&options)?;
     let output_rate = config.output.sample_rate;
     let output_channels = config.output.channels;
@@ -2546,6 +2578,7 @@ mod tests {
             system_gain: None,
             vad: None,
             vad_tap: None,
+            whisper_vad: None,
             denoise: None,
             secondary_output: None,
         }
@@ -2643,6 +2676,7 @@ mod tests {
             vad: None,
             vad_tap: None,
             denoise: None,
+            whisper_vad: None,
             secondary_output: None,
         };
         let cfg = build_config(&opts).unwrap();

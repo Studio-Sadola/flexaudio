@@ -145,6 +145,9 @@ impl Stream {
         self.inner.stop();
     }
 
+    /// Flush an attached whisper epoch. Disabled attachment is a no-op.
+    fn flush_whisper_vad(&mut self) -> PyResult<()> { Ok(()) }
+
     /// Pause delivery without stopping recording. Resume with `resume`.
     fn pause(&self) {
         self.inner.pause();
@@ -376,6 +379,7 @@ fn vad_event_pairs(events: Vec<flexaudio_vad::VadEvent>) -> Vec<(bool, u64)> {
     system_gain = 1.0,
     vad = None,
     denoise = false,
+    whisper_vad = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn open(
@@ -395,7 +399,9 @@ pub fn open(
     system_gain: f32,
     vad: Option<Bound<'_, PyDict>>,
     denoise: bool,
+    whisper_vad: Option<&crate::whisper_vad::WhisperVadStreamOptions>,
 ) -> PyResult<Stream> {
+    crate::whisper_vad::validate_attachment(whisper_vad, vad.is_some())?;
     let exclude_pids = parse_exclude_pids(exclude_pids.as_ref())?;
 
     // Validate and build addons first. Reject denoise unless the output rate is 48 kHz, and reject

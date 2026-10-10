@@ -31,6 +31,40 @@
 // The handle state does not allow the operation (such as writing to finalized FLAC).
 #define FLEX_INVALID_STATE -4
 
+#define FLEX_WHISPER_SEGMENT 1
+
+#define FLEX_WHISPER_SPEECH_START 2
+
+#define FLEX_WHISPER_SPEECH_END 3
+
+#define FLEX_WHISPER_CUT 4
+
+#define FLEX_WHISPER_EPOCH_END 5
+
+#define FLEX_WHISPER_HYSTERESIS 1
+
+#define FLEX_WHISPER_FINISH 2
+
+#define FLEX_WHISPER_RESET 3
+
+#define FLEX_WHISPER_ERROR 4
+
+#define FLEX_WHISPER_LIMIT 5
+
+#define FLEX_STREAM_VERSION_2 2
+
+#define FLEX_WHISPER_PRIMARY 1
+
+#define FLEX_WHISPER_SECONDARY 2
+
+#define FLEX_WHISPER_UNSUPPORTED_TAP -5
+
+#define FLEX_WHISPER_UNSUPPORTED_CONVERSION_CLOCK -6
+
+#define FLEX_WHISPER_CONFLICTING_VAD -7
+
+#define FLEX_WHISPER_EPOCH_START 6
+
 // Audio source kind to record (corresponds to [`flexaudio::SourceKind`]).
 typedef enum FlexSourceKind {
     // Microphone input.
@@ -126,6 +160,12 @@ typedef struct FlexVad FlexVad;
 // Opaque device watcher handle containing [`flexaudio::DeviceWatcher`]. Create with
 // `flexaudio_watch_devices` and release with `flexaudio_watcher_free`.
 typedef struct FlexWatcher FlexWatcher;
+
+// Opaque exclusively owned session. Construct off the capture callback.
+typedef struct FlexWhisperVad FlexWhisperVad;
+
+// Opaque probability-only segmentation owner.
+typedef struct FlexWhisperVadPostProcessor FlexWhisperVadPostProcessor;
 
 // VAD (voice activity detection) configuration. Passed to `FlexConfig::vad` and `flexaudio_vad_new`.
 //
@@ -238,6 +278,10 @@ typedef struct FlexChunk {
     // Events finalized by VAD for this chunk. NULL when VAD is disabled or there are no events
     // (`vad_events_len = 0`). When non-NULL, `flexaudio_chunk_free` releases it
     // together with `data`.
+    // On DISCONTINUITY, flushed pre-gap events precede any post-gap events. The core's fixed
+    // 20 ms chunks are shorter than a fresh 32 ms VAD frame, so this chunk contains only pre-gap
+    // events; all events on subsequent chunks use the new sample clock, restarted at zero.
+    // SpeechStart and SpeechEnd are delivered together when a segment is finalized.
     struct FlexVadEvent *vad_events;
     // Number of `vad_events`. 0 when VAD is disabled or there are no events.
     uintptr_t vad_events_len;
@@ -324,6 +368,110 @@ typedef struct FlexDeviceEvent {
     // Whether this is the OS default device (`Added` only).
     bool is_default;
 } FlexDeviceEvent;
+
+// Pinned segmentation parameters. NULL uses defaults; every supplied zero is literal.
+typedef struct FlexWhisperVadParams {
+    float threshold;
+    int32_t min_speech_duration_ms;
+    int32_t min_silence_duration_ms;
+    float max_speech_duration_s;
+    int32_t speech_pad_ms;
+} FlexWhisperVadParams;
+
+// Preview policy. provisional must be 0 (disabled) or 1 (enabled).
+typedef struct FlexWhisperVadOptions {
+    uint8_t provisional;
+} FlexWhisperVadOptions;
+
+// Half-open final interval on the 10 ms grid; its end may exceed physical EOF.
+typedef struct FlexWhisperSpeechSegment {
+    uint64_t start_ms;
+    uint64_t end_ms;
+} FlexWhisperSpeechSegment;
+
+typedef struct FlexWhisperSpeechStart {
+    uint64_t at_ms;
+} FlexWhisperSpeechStart;
+
+typedef struct FlexWhisperSpeechEnd {
+    uint64_t at_ms;
+    uint32_t reason;
+} FlexWhisperSpeechEnd;
+
+typedef struct FlexWhisperCut {
+    uint64_t start_ms;
+    uint64_t end_ms;
+    uint32_t reason;
+} FlexWhisperCut;
+
+typedef struct FlexWhisperEpochEnd {
+    uint32_t reason;
+} FlexWhisperEpochEnd;
+
+// Read only the payload selected by the event's type tag.
+typedef union FlexWhisperVadPayload {
+    struct FlexWhisperSpeechSegment segment;
+    struct FlexWhisperSpeechStart speech_start;
+    struct FlexWhisperSpeechEnd speech_end;
+    struct FlexWhisperCut cut;
+    struct FlexWhisperEpochEnd epoch_end;
+} FlexWhisperVadPayload;
+
+// Standalone ordered event. All times are epoch-relative integer milliseconds.
+typedef struct FlexWhisperVadEvent {
+    uint32_t type;
+    uint32_t epoch;
+    uint64_t seq;
+    union FlexWhisperVadPayload data;
+} FlexWhisperVadEvent;
+
+// Fixed-width new-mode attachment settings. Only primary is supported by this binding.
+typedef struct FlexWhisperVadStreamOptions {
+    struct FlexWhisperVadParams params;
+    // 0 or 1, never a default sentinel.
+    uint8_t provisional;
+    // FLEX_WHISPER_PRIMARY or FLEX_WHISPER_SECONDARY.
+    uint32_t tap;
+} FlexWhisperVadStreamOptions;
+
+// Versioned envelope around the frozen v1 configuration. All pointers are borrowed during open.
+typedef struct FlexStreamConfigV2 {
+    uint32_t size;
+    uint32_t version;
+    const struct FlexConfig *config;
+    // NULL disables whisper attachment.
+    const struct FlexWhisperVadStreamOptions *whisper_vad;
+} FlexStreamConfigV2;
+
+typedef struct FlexWhisperEpochStart {
+    uint64_t capture_sample;
+    int64_t pts_ns;
+} FlexWhisperEpochStart;
+
+// Attached union is distinct from the standalone event union.
+typedef union FlexAttachedWhisperVadPayload {
+    union FlexWhisperVadPayload vad;
+    struct FlexWhisperEpochStart epoch_start;
+} FlexAttachedWhisperVadPayload;
+
+// Versioned attached event. Epoch start is sequence 0 before all VAD payloads.
+typedef struct FlexAttachedWhisperVadEvent {
+    uint32_t size;
+    uint32_t version;
+    uint32_t type;
+    uint32_t epoch;
+    uint64_t seq;
+    union FlexAttachedWhisperVadPayload data;
+} FlexAttachedWhisperVadEvent;
+
+// Owns v1 PCM/events and attached events until flexaudio_chunk_free_v2.
+typedef struct FlexChunkV2 {
+    uint32_t size;
+    uint32_t version;
+    struct FlexChunk chunk;
+    struct FlexAttachedWhisperVadEvent *whisper_vad_events;
+    uintptr_t whisper_vad_events_len;
+} FlexChunkV2;
 
 // Open a stream from the configuration (without starting it). On failure, return NULL and
 // set last_error.
@@ -619,7 +767,9 @@ int32_t flexaudio_flac_write(struct FlexFlac *f,
 
 // Write any remaining data, finalize and close the current file. Further writes return InvalidState.
 //
-// Calling finalize more than once is safe (no-op returning 0). Returns 0 on success and a negative value on error.
+// Calling finalize more than once after success is safe (no-op returning 0). A failed write or
+// finalize retains its first error for all later writes and finalization attempts.
+// Returns 0 on success and a negative value on error.
 //
 // # Safety
 // `f` must be a valid handle (NULL is InvalidArg).
@@ -711,5 +861,112 @@ void flexaudio_device_event_free(struct FlexDeviceEvent *ev);
 // # Safety
 // `w` must be a handle returned by `flexaudio_watch_devices`, or NULL. Do not use `w` after release.
 void flexaudio_watcher_free(struct FlexWatcher *w);
+
+// Five pinned defaults. Supplied structs use literal fields, including zero.
+struct FlexWhisperVadParams flexaudio_whisper_vad_default_params(void);
+
+// Create a session; NULL params/options use defaults. Returns NULL plus last_error on error.
+// # Safety
+// Optional pointers must refer to initialized aligned structs.
+struct FlexWhisperVad *flexaudio_whisper_vad_new(const struct FlexWhisperVadParams *params,
+                                                 const struct FlexWhisperVadOptions *options);
+
+// Feed normalized mono16k PCM. On failure still drain/free the owned terminal event array.
+// # Safety
+// Handle is exclusively owned; input/output allocations must be valid for their lengths.
+int32_t flexaudio_whisper_vad_process(struct FlexWhisperVad *v,
+                                      const float *samples,
+                                      uintptr_t len,
+                                      struct FlexWhisperVadEvent **out,
+                                      uintptr_t *out_len);
+
+// Return owned events, including terminal closure on failure.
+// # Safety
+// Handle and mandatory outputs must be valid and exclusively owned during mutation.
+int32_t flexaudio_whisper_vad_finish(struct FlexWhisperVad *v,
+                                     struct FlexWhisperVadEvent **out,
+                                     uintptr_t *out_len);
+
+// Return owned events, including terminal closure on failure.
+// # Safety
+// Handle and mandatory outputs must be valid and exclusively owned during mutation.
+int32_t flexaudio_whisper_vad_reset(struct FlexWhisperVad *v,
+                                    struct FlexWhisperVadEvent **out,
+                                    uintptr_t *out_len);
+
+// Borrow latest probabilities until the next session mutation/free. Empty arrays return NULL.
+// # Safety
+// Handle and all mandatory output pointers must be valid.
+int32_t flexaudio_whisper_vad_probabilities(const struct FlexWhisperVad *v,
+                                            uint64_t *first_frame,
+                                            const float **out,
+                                            uintptr_t *out_len);
+
+// Create the inference-independent 16k/512 probability processor. NULL uses defaults.
+// # Safety
+// Params must be NULL or a valid aligned struct.
+struct FlexWhisperVadPostProcessor *flexaudio_whisper_postprocessor_new(const struct FlexWhisperVadParams *p);
+
+// Feed finite [0,1] probabilities. Validation preserves processor state.
+// # Safety
+// Handle, input and output allocations must be valid for their lengths.
+int32_t flexaudio_whisper_postprocessor_process(struct FlexWhisperVadPostProcessor *v,
+                                                const float *samples,
+                                                uintptr_t len,
+                                                struct FlexWhisperSpeechSegment **out,
+                                                uintptr_t *out_len);
+
+// Finish probability segmentation without inference.
+// # Safety
+// Handle and outputs must be valid and exclusively owned during mutation.
+int32_t flexaudio_whisper_postprocessor_finish(struct FlexWhisperVadPostProcessor *v,
+                                               struct FlexWhisperSpeechSegment **out,
+                                               uintptr_t *out_len);
+
+// Discard the probability timeline.
+// # Safety
+// Handle must be valid and exclusively owned.
+int32_t flexaudio_whisper_postprocessor_reset(struct FlexWhisperVadPostProcessor *v);
+
+// Release an exclusively owned handle. NULL is safe.
+// # Safety
+// Non-NULL must be a live handle of this exact type returned by its constructor.
+void flexaudio_whisper_vad_free(struct FlexWhisperVad *v);
+
+// Release an exclusively owned handle. NULL is safe.
+// # Safety
+// Non-NULL must be a live handle of this exact type returned by its constructor.
+void flexaudio_whisper_postprocessor_free(struct FlexWhisperVadPostProcessor *v);
+
+// Release an owned result array with its original length. NULL/0 is safe.
+// # Safety
+// Non-NULL must be an array of this exact type and original length returned by this API.
+void flexaudio_whisper_events_free(struct FlexWhisperVadEvent *v, uintptr_t len);
+
+// Release an owned result array with its original length. NULL/0 is safe.
+// # Safety
+// Non-NULL must be an array of this exact type and original length returned by this API.
+void flexaudio_whisper_segments_free(struct FlexWhisperSpeechSegment *v, uintptr_t len);
+
+// Open a versioned primary stream, returning a typed result code and last_error.
+// Attachment fails closed until the capture producer supplies exact canonical provenance.
+// # Safety
+// Config and its borrowed fields must be valid; out must be writable.
+int32_t flexaudio_open_v2(const struct FlexStreamConfigV2 *config, struct FlexStream **out);
+
+// Poll a versioned chunk: 1 available, 0 absent, negative result on error.
+// # Safety
+// Stream must be exclusively owned; out must be writable, with any prior chunk already freed.
+int32_t flexaudio_poll_chunk_v2(struct FlexStream *s, struct FlexChunkV2 *out);
+
+// Free all allocations in a versioned chunk, then clear its fields. NULL is safe.
+// # Safety
+// Non-NULL must be a chunk returned by poll_chunk_v2 and must not have been freed already.
+void flexaudio_chunk_free_v2(struct FlexChunkV2 *chunk);
+
+// Flush a whisper epoch. Disabled attachment is a no-op.
+// # Safety
+// s must be a valid, exclusively owned stream handle.
+int32_t flexaudio_flush_whisper_vad(struct FlexStream *s);
 
 #endif  /* FLEXAUDIO_H */

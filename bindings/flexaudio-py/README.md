@@ -190,3 +190,57 @@ their models/tables and require no runtime files or network access:
   (Apache-2.0) for pure-Rust FLAC encoding.
 - **flexaudio-denoise** — uses [nnnoiseless](https://github.com/jneem/nnnoiseless)
   (BSD-3-Clause), a Rust port of RNNoise with embedded model weights.
+
+### Whisper-compatible VAD
+
+`WhisperVad` runs embedded Silero v6 on normalized mono float32 at 16 kHz, with
+segmentation matching whisper.cpp pin `85a69493a601d4ff5a834064f7b7bac250bd8739`.
+It accepts a sequence or a contiguous one-dimensional native float32 buffer;
+NumPy is optional. Buffer input is borrowed for the call, and sequence input is
+copied for that feed. Instances stay on their creating thread.
+
+```python
+import array
+import flexaudio
+
+vad = flexaudio.WhisperVad(provisional=True)
+events = vad.process(memoryview(array.array('f', [0.0] * 513)))
+events += vad.finish()
+for event in events:
+    if event.type == 'segment':
+        print(event.start_ms, event.end_ms)
+```
+
+Parameters are `threshold=0.5`, `min_speech_duration_ms=250`,
+`min_silence_duration_ms=100`, `max_speech_duration_s=3.4028234663852886e38`, and
+`speech_pad_ms=30`. Supplied zero values stay zero. Durations must be integers
+in 0..134217; bool durations, unknown keys, invalid PCM and nonfinite parameters
+are rejected. The seconds budget is truncated by the pinned algorithm, and
+200 ms merging can undo splits: it does **not** bound final segment duration or
+latency. Optional provisional cuts independently cap pieces at 30000 ms.
+
+Events are read-only variant objects with snake_case fields and type tags:
+`segment`, `provisional_speech_start`, `provisional_speech_end`,
+`provisional_cut`, and `epoch_end`. Times are epoch-relative integer milliseconds;
+final endpoints use the 10 ms grid and can exceed physical EOF. `finish()`
+infers one zero-padded partial frame when needed, closes the epoch, and is
+idempotent. Call `reset()` to start another epoch; its returned closure events
+must also be consumed. Processing after finish raises `WhisperVadRuntimeError`.
+Typed errors carry `code` and `terminal_events`; drain those events even when
+processing fails. `last_frame_probabilities()` returns the latest call's frame
+index and an owned read-only float32 memoryview, independent of future calls.
+
+`WhisperVadPostProcessor(WhisperVadParams(...))` accepts probabilities from the
+16 kHz/512-sample frame geometry and delegates to the same segmentation kernel.
+`whisper_speech_segments(samples, params=None)` is the single whole-PCM helper
+and uses the same streaming process/finish path with preview disabled.
+
+The additive capture option is `open(...,
+whisper_vad=WhisperVadStreamOptions(params=..., provisional=True, tap='primary'))`.
+It rejects simultaneous legacy `vad` with `ConflictingVad`, and secondary with
+`UnsupportedTap`. **Attachment currently fails before opening a device with
+`UnsupportedConversionClock`**: the capture facade does not expose authoritative
+canonical capture indices and valid tail lengths required by the exact origin
+contract. No timestamps are fabricated from polled chunks. Disabled attachment
+has `AudioChunk.whisper_vad_events=None`, and `flush_whisper_vad()` is a no-op.
+Legacy `Vad` and its integration keep their existing behavior.

@@ -59,6 +59,8 @@ export interface JsAudioChunk {
   rms: number
   /** VAD events finalized in this chunk (only when `vadTap` is 'primary'). */
   vadEvents?: Array<JsVadEvent>
+  /** Attached events on the selected tap only; absent when whisperVad is disabled. */
+  whisperVadEvents?: AttachedWhisperVadEvent[]
   /**
    * Timestamp-matched secondary tap chunk (only with `secondaryOutput`). Delivered as a pair in
    * the same callback (`primary.secondary` in `onChunk(primary)`, not a second argument). It is
@@ -89,6 +91,8 @@ export interface JsSecondaryChunk {
   rms: number
   /** VAD events finalized in this chunk (only when `vadTap` is 'secondary'). */
   vadEvents?: Array<JsVadEvent>
+  /** Attached events on the selected tap only; absent when whisperVad is disabled. */
+  whisperVadEvents?: AttachedWhisperVadEvent[]
 }
 /**
  * JS VAD event (speech segment start/end).
@@ -144,6 +148,69 @@ export interface VadOptions {
   maxSpeechMs?: number
   /** VAD internal sample rate. Only 8000 or 16000. Default 16000. */
   sampleRate?: number
+}
+
+/** Immutable whisper.cpp 85a69493 segmentation settings; literal zero stays zero. */
+export interface WhisperVadParams {
+  /** Finite [0,1], default 0.5. */
+  threshold?: number
+  /** Integer 0..134217 ms, default 250. */
+  minSpeechDurationMs?: number
+  /** Integer 0..134217 ms, default 100. */
+  minSilenceDurationMs?: number
+  /** Finite 0..f32::MAX seconds; fractions are truncated. Merging can undo splits. */
+  maxSpeechDurationS?: number
+  /** Integer 0..134217 ms, default 30. */
+  speechPadMs?: number
+  /** Add immediate hints and nonoverlapping pieces <=30000 ms; default false. */
+  provisional?: boolean
+}
+
+export type WhisperVadCloseReason = 'hysteresis' | 'finish' | 'reset' | 'error'
+/** Epoch-relative integer milliseconds. Final segment endpoints use the 10 ms grid. */
+export type WhisperVadEvent = { epoch: number; seq: number } & (
+  | { type: 'segment'; startMs: number; endMs: number }
+  | { type: 'provisionalSpeechStart'; atMs: number }
+  | { type: 'provisionalSpeechEnd'; atMs: number; reason: WhisperVadCloseReason }
+  | { type: 'provisionalCut'; startMs: number; endMs: number; reason: 'limit' | WhisperVadCloseReason }
+  | { type: 'epochEnd'; reason: 'finish' | 'reset' | 'error' }
+)
+
+/** Capture origins appear only on attached streams, before any VAD payload in that epoch. */
+export type AttachedWhisperVadEvent = WhisperVadEvent
+  | { type: 'epochStart'; epoch: number; seq: 0; captureSample: bigint; ptsNs: number }
+
+/** Attachment currently fails UnsupportedConversionClock until canonical producer provenance is available. */
+export interface WhisperVadStreamOptions extends WhisperVadParams {
+  tap: 'primary' | 'secondary'
+}
+
+export interface FrameProbabilities {
+  firstFrameIndex: number
+  /** Owned copy from the latest successful call; one probability per 512 samples. */
+  values: Float32Array
+}
+
+export type WhisperVadErrorCode = 'InvalidParameter' | 'InvalidPcm' | 'InvalidProbability'
+  | 'Overflow' | 'SessionFinished' | 'Inference' | 'ModelLoad' | 'FailedSession'
+  | 'ConflictingVad' | 'UnsupportedTap' | 'UnsupportedConversionClock'
+
+/** Drain terminalEvents through the normal consumer even when a call throws. */
+export interface WhisperVadError extends Error {
+  code: WhisperVadErrorCode
+  terminalEvents: WhisperVadEvent[]
+}
+
+/** Synchronous, serialized inference; use a Node Worker for realtime processing. */
+export declare class WhisperVad {
+  constructor(params?: WhisperVadParams)
+  /** Normalized [-1,1] mono float32 PCM at 16000 Hz; input is not retained. */
+  process(mono16k: Float32Array): WhisperVadEvent[]
+  /** True EOF pads one partial frame; repeated finish returns []. */
+  finish(): WhisperVadEvent[]
+  /** Closes hints and discards pending finals, then starts a fresh epoch. */
+  reset(): WhisperVadEvent[]
+  lastFrameProbabilities(): FrameProbabilities
 }
 /**
  * Stream notification. permissionDenied is terminal, with permission and
@@ -246,6 +313,8 @@ export interface OpenOptions {
    * finalized events attach to that tap's chunk `vadEvents` (audio is unchanged). Omission disables VAD.
    */
   vad?: VadOptions
+  /** Strictly exclusive with vad/vadTap; unavailable until canonical capture provenance is supplied. */
+  whisperVad?: WhisperVadStreamOptions
   /**
    * Tap to run VAD on. 'primary' (default) | 'secondary'. 'secondary' requires
    * `secondaryOutput`; a 16k/mono secondary avoids resampling for efficiency.

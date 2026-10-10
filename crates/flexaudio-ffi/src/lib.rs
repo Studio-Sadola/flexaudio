@@ -27,6 +27,9 @@ mod integration;
 mod types;
 mod vad;
 mod watch;
+mod whisper_types;
+mod whisper_vad;
+mod whisper_integration;
 
 // This crate builds C libraries rather than an rlib, so compile the FFI regression tests
 // as a unit-test module while keeping their source under tests/.

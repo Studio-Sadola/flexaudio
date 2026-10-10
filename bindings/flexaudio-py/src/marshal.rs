@@ -176,6 +176,10 @@ impl PyAudioChunk {
         PyBytes::new(py, &buf)
     }
 
+    /// New-mode events are absent when whisper attachment is disabled.
+    #[getter]
+    fn whisper_vad_events(&self) -> Option<Vec<Py<PyAny>>> { None }
+
     /// Integrated VAD events finalized for this chunk. Empty when VAD is disabled.
     #[getter]
     fn vad_events(&self) -> Vec<PyVadEvent> {
