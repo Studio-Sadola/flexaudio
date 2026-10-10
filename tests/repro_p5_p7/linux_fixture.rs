@@ -5,6 +5,13 @@ use std::sync::{Arc, Mutex};
 use std::sync::{mpsc, atomic::{AtomicBool, Ordering}};
 use std::rc::Rc;
 use flexaudio_core::types::ProcessMode;
+use flexaudio_core::{ErrorContext, Event, Operation, ErrorKind, DefaultDeviceKind, AudioPath, LossReason};
+mod owner { include!(concat!(env!("PWD"), "/crates/flexaudio-os-linux/src/owner.rs")); }
+use owner::{finish_worker, poll_backend_event, push_backend_event, rollback_worker, BackendEvents};
+mod watcher_queue { include!(concat!(env!("PWD"), "/crates/flexaudio-os-linux/src/watcher_queue.rs")); }
+use watcher_queue::{lock_events, transition_default, WatchEventQueue, WatchEvents};
+mod discovery { include!(concat!(env!("PWD"), "/crates/flexaudio-os-linux/src/discovery.rs")); }
+use discovery::EnumerationFailure;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use flexaudio_core::backend::RawSink;
 use flexaudio_core::clock::monotonic_now_ns;
@@ -93,8 +100,8 @@ const NATIVE_CHANNELS: u16 = 2;
 const PROC_SCRATCH_CAP: usize = 96_000;
 const MAX_WATCH_EVENTS: usize = 1024;
 thread_local! {
-    static PROC_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static ENUM_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static SCAN_MODE: Cell<ScanMode> = const { Cell::new(ScanMode::Complete) };
 }
 mod pw {
     pub(crate) use crate::spa;
@@ -191,12 +198,12 @@ impl PidSelect {
         match self { Self::Include(pid) => entry.pid == *pid, Self::Exclude(pids) => !pids.contains(&entry.pid) }
     }
 }
-struct UserData { format: spa::param::audio::AudioInfoRaw, sink: RawSink, readiness: Option<Rc<Readiness>> }
+struct UserData { format: spa::param::audio::AudioInfoRaw, sink: RawSink, scratch: Rc<RefCell<Vec<f32>>>, events: BackendEvents, readiness: Option<Rc<Readiness>> }
 // LIVE_PAIRING
 // LIVE_LINKING
 // LIVE_CAPTURE
 fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
-    if ENUM_FAILURE.get() { Err("injected registry query failure".into()) } else { Ok(Vec::new()) }
+    if ENUM_FAILURE.get() { Err("injected registry query failure".into()) } else { scan_result(SCAN_MODE.get()).0.map(|()| Vec::new()) }
 }
 // LIVE_LIST_DEVICES
 // LIVE_ENQUEUE
@@ -275,12 +282,12 @@ impl FakeLoop {
 }
 struct Terminate;
 type FakeCaptureListener = Rc<RefCell<pw::stream::StreamListener<UserData>>>;
-fn setup_pw(_: Option<String>, sink: RawSink, readiness: Rc<Readiness>) -> std::result::Result<(FakeLoop, Rc<pw::stream::StreamRc>, FakeCaptureListener), String> {
+fn setup_pw(_: Option<String>, sink: RawSink, readiness: Rc<Readiness>, events: BackendEvents) -> std::result::Result<(FakeLoop, Rc<pw::stream::StreamRc>, FakeCaptureListener), String> {
     LOOP_QUIT.set(false); LOOP_RAN.set(false);
     LOOP_TIMERS.with(|t| t.borrow_mut().clear());
     let stream = Rc::new(pw::stream::StreamRc { id: 99, queued: RefCell::new(None) });
     let listener = Rc::new(RefCell::new(add_capture_listener(&stream, UserData {
-        format: spa::param::audio::AudioInfoRaw::new(), sink, readiness: Some(readiness),
+        format: spa::param::audio::AudioInfoRaw::new(), sink, scratch: Default::default(), events, readiness: Some(readiness),
     }, &FakeLoop)?));
     LOOP_CAPTURE.with(|c| *c.borrow_mut() = Some((Rc::downgrade(&stream), Rc::downgrade(&listener))));
     Ok((FakeLoop, stream, listener))
@@ -290,7 +297,7 @@ fn setup_pw(_: Option<String>, sink: RawSink, readiness: Rc<Readiness>) -> std::
 fn repro_p7_early_readiness() {
     let (tx, rx) = mpsc::channel(); READY_RX.with(|r| *r.borrow_mut() = Some(rx));
     let (_, stop) = pw::channel::channel(); let (producer, _) = flexaudio_core::raw_ring(16);
-    run_pw_loop(None, RawSink::new(producer, 48_000, 2), stop, &tx);
+    run_pw_loop(None, RawSink::new(producer, 48_000, 2), stop, &tx, Arc::new(Mutex::new(VecDeque::new())));
     assert!(!READY_EARLY.get(), "F03: successful readiness observable before loop runs negotiation");
 }
 #[test]
@@ -299,7 +306,7 @@ fn repro_p7_early_readiness_control() {
     READY_EARLY.set(false);
     let (tx, rx) = mpsc::channel(); drop(rx);
     let (_, stop) = pw::channel::channel(); let (producer, _) = flexaudio_core::raw_ring(16);
-    run_pw_loop(None, RawSink::new(producer, 48_000, 2), stop, &tx);
+    run_pw_loop(None, RawSink::new(producer, 48_000, 2), stop, &tx, Arc::new(Mutex::new(VecDeque::new())));
     assert!(!READY_EARLY.get());
 }
 mod thread {
@@ -321,12 +328,13 @@ mod thread {
     }
 }
 struct ProcessOwner {
+    shutdown: Option<Result<()>>, events: BackendEvents,
     running: Arc<AtomicBool>, target_pid: u32, mode: ProcessMode,
     stop_tx: Option<pw::channel::Sender<Terminate>>, handle: Option<thread::JoinHandle<()>>,
 }
-fn run_pw_process_loop(_: PidSelect, sink: RawSink, stop: pw::channel::Receiver<Terminate>, ready: &mpsc::Sender<std::result::Result<(), String>>) {
+fn run_pw_process_loop(_: PidSelect, sink: RawSink, stop: pw::channel::Receiver<Terminate>, ready: &mpsc::Sender<std::result::Result<(), String>>, events: BackendEvents) {
     // Exercise the live owner's start/error/join handshake with the monitor loop under test.
-    if MONITOR_START.get() { run_pw_loop(None, sink, stop, ready); } else { ready.send(Ok(())).unwrap(); }
+    if MONITOR_START.get() { run_pw_loop(None, sink, stop, ready, events); } else { ready.send(Ok(())).unwrap(); }
 }
 impl ProcessOwner {
     // LIVE_PROCESS_START
@@ -336,12 +344,12 @@ impl flexaudio_core::CaptureBackend for ProcessOwner {
     fn native_format(&self) -> (u32, u16) { (48_000, 2) }
     fn start(&mut self, sink: RawSink) -> Result<()> { ProcessOwner::start(self, sink) }
     fn stop(&mut self) { ProcessOwner::stop(self); }
-    // Matches the native adapter: no poll_event override, real core default.
+    fn stop_checked(&mut self) -> Result<()> { ProcessOwner::stop_checked(self) }
+    fn poll_event(&mut self) -> Option<Event> { ProcessOwner::poll_event(self) }
 }
-fn process_owner() -> ProcessOwner { ProcessOwner { running: Arc::new(AtomicBool::new(false)), target_pid: 42, mode: ProcessMode::Include, stop_tx: None, handle: None } }
+fn process_owner() -> ProcessOwner { ProcessOwner { shutdown: None, events: Arc::new(Mutex::new(VecDeque::new())), running: Arc::new(AtomicBool::new(false)), target_pid: 42, mode: ProcessMode::Include, stop_tx: None, handle: None } }
 fn sink() -> RawSink { let (producer, _) = flexaudio_core::raw_ring(16); RawSink::new(producer, 48_000, 2) }
 #[test]
-#[ignore = "repro: F12"]
 fn repro_p7_spawn_rollback() {
     thread::FAIL.set(true); let mut owner = process_owner();
     let first = owner.start(sink()); let second = owner.start(sink());
@@ -355,56 +363,71 @@ fn repro_p7_spawn_rollback_control() {
     assert!(!owner.running.load(Ordering::SeqCst)); assert!(owner.handle.is_none());
 }
 #[test]
-#[ignore = "repro: F37"]
 fn repro_p7_join_failure() {
     let mut owner = process_owner();
     owner.handle = Some(std::thread::spawn(|| panic!("injected PipeWire owner panic")));
     owner.stop();
     let event = flexaudio_core::CaptureBackend::poll_event(&mut owner);
-    assert!(event.is_some(), "F37: PipeWire owner join panic discarded; stop returned (), event=None");
+    assert!(matches!(event, Some(Event::ShutdownError { error }) if matches!(error, Error::Context { context, .. } if context.operation() == Operation::Join)));
+    let first = owner.stop_checked().unwrap_err();
+    assert_eq!(first.kind(), ErrorKind::Backend);
+    assert_eq!(owner.stop_checked(), Err(first));
+    assert!(owner.poll_event().is_none());
 }
 #[test]
 fn repro_p7_join_failure_control() {
     let mut owner = process_owner(); owner.handle = Some(std::thread::spawn(|| {})); owner.stop();
     assert!(owner.handle.is_none()); assert!(flexaudio_core::CaptureBackend::poll_event(&mut owner).is_none());
 }
-struct WatchQueue { events: Arc<Mutex<VecDeque<DeviceEvent>>> }
+struct WatchQueue { events: WatchEventQueue }
 impl WatchQueue { // LIVE_POLL
 }
 fn watcher(poison: bool) -> WatchQueue {
-    let events = Arc::new(Mutex::new(VecDeque::from([DeviceEvent::Removed { id: "mic".into() }])));
+    let events = Arc::new(Mutex::new(WatchEvents::default()));
+    enqueue_event(&events, DeviceEvent::Removed { id: "mic".into() });
     if poison { let shared = events.clone(); let _ = std::thread::spawn(move || { let _lock = shared.lock().unwrap(); panic!("injected queue-owner panic"); }).join(); }
     WatchQueue { events }
 }
 #[test]
-#[ignore = "repro: F27/M5"]
 fn repro_p7_poisoned_queue() {
     let mut w = watcher(true);
-    assert!(w.poll_event().is_some(), "F27/M5: queued removal exists behind poisoned lock; poll_event=None");
+    assert_eq!(w.poll_event(), Some(DeviceEvent::RescanRequired { dropped_events: 0 }));
+    assert_eq!(w.poll_event(), Some(DeviceEvent::Removed { id: "mic".into() }));
+    assert_eq!(w.poll_event(), None);
 }
 #[test]
 fn repro_p7_poisoned_queue_control() {
     assert_eq!(watcher(false).poll_event(), Some(DeviceEvent::Removed { id: "mic".into() }));
 }
 struct WatchState { default_sink: Option<String>, default_source: Option<String>, initial_scan_done: bool }
-fn default_change(value: Option<&str>) -> (Option<String>, usize) {
-    let state_for_meta = Rc::new(RefCell::new(WatchState { default_sink: Some("old".into()), default_source: None, initial_scan_done: true }));
-    let events_for_meta = Arc::new(Mutex::new(VecDeque::new()));
+fn typed_default(callback: impl Fn(u32, Option<&str>, Option<&str>, Option<&str>) -> i32) -> impl Fn(u32, Option<&str>, Option<&str>, Option<&str>) -> i32 { callback }
+fn default_change(key: Option<&str>, value: Option<&str>) -> (Option<String>, Vec<DeviceEvent>) {
+    let state_for_meta = Rc::new(RefCell::new(WatchState { default_sink: Some("old".into()), default_source: Some("old".into()), initial_scan_done: true }));
+    let events_for_meta = Arc::new(Mutex::new(WatchEvents::default()));
     let inspect_state = state_for_meta.clone(); let inspect_events = events_for_meta.clone();
-    let callback = // LIVE_DEFAULT_CALLBACK
-    ;
-    callback(0u32, Some("default.audio.sink"), None::<&str>, value);
-    let state = inspect_state.borrow().default_sink.clone(); let count = inspect_events.lock().unwrap().len(); (state, count)
+    let callback = typed_default( // LIVE_DEFAULT_CALLBACK
+    );
+    callback(0u32, key, None::<&str>, value);
+    let state = if key == Some("default.audio.sink") { inspect_state.borrow().default_sink.clone() } else { inspect_state.borrow().default_source.clone() };
+    let mut out = Vec::new();
+    while let Some(event) = lock_events(&inspect_events).poll() { out.push(event); }
+    (state, out)
 }
 #[test]
-#[ignore = "repro: L2"]
 fn repro_p7_default_clear() {
-    let (state, count) = default_change(Some("{}"));
-    assert!(state.is_none()); assert!(count > 0, "L2: default changed old -> None; queued events=0");
+    for (key, kind) in [("default.audio.sink", DefaultDeviceKind::SystemAudio), ("default.audio.source", DefaultDeviceKind::Microphone)] {
+        for value in [None, Some("{}"), Some(r#"{"name":""}"#)] {
+            let (state, events) = default_change(Some(key), value);
+            assert!(state.is_none());
+            assert_eq!(events, vec![DeviceEvent::DefaultCleared { kind }]);
+        }
+    }
 }
 #[test]
 fn repro_p7_default_clear_control() {
-    assert_eq!(default_change(Some(r#"{"name":"new"}"#)), (Some("new".into()), 1));
+    for (key, kind) in [("default.audio.sink", DefaultDeviceKind::SystemAudio), ("default.audio.source", DefaultDeviceKind::Microphone)] {
+        assert_eq!(default_change(Some(key), Some(r#"{"name":"new"}"#)), (Some("new".into()), vec![DeviceEvent::DefaultChanged { kind, id: "new".into() }]));
+    }
 }
 #[derive(Clone, Copy)] struct Sequence(i32);
 impl Sequence { fn seq(&self) -> i32 { self.0 } }
@@ -417,6 +440,7 @@ fn scan_sync(fail: bool) -> bool {
     SYNC_FAILURE.set(fail);
     let done_for_cb = Rc::new(Cell::new(false)); let inspect = done_for_cb.clone();
     let aborted_for_cb = Rc::new(Cell::new(false));
+    let failure_for_cb = Rc::new(Cell::new(None));
     let stage_for_cb = Rc::new(Cell::new(0)); let pending1_for_cb = Rc::new(Cell::new(1));
     let loop_for_cb = FakeLoop; let core_weak = WeakSync;
     let callback = typed_sync( // LIVE_SYNC_CALLBACK
@@ -461,7 +485,11 @@ fn scan_deadline(block: bool) -> bool {
         let done = Rc::new(Cell::new(!block));
         let aborted = Rc::new(Cell::new(false));
         let main_loop = BlockingLoop { release: release_rx, done: done.clone() };
-        // LIVE_DEADLINE
+        let failure = Rc::new(Cell::new(None));
+        let _result: std::result::Result<(), String> = (|| {
+            // LIVE_DEADLINE
+            Ok(())
+        })();
         finished_tx.send(()).unwrap();
     });
     let completed = finished_rx.recv_timeout(std::time::Duration::from_millis(2200)).is_ok();
@@ -496,6 +524,7 @@ fn remove_port(f: &LinkFixture, id: u32) {
     let ports_for_remove = &f.ports; let client_pid_for_remove = &f.clients;
     let core_for_remove = &f.core; let stream_for_remove = &f.stream;
     let self_node_for_remove = &f.own;
+    let events_for_remove = &f.events; let loop_for_remove = &FakeLoop;
     let select_for_remove = PidSelect::Include(42);
     let target_client_for_remove = RefCell::new(HashSet::<u32>::new());
     let bound_for_remove = RefCell::new(HashMap::<u32, ()>::new());
@@ -505,20 +534,21 @@ fn remove_port(f: &LinkFixture, id: u32) {
 }
 #[test]
 fn repro_p7_relink_gap_attempt() {
-    let f = LinkFixture::new(1, false); f.link();
+    let f = LinkFixture::new(1, false); f.link().unwrap();
     remove_port(&f, 1001); assert!(f.linked.borrow().is_empty());
     f.ports.borrow_mut().insert(1001, PortEntry { node_id: 99, direction: "in".into(), channel: "FR".into() });
-    f.link(); assert_eq!(f.linked.borrow().get(&1).unwrap().len(), 2);
+    f.link().unwrap(); assert_eq!(f.linked.borrow().get(&1).unwrap().len(), 2);
     // Fake link creation is synchronous: this cannot establish actual lost PCM
     // or the gap duration between native unlink/relink completion.
 }
 #[test]
 fn repro_p7_relink_gap_attempt_control() {
-    let f = LinkFixture::new(1, false); f.link(); remove_port(&f, 123456);
+    let f = LinkFixture::new(1, false); f.link().unwrap(); remove_port(&f, 123456);
     assert_eq!(f.linked.borrow().get(&1).unwrap().len(), 2);
 }
 
 struct LinkFixture {
+    events: BackendEvents,
     core: pw::core::CoreRc,
     stream: pw::stream::StreamRc,
     own: Cell<Option<u32>>,
@@ -540,50 +570,53 @@ impl LinkFixture {
         for (channel, id) in [("FL", 1000), ("FR", 1001)] {
             ports.insert(id, PortEntry { node_id: 99, direction: "in".into(), channel: channel.into() });
         }
-        Self { core: pw::core::CoreRc { fail: Cell::new(fail), calls: Cell::new(0), failures: Cell::new(0) },
+        Self { events: Arc::new(Mutex::new(VecDeque::new())), core: pw::core::CoreRc { fail: Cell::new(fail), calls: Cell::new(0), failures: Cell::new(0) },
             stream: pw::stream::StreamRc { id: 99, queued: RefCell::new(None) }, own: Cell::new(None),
             nodes: RefCell::new(nodes), clients: RefCell::new(HashMap::new()), ports: RefCell::new(ports), linked: RefCell::new(HashMap::new()) }
     }
-    fn link(&self) {
+    fn link(&self) -> Result<()> {
         try_link(&self.core, &self.stream, &PidSelect::Include(42), &self.own,
-                 &self.nodes, &self.clients, &self.ports, &self.linked);
+                 &self.nodes, &self.clients, &self.ports, &self.linked, &self.events, &FakeLoop)
     }
 }
 #[test]
 fn repro_p7_multinode_include() {
     let f = LinkFixture::new(2, false);
-    f.link(); f.link();
+    f.link().unwrap(); f.link().unwrap();
     assert_eq!(f.linked.borrow().len(), 2, "F29: two selected stereo nodes; only one linked even after reevaluation");
 }
 #[test]
 fn repro_p7_multinode_include_control() {
-    let f = LinkFixture::new(1, false); f.link();
+    let f = LinkFixture::new(1, false); f.link().unwrap();
     assert_eq!(f.linked.borrow().len(), 1);
     assert_eq!(f.core.calls.get(), 2);
 }
 #[test]
-#[ignore = "repro: F30"]
 fn repro_p7_link_refusal() {
-    let f = LinkFixture::new(1, true); f.link();
+    let f = LinkFixture::new(1, true);
+    let error = f.link().unwrap_err();
     assert_eq!(f.core.failures.get(), 1, "failure injection must reach create_object");
-    // try_link returns (), so the adapter can neither return the native refusal
-    // nor report any per-source state. The caller sees only the unchanged map.
-    assert!(!f.linked.borrow().is_empty(), "F30: injected link-factory refusal discarded; linked=0, try_link returned ()");
+    assert!(f.linked.borrow().is_empty(), "refused links must not leave partial routing");
+    assert_eq!(error.kind(), ErrorKind::Backend);
+    assert!(matches!(error, Error::Context { context, .. } if context.operation() == Operation::Link));
+    assert!(matches!(poll_backend_event(&f.events), Some(Event::TerminalError { error }) if error.kind() == ErrorKind::Backend));
 }
 #[test]
 fn repro_p7_link_refusal_control() {
-    let f = LinkFixture::new(1, false); f.link();
+    let f = LinkFixture::new(1, false); f.link().unwrap();
     assert_eq!(f.core.failures.get(), 0);
     assert_eq!(f.linked.borrow().get(&1).unwrap().len(), 2);
 }
 #[test]
-#[ignore = "repro: F15"]
 fn repro_p7_multichannel_loss() {
-    let output = [(1, "FL".into()), (2, "FR".into()), (3, "FC".into())];
-    let input = [(10, "FL".into()), (11, "FR".into())];
-    let pairs = pair_ports(&output, &input);
-    let complete = link_plan_is_complete(Some(3), output.len(), input.len(), pairs.len(), 2);
-    assert!(!complete || pairs.iter().any(|(out, _)| *out == 3), "F15: complete=true with center channel 3 omitted; pairs={pairs:?}");
+    let f = LinkFixture::new(1, false);
+    f.nodes.borrow_mut().get_mut(&1).unwrap().n_output_ports = Some(3);
+    f.ports.borrow_mut().insert(12, PortEntry { node_id: 1, direction: "out".into(), channel: "FC".into() });
+    let error = f.link().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::UnsupportedFormat);
+    assert_eq!(f.core.calls.get(), 0, "unsupported layouts must be rejected before linking");
+    assert!(f.linked.borrow().is_empty());
+    assert!(!link_plan_is_complete(Some(3), 3, 2, 2, 2));
 }
 #[test]
 fn repro_p7_multichannel_loss_control() {
@@ -593,11 +626,17 @@ fn repro_p7_multichannel_loss_control() {
     assert!(link_plan_is_complete(Some(2), 2, 2, 2, 2));
 }
 #[test]
-#[ignore = "repro: F23"]
 fn repro_p7_query_failure() {
     ENUM_FAILURE.set(true);
-    let result = list_devices();
-    assert!(result.is_err(), "F23: injected registry query failure returned {result:?}");
+    assert_eq!(list_devices().unwrap_err().kind(), ErrorKind::Backend);
+    ENUM_FAILURE.set(false);
+    for mode in [ScanMode::SyncFailure, ScanMode::CoreGone, ScanMode::IterateFailure, ScanMode::Timeout] {
+        SCAN_MODE.set(mode);
+        let error = list_devices().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Backend);
+        assert!(matches!(error, Error::Context { context, .. } if context.operation() == Operation::Enumerate));
+    }
+    SCAN_MODE.set(ScanMode::Complete);
 }
 #[test]
 fn repro_p7_query_failure_control() {
@@ -611,7 +650,7 @@ fn process_fixture(bytes: Vec<u8>, stride: i32, flags: i32) -> (pw::stream::Stre
     let (producer, consumer) = flexaudio_core::raw_ring(16);
     let mut format = spa::param::audio::AudioInfoRaw::new();
     format.set_format(spa::param::audio::AudioFormat::F32LE); format.set_rate(48_000); format.set_channels(2);
-    let listener = add_capture_listener(&stream, UserData { format, sink: RawSink::new(producer, 48_000, 2), readiness: None }, &FakeLoop).unwrap();
+    let listener = add_capture_listener(&stream, UserData { format, sink: RawSink::new(producer, 48_000, 2), scratch: Default::default(), events: Arc::new(Mutex::new(VecDeque::new())), readiness: None }, &FakeLoop).unwrap();
     (stream, listener, consumer)
 }
 #[test]
@@ -637,28 +676,40 @@ fn repro_p7_padded_stride() {
 #[test]
 fn repro_p7_padded_stride_control() { repro_p7_corrupt_buffer_control(); }
 #[test]
-#[ignore = "repro: F33"]
 fn repro_p7_callback_borrow_panic() {
     let (stream, mut listener, mut consumer) = process_fixture([0.25f32.to_le_bytes(), (-0.25f32).to_le_bytes()].concat(), 8, 0);
-    PROC_SCRATCH.with(|cell| { let _borrow = cell.borrow_mut(); listener.fire(&stream); });
-    let got = consumer.pop_slice(&mut [0.0; 2]);
-    assert!(got > 0 || listener.user_data.sink.overflow_count() > 0, "F33: injected reentrant borrow panic swallowed; delivered=0, loss_count=0");
+    let scratch = listener.user_data.scratch.clone();
+    let _borrow = scratch.borrow_mut();
+    listener.fire(&stream);
+    assert_eq!(consumer.pop_slice(&mut [0.0; 2]), 0);
+    let diagnostics = listener.user_data.sink.diagnostics();
+    let losses = diagnostics.drain().unwrap();
+    assert_eq!(losses.len(), 1);
+    assert_eq!(losses[0].reason(), LossReason::CallbackRejected);
+    assert_eq!(losses[0].path(), AudioPath::Capture { lane: None });
+    assert_eq!((losses[0].sample_rate(), losses[0].channels(), losses[0].samples()), (48_000, 2, None));
+    assert!(diagnostics.drain().unwrap().is_empty());
 }
 #[test]
 fn repro_p7_callback_borrow_panic_control() { repro_p7_corrupt_buffer_control(); }
 #[test]
-#[ignore = "repro: F27"]
 fn repro_p7_queue_overflow() {
-    let events = Arc::new(Mutex::new(VecDeque::new()));
+    let events = Arc::new(Mutex::new(WatchEvents::default()));
     for i in 0..=MAX_WATCH_EVENTS { enqueue_event(&events, DeviceEvent::Removed { id: i.to_string() }); }
-    let q = events.lock().unwrap();
-    assert_eq!(q.front(), Some(&DeviceEvent::Removed { id: "0".into() }), "F27: oldest removal silently lost; first remaining={:?}, length={}", q.front(), q.len());
+    assert_eq!(lock_events(&events).deltas.len(), MAX_WATCH_EVENTS);
+    assert_eq!(lock_events(&events).poll(), Some(DeviceEvent::RescanRequired { dropped_events: 1 }));
+    assert_eq!(lock_events(&events).poll(), Some(DeviceEvent::Removed { id: "1".into() }));
+    // Invalidation itself is separate from the bounded deltas and survives repeated overflow.
+    for i in 0..=MAX_WATCH_EVENTS { enqueue_event(&events, DeviceEvent::Removed { id: i.to_string() }); }
+    assert_eq!(lock_events(&events).poll(), Some(DeviceEvent::RescanRequired { dropped_events: 1025 }));
+    assert_eq!(lock_events(&events).deltas.len(), MAX_WATCH_EVENTS);
 }
 #[test]
 fn repro_p7_queue_overflow_control() {
-    let events = Arc::new(Mutex::new(VecDeque::new()));
+    let events = Arc::new(Mutex::new(WatchEvents::default()));
     for i in 0..MAX_WATCH_EVENTS { enqueue_event(&events, DeviceEvent::Removed { id: i.to_string() }); }
-    let q = events.lock().unwrap(); assert_eq!(q.len(), MAX_WATCH_EVENTS);
+    let queue = events.lock().unwrap();
+    let q = &queue.deltas; assert_eq!(q.len(), MAX_WATCH_EVENTS);
     assert_eq!(q.front(), Some(&DeviceEvent::Removed { id: "0".into() }));
 }
 
@@ -679,7 +730,7 @@ fn monitor_start_result(timer_fails: bool, param: Option<spa::pod::Pod>) -> Resu
 #[test]
 fn repro_p7_timer_arming_failure() {
     let error = monitor_start_result(true, Some(spa::pod::Pod::negotiated())).unwrap_err();
-    assert!(matches!(error, Error::Backend(ref message) if message.contains("arm pipewire negotiation deadline failed")));
+    assert!(matches!(error.root(), Error::Backend(message) if message.contains("arm pipewire negotiation deadline failed")));
 }
 #[test]
 fn repro_p7_timer_arming_failure_control() {
@@ -775,7 +826,7 @@ fn repro_p7_format_none_not_ready() {
     let (reported, result) = readiness_after_param(None);
     assert!(!reported); assert_eq!(result, Err(mpsc::TryRecvError::Empty));
     let error = monitor_start_result(false, None).unwrap_err();
-    assert!(matches!(error, Error::Backend(ref message) if message.contains("format negotiation timed out")));
+    assert!(matches!(error.root(), Error::Backend(message) if message.contains("format negotiation timed out")));
 }
 #[test]
 fn repro_p7_format_none_not_ready_control() {
@@ -801,10 +852,12 @@ impl<F: FnMut(pw::loop_::Timeout) -> i32> DispatchLoop<F> {
     fn loop_(&self) -> &Self { self }
     fn iterate(&self, timeout: pw::loop_::Timeout) -> i32 { (self.dispatch.borrow_mut())(timeout) }
 }
-#[derive(Clone, Copy)] enum ScanMode { Complete, SyncFailure, CoreGone, IterateFailure }
-fn scan_abort(mode: ScanMode) -> (bool, bool, usize, std::time::Duration) {
+#[derive(Clone, Copy)] enum ScanMode { Complete, SyncFailure, CoreGone, IterateFailure, Timeout }
+fn scan_result(mode: ScanMode) -> (std::result::Result<(), String>, bool, bool, usize, std::time::Duration) {
     SYNC_FAILURE.set(matches!(mode, ScanMode::SyncFailure)); WEAK_FAILURE.set(matches!(mode, ScanMode::CoreGone));
     let done = Rc::new(Cell::new(false)); let aborted = Rc::new(Cell::new(false));
+    let failure = Rc::new(Cell::new(None));
+    let failure_for_cb = failure.clone();
     let done_for_cb = done.clone(); let aborted_for_cb = aborted.clone();
     let stage_for_cb = Rc::new(Cell::new(0)); let pending1_for_cb = Rc::new(Cell::new(1));
     let loop_for_cb = FakeLoop; let core_weak = WeakSync;
@@ -815,6 +868,7 @@ fn scan_abort(mode: ScanMode) -> (bool, bool, usize, std::time::Duration) {
         let call = calls.get() + 1; calls.set(call);
         match (mode, call) {
             (ScanMode::IterateFailure, 1) => -1,
+            (ScanMode::Timeout, _) => { if let pw::loop_::Timeout::Finite(wait) = timeout { std::thread::sleep(wait); } 0 },
             (_, 1) => { callback(0, Sequence(1)); 1 },
             (ScanMode::Complete, 2) => { callback(0, Sequence(2)); 1 },
             _ => {
@@ -824,10 +878,18 @@ fn scan_abort(mode: ScanMode) -> (bool, bool, usize, std::time::Duration) {
         }
     }) };
     let started = std::time::Instant::now();
-    // LIVE_DEADLINE
+    let result: std::result::Result<(), String> = (|| {
+        // LIVE_DEADLINE
+        Ok(())
+    })();
+    assert_eq!(result.is_ok(), matches!(mode, ScanMode::Complete));
     let elapsed = started.elapsed();
     SYNC_FAILURE.set(false); WEAK_FAILURE.set(false);
-    (done.get(), aborted.get(), calls.get(), elapsed)
+    (result, done.get(), aborted.get(), calls.get(), elapsed)
+}
+fn scan_abort(mode: ScanMode) -> (bool, bool, usize, std::time::Duration) {
+    let (_, done, aborted, calls, elapsed) = scan_result(mode);
+    (done, aborted, calls, elapsed)
 }
 #[test]
 fn repro_p7_enumeration_abort_prompt() {
@@ -851,3 +913,78 @@ fn repro_p7_enumeration_iterate_error() {
 }
 #[test]
 fn repro_p7_enumeration_iterate_error_control() { repro_p7_enumeration_abort_prompt_control(); }
+
+fn assert_rejection(stride: i32, flags: i32, reason: LossReason) {
+    let (stream, mut listener, mut consumer) = process_fixture([0.25f32.to_le_bytes(), (-0.25f32).to_le_bytes()].concat(), stride, flags);
+    let diagnostics = listener.user_data.sink.diagnostics();
+    listener.fire(&stream);
+    assert_eq!(consumer.pop_slice(&mut [0.0; 16]), 0);
+    // The same CaptureDiagnostics::drain used by facade intake and its final stop drain.
+    // The producer is quiescent and no subsequent PCM is needed to observe this final loss.
+    drop(listener);
+    let losses = diagnostics.drain().unwrap();
+    assert_eq!(losses.len(), 1);
+    let loss = losses[0];
+    assert_eq!(loss.path(), AudioPath::Capture { lane: None });
+    assert_eq!(loss.reason(), reason);
+    assert_eq!((loss.sample_rate(), loss.channels(), loss.samples()), (48_000, 2, None));
+    assert!(diagnostics.drain().unwrap().is_empty());
+}
+#[test]
+fn repro_p7_corrupt_buffer_reports_loss() { assert_rejection(8, 1, LossReason::CorruptBuffer); }
+#[test]
+fn repro_p7_short_stride_reports_loss() { assert_rejection(4, 0, LossReason::MalformedBuffer); }
+#[test]
+fn repro_p7_valid_buffer_reports_no_loss() {
+    for (bytes, stride, expected) in [
+        ([0.25f32.to_le_bytes(), (-0.25f32).to_le_bytes()].concat(), 8, vec![0.25, -0.25]),
+        ([0.25f32.to_le_bytes(), (-0.25f32).to_le_bytes(), 123.0f32.to_le_bytes()].concat(), 12, vec![0.25, -0.25]),
+        (Vec::new(), 8, Vec::new()),
+    ] {
+        let (stream, mut listener, mut consumer) = process_fixture(bytes, stride, 0);
+        let diagnostics = listener.user_data.sink.diagnostics();
+        listener.fire(&stream);
+        let mut out = [0.0; 16]; let got = consumer.pop_slice(&mut out);
+        assert_eq!(&out[..got], expected.as_slice());
+        drop(listener);
+        assert!(diagnostics.drain().unwrap().is_empty());
+        assert!(diagnostics.drain().unwrap().is_empty());
+    }
+}
+#[test]
+fn repro_p7_unknown_layout_stays_unlinked() {
+    let f = LinkFixture::new(1, false);
+    f.nodes.borrow_mut().get_mut(&1).unwrap().n_output_ports = None;
+    f.link().unwrap();
+    assert!(f.linked.borrow().is_empty()); assert_eq!(f.core.calls.get(), 0);
+}
+#[test]
+fn repro_p7_unknown_channel_layout_is_unsupported() {
+    let f = LinkFixture::new(1, false);
+    f.ports.borrow_mut().get_mut(&10).unwrap().channel.clear();
+    assert_eq!(f.link().unwrap_err().kind(), ErrorKind::UnsupportedFormat);
+    assert!(f.linked.borrow().is_empty()); assert_eq!(f.core.calls.get(), 0);
+}
+#[test]
+fn repro_p7_negotiated_multichannel_is_unsupported() {
+    let error = monitor_start_result(false, Some(spa::pod::Pod { channels: 3, ..spa::pod::Pod::negotiated() })).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::UnsupportedFormat);
+}
+
+#[test]
+fn repro_p7_default_bulk_clear() {
+    assert_eq!(default_change(None, None).1, vec![
+        DeviceEvent::DefaultCleared { kind: DefaultDeviceKind::SystemAudio },
+        DeviceEvent::DefaultCleared { kind: DefaultDeviceKind::Microphone },
+    ]);
+}
+#[test]
+fn repro_p7_oversized_buffer_reports_loss_without_scratch_growth() {
+    let (stream, mut listener, mut consumer) = process_fixture(vec![0; (PROC_SCRATCH_CAP + 2) * 4], 8, 0);
+    let capacity = listener.user_data.scratch.borrow().capacity();
+    listener.fire(&stream);
+    assert_eq!(consumer.pop_slice(&mut [0.0; 16]), 0);
+    assert_eq!(listener.user_data.scratch.borrow().capacity(), capacity);
+    let loss = listener.user_data.sink.diagnostics().drain().unwrap();
+    assert_eq!(loss.len(), 1); assert_eq!(loss[0].reason(), LossReason::MalformedBuffer);
+}
