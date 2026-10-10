@@ -3,6 +3,67 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
+#[test]
+fn consent_pending_then_granted_once() {
+    let fake = Fake::new(Status::NotDetermined, false, None);
+    let mut poll = ConsentPoll::new();
+    assert!(matches!(
+        poll.poll(PENDING_GRACE, &fake),
+        Ok(Some(Event::PermissionPending { .. }))
+    ));
+    *fake.status.lock().unwrap() = Ok(Status::Authorized);
+    assert_eq!(
+        poll.poll(PENDING_GRACE + POLL_INTERVAL, &fake),
+        Ok(Some(Event::PermissionGranted))
+    );
+    assert!(!poll.active());
+    *fake.status.lock().unwrap() = Err(Error::Backend("finished poll must not query".into()));
+    for elapsed in [Duration::from_secs(10), Duration::from_secs(70)] {
+        assert_eq!(poll.poll(elapsed, &fake), Ok(None));
+    }
+}
+
+#[test]
+fn consent_authorized_without_pending_no_grant() {
+    for status in [Status::Authorized, Status::NotDetermined] {
+        let fake = Fake::new(status, false, None);
+        let mut poll = ConsentPoll::new();
+        assert_eq!(poll.poll(POLL_INTERVAL, &fake), Ok(None));
+        *fake.status.lock().unwrap() = Ok(Status::Authorized);
+        assert_eq!(poll.poll(POLL_INTERVAL * 2, &fake), Ok(None));
+        assert_eq!(poll.poll(PENDING_GRACE, &fake), Ok(None));
+    }
+    let fake = Fake::new(Status::NotDetermined, true, Some(true));
+    assert_eq!(check(&fake), Ok(false));
+    assert_eq!(ConsentPoll::new().poll(PENDING_GRACE, &fake), Ok(None));
+}
+
+#[test]
+fn consent_denied_or_query_error_no_grant() {
+    for status in [
+        Ok(Status::Denied),
+        Ok(Status::Restricted),
+        Err(Error::Backend("injected query failure".into())),
+    ] {
+        let fake = Fake::new(Status::NotDetermined, false, None);
+        let mut poll = ConsentPoll::new();
+        assert!(matches!(
+            poll.poll(PENDING_GRACE, &fake),
+            Ok(Some(Event::PermissionPending { .. }))
+        ));
+        *fake.status.lock().unwrap() = status.clone();
+        let result = poll.poll(PENDING_GRACE + POLL_INTERVAL, &fake);
+        if let Err(error) = status {
+            assert_eq!(result, Err(error));
+        } else {
+            assert!(matches!(result, Ok(Some(Event::PermissionDenied { .. }))));
+        }
+        *fake.status.lock().unwrap() = Ok(Status::Authorized);
+        assert_eq!(poll.poll(Duration::from_secs(70), &fake), Ok(None));
+        assert!(!poll.active());
+    }
+}
+
 type Completion = Box<dyn Fn(bool) + Send + Sync>;
 
 struct Fake {
@@ -380,7 +441,10 @@ fn authorization_before_grace_emits_no_advisory_and_late_grant_ends_polling() {
         Ok(Some(Event::PermissionPending { .. }))
     ));
     *fake.status.lock().unwrap() = Ok(Status::Authorized);
-    assert_eq!(poll.poll(Duration::from_secs(70), &fake), Ok(None));
+    assert_eq!(
+        poll.poll(Duration::from_secs(70), &fake),
+        Ok(Some(Event::PermissionGranted))
+    );
     assert!(!poll.active());
 }
 
