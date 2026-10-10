@@ -176,7 +176,7 @@ class ResolverTests(unittest.TestCase):
             environment = dict(EVENT_NAME="workflow_dispatch", INPUT_VERSION="0.3.1", GITHUB_REPOSITORY="owner/repo",
                                GH_TOKEN="unused-test-token", GITHUB_OUTPUT=str(output), GITHUB_RUN_ID="99", GITHUB_SHA=self.sha,
                                REF_TYPE="tag", REF_NAME=self.tag, GITHUB_RUN_ATTEMPT="1")
-            with patch.dict(os.environ, environment), patch.object(resolver.GitHub, "tag_commit", return_value=self.sha), patch.object(resolver.GitHub, "original_run", return_value=10), patch.object(resolver.GitHub, "get", return_value={"run_attempt": 1}):
+            with patch.dict(os.environ, environment), patch.object(resolver.GitHub, "tag_commit", return_value=self.sha), patch.object(resolver.GitHub, "original_run", return_value=10), patch.object(resolver.GitHub, "get", return_value=dict(self.run_record(), run_attempt=1)):
                 resolver.main()
                 self.assertIn("run_id=10", output.read_text())
                 os.environ["EVENT_NAME"] = "push"

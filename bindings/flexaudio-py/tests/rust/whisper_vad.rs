@@ -51,11 +51,32 @@ for data in [array.array('d', [0.0]), array.array('h', [0]),
     try:
         vad.process(data)
         assert False
-    except ValueError:
-        pass
+    except fa.WhisperVadValidationError as error:
+        assert error.code == 'InvalidPcm' and error.terminal_events == []
+        assert 'contiguous one-dimensional native float32' in str(error)
 assert vad.last_frame_probabilities().first_frame_index == 0
 "#
     ));
+}
+
+#[test]
+fn float32_buffer_copy_preserves_native_values_and_empty_input() {
+    Python::initialize();
+    Python::attach(|py| {
+        let array = py.import("array").unwrap();
+        let expected = [0.25_f32, -0.5, -0.0, f32::INFINITY, f32::NAN];
+        let samples = array
+            .call_method1("array", ("f", expected.to_vec()))
+            .unwrap();
+        let actual =
+            crate::whisper_buffer::with_samples(&samples, |values| values.to_vec()).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        let empty = array.call_method1("array", ("f",)).unwrap();
+        assert!(crate::whisper_buffer::with_samples(&empty, |values| values.is_empty()).unwrap());
+    });
 }
 #[test]
 fn synthetic_tail_events_probabilities_owned_and_readonly() {

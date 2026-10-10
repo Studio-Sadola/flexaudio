@@ -541,6 +541,10 @@ class WhisperVadRuntimeError(RuntimeError):
     terminal_events: List[WhisperVadEvent]
 
 class WhisperVad:
+    """Accepts float sequences or contiguous 1-D native float32 buffers.
+
+    Buffer input is copied into owned storage for Python 3.8 stable-ABI support.
+    """
     def __init__(self, threshold: float = 0.5, min_speech_duration_ms: int = 250,
                  min_silence_duration_ms: int = 100,
                  max_speech_duration_s: float = 3.4028234663852886e38,

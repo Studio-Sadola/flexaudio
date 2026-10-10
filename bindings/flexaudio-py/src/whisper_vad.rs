@@ -1,4 +1,4 @@
-//! Validate, borrow canonical input, and delegate to the shared Rust session.
+//! Validate, copy canonical input, and delegate to the shared Rust session.
 use crate::whisper_marshal::{self as marshal, FrameProbabilities, WhisperSpeechSegment};
 use flexaudio_vad::{
     WhisperVad as CoreVad, WhisperVadError, WhisperVadFailure, WhisperVadOptions,

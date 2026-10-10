@@ -240,7 +240,8 @@ their models/tables and require no runtime files or network access:
 `WhisperVad` runs embedded Silero v6 on normalized mono float32 at 16 kHz, with
 segmentation matching whisper.cpp pin `85a69493a601d4ff5a834064f7b7bac250bd8739`.
 It accepts a sequence or a contiguous one-dimensional native float32 buffer;
-NumPy is optional. Buffer input is borrowed for the call, and sequence input is
+NumPy is optional. Buffer input is copied through Python bytes into owned Rust
+float32 storage for Python 3.8 stable-ABI compatibility, and sequence input is
 copied for that feed. Instances stay on their creating thread.
 
 ```python
