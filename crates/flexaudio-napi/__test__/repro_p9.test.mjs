@@ -76,6 +76,50 @@ test('repro_p9_throwing_callback_observation', () => {
   assert.match(output.stdout, /observed=true/);
 });
 
+test('throwing callbacks preserve exception identity and allow checked shutdown', () => {
+  const addons = new Set([addonPath, process.env.FLEXAUDIO_TEST_ADDON].filter(Boolean));
+  for (const path of addons) {
+    const output = spawnSync(process.execPath, ['-e', `
+      const assert = require('node:assert/strict');
+      const native = require(process.argv[1]);
+      const thrown = new Error('repro callback exception');
+      thrown.code = 'CALLBACK_TEST';
+      let observed;
+      let continued = false;
+      process.once('uncaughtException', error => { observed = error; });
+      const stream = native.__openMockStream(48000, 1, 440, chunk => {
+        if (!observed) throw thrown;
+        if (chunk.frames > 0) continued = true;
+      });
+      setTimeout(async () => {
+        assert.strictEqual(observed, thrown);
+        assert.equal(observed.code, 'CALLBACK_TEST');
+        await stream.stop();
+        assert.equal(continued, true);
+        assert.equal(stream.terminalError(), undefined);
+        const report = stream.shutdownReport();
+        assert.equal(report.primary, null);
+        assert.deepEqual(report.cleanupErrors, []);
+        console.log('exception retained; stop resolved');
+        process.exit(0);
+      }, 100);
+    `, path], { encoding: 'utf8', timeout: 10000 });
+    assert.equal(output.status, 0, `${path}: ${output.stderr}`);
+    assert.match(output.stdout, /exception retained; stop resolved/);
+  }
+});
+
+test('optional lifecycle getters return undefined until a report is retained', async () => {
+  const stream = native.__openMockStream(48000, 1, 440, () => {});
+  assert.equal(stream.terminalError(), undefined);
+  assert.equal(stream.shutdownReport(), undefined);
+  await stream.stop();
+  assert.equal(stream.terminalError(), undefined);
+  const report = stream.shutdownReport();
+  assert.equal(report.primary, null);
+  assert.deepEqual(report.cleanupErrors, []);
+});
+
 test('repro_p9_reaper_failure_control', () => {
   const output = spawnSync(process.execPath, ['-e', `
     const native = require(process.argv[1]);

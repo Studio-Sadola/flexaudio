@@ -32,7 +32,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use napi::bindgen_prelude::{
-    AsyncTask, BigInt, Either, Float32Array, FromNapiValue, Function, Int16Array, Unknown,
+    AsyncTask, BigInt, Either, Float32Array, FromNapiValue, Function, Int16Array, Undefined,
+    Unknown,
 };
 use napi::threadsafe_function::{
     ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
@@ -428,7 +429,9 @@ fn make_chunk_tsfn(
                     })?;
                     let func: Function<JsAudioChunk, Unknown> =
                         unsafe { Function::from_napi_value(ctx.env.raw(), value)? };
-                    let _ = func.call(*chunk);
+                    // Function::call captures and clears a thrown JS exception. Return it
+                    // to the TSFN's Fatal handler so Node surfaces uncaughtException.
+                    func.call(*chunk)?;
                     Ok(Vec::<Unknown>::new())
                 }
                 ChunkEmit::WhisperFlushed(deferred, error) => {
@@ -1856,25 +1859,29 @@ impl FlexStream {
     /// Stored terminal failure, or undefined when capture has not terminally failed.
     /// Remains available after stop and does not consume onEvent notifications.
     #[napi]
-    pub fn terminal_error(&self) -> Option<JsStreamEvent> {
+    pub fn terminal_error(&self) -> Either<JsStreamEvent, Undefined> {
         self.terminal
             .lock()
             .unwrap_or_else(lock_poisoned)
             .clone()
-            .map(|error| match error {
-                StreamTerminal::Capture(error) => terminal_event(error),
-                StreamTerminal::Whisper(error) => event_to_js(Event::Error(error.to_string())),
+            .map(|error| {
+                Either::A(match error {
+                    StreamTerminal::Capture(error) => terminal_event(error),
+                    StreamTerminal::Whisper(error) => event_to_js(Event::Error(error.to_string())),
+                })
             })
+            .unwrap_or(Either::B(()))
     }
 
     /// Retained checked shutdown, including binding bridge failures.
     #[napi]
-    pub fn shutdown_report(&self) -> Option<boundary::JsShutdownReport> {
+    pub fn shutdown_report(&self) -> Either<boundary::JsShutdownReport, Undefined> {
         self.report
             .lock()
             .unwrap_or_else(lock_poisoned)
             .as_ref()
-            .map(boundary::shutdown_report)
+            .map(|report| Either::A(boundary::shutdown_report(report)))
+            .unwrap_or(Either::B(()))
     }
 
     /// Hot-swap the input source (mic/system/process) without stopping recording.
