@@ -29,6 +29,10 @@
 pub mod backend;
 pub mod chunk_ring;
 pub mod clock;
+pub mod diagnostics;
+pub mod error_context;
+mod errors;
+mod loss;
 pub mod normalizer;
 pub mod process_list;
 pub mod quant;
@@ -40,11 +44,15 @@ pub mod types;
 pub use backend::{CaptureBackend, RawSink};
 pub use chunk_ring::{chunk_ring, ChunkConsumer, ChunkProducer};
 pub use clock::{monotonic_now_ns, ClockNormalizer};
-pub use normalizer::{InnerProcessor, Normalizer, CHUNK_FRAMES};
+pub use normalizer::{InnerProcessor, NormalizedChunk, Normalizer, CHUNK_FRAMES};
 pub use quant::quantize_i16;
 pub use raw_ring::{raw_ring, RawConsumer, RawProducer};
 pub use secondary_ring::{secondary_chunk_ring, SecondaryChunkConsumer, SecondaryChunkProducer};
 pub use types::{
-    AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Error, Event, OutputFormat, Permission,
-    ProcessInfo, Result, SecondaryChunk, SourceKind, StreamConfig, CHANNELS, SAMPLE_RATE,
+    AudioChunk, AudioLoss, AudioPath, ChunkFlags, DefaultDeviceKind, DeviceEvent, DeviceInfo,
+    Error, ErrorContext, ErrorGroup, ErrorKind, Event, LossReason, MixLane, NativeStatus,
+    Operation, OutputFormat, OutputTap, Permission, ProcessInfo, Result, SecondaryChunk,
+    ShutdownReport, SourceKind, StreamConfig, CHANNELS, SAMPLE_RATE,
 };
+
+pub use diagnostics::CaptureDiagnostics;

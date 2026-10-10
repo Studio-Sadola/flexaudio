@@ -335,7 +335,9 @@ fn mailbox_work_is_bounded_for_noisy_custom_backends() {
         fn stop(&mut self) {}
         fn poll_event(&mut self) -> Option<Event> {
             self.polls.fetch_add(1, Ordering::SeqCst);
-            Some(Event::Error("notice".into()))
+            Some(Event::RecoverableError {
+                error: Error::Backend("notice".into()),
+            })
         }
     }
     let polls = Arc::new(AtomicUsize::new(0));
@@ -364,7 +366,11 @@ fn budget_exhaustion_defers_recovery_until_permission_events_are_read() {
         .events
         .lock()
         .unwrap()
-        .extend((0..MAX_BACKEND_EVENTS_PER_TICK).map(|_| Event::Error("notice".into())));
+        .extend(
+            (0..MAX_BACKEND_EVENTS_PER_TICK).map(|_| Event::RecoverableError {
+                error: Error::Backend("notice".into()),
+            }),
+        );
     backend.events.lock().unwrap().push_back(denied_event());
     let mut stream = Stream::open(StreamConfig::default(), Box::new(backend)).unwrap();
     assert_eq!(
@@ -386,7 +392,11 @@ fn final_reconciliation_finds_denial_behind_multiple_event_batches() {
         mailbox
             .lock()
             .unwrap()
-            .extend((0..MAX_BACKEND_EVENTS_PER_TICK * 2).map(|_| Event::Error("notice".into())));
+            .extend(
+                (0..MAX_BACKEND_EVENTS_PER_TICK * 2).map(|_| Event::RecoverableError {
+                    error: Error::Backend("notice".into()),
+                }),
+            );
         mailbox.lock().unwrap().push_back(denied_event());
         if switch {
             assert_eq!(
@@ -403,4 +413,88 @@ fn final_reconciliation_finds_denial_behind_multiple_event_batches() {
         assert_eq!(permission_events, 1);
         stream.stop();
     }
+}
+
+fn poll_panic_then_event(denied: bool) {
+    struct PanicOnce {
+        panicked: bool,
+        events: Arc<Mutex<VecDeque<Event>>>,
+    }
+    impl CaptureBackend for PanicOnce {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 2)
+        }
+        fn start(&mut self, mut sink: RawSink) -> Result<()> {
+            sink.push(&[0.25; 1920], 0);
+            Ok(())
+        }
+        fn stop(&mut self) {}
+        fn poll_event(&mut self) -> Option<Event> {
+            if !std::mem::replace(&mut self.panicked, true) {
+                panic!("injected poll panic");
+            }
+            self.events.lock().unwrap().pop_front()
+        }
+    }
+    let events = Arc::new(Mutex::new(VecDeque::new()));
+    let mut stream = Stream::open(
+        StreamConfig::default(),
+        Box::new(PanicOnce {
+            panicked: false,
+            events: events.clone(),
+        }),
+    )
+    .unwrap();
+    stream.start().unwrap();
+    assert_eq!(
+        drain_backend_events(&stream.shared),
+        MailboxDrain::BudgetExhausted
+    );
+    assert!(matches!(
+        stream.poll_event(),
+        Some(Event::RecoverableError {
+            error: Error::Backend(_)
+        })
+    ));
+    assert!(stream.terminal_error().is_none());
+    assert!(!stream.shared.stopping.load(Ordering::SeqCst));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while stream.chunk_consumer.is_empty() {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        stream.poll_chunk().is_some(),
+        "poll warning must not suppress PCM"
+    );
+    events.lock().unwrap().push_back(if denied {
+        denied_event()
+    } else {
+        Event::PermissionGranted
+    });
+    assert_eq!(
+        drain_backend_events(&stream.shared),
+        if denied {
+            MailboxDrain::Terminal
+        } else {
+            MailboxDrain::Empty
+        }
+    );
+    if denied {
+        assert_eq!(stream.terminal_error(), Some(denial()));
+        assert!(stream.poll_chunk().is_none());
+        assert_eq!(stream.poll_event(), Some(denied_event()));
+    } else {
+        assert_eq!(stream.poll_event(), Some(Event::PermissionGranted));
+        assert!(stream.terminal_error().is_none());
+    }
+    stream.stop();
+}
+#[test]
+fn poll_event_panic_is_recoverable_then_polling_resumes() {
+    poll_panic_then_event(false);
+}
+#[test]
+fn denial_after_poll_panic_still_latches_terminality() {
+    poll_panic_then_event(true);
 }

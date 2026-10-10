@@ -103,10 +103,8 @@ fn assert_invariants(events: &[WhisperVadEvent]) {
     let mut open = None;
     let mut cut_count = 0;
     let mut last_end = 0;
-    let mut seq = 0;
     for (i, event) in events.iter().enumerate() {
-        assert_eq!(event.seq, seq);
-        seq += 1;
+        assert_eq!(event.seq, u64::try_from(i).expect("event index fits u64"));
         match event.kind {
             Kind::ProvisionalSpeechStart { at_ms } => {
                 assert!(open.is_none());

@@ -84,7 +84,7 @@ impl WhisperVadTap {
         discontinuity: bool,
     ) -> Result<Vec<Attached>, Failure> {
         self.require_running()?;
-        if stereo_48k.len() % 2 != 0 {
+        if !stereo_48k.len().is_multiple_of(2) {
             return Err(Error::InvalidStereoLength.into());
         }
         for (sample, value) in stereo_48k.iter().enumerate() {

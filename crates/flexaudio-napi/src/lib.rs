@@ -988,13 +988,22 @@ fn event_to_js(ev: Event) -> JsStreamEvent {
             count: None,
             message: Some(msg),
         },
-        // Event is #[non_exhaustive]. For future variants, report unknown kinds to JS as "error"
-        // with their debug representation (do not swallow them).
-        other => JsStreamEvent {
-            kind: "error".to_string(),
+        Event::RecoverableError { .. }
+        | Event::ShutdownError { .. }
+        | Event::AudioLoss { .. }
+        | Event::Clipped
+        | Event::PermissionGranted => JsStreamEvent {
+            kind: "unknown".to_string(),
             permission: None,
             count: None,
-            message: Some(format!("unknown event: {other:?}")),
+            message: Some("unknown event: pending 0.5 binding support".to_string()),
+        },
+        // Future variants remain observable without exposing raw diagnostics.
+        _ => JsStreamEvent {
+            kind: "unknown".to_string(),
+            permission: None,
+            count: None,
+            message: Some("unknown event".to_string()),
         },
     }
 }
@@ -1017,10 +1026,14 @@ fn device_event_to_js(ev: DeviceEvent) -> JsDeviceEvent {
             kind: "defaultChanged".to_string(),
             device: None,
             id: Some(id),
-            source_kind: Some(source_kind_str(kind)),
+            source_kind: Some(source_kind_str(kind.into())),
         },
-        // DeviceEvent is #[non_exhaustive]. For future variants, pass unknown kinds to JS
-        // as "unknown" (do not swallow them).
+        DeviceEvent::DefaultCleared { .. } | DeviceEvent::RescanRequired { .. } => JsDeviceEvent {
+            kind: "unknown".to_string(),
+            device: None,
+            id: None,
+            source_kind: None,
+        },
         _ => JsDeviceEvent {
             kind: "unknown".to_string(),
             device: None,
@@ -3019,7 +3032,7 @@ mod tests {
         assert_eq!(removed.id.as_deref(), Some("gone"));
 
         let changed = device_event_to_js(DeviceEvent::DefaultChanged {
-            kind: SourceKind::SystemLoopback,
+            kind: flexaudio::DefaultDeviceKind::SystemAudio,
             id: "sink-2".to_string(),
         });
         assert_eq!(changed.kind, "defaultChanged");
@@ -3337,15 +3350,13 @@ mod reproduction_tests {
     }
 }
 
-// Build the test addon with cargo rustc --lib -- --cfg test.
-#[cfg(test)]
+// Build the test addon with cargo rustc --lib -- --cfg test --cfg flexaudio_repro_addon.
+#[cfg(all(test, flexaudio_repro_addon))]
 mod reproduction_bridge {
     use super::*;
 
     // napi-derive disables automatic registration under cfg(test). Register only these test
     // exports explicitly; expose the real FlexStream::stop through a plain JS object.
-    #[allow(unexpected_cfgs)]
-    #[cfg(flexaudio_repro_addon)]
     #[napi::bindgen_prelude::ctor]
     fn register_test_exports() {
         napi::bindgen_prelude::register_module_export(None, "__reproP9Bridge\0", export_bridge);

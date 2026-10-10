@@ -837,7 +837,8 @@ mod permission_tests {
         unsafe {
             assert_eq!(flexaudio_poll_chunk(&mut stream, chunk.as_mut_ptr()), -2);
             let message = CStr::from_ptr(flexaudio_last_error()).to_str().unwrap();
-            assert!(message.contains("denied by user"));
+            assert!(message.contains("recording permission denied"));
+            assert!(!message.contains("denied by user"));
             assert!(message.contains(&fa::Permission::Microphone.to_string()));
             assert!(message.contains(fa::Permission::Microphone.guidance()));
             let mut event = std::mem::MaybeUninit::<FlexEvent>::uninit();

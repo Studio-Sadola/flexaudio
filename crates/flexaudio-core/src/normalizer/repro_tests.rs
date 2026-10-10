@@ -92,7 +92,7 @@ fn flush_drains_capture_converter_without_transport_padding() {
         .unwrap(),
     );
     n.push(&[0.25; 200], 0).unwrap();
-    n.flush();
+    n.flush().unwrap();
     assert!(n.capture.as_ref().unwrap().buffered_out_frames() > 0);
 }
 
@@ -120,12 +120,11 @@ fn output() -> OutputFormat {
 fn short_tail(rate: u32) {
     let mut n = Normalizer::new(rate, 2, output()).unwrap();
     n.push(&vec![0.25; 200], 0).unwrap();
-    n.flush();
+    n.flush().unwrap();
     let buffered = n.buffered_out_frames();
     assert!(buffered > 0, "F13: 100 real input frames vanished after flush: output_frames={buffered}, stage1_pending={}", n.stage1_resampler.as_ref().map_or(0, |r| r.in_accum.len() / 2));
 }
 #[test]
-#[ignore = "repro: F13"]
 fn repro_p1_short_44100_tail() {
     short_tail(44_100);
 }
@@ -135,18 +134,17 @@ fn repro_p1_short_44100_tail_control() {
 }
 
 fn multichannel(channel: usize) {
-    let mut n = Normalizer::new(48_000, 6, output()).unwrap();
     let mut input = vec![0.0; 960 * 6];
     for frame in input.chunks_exact_mut(6) {
         frame[channel] = 0.5;
     }
-    n.push(&input, 0).unwrap();
-    let (data, _) = n.pop_chunk().unwrap();
-    let nonzero = data.iter().filter(|&&s| s != 0.0).count();
-    assert!(nonzero > 0, "F15: accepted 6-channel center-only input became silence: nonzero_output_samples={nonzero}");
+    let result = Normalizer::new(48_000, 6, output());
+    assert!(
+        matches!(result, Err(Error::UnsupportedFormat(_))),
+        "six-channel input must be rejected before consuming either center or front PCM"
+    );
 }
 #[test]
-#[ignore = "repro: F15"]
 fn repro_p1_center_channel() {
     multichannel(2);
 }
@@ -170,7 +168,7 @@ fn partial_frame(split: bool) {
         }
         n.push(&scratch[..got], 0).unwrap();
     }
-    n.flush();
+    n.flush().unwrap();
     assert!(
         n.pop_chunk().is_some(),
         "H8: partial input frames discarded rather than retained: output_frames={}",
@@ -195,33 +193,72 @@ fn flush_error(inject: bool) {
         channels: 1,
     };
     let mut n = Normalizer::new(48_000, 2, format).unwrap();
-    n.push(&vec![0.25; 200], 0).unwrap();
-    let resampler = n
-        .primary
-        .stage2
-        .as_mut()
-        .unwrap()
-        .resampler
-        .as_mut()
-        .unwrap();
+    // Retain a completed valid chunk before injecting the original adapter failure.
+    n.push(&vec![0.25; 5760], 0).unwrap();
+    n.push(&vec![0.25; 200], 60_000_000).unwrap();
     if inject {
-        resampler.out_scratch.clear();
-        let error = resampler.flush_into(&mut Vec::new()).unwrap_err();
-        assert!(
-            error.to_string().contains("output adapter failed"),
-            "unexpected injected failure: {error}"
-        );
-        eprintln!("injected error: {error}");
+        n.primary
+            .stage2
+            .as_mut()
+            .unwrap()
+            .resampler
+            .as_mut()
+            .unwrap()
+            .out_scratch
+            .clear();
     }
-    n.flush();
-    assert!(n.pop_chunk().is_some(), "F14/M24: flush returned normally but lost tail after injected output-adapter failure: output_frames={}", n.buffered_out_frames());
+    let result = n.flush();
+    assert_eq!(
+        result.is_err(),
+        inject,
+        "injected adapter failure must be returned by flush"
+    );
+    if let Err(error) = &result {
+        assert!(
+            matches!(error, Error::Context { context, .. } if context.operation() == Operation::Flush)
+        );
+        assert_eq!(error.kind(), crate::ErrorKind::Backend);
+    }
+    assert!(
+        n.pop_chunk().is_some(),
+        "valid output must remain drainable after a cleanup-only failure"
+    );
+    assert_eq!(n.flush(), result, "repeated flush retains its result");
 }
 #[test]
-#[ignore = "repro: F14 / D M24"]
 fn repro_p1_flush_error() {
     flush_error(true);
 }
 #[test]
 fn repro_p1_flush_error_control() {
     flush_error(false);
+}
+
+#[test]
+fn supported_stereo_control() {
+    let mut n = Normalizer::new(48_000, 2, output()).unwrap();
+    n.push(&vec![0.5; 1920], 0).unwrap();
+    assert_eq!(n.pop_chunk().unwrap().0, vec![0.5; 1920]);
+}
+#[test]
+fn flush_is_idempotent_and_padding_is_not_a_gap() {
+    let mut n = Normalizer::new(48_000, 2, output()).unwrap();
+    n.push(&[0.25; 200], 0).unwrap();
+    n.flush().unwrap();
+    let chunk = n.pop_chunk_with_metadata().unwrap();
+    assert!(chunk.flags.contains(ChunkFlags::PADDED));
+    assert!(!chunk
+        .flags
+        .intersects(ChunkFlags::SILENCE | ChunkFlags::DISCONTINUITY));
+    n.flush().unwrap();
+    assert!(n.pop_chunk_with_metadata().is_none());
+}
+#[test]
+fn zero_native_format_is_invalid() {
+    for (rate, channels) in [(0, 2), (48_000, 0)] {
+        assert!(matches!(
+            Normalizer::new(rate, channels, output()),
+            Err(Error::InvalidArg(_))
+        ));
+    }
 }

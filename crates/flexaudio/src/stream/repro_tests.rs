@@ -106,10 +106,7 @@ fn rollback(fail: bool) {
     stream.start().unwrap();
     let mut replacement = Backend::silent();
     replacement.fail_start = true;
-    let error = stream
-        .switch_backend(Box::new(replacement))
-        .unwrap_err()
-        .to_string();
+    let error = stream.switch_backend(Box::new(replacement)).unwrap_err();
     let restored_live = live.load(Ordering::SeqCst);
     let attempts = starts.load(Ordering::SeqCst);
     stream.stop();
@@ -119,12 +116,12 @@ fn rollback(fail: bool) {
         "control must actually restore the old source"
     );
     assert!(
-        !fail || error.contains("rollback"),
+        !fail
+            || matches!(&error, Error::Multiple(group) if group.secondary().any(|error| matches!(error, Error::Context { context, .. } if context.operation() == Operation::Rollback))),
         "F10: both opens failed but returned cause={error:?}; rollback cause absent"
     );
 }
 #[test]
-#[ignore = "repro: F10"]
 fn repro_p2_rollback() {
     rollback(true);
 }
@@ -224,9 +221,13 @@ fn final_buffer(late: bool) {
     });
     if late {
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        wait(|| worker.is_finished());
-        worker.join().unwrap();
+        // Producer-before-intake shutdown supersedes the old exit-before-release schedule.
+        assert!(
+            !worker.is_finished(),
+            "intake must remain alive until the producer quiesces"
+        );
         release_tx.send(()).unwrap();
+        worker.join().unwrap();
     } else {
         worker.join().unwrap();
     }
@@ -243,7 +244,6 @@ fn final_buffer(late: bool) {
     assert!(delivered > 0, "NEW-final-buffer: intake exited before backend final push: delivered_frames={delivered}, stranded_raw_samples={pending}");
 }
 #[test]
-#[ignore = "repro: NEW-final-buffer"]
 fn repro_p2_final_buffer() {
     final_buffer(true);
 }
@@ -295,9 +295,9 @@ fn poison(poison: bool) {
         })
         .join();
     }
-    stream
-        .shared
-        .push_event(Event::Error("retained diagnostic".into()));
+    stream.shared.push_event(Event::RecoverableError {
+        error: Error::Backend("retained diagnostic".into()),
+    });
     let event = stream.poll_event();
     assert!(
         event.is_some(),
@@ -327,7 +327,6 @@ fn shutdown(panic: bool) {
     );
 }
 #[test]
-#[ignore = "repro: F37"]
 fn repro_p2_shutdown_panic() {
     shutdown(true);
 }
@@ -352,7 +351,6 @@ fn tail_metadata(partial: bool) {
     );
 }
 #[test]
-#[ignore = "repro: F14 / D M1"]
 fn repro_p2_padding_metadata() {
     tail_metadata(true);
 }
@@ -378,7 +376,6 @@ fn clipping(clip: bool) {
     );
 }
 #[test]
-#[ignore = "repro: F16"]
 fn repro_p2_clipping_metadata() {
     clipping(true);
 }
@@ -424,7 +421,6 @@ fn secondary_loss(overflow: bool) {
     );
 }
 #[test]
-#[ignore = "repro: D M4"]
 fn repro_p2_secondary_drop_event() {
     secondary_loss(true);
 }
@@ -438,7 +434,6 @@ fn repro_p2_secondary_drop_event_control() {
 // production spawn code or exhausting the host's process/thread quota.
 #[test]
 #[cfg(target_os = "linux")]
-#[ignore = "repro: F12"]
 fn repro_p2_spawn_failure() {
     if std::env::var_os("FLEXAUDIO_REPRO_SPAWN_CHILD").is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -512,7 +507,7 @@ fn repro_p2_spawn_failure() {
     assert!(restored.success());
     let error = result.expect_err("fixture must fail a real worker spawn");
     assert!(
-        error.to_string().contains("spawn intake thread"),
+        matches!(error.root(), Error::Backend(detail) if detail.contains("spawn intake thread")),
         "unexpected failure: {error}"
     );
     drop(stream);

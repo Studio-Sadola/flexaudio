@@ -337,13 +337,22 @@ pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
             count: None,
             message: Some(msg),
         },
-        // Event is #[non_exhaustive]. For future variants, pass unknown kinds to Python as "unknown"
-        // plus their debug representation (do not swallow them).
-        other => PyStreamEvent {
+        Event::RecoverableError { .. }
+        | Event::ShutdownError { .. }
+        | Event::AudioLoss { .. }
+        | Event::Clipped
+        | Event::PermissionGranted => PyStreamEvent {
             kind: "unknown".to_string(),
             permission: None,
             count: None,
-            message: Some(format!("unknown event: {other:?}")),
+            message: Some("unknown event: pending 0.5 binding support".to_string()),
+        },
+        // Future variants remain observable without exposing raw diagnostics.
+        _ => PyStreamEvent {
+            kind: "unknown".to_string(),
+            permission: None,
+            count: None,
+            message: Some("unknown event".to_string()),
         },
     }
 }
@@ -460,14 +469,18 @@ pub(crate) fn device_event_to_py(ev: DeviceEvent) -> PyDeviceEvent {
             kind: "defaultChanged".to_string(),
             device: None,
             id: Some(id),
-            source_kind: Some(source_kind_str(kind).to_string()),
+            source_kind: Some(source_kind_str(kind.into()).to_string()),
         },
-        // DeviceEvent is #[non_exhaustive]. For future variants, pass unknown kinds as
-        // "unknown" (do not swallow them).
-        other => PyDeviceEvent {
+        DeviceEvent::DefaultCleared { .. } | DeviceEvent::RescanRequired { .. } => PyDeviceEvent {
             kind: "unknown".to_string(),
             device: None,
-            id: Some(format!("{other:?}")),
+            id: None,
+            source_kind: None,
+        },
+        _ => PyDeviceEvent {
+            kind: "unknown".to_string(),
+            device: None,
+            id: None,
             source_kind: None,
         },
     }
@@ -632,7 +645,7 @@ mod tests {
         assert!(removed.device.is_none());
 
         let changed = device_event_to_py(DeviceEvent::DefaultChanged {
-            kind: SourceKind::SystemLoopback,
+            kind: fa::DefaultDeviceKind::SystemAudio,
             id: "new-default".to_string(),
         });
         assert_eq!(changed.kind, "defaultChanged");

@@ -875,12 +875,18 @@ fn watch_devices_loop() -> std::result::Result<(), String> {
                     eprintln!("[-] REMOVED {id}");
                 }
                 DeviceEvent::DefaultChanged { kind, id } => {
-                    eprintln!("[*] DEFAULT {:<7} -> {}", source_kind_label(kind), id,);
+                    eprintln!(
+                        "[*] DEFAULT {:<7} -> {}",
+                        source_kind_label(kind.into()),
+                        id,
+                    );
                 }
-                // DeviceEvent is #[non_exhaustive]. Show unknown variants in debug form in case
-                // future variants are added (do not swallow them).
-                other => {
-                    eprintln!("[?] UNKNOWN  {other:?}");
+                DeviceEvent::DefaultCleared { .. } | DeviceEvent::RescanRequired { .. } => {
+                    eprintln!("[?] UNKNOWN device event: pending 0.5 CLI support");
+                }
+                // Future variants remain observable without exposing raw diagnostics.
+                _ => {
+                    eprintln!("[?] UNKNOWN device event");
                 }
             }
         }
@@ -928,8 +934,16 @@ fn report_capture_event(event: flexaudio::Event) -> Result<(), Error> {
             eprintln!("Warning: {detail}");
             Ok(())
         }
-        other => {
-            eprintln!("  Event: {other:?}");
+        flexaudio::Event::RecoverableError { .. }
+        | flexaudio::Event::ShutdownError { .. }
+        | flexaudio::Event::AudioLoss { .. }
+        | flexaudio::Event::Clipped
+        | flexaudio::Event::PermissionGranted => {
+            eprintln!("Unknown event: pending 0.5 CLI support");
+            Ok(())
+        }
+        _ => {
+            eprintln!("Unknown event");
             Ok(())
         }
     }
@@ -1816,7 +1830,8 @@ mod tests {
             .expect_err("confirmed denial must fail the capture loop");
             let message = describe_error(error);
             assert!(message.contains(&permission.to_string()));
-            assert!(message.contains("denied by user"));
+            assert!(message.contains("recording permission denied"));
+            assert!(!message.contains("denied by user"));
             assert!(message.contains("Restart"));
         }
         report_capture_event(flexaudio::Event::SilenceWhileSourceActive {

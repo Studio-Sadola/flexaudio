@@ -42,9 +42,9 @@ mod marshal;
 mod stream;
 mod vad;
 mod watcher;
-mod whisper_vad;
-mod whisper_marshal;
 mod whisper_buffer;
+mod whisper_marshal;
+mod whisper_vad;
 
 use marshal::{device_info_to_py, process_info_to_py};
 

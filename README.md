@@ -108,7 +108,9 @@ The facade crate `flexaudio` re-exports everything you need:
 
 - `flexaudio::open(StreamConfig) -> Result<Stream>` — pick a backend by source +
   OS and build a (not-yet-started) capture stream.
-- `Stream::start` / `Stream::stop` — control capture.
+- `Stream::start` / `Stream::stop` — control capture. `stop_checked()` returns
+  capture and cleanup failures; `shutdown_report()` retains the completed outcome.
+  Repeated stop does not repeat teardown or duplicate events.
 - `Stream::poll_chunk` / `Stream::poll_event` — pull `AudioChunk`s and `Event`s.
 - `Stream::terminal_error() -> Option<Error>` — inspect a stored terminal failure,
   including after stop. `Stream::resume()` returns `Result<()>`.
@@ -124,9 +126,9 @@ The facade crate `flexaudio` re-exports everything you need:
   [Listing capturable processes](#listing-capturable-processes)). Idle/stopped
   processes are included; use `is_output_active` to check current playback and
   `pid` as `target_pid` for per-process capture.
-- `flexaudio::watch_devices() -> Result<DeviceWatcher>` — pull-style hotplug
-  (added / removed / default-changed) notifications (Linux only; Windows/macOS
-  return a no-op watcher).
+- `flexaudio::watch_devices() -> Result<DeviceWatcher>` — pull-style device
+  notifications. Linux startup failure returns an error; Windows/macOS currently
+  provide an intentional no-op watcher.
 - Re-exported types: `StreamConfig`, `SourceKind`, `ProcessMode`, `OutputFormat`,
   `AudioChunk`, `SecondaryChunk`, `ChunkFlags`, `DeviceInfo`, `ProcessInfo`,
   `DeviceEvent`, `Event`, `Permission`, `Error`, `Result`.
@@ -400,10 +402,10 @@ permission events keep type `permissionDenied` and add `permission`
   access to the audio device (typically the `audio` group / a running PipeWire
   or PulseAudio session).
 - System and per-process capture require a running **PipeWire** session. If
-  PipeWire is absent, `devices()` still returns microphones found by cpal; only
-  the PipeWire devices are missing. `watch_devices()` degrades to a no-op rather
-  than failing. Under a portal-based desktop, the user may be prompted to grant
-  capture access.
+  PipeWire is absent or watcher startup fails, `watch_devices()` returns an error.
+  Device discovery requires a complete inventory from every provider; an incomplete
+  or failed query returns an error. Under a portal-based desktop, the user may be
+  prompted to grant capture access.
 
 ---
 

@@ -18,7 +18,7 @@ pub(super) enum Ring<'a> {
 
 pub(super) fn drain(
     shared: &SharedState,
-    mut pop: impl FnMut() -> Option<(Vec<f32>, i64)>,
+    mut pop: impl FnMut() -> Option<NormalizedChunk>,
     format: OutputFormat,
     gain: f32,
     counter: &AtomicU64,
@@ -29,7 +29,10 @@ pub(super) fn drain(
     let capture = matches!(ring, Ring::Capture(_));
     let primary = matches!(ring, Ring::Primary(_));
     let mut emitted = false;
-    while let Some((mut data, raw_pts)) = pop() {
+    while let Some(chunk) = pop() {
+        let mut data = chunk.samples;
+        let raw_pts = chunk.pts_ns;
+        let mut integrity_flags = chunk.flags;
         let frames = data.len() / channels;
         let frame_index = advance_frame_index(counter, frames as u64, format.sample_rate)?;
         // Popped frames advance even while discarded, retaining flags until delivery.
@@ -42,7 +45,9 @@ pub(super) fn drain(
         } else {
             let pts = apply_epoch(shared, raw_pts).max(state.last_pts);
             state.last_pts = pts;
-            apply_gain(&mut data, gain);
+            if apply_gain(&mut data, gain) {
+                integrity_flags |= ChunkFlags::CLIPPED;
+            }
             Some((pts, peak_rms(&data)))
         };
         let _delivery = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
@@ -51,11 +56,13 @@ pub(super) fn drain(
         }
         let (pts_ns, (peak, rms)) = prepared.unwrap_or_else(|| {
             let pts = apply_epoch(shared, raw_pts);
-            apply_gain(&mut data, gain);
+            if apply_gain(&mut data, gain) {
+                integrity_flags |= ChunkFlags::CLIPPED;
+            }
             (pts, peak_rms(&data))
         });
         let resumed = shared.resume_generation.load(Ordering::SeqCst);
-        let mut flags = ChunkFlags::empty();
+        let mut flags = integrity_flags;
         if state.recovered && !capture && !shared.stopping.load(Ordering::SeqCst) {
             flags |= ChunkFlags::RECOVERED | ChunkFlags::DISCONTINUITY;
         } else if state.recovered && !capture {
@@ -85,7 +92,8 @@ pub(super) fn drain(
                 }
             }
             Ring::Secondary(producer) => {
-                producer.push(SecondaryChunk {
+                let dropped_before = producer.dropped_count();
+                let dropped = producer.push(SecondaryChunk {
                     samples: chunk.data,
                     frames: chunk.frames,
                     frame_index: chunk.frame_index,
@@ -96,6 +104,19 @@ pub(super) fn drain(
                     peak: chunk.peak,
                     rms: chunk.rms,
                 });
+                if let Some(total) = dropped {
+                    let samples = (total - dropped_before)
+                        .checked_mul(frames as u64)
+                        .and_then(|frames| frames.checked_mul(u64::from(format.channels)))
+                        .and_then(NonZeroU64::new);
+                    let loss = AudioLoss::output_overflow(
+                        OutputTap::Secondary,
+                        samples,
+                        format.sample_rate,
+                        format.channels,
+                    )?;
+                    shared.push_event(Event::AudioLoss { loss });
+                }
             }
         }
         if primary && flags.contains(ChunkFlags::RECOVERED) {

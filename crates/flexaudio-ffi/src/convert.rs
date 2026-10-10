@@ -382,10 +382,19 @@ pub fn event_to_c(ev: Event) -> FlexEvent {
                 count: 0,
             }
         }
-        // Event is #[non_exhaustive]. Map unknown variants to Unknown and preserve their debug
-        // representation in last_error rather than swallowing it.
-        other => {
-            set_last_error(format!("unknown event: {other:?}"));
+        Event::RecoverableError { .. }
+        | Event::ShutdownError { .. }
+        | Event::AudioLoss { .. }
+        | Event::Clipped
+        | Event::PermissionGranted => {
+            set_last_error("unknown event: pending 0.5 binding support".to_string());
+            FlexEvent {
+                kind: FlexEventKind::Unknown,
+                count: 0,
+            }
+        }
+        _ => {
+            set_last_error("unknown event".to_string());
             FlexEvent {
                 kind: FlexEventKind::Unknown,
                 count: 0,

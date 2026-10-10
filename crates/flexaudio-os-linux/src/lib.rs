@@ -2670,7 +2670,7 @@ fn setup_watch(
                                                         enqueue_event(
                                                             &events_for_meta,
                                                             DeviceEvent::DefaultChanged {
-                                                                kind: SourceKind::SystemLoopback,
+                                                                kind: flexaudio_core::DefaultDeviceKind::SystemAudio,
                                                                 id,
                                                             },
                                                         );
@@ -2687,7 +2687,7 @@ fn setup_watch(
                                                     enqueue_event(
                                                         &events_for_meta,
                                                         DeviceEvent::DefaultChanged {
-                                                            kind: SourceKind::Mic,
+                                                            kind: flexaudio_core::DefaultDeviceKind::Microphone,
                                                             id,
                                                         },
                                                     );
@@ -3834,7 +3834,7 @@ mod tests {
         enqueue_event(
             &events,
             DeviceEvent::DefaultChanged {
-                kind: SourceKind::SystemLoopback,
+                kind: flexaudio_core::DefaultDeviceKind::SystemAudio,
                 id: "sink.x".into(),
             },
         );
@@ -3849,7 +3849,7 @@ mod tests {
                 DeviceEvent::Added(mic),
                 DeviceEvent::Removed { id: "mic.a".into() },
                 DeviceEvent::DefaultChanged {
-                    kind: SourceKind::SystemLoopback,
+                    kind: flexaudio_core::DefaultDeviceKind::SystemAudio,
                     id: "sink.x".into(),
                 },
             ]

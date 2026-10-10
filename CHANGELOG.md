@@ -12,6 +12,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Wave 1 contracts for 0.5
+
+- `Normalizer::flush` now returns `Result<()>`; metadata pop methods retain
+  `PADDED` flags. Native inputs above two channels return `UnsupportedFormat`.
+- `Stream::stop_checked` returns the retained capture and cleanup outcome;
+  `shutdown_report` distinguishes the capture primary from ordered cleanup errors.
+- Capture errors gain typed root kinds, operation/lane/native context and
+  nonempty related-error groups. Default error messages retain library-authored explanations while redacting permission
+  details and internal call labels.
+- Transient reopen and poll failures use `RecoverableError`; legacy `Error`
+  events are terminal at the facade boundary. Typed loss reports and clipping flags
+  make audio integrity observable without changing the realtime sample transport.
+- `DeviceEvent::DefaultChanged.kind` now takes `DefaultDeviceKind` rather than
+  `SourceKind`. Added `DefaultCleared`, `RescanRequired` and microphone
+  `PermissionGranted` contracts for subsequent native and binding integration.
+- Non-20 `chunk_ms` values return `InvalidArg`. Linux watcher startup failure
+  returns an error; unsupported non-Linux watchers remain intentional no-ops.
+
 ### Breaking in 0.5
 
 - Rust `AudioChunk` and `SecondaryChunk` add the public `frame_index: u64` field.

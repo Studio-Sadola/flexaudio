@@ -44,3 +44,6 @@ napi-derive = "2.16"
 [build-dependencies]
 # Call napi_build::setup() from build.rs (for cdylib symbol settings, etc.). Build-time only.
 napi-build = "2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(flexaudio_repro_addon)'] }

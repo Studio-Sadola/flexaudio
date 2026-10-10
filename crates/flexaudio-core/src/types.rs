@@ -10,6 +10,9 @@
 //! (48k=960 / 16k=320 / 8k=160). With the default `{48000, 2}`, stage 2 is
 //! a pass-through and emits the internal canonical form unchanged.
 
+pub use crate::error_context::{ErrorContext, ErrorGroup, NativeStatus, Operation, ShutdownReport};
+pub use crate::errors::{Error, ErrorKind};
+pub use crate::loss::{AudioLoss, AudioPath, LossReason, MixLane, OutputTap};
 use bitflags::bitflags;
 
 /// Sample rate (Hz) of the internal canonical form. All streams are normalized to this rate first.
@@ -30,6 +33,10 @@ bitflags! {
         const RECOVERED = 0b0000_0010;
         /// Generated-silence chunk (silence synthesized to fill a gap, etc.).
         const SILENCE = 0b0000_0100;
+        /// Explicit library-inserted fill, including partial final padding.
+        const PADDED = 8;
+        /// Final facade gain/clamp changed at least one sample in this chunk.
+        const CLIPPED = 16;
     }
 }
 
@@ -64,6 +71,7 @@ pub struct AudioChunk {
     /// Number of chunks dropped immediately before this chunk arrived.
     pub dropped_before: u32,
     /// Maximum absolute sample value in the final `data` (output format) for this chunk.
+    /// Measured after denoise/gain processing and before integer encoding.
     /// Linear amplitude (usually `0.0..=1.0`).
     pub peak: f32,
     /// Linear root-mean-square value in the final `data` (output format) for this chunk.
@@ -101,7 +109,7 @@ pub struct SecondaryChunk {
     pub flags: ChunkFlags,
     /// Number of secondary chunks dropped immediately before this chunk arrived.
     pub dropped_before: u32,
-    /// Maximum absolute sample value (linear amplitude) in `samples` (f32 before quantization).
+    /// Maximum absolute value in final float samples after denoise/gain, before quantization.
     pub peak: f32,
     /// Linear root-mean-square value in `samples` (f32 before quantization).
     pub rms: f32,
@@ -175,8 +183,8 @@ pub struct ProcessInfo {
 /// Hotplug event for device attach/detach or default-device changes.
 ///
 /// Separate from capture-stream [`Event`], `DeviceWatcher` (facade layer) delivers these events
-/// per device through `poll_event`. Attach/detach events are infrequent, but must not be lost,
-/// so the delivery queue is unbounded.
+/// per device through `poll_event`. The bounded queue emits sticky RescanRequired
+/// ahead of deltas whenever overflow or poisoning invalidates the incremental inventory.
 ///
 /// Mark `#[non_exhaustive]` to allow future variants (external matches must include `_ =>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,11 +200,50 @@ pub enum DeviceEvent {
     },
     /// The OS default device changed (default sink / source switched).
     DefaultChanged {
-        /// Source kind whose default changed (`Mic` = default source / `SystemLoopback` = default sink).
-        kind: SourceKind,
+        /// Default endpoint domain.
+        kind: DefaultDeviceKind,
         /// Stable ID of the new default device (= `node.name`).
         id: String,
     },
+    /// Default endpoint no longer exists; no fabricated empty ID.
+    DefaultCleared {
+        /// Default endpoint domain.
+        kind: DefaultDeviceKind,
+    },
+    /// Incremental inventory is invalid; obtain a complete inventory again.
+    RescanRequired {
+        /// Cumulative dropped deltas, saturating; zero may mean unknown poison loss.
+        dropped_events: u64,
+    },
+}
+
+/// Endpoint kinds that can have a system default.
+///
+/// default_changed_rejects_mix:
+/// ```compile_fail
+/// use flexaudio_core::{DeviceEvent, SourceKind};
+/// let _ = DeviceEvent::DefaultChanged { kind: SourceKind::Mix, id: String::new() };
+/// ```
+/// default_changed_rejects_process_loopback:
+/// ```compile_fail
+/// use flexaudio_core::{DeviceEvent, SourceKind};
+/// let _ = DeviceEvent::DefaultChanged { kind: SourceKind::ProcessLoopback, id: String::new() };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DefaultDeviceKind {
+    /// Default microphone input.
+    Microphone,
+    /// Default system audio output.
+    SystemAudio,
+}
+impl From<DefaultDeviceKind> for SourceKind {
+    fn from(kind: DefaultDeviceKind) -> Self {
+        match kind {
+            DefaultDeviceKind::Microphone => Self::Mic,
+            DefaultDeviceKind::SystemAudio => Self::SystemLoopback,
+        }
+    }
 }
 
 /// Kind of audio source to capture.
@@ -318,7 +365,7 @@ pub struct StreamConfig {
     pub device_id: Option<String>,
     /// Source kind.
     pub kind: SourceKind,
-    /// Chunk duration (ms). Fixed at 20.
+    /// Chunk duration (ms). Default 20; any other value returns InvalidArg.
     pub chunk_ms: u32,
     /// Chunk-ring capacity (number of chunks). Drops the oldest when full.
     pub ring_capacity_chunks: usize,
@@ -487,7 +534,7 @@ impl std::fmt::Display for Permission {
 pub enum Event {
     /// `count` chunks were dropped because the chunk ring was full.
     ChunkDropped {
-        /// Total (or incremental) number dropped since the previous notification.
+        /// Cumulative primary-tap chunk drops; excludes capture and secondary losses.
         count: u64,
     },
     /// Data stopped arriving; the stream was deemed stalled.
@@ -516,246 +563,37 @@ pub enum Event {
     },
     /// The capture device was lost (for example, disconnected).
     DeviceLost,
-    /// Other backend error (with description).
+    /// Legacy failure, conservatively terminal at the facade boundary.
     Error(String),
     /// Unrecoverable backend failure. Delivery and automatic recovery must stop.
     TerminalError {
         /// Original typed failure, retained by the stream after capture stops.
         error: Error,
     },
-}
-
-/// Errors that can occur during flexaudio-core operations.
-///
-/// Mark `#[non_exhaustive]` to allow future variants (external matches must include `_ =>`).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum Error {
-    /// Invalid argument.
-    #[error("invalid argument: {0}")]
-    InvalidArg(String),
-    /// Operation is not allowed in the current state.
-    #[error("invalid state: {0}")]
-    InvalidState(String),
-    /// Specified device was not found.
-    #[error("device not found")]
-    DeviceNotFound,
-    /// Permission was denied.
-    #[error("{permission} recording permission denied or not granted: {detail}. {guidance}", guidance = permission.guidance())]
-    PermissionDenied {
-        /// Recording permission that was not granted.
-        permission: Permission,
-        /// Specific cause of the denial or restriction.
-        detail: String,
+    /// Transient failure; capture and retries may continue.
+    RecoverableError {
+        /// Typed failure, independent of message text.
+        error: Error,
     },
-    /// The running OS version does not meet this feature's requirements.
-    #[error("unsupported OS version")]
-    UnsupportedOsVersion,
-    /// The device was lost while running.
-    #[error("device lost")]
-    DeviceLost,
-    /// Backend-specific error (with description).
-    #[error("backend error: {0}")]
-    Backend(String),
-    /// Requested output format (rate / channels) is unsupported.
-    #[error("unsupported output format: {0}")]
-    UnsupportedFormat(String),
-    /// The device configuration differs from the sink's advertised native format.
-    #[error("native input format changed from {advertised:?} to {actual:?} (Hz, channels); recreate the stream using the current device format")]
-    NativeFormatChanged {
-        /// Format used to configure the sink and normalizer.
-        advertised: (u32, u16),
-        /// Actual device configuration selected for capture.
-        actual: (u32, u16),
+    /// Cleanup failure; does not replace the capture primary.
+    ShutdownError {
+        /// Typed cleanup failure.
+        error: Error,
     },
-    /// Operation is unsupported in this environment.
-    #[error("unsupported")]
-    Unsupported,
+    /// Discarded audio, including observations with no subsequent PCM.
+    AudioLoss {
+        /// Validated interval report.
+        loss: AudioLoss,
+    },
+    /// Advisory coalesced upstream clipping; not associated with an exact output chunk.
+    Clipped,
+    /// Late microphone consent after Pending in the same live generation.
+    PermissionGranted,
 }
 
 /// Result type used throughout flexaudio-core.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn permission_errors_name_cause_settings_and_recovery() {
-        for permission in [Permission::Microphone, Permission::SystemAudio] {
-            let error = Error::PermissionDenied {
-                permission,
-                detail: "authorization is restricted".into(),
-            };
-            let message = error.to_string();
-            assert!(message.contains(&permission.to_string()));
-            assert!(message.contains("authorization is restricted"));
-            assert!(message.contains(permission.guidance()));
-            assert!(message.contains("Restart the app"));
-            assert!(message.contains("retry"));
-        }
-        assert_eq!(Permission::Microphone.as_str(), "microphone");
-        assert_eq!(Permission::SystemAudio.as_str(), "systemAudio");
-    }
-
-    #[test]
-    fn macos_permission_remedies_never_reference_windows() {
-        for (permission, setting) in [
-            (Permission::Microphone, "Privacy & Security > Microphone"),
-            (Permission::SystemAudio, "Screen & System Audio Recording"),
-        ] {
-            let remedy = permission_guidance(permission, PermissionPlatform::MacOs);
-            assert!(remedy.contains(setting));
-            assert!(remedy.contains("Restart the app"));
-            assert!(!remedy.contains("Windows"));
-        }
-    }
-
-    #[test]
-    fn windows_permission_remedies_never_reference_macos() {
-        let microphone = permission_guidance(Permission::Microphone, PermissionPlatform::Windows);
-        assert!(microphone.contains("Windows Settings > Privacy & security > Microphone"));
-        assert!(microphone.contains("Let desktop apps access your microphone"));
-        let system = permission_guidance(Permission::SystemAudio, PermissionPlatform::Windows);
-        assert!(system.contains("target process's access restrictions"));
-        assert!(system.contains("security policy"));
-        for remedy in [microphone, system] {
-            assert!(remedy.contains("Restart the app"));
-            assert!(!remedy.contains("macOS"));
-            assert!(!remedy.contains("System Settings"));
-        }
-    }
-
-    #[test]
-    fn default_stream_config_matches_contract() {
-        let c = StreamConfig::default();
-        assert_eq!(c.chunk_ms, 20);
-        assert_eq!(c.ring_capacity_chunks, 50);
-        assert_eq!(c.mode, ProcessMode::Include);
-        assert!(!c.exclude_self);
-        assert!(c.exclude_pids.is_empty(), "no pids excluded by default");
-        assert_eq!(c.kind, SourceKind::Mic);
-        assert_eq!(c.device_id, None);
-        assert_eq!(c.target_pid, None);
-        assert_eq!(c.gain, 1.0);
-        // Defaults for Mix-only fields (no device selected; pre-mix gain 1.0).
-        assert_eq!(c.mix_mic_device_id, None);
-        assert_eq!(c.mix_system_device_id, None);
-        assert_eq!(c.mix_mic_gain, 1.0);
-        assert_eq!(c.mix_system_gain, 1.0);
-        // Default output matches the internal canonical form (stage 2 pass-through).
-        assert_eq!(c.output.sample_rate, SAMPLE_RATE);
-        assert_eq!(c.output.channels, CHANNELS);
-        assert_eq!(c.output, OutputFormat::default());
-        // No secondary tap by default.
-        assert_eq!(c.secondary_output, None);
-    }
-
-    #[test]
-    fn output_format_chunk_frames_are_time_based() {
-        assert_eq!(
-            OutputFormat {
-                sample_rate: 48_000,
-                channels: 2
-            }
-            .chunk_frames(),
-            960
-        );
-        assert_eq!(
-            OutputFormat {
-                sample_rate: 16_000,
-                channels: 1
-            }
-            .chunk_frames(),
-            320
-        );
-        assert_eq!(
-            OutputFormat {
-                sample_rate: 8_000,
-                channels: 2
-            }
-            .chunk_frames(),
-            160
-        );
-    }
-
-    #[test]
-    fn output_format_validation_rejects_bad_configs() {
-        // ch=0 / ch=3 are unsupported.
-        assert!(OutputFormat {
-            sample_rate: 48_000,
-            channels: 0
-        }
-        .validate()
-        .is_err());
-        assert!(OutputFormat {
-            sample_rate: 48_000,
-            channels: 3
-        }
-        .validate()
-        .is_err());
-        // Extreme rates are unsupported.
-        assert!(OutputFormat {
-            sample_rate: 100,
-            channels: 1
-        }
-        .validate()
-        .is_err());
-        assert!(OutputFormat {
-            sample_rate: 1_000_000,
-            channels: 2
-        }
-        .validate()
-        .is_err());
-        // Valid configuration is OK.
-        assert!(OutputFormat {
-            sample_rate: 16_000,
-            channels: 1
-        }
-        .validate()
-        .is_ok());
-        assert!(OutputFormat::default().validate().is_ok());
-    }
-
-    #[test]
-    fn device_info_builds_and_clones() {
-        let mic = DeviceInfo {
-            id: "alsa_input.pci-0000_00_1f.3".into(),
-            name: "Built-in Microphone".into(),
-            source_kind: SourceKind::Mic,
-            sample_rate: 48_000,
-            channels: 2,
-            is_loopback: false,
-            is_default: true,
-        };
-        // Clone / PartialEq work (used to compare and duplicate enumeration results).
-        assert_eq!(mic, mic.clone());
-        assert!(!mic.is_loopback);
-        assert!(mic.is_default);
-        assert_eq!(mic.source_kind, SourceKind::Mic);
-
-        let sys = DeviceInfo {
-            source_kind: SourceKind::SystemLoopback,
-            is_loopback: true,
-            is_default: false,
-            ..mic.clone()
-        };
-        assert!(sys.is_loopback);
-        assert_ne!(mic, sys);
-    }
-
-    #[test]
-    fn process_mode_default_is_include() {
-        // Default is Include (capture only the target PID). Exclude must be explicitly selected.
-        assert_eq!(ProcessMode::default(), ProcessMode::Include);
-        assert_ne!(ProcessMode::Include, ProcessMode::Exclude);
-    }
-
-    #[test]
-    fn chunk_flags_are_distinct_bits() {
-        let all = ChunkFlags::DISCONTINUITY | ChunkFlags::RECOVERED | ChunkFlags::SILENCE;
-        assert_eq!(all.bits(), 0b111);
-        assert!(all.contains(ChunkFlags::SILENCE));
-        assert_eq!(ChunkFlags::default(), ChunkFlags::empty());
-    }
-}
+#[path = "types_tests.rs"]
+mod tests;

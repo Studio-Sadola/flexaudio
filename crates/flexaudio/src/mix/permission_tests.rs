@@ -89,7 +89,9 @@ fn either_child_denial_stops_both_lanes_and_gates_stream() {
 #[test]
 fn both_child_advisories_are_forwarded_without_stopping() {
     let stops = Arc::new(AtomicUsize::new(0));
-    let mic_event = Event::Error("mic notice".into());
+    let mic_event = Event::RecoverableError {
+        error: Error::Backend("mic notice".into()),
+    };
     let system_event = Event::SilenceWhileSourceActive {
         detail: "system notice".into(),
     };
@@ -175,10 +177,15 @@ fn busy_child_cannot_starve_other_mailbox() {
         stops,
     });
     let system = Box::new(Busy {
-        event: Event::Error("notice".into()),
+        event: Event::RecoverableError {
+            error: Error::Backend("notice".into()),
+        },
     });
     let mut mix = CompositeBackend::new(mic, system, 1.0, 1.0);
-    assert!(matches!(mix.poll_event(), Some(Event::Error(_))));
+    assert!(matches!(
+        mix.poll_event(),
+        Some(Event::RecoverableError { .. })
+    ));
     assert_eq!(mix.poll_event(), Some(denial(Permission::Microphone)));
 }
 

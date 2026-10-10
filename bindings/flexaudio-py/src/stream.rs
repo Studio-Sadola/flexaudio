@@ -633,7 +633,8 @@ mod tests {
                 Ok(_) => panic!("terminal polling must raise"),
             };
             assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
-            assert!(error.to_string().contains("denied by user"));
+            assert!(error.to_string().contains("recording permission denied"));
+            assert!(!error.to_string().contains("denied by user"));
             assert!(stream.poll_event().is_some());
             assert!(stream.terminal_error().is_some());
             let _ = stream.stop();
@@ -650,7 +651,8 @@ mod tests {
 try:
     stream.switch_source("invalid", exclude_pids=[False], denoise=True)
 except RuntimeError as error:
-    assert "denied by user" in str(error), str(error)
+    assert "recording permission denied" in str(error), str(error)
+    assert "denied by user" not in str(error), str(error)
 else:
     raise AssertionError("terminal error must precede source validation")
 "#

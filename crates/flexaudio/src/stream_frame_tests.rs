@@ -92,7 +92,10 @@ fn rebuild_accounts_for_discarded_capture_remainder() {
         next.is_some()
     });
     stream.stop();
-    assert_eq!(next.unwrap().frame_index, 973);
+    let next = next.unwrap();
+    assert_eq!(next.frame_index, 973);
+    assert!(next.flags.contains(ChunkFlags::DISCONTINUITY));
+    assert!(!next.flags.contains(ChunkFlags::PADDED));
 }
 
 #[test]
@@ -118,12 +121,12 @@ fn zero_rate_frame_index_is_a_typed_error() {
 
 #[test]
 fn intake_uses_one_shared_drain_path() {
-    let source = include_str!("stream.rs");
+    let source = include_str!("stream/intake.rs");
     let intake = source
-        .split("fn run_intake(")
+        .split("fn run_intake_inner(")
         .nth(1)
         .unwrap()
-        .split("/// Producer-only advancement")
+        .split("struct OutputRings")
         .next()
         .unwrap();
     assert!(
@@ -131,7 +134,7 @@ fn intake_uses_one_shared_drain_path() {
         "intake lines: {}",
         intake.lines().count()
     );
-    assert_eq!(intake.matches("tap_drain::drain(").count(), 3);
+    assert_eq!(source.matches("tap_drain::drain(").count(), 3);
 }
 
 #[test]

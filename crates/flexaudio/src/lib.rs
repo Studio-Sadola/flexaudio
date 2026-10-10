@@ -25,8 +25,10 @@ pub use stream::Stream;
 // use `flexaudio::{StreamConfig, SourceKind, ...}` without going through `flexaudio::core`.
 pub use flexaudio_core::backend::CaptureBackend;
 pub use flexaudio_core::types::{
-    AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Error, Event, OutputFormat, Permission,
-    ProcessInfo, ProcessMode, Result, SecondaryChunk, SourceKind, StreamConfig,
+    AudioChunk, AudioLoss, AudioPath, ChunkFlags, DefaultDeviceKind, DeviceEvent, DeviceInfo,
+    Error, ErrorContext, ErrorGroup, ErrorKind, Event, LossReason, MixLane, NativeStatus,
+    Operation, OutputFormat, OutputTap, Permission, ProcessInfo, ProcessMode, Result,
+    SecondaryChunk, ShutdownReport, SourceKind, StreamConfig,
 };
 
 /// Return audio devices for all sources in one list.
@@ -42,33 +44,33 @@ pub use flexaudio_core::types::{
 /// Each [`DeviceInfo`] uses the most stable available key for `id` (cpal=device name /
 /// PipeWire=`node.name`). The OS default device has `is_default` set.
 ///
-/// # OS-specific behavior
-/// - Linux: Combine cpal microphones with PipeWire sinks and sources. If there is no PipeWire
-///   session, the PipeWire portion is empty and only cpal devices are returned.
-/// - Windows / macOS: Combine cpal microphones with OS output endpoints.
-///
-/// Does not panic when devices are absent or enumeration fails; returns the devices found
-/// (often an empty list).
+/// Success means a complete authoritative inventory across every provider.
+/// A confirmed empty inventory is valid; query failure returns Err, even if another
+/// provider returned devices. A partial inventory must never be treated as complete.
 pub fn devices() -> Result<Vec<DeviceInfo>> {
     // Microphone input (cpal) is common to all OSes. Linux extends this with PipeWire devices,
     // so mut is needed there; other OSes do not extend it. The allow handles this difference.
     #[allow(unused_mut)]
-    let mut all = flexaudio_mic::list_devices()?;
+    let mut all = flexaudio_mic::list_devices()
+        .map_err(|error| error.with_context(ErrorContext::new(Operation::Enumerate)))?;
 
     // System output endpoints are OS-specific.
     #[cfg(target_os = "linux")]
     {
-        let linux = flexaudio_os_linux::list_devices()?;
+        let linux = flexaudio_os_linux::list_devices()
+            .map_err(|error| error.with_context(ErrorContext::new(Operation::Enumerate)))?;
         all.extend(linux);
     }
     #[cfg(target_os = "windows")]
     {
-        let win = flexaudio_os_windows::list_output_devices()?;
+        let win = flexaudio_os_windows::list_output_devices()
+            .map_err(|error| error.with_context(ErrorContext::new(Operation::Enumerate)))?;
         all.extend(win);
     }
     #[cfg(target_os = "macos")]
     {
-        let mac = flexaudio_os_macos::list_output_devices()?;
+        let mac = flexaudio_os_macos::list_output_devices()
+            .map_err(|error| error.with_context(ErrorContext::new(Operation::Enumerate)))?;
         all.extend(mac);
     }
 
@@ -81,14 +83,8 @@ pub fn devices() -> Result<Vec<DeviceInfo>> {
 /// and default-device changes as [`DeviceEvent`] values. These are device-level events,
 /// separate from capture-stream-level [`core::Event`].
 ///
-/// # OS-specific behavior and degraded mode
-/// - Linux: Persistently monitor the PipeWire registry (`flexaudio-os-linux`). If the PipeWire
-///   daemon is absent or a connection fails, degrade to [`NoopWatcher`](device_watcher) and
-///   return `Ok` (no device-change events arrive, like `devices()` returning an empty list
-///   when the daemon is absent).
-/// - Other OSes: Always no-op (device changes are not reported).
-///
-/// Degrades without panicking when PipeWire is absent, so this normally returns `Ok`.
+/// Linux watches the PipeWire registry and returns Err on startup failure.
+/// Unsupported platforms intentionally provide a no-op watcher.
 pub fn watch_devices() -> Result<DeviceWatcher> {
     device_watcher::watch_devices()
 }
@@ -160,6 +156,7 @@ pub fn watch_devices() -> Result<DeviceWatcher> {
 /// # Ok::<(), flexaudio::Error>(())
 /// ```
 pub fn open(config: StreamConfig) -> Result<Stream> {
+    stream::validate_chunk_ms(config.chunk_ms)?;
     // Validate the output format early. Stream::open also checks it, but errors should be
     // returned before constructing the backend.
     config.output.validate()?;
@@ -212,6 +209,7 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
     // Error is used by multiple branches (missing PID -> InvalidArg, unsupported OS -> Unsupported),
     // so import it at the top of the function.
     use flexaudio_core::types::Error;
+    stream::validate_chunk_ms(config.chunk_ms)?;
 
     let backend: Box<dyn CaptureBackend> = match config.kind {
         // Microphone input is common to all OSes (cpal). device_id selects an input device

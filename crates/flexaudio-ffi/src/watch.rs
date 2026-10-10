@@ -93,15 +93,28 @@ fn device_event_to_c(ev: DeviceEvent) -> FlexDeviceEvent {
             kind: FlexDeviceEventKind::DefaultChanged,
             id: string_to_c(id),
             name: std::ptr::null_mut(),
-            source_kind: source_kind_to_c(kind),
+            source_kind: source_kind_to_c(kind.into()),
             sample_rate: 0,
             channels: 0,
             is_loopback: false,
             is_default: false,
         },
         // DeviceEvent is #[non_exhaustive]. Preserve unknown kinds as Unknown; do not discard them.
-        other => {
-            set_last_error(format!("unknown device event: {other:?}"));
+        DeviceEvent::DefaultCleared { .. } | DeviceEvent::RescanRequired { .. } => {
+            set_last_error("unknown device event: pending 0.5 binding support".to_string());
+            FlexDeviceEvent {
+                kind: FlexDeviceEventKind::Unknown,
+                id: std::ptr::null_mut(),
+                name: std::ptr::null_mut(),
+                source_kind: FlexSourceKind::Mic,
+                sample_rate: 0,
+                channels: 0,
+                is_loopback: false,
+                is_default: false,
+            }
+        }
+        _ => {
+            set_last_error("unknown device event".to_string());
             FlexDeviceEvent {
                 kind: FlexDeviceEventKind::Unknown,
                 id: std::ptr::null_mut(),
@@ -124,9 +137,8 @@ pub struct FlexWatcher {
 
 /// Start monitoring device connection and default changes, then return a watcher handle.
 ///
-/// On Linux, continuously monitor the PipeWire registry. If PipeWire is unavailable or the OS is
-/// unsupported, degrade to a no-op and return a valid handle (no device events arrive; poll always
-/// returns 0). Only failures return NULL + last_error. Release the returned handle with
+/// On Linux, continuously monitor the PipeWire registry. Startup failure returns NULL
+/// with last_error. Unsupported operating systems return a valid no-op handle. Release it with
 /// `flexaudio_watcher_free`.
 #[no_mangle]
 pub extern "C" fn flexaudio_watch_devices() -> *mut FlexWatcher {
@@ -136,6 +148,8 @@ pub extern "C" fn flexaudio_watch_devices() -> *mut FlexWatcher {
             Ok(inner) => Box::into_raw(Box::new(FlexWatcher { inner })),
             Err(e) => {
                 set_last_error(e.to_string());
+                #[cfg(test)]
+                crate::error::record_open_failure(e);
                 std::ptr::null_mut()
             }
         }
@@ -217,23 +231,31 @@ mod tests {
     use flexaudio::{DeviceInfo, SourceKind};
     use std::ffi::CStr;
 
-    /// One watch → poll → free cycle (safely degrades when PipeWire is unavailable).
+    /// One watch → poll → free cycle, or a typed startup failure without a panic.
     #[test]
     fn watch_poll_free_smoke() {
         let w = flexaudio_watch_devices();
-        assert!(
-            !w.is_null(),
-            "watch_devices is designed to degrade and always return a handle"
-        );
+        if w.is_null() {
+            let error = crate::error::take_open_failure()
+                .expect("NULL must retain a typed watcher startup failure, not a panic");
+            let message = crate::error::last_error_ptr();
+            assert!(!message.is_null());
+            assert_eq!(
+                unsafe { CStr::from_ptr(message) }.to_str().unwrap(),
+                error.to_string(),
+            );
+            unsafe { flexaudio_watcher_free(w) };
+            return;
+        }
         let mut ev = std::mem::MaybeUninit::<FlexDeviceEvent>::uninit();
-        // Returns 0 when degraded (none currently available); it must not be negative.
+        // A valid watcher returns either no event or one owned event.
         let rc = unsafe { flexaudio_watcher_poll(w, ev.as_mut_ptr()) };
+        unsafe { flexaudio_watcher_free(w) };
         assert!(rc >= 0, "poll returned an error: {rc}");
         if rc == 1 {
             // Release the event if one was retrieved.
             unsafe { flexaudio_device_event_free(ev.as_mut_ptr()) };
         }
-        unsafe { flexaudio_watcher_free(w) };
     }
 
     /// NULL handle and NULL output destination are InvalidArg. Freeing NULL is safe.
@@ -297,7 +319,7 @@ mod tests {
 
         // DefaultChanged: id + source_kind.
         let mut def = device_event_to_c(DeviceEvent::DefaultChanged {
-            kind: SourceKind::SystemLoopback,
+            kind: flexaudio::DefaultDeviceKind::SystemAudio,
             id: "sink-3".to_string(),
         });
         assert_eq!(def.kind, FlexDeviceEventKind::DefaultChanged);
