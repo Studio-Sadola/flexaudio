@@ -54,6 +54,18 @@ pub(crate) struct SileroEngine {
 }
 
 impl SileroEngine {
+    /// Checked boundary used only by the additive whisper-compatible session.
+    pub(crate) fn infer_checked_16k_frame(&mut self, frame: &[f32]) -> Result<f32, VadError> {
+        let probability = self.infer_16k_frame(frame)?;
+        if !probability.is_finite()
+            || !(0.0..=1.0).contains(&probability)
+            || self.state.iter().any(|value| !value.is_finite())
+        {
+            return Err(VadError::Inference("nonfinite state or invalid probability".into()));
+        }
+        Ok(probability)
+    }
+
     /// Optimize the embedded model with `into_optimized` and build the inference plan.
     pub(crate) fn load() -> Result<Self, VadError> {
         let (plan, input_ix, state_ix, output_ix, state_out_ix) = load_plan()?;

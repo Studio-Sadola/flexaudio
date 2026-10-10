@@ -853,6 +853,8 @@ name = "flexaudio-vad"
 version = "0.4.0"
 dependencies = [
  "rubato",
+ "serde",
+ "serde_json",
  "tract-onnx",
 ]
 
