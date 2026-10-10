@@ -1,13 +1,11 @@
 //! Device-free capture lifecycle and wait-result validation.
 
 use flexaudio_core::types::{Error, Result};
+use flexaudio_core::{ErrorContext, Operation, ShutdownReport};
 
-/// Add startup context without erasing errors callers handle by variant.
-pub(crate) fn keepalive_error(context: &str, error: Error) -> Error {
-    match error {
-        Error::Backend(message) => Error::Backend(format!("{context}: {message}")),
-        error => error,
-    }
+/// Add startup context without erasing the underlying error kind.
+pub(crate) fn keepalive_error(error: Error) -> Error {
+    error.with_context(ErrorContext::new(Operation::Start))
 }
 
 /// Operations used by the owner thread; implementations own their OS resources.
@@ -41,9 +39,7 @@ impl<C: StreamClient, K: StreamClient> Session<C, K> {
         };
         let start = (|| {
             if let Some(render) = session.keepalive.as_mut() {
-                render.fill_silence().map_err(|error| {
-                    keepalive_error("cannot prime classic loopback silent keepalive", error)
-                })?;
+                render.fill_silence().map_err(keepalive_error)?;
                 render.start()?;
                 session.render_started = true;
             }
@@ -52,8 +48,8 @@ impl<C: StreamClient, K: StreamClient> Session<C, K> {
             Ok(())
         })();
         if let Err(error) = start {
-            let _ = session.stop();
-            report(Err(error));
+            let cleanup = session.stop().err().into_iter().collect();
+            report(ShutdownReport::new(Some(error), cleanup).result());
             return None;
         }
         if !report(Ok(())) {
@@ -69,7 +65,7 @@ impl<C: StreamClient, K: StreamClient> Session<C, K> {
         Ok(())
     }
 
-    /// Attempt both stops even when capture stop fails; preserve the first error.
+    /// Attempt both stops even when capture stop fails; preserve every failure.
     pub(crate) fn stop(&mut self) -> Result<()> {
         let capture = if self.capture_started {
             self.capture_started = false;
@@ -86,7 +82,11 @@ impl<C: StreamClient, K: StreamClient> Session<C, K> {
         } else {
             Ok(())
         };
-        capture.and(render)
+        ShutdownReport::new(
+            None,
+            capture.err().into_iter().chain(render.err()).collect(),
+        )
+        .result()
     }
 }
 
@@ -328,22 +328,22 @@ mod tests {
             permission: flexaudio_core::types::Permission::SystemAudio,
             detail: "keepalive access denied".into(),
         };
-        assert_eq!(keepalive_error("create keepalive", denied.clone()), denied);
+        assert_eq!(keepalive_error(denied.clone()).root(), &denied);
         assert!(matches!(
-            keepalive_error("create keepalive", Error::DeviceNotFound),
+            keepalive_error(Error::DeviceNotFound).root(),
             Error::DeviceNotFound
         ));
         assert!(matches!(
-            keepalive_error("create keepalive", Error::UnsupportedFormat("format".into())),
+            keepalive_error(Error::UnsupportedFormat("format".into())).root(),
             Error::UnsupportedFormat(message) if message == "format"
         ));
     }
 
     #[test]
-    fn keepalive_context_enriches_backend_messages() {
+    fn keepalive_context_keeps_explanation_and_operation() {
         assert!(matches!(
-            keepalive_error("create keepalive", Error::Backend("Initialize failed".into())),
-            Error::Backend(message) if message == "create keepalive: Initialize failed"
+            keepalive_error(Error::Backend("native initialization failed".into())),
+            Error::Context { source, context } if matches!(*source, Error::Backend(ref message) if message == "native initialization failed") && context.operation() == Operation::Start
         ));
     }
 }

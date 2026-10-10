@@ -13,6 +13,7 @@ use std::ptr::NonNull;
 
 use flexaudio_core::clock::monotonic_now_ns;
 use flexaudio_core::types::{Error, Permission};
+use flexaudio_core::{ErrorContext, NativeStatus, Operation};
 
 use objc2_core_audio::{
     kAudioHardwareBadPropertySizeError, kAudioHardwarePropertyTranslatePIDToProcessObject,
@@ -20,7 +21,10 @@ use objc2_core_audio::{
     kAudioTapPropertyFormat, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
     AudioObjectID, AudioObjectPropertyAddress,
 };
-use objc2_core_audio_types::{kAudioFormatFlagIsFloat, AudioStreamBasicDescription};
+use objc2_core_audio_types::{
+    kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved,
+    kAudioFormatLinearPCM, AudioStreamBasicDescription,
+};
 use objc2_core_foundation::{CFRetained, CFString};
 
 /// CoreAudio's `OSStatus` success value, `noErr`.
@@ -43,7 +47,11 @@ pub(crate) fn now_ns() -> i64 {
 /// The first capture's OS prompt is the authoritative permission check (no private TCC SPI), so
 /// this only best-effort maps statuses that look like denials. Other statuses become
 /// [`Error::Backend`].
-pub(crate) fn map_os_status(ctx: &str, status: i32) -> Error {
+pub(crate) fn map_os_status(call: &'static str, status: i32) -> Error {
+    map_os_status_at(Operation::Start, call, status)
+}
+
+pub(crate) fn map_os_status_at(operation: Operation, call: &'static str, status: i32) -> Error {
     // Representative CoreAudio OSStatus values (four-character codes).
     // 'who?' = kAudioHardwareUnknownPropertyError, '!obj' = kAudioHardwareBadObjectError,
     // 'nope' = kAudioHardwareIllegalOperationError, 'stop' = kAudioHardwareNotRunningError,
@@ -53,31 +61,37 @@ pub(crate) fn map_os_status(ctx: &str, status: i32) -> Error {
     const BAD_OBJECT: i32 = 0x216f626a; // '!obj'
     const BAD_DEVICE: i32 = 0x21646576; // '!dev' — requested device is missing or invalid
 
-    match status {
+    let error = match status {
         // 'nope' (illegal operation) can also mean tap/aggregate creation was denied due to
         // missing permission, so map it to PermissionDenied (typical when the OS prompt is denied).
         ILLEGAL_OPERATION => Error::PermissionDenied {
             permission: Permission::SystemAudio,
-            detail: format!("{ctx}: Core Audio rejected the operation (OSStatus 'nope'); system/process recording access may have been denied"),
+            detail: "Core Audio rejected the operation; system/process recording access may have been denied".into(),
         },
         // '!dev' (invalid device) indicates the requested device or endpoint is missing, so map it
         // to DeviceNotFound.
         BAD_DEVICE => Error::DeviceNotFound,
-        NOT_RUNNING => Error::Backend(format!("{ctx}: CoreAudio not running (OSStatus 'stop')")),
-        BAD_OBJECT => Error::Backend(format!("{ctx}: bad audio object (OSStatus '!obj')")),
+        NOT_RUNNING => Error::Backend("Core Audio is not running (OSStatus 'stop')".into()),
+        BAD_OBJECT => Error::Backend("bad audio object (OSStatus '!obj')".into()),
         other => {
             // Make the four-character code readable (four printable ASCII characters, or decimal).
             let be = (other as u32).to_be_bytes();
             if be.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
                 Error::Backend(format!(
-                    "{ctx}: OSStatus '{}' ({other})",
+                    "OSStatus '{}' ({other})",
                     String::from_utf8_lossy(&be)
                 ))
             } else {
-                Error::Backend(format!("{ctx}: OSStatus {other}"))
+                Error::Backend(format!("OSStatus {other}"))
             }
         }
-    }
+    };
+    error.with_context(
+        ErrorContext::new(operation).with_native_status(NativeStatus::OsStatus {
+            call,
+            value: status,
+        }),
+    )
 }
 
 /// Create a property address with the given scope and main element.
@@ -228,9 +242,8 @@ fn read_system_object_list_once(selector: u32) -> Result<Vec<AudioObjectID>, i32
 
 /// Read the tap's `kAudioTapPropertyFormat` (ASBD).
 ///
-/// Returns `None` if unavailable (the caller uses a fallback). Read both rate/channels and
-/// `mFormatFlags` (for float detection) here.
-fn read_tap_asbd(tap_id: AudioObjectID) -> Option<AudioStreamBasicDescription> {
+/// Fail closed if the property is unreadable or has an unexpected size.
+fn read_tap_asbd(tap_id: AudioObjectID) -> Result<AudioStreamBasicDescription, Error> {
     let address = global_address(kAudioTapPropertyFormat);
     // ASBD has no Default, so zero-initialize it and let the OS fill it in.
     // SAFETY: AudioStreamBasicDescription is a `#[repr(C)]` POD with only numeric fields, so zero
@@ -252,36 +265,58 @@ fn read_tap_asbd(tap_id: AudioObjectID) -> Option<AudioStreamBasicDescription> {
         )
     };
     if status != NO_ERR {
-        return None;
+        return Err(map_os_status(
+            "AudioObjectGetPropertyData(TapFormat)",
+            status,
+        ));
     }
-    Some(asbd)
+    if size as usize != core::mem::size_of::<AudioStreamBasicDescription>() {
+        return Err(Error::UnsupportedFormat(
+            "native format description has an invalid size".into(),
+        ));
+    }
+    Ok(asbd)
 }
 
-/// Read `(sample_rate, channels)` from the tap's ASBD. Returns `None` if unavailable.
-pub(crate) fn tap_native_format(tap_id: AudioObjectID) -> Option<(u32, u16)> {
-    let asbd = read_tap_asbd(tap_id)?;
-    let rate = asbd.mSampleRate as u32;
-    let channels = asbd.mChannelsPerFrame as u16;
-    if rate == 0 || channels == 0 {
-        return None;
-    }
-    Some((rate, channels))
+/// Read and validate the complete native f32 description before registering an IOProc.
+pub(crate) fn tap_native_format(tap_id: AudioObjectID) -> Result<(u32, u16), Error> {
+    validate_tap_asbd(&read_tap_asbd(tap_id)?)
 }
 
-/// Check whether the tap's ASBD indicates float samples (`kAudioFormatFlagIsFloat`).
-///
-/// The IOProc reads samples directly as f32 via `mData as *const f32`, so a non-float tap (such
-/// as int PCM) could cause UB. Call this during build and reject only when non-float is confirmed.
-/// If the ASBD cannot be read (`None`), the format is unknown, so the caller continues with its
-/// fallback behavior (assume float). Real hardware taps are always float, so an unavailable ASBD
-/// does not need to cause rejection.
-///
-/// - `Some(true)`: float bit is set.
-/// - `Some(false)`: float bit is absent (reject as non-float).
-/// - `None`: ASBD could not be read, so the format is unknown.
-pub(crate) fn tap_format_is_float(tap_id: AudioObjectID) -> Option<bool> {
-    let asbd = read_tap_asbd(tap_id)?;
-    Some((asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0)
+fn validate_tap_asbd(asbd: &AudioStreamBasicDescription) -> Result<(u32, u16), Error> {
+    if !asbd.mSampleRate.is_finite() || asbd.mSampleRate <= 0.0 || asbd.mChannelsPerFrame == 0 {
+        return Err(Error::InvalidArg(
+            "native rate and channels must be positive".into(),
+        ));
+    }
+    if asbd.mSampleRate.fract() != 0.0
+        || asbd.mSampleRate > f64::from(u32::MAX)
+        || asbd.mChannelsPerFrame > 2
+    {
+        return Err(Error::UnsupportedFormat(
+            "native input must use an integer rate and at most two channels".into(),
+        ));
+    }
+    let channels = u16::try_from(asbd.mChannelsPerFrame)
+        .map_err(|_| Error::UnsupportedFormat("native channel count is unsupported".into()))?;
+    let frame_bytes = if asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0 {
+        4
+    } else {
+        u32::from(channels) * 4
+    };
+    if asbd.mFormatID != kAudioFormatLinearPCM
+        || asbd.mFormatFlags & kAudioFormatFlagIsFloat == 0
+        || asbd.mFormatFlags & kAudioFormatFlagIsBigEndian != 0
+        || asbd.mBitsPerChannel != 32
+        || asbd.mBytesPerFrame != frame_bytes
+        || asbd.mFramesPerPacket != 1
+        || asbd.mBytesPerPacket != frame_bytes
+    {
+        return Err(Error::UnsupportedFormat(
+            "native input must contain complete native-endian f32 PCM frames".into(),
+        ));
+    }
+    Ok((asbd.mSampleRate as u32, channels))
 }
 
 #[cfg(test)]
@@ -292,7 +327,7 @@ mod tests {
     #[test]
     fn map_os_status_maps_known_codes() {
         assert!(matches!(
-            map_os_status("x", 0x6e6f7065),
+            map_os_status("x", 0x6e6f7065).root(),
             Error::PermissionDenied {
                 permission: Permission::SystemAudio,
                 ..
@@ -300,10 +335,13 @@ mod tests {
         ));
         // '!dev' (invalid device) maps to DeviceNotFound.
         assert!(matches!(
-            map_os_status("x", 0x21646576),
+            map_os_status("x", 0x21646576).root(),
             Error::DeviceNotFound
         ));
-        assert!(matches!(map_os_status("x", 0x73746f70), Error::Backend(_)));
+        assert!(matches!(
+            map_os_status("x", 0x73746f70).root(),
+            Error::Backend(_)
+        ));
         // Four-character-code formatting (printable ASCII).
         let e = map_os_status("ctx", i32::from_be_bytes(*b"abcd"));
         assert!(format!("{e}").contains("abcd"));
@@ -314,6 +352,46 @@ mod tests {
     fn fallback_format_is_48k_stereo() {
         assert_eq!(FALLBACK_FORMAT, (48_000, 2));
     }
+
+    fn stereo_asbd() -> AudioStreamBasicDescription {
+        AudioStreamBasicDescription {
+            mSampleRate: 48_000.0,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat,
+            mBytesPerPacket: 8,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 8,
+            mChannelsPerFrame: 2,
+            mBitsPerChannel: 32,
+            mReserved: 0,
+        }
+    }
+
+    #[test]
+    fn native_description_accepts_complete_f32_and_rejects_unknown_layouts() {
+        let mut asbd = stereo_asbd();
+        assert_eq!(validate_tap_asbd(&asbd), Ok((48_000, 2)));
+        asbd.mFormatFlags |= kAudioFormatFlagIsNonInterleaved;
+        asbd.mBytesPerFrame = 4;
+        asbd.mBytesPerPacket = 4;
+        assert_eq!(validate_tap_asbd(&asbd), Ok((48_000, 2)));
+        asbd.mBitsPerChannel = 64;
+        assert_eq!(
+            validate_tap_asbd(&asbd).unwrap_err().kind(),
+            flexaudio_core::ErrorKind::UnsupportedFormat
+        );
+        let mut asbd = stereo_asbd();
+        asbd.mChannelsPerFrame = 4;
+        assert_eq!(
+            validate_tap_asbd(&asbd).unwrap_err().kind(),
+            flexaudio_core::ErrorKind::UnsupportedFormat
+        );
+        asbd.mChannelsPerFrame = 0;
+        assert_eq!(
+            validate_tap_asbd(&asbd).unwrap_err().kind(),
+            flexaudio_core::ErrorKind::InvalidArg
+        );
+    }
 }
 
 #[cfg(test)]
@@ -321,11 +399,21 @@ mod repro_tests {
     use super::*;
 
     #[test]
-    #[ignore = "repro: C F17 / D M7 native context"]
     fn repro_p7mac_bad_device_retains_operation_and_status() {
         let error = map_os_status("AudioDeviceStart", 0x21646576);
-        let message = error.to_string();
-        assert!(message.contains("AudioDeviceStart"));
-        assert!(message.contains("!dev") || message.contains("560227702"));
+        assert_eq!(error.kind(), flexaudio_core::ErrorKind::DeviceNotFound);
+        let Error::Context { context, .. } = &error else {
+            panic!("missing native context")
+        };
+        assert_eq!(context.operation(), Operation::Start);
+        assert_eq!(
+            context.native_status(),
+            Some(NativeStatus::OsStatus {
+                call: "AudioDeviceStart",
+                value: 0x21646576
+            })
+        );
+        assert!(!error.to_string().contains("AudioDeviceStart"));
+        assert!(error.to_string().contains("560227702"));
     }
 }

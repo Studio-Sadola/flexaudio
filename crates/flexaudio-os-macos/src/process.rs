@@ -24,6 +24,9 @@ use std::thread::{self, JoinHandle};
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::types::{Error, Event, ProcessMode, Result};
 
+use crate::owner::{stop_owner, OwnerShutdown};
+use flexaudio_core::{ErrorContext, Operation, ShutdownReport};
+
 use crate::common::{translate_pid_to_object, FALLBACK_FORMAT};
 use crate::probe::PublicationGate;
 use crate::system::run_tap_thread;
@@ -52,7 +55,8 @@ pub struct MacProcessBackend {
     /// Owner-reported terminal failure, retained after stop and mailbox consumption.
     terminal: Arc<TerminalFailure>,
     /// Handle for the thread that owns the tap chain (`Some` after start).
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<Result<()>>>,
+    shutdown: OwnerShutdown,
     /// Owner-thread notifications for the current capture generation.
     events: Option<mpsc::Receiver<Event>>,
     /// Native format `(rate, channels)`. Cache the fallback because the actual format is determined
@@ -70,6 +74,7 @@ impl MacProcessBackend {
             publication: Arc::new(PublicationGate::default()),
             terminal: Arc::new(TerminalFailure::default()),
             handle: None,
+            shutdown: OwnerShutdown::default(),
             events: None,
             native: FALLBACK_FORMAT,
         }
@@ -96,6 +101,11 @@ impl CaptureBackend for MacProcessBackend {
             return Ok(());
         }
 
+        let target_pid = i32::try_from(self.target_pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| Error::InvalidArg("target_pid must be in 1..=i32::MAX".into()))?;
+
         // Version gate: Process Tap requires macOS 14.4 or later. Check the OS version before
         // creating the tap; return the typed Error::UnsupportedOsVersion instead of converting a
         // raw OSStatus into a Backend error.
@@ -108,7 +118,6 @@ impl CaptureBackend for MacProcessBackend {
         let terminal = self.terminal.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let (event_tx, event_rx) = mpsc::channel();
-        let target_pid = self.target_pid;
         // ProcessMode is Copy, so it can be moved directly into the closure.
         let mode = self.mode;
 
@@ -116,11 +125,11 @@ impl CaptureBackend for MacProcessBackend {
             .name("flexaudio-macos-process".into())
             .spawn(move || {
                 // PID-to-AudioObjectID conversion calls CoreAudio, so do it on the owner thread.
-                let kind = match translate_pid_to_object(target_pid as i32) {
+                let kind = match translate_pid_to_object(target_pid) {
                     Ok(0) => {
                         // No audio object for the target process (silent or absent).
                         let _ = ready_tx.send(Err(Error::DeviceNotFound));
-                        return;
+                        return Ok(());
                     }
                     Ok(object_id) => match mode {
                         // INCLUDE (default): mix down only the target PID.
@@ -130,7 +139,7 @@ impl CaptureBackend for MacProcessBackend {
                     },
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
-                        return;
+                        return Ok(());
                     }
                 };
                 run_tap_thread(
@@ -141,44 +150,66 @@ impl CaptureBackend for MacProcessBackend {
                     terminal,
                     ready_tx,
                     event_tx,
-                );
+                )
             })
-            .map_err(|e| Error::Backend(format!("spawn macos process thread: {e}")))?;
+            .map_err(|_| {
+                ShutdownReport::new(
+                    Some(
+                        Error::Backend("capture owner thread could not be started".into())
+                            .with_context(ErrorContext::new(Operation::Start)),
+                    ),
+                    stop_owner(&self.publication, &self.stop_flag, None),
+                )
+                .result()
+                .expect_err("owner spawn failed")
+            })?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.handle = Some(handle);
+                self.shutdown.reset();
                 self.events = Some(event_rx);
                 Ok(())
             }
             Ok(Err(e)) => {
-                if matches!(e, Error::PermissionDenied { .. }) {
+                if e.permission().is_some() {
                     self.terminal.record(e.clone());
                 }
-                self.stop_flag.store(false, Ordering::SeqCst);
-                let _ = handle.join();
-                Err(e)
+                ShutdownReport::new(
+                    Some(e),
+                    stop_owner(&self.publication, &self.stop_flag, Some(handle)),
+                )
+                .result()
             }
-            Err(_) => {
-                self.stop_flag.store(false, Ordering::SeqCst);
-                let _ = handle.join();
-                Err(Error::Backend(
-                    "macos process thread exited before reporting readiness".into(),
-                ))
-            }
+            Err(_) => ShutdownReport::new(
+                Some(
+                    Error::Backend("capture owner exited before reporting readiness".into())
+                        .with_context(ErrorContext::new(Operation::Start)),
+                ),
+                stop_owner(&self.publication, &self.stop_flag, Some(handle)),
+            )
+            .result(),
         }
     }
 
     fn stop(&mut self) {
-        // Poison still sets cancellation, so shutdown remains fail-closed.
-        let _ = self.publication.cancel(&self.stop_flag);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        let _ = self.stop_checked();
+    }
+
+    fn stop_checked(&mut self) -> Result<()> {
+        self.shutdown.finish(
+            &self.publication,
+            &self.stop_flag,
+            &self.terminal,
+            self.handle.take(),
+        )
     }
 
     fn poll_event(&mut self) -> Option<Event> {
-        self.events.as_ref()?.try_recv().ok()
+        self.events
+            .as_ref()
+            .and_then(|events| events.try_recv().ok())
+            .or_else(|| self.shutdown.poll_event())
     }
 }
 
@@ -205,7 +236,7 @@ mod tests {
             let mut backend = MacProcessBackend::new(1234, ProcessMode::Include);
             // Only a completed Rust thread and in-memory ring are needed to
             // exercise the native-free early start and stop paths.
-            backend.handle = Some(thread::spawn(|| {}));
+            backend.handle = Some(thread::spawn(|| Ok(())));
             let sink = || {
                 let (producer, _consumer) = raw_ring(16);
                 RawSink::new(producer, 48_000, 2)
@@ -256,7 +287,6 @@ mod repro_tests {
     use flexaudio_core::raw_ring;
 
     #[test]
-    #[ignore = "repro: D L4 unchecked target PID"]
     fn repro_p7mac_oversized_target_pid_is_invalid_arg() {
         // On macOS 14.4+, this must fail before any native PID translation or tap creation.
         let mut backend = MacProcessBackend::new(u32::MAX, ProcessMode::Include);
@@ -270,14 +300,16 @@ mod repro_tests {
     }
 
     #[test]
-    #[ignore = "repro: C F37 / D L13 owner panic"]
     fn repro_p7mac_stop_reports_owner_panic() {
         let mut backend = MacProcessBackend::new(1, ProcessMode::Include);
         backend.handle = Some(thread::spawn(|| panic!("injected owner failure")));
         backend.stop();
+        let result = backend.stop_checked();
+        assert!(result.is_err());
         assert!(
-            backend.poll_event().is_some(),
-            "explicit stop must expose the owner panic"
+            matches!(backend.poll_event(), Some(Event::ShutdownError { error }) if matches!(error, Error::Context { context, .. } if context.operation() == Operation::Join))
         );
+        assert_eq!(backend.stop_checked(), result);
+        assert!(backend.poll_event().is_none());
     }
 }

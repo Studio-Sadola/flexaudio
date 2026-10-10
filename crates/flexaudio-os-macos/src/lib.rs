@@ -45,6 +45,8 @@ mod common;
 mod devices;
 #[cfg(target_os = "macos")]
 mod native_probe;
+#[cfg(target_os = "macos")]
+mod owner;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod probe;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
