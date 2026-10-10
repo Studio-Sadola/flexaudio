@@ -50,6 +50,11 @@ export interface JsProcessInfo {
  */
 export interface JsAudioChunk {
   data: Float32Array
+  /** Producer-assigned first frame in 48 kHz units; continues across recovery and source switches.
+   * At rates divisible by 50 each full chunk advances 960 before queue drops; other rates
+   * project cumulative produced frames by floor(totalFrames*48000/outputRate).
+   * Secondary uses its own tap timeline. */
+  frameIndex: bigint
   frames: number
   ptsNs: number
   seq: bigint
@@ -81,6 +86,11 @@ export interface JsSecondaryChunk {
   data: Int16Array | Float32Array
   /** 'f32' | 's16' (discriminator for narrowing the type of `data`). */
   encoding: string
+  /** Producer-assigned first frame in 48 kHz units; continues across recovery and source switches.
+   * At rates divisible by 50 each full chunk advances 960 before queue drops; other rates
+   * project cumulative produced frames by floor(totalFrames*48000/outputRate).
+   * Secondary uses its own tap timeline. */
+  frameIndex: bigint
   frames: number
   ptsNs: number
   seq: bigint
@@ -180,8 +190,10 @@ export type WhisperVadEvent = { epoch: number; seq: number } & (
 export type AttachedWhisperVadEvent = WhisperVadEvent
   | { type: 'epochStart'; epoch: number; seq: 0; captureSample: bigint; ptsNs: number }
 
-/** Attachment currently fails UnsupportedConversionClock until canonical producer provenance is available. */
-export interface WhisperVadStreamOptions extends WhisperVadParams {
+/** Attach one canonical VAD owner; tap selects only its event carrier. */
+export interface WhisperVadStreamOptions {
+  params?: Omit<WhisperVadParams, 'provisional'>
+  provisional?: boolean
   tap: 'primary' | 'secondary'
 }
 
@@ -194,6 +206,7 @@ export interface FrameProbabilities {
 export type WhisperVadErrorCode = 'InvalidParameter' | 'InvalidPcm' | 'InvalidProbability'
   | 'Overflow' | 'SessionFinished' | 'Inference' | 'ModelLoad' | 'FailedSession'
   | 'ConflictingVad' | 'UnsupportedTap' | 'UnsupportedConversionClock'
+  | 'InvalidStereoLength' | 'CaptureSampleOverflow' | 'PtsOutOfRange' | 'Conversion' | 'Stopped'
 
 /** Drain terminalEvents through the normal consumer even when a call throws. */
 export interface WhisperVadError extends Error {
@@ -426,7 +439,7 @@ export declare function watchDevices(onEvent: (event: JsDeviceEvent) => void): D
  * JS name is `__openMockStream`. Leading `__` marks it outside the public API. napi's default
  * conversion drops leading underscores, producing `openMockStream`, so `js_name` fixes the name.
  */
-export declare function __openMockStream(sampleRate: number, channels: number, freqHz: number, onChunk: (chunk: JsAudioChunk) => void, secondaryRate?: number | undefined | null, secondaryChannels?: number | undefined | null, secondaryEncoding?: string | undefined | null, vadThreshold?: number | undefined | null, vadTap?: string | undefined | null): FlexStream
+export declare function __openMockStream(sampleRate: number, channels: number, freqHz: number, onChunk: (chunk: JsAudioChunk) => void, secondaryRate?: number | undefined | null, secondaryChannels?: number | undefined | null, secondaryEncoding?: string | undefined | null, vadThreshold?: number | undefined | null, vadTap?: string | undefined | null, whisperVad?: WhisperVadStreamOptions | undefined | null): FlexStream
 /**
  * Recording stream handle. Internally, the bridge thread owns and polls `flexaudio::Stream`
  * and sends chunks/events to JS through TSFN.
@@ -478,6 +491,8 @@ export declare class FlexStream {
    * stop-flush. Throws if `stop()` has already completed.
    */
   flushVad(): void
+  /** Drain/finish/reset an attached epoch; its closing carrier is delivered before settlement. */
+  flushWhisperVad(): Promise<void>
   /**
    * Change input gain (linear multiplier). 1.0=unchanged, 2.0=about +6dB, 0.0=silence. Callable
    * any time during recording; takes effect on the next chunk (20ms granularity). Multiplied samples

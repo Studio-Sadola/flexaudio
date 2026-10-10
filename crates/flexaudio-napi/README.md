@@ -264,13 +264,15 @@ for the latest successful call, including an EOF tail. Processing an empty
 array clears that batch without advancing the frame timeline. One model frame
 consumes 512 samples (32 ms); that stride differs from the final 10 ms grid.
 
-`openStream` validates the additive flat `whisperVad: { ...params, tap }` option,
-including whole-stream exclusion against `vad`/`vadTap` and the requirement for
-an enabled secondary output when `tap: 'secondary'`. Attachment currently fails
-with `UnsupportedConversionClock` before opening a device: the shared stream
-does not yet provide producer-owned canonical capture indices and valid tail
-lengths. Output-chunk PTS or delivered frame counts cannot replace that metadata.
-Attached event delivery and `flushWhisperVad()` are therefore not available yet.
+`openStream` accepts `whisperVad: { params: { ... }, provisional: true, tap }`.
+Legacy `vad`/`vadTap` are mutually exclusive with attachment; secondary requires
+an enabled secondary output. One VAD owner consumes the producer's shared 48 kHz
+stereo branch before output conversion. The selected chunk carries
+`whisperVadEvents`, beginning each epoch with its exact `captureSample` bigint and
+`ptsNs` origin. Every audio chunk exposes `frameIndex: bigint` in 48 kHz units;
+output taps keep independent producer timelines across native restarts and gaps.
+`flushWhisperVad()` delivers an empty closing carrier before its promise resolves;
+`stop()` drains capture and closes its last epoch before settlement.
 
 Standalone tests do not open audio devices. After building/copying the addon as
 in `__test__/run-smoke.sh`, run

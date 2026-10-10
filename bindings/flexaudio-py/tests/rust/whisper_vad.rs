@@ -163,15 +163,6 @@ fn attached_epoch_origin_is_readonly_and_preserves_u64() {
         assert!(WhisperVadStreamOptions::new(py, None, false, "secondary").is_err());
         let conflict = validate_attachment(Some(&options), true).unwrap_err();
         assert!(conflict.is_instance_of::<WhisperVadValidationError>(py));
-        let clock = validate_attachment(Some(&options), false).unwrap_err();
-        assert_eq!(
-            clock
-                .value(py)
-                .getattr("code")
-                .unwrap()
-                .extract::<String>()
-                .unwrap(),
-            "UnsupportedConversionClock"
-        );
+        validate_attachment(Some(&options), false).unwrap();
     });
 }

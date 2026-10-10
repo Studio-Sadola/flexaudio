@@ -852,6 +852,7 @@ dependencies = [
 name = "flexaudio-vad"
 version = "0.4.0"
 dependencies = [
+ "flate2",
  "rubato",
  "serde",
  "serde_json",

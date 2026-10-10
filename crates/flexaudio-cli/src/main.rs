@@ -1972,6 +1972,7 @@ mod tests {
     /// Create a test chunk with identical interleaved samples.
     fn chunk_of(frames: usize, channels: usize, value: f32) -> AudioChunk {
         AudioChunk {
+            frame_index: 0,
             data: vec![value; frames * channels],
             frames,
             pts_ns: 0,
@@ -2015,6 +2016,7 @@ mod tests {
             .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
             .collect();
         let chunk = AudioChunk {
+            frame_index: 0,
             data,
             frames: 320,
             pts_ns: 0,
@@ -2320,6 +2322,7 @@ mod tests {
     #[test]
     fn write_chunk_s16_quantizes_and_clamps() {
         let chunk = AudioChunk {
+            frame_index: 0,
             // 0.0 / 1.0 / -1.0 / out-of-range 2.0 (-> clamp 32767) / -2.0 (-> clamp -32768).
             data: vec![0.0, 1.0, -1.0, 2.0, -2.0],
             frames: 5,
@@ -2346,6 +2349,7 @@ mod tests {
     #[test]
     fn write_chunk_f32_roundtrips() {
         let chunk = AudioChunk {
+            frame_index: 0,
             data: vec![0.25, -0.5, 0.75],
             frames: 3,
             pts_ns: 0,

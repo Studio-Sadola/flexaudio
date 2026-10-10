@@ -179,15 +179,47 @@ test('stream options reject conflicts and unsupported taps before opening any de
     rejectsCode(() => open({ whisperVad: { tap } }), 'UnsupportedTap');
   }
   for (const whisperVad of [{}, { tap: 5 }, { tap: 'primary', threshold: 1.1 },
-    { tap: 'primary', provisional: 'true' }, { tap: 'primary', params: {} }]) {
+    { tap: 'primary', provisional: 'true' }, { tap: 'primary', params: { threshold: 1.1 } }]) {
     rejectsCode(() => open({ whisperVad }), 'InvalidParameter');
   }
 });
 
-test('attachment fails closed without exact canonical capture provenance',
-  { skip: typeof native.openStream !== 'function' && 'standalone boundary addon has no capture API' }, () => {
-  const open = options => native.openStream({ kind: 'mic', ...options }, () => {});
-  rejectsCode(() => open({ whisperVad: { tap: 'primary' } }), 'UnsupportedConversionClock');
-  rejectsCode(() => open({ secondaryOutput: { rate: 16000, channels: 1, encoding: 's16' },
-    whisperVad: { tap: 'secondary' } }), 'UnsupportedConversionClock');
+test('attached primary and secondary close epochs before flush and stop settle',
+  { skip: typeof native.__openMockStream !== 'function' && 'addon has no fake capture API' }, async () => {
+  for (const tap of ['primary', 'secondary']) {
+    const chunks = [];
+    const events = [];
+    const stream = native.__openMockStream(48000, 2, 0, chunk => {
+      chunks.push(chunk);
+      const carrier = tap === 'primary' ? chunk : chunk.secondary;
+      if (carrier) events.push(...(carrier.whisperVadEvents ?? []));
+    }, tap === 'secondary' ? 16000 : undefined, 1, 's16', undefined, undefined,
+    { params: { threshold: 0, minSpeechDurationMs: 0, speechPadMs: 0 }, provisional: true, tap });
+    const deadline = Date.now() + 5000;
+    while (!events.some(event => event.type === 'provisionalSpeechStart')) {
+      assert.ok(Date.now() < deadline, 'fake capture timed out');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal(events[0].type, 'epochStart');
+    assert.equal(typeof events[0].captureSample, 'bigint');
+    assert.equal(events[0].captureSample, 0n);
+    assert.equal(typeof chunks[0].frameIndex, 'bigint');
+    await stream.flushWhisperVad();
+    assert.equal(events.at(-1).type, 'epochEnd');
+    assert.equal(chunks.at(-1).frames, 0);
+    await stream.stop();
+    assert.equal(chunks.at(-1).frames, 0);
+    await stream.stop();
+    const epochs = new Map();
+    for (const event of events) {
+      const epoch = epochs.get(event.epoch) ?? [];
+      epoch.push(event);
+      epochs.set(event.epoch, epoch);
+    }
+    for (const epoch of epochs.values()) {
+      assert.equal(epoch[0].type, 'epochStart');
+      assert.equal(epoch.at(-1).type, 'epochEnd');
+      epoch.forEach((event, seq) => assert.equal(event.seq, seq));
+    }
+  }
 });

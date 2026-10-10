@@ -155,21 +155,31 @@ pub(crate) fn stream_options(
     legacy: bool,
     legacy_tap: bool,
     secondary: bool,
-) -> Result<(), BoundaryError> {
+) -> Result<(WhisperVadParams, WhisperVadOptions, crate::VadTap), BoundaryError> {
     if legacy || legacy_tap {
         return Err(BoundaryError::ConflictingVad);
     }
     let object = object(value)?;
-    let mut allowed = PARAM_KEYS.to_vec();
-    allowed.extend(["provisional", "tap"]);
-    keys(&object, &allowed)?;
-    params(&object)?;
+    keys(&object, &["params", "provisional", "tap"])?;
+    let parameters = object
+        .get_named_property::<JsUnknown>("params")
+        .map_err(|_| invalid())?;
+    let parameters = match parameters.get_type().map_err(|_| invalid())? {
+        ValueType::Undefined => WhisperVadParams::default(),
+        _ => {
+            let parameters = self::object(parameters)?;
+            keys(&parameters, PARAM_KEYS)?;
+            params(&parameters)?
+        }
+    };
     let tap = object
         .get_named_property::<String>("tap")
         .map_err(|_| invalid())?;
-    validate_tap(&tap, secondary)?;
-    provisional(&object)?;
-    Ok(())
+    let tap = validate_tap(&tap, secondary)?;
+    let options = WhisperVadOptions {
+        provisional: provisional(&object)?,
+    };
+    Ok((parameters, options, tap))
 }
 
 fn validate_tap(tap: &str, secondary: bool) -> Result<crate::VadTap, BoundaryError> {

@@ -84,6 +84,8 @@ impl FlexStream {
             return Ok(None);
         };
 
+        self.whisper_origin.1 = self.whisper_origin.1.max(chunk.pts_ns);
+
         // A DISCONTINUITY chunk (resume after pause, source switch, or dropped audio) is not
         // contiguous with what came before, so clear the add-ons' history: otherwise the denoise
         // delay line replays pre-gap audio into the first samples and VAD keeps counting across a
@@ -229,6 +231,12 @@ mod tests {
         inner.start().expect("start");
         (
             FlexStream {
+                whisper: None,
+                whisper_events: Vec::new(),
+                whisper_origin: (0, 0),
+                whisper_error: None,
+                whisper_error_reported: false,
+                ready_chunks: std::collections::VecDeque::new(),
                 inner,
                 denoiser: None,
                 vad: Some(vad),

@@ -45,6 +45,16 @@ pub struct AudioChunk {
     pub data: Vec<f32>,
     /// Number of frames in the chunk (one sample per output channel per frame).
     pub frames: usize,
+    /// First frame on this tap's canonical 48 kHz output timeline (not an interleaved
+    /// scalar index). Assigned by the producer before queueing or dropping. Each full
+    /// 20 ms output chunk advances by 960 at rates divisible by 50. Other rates use
+    /// floor(total produced output frames * 48000 / output rate), retaining the rational
+    /// remainder across chunks and generations rather than rounding each increment.
+    /// Continues across native backend restart, reopen, recovery, pause and source switches. A dropped
+    /// chunk leaves a gap equal to its canonical frame length. DISCONTINUITY never
+    /// inserts wall-time silence: PTS and flags express the real-time gap. Within a
+    /// Whisper VAD epoch, an event at t ms maps to its capture origin + t * 48.
+    pub frame_index: u64,
     /// Normalized monotonic presentation timestamp (ns) of the first sample.
     pub pts_ns: i64,
     /// Monotonically increasing sequence number assigned by the stream layer.
@@ -78,6 +88,10 @@ pub struct SecondaryChunk {
     pub samples: Vec<f32>,
     /// Number of frames in the chunk (one sample per output channel per frame).
     pub frames: usize,
+    /// First frame on the secondary tap's own output timeline, expressed in 48 kHz
+    /// units. Same counting rule as AudioChunk::frame_index, but independent of the
+    /// primary's buffering and drops; never use it to pair taps or anchor canonical VAD.
+    pub frame_index: u64,
     /// Presentation timestamp (ns) of the first sample, relative to recording start at 0.
     /// Uses the same recording clock as the primary [`AudioChunk`], but has independent values.
     pub pts_ns: i64,

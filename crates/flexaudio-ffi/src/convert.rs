@@ -215,9 +215,14 @@ pub fn chunk_to_c(chunk: AudioChunk) -> FlexChunk {
 
     // Convert Vec to a boxed slice and take its pointer and length. Even when empty, do not
     // return null (Box::into_raw returns a non-null dangling pointer), consistent with len=0.
-    let boxed: Box<[f32]> = chunk.data.into_boxed_slice();
-    let len = boxed.len();
-    let data = Box::into_raw(boxed) as *mut f32;
+    let len = chunk.data.len();
+    let mut storage = Vec::with_capacity(len + 2);
+    storage.push(f32::from_bits(chunk.frame_index as u32));
+    storage.push(f32::from_bits((chunk.frame_index >> 32) as u32));
+    storage.extend(chunk.data);
+    let allocation = Box::into_raw(storage.into_boxed_slice()) as *mut f32;
+    // Two private f32 words preserve the frame index without changing FlexChunk v1.
+    let data = unsafe { allocation.add(2) };
 
     FlexChunk {
         data,
@@ -244,7 +249,7 @@ pub fn chunk_to_c(chunk: AudioChunk) -> FlexChunk {
 pub unsafe fn free_chunk_data(chunk: &mut FlexChunk) {
     if !chunk.data.is_null() {
         // Reconstruct and drop the boxed slice using the same len allocated by chunk_to_c.
-        let slice = slice::from_raw_parts_mut(chunk.data, chunk.len);
+        let slice = slice::from_raw_parts_mut(chunk.data.sub(2), chunk.len + 2);
         drop(Box::from_raw(slice as *mut [f32]));
         chunk.data = ptr::null_mut();
         chunk.len = 0;
@@ -655,6 +660,7 @@ mod tests {
     #[test]
     fn chunk_to_c_keeps_ptr_and_len_consistent() {
         let chunk = AudioChunk {
+            frame_index: 9_007_199_254_740_993,
             data: vec![0.1, -0.2, 0.3, -0.4],
             frames: 2,
             pts_ns: 123,
@@ -665,6 +671,12 @@ mod tests {
             rms: 0.25,
         };
         let mut fc = chunk_to_c(chunk);
+        unsafe {
+            assert_eq!(
+                crate::flexaudio_chunk_frame_index(&fc),
+                9_007_199_254_740_993
+            );
+        }
         assert_eq!(fc.len, 4);
         assert_eq!(fc.frames, 2);
         assert_eq!(fc.flags, ChunkFlags::DISCONTINUITY.bits());
@@ -952,6 +964,7 @@ mod tests {
         // Allocate both data from chunk_to_c and appended vad_events; verify free_chunk_data
         // releases both and resets them to NULL/0 (double-free is safe too).
         let chunk = AudioChunk {
+            frame_index: 0,
             data: vec![0.0, 0.1, 0.2, 0.3],
             frames: 2,
             pts_ns: 0,

@@ -27,9 +27,9 @@ mod integration;
 mod types;
 mod vad;
 mod watch;
+mod whisper_integration;
 mod whisper_types;
 mod whisper_vad;
-mod whisper_integration;
 
 // This crate builds C libraries rather than an rlib, so compile the FFI regression tests
 // as a unit-test module while keeping their source under tests/.
@@ -170,6 +170,12 @@ unsafe fn open_with_exclude_pids(
         };
         match flexaudio::open(stream_config) {
             Ok(inner) => Box::into_raw(Box::new(FlexStream {
+                whisper: None,
+                whisper_events: Vec::new(),
+                whisper_origin: (0, 0),
+                whisper_error: None,
+                whisper_error_reported: false,
+                ready_chunks: std::collections::VecDeque::new(),
                 inner,
                 denoiser,
                 vad,
@@ -185,6 +191,9 @@ unsafe fn open_with_exclude_pids(
 }
 
 /// Stop the stream, then free it. NULL-safe.
+/// Attached v2 streams must be polled through their terminal carrier before free.
+/// If attached chunks remain unread, keep the handle alive and set last_error; poll
+/// with poll_chunk_v2 and call free again rather than silently losing closure events.
 ///
 /// # Safety
 /// `s` must be a handle returned by `flexaudio_open` (or NULL). Do not use `s` after freeing it.
@@ -192,11 +201,20 @@ unsafe fn open_with_exclude_pids(
 pub unsafe extern "C" fn flexaudio_free(s: *mut FlexStream) {
     // Use the i32 guard to catch panics; discard its return value.
     guard_i32(|| {
+        clear_last_error();
         if s.is_null() {
             return code::FLEX_OK;
         }
         let mut stream = Box::from_raw(s);
         stream.inner.stop();
+        stream.stop_whisper();
+        if !stream.ready_chunks.is_empty() || !stream.whisper_events.is_empty() {
+            set_last_error(
+                "PendingWhisperVadEvents: poll_chunk_v2 until drained, then call free again",
+            );
+            let _ = Box::into_raw(stream);
+            return code::FLEX_FAILURE;
+        }
         drop(stream);
         code::FLEX_OK
     });
@@ -234,6 +252,7 @@ pub unsafe extern "C" fn flexaudio_stop(s: *mut FlexStream) -> i32 {
             return code::FLEX_INVALID_ARG;
         };
         stream.inner.stop();
+        stream.stop_whisper();
         code::FLEX_OK
     })
 }
@@ -400,6 +419,10 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
             set_last_error("flexaudio_poll_chunk: out pointer is null");
             return code::FLEX_INVALID_ARG;
         }
+        if stream.whisper.is_some() {
+            set_last_error("InvalidState: attached streams require flexaudio_poll_chunk_v2");
+            return code::FLEX_INVALID_ARG;
+        }
         if let Some(error) = stream.inner.terminal_error() {
             return fail(error);
         }
@@ -419,6 +442,21 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
             }
         }
     })
+}
+
+/// Return the producer frame index in canonical 48 kHz units without changing v1 layout.
+/// NULL or a freed/zeroed chunk returns zero.
+/// # Safety
+/// Non-NULL must point to a live chunk returned by poll_chunk or poll_chunk_v2.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_chunk_frame_index(chunk: *const FlexChunk) -> u64 {
+    let Some(chunk) = chunk.as_ref() else {
+        return 0;
+    };
+    if chunk.data.is_null() {
+        return 0;
+    }
+    u64::from((*chunk.data.sub(2)).to_bits()) | (u64::from((*chunk.data.sub(1)).to_bits()) << 32)
 }
 
 /// Free the `data` filled by `flexaudio_poll_chunk` and set `data=NULL` / `len=0`.
@@ -777,6 +815,12 @@ mod permission_tests {
     #[test]
     fn terminal_poll_failure_keeps_code_reason_and_event_after_stop() {
         let mut stream = FlexStream {
+            whisper: None,
+            whisper_events: Vec::new(),
+            whisper_origin: (0, 0),
+            whisper_error: None,
+            whisper_error_reported: false,
+            ready_chunks: std::collections::VecDeque::new(),
             inner: denied_stream(),
             denoiser: None,
             vad: None,
@@ -808,6 +852,12 @@ mod permission_tests {
         )
         .expect("open mock");
         let stream = FlexStream {
+            whisper: None,
+            whisper_events: Vec::new(),
+            whisper_origin: (0, 0),
+            whisper_error: None,
+            whisper_error_reported: false,
+            ready_chunks: std::collections::VecDeque::new(),
             inner,
             denoiser: None,
             vad: None,

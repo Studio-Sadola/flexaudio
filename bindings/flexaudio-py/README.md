@@ -238,9 +238,11 @@ and uses the same streaming process/finish path with preview disabled.
 The additive capture option is `open(...,
 whisper_vad=WhisperVadStreamOptions(params=..., provisional=True, tap='primary'))`.
 It rejects simultaneous legacy `vad` with `ConflictingVad`, and secondary with
-`UnsupportedTap`. **Attachment currently fails before opening a device with
-`UnsupportedConversionClock`**: the capture facade does not expose authoritative
-canonical capture indices and valid tail lengths required by the exact origin
-contract. No timestamps are fabricated from polled chunks. Disabled attachment
-has `AudioChunk.whisper_vad_events=None`, and `flush_whisper_vad()` is a no-op.
+`UnsupportedTap`. The producer's shared 48 kHz stereo branch supplies valid PCM
+and authoritative frame indices before output conversion. Attached chunks carry
+`whisper_vad_events`; each epoch begins with its saved `capture_sample` and `pts_ns`
+origin. `AudioChunk.frame_index` is a producer-owned 48 kHz timeline position.
+`flush_whisper_vad()` and `stop()` queue ordered closing carriers even without new
+PCM. Poll until the terminal carrier is consumed before releasing the stream.
+Disabled attachment has `AudioChunk.whisper_vad_events=None` and flush is a no-op.
 Legacy `Vad` and its integration keep their existing behavior.

@@ -317,7 +317,7 @@ impl WhisperVadStreamOptions {
     }
 }
 
-/// Reject attachment before acquiring a device unless exact producer provenance exists.
+/// Validate attachment before acquiring a device.
 pub(crate) fn validate_attachment(
     options: Option<&WhisperVadStreamOptions>,
     legacy: bool,
@@ -333,14 +333,7 @@ pub(crate) fn validate_attachment(
                 "vad and whisper_vad are mutually exclusive",
             ));
         }
-        let error = WhisperVadRuntimeError::new_err("UnsupportedConversionClock: capture producer does not expose canonical sample provenance and valid tail frames");
-        error
-            .value(py)
-            .setattr("code", "UnsupportedConversionClock")?;
-        error
-            .value(py)
-            .setattr("terminal_events", Vec::<Py<PyAny>>::new())?;
-        Err(error)
+        Ok(())
     })
 }
 
@@ -364,3 +357,27 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 #[path = "../tests/rust/whisper_vad.rs"]
 mod tests;
+
+pub(crate) fn tap_error(error: flexaudio_vad::WhisperVadTapError) -> PyErr {
+    Python::attach(|py| {
+        let error_code = match &error {
+            flexaudio_vad::WhisperVadTapError::Vad(error) => code(error),
+            flexaudio_vad::WhisperVadTapError::InvalidStereoLength => "InvalidStereoLength",
+            flexaudio_vad::WhisperVadTapError::InvalidPcm { .. } => "InvalidPcm",
+            flexaudio_vad::WhisperVadTapError::CaptureSampleOverflow => "CaptureSampleOverflow",
+            flexaudio_vad::WhisperVadTapError::PtsOutOfRange => "PtsOutOfRange",
+            flexaudio_vad::WhisperVadTapError::UnsupportedConversionClock => {
+                "UnsupportedConversionClock"
+            }
+            flexaudio_vad::WhisperVadTapError::Conversion => "Conversion",
+            flexaudio_vad::WhisperVadTapError::Stopped => "Stopped",
+            flexaudio_vad::WhisperVadTapError::FailedSession => "FailedSession",
+        };
+        let result = WhisperVadRuntimeError::new_err(error.to_string());
+        let _ = result.value(py).setattr("code", error_code);
+        let _ = result
+            .value(py)
+            .setattr("terminal_events", Vec::<Py<PyAny>>::new());
+        result
+    })
+}

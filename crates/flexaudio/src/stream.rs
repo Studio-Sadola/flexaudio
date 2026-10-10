@@ -17,6 +17,9 @@
 //!   [`Event::StreamStalled`] on a stall and [`Event::StreamRecovered`] on recovery, and marks the
 //!   first post-recovery chunk with [`ChunkFlags::RECOVERED`] | [`ChunkFlags::DISCONTINUITY`].
 
+#[path = "capture_processor.rs"]
+mod capture_processor;
+
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -101,11 +104,20 @@ fn build_normalizer(
     secondary_output: Option<OutputFormat>,
 ) -> Result<Normalizer> {
     let mut n = Normalizer::new(rate, channels, output)?;
+    if shared.capture_enabled.load(Ordering::SeqCst) {
+        n = n.with_capture_tap()?;
+    }
     if let Some(sec) = secondary_output {
         n = n.with_secondary(sec)?;
     }
-    if let Some(proc) = build_inner_processor(shared) {
-        n = n.with_inner_processor(proc);
+    let processor = build_inner_processor(shared);
+    if shared.capture_enabled.load(Ordering::SeqCst) {
+        n = n.with_inner_processor(Box::new(capture_processor::CaptureProcessor::new(
+            processor,
+            shared.gain_bits.clone(),
+        )));
+    } else if let Some(processor) = processor {
+        n = n.with_inner_processor(processor);
     }
     Ok(n)
 }
@@ -144,6 +156,7 @@ pub struct Stream {
 
     /// Consumer end of the chunk ring, read by the caller.
     chunk_consumer: ChunkConsumer,
+    capture_consumer: Option<ChunkConsumer>,
 
     /// Secondary tap consumer (only when `config.secondary_output` is `Some`).
     secondary_consumer: Option<SecondaryChunkConsumer>,
@@ -162,6 +175,11 @@ pub struct Stream {
 
 /// State shared by the intake thread, watchdog thread, and main thread.
 struct SharedState {
+    primary_frame_index: AtomicU64,
+    secondary_frame_index: AtomicU64,
+    capture_frame_index: AtomicU64,
+    capture_enabled: AtomicBool,
+    capture_producer: Mutex<Option<ChunkProducer>>,
     /// Backend implementation, protected by a lock for reopen.
     backend: Mutex<Box<dyn CaptureBackend>>,
 
@@ -228,7 +246,7 @@ struct SharedState {
     /// Input gain (linear multiplier) stored as f32 bits (using `f32::to_bits`/`from_bits`).
     /// Initialized from config.gain in open(); set_gain() can update it during recording. The
     /// intake thread reads it per completed chunk and multiplies each sample when it is not 1.0.
-    gain_bits: AtomicU32,
+    gain_bits: Arc<AtomicU32>,
 
     /// Recording epoch (ns). Set once to the computed PTS of the first delivered primary chunk, then
     /// subtract it from all later chunks (primary and secondary) so recording starts at zero. The
@@ -411,6 +429,11 @@ impl Stream {
         let events = Arc::new(Mutex::new(VecDeque::new()));
 
         let shared = Arc::new(SharedState {
+            primary_frame_index: AtomicU64::new(0),
+            secondary_frame_index: AtomicU64::new(0),
+            capture_frame_index: AtomicU64::new(0),
+            capture_enabled: AtomicBool::new(false),
+            capture_producer: Mutex::new(None),
             backend: Mutex::new(backend),
             raw_consumer: Mutex::new(None),
             raw_generation: AtomicU64::new(0),
@@ -426,7 +449,7 @@ impl Stream {
             paused: AtomicBool::new(false),
             delivery: Mutex::new(()),
             resume_generation: AtomicU64::new(0),
-            gain_bits: AtomicU32::new(config.gain.to_bits()),
+            gain_bits: Arc::new(AtomicU32::new(config.gain.to_bits())),
             recording_epoch_ns: AtomicI64::new(i64::MIN),
             denoise_enabled: AtomicBool::new(false),
             secondary_producer: Mutex::new(secondary_producer),
@@ -436,6 +459,7 @@ impl Stream {
             config,
             shared,
             chunk_consumer,
+            capture_consumer: None,
             secondary_consumer,
             events,
             worker: None,
@@ -444,10 +468,36 @@ impl Stream {
         })
     }
 
-    /// Start capture.
-    ///
-    /// Create RawRing, start the backend, and start the intake/processing and watchdog threads. Does
-    /// nothing if already started.
+    /// Enable the canonical 48 kHz stereo branch before starting capture.
+    /// The producer applies the same denoise and gain snapshot used by output taps.
+    /// This bounded queue is consumed off-callback; gaps retain producer frame indices.
+    pub fn enable_capture_tap(&mut self) -> Result<()> {
+        if self.started {
+            return Err(Error::InvalidArg(
+                "capture tap must be enabled before start".into(),
+            ));
+        }
+        if self.capture_consumer.is_none() {
+            let (producer, consumer) = chunk_ring(self.config.ring_capacity_chunks);
+            *self
+                .shared
+                .capture_producer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(producer);
+            self.capture_consumer = Some(consumer);
+            self.shared.capture_enabled.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// Poll valid canonical PCM for attached processing; frames exclude transport padding.
+    /// `frame_index` is the authoritative canonical source origin for WhisperVadTap.
+    pub fn poll_capture(&mut self) -> Option<AudioChunk> {
+        self.capture_consumer.as_mut()?.try_pop()
+    }
+
+    /// Start capture, the intake worker and watchdog. Repeated calls while running are a no-op.
+    /// A stopped stream is spent; native backend restarts happen inside the same intake lifetime.
     pub fn start(&mut self) -> Result<()> {
         if let Some(error) = self.terminal_error() {
             return Err(error);
@@ -1079,6 +1129,14 @@ fn run_intake(
     let mut seq: u64 = 0; // Primary tap sequence number.
     let mut sec_seq: u64 = 0; // Secondary tap sequence number (separate from primary).
     let mut current_generation = initial.generation;
+    let mut capture_discontinuity = shared.primary_frame_index.load(Ordering::SeqCst) != 0;
+    let mut capture_resume_generation = 0;
+    let mut capture_seq = 0;
+    let mut capture_producer = shared
+        .capture_producer
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     // Observe resume generations independently per tap. The secondary tap has a separate ring and
     // consumer, so reusing the primary's observed generation could miss marking its first chunk.
     // A new intake starts at generation 0. If resume() occurs between start() and worker startup, it
@@ -1113,7 +1171,7 @@ fn run_intake(
     // Pop scratch buffer (sized to the RawRing capacity so the whole ring can be drained in one call).
     let mut scratch = vec![0.0f32; RAW_RING_SAMPLES];
 
-    loop {
+    'intake: loop {
         if shared.terminal.is_failed() {
             break;
         }
@@ -1127,6 +1185,7 @@ fn run_intake(
         let gen = snapshot.generation;
         if gen != current_generation {
             current_generation = gen;
+            capture_discontinuity = true;
             // Pending delivery flags belong to the discarded normalizer, never its replacement.
             rec_primary = false;
             rec_secondary = false;
@@ -1148,6 +1207,9 @@ fn run_intake(
         // Fan out shared pending flags to each tap's local state. The watchdog is stopped by
         // switching during a source switch, so both flags should not be set together; if they are,
         // they are combined with OR.
+        if snapshot.recovered || snapshot.discontinuity {
+            capture_discontinuity = true;
+        }
         if snapshot.recovered {
             rec_primary = true;
             rec_secondary = true;
@@ -1161,6 +1223,21 @@ fn run_intake(
         let mut produced_any = false;
         let mut push_err: Option<Error> = None;
         let overflow_now = snapshot.overflows;
+        if shared.capture_enabled.load(Ordering::SeqCst) && overflow_now > overflow_baseline {
+            // No DSP history or partial chunk may bridge capture-side loss. Rebuild
+            // the normalized representation and reanchor its PTS, keeping stream counters.
+            let (rate, channels) = snapshot.native_format;
+            normalizer = match build_normalizer(&shared, rate, channels, output, secondary_output) {
+                Ok(normalizer) => normalizer,
+                Err(error) => {
+                    shared.push_event(Event::Error(format!(
+                        "normalizer rebuild after capture loss: {error}"
+                    )));
+                    break 'intake;
+                }
+            };
+            clock = ClockNormalizer::new();
+        }
         if snapshot.samples > 0 {
             let samples = &scratch[..snapshot.samples];
             // Device PTS: monotonic approximation based on the native sample rate (arrival time).
@@ -1186,6 +1263,7 @@ fn run_intake(
         // next primary and secondary chunks (loss before normalization affects both taps equally).
         // The PTS already reflects the gap through wall-clock re-anchoring.
         if overflow_now > overflow_baseline {
+            capture_discontinuity = true;
             disc_primary = true;
             disc_secondary = true;
         }
@@ -1196,10 +1274,66 @@ fn run_intake(
             normalizer.flush();
         }
 
+        // Capture mode applies one shared gain snapshot before output conversion.
+        // Legacy mode retains its existing per-output-block gain placement.
+        let gain = if shared.capture_enabled.load(Ordering::SeqCst) {
+            1.0
+        } else {
+            f32::from_bits(shared.gain_bits.load(Ordering::Relaxed))
+        };
+        if let Some(producer) = capture_producer.as_mut() {
+            while let Some((mut data, raw_pts)) = normalizer.pop_capture(stopping) {
+                let frames = data.len() / 2;
+                let frame_index =
+                    match advance_frame_index(&shared.capture_frame_index, frames as u64, 48_000) {
+                        Ok(index) => index,
+                        Err(error) => {
+                            shared.push_event(Event::Error(error.to_string()));
+                            break 'intake;
+                        }
+                    };
+                let _delivery = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
+                if shared.paused.load(Ordering::SeqCst) || shared.terminal.is_failed() {
+                    continue;
+                }
+                let resumed = shared.resume_generation.load(Ordering::SeqCst);
+                let mut flags = ChunkFlags::empty();
+                if capture_discontinuity || resumed != capture_resume_generation {
+                    flags |= ChunkFlags::DISCONTINUITY;
+                }
+                capture_discontinuity = false;
+                capture_resume_generation = resumed;
+                let pts_ns = apply_epoch(&shared, raw_pts);
+                apply_gain(&mut data, gain);
+                let (peak, rms) = peak_rms(&data);
+                producer.push(AudioChunk {
+                    data,
+                    frames,
+                    frame_index,
+                    pts_ns,
+                    seq: capture_seq,
+                    flags,
+                    dropped_before: 0,
+                    peak,
+                    rms,
+                });
+                capture_seq += 1;
+            }
+        }
         // --- Primary tap: drain all completed chunks into ChunkRing. ---
-        let gain = f32::from_bits(shared.gain_bits.load(Ordering::Relaxed));
         let mut emitted_any = false;
         while let Some((mut data, raw_pts)) = normalizer.pop_chunk() {
+            let frame_index = match advance_frame_index(
+                &shared.primary_frame_index,
+                (data.len() / out_channels) as u64,
+                output.sample_rate,
+            ) {
+                Ok(index) => index,
+                Err(error) => {
+                    shared.push_event(Event::Error(error.to_string()));
+                    break 'intake;
+                }
+            };
             // Discard while paused (out_frame_origin advances on pop, so PTS still progresses).
             // Keep pending flags for the first chunk after resume.
             if shared.paused.load(Ordering::SeqCst) {
@@ -1223,6 +1357,7 @@ fn run_intake(
             }
 
             let mut chunk = AudioChunk {
+                frame_index,
                 data,
                 frames,
                 pts_ns,
@@ -1271,6 +1406,17 @@ fn run_intake(
         // --- Secondary tap: only when configured; pop, discard, and add flags like the primary. ---
         if let Some(sec_prod) = secondary_producer.as_mut() {
             while let Some((mut samples, raw_pts)) = normalizer.pop_secondary() {
+                let frame_index = match advance_frame_index(
+                    &shared.secondary_frame_index,
+                    (samples.len() / sec_channels) as u64,
+                    secondary_output.expect("enabled secondary").sample_rate,
+                ) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        shared.push_event(Event::Error(error.to_string()));
+                        break 'intake;
+                    }
+                };
                 // Pop and discard secondary chunks while paused too (prevent unbounded out_buf growth).
                 if shared.paused.load(Ordering::SeqCst) {
                     continue;
@@ -1293,6 +1439,7 @@ fn run_intake(
                 }
 
                 let mut chunk = SecondaryChunk {
+                    frame_index,
                     samples,
                     frames,
                     pts_ns,
@@ -1337,6 +1484,23 @@ fn run_intake(
             thread::sleep(Duration::from_millis(2));
         }
     }
+    *shared
+        .capture_producer
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = capture_producer;
+}
+
+/// Producer-only advancement, outside the realtime callback. Never wrap the clock.
+fn advance_frame_index(counter: &AtomicU64, frames: u64, rate: u32) -> Result<u64> {
+    let previous = counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |index| {
+            let next = index.checked_add(frames)?;
+            u64::try_from(u128::from(next) * 48_000 / u128::from(rate)).ok()?;
+            Some(next)
+        })
+        .map_err(|_| Error::InvalidState("canonical frame timeline exhausted".into()))?;
+    u64::try_from(u128::from(previous) * 48_000 / u128::from(rate))
+        .map_err(|_| Error::InvalidState("canonical frame timeline exhausted".into()))
 }
 
 /// Watchdog thread body.
@@ -1821,6 +1985,7 @@ mod tests {
             Duration::from_millis(300),
         ));
         let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.enable_capture_tap().expect("canonical tap");
         stream.start().expect("start");
 
         let mut chunks: Vec<AudioChunk> = Vec::new();
@@ -1855,6 +2020,24 @@ mod tests {
             chunks.push(c);
         }
 
+        let capture: Vec<_> = std::iter::from_fn(|| stream.poll_capture()).collect();
+        assert!(!capture.is_empty());
+        assert!(capture
+            .iter()
+            .any(|chunk| chunk.flags.contains(ChunkFlags::DISCONTINUITY)));
+        for pair in capture.windows(2) {
+            assert_eq!(
+                pair[1].frame_index - pair[0].frame_index,
+                (pair[1].seq - pair[0].seq) * 960
+            );
+        }
+        for pair in chunks.windows(2) {
+            assert_eq!(
+                pair[1].frame_index - pair[0].frame_index,
+                (pair[1].seq - pair[0].seq) * 960,
+                "recovery must preserve the producer timeline, including queue drops"
+            );
+        }
         assert!(saw_stalled, "expected Event::StreamStalled to fire");
         assert!(saw_recovered, "expected Event::StreamRecovered to fire");
         assert!(
@@ -1890,6 +2073,7 @@ mod tests {
     /// With steady input (no stall), RECOVERED is never set and StreamStalled never arrives (regression
     /// check: the watchdog must not report a false positive). Check briefly with the regular
     /// MockBackend instead of configuring StallableMockBackend with a small, non-stalling interval.
+
     #[test]
     fn no_recovered_flag_under_steady_feed() {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
@@ -2690,6 +2874,14 @@ mod tests {
             secondary[0].pts_ns >= 0,
             "secondary PTS should be non-negative (based on primary epoch)"
         );
+        for pair in primary.windows(2) {
+            assert_eq!(pair[1].frame_index, pair[0].frame_index + 960);
+        }
+        for pair in secondary.windows(2) {
+            assert_eq!(pair[1].frame_index, pair[0].frame_index + 960);
+        }
+        assert_eq!(primary[0].frame_index, 0);
+        assert_eq!(secondary[0].frame_index, 0);
         // Secondary seq uses its own counter and increases from 0.
         assert_eq!(secondary[0].seq, 0);
         for w in secondary.windows(2) {
@@ -2922,3 +3114,7 @@ mod tests {
 
 #[cfg(test)]
 mod repro_tests;
+
+#[cfg(test)]
+#[path = "stream_frame_tests.rs"]
+mod frame_tests;

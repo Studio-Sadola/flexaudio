@@ -31,6 +31,20 @@
 // The handle state does not allow the operation (such as writing to finalized FLAC).
 #define FLEX_INVALID_STATE -4
 
+#define FLEX_STREAM_VERSION_2 2
+
+#define FLEX_WHISPER_PRIMARY 1
+
+#define FLEX_WHISPER_SECONDARY 2
+
+#define FLEX_WHISPER_UNSUPPORTED_TAP -5
+
+#define FLEX_WHISPER_UNSUPPORTED_CONVERSION_CLOCK -6
+
+#define FLEX_WHISPER_CONFLICTING_VAD -7
+
+#define FLEX_WHISPER_EPOCH_START 6
+
 #define FLEX_WHISPER_SEGMENT 1
 
 #define FLEX_WHISPER_SPEECH_START 2
@@ -50,20 +64,6 @@
 #define FLEX_WHISPER_ERROR 4
 
 #define FLEX_WHISPER_LIMIT 5
-
-#define FLEX_STREAM_VERSION_2 2
-
-#define FLEX_WHISPER_PRIMARY 1
-
-#define FLEX_WHISPER_SECONDARY 2
-
-#define FLEX_WHISPER_UNSUPPORTED_TAP -5
-
-#define FLEX_WHISPER_UNSUPPORTED_CONVERSION_CLOCK -6
-
-#define FLEX_WHISPER_CONFLICTING_VAD -7
-
-#define FLEX_WHISPER_EPOCH_START 6
 
 // Audio source kind to record (corresponds to [`flexaudio::SourceKind`]).
 typedef enum FlexSourceKind {
@@ -378,10 +378,23 @@ typedef struct FlexWhisperVadParams {
     int32_t speech_pad_ms;
 } FlexWhisperVadParams;
 
-// Preview policy. provisional must be 0 (disabled) or 1 (enabled).
-typedef struct FlexWhisperVadOptions {
+// Fixed-width new-mode attachment settings. Only primary is supported by this binding.
+typedef struct FlexWhisperVadStreamOptions {
+    struct FlexWhisperVadParams params;
+    // 0 or 1, never a default sentinel.
     uint8_t provisional;
-} FlexWhisperVadOptions;
+    // FLEX_WHISPER_PRIMARY or FLEX_WHISPER_SECONDARY.
+    uint32_t tap;
+} FlexWhisperVadStreamOptions;
+
+// Versioned envelope around the frozen v1 configuration. All pointers are borrowed during open.
+typedef struct FlexStreamConfigV2 {
+    uint32_t size;
+    uint32_t version;
+    const struct FlexConfig *config;
+    // NULL disables whisper attachment.
+    const struct FlexWhisperVadStreamOptions *whisper_vad;
+} FlexStreamConfigV2;
 
 // Half-open final interval on the 10 ms grid; its end may exceed physical EOF.
 typedef struct FlexWhisperSpeechSegment {
@@ -417,32 +430,6 @@ typedef union FlexWhisperVadPayload {
     struct FlexWhisperEpochEnd epoch_end;
 } FlexWhisperVadPayload;
 
-// Standalone ordered event. All times are epoch-relative integer milliseconds.
-typedef struct FlexWhisperVadEvent {
-    uint32_t type;
-    uint32_t epoch;
-    uint64_t seq;
-    union FlexWhisperVadPayload data;
-} FlexWhisperVadEvent;
-
-// Fixed-width new-mode attachment settings. Only primary is supported by this binding.
-typedef struct FlexWhisperVadStreamOptions {
-    struct FlexWhisperVadParams params;
-    // 0 or 1, never a default sentinel.
-    uint8_t provisional;
-    // FLEX_WHISPER_PRIMARY or FLEX_WHISPER_SECONDARY.
-    uint32_t tap;
-} FlexWhisperVadStreamOptions;
-
-// Versioned envelope around the frozen v1 configuration. All pointers are borrowed during open.
-typedef struct FlexStreamConfigV2 {
-    uint32_t size;
-    uint32_t version;
-    const struct FlexConfig *config;
-    // NULL disables whisper attachment.
-    const struct FlexWhisperVadStreamOptions *whisper_vad;
-} FlexStreamConfigV2;
-
 typedef struct FlexWhisperEpochStart {
     uint64_t capture_sample;
     int64_t pts_ns;
@@ -472,6 +459,19 @@ typedef struct FlexChunkV2 {
     struct FlexAttachedWhisperVadEvent *whisper_vad_events;
     uintptr_t whisper_vad_events_len;
 } FlexChunkV2;
+
+// Preview policy. provisional must be 0 (disabled) or 1 (enabled).
+typedef struct FlexWhisperVadOptions {
+    uint8_t provisional;
+} FlexWhisperVadOptions;
+
+// Standalone ordered event. All times are epoch-relative integer milliseconds.
+typedef struct FlexWhisperVadEvent {
+    uint32_t type;
+    uint32_t epoch;
+    uint64_t seq;
+    union FlexWhisperVadPayload data;
+} FlexWhisperVadEvent;
 
 // Open a stream from the configuration (without starting it). On failure, return NULL and
 // set last_error.
@@ -512,6 +512,9 @@ struct FlexStream *flexaudio_open_with_exclude_pids(const struct FlexConfig *con
                                                     uintptr_t exclude_pids_len);
 
 // Stop the stream, then free it. NULL-safe.
+// Attached v2 streams must be polled through their terminal carrier before free.
+// If attached chunks remain unread, keep the handle alive and set last_error; poll
+// with poll_chunk_v2 and call free again rather than silently losing closure events.
 //
 // # Safety
 // `s` must be a handle returned by `flexaudio_open` (or NULL). Do not use `s` after freeing it.
@@ -595,6 +598,12 @@ uint64_t flexaudio_dropped_chunks(const struct FlexStream *s);
 // # Safety
 // `s` must be a valid handle, and `out` must point to a valid `FlexChunk` destination.
 int32_t flexaudio_poll_chunk(struct FlexStream *s, struct FlexChunk *out);
+
+// Return the producer frame index in canonical 48 kHz units without changing v1 layout.
+// NULL or a freed/zeroed chunk returns zero.
+// # Safety
+// Non-NULL must point to a live chunk returned by poll_chunk or poll_chunk_v2.
+uint64_t flexaudio_chunk_frame_index(const struct FlexChunk *chunk);
 
 // Free the `data` filled by `flexaudio_poll_chunk` and set `data=NULL` / `len=0`.
 // Safe for NULL and repeated calls.
@@ -862,6 +871,33 @@ void flexaudio_device_event_free(struct FlexDeviceEvent *ev);
 // `w` must be a handle returned by `flexaudio_watch_devices`, or NULL. Do not use `w` after release.
 void flexaudio_watcher_free(struct FlexWatcher *w);
 
+// Open a versioned primary stream, returning a typed result code and last_error.
+// Attachment uses the producer canonical branch before output conversion.
+// # Safety
+// Config and its borrowed fields must be valid; out must be writable.
+int32_t flexaudio_open_v2(const struct FlexStreamConfigV2 *config, struct FlexStream **out);
+
+// Poll a versioned chunk: 1 available, 0 absent, negative result on error.
+// # Safety
+// Stream must be exclusively owned; out must be writable, with any prior chunk already freed.
+int32_t flexaudio_poll_chunk_v2(struct FlexStream *s, struct FlexChunkV2 *out);
+
+// Free all allocations in a versioned chunk, then clear its fields. NULL is safe.
+// # Safety
+// Non-NULL must be a chunk returned by poll_chunk_v2 and must not have been freed already.
+void flexaudio_chunk_free_v2(struct FlexChunkV2 *chunk);
+
+// Flush a whisper epoch. Disabled attachment is a no-op.
+// # Safety
+// s must be a valid, exclusively owned stream handle.
+int32_t flexaudio_flush_whisper_vad(struct FlexStream *s);
+
+// Borrow attached events until chunk_free_v2; NULL when none are present.
+// # Safety
+// chunk must point to a live versioned chunk; len must be writable when non-NULL.
+const struct FlexAttachedWhisperVadEvent *flexaudio_chunk_whisper_vad_events(const struct FlexChunkV2 *chunk,
+                                                                             uintptr_t *len);
+
 // Five pinned defaults. Supplied structs use literal fields, including zero.
 struct FlexWhisperVadParams flexaudio_whisper_vad_default_params(void);
 
@@ -947,26 +983,5 @@ void flexaudio_whisper_events_free(struct FlexWhisperVadEvent *v, uintptr_t len)
 // # Safety
 // Non-NULL must be an array of this exact type and original length returned by this API.
 void flexaudio_whisper_segments_free(struct FlexWhisperSpeechSegment *v, uintptr_t len);
-
-// Open a versioned primary stream, returning a typed result code and last_error.
-// Attachment fails closed until the capture producer supplies exact canonical provenance.
-// # Safety
-// Config and its borrowed fields must be valid; out must be writable.
-int32_t flexaudio_open_v2(const struct FlexStreamConfigV2 *config, struct FlexStream **out);
-
-// Poll a versioned chunk: 1 available, 0 absent, negative result on error.
-// # Safety
-// Stream must be exclusively owned; out must be writable, with any prior chunk already freed.
-int32_t flexaudio_poll_chunk_v2(struct FlexStream *s, struct FlexChunkV2 *out);
-
-// Free all allocations in a versioned chunk, then clear its fields. NULL is safe.
-// # Safety
-// Non-NULL must be a chunk returned by poll_chunk_v2 and must not have been freed already.
-void flexaudio_chunk_free_v2(struct FlexChunkV2 *chunk);
-
-// Flush a whisper epoch. Disabled attachment is a no-op.
-// # Safety
-// s must be a valid, exclusively owned stream handle.
-int32_t flexaudio_flush_whisper_vad(struct FlexStream *s);
 
 #endif  /* FLEXAUDIO_H */

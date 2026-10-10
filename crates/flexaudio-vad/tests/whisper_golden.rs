@@ -1,6 +1,8 @@
 //! Independent pinned-oracle fixtures provided by the coordinator.
+use flate2::read::GzDecoder;
 use flexaudio_vad::{WhisperVadParams, WhisperVadPostProcessor};
 use serde::Deserialize;
+use std::io::Read;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,22 +37,25 @@ fn pinned_whisper_cpp_golden_in_random_partitions() {
 }
 
 #[test]
-fn optional_extreme_pinned_whisper_cpp_golden_in_random_partitions() {
+fn extreme_pinned_whisper_cpp_golden_in_random_partitions() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/whisper_vad_golden_extreme.json");
-    match std::fs::read_to_string(&path) {
-        Ok(data) => check_fixture(&data),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "Optional extreme pinned whisper.cpp fixture is absent; skipping: {}",
-                path.display()
-            );
-        }
-        Err(error) => panic!(
-            "Optional extreme fixture is unreadable: {} ({error})",
+        .join("tests/fixtures/whisper_vad_golden_extreme.json.gz");
+    let file = std::fs::File::open(&path).unwrap_or_else(|error| {
+        panic!(
+            "Required extreme pinned whisper.cpp golden fixture is missing or unreadable: {} ({error}). The coordinator must provide it; this conformance test must not be skipped.",
             path.display()
-        ),
-    }
+        )
+    });
+    let mut data = String::new();
+    GzDecoder::new(file)
+        .read_to_string(&mut data)
+        .unwrap_or_else(|error| {
+            panic!(
+                "Required extreme pinned whisper.cpp golden fixture cannot be decoded: {} ({error})",
+                path.display()
+            )
+        });
+    check_fixture(&data);
 }
 
 fn check_fixture(data: &str) {

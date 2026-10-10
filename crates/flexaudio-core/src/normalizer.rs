@@ -97,6 +97,7 @@ pub struct Normalizer {
     // --- Output taps (each has its own stage 2, output buffer, and PTS state) ---
     /// Primary output tap (its [`OutputFormat`] is `output`).
     primary: OutputTap,
+    capture: Option<OutputTap>,
     /// Secondary output tap (when configured). Has stage 2 and PTS state independent of primary.
     secondary: Option<OutputTap>,
 }
@@ -191,6 +192,7 @@ impl Normalizer {
             total_inner_frames: 0,
             inner_processor: None,
             primary: OutputTap::new(output)?,
+            capture: None,
             secondary: None,
         })
     }
@@ -203,6 +205,27 @@ impl Normalizer {
     pub fn with_secondary(mut self, secondary: OutputFormat) -> Result<Self> {
         self.secondary = Some(OutputTap::new(secondary)?);
         Ok(self)
+    }
+
+    /// Enable a pre-output-conversion canonical branch for off-callback consumers.
+    /// Its stop tail contains valid frames only, never transport padding.
+    pub fn with_capture_tap(mut self) -> Result<Self> {
+        self.capture = Some(OutputTap::new(OutputFormat::default())?);
+        Ok(self)
+    }
+
+    /// Retrieve valid canonical stereo frames; allow a short final tail only at stop.
+    pub fn pop_capture(&mut self, stopping: bool) -> Option<(Vec<f32>, i64)> {
+        let tap = self.capture.as_mut()?;
+        let frames = tap.buffered_out_frames();
+        if frames == 0 || (frames < CHUNK_FRAMES && !stopping) {
+            return None;
+        }
+        let take = frames.min(CHUNK_FRAMES);
+        let pts = tap.pts_for_out_frame(tap.out_frame_origin);
+        let data = tap.out_buf.drain(..take * INNER_CH).collect();
+        tap.out_frame_origin += take as u64;
+        Some((data, pts))
     }
 
     /// Inject a processor to apply once to the internal canonical form before the stage 2 split.
@@ -269,6 +292,14 @@ impl Normalizer {
             .update_pts_anchor(self.total_inner_frames, device_pts_ns);
         if let Some(sec) = self.secondary.as_mut() {
             sec.update_pts_anchor(self.total_inner_frames, device_pts_ns);
+        }
+
+        if let Some(capture) = self.capture.as_mut() {
+            // One rational PTS anchor per source generation. Arrival-time jitter must
+            // not reanchor old samples or create a VAD epoch on every push.
+            if capture.pts_anchor.is_none() {
+                capture.update_pts_anchor(self.total_inner_frames, device_pts_ns);
+            }
         }
 
         // Stage 1: mix channels → stereo interleaved → normalize to 48k. Collect what this push
@@ -362,6 +393,9 @@ impl Normalizer {
         }
         let inner = std::mem::take(&mut self.inner_scratch);
         let r_primary = self.primary.feed_inner(&inner);
+        if let Some(capture) = self.capture.as_mut() {
+            capture.feed_inner(&inner)?;
+        }
         let r_secondary = self
             .secondary
             .as_mut()
@@ -478,8 +512,11 @@ impl OutputTap {
     /// to the output rate (not exact because the resampler retains a remainder). `in_sample_rate`
     /// cancels out, so only the output and internal rates are needed.
     fn update_pts_anchor(&mut self, total_inner_frames: u64, device_pts_ns: i64) {
-        let projected_out_frame = (total_inner_frames as f64 * self.output.sample_rate as f64
-            / SAMPLE_RATE as f64) as u64;
+        let projected_out_frame = u64::try_from(
+            u128::from(total_inner_frames) * u128::from(self.output.sample_rate)
+                / u128::from(SAMPLE_RATE),
+        )
+        .expect("bounded normalizer output timeline");
         self.pts_anchor = Some(PtsAnchor {
             out_frame: projected_out_frame,
             pts_ns: device_pts_ns,
@@ -492,9 +529,10 @@ impl OutputTap {
         match self.pts_anchor {
             None => crate::clock::monotonic_now_ns(),
             Some(anchor) => {
-                let frame_delta = out_frame as i64 - anchor.out_frame as i64;
-                let ns_per_out_frame = 1_000_000_000_i64 / self.output.sample_rate as i64;
-                anchor.pts_ns + frame_delta * ns_per_out_frame
+                let frame_delta = i128::from(out_frame) - i128::from(anchor.out_frame);
+                let pts = i128::from(anchor.pts_ns)
+                    + (frame_delta * 1_000_000_000).div_euclid(i128::from(self.output.sample_rate));
+                i64::try_from(pts).unwrap_or(if pts < 0 { i64::MIN } else { i64::MAX })
             }
         }
     }

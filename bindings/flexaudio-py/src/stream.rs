@@ -4,6 +4,9 @@
 //! invokes `poll_chunk` / `poll_event`. Integrated VAD / denoise processing also runs when
 //! poll_chunk is called (under the GIL; process on demand).
 
+#[path = "stream_whisper.rs"]
+mod whisper_capture;
+
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -32,6 +35,12 @@ use crate::{denoise_err_to_py, to_py_err, vad_err_to_py};
 #[pyclass(module = "flexaudio", unsendable)]
 pub struct Stream {
     inner: fa::Stream,
+    whisper: Option<flexaudio_vad::WhisperVadTap>,
+    whisper_events: Vec<flexaudio_vad::AttachedWhisperVadEvent>,
+    whisper_origin: (u64, i64),
+    whisper_error: Option<flexaudio_vad::WhisperVadTapError>,
+    whisper_error_reported: bool,
+    ready_chunks: std::collections::VecDeque<PyAudioChunk>,
     // Integrated denoise (requires 48kHz). None when disabled.
     denoiser: Option<CoreDenoiser>,
     // Integrated VAD. None when disabled.
@@ -71,6 +80,7 @@ impl Stream {
             &mut CoreVad,
         ) -> Result<Vec<flexaudio_vad::VadEvent>, flexaudio_vad::VadError>,
     ) -> PyResult<Option<PyAudioChunk>> {
+        self.drain_capture();
         if let Some(error) = self.inner.terminal_error() {
             return Err(to_py_err(error));
         }
@@ -89,6 +99,7 @@ impl Stream {
         // SpeechStart and SpeechEnd are emitted only when that segment is finalized. Flush returns
         // that pair on the old sample clock and resets before processing post-gap audio.
         let discontinuity = chunk.flags.contains(fa::ChunkFlags::DISCONTINUITY);
+        self.whisper_origin.1 = self.whisper_origin.1.max(chunk.pts_ns);
         let mut py_chunk = chunk_to_py(chunk);
         let mut vad_events: Vec<(bool, u64)> = Vec::new();
         if discontinuity {
@@ -134,6 +145,9 @@ impl Stream {
             py_chunk.set_vad_events(vad_events);
         }
 
+        if self.whisper.is_some() {
+            py_chunk.set_whisper_events(std::mem::take(&mut self.whisper_events));
+        }
         Ok(Some(py_chunk))
     }
 }
@@ -141,12 +155,37 @@ impl Stream {
 #[pymethods]
 impl Stream {
     /// Stop recording. Safe to call repeatedly (flexaudio is idempotent).
-    fn stop(&mut self) {
+    fn stop(&mut self) -> PyResult<()> {
         self.inner.stop();
+        if self.whisper.is_none() {
+            return Ok(());
+        }
+        self.drain_capture();
+        let drained = self.drain_output();
+        if let Some(whisper) = self.whisper.as_mut() {
+            let result = whisper.stop();
+            self.accept_whisper(result);
+            self.whisper_carrier();
+        }
+        drained
     }
 
     /// Flush an attached whisper epoch. Disabled attachment is a no-op.
-    fn flush_whisper_vad(&mut self) -> PyResult<()> { Ok(()) }
+    fn flush_whisper_vad(&mut self) -> PyResult<()> {
+        if self.whisper.is_none() {
+            return Ok(());
+        }
+        self.drain_capture();
+        let drained = self.drain_output();
+        if let Some(whisper) = self.whisper.as_mut() {
+            let result = whisper.flush();
+            self.whisper_error = None;
+            self.whisper_error_reported = false;
+            self.accept_whisper(result);
+            self.whisper_carrier();
+        }
+        drained
+    }
 
     /// Pause delivery without stopping recording. Resume with `resume`.
     fn pause(&self) {
@@ -201,7 +240,39 @@ impl Stream {
     /// Both boundaries are delivered together when a segment finalizes. If flushing fails,
     /// reset VAD and denoise before raising the flush error; the consumed chunk is not returned.
     fn poll_chunk(&mut self) -> PyResult<Option<PyAudioChunk>> {
-        self.poll_chunk_with_flush(CoreVad::flush)
+        if let Some(chunk) = self.ready_chunks.pop_front() {
+            return Ok(Some(chunk));
+        }
+        if !self.whisper_error_reported && self.whisper_events.is_empty() {
+            if let Some(error) = self.whisper_error.clone() {
+                self.whisper_error_reported = true;
+                return Err(crate::whisper_vad::tap_error(error));
+            }
+        }
+        let result = match self.poll_chunk_with_flush(CoreVad::flush) {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                self.whisper_carrier();
+                if let Some(chunk) = self.ready_chunks.pop_front() {
+                    return Ok(Some(chunk));
+                }
+                return Err(error);
+            }
+        };
+        if result.is_some() {
+            return Ok(result);
+        }
+        self.whisper_carrier();
+        if let Some(chunk) = self.ready_chunks.pop_front() {
+            return Ok(Some(chunk));
+        }
+        if !self.whisper_error_reported {
+            if let Some(error) = self.whisper_error.clone() {
+                self.whisper_error_reported = true;
+                return Err(crate::whisper_vad::tap_error(error));
+            }
+        }
+        Ok(None)
     }
 
     /// Return the stored terminal failure as an event, including after stop.
@@ -282,6 +353,15 @@ impl Stream {
         // Addons depend on output format. Since a switch cannot change it, validate and build using
         // output_rate/output_channels from open (the output_rate argument is used by core's
         // switch_source to check that formats match).
+        if self.whisper.is_some() && vad.is_some() {
+            return Python::attach(|py| {
+                Err(crate::whisper_vad::boundary_error(
+                    py,
+                    "ConflictingVad",
+                    "vad and whisper_vad are mutually exclusive",
+                ))
+            });
+        }
         let (new_vad, new_denoiser) = Self::build_addons(
             vad.as_ref(),
             denoise,
@@ -309,7 +389,12 @@ impl Stream {
 
         // Replace addons only after the switch succeeds (keep old addons on failure).
         self.vad = new_vad;
-        self.denoiser = new_denoiser;
+        if self.whisper.is_some() {
+            self.inner.set_denoise(denoise);
+            self.denoiser = None;
+        } else {
+            self.denoiser = new_denoiser;
+        }
         Ok(())
     }
 
@@ -324,9 +409,9 @@ impl Stream {
         _exc_type: Option<Bound<'_, PyAny>>,
         _exc_value: Option<Bound<'_, PyAny>>,
         _traceback: Option<Bound<'_, PyAny>>,
-    ) -> bool {
-        self.inner.stop();
-        false
+    ) -> PyResult<bool> {
+        self.stop()?;
+        Ok(false)
     }
 }
 
@@ -402,6 +487,17 @@ pub fn open(
     whisper_vad: Option<&crate::whisper_vad::WhisperVadStreamOptions>,
 ) -> PyResult<Stream> {
     crate::whisper_vad::validate_attachment(whisper_vad, vad.is_some())?;
+    let whisper = whisper_vad
+        .map(|options| {
+            flexaudio_vad::WhisperVadTap::new(
+                options.params.inner.clone(),
+                flexaudio_vad::WhisperVadOptions {
+                    provisional: options.provisional,
+                },
+            )
+        })
+        .transpose()
+        .map_err(crate::whisper_vad::tap_error)?;
     let exclude_pids = parse_exclude_pids(exclude_pids.as_ref())?;
 
     // Validate and build addons first. Reject denoise unless the output rate is 48 kHz, and reject
@@ -426,10 +522,24 @@ pub fn open(
         system_gain,
     )?;
     let mut stream = fa::open(config).map_err(to_py_err)?;
+    if whisper.is_some() {
+        stream.enable_capture_tap().map_err(to_py_err)?;
+        stream.set_denoise(denoise);
+    }
     stream.start().map_err(to_py_err)?;
     Ok(Stream {
+        whisper,
+        whisper_events: Vec::new(),
+        whisper_origin: (0, 0),
+        whisper_error: None,
+        whisper_error_reported: false,
+        ready_chunks: std::collections::VecDeque::new(),
         inner: stream,
-        denoiser,
+        denoiser: if whisper_vad.is_some() {
+            None
+        } else {
+            denoiser
+        },
         vad: vad_state,
         output_rate,
         output_channels,
@@ -482,6 +592,12 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             let mut stream = Stream {
+                whisper: None,
+                whisper_events: Vec::new(),
+                whisper_origin: (0, 0),
+                whisper_error: None,
+                whisper_error_reported: false,
+                ready_chunks: std::collections::VecDeque::new(),
                 inner: denied_stream(),
                 denoiser: None,
                 vad: None,
@@ -496,7 +612,7 @@ mod tests {
             assert!(error.to_string().contains("denied by user"));
             assert!(stream.poll_event().is_some());
             assert!(stream.terminal_error().is_some());
-            stream.stop();
+            let _ = stream.stop();
             assert!(stream.poll_chunk().is_err());
             assert!(stream.resume().is_err());
             assert!(stream.terminal_error().is_some());
@@ -534,6 +650,12 @@ else:
             let stream = Py::new(
                 py,
                 Stream {
+                    whisper: None,
+                    whisper_events: Vec::new(),
+                    whisper_origin: (0, 0),
+                    whisper_error: None,
+                    whisper_error_reported: false,
+                    ready_chunks: std::collections::VecDeque::new(),
                     inner,
                     denoiser: None,
                     vad: None,
@@ -612,6 +734,12 @@ mod repro_tests {
         inner.start().unwrap();
         (
             Stream {
+                whisper: None,
+                whisper_events: Vec::new(),
+                whisper_origin: (0, 0),
+                whisper_error: None,
+                whisper_error_reported: false,
+                ready_chunks: std::collections::VecDeque::new(),
                 inner,
                 denoiser: denoise.then(|| CoreDenoiser::new(1).unwrap()),
                 vad: vad.then(|| CoreVad::new(Default::default()).unwrap()),
@@ -647,7 +775,7 @@ mod repro_tests {
     fn repro_p10_f42_stop_retains_denoise_tail() {
         let (mut stream, sink) = fixture(true, false);
         let mut delivered = send(&mut stream, &sink).samples().len();
-        stream.stop();
+        let _ = stream.stop();
         while let Some(chunk) = stream.poll_chunk().unwrap() {
             delivered += chunk.samples().len();
         }
@@ -681,7 +809,7 @@ mod repro_tests {
                 before,
                 "VAD sample history should restart at the resumed discontinuity"
             );
-            stream.stop();
+            let _ = stream.stop();
         });
     }
     #[test]
@@ -695,7 +823,7 @@ mod repro_tests {
             stream.vad.as_ref().unwrap().converted_sample_position(),
             639
         );
-        stream.stop();
+        let _ = stream.stop();
         while stream.poll_chunk().unwrap().is_some() {}
         assert!(stream.denoiser.is_none());
     }
@@ -729,6 +857,12 @@ mod repro_tests {
         inner.start().unwrap();
         (
             Stream {
+                whisper: None,
+                whisper_events: Vec::new(),
+                whisper_origin: (0, 0),
+                whisper_error: None,
+                whisper_error_reported: false,
+                ready_chunks: std::collections::VecDeque::new(),
                 inner,
                 denoiser: None,
                 vad: Some(vad),
@@ -778,7 +912,7 @@ mod repro_tests {
             let flags: u32 = bound.getattr("flags").unwrap().extract().unwrap();
             assert_ne!(flags & fa::ChunkFlags::DISCONTINUITY.bits(), 0);
             let types = delivered_event_types(bound);
-            stream.stop();
+            let _ = stream.stop();
             assert_eq!(
                 types.iter().filter(|t| *t == "speech_end").count(),
                 1,
@@ -814,7 +948,7 @@ mod repro_tests {
             let flags: u32 = bound.getattr("flags").unwrap().extract().unwrap();
             assert_ne!(flags & fa::ChunkFlags::DISCONTINUITY.bits(), 0);
             let types = delivered_event_types(bound);
-            stream.stop();
+            let _ = stream.stop();
             assert!(types.is_empty(), "types: {types:?}");
         });
     }
@@ -850,7 +984,7 @@ mod repro_tests {
         // Post-gap speech starts inside the same chunk, but 319 converted samples cannot complete
         // a fresh 512-sample frame. Its boundaries arrive on a later chunk.
         let after = (0..3).map(|_| send(&mut stream, &sink)).collect::<Vec<_>>();
-        stream.stop();
+        let _ = stream.stop();
         // Initialize/read Python objects after stopping: lazy type initialization can release the
         // GIL to other tests for longer than the mock capture's watchdog idle limit.
         Python::attach(|py| {
@@ -964,7 +1098,7 @@ mod repro_tests {
                 if fail_flush { 959 } else { 1279 }
             );
             assert!(stream.poll_chunk().unwrap().is_none());
-            stream.stop();
+            let _ = stream.stop();
             // Inspect Python objects after capture stops so parallel type initialization cannot
             // introduce a watchdog recovery discontinuity into the mock's otherwise continuous PCM.
             Python::attach(|py| {
