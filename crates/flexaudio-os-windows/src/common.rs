@@ -32,6 +32,7 @@ use windows::Win32::System::Threading::{
 
 use crate::keepalive::SilentRender;
 use crate::lifecycle::{check_wait_result, Session, StreamClient};
+use crate::owner::finish_capture;
 use flexaudio_core::{ErrorContext, NativeStatus, Operation, ShutdownReport};
 
 /// Classify access-denied and device-unavailable HRESULTs as typed [`Error`] variants.
@@ -274,7 +275,8 @@ pub(crate) unsafe fn capture_loop(
     mut sink: RawSink,
     stop_flag: &Arc<AtomicBool>,
     ready: mpsc::Sender<Result<(), Error>>,
-) -> Result<(), Error> {
+    event_tx: mpsc::Sender<flexaudio_core::Event>,
+) -> ShutdownReport {
     let CaptureSetup {
         client,
         capture,
@@ -288,7 +290,7 @@ pub(crate) unsafe fn capture_loop(
         Ok(frames) => frames,
         Err(e) => {
             let _ = ready.send(Err(map_hr("IAudioClient::GetBufferSize(capture)", e)));
-            return Ok(());
+            return ShutdownReport::new(None, Vec::new());
         }
     };
     let silence = vec![0.0f32; buffer_frames as usize * channels];
@@ -304,7 +306,7 @@ pub(crate) unsafe fn capture_loop(
             ready.send(status).is_ok()
         })
     else {
-        return Ok(());
+        return ShutdownReport::new(None, Vec::new());
     };
 
     let result = (|| {
@@ -371,9 +373,8 @@ pub(crate) unsafe fn capture_loop(
         }
         Ok(())
     })();
-    let stopped = session.stop();
     // Session drops before capture/event/COM, and render stops after capture.
-    ShutdownReport::new(result.err(), stopped.err().into_iter().collect()).result()
+    finish_capture(result, || session.stop(), &event_tx)
 }
 
 /// Shared sequence that initializes `client` in shared mode with

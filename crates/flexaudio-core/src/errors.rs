@@ -33,9 +33,10 @@ pub enum ErrorKind {
 
 /// Typed failure with library-authored explanations and redacted private fields.
 ///
-/// Message-bearing variants must contain safe explanations, never device names,
-/// paths, or raw environment diagnostics. Permission details and context call
-/// labels remain available only through structured access.
+/// Message-bearing variants must contain safe, library-authored explanations, which may
+/// include OS error text, never device names, paths, or raw environment diagnostics.
+/// Display retains those explanations. Permission details and context call labels remain
+/// available only through structured access.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {

@@ -551,8 +551,10 @@ fn randomized_pcm_partitions_match_whole_events_and_probabilities() {
 fn embedded_v6_fixture_random_partitions_and_reset_are_bit_identical() {
     let wav = include_bytes!("../tests/fixtures/jp_2spk_FF_4s_16k.wav");
     let pcm: Vec<_> = wav[44..]
-        .chunks_exact(2)
-        .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&b| f32::from(i16::from_le_bytes(b)) / 32768.0)
         .collect();
     let mut vad =
         WhisperVad::new(Default::default(), WhisperVadOptions { provisional: true }).unwrap();

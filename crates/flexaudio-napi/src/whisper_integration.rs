@@ -10,9 +10,14 @@ pub(super) struct WhisperBridge {
     pub tap: VadTap,
     events: Vec<AttachedWhisperVadEvent>,
     pub error: Option<WhisperVadTapError>,
+    error_stage: shutdown::WhisperFailureStage,
     reported_error: bool,
     last_frame_index: u64,
     last_pts: i64,
+    #[cfg(all(test, flexaudio_repro_addon))]
+    inject_invalid_pcm: bool,
+    #[cfg(all(test, flexaudio_repro_addon))]
+    inject_stop_failure: bool,
 }
 
 impl WhisperBridge {
@@ -26,19 +31,29 @@ impl WhisperBridge {
             tap,
             events: Vec::new(),
             error: None,
+            error_stage: shutdown::WhisperFailureStage::Process,
             reported_error: false,
             last_frame_index: 0,
             last_pts: 0,
+            #[cfg(all(test, flexaudio_repro_addon))]
+            inject_invalid_pcm: false,
+            #[cfg(all(test, flexaudio_repro_addon))]
+            inject_stop_failure: false,
         })
     }
 
-    fn accept(&mut self, result: Result<Vec<AttachedWhisperVadEvent>, WhisperVadTapFailure>) {
+    fn accept(
+        &mut self,
+        result: Result<Vec<AttachedWhisperVadEvent>, WhisperVadTapFailure>,
+        stage: shutdown::WhisperFailureStage,
+    ) {
         match result {
             Ok(events) => self.events.extend(events),
             Err(failure) => {
                 self.events.extend(failure.terminal_events);
                 if self.error.is_none() {
                     self.error = Some(failure.error);
+                    self.error_stage = stage;
                 }
             }
         }
@@ -48,6 +63,14 @@ impl WhisperBridge {
         if self.error.is_some() {
             return;
         }
+        #[cfg(all(test, flexaudio_repro_addon))]
+        let chunk = {
+            let mut chunk = chunk;
+            if std::mem::take(&mut self.inject_invalid_pcm) {
+                chunk.data[0] = f32::NAN;
+            }
+            chunk
+        };
         let result = self.owner.process(
             &chunk.data,
             chunk.frame_index,
@@ -58,11 +81,27 @@ impl WhisperBridge {
             self.last_frame_index = chunk.frame_index + chunk.frames as u64;
             self.last_pts = chunk.pts_ns + (chunk.frames as i64 * 1_000_000_000 / 48_000);
         }
-        self.accept(result);
+        self.accept(result, shutdown::WhisperFailureStage::Process);
     }
 
     pub fn take_events(&mut self) -> Vec<whisper_vad::JsWhisperVadEvent> {
         whisper_vad::marshal(std::mem::take(&mut self.events))
+    }
+
+    pub(super) fn processing_error(&self) -> Option<WhisperVadTapError> {
+        self.error_stage
+            .is_primary()
+            .then(|| self.error.clone())
+            .flatten()
+    }
+
+    #[cfg(all(test, flexaudio_repro_addon))]
+    pub(super) fn inject_shutdown_failure(&mut self, processing: bool) {
+        self.inject_invalid_pcm = processing;
+        self.inject_stop_failure = !processing;
+        // The fixture inspects retained stop/report diagnostics instead of throwing
+        // an additional asynchronous exception into the node:test runner.
+        self.reported_error = true;
     }
 }
 
@@ -84,12 +123,42 @@ impl PairingBridge {
         } else {
             whisper.owner.flush()
         };
+        #[cfg(all(test, flexaudio_repro_addon))]
+        let result = if stopping && whisper.inject_stop_failure {
+            Err(WhisperVadTapError::Conversion.into())
+        } else {
+            result
+        };
         if !stopping {
             whisper.error = None;
             whisper.reported_error = false;
         }
-        whisper.accept(result);
+        whisper.accept(
+            result,
+            if stopping {
+                shutdown::WhisperFailureStage::StopFlush
+            } else {
+                shutdown::WhisperFailureStage::RuntimeFlush
+            },
+        );
         self.emit_whisper_carrier();
+    }
+
+    pub(super) fn retain_shutdown_outcome(&self, core: Option<flexaudio::core::ShutdownReport>) {
+        let failure = self.whisper.as_ref().and_then(|owner| {
+            owner.error.clone().map(|error| shutdown::WhisperFailure {
+                error,
+                stage: owner.error_stage,
+            })
+        });
+        let mut retained = self.report.lock().unwrap_or_else(lock_poisoned);
+        let mut report = shutdown::ShutdownReport::from_core(core);
+        // Legacy VAD's finalization also uses the shared cleanup recorder.
+        if let Some(previous) = retained.take() {
+            report.binding_cleanup = previous.binding_cleanup;
+        }
+        report.whisper = failure;
+        *retained = Some(report);
     }
 
     pub(super) fn report_whisper_failure(&mut self) {
@@ -169,7 +238,13 @@ pub(super) fn throw_error(env: &Env, error: WhisperVadTapError) -> NapiError {
 
 pub(super) fn js_error(env: &Env, error: &WhisperVadTapError) -> napi::Result<JsObject> {
     let mut object = env.create_error(NapiError::new(Status::GenericFailure, error.to_string()))?;
-    let code = match error {
+    object.set_named_property("code", error_code(error))?;
+    object.set_named_property("terminalEvents", env.create_array(0)?)?;
+    Ok(object)
+}
+
+pub(super) fn error_code(error: &WhisperVadTapError) -> &'static str {
+    match error {
         WhisperVadTapError::Vad(error) => whisper_vad::core_code(error).0,
         WhisperVadTapError::InvalidStereoLength => "InvalidStereoLength",
         WhisperVadTapError::InvalidPcm { .. } => "InvalidPcm",
@@ -179,10 +254,7 @@ pub(super) fn js_error(env: &Env, error: &WhisperVadTapError) -> napi::Result<Js
         WhisperVadTapError::Conversion => "Conversion",
         WhisperVadTapError::Stopped => "Stopped",
         WhisperVadTapError::FailedSession => "FailedSession",
-    };
-    object.set_named_property("code", code)?;
-    object.set_named_property("terminalEvents", env.create_array(0)?)?;
-    Ok(object)
+    }
 }
 
 pub(super) fn settle_flush(
@@ -257,7 +329,7 @@ mod tests {
                 bridge.process(chunk);
             }
             let result = bridge.owner.stop();
-            bridge.accept(result);
+            bridge.accept(result, shutdown::WhisperFailureStage::StopFlush);
             let terminal = bridge.take_events();
             assert!(matches!(
                 terminal.last().unwrap().0,

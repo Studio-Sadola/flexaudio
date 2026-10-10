@@ -267,6 +267,12 @@ mod tests {
             let message = unsafe { std::ffi::CStr::from_ptr(crate::error::last_error_ptr()) }
                 .to_str()
                 .unwrap();
+            let error = crate::error::last_audio_error().expect("typed format error retained");
+            let flexaudio::Error::InvalidArg(detail) = &error else {
+                panic!("invalid format must preserve its InvalidArg root");
+            };
+            assert!(detail.contains(reason));
+            assert_eq!(message, error.to_string());
             assert!(message.contains(reason));
         }
         unsafe { flexaudio_vad_free(v) };

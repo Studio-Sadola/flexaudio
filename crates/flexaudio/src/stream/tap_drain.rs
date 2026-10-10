@@ -84,7 +84,20 @@ pub(super) fn drain(
         };
         match &mut ring {
             Ring::Capture(producer) => {
-                producer.push(chunk);
+                if let Some((_, evicted)) = producer.push_with_evicted(chunk) {
+                    // This independent canonical transport is capture-side loss, not a
+                    // primary/secondary output drop. Count the evicted PCM, including tails.
+                    let samples = u64::try_from(evicted.data.len())
+                        .ok()
+                        .and_then(NonZeroU64::new);
+                    let loss = AudioLoss::raw_overflow(
+                        None,
+                        samples,
+                        format.sample_rate,
+                        format.channels,
+                    )?;
+                    shared.push_event(Event::AudioLoss { loss });
+                }
             }
             Ring::Primary(producer) => {
                 if let Some(total) = producer.push(chunk) {

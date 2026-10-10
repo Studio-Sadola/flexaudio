@@ -114,6 +114,16 @@ fn mock_handle() -> Handle {
     })))
 }
 
+fn assert_invalid_detail(expected: &str) {
+    let error = crate::error::last_audio_error().expect("typed argument error retained");
+    let flexaudio::Error::InvalidArg(detail) = &error else {
+        panic!("expected typed InvalidArg");
+    };
+    assert_eq!(detail, expected);
+    assert_eq!(last_error(), error.to_string());
+    assert_eq!(last_error(), format!("invalid argument: {expected}"));
+}
+
 fn assert_invalid_list(pointer: *const u32, len: usize, expected: &str) {
     let cfg = config(FlexSourceKind::Mic as i32);
     // SAFETY: Invalid pointer shapes must be rejected before any dereference; other test
@@ -123,12 +133,12 @@ fn assert_invalid_list(pointer: *const u32, len: usize, expected: &str) {
         opened.is_null(),
         "invalid list unexpectedly opened a stream"
     );
-    assert_eq!(last_error(), format!("invalid argument: {expected}"));
+    assert_invalid_detail(expected);
 
     let handle = mock_handle();
     let result = unsafe { flexaudio_switch_source_with_exclude_pids(handle.0, &cfg, pointer, len) };
     assert_eq!(result, code::FLEX_INVALID_ARG);
-    assert_eq!(last_error(), format!("invalid argument: {expected}"));
+    assert_invalid_detail(expected);
     assert!(
         handle.pids().is_empty(),
         "invalid switch changed the config"
@@ -184,14 +194,14 @@ fn zero_pid_message_names_index_two_for_every_source() {
         assert!(
             unsafe { flexaudio_open_with_exclude_pids(&cfg, pids.as_ptr(), pids.len()) }.is_null()
         );
-        assert_eq!(last_error(), format!("invalid argument: {message}"));
+        assert_invalid_detail(message);
         assert_eq!(
             unsafe {
                 flexaudio_switch_source_with_exclude_pids(handle.0, &cfg, pids.as_ptr(), pids.len())
             },
             code::FLEX_INVALID_ARG,
         );
-        assert_eq!(last_error(), format!("invalid argument: {message}"));
+        assert_invalid_detail(message);
     }
 }
 

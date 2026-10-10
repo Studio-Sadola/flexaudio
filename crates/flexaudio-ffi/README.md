@@ -79,6 +79,14 @@ int main(void) {
 }
 ```
 
+Save this example as `capture.c`. From the repository root, check its identifiers and types with:
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror -fsyntax-only -I crates/flexaudio-ffi/include capture.c
+```
+
+The capture example is also compiled against the generated header by the Rust test suite.
+
 ## Exclude Playback by PID
 
 Use the extended entry points without changing the `FlexConfig` layout:

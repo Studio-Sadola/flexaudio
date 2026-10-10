@@ -181,7 +181,7 @@ pub struct WasapiProcessBackend {
     /// Running flag (guards duplicate start, signals stop, and is checked on drop). `Send`.
     stop_flag: Arc<AtomicBool>,
     /// Handle for the thread that owns COM/capture (`Some` after start).
-    handle: Option<JoinHandle<Result<()>>>,
+    handle: Option<JoinHandle<ShutdownReport>>,
     /// Runtime failure reported once by the next start (watchdog reopen).
     pending_error: Option<Error>,
     shutdown: OwnerShutdown,
@@ -234,12 +234,15 @@ impl CaptureBackend for WasapiProcessBackend {
 
         let stop_flag = self.stop_flag.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        let (event_tx, event_rx) = mpsc::channel();
         let target_pid = self.target_pid;
         let mode = self.mode;
 
         let handle = thread::Builder::new()
             .name("flexaudio-wasapi-process".into())
-            .spawn(move || run_process_thread(target_pid, mode, sink, stop_flag, ready_tx))
+            .spawn(move || {
+                run_process_thread(target_pid, mode, sink, stop_flag, ready_tx, event_tx)
+            })
             .map_err(|_| {
                 self.stop_flag.store(true, Ordering::SeqCst);
                 Error::Backend("capture owner thread could not be started".into())
@@ -249,13 +252,12 @@ impl CaptureBackend for WasapiProcessBackend {
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.handle = Some(handle);
-                self.shutdown.reset();
+                self.shutdown.reset(event_rx);
                 Ok(())
             }
             Ok(Err(e)) => {
                 self.stop_flag.store(true, Ordering::SeqCst);
-                ShutdownReport::new(Some(e), join_owner(handle).err().into_iter().collect())
-                    .result()
+                ShutdownReport::new(Some(e), join_owner(handle).cleanup().to_vec()).result()
             }
             Err(_) => {
                 self.stop_flag.store(true, Ordering::SeqCst);
@@ -264,7 +266,7 @@ impl CaptureBackend for WasapiProcessBackend {
                         Error::Backend("capture owner exited before reporting readiness".into())
                             .with_context(ErrorContext::new(Operation::Start)),
                     ),
-                    join_owner(handle).err().into_iter().collect(),
+                    join_owner(handle).cleanup().to_vec(),
                 )
                 .result()
             }
@@ -320,7 +322,8 @@ fn run_process_thread(
     sink: RawSink,
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<()>>,
-) -> Result<()> {
+    event_tx: mpsc::Sender<Event>,
+) -> ShutdownReport {
     let _com = ComThread::new();
 
     let setup = unsafe { setup_process_loopback(target_pid, mode) };
@@ -328,11 +331,11 @@ fn run_process_thread(
         Ok(t) => CaptureSetup::process(t),
         Err(e) => {
             let _ = ready_tx.send(Err(e));
-            return Ok(());
+            return ShutdownReport::new(None, Vec::new());
         }
     };
 
-    unsafe { capture_loop(setup, sink, &stop_flag, ready_tx) }
+    unsafe { capture_loop(setup, sink, &stop_flag, ready_tx, event_tx) }
 }
 
 /// Set up process loopback and return the initialized `IAudioClient` / `IAudioCaptureClient` / event
@@ -545,6 +548,32 @@ mod repro_tests {
     use super::*;
 
     #[test]
+    fn checked_stop_after_capture_failure_publishes_terminality() {
+        let mut backend = WasapiProcessBackend::new(1, ProcessMode::Include);
+        let primary = crate::common::map_hr(
+            "IAudioCaptureClient::GetBuffer",
+            windows::core::Error::from(windows::core::HRESULT(0x80070005u32 as i32)),
+        );
+        let (event_tx, event_rx) = mpsc::channel();
+        backend.shutdown.reset(event_rx);
+        let capture_error = primary.clone();
+        backend.handle = Some(thread::spawn(move || {
+            crate::owner::finish_capture(Err(capture_error), || Ok(()), &event_tx)
+        }));
+
+        // Explicit stop before any watchdog reopen still publishes the capture
+        // cause, so the facade latches terminality before delivering final PCM.
+        let result = backend.stop_checked();
+        assert_eq!(result, Err(primary.clone()));
+        assert_eq!(primary.kind(), flexaudio_core::ErrorKind::PermissionDenied);
+        assert!(
+            matches!(backend.poll_event(), Some(Event::TerminalError { error }) if error == primary)
+        );
+        assert!(backend.poll_event().is_none());
+        assert_eq!(backend.stop_checked(), result);
+    }
+
+    #[test]
     fn repro_p6_activation_signalling_failure_is_returned() {
         // A null event deterministically fails SetEvent; no activation or device is opened.
         let handler = ActivationHandler {
@@ -557,7 +586,10 @@ mod repro_tests {
     fn repro_p6_stop_reports_owner_error() {
         let mut backend = WasapiProcessBackend::new(1, ProcessMode::Include);
         backend.handle = Some(thread::spawn(|| {
-            Err(Error::Backend("injected owner shutdown failure".into()))
+            ShutdownReport::new(
+                None,
+                vec![Error::Backend("injected owner shutdown failure".into())],
+            )
         }));
         backend.stop();
         assert!(
@@ -576,7 +608,9 @@ mod repro_tests {
     #[test]
     fn checked_stop_does_not_restore_a_consumed_reopen_failure() {
         let mut backend = WasapiProcessBackend::new(1, ProcessMode::Include);
-        backend.handle = Some(thread::spawn(|| Err(Error::DeviceLost)));
+        backend.handle = Some(thread::spawn(|| {
+            ShutdownReport::new(None, vec![Error::DeviceLost])
+        }));
         let result = backend.stop_checked();
         let (producer, _consumer) = flexaudio_core::raw_ring(16);
         let first_retry = backend.start(RawSink::new(producer, 48_000, 2));

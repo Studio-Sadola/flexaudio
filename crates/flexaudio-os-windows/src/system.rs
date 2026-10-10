@@ -90,7 +90,7 @@ pub struct WasapiSystemBackend {
     /// Running flag (guards duplicate starts, signals stop, and supports drop checks). `Send`.
     stop_flag: Arc<AtomicBool>,
     /// Handle for the thread that owns COM and capture (`Some` after start).
-    handle: Option<JoinHandle<Result<()>>>,
+    handle: Option<JoinHandle<ShutdownReport>>,
     /// Runtime failure reported once by the next start (watchdog reopen).
     pending_error: Option<Error>,
     shutdown: OwnerShutdown,
@@ -381,10 +381,13 @@ impl CaptureBackend for WasapiSystemBackend {
         let device_id = self.device_id.clone();
         // Channel for synchronously returning setup status (COM init through successful Start).
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        let (event_tx, event_rx) = mpsc::channel();
 
         let handle = thread::Builder::new()
             .name("flexaudio-wasapi-system".into())
-            .spawn(move || run_system_thread(exclude_root, device_id, sink, stop_flag, ready_tx))
+            .spawn(move || {
+                run_system_thread(exclude_root, device_id, sink, stop_flag, ready_tx, event_tx)
+            })
             .map_err(|_| {
                 self.stop_flag.store(true, Ordering::SeqCst);
                 Error::Backend("capture owner thread could not be started".into())
@@ -394,14 +397,13 @@ impl CaptureBackend for WasapiSystemBackend {
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.handle = Some(handle);
-                self.shutdown.reset();
+                self.shutdown.reset(event_rx);
                 Ok(())
             }
             Ok(Err(e)) => {
                 // Setup failed. Join because the thread exits just after sending ready.
                 self.stop_flag.store(true, Ordering::SeqCst);
-                ShutdownReport::new(Some(e), join_owner(handle).err().into_iter().collect())
-                    .result()
+                ShutdownReport::new(Some(e), join_owner(handle).cleanup().to_vec()).result()
             }
             Err(_) => {
                 self.stop_flag.store(true, Ordering::SeqCst);
@@ -410,7 +412,7 @@ impl CaptureBackend for WasapiSystemBackend {
                         Error::Backend("capture owner exited before reporting readiness".into())
                             .with_context(ErrorContext::new(Operation::Start)),
                     ),
-                    join_owner(handle).err().into_iter().collect(),
+                    join_owner(handle).cleanup().to_vec(),
                 )
                 .result()
             }
@@ -463,7 +465,8 @@ fn run_system_thread(
     sink: RawSink,
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<()>>,
-) -> Result<()> {
+    event_tx: mpsc::Sender<Event>,
+) -> ShutdownReport {
     // Initialize COM on this thread (uninitialize on drop). Declared first, dropped last.
     let _com = ComThread::new();
 
@@ -482,11 +485,11 @@ fn run_system_thread(
         Ok(t) => t,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
-            return Ok(());
+            return ShutdownReport::new(None, Vec::new());
         }
     };
 
-    unsafe { capture_loop(setup, sink, &stop_flag, ready_tx) }
+    unsafe { capture_loop(setup, sink, &stop_flag, ready_tx, event_tx) }
 }
 
 /// Set up classic loopback on the render endpoint selected by `device_id` (`None`
@@ -540,10 +543,45 @@ mod tests {
     use flexaudio_core::raw_ring;
 
     #[test]
+    fn checked_stop_after_capture_failure_keeps_primary_and_cleanup() {
+        let mut backend = WasapiSystemBackend::new(true, None);
+        let primary = crate::common::map_hr(
+            "IAudioCaptureClient::ReleaseBuffer",
+            windows::core::Error::from(windows::core::HRESULT(0x80070005u32 as i32)),
+        );
+        let cleanup = Error::Backend("injected capture stop failure".into())
+            .with_context(ErrorContext::new(Operation::Stop));
+        let (event_tx, event_rx) = mpsc::channel();
+        backend.shutdown.reset(event_rx);
+        let capture_error = primary.clone();
+        let stop_error = cleanup.clone();
+        backend.handle = Some(thread::spawn(move || {
+            crate::owner::finish_capture(Err(capture_error), || Err(stop_error), &event_tx)
+        }));
+
+        let result = backend.stop_checked();
+        let Error::Multiple(group) = result.as_ref().unwrap_err() else {
+            panic!("capture and cleanup failures must both survive")
+        };
+        assert_eq!(group.primary(), &primary);
+        assert_eq!(group.secondary().next(), Some(&cleanup));
+        assert!(
+            matches!(backend.poll_event(), Some(Event::TerminalError { error }) if error == primary)
+        );
+        assert!(
+            matches!(backend.poll_event(), Some(Event::ShutdownError { error }) if error == cleanup)
+        );
+        assert!(backend.poll_event().is_none());
+        assert_eq!(backend.stop_checked(), result);
+    }
+
+    #[test]
     fn checked_system_stop_retains_owner_failure_once() {
         // Exclusion construction avoids any endpoint queries.
         let mut backend = WasapiSystemBackend::new(true, None);
-        backend.handle = Some(thread::spawn(|| Err(Error::DeviceLost)));
+        backend.handle = Some(thread::spawn(|| {
+            ShutdownReport::new(None, vec![Error::DeviceLost])
+        }));
         let result = backend.stop_checked();
         assert_eq!(
             result.as_ref().unwrap_err().kind(),

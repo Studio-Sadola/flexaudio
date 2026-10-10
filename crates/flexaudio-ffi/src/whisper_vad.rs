@@ -161,13 +161,13 @@ unsafe fn read_params(p: *const FlexWhisperVadParams) -> Result<WhisperVadParams
 /// Five pinned defaults. Supplied structs use literal fields, including zero.
 #[no_mangle]
 pub extern "C" fn flexaudio_whisper_vad_default_params() -> FlexWhisperVadParams {
-    FlexWhisperVadParams {
+    crate::guard_value(unsafe { mem::zeroed() }, || FlexWhisperVadParams {
         threshold: 0.5,
         min_speech_duration_ms: 250,
         min_silence_duration_ms: 100,
         max_speech_duration_s: f32::MAX,
         speech_pad_ms: 30,
-    }
+    })
 }
 
 /// Create a session; NULL params/options use defaults. Returns NULL plus last_error on error.

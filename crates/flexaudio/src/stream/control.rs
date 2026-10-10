@@ -137,8 +137,13 @@ fn drain_backend_events_locked(
                 shared.stop_backend_owned(be, delivery);
                 return MailboxDrain::Terminal;
             }
-            Some(Event::Error(detail)) => {
-                let error = Error::Backend(detail);
+            Some(Event::Error(_)) => {
+                // Built-in producers use typed errors with safe library-authored explanations.
+                // A third-party backend's legacy string has no provenance or private-detail
+                // slot, so discard it rather than placing arbitrary text in a Display payload.
+                let error = Error::Backend(
+                    "backend reported a failure through a legacy error event".into(),
+                );
                 if let Some(delivery) = delivery {
                     shared.fail_terminal_locked(error, delivery);
                 } else {

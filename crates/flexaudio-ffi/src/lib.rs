@@ -25,6 +25,8 @@ mod denoise;
 mod error;
 mod flac;
 mod integration;
+mod legacy_codes;
+pub use legacy_codes::*;
 mod shutdown;
 mod types;
 mod v2;
@@ -91,6 +93,19 @@ pub(crate) fn guard_const_ptr<T>(f: impl FnOnce() -> *const T) -> *const T {
                 "panic caught at FFI boundary".into(),
             ));
             std::ptr::null()
+        }
+    }
+}
+
+/// Guard a scalar or record value, retaining a safe typed diagnostic on panic.
+pub(crate) fn guard_value<T>(fallback: T, f: impl FnOnce() -> T) -> T {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(_) => {
+            error::set_audio_error(flexaudio::Error::Backend(
+                "panic caught at FFI boundary".into(),
+            ));
+            fallback
         }
     }
 }
@@ -529,19 +544,21 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
 /// Non-NULL must point to an aligned, readable FlexChunk. PCM is never dereferenced.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_chunk_frame_index(chunk: *const FlexChunk) -> u64 {
-    error::clear_last_error();
-    if chunk.is_null() || !chunk.is_aligned() {
-        error::set_last_error("InvalidArgument: invalid chunk pointer");
-        return 0;
-    }
-    let chunk = &*chunk;
-    match chunk_storage::frame_index(chunk.data, chunk.len) {
-        Some(index) => index,
-        None => {
-            error::set_last_error("InvalidArgument: chunk PCM is not owned by flexaudio");
-            0
+    guard_value(0, || {
+        error::clear_last_error();
+        if chunk.is_null() || !chunk.is_aligned() {
+            error::set_last_error("InvalidArgument: invalid chunk pointer");
+            return 0;
         }
-    }
+        let chunk = &*chunk;
+        match chunk_storage::frame_index(chunk.data, chunk.len) {
+            Some(index) => index,
+            None => {
+                error::set_last_error("InvalidArgument: chunk PCM is not owned by flexaudio");
+                0
+            }
+        }
+    })
 }
 
 /// Free the `data` filled by `flexaudio_poll_chunk` and set `data=NULL` / `len=0`.

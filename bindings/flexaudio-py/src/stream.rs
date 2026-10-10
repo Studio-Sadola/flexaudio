@@ -182,20 +182,9 @@ impl Stream {
     }
 
     /// Flush an attached whisper epoch. Disabled attachment is a no-op.
+    /// Raise a typed failure immediately; poll_chunk still delivers queued closing events.
     fn flush_whisper_vad(&mut self) -> PyResult<()> {
-        if self.whisper.is_none() {
-            return Ok(());
-        }
-        self.drain_capture();
-        let drained = self.drain_output();
-        if let Some(whisper) = self.whisper.as_mut() {
-            let result = whisper.flush();
-            self.whisper_error = None;
-            self.whisper_error_reported = false;
-            self.accept_whisper(result);
-            self.whisper_carrier();
-        }
-        drained
+        self.flush_whisper_with(flexaudio_vad::WhisperVadTap::flush)
     }
 
     /// Pause delivery without stopping recording. Resume with `resume`.

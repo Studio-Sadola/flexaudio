@@ -313,6 +313,30 @@ fn validation_display_preserves_library_explanations() {
 }
 
 #[test]
+fn library_authored_display_retains_validation_lifecycle_format_and_os_explanations() {
+    for (error, expected) in [
+        (
+            Error::InvalidArg("exclude_pids: pid 0 is not a valid process id".into()),
+            "invalid argument: exclude_pids: pid 0 is not a valid process id",
+        ),
+        (
+            Error::InvalidState("stream has already stopped".into()),
+            "invalid state: stream has already stopped",
+        ),
+        (
+            Error::UnsupportedFormat("output channels must be one or two".into()),
+            "unsupported output format: output channels must be one or two",
+        ),
+        (
+            Error::Backend("reopen failed: No such device (os error 19)".into()),
+            "backend error: reopen failed: No such device (os error 19)",
+        ),
+    ] {
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
 fn private_error_fields_are_not_in_display() {
     assert_eq!(
         Error::AmbiguousDeviceName.to_string(),

@@ -43,7 +43,7 @@ mod format;
 mod common;
 #[cfg(target_os = "windows")]
 mod keepalive;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 mod owner;
 #[cfg(target_os = "windows")]
 mod process;

@@ -215,7 +215,7 @@ fn tiny_tail_starts_epoch_at_drain_and_only_pads_one_model_frame() {
 fn discontinuity_drains_old_epoch_before_new_origin_and_never_bridges_gap() {
     let (mut tap, control) = tap();
     let mut events = tap.process(&[0.2; 2000], 100, 0, false).unwrap();
-    events.extend(tap.process(&[0.0; 1920], 5000, 200_000_000, true).unwrap());
+    events.extend(tap.process(&[0.0; 1920], 1100, 200_000_000, true).unwrap());
     events.extend(tap.stop().unwrap());
     assert_order(&events);
     let boundary = events
@@ -235,7 +235,7 @@ fn discontinuity_drains_old_epoch_before_new_origin_and_never_bridges_gap() {
     assert!(matches!(
         events[boundary],
         Attached::EpochStart {
-            capture_sample: 5000,
+            capture_sample: 1100,
             pts_ns: 200_000_000,
             seq: 0,
             ..
@@ -248,11 +248,11 @@ fn discontinuity_drains_old_epoch_before_new_origin_and_never_bridges_gap() {
 }
 
 #[test]
-fn clock_breaks_use_same_drain_finish_reset_path() {
-    for (sample, pts) in [(1000, 0), (1060, 999999)] {
+fn pts_reanchors_use_same_drain_finish_reset_path() {
+    for pts in [0, 999999] {
         let (mut tap, control) = tap();
         tap.process(&[0.2; 120], 1000, 0, false).unwrap();
-        let mut events = tap.process(&[0.2; 120], sample, pts, false).unwrap();
+        let mut events = tap.process(&[0.2; 120], 1060, pts, false).unwrap();
         events.extend(tap.stop().unwrap());
         assert_order(&events);
         assert_eq!(
@@ -264,6 +264,99 @@ fn clock_breaks_use_same_drain_finish_reset_path() {
         );
         assert_eq!(control.lock().unwrap().resets, 1);
     }
+}
+
+#[test]
+fn capture_index_gaps_fail_without_eof_finals_or_tail_inference() {
+    for discontinuity in [false, true] {
+        for next_sample in [100, 21100] {
+            let (mut tap, control) = tap();
+            let mut events = tap.process(&[0.2; 40000], 100, 0, false).unwrap();
+            let inferred = control.lock().unwrap().frames.len();
+            let failure = tap
+                .process(&[0.2; 1920], next_sample, 500_000_000, discontinuity)
+                .unwrap_err();
+            assert_eq!(failure.error, Error::Conversion);
+            events.extend(failure.terminal_events);
+            assert_order(&events);
+            assert!(events.iter().all(|event| !matches!(
+                event,
+                Attached::Vad(WhisperVadEvent {
+                    kind: Kind::Segment(_),
+                    ..
+                })
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                Attached::Vad(WhisperVadEvent {
+                    kind: Kind::ProvisionalSpeechEnd {
+                        reason: PreviewCloseReason::Error,
+                        ..
+                    },
+                    ..
+                })
+            )));
+            assert!(matches!(
+                events.last().unwrap(),
+                Attached::Vad(WhisperVadEvent {
+                    kind: Kind::EpochEnd {
+                        reason: EpochEndReason::Error
+                    },
+                    ..
+                })
+            ));
+            assert_eq!(control.lock().unwrap().frames.len(), inferred);
+            assert_eq!(control.lock().unwrap().resets, 0);
+            assert_eq!(
+                tap.process(&[0.0; 2], 99999, 0, false).unwrap_err().error,
+                Error::FailedSession
+            );
+            assert!(tap.stop().unwrap_err().terminal_events.is_empty());
+            assert!(tap.flush().unwrap().is_empty());
+            assert!(tap.process(&[0.0; 2], 99999, 0, false).unwrap().is_empty());
+            let next = tap.stop().unwrap();
+            assert!(matches!(next[0], Attached::EpochStart { epoch: 1, .. }));
+            assert_order(&next);
+        }
+    }
+}
+
+#[test]
+fn loss_before_first_poll_fails_without_accepting_a_later_origin() {
+    let (mut tap, control) = tap();
+    let failure = tap
+        .process(&[0.2; 1920], 960, 20_000_000, true)
+        .unwrap_err();
+    assert_eq!(failure.error, Error::Conversion);
+    assert!(failure.terminal_events.is_empty());
+    assert!(control.lock().unwrap().frames.is_empty());
+    assert!(tap.origin.is_none());
+    assert!(tap.stop().unwrap_err().terminal_events.is_empty());
+    assert!(tap.flush().unwrap().is_empty());
+    assert!(tap
+        .process(&[0.0; 2], 9600, 200_000_000, false)
+        .unwrap()
+        .is_empty());
+    let events = tap.stop().unwrap();
+    assert!(matches!(
+        events[0],
+        Attached::EpochStart {
+            epoch: 1,
+            capture_sample: 9600,
+            ..
+        }
+    ));
+    assert_order(&events);
+}
+
+#[test]
+fn transport_gap_before_converter_publishes_never_fabricates_an_epoch() {
+    let (mut tap, control) = tap();
+    assert!(tap.process(&[0.2; 120], 1000, 0, false).unwrap().is_empty());
+    let failure = tap.process(&[0.2; 120], 2000, 0, false).unwrap_err();
+    assert_eq!(failure.error, Error::Conversion);
+    assert!(failure.terminal_events.is_empty());
+    assert!(control.lock().unwrap().frames.is_empty());
 }
 
 #[test]
@@ -469,7 +562,7 @@ fn failing_post_gap_inference_keeps_finished_prefix_before_new_error_epoch() {
     let mut events = tap.process(&[0.2; 2000], 100, 0, false).unwrap();
     control.lock().unwrap().fail_at = Some(1);
     let failure = tap
-        .process(&[0.2; 4000], 9000, 200_000_000, true)
+        .process(&[0.2; 4000], 1100, 200_000_000, true)
         .unwrap_err();
     events.extend(failure.terminal_events);
     assert_order(&events);
@@ -489,7 +582,7 @@ fn failing_post_gap_inference_keeps_finished_prefix_before_new_error_epoch() {
         Attached::EpochStart {
             epoch: 1,
             seq: 0,
-            capture_sample: 9000,
+            capture_sample: 1100,
             pts_ns: 200_000_000,
         }
     ));
@@ -500,9 +593,11 @@ fn embedded_model_capture_events_match_whole_and_10_20_37_ms_partitions() {
     let wav = include_bytes!("../tests/fixtures/jp_2spk_FF_4s_16k.wav");
     // Deterministic test source at capture rate; this is not a resampling policy for callers.
     let stereo: Vec<_> = wav[44..]
-        .chunks_exact(2)
-        .flat_map(|bytes| {
-            let value = f32::from(i16::from_le_bytes([bytes[0], bytes[1]])) / 32768.0;
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .flat_map(|&bytes| {
+            let value = f32::from(i16::from_le_bytes(bytes)) / 32768.0;
             [value; 6]
         })
         .collect();

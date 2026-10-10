@@ -317,12 +317,186 @@ fn legacy_failure_is_terminal_and_cleanup_does_not_replace_the_primary() {
     let result = stream.stop_checked().unwrap_err();
     assert_eq!(
         stream.terminal_error(),
-        Some(Error::Backend("legacy capture failure".into()))
+        Some(Error::Backend(
+            "backend reported a failure through a legacy error event".into()
+        ))
     );
     assert!(matches!(result, Error::Multiple(group) if group.secondary().count() == 1));
     assert!(stream.poll_chunk().is_none());
     assert_eq!(stops.load(Ordering::SeqCst), 1);
     assert_eq!(stream.shutdown_report().unwrap().cleanup().len(), 1);
+}
+
+#[test]
+fn legacy_backend_payload_is_sanitized_across_terminal_and_shutdown_paths() {
+    for (private, final_notice) in [
+        (
+            "private-device token-like-secret private-native-call",
+            false,
+        ),
+        ("private-device token-like-secret private-native-call", true),
+        ("reopen failed: No such device (os error 19)", false),
+    ] {
+        let mut backend = backend();
+        let events = if final_notice {
+            &mut backend.final_events
+        } else {
+            &mut backend.events
+        };
+        events.push_back(Event::Error(private.into()));
+        let mut stream = Stream::open(StreamConfig::default(), Box::new(backend)).unwrap();
+        stream.enable_capture_tap().unwrap();
+        stream.start().unwrap();
+        let result = stream.stop_checked().unwrap_err();
+        assert_eq!(result.kind(), ErrorKind::Backend);
+        let expected =
+            Error::Backend("backend reported a failure through a legacy error event".into());
+        assert_eq!(result, expected);
+        assert_eq!(
+            result.to_string(),
+            "backend error: backend reported a failure through a legacy error event"
+        );
+        assert!(!result.to_string().contains(private));
+        let terminal = stream.terminal_error().unwrap();
+        assert_eq!(terminal.root(), &expected);
+        assert_eq!(terminal.to_string(), expected.to_string());
+        assert_eq!(stream.shutdown_report().unwrap().primary(), Some(&terminal));
+        assert_eq!(
+            stream.poll_event(),
+            Some(Event::TerminalError { error: terminal })
+        );
+        assert!(stream.poll_event().is_none());
+        assert!(stream.poll_chunk().is_none());
+        assert!(stream.poll_capture().is_none());
+        assert_eq!(stream.stop_checked().unwrap_err(), result);
+    }
+}
+
+#[test]
+fn typed_library_backend_errors_keep_explanations_and_os_error_text() {
+    let explanation = "reopen failed: No such device (os error 19)";
+    for terminal in [false, true] {
+        for final_notice in [false, true] {
+            let mut backend = backend();
+            let error = Error::Backend(explanation.into())
+                .with_context(ErrorContext::new(Operation::Reopen));
+            let notice = if terminal {
+                Event::TerminalError {
+                    error: error.clone(),
+                }
+            } else {
+                Event::RecoverableError {
+                    error: error.clone(),
+                }
+            };
+            let events = if final_notice {
+                &mut backend.final_events
+            } else {
+                &mut backend.events
+            };
+            events.push_back(notice.clone());
+            let mut stream = Stream::open(StreamConfig::default(), Box::new(backend)).unwrap();
+            stream.start().unwrap();
+            let result = stream.stop_checked();
+            if terminal {
+                assert_eq!(result, Err(error.clone()));
+                assert_eq!(stream.terminal_error(), Some(error.clone()));
+                assert!(stream.poll_chunk().is_none());
+            } else {
+                assert_eq!(result, Ok(()));
+                assert!(stream.terminal_error().is_none());
+                assert!(stream.poll_chunk().is_some());
+            }
+            assert_eq!(stream.poll_event(), Some(notice));
+            assert!(stream.poll_event().is_none());
+            assert_eq!(
+                error.to_string(),
+                "backend error: reopen failed: No such device (os error 19) during reopen"
+            );
+        }
+    }
+}
+
+#[test]
+fn delayed_capture_poll_reports_exact_loss_and_next_delivery_discontinuity() {
+    struct ControlledBackend(Arc<Mutex<Option<RawSink>>>);
+    impl CaptureBackend for ControlledBackend {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 2)
+        }
+        fn start(&mut self, sink: RawSink) -> Result<()> {
+            *self.0.lock().unwrap() = Some(sink);
+            Ok(())
+        }
+        fn stop(&mut self) {
+            self.0.lock().unwrap().take();
+        }
+    }
+    let sink = Arc::new(Mutex::new(None));
+    let mut stream = Stream::open(
+        StreamConfig {
+            ring_capacity_chunks: 2,
+            ..Default::default()
+        },
+        Box::new(ControlledBackend(sink.clone())),
+    )
+    .unwrap();
+    stream.enable_capture_tap().unwrap();
+    stream.start().unwrap();
+    for seq in 0..4 {
+        assert_eq!(
+            sink.lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .push(&[0.25; 1920], 0),
+            1920
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let primary = loop {
+            if let Some(chunk) = stream.poll_chunk() {
+                break chunk;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "intake did not publish primary PCM"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(primary.seq, seq);
+        assert_eq!(primary.dropped_before, 0);
+    }
+    stream.stop_checked().unwrap();
+    assert_eq!(
+        stream.dropped_chunks(),
+        0,
+        "canonical loss is independent of primary drops"
+    );
+    let mut lost_samples = 0;
+    let mut notices = 0;
+    while let Some(event) = stream.poll_event() {
+        let Event::AudioLoss { loss } = event else {
+            panic!("unexpected event: {event:?}");
+        };
+        assert_eq!(
+            loss.path(),
+            flexaudio_core::AudioPath::Capture { lane: None }
+        );
+        assert_eq!(loss.reason(), flexaudio_core::LossReason::RawOverflow);
+        assert_eq!((loss.sample_rate(), loss.channels()), (48_000, 2));
+        lost_samples += loss.samples().unwrap().get();
+        notices += 1;
+    }
+    assert_eq!((notices, lost_samples), (2, 3840));
+    let first = stream.poll_capture().unwrap();
+    assert_eq!(first.frame_index, 1920);
+    assert!(first.flags.contains(ChunkFlags::DISCONTINUITY));
+    let second = stream.poll_capture().unwrap();
+    assert_eq!(second.frame_index, 2880);
+    assert!(!second.flags.contains(ChunkFlags::DISCONTINUITY));
+    assert!(stream.poll_capture().is_none());
+    stream.stop_checked().unwrap();
+    assert!(stream.poll_event().is_none());
 }
 #[test]
 fn final_capture_loss_without_following_pcm_is_reported_once() {

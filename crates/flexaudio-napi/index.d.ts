@@ -214,6 +214,8 @@ export type WhisperVadErrorCode = 'InvalidParameter' | 'InvalidPcm' | 'InvalidPr
 export interface WhisperVadError extends Error {
   code: WhisperVadErrorCode
   terminalEvents: WhisperVadEvent[]
+  /** Present on checked capture shutdown; includes every primary and cleanup cause. */
+  audioError?: AudioError
 }
 
 /** Synchronous, serialized inference; use a Node Worker for realtime processing. */
@@ -262,7 +264,7 @@ export type AudioError = {
   | { kind: 'permissionDenied'; permission: 'microphone' | 'systemAudio' }
   | { kind: 'unsupportedOsVersion' }
   | { kind: 'deviceLost' }
-  | { kind: 'backend' }
+  | { kind: 'backend'; whisperCode?: WhisperVadErrorCode }
   | { kind: 'unsupportedFormat' }
   | { kind: 'nativeFormatChanged'; advertised: JsNativeFormat; actual: JsNativeFormat }
   | { kind: 'unsupported' }
@@ -289,7 +291,9 @@ export interface AudioLoss {
 }
 
 export interface ShutdownReport {
+  /** Capture failure, including attached Whisper processing; null on cleanup-only failure. */
   primary: AudioError | null
+  /** Core teardown followed by addon final flush failures, retained in order. */
   cleanupErrors: readonly AudioError[]
 }
 
@@ -521,9 +525,10 @@ export declare class FlexStream {
   /**
    * Stop recording. When the Promise resolves, all `onChunk` calls queued on the TSFN before
    * stop (the last PCM and `frames:0` terminator) have been delivered to JS.
-   * Repeated calls await the same completion, or resolve immediately if already complete. Calling
+   * Repeated calls return the same retained success or failure after completion. Calling
    * inside `onChunk` does not freeze JS because joining happens off the JS thread.
-   * Rejects with AudioException on capture or cleanup failure. Capture failure suppresses
+   * Rejects with AudioException or WhisperVadError on capture or cleanup failure; audioError
+   * retains all related causes. Capture failure suppresses
    * further PCM and the normal terminator. Cleanup-only failure preserves valid graceful output.
    * The stopped stream is spent; call openStream to capture again.
    */

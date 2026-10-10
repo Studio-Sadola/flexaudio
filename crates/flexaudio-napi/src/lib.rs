@@ -17,6 +17,7 @@
 
 mod boundary;
 mod flac_encoder;
+mod shutdown;
 use boundary::{device_event_to_js, event_to_js, to_napi_err, JsAudioError, JsAudioLoss};
 mod vad_integration;
 mod whisper_integration;
@@ -185,32 +186,27 @@ fn resolve_undefined(env: sys::napi_env, deferred: SendDeferred) {
 
 /// Settle on the JS thread after delivery has drained. Terminal failures reject
 /// every waiter, including subsequent stop calls.
-fn settle_stop(
-    env: sys::napi_env,
-    deferred: SendDeferred,
-    terminal: &Mutex<Option<StreamTerminal>>,
-    report: &FinalReport,
-) {
-    let error = terminal.lock().unwrap_or_else(lock_poisoned).clone();
-    let error = report
-        .lock()
-        .unwrap_or_else(lock_poisoned)
-        .as_ref()
-        .and_then(|report| report.result().err())
-        .map(StreamTerminal::Capture)
-        .or(error);
-    match error {
-        None => resolve_undefined(env, deferred),
-        Some(error) => {
-            // SAFETY: settlement is called only on the live JS thread.
-            let env = unsafe { Env::from_raw(env) };
-            let exception = match error {
-                StreamTerminal::Capture(error) => boundary::js_error(&env, &error),
-                StreamTerminal::Whisper(error) => whisper_integration::js_error(&env, &error),
-            };
-            if let Ok(exception) = exception {
-                let _ =
-                    unsafe { sys::napi_reject_deferred(env.raw(), deferred.0, exception.raw()) };
+fn settle_stop(env: sys::napi_env, deferred: SendDeferred, report: &FinalReport) {
+    // A completed report is the sole authority for every stop waiter.
+    let retained = report.lock().unwrap_or_else(lock_poisoned);
+    // SAFETY: settlement is called only on the live JS thread.
+    let js_env = unsafe { Env::from_raw(env) };
+    let exception = match retained.as_ref() {
+        Some(report) => report.exception(&js_env),
+        None => boundary::js_error(
+            &js_env,
+            &flexaudio::Error::InvalidState("shutdown report missing".into()),
+        )
+        .map(Some),
+    };
+    match exception {
+        Ok(Some(exception)) => {
+            let _ = unsafe { sys::napi_reject_deferred(env, deferred.0, exception.raw()) };
+        }
+        Ok(None) => resolve_undefined(env, deferred),
+        Err(error) => {
+            if let Ok(exception) = js_env.create_error(error) {
+                let _ = unsafe { sys::napi_reject_deferred(env, deferred.0, exception.raw()) };
             }
         }
     }
@@ -288,28 +284,38 @@ fn retain_whisper_failure(
 }
 
 type TerminalError = Arc<Mutex<Option<StreamTerminal>>>;
-type FinalReport = Arc<Mutex<Option<flexaudio::core::ShutdownReport>>>;
+type FinalReport = Arc<Mutex<Option<shutdown::ShutdownReport>>>;
 
 fn record_cleanup_failure(report: &FinalReport, error: flexaudio::Error) {
     let mut report = report.lock().unwrap_or_else(lock_poisoned);
-    let primary = report.as_ref().and_then(|report| report.primary().cloned());
-    let mut cleanup = report
-        .as_ref()
-        .map(|report| report.cleanup().to_vec())
-        .unwrap_or_default();
-    cleanup.push(error);
-    *report = Some(flexaudio::core::ShutdownReport::new(primary, cleanup));
+    report
+        .get_or_insert_with(shutdown::ShutdownReport::default)
+        .binding_cleanup
+        .push(error);
 }
 
 fn record_bridge_failure(report: &FinalReport, terminal: &Mutex<Option<StreamTerminal>>) {
-    let primary = match terminal.lock().unwrap_or_else(lock_poisoned).as_ref() {
-        Some(StreamTerminal::Capture(error)) => Some(error.clone()),
-        _ => None,
-    };
+    let terminal = terminal.lock().unwrap_or_else(lock_poisoned).clone();
     {
         let mut report = report.lock().unwrap_or_else(lock_poisoned);
         if report.is_none() {
-            *report = Some(flexaudio::core::ShutdownReport::new(primary, Vec::new()));
+            let mut retained = shutdown::ShutdownReport::default();
+            match terminal {
+                Some(StreamTerminal::Capture(error)) => {
+                    retained.core = Some(flexaudio::core::ShutdownReport::new(
+                        Some(error),
+                        Vec::new(),
+                    ));
+                }
+                Some(StreamTerminal::Whisper(error)) => {
+                    retained.whisper = Some(shutdown::WhisperFailure {
+                        error,
+                        stage: shutdown::WhisperFailureStage::Process,
+                    });
+                }
+                None => {}
+            }
+            *report = Some(retained);
         }
     }
     record_cleanup_failure(
@@ -341,7 +347,7 @@ where
             } else {
                 let mut report = report.lock().unwrap_or_else(lock_poisoned);
                 if report.is_none() {
-                    *report = Some(flexaudio::core::ShutdownReport::new(None, Vec::new()));
+                    *report = Some(shutdown::ShutdownReport::default());
                 }
             }
             post_stop_flushed(&chunk, &settle, &phase);
@@ -449,7 +455,7 @@ fn make_chunk_tsfn(
                 }
                 ChunkEmit::StopFlushed => {
                     for deferred in take_stop_waiters(&stop_phase) {
-                        settle_stop(ctx.env.raw(), deferred, &terminal, &report);
+                        settle_stop(ctx.env.raw(), deferred, &report);
                     }
                     // Release the event-loop reference after termination and resolution (ordering contract).
                     unref_chunk_weak(&chunk_weak, &ctx.env);
@@ -474,7 +480,6 @@ fn make_settle_tsfn(
     stop_phase: Arc<Mutex<StopPhase>>,
     chunk_weak: ChunkTsfnWeakCell,
     user: Arc<UserChunkCb>,
-    terminal: TerminalError,
     report: FinalReport,
 ) -> napi::Result<SettleTsfn> {
     let pump =
@@ -482,7 +487,7 @@ fn make_settle_tsfn(
     let mut tsfn = pump.create_threadsafe_function::<(), Unknown, _, ErrorStrategy::Fatal>(0, {
         move |ctx: ThreadSafeCallContext<()>| {
             for deferred in take_stop_waiters(&stop_phase) {
-                settle_stop(ctx.env.raw(), deferred, &terminal, &report);
+                settle_stop(ctx.env.raw(), deferred, &report);
             }
             unref_chunk_weak(&chunk_weak, &ctx.env);
             user.release();
@@ -1516,7 +1521,6 @@ impl FlexStream {
         let thread_stop = stop_flag.clone();
         let thread_terminal = terminal.clone();
         let stop_phase = bridge.stop_phase.clone();
-        let report_for_bridge = report.clone();
         let (cmd_tx, cmd_rx) = mpsc::channel::<BridgeCmd>();
 
         let resources = Arc::new(Mutex::new(Some((stream, bridge, on_event))));
@@ -1644,8 +1648,7 @@ impl FlexStream {
                 //      a dedicated trailing carrier (independent of pairing; no drops even without a primary tail).
                 // This delivers both trailing recorded audio (2) and final speechEnd (3). Audio stop-flush and
                 // flushVad are separate (audio samples versus VAD events).
-                let _ = stream.stop_checked(); // ①
-                *report_for_bridge.lock().unwrap_or_else(lock_poisoned) = stream.shutdown_report();
+                let _ = stream.stop_checked();
                 // Stop can discover a pending backend denial. Preserve its event and
                 // terminal state before queuing any tail audio or settlement.
                 forward_stream_events(&mut stream, on_event.as_ref(), &thread_terminal);
@@ -1681,13 +1684,15 @@ impl FlexStream {
                     if let Some(error) = bridge
                         .whisper
                         .as_ref()
-                        .and_then(|owner| owner.error.clone())
+                        .and_then(|owner| owner.processing_error())
                     {
                         retain_whisper_failure(&thread_terminal, error);
                     }
                 } else if stream.terminal_error().is_none() {
                     bridge.flush_vad_final();
                 }
+                // Publish completion only after core and addon teardown are both known.
+                bridge.retain_shutdown_outcome(stream.shutdown_report());
                 // 4. End signal in the same TSFN queue. Processing it in JS resolves stop()'s Promise
                 // (AsyncTask / another TSFN could resolve before onChunk).
                 // If the chunk TSFN fails (Closing / QueueFull, etc.), use the settlement TSFN.
@@ -1825,7 +1830,7 @@ impl FlexStream {
             StopPhase::Stopped => {
                 drop(phase);
                 self.join_finished_bridge();
-                settle_stop(env.raw(), deferred, &self.terminal, &self.report);
+                settle_stop(env.raw(), deferred, &self.report);
                 unref_chunk_tsfn(self.chunk_tsfn.as_ref(), &env);
                 return Ok(promise);
             }
@@ -1847,7 +1852,7 @@ impl FlexStream {
                 // No join handle (e.g. taken by Drop's reaper). Callbacks to deliver are being
                 // cleaned up through another path, or are gone. Resolve immediately on the JS thread.
                 for d in take_stop_waiters(&self.stop_phase) {
-                    settle_stop(env.raw(), d, &self.terminal, &self.report);
+                    settle_stop(env.raw(), d, &self.report);
                 }
                 unref_chunk_tsfn(self.chunk_tsfn.as_ref(), &env);
             }
@@ -1880,7 +1885,7 @@ impl FlexStream {
             .lock()
             .unwrap_or_else(lock_poisoned)
             .as_ref()
-            .map(|report| Either::A(boundary::shutdown_report(report)))
+            .map(|report| Either::A(report.to_js()))
             .unwrap_or(Either::B(()))
     }
 
@@ -2345,14 +2350,7 @@ pub fn open_stream(
         terminal.clone(),
         report.clone(),
     )?;
-    let settle_tsfn = make_settle_tsfn(
-        &env,
-        stop_phase.clone(),
-        chunk_weak,
-        user,
-        terminal.clone(),
-        report.clone(),
-    )?;
+    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user, report.clone())?;
     let bridge = PairingBridge {
         whisper,
         on_chunk: on_chunk.as_ref().clone(),
@@ -2553,14 +2551,7 @@ pub fn open_mock_stream(
         terminal.clone(),
         report.clone(),
     )?;
-    let settle_tsfn = make_settle_tsfn(
-        &env,
-        stop_phase.clone(),
-        chunk_weak,
-        user,
-        terminal.clone(),
-        report.clone(),
-    )?;
+    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user, report.clone())?;
     let bridge = PairingBridge {
         whisper,
         on_chunk: on_chunk.as_ref().clone(),

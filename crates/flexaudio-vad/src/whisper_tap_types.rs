@@ -57,7 +57,8 @@ pub enum WhisperVadTapError {
     PtsOutOfRange,
     /// The locked converter could not establish its exact sample-aligned clock.
     UnsupportedConversionClock,
-    /// Conversion failed; the epoch is incomplete and cannot produce successful EOF finals.
+    /// Capture transport or conversion failed; the epoch is incomplete and cannot produce
+    /// successful EOF finals. Includes missing/reordered canonical capture frames.
     Conversion,
     /// Capture intake has already stopped.
     Stopped,

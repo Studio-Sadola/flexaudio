@@ -2,6 +2,40 @@
 use super::*;
 
 impl Stream {
+    pub(super) fn flush_whisper_with(
+        &mut self,
+        flush: impl FnOnce(
+            &mut flexaudio_vad::WhisperVadTap,
+        ) -> Result<
+            Vec<flexaudio_vad::AttachedWhisperVadEvent>,
+            flexaudio_vad::WhisperVadTapFailure,
+        >,
+    ) -> PyResult<()> {
+        if self.whisper.is_none() {
+            return Ok(());
+        }
+        self.drain_capture();
+        let drained = self.drain_output();
+        let intake_error = (!self.whisper_error_reported)
+            .then(|| self.whisper_error.clone())
+            .flatten();
+        let result = flush(self.whisper.as_mut().expect("enabled attachment"));
+        self.whisper_error = None;
+        self.whisper_error_reported = false;
+        self.accept_whisper(result);
+        self.whisper_carrier();
+        let tap_error = intake_error.or_else(|| self.whisper_error.clone());
+        let flushed = match tap_error {
+            Some(error) => {
+                self.whisper_error.get_or_insert(error.clone());
+                self.whisper_error_reported = true;
+                Err(crate::whisper_vad::tap_error(error))
+            }
+            None => Ok(()),
+        };
+        drained.and(flushed)
+    }
+
     pub(super) fn accept_whisper(
         &mut self,
         result: Result<
@@ -100,6 +134,115 @@ mod tests {
             assert!(Instant::now() < deadline, "fake capture timed out");
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn flush_failures_raise_typed_errors_and_keep_terminal_carriers() {
+        use flexaudio_vad::{
+            AttachedWhisperVadEvent, EpochEndReason, WhisperVadEvent, WhisperVadEventKind,
+            WhisperVadTapError, WhisperVadTapFailure,
+        };
+        Python::initialize();
+        Python::attach(|py| {
+            let mut stream = Stream {
+                inner: fa::Stream::open(
+                    Default::default(),
+                    Box::new(PushBackend(Arc::new(Mutex::new(None)))),
+                )
+                .unwrap(),
+                shutdown: None,
+                local_events: Default::default(),
+                output_end: None,
+                whisper: Some(
+                    flexaudio_vad::WhisperVadTap::new(Default::default(), Default::default())
+                        .unwrap(),
+                ),
+                whisper_events: Vec::new(),
+                whisper_origin: (0, 0),
+                whisper_error: None,
+                whisper_error_reported: false,
+                ready_chunks: Default::default(),
+                vad: None,
+                denoiser: None,
+                output_rate: 48_000,
+                output_channels: 2,
+            };
+            for (error, expected) in [
+                (WhisperVadTapError::Conversion, "Conversion"),
+                (
+                    WhisperVadTapError::Vad(flexaudio_vad::WhisperVadError::Inference),
+                    "Inference",
+                ),
+                (
+                    WhisperVadTapError::UnsupportedConversionClock,
+                    "UnsupportedConversionClock",
+                ),
+                (
+                    WhisperVadTapError::Vad(flexaudio_vad::WhisperVadError::SessionFinished),
+                    "SessionFinished",
+                ),
+            ] {
+                let error = stream
+                    .flush_whisper_with(|_| {
+                        Err(WhisperVadTapFailure {
+                            error,
+                            terminal_events: vec![AttachedWhisperVadEvent::Vad(WhisperVadEvent {
+                                epoch: 0,
+                                seq: 1,
+                                kind: WhisperVadEventKind::EpochEnd {
+                                    reason: EpochEndReason::Error,
+                                },
+                            })],
+                        })
+                    })
+                    .unwrap_err();
+                assert!(error.is_instance_of::<crate::whisper_vad::WhisperVadRuntimeError>(py));
+                assert_eq!(
+                    error
+                        .value(py)
+                        .getattr("code")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    expected
+                );
+                let carrier = Py::new(py, stream.poll_chunk().unwrap().unwrap()).unwrap();
+                assert_eq!(
+                    carrier
+                        .bind(py)
+                        .getattr("frames")
+                        .unwrap()
+                        .extract::<usize>()
+                        .unwrap(),
+                    0
+                );
+                let events = carrier.bind(py).getattr("whisper_vad_events").unwrap();
+                assert_eq!(events.len().unwrap(), 1);
+                assert_eq!(
+                    events
+                        .get_item(0)
+                        .unwrap()
+                        .getattr("type")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "epoch_end"
+                );
+                assert!(stream.poll_chunk().unwrap().is_none());
+                stream.flush_whisper_with(|_| Ok(Vec::new())).unwrap();
+            }
+            stream.whisper_error = Some(WhisperVadTapError::Conversion);
+            let error = stream.flush_whisper_with(|_| Ok(Vec::new())).unwrap_err();
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("code")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "Conversion"
+            );
+        });
     }
 
     #[test]
@@ -230,6 +373,17 @@ mod tests {
             sink.lock().unwrap().as_mut().unwrap().push(&[0.0; 1920], 0);
             let _ = next_chunk(&mut stream);
             stream.stop().unwrap();
+            let error = stream.flush_whisper_vad().unwrap_err();
+            assert!(error.is_instance_of::<crate::whisper_vad::WhisperVadRuntimeError>(py));
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("code")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "Stopped"
+            );
             let terminal = Py::new(py, next_chunk(&mut stream)).unwrap();
             let events = terminal.bind(py).getattr("whisper_vad_events").unwrap();
             assert_eq!(

@@ -248,3 +248,57 @@ test('asynchronous failures reject with the same typed audio error tree', async 
     return true;
   });
 });
+
+for (const processing of [true, false]) {
+  for (const coreCleanup of [false, true]) {
+    const scenario = `whisper-${processing ? 'process' : 'flush'}${coreCleanup ? '-cleanup' : ''}`;
+    test(`${scenario}: stop and report retain addon and core causes across all waiters`, async () => {
+      const stream = native.__reproP9Bridge(scenario, () => {});
+      const whisperCode = processing ? 'InvalidPcm' : 'Conversion';
+      let retainedError;
+      const checkError = error => {
+        assert.equal(error.code, !processing && coreCleanup ? 'FLEX_DEVICE_LOST' : whisperCode);
+        const report = stream.shutdownReport();
+        assert.ok(report);
+        if (processing) {
+          assert.equal(report.primary.whisperCode, whisperCode);
+          assert.equal(report.primary.contexts[0].operation, 'normalize');
+          assert.equal(report.cleanupErrors.length, coreCleanup ? 1 : 0);
+          if (coreCleanup) assert.equal(report.cleanupErrors[0].kind, 'deviceLost');
+        } else {
+          assert.equal(report.primary, null);
+          assert.equal(report.cleanupErrors.length, coreCleanup ? 2 : 1);
+          assert.equal(report.cleanupErrors.at(-1).whisperCode, whisperCode);
+          assert.equal(report.cleanupErrors.at(-1).contexts[0].operation, 'flush');
+          assert.equal(stream.terminalError(), undefined, 'flush-only failure is cleanup');
+        }
+        const causes = report.primary ? [report.primary, ...report.cleanupErrors] : report.cleanupErrors;
+        const [root, ...secondary] = causes;
+        assert.deepEqual(error.audioError, { ...root, secondary: [...root.secondary, ...secondary] });
+        if (retainedError) assert.deepEqual(error.audioError, retainedError);
+        retainedError = error.audioError;
+        return true;
+      };
+      // Concurrent stop waiters and a call made after completion share one outcome.
+      await Promise.all([assert.rejects(stream.stop(), checkError), assert.rejects(stream.stop(), checkError)]);
+      const report = stream.shutdownReport();
+      await assert.rejects(stream.stop(), checkError);
+      assert.deepEqual(stream.shutdownReport(), report);
+    });
+  }
+}
+
+test('core capture primary, core cleanup and final Whisper failure are all retained', async () => {
+  const stream = native.__reproP9Bridge('whisper-flush-primary', () => {});
+  for (let index = 0; index < 2; index++) {
+    await assert.rejects(stream.stop(), error => {
+      assert.equal(error.code, 'FLEX_UNSUPPORTED_FORMAT');
+      const report = stream.shutdownReport();
+      assert.equal(report.primary.kind, 'unsupportedFormat');
+      assert.deepEqual(report.cleanupErrors.map(cause => cause.kind), ['deviceLost', 'backend']);
+      assert.equal(report.cleanupErrors[1].whisperCode, 'Conversion');
+      assert.deepEqual(error.audioError.secondary, report.cleanupErrors);
+      return true;
+    });
+  }
+});

@@ -74,8 +74,10 @@ impl WhisperVadTap {
     /// `capture_sample`/`pts_ns` locate the first frame, independently of event delivery.
     /// PTS uses the chunk's signed safe-integer domain. Within an epoch, project PTS with
     /// floor(delta_frames*1e9/48000), rather than multiplying by truncated ns per frame.
-    /// A discontinuity, unexpected capture index, or PTS reanchor closes the prefix before
-    /// resetting and accepting the new origin. Invalid complete feeds leave state unchanged.
+    /// An explicit discontinuity or PTS reanchor closes an intact prefix before resetting.
+    /// Missing/reordered capture frames, or a discontinuity before the first accepted feed,
+    /// fail the epoch without successful EOF finals. A successful flush is required to
+    /// recover. Invalid complete feeds leave state unchanged.
     pub fn process(
         &mut self,
         stereo_48k: &[f32],
@@ -100,11 +102,18 @@ impl WhisperVadTap {
         project_pts(pts_ns, 0)?;
         project_pts(pts_ns, frames)?;
         let input_frames = self.converter.input_frames();
-        let clock_break = if frames != 0 {
-            self.origin.is_some_and(|origin| {
+        let transport_gap = frames != 0
+            && self.origin.is_some_and(|origin| {
                 origin.capture_sample.checked_add(input_frames) != Some(capture_sample)
-                    || project_pts(origin.pts_ns, input_frames).ok() != Some(pts_ns)
-            })
+            });
+        if transport_gap || (frames != 0 && discontinuity && self.origin.is_none()) {
+            // Do not infer a tail or call finish on an incomplete capture timeline.
+            // Reuse the fatal conversion/intake path to close published hints once.
+            return Err(self.conversion_failure(Vec::new()));
+        }
+        let clock_break = if frames != 0 {
+            self.origin
+                .is_some_and(|origin| project_pts(origin.pts_ns, input_frames).ok() != Some(pts_ns))
         } else {
             false
         };

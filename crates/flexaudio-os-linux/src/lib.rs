@@ -2077,6 +2077,19 @@ struct EnumState {
     default_source: Option<String>,
 }
 
+/// Only nodes can represent entries in the audio inventory. A props-less node
+/// cannot be classified safely; unrelated globals do not require device identity.
+fn enumeration_properties<'a>(
+    object_type: &pw::types::ObjectType,
+    props: Option<&'a spa::utils::dict::DictRef>,
+) -> std::result::Result<Option<&'a spa::utils::dict::DictRef>, EnumerationFailure> {
+    if props.is_none() && *object_type == pw::types::ObjectType::Node {
+        Err(EnumerationFailure::Identity)
+    } else {
+        Ok(props)
+    }
+}
+
 /// Enumerate audio devices (microphones and system output sinks) through PipeWire.
 ///
 /// Wait for one round of registry global events:
@@ -2141,9 +2154,13 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
         .global(move |global| {
             // A panic crossing FFI is UB, so wrap the callback body in catch_unwind.
             let result = catch_unwind(AssertUnwindSafe(|| {
-                let Some(props) = global.props else {
-                    failure_for_global.set(Some(EnumerationFailure::Identity));
-                    return;
+                let props = match enumeration_properties(&global.type_, global.props) {
+                    Ok(Some(props)) => props,
+                    Ok(None) => return,
+                    Err(failure) => {
+                        failure_for_global.set(Some(failure));
+                        return;
+                    }
                 };
                 match global.type_ {
                     pw::types::ObjectType::Node => {
@@ -2416,9 +2433,8 @@ fn extract_json_name(value: &str) -> Option<String> {
 ///
 /// # PipeWire unavailable
 /// If the PipeWire daemon is unavailable or connection fails, [`start`](Self::start) returns
-/// [`Error::Backend`] without panicking. The facade degrades this to a no-op watcher (there is
-/// nothing to publish if there are no device changes). An available but empty PipeWire session
-/// works normally.
+/// [`Error::Backend`] without panicking. The facade propagates this startup error to the caller.
+/// An available but empty PipeWire session works normally.
 ///
 /// ```no_run
 /// use flexaudio_os_linux::PwDeviceWatcher;
@@ -2922,6 +2938,46 @@ fn enqueue_event(events: &WatchEventQueue, ev: DeviceEvent) {
 mod tests {
     use super::*;
     use flexaudio_core::raw_ring::raw_ring;
+
+    #[test]
+    fn enumeration_missing_properties_only_fail_for_nodes() {
+        use pw::types::ObjectType;
+
+        for object_type in [
+            ObjectType::Core,
+            ObjectType::Module,
+            ObjectType::Client,
+            ObjectType::Metadata,
+            ObjectType::Device,
+            ObjectType::Port,
+            ObjectType::Other("unrelated interface".into()),
+        ] {
+            assert!(matches!(
+                enumeration_properties(&object_type, None),
+                Ok(None)
+            ));
+        }
+        assert!(matches!(
+            enumeration_properties(&ObjectType::Node, None),
+            Err(EnumerationFailure::Identity)
+        ));
+
+        // A dictionary (including an empty one) remains available to the normal
+        // media.class/node.name checks in the registry callback.
+        let properties = properties! { "node.name" => "fixture.audio" };
+        let props: &spa::utils::dict::DictRef = properties.as_ref();
+        assert!(std::ptr::eq(
+            enumeration_properties(&ObjectType::Node, Some(props))
+                .unwrap()
+                .unwrap(),
+            props,
+        ));
+        let empty = pw::properties::PropertiesBox::new();
+        assert!(matches!(
+            enumeration_properties(&ObjectType::Node, Some(empty.as_ref())),
+            Ok(Some(_))
+        ));
+    }
 
     /// Verify `PwSystemBackend: Send` as required by the [`CaptureBackend`] contract (proves
     /// PipeWire's `!Send` values are confined to the dedicated thread). Passing compilation is enough.

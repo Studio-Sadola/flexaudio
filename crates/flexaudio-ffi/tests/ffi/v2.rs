@@ -822,6 +822,12 @@ fn v2_repeated_stop_delivers_one_denoise_tail_and_spent_stream_keeps_addon() {
     let last_error = crate::flexaudio_last_error();
     assert!(!last_error.is_null());
     let message = unsafe { CStr::from_ptr(last_error) }.to_str().unwrap();
+    let error = crate::error::last_audio_error().expect("typed state error retained");
+    let flexaudio::Error::InvalidState(detail) = &error else {
+        panic!("restart must retain an InvalidState error");
+    };
+    assert!(detail.contains("already stopped") || detail.contains("spent"));
+    assert_eq!(message, error.to_string());
     assert!(
         message.contains("already stopped") || message.contains("spent"),
         "restart must explain the spent stream: {message}"

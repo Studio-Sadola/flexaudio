@@ -363,6 +363,8 @@ impl Stream {
 
     /// Poll valid canonical PCM for attached processing; frames exclude transport padding.
     /// `frame_index` is the authoritative canonical source origin for WhisperVadTap.
+    /// Queue overflow emits capture AudioLoss in 48 kHz stereo scalar samples and marks
+    /// the next delivered capture chunk DISCONTINUITY, including before the first poll.
     pub fn poll_capture(&mut self) -> Option<AudioChunk> {
         let _delivery = self
             .shared

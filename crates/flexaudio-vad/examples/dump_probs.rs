@@ -94,8 +94,10 @@ fn read_samples(bytes: &[u8]) -> io::Result<Vec<f32>> {
     }
     let data = data.ok_or_else(|| invalid_wav("missing WAV data chunk"))?;
     Ok(data
-        .chunks_exact(2)
-        .map(|sample| f32::from(i16::from_le_bytes([sample[0], sample[1]])) / 32768.0)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&sample| f32::from(i16::from_le_bytes(sample)) / 32768.0)
         .collect())
 }
 

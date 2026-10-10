@@ -294,6 +294,13 @@ mod repro_tests {
             let error = to_py_err(fa::Error::InvalidArg("benign validation".into()));
             assert!(error.is_instance_of::<PyValueError>(py));
             assert!(error.to_string().contains("benign validation"));
+            let payload = error.value(py).getattr("audio_error").unwrap();
+            let payload = payload
+                .extract::<PyRef<'_, crate::errors::AudioError>>()
+                .unwrap();
+            assert!(
+                matches!(&payload.0, fa::Error::InvalidArg(detail) if detail == "benign validation")
+            );
         });
     }
 }
@@ -314,6 +321,7 @@ mod boundary_tests {
             py.run(
                 pyo3::ffi::c_str!(
                     r#"
+failures = []
 for duration in (0, 10, 40, 4294967295):
     try:
         flexaudio.open('mic', chunk_ms=duration, denoise=True, output_rate=16000,
@@ -321,6 +329,7 @@ for duration in (0, 10, 40, 4294967295):
     except flexaudio.InvalidArgumentError as error:
         assert error.audio_error.kind == 'invalidArg'
         assert 'chunk_ms' in str(error)
+        failures.append(error.audio_error)
     else:
         raise AssertionError('unsupported chunk duration was accepted')
 "#
@@ -329,6 +338,21 @@ for duration in (0, 10, 40, 4294967295):
                 Some(&locals),
             )
             .unwrap();
+            for payload in locals
+                .get_item("failures")
+                .unwrap()
+                .unwrap()
+                .try_iter()
+                .unwrap()
+            {
+                let payload = payload.unwrap();
+                let payload = payload
+                    .extract::<PyRef<'_, crate::errors::AudioError>>()
+                    .unwrap();
+                assert!(
+                    matches!(&payload.0, fa::Error::InvalidArg(detail) if detail.contains("chunk_ms"))
+                );
+            }
         });
     }
 }

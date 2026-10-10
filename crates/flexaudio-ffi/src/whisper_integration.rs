@@ -3,7 +3,7 @@ use crate::whisper_types::*;
 use crate::whisper_vad::params_from_c;
 use crate::{
     error::{clear_last_error, code, set_last_error},
-    guard_i32,
+    guard_const_ptr, guard_i32,
     types::{FlexChunk, FlexConfig, FlexStream},
 };
 use std::{mem, ptr};
@@ -97,13 +97,16 @@ pub(crate) fn attached_to_c(
 }
 
 fn tap_status(error: &flexaudio_vad::WhisperVadTapError) -> i32 {
-    if matches!(
-        error,
-        flexaudio_vad::WhisperVadTapError::UnsupportedConversionClock
-    ) {
-        FLEX_WHISPER_UNSUPPORTED_CONVERSION_CLOCK
-    } else {
-        code::FLEX_FAILURE
+    use flexaudio_vad::WhisperVadTapError;
+    match error {
+        WhisperVadTapError::Vad(error) => crate::whisper_vad::error_code(error),
+        WhisperVadTapError::InvalidStereoLength
+        | WhisperVadTapError::InvalidPcm { .. }
+        | WhisperVadTapError::CaptureSampleOverflow
+        | WhisperVadTapError::PtsOutOfRange => code::FLEX_INVALID_ARG,
+        WhisperVadTapError::Stopped | WhisperVadTapError::FailedSession => code::FLEX_INVALID_STATE,
+        WhisperVadTapError::UnsupportedConversionClock => FLEX_WHISPER_UNSUPPORTED_CONVERSION_CLOCK,
+        WhisperVadTapError::Conversion => code::FLEX_FAILURE,
     }
 }
 
@@ -315,20 +318,25 @@ pub unsafe extern "C" fn flexaudio_poll_chunk_v2(s: *mut FlexStream, out: *mut F
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_chunk_free_v2(chunk: *mut FlexChunkV2) {
     guard_i32(|| {
-        if !chunk.is_null() {
-            crate::flexaudio_chunk_free(&mut (*chunk).chunk);
-            if !(*chunk).whisper_vad_events.is_null() {
-                drop(Box::from_raw(ptr::slice_from_raw_parts_mut(
-                    (*chunk).whisper_vad_events,
-                    (*chunk).whisper_vad_events_len,
-                )));
-            }
-            chunk.write(mem::zeroed());
+        if chunk.is_null() {
+            return code::FLEX_OK;
         }
+        if !crate::v2::valid(chunk) {
+            return crate::v2::invalid();
+        }
+        crate::flexaudio_chunk_free(&mut (*chunk).chunk);
+        if !(*chunk).whisper_vad_events.is_null() {
+            drop(Box::from_raw(ptr::slice_from_raw_parts_mut(
+                (*chunk).whisper_vad_events,
+                (*chunk).whisper_vad_events_len,
+            )));
+        }
+        chunk.write(mem::zeroed());
         code::FLEX_OK
     });
 }
 /// Flush a whisper epoch. Disabled attachment is a no-op.
+/// Failures return their root code immediately; closing events remain available via poll_chunk_v2.
 /// # Safety
 /// s must be a valid, exclusively owned stream handle.
 #[no_mangle]
@@ -341,21 +349,7 @@ pub unsafe extern "C" fn flexaudio_flush_whisper_vad(s: *mut FlexStream) -> i32 
                 "InvalidArgument: invalid stream handle",
             );
         }
-        let stream = &mut *s;
-        if stream.whisper.is_none() {
-            return code::FLEX_OK;
-        }
-        if let Err(error) = stream.queue_whisper_input() {
-            return crate::vad::vad_failure(error);
-        }
-        if let Some(tap) = stream.whisper.as_mut() {
-            let result = tap.flush();
-            stream.whisper_error = None;
-            stream.whisper_error_reported = false;
-            stream.accept_whisper(result);
-            stream.queue_whisper_carrier();
-        }
-        code::FLEX_OK
+        (&mut *s).flush_whisper_with(flexaudio_vad::WhisperVadTap::flush)
     })
 }
 
@@ -374,6 +368,38 @@ fn empty_carrier(origin: (u64, i64)) -> flexaudio::AudioChunk {
 }
 
 impl FlexStream {
+    fn flush_whisper_with(
+        &mut self,
+        flush: impl FnOnce(
+            &mut flexaudio_vad::WhisperVadTap,
+        ) -> Result<
+            Vec<flexaudio_vad::AttachedWhisperVadEvent>,
+            flexaudio_vad::WhisperVadTapFailure,
+        >,
+    ) -> i32 {
+        if self.whisper.is_none() {
+            return code::FLEX_OK;
+        }
+        if let Err(error) = self.queue_whisper_input() {
+            return crate::vad::vad_failure(error);
+        }
+        // Report intake failures before a successful flush can recover the tap.
+        let intake_error = (!self.whisper_error_reported)
+            .then(|| self.whisper_error.clone())
+            .flatten();
+        let result = flush(self.whisper.as_mut().expect("enabled attachment"));
+        self.whisper_error = None;
+        self.whisper_error_reported = false;
+        self.accept_whisper(result);
+        self.queue_whisper_carrier();
+        if let Some(error) = intake_error.or_else(|| self.whisper_error.clone()) {
+            self.whisper_error.get_or_insert(error.clone());
+            self.whisper_error_reported = true;
+            return reject(tap_status(&error), &error.to_string());
+        }
+        code::FLEX_OK
+    }
+
     pub(crate) fn accept_whisper(
         &mut self,
         result: Result<
@@ -485,16 +511,24 @@ pub unsafe extern "C" fn flexaudio_chunk_whisper_vad_events(
     chunk: *const FlexChunkV2,
     len: *mut usize,
 ) -> *const FlexAttachedWhisperVadEvent {
-    let Some(chunk) = chunk.as_ref() else {
-        if let Some(len) = len.as_mut() {
-            *len = 0;
+    guard_const_ptr(|| {
+        clear_last_error();
+        if !len.is_null() && !crate::v2::valid(len) {
+            crate::v2::invalid();
+            return ptr::null();
         }
-        return ptr::null();
-    };
-    if let Some(len) = len.as_mut() {
-        *len = chunk.whisper_vad_events_len;
-    }
-    chunk.whisper_vad_events
+        if !len.is_null() {
+            len.write(0);
+        }
+        if !crate::v2::valid(chunk) {
+            crate::v2::invalid();
+            return ptr::null();
+        }
+        if !len.is_null() {
+            len.write((*chunk).whisper_vad_events_len);
+        }
+        (*chunk).whisper_vad_events
+    })
 }
 
 #[cfg(test)]
@@ -667,6 +701,11 @@ mod tests {
             let mut chunk = next_chunk(&mut stream);
             flexaudio_chunk_free_v2(&mut chunk);
             assert_eq!(crate::flexaudio_stop(&mut stream), code::FLEX_OK);
+            assert_eq!(
+                flexaudio_flush_whisper_vad(&mut stream),
+                code::FLEX_INVALID_STATE
+            );
+            assert!(!crate::flexaudio_last_error().is_null());
             let handle = Box::into_raw(Box::new(stream));
             crate::flexaudio_free(handle);
             assert!(std::ffi::CStr::from_ptr(crate::flexaudio_last_error())
@@ -756,3 +795,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/ffi/whisper_audit.rs"]
+mod audit_tests;

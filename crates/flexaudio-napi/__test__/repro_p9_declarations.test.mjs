@@ -60,3 +60,10 @@ test('audio errors have closed kind-specific payloads and exact loss counts', ()
   assert.match(body('AudioLoss'), /samples: bigint \| null/);
   assert.ok(!/\bany\b/.test(declarations.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')));
 });
+
+test('retained addon shutdown failures declare their typed Whisper code and audio error tree', () => {
+  assert.match(alias('AudioError'), /kind: 'backend'; whisperCode\?: WhisperVadErrorCode/);
+  assert.match(declarations, /export interface WhisperVadError extends Error \{[^}]*audioError\?: AudioError/);
+  assert.match(body('ShutdownReport'), /primary: AudioError \| null/);
+  assert.match(body('ShutdownReport'), /cleanupErrors: readonly AudioError\[\]/);
+});

@@ -105,6 +105,10 @@ pub trait CaptureBackend: Send {
     /// Return promptly and return `None` when empty. After `stop`, final owner
     /// notifications must remain pollable until drained; do not discard denial
     /// when stopping or replacing a capture generation.
+    /// Typed error messages must be safe library-authored explanations; OS error text is
+    /// allowed, but device names, private environment diagnostics and internal call labels
+    /// are not. Legacy [`Event::Error`] strings are conservatively terminal and replaced
+    /// with a library-authored explanation at the facade boundary.
     fn poll_event(&mut self) -> Option<Event> {
         None
     }

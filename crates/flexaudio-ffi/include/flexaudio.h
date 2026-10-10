@@ -56,6 +56,50 @@
 // The handle state does not allow the operation (such as writing to finalized FLAC).
 #define FLEX_INVALID_STATE -4
 
+#define FLEX_SOURCE_KIND_MIC 0
+
+#define FLEX_SOURCE_KIND_SYSTEM 1
+
+#define FLEX_SOURCE_KIND_PROCESS 2
+
+#define FLEX_SOURCE_KIND_MIX 3
+
+#define FLEX_PROCESS_MODE_INCLUDE 0
+
+#define FLEX_PROCESS_MODE_EXCLUDE 1
+
+#define FLEX_EVENT_KIND_CHUNK_DROPPED 0
+
+#define FLEX_EVENT_KIND_STALLED 1
+
+#define FLEX_EVENT_KIND_RECOVERED 2
+
+#define FLEX_EVENT_KIND_PERMISSION_DENIED 3
+
+#define FLEX_EVENT_KIND_DEVICE_LOST 4
+
+#define FLEX_EVENT_KIND_ERROR 5
+
+#define FLEX_EVENT_KIND_UNKNOWN 6
+
+#define FLEX_EVENT_KIND_SILENCE_WHILE_SOURCE_ACTIVE 7
+
+#define FLEX_EVENT_KIND_PERMISSION_PENDING 8
+
+#define FLEX_OUTPUT_ACTIVITY_UNKNOWN 0
+
+#define FLEX_OUTPUT_ACTIVITY_INACTIVE 1
+
+#define FLEX_OUTPUT_ACTIVITY_ACTIVE 2
+
+#define FLEX_DEVICE_EVENT_KIND_ADDED 0
+
+#define FLEX_DEVICE_EVENT_KIND_REMOVED 1
+
+#define FLEX_DEVICE_EVENT_KIND_DEFAULT_CHANGED 2
+
+#define FLEX_DEVICE_EVENT_KIND_UNKNOWN 3
+
 // Late microphone consent; permission getter returns 1.
 #define FLEX_EVENT_KIND_PERMISSION_GRANTED 9
 
@@ -1137,6 +1181,7 @@ int32_t flexaudio_poll_chunk_v2(struct FlexStream *s, struct FlexChunkV2 *out);
 void flexaudio_chunk_free_v2(struct FlexChunkV2 *chunk);
 
 // Flush a whisper epoch. Disabled attachment is a no-op.
+// Failures return their root code immediately; closing events remain available via poll_chunk_v2.
 // # Safety
 // s must be a valid, exclusively owned stream handle.
 int32_t flexaudio_flush_whisper_vad(struct FlexStream *s);

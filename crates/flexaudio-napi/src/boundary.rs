@@ -83,22 +83,14 @@ pub struct JsAudioError {
     pub permission: Option<String>,
     pub advertised: Option<JsNativeFormat>,
     pub actual: Option<JsNativeFormat>,
+    /// Typed attached-addon cause, projected as a backend error in the shared report.
+    pub whisper_code: Option<String>,
 }
 
 #[napi(object)]
 pub struct JsShutdownReport {
     pub primary: Either<JsAudioError, Null>,
     pub cleanup_errors: Vec<JsAudioError>,
-}
-
-pub(super) fn shutdown_report(report: &flexaudio::core::ShutdownReport) -> JsShutdownReport {
-    JsShutdownReport {
-        primary: report
-            .primary()
-            .map(|error| Either::A(audio_error(error)))
-            .unwrap_or(Either::B(Null)),
-        cleanup_errors: report.cleanup().iter().map(audio_error).collect(),
-    }
 }
 
 fn lane_name(lane: MixLane) -> Option<&'static str> {
@@ -205,6 +197,7 @@ pub(super) fn audio_error(error: &Error) -> JsAudioError {
             .map(|permission| permission.as_str().into()),
         advertised,
         actual,
+        whisper_code: None,
     }
 }
 

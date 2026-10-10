@@ -648,6 +648,7 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(message, "backend error: legacy capture failure");
+        assert!(!message.contains("secret diagnostic"));
     }
 
     // All-zero fields in FlexVadConfig mean all defaults.

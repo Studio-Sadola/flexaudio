@@ -1,6 +1,53 @@
 //! Test-only fixtures invoke the real boundary and bridge paths.
 use super::*;
 
+/// Sends deterministic PCM without devices or a producer thread; failures travel
+/// through the real facade stop/report and the production N-API bridge.
+struct ShutdownFixtureBackend {
+    sink: Option<flexaudio::core::RawSink>,
+    cleanup_failure: bool,
+    capture_failure: bool,
+    stopped: bool,
+}
+
+impl flexaudio::core::CaptureBackend for ShutdownFixtureBackend {
+    fn native_format(&self) -> (u32, u16) {
+        (48_000, 2)
+    }
+    fn start(&mut self, mut sink: flexaudio::core::RawSink) -> flexaudio::Result<()> {
+        sink.push(&[0.0; 1920], 0);
+        self.sink = Some(sink);
+        Ok(())
+    }
+    fn stop(&mut self) {
+        if let Some(mut sink) = self.sink.take() {
+            sink.push(&[0.0; 1920], 20_000_000);
+        }
+        self.stopped = true;
+    }
+    fn stop_checked(&mut self) -> flexaudio::Result<()> {
+        self.stop();
+        if self.cleanup_failure {
+            Err(
+                flexaudio::Error::DeviceLost.with_context(flexaudio::core::ErrorContext::new(
+                    flexaudio::core::Operation::Stop,
+                )),
+            )
+        } else {
+            Ok(())
+        }
+    }
+    fn poll_event(&mut self) -> Option<Event> {
+        if self.stopped && std::mem::take(&mut self.capture_failure) {
+            Some(Event::TerminalError {
+                error: flexaudio::Error::UnsupportedFormat("fixture".into()),
+            })
+        } else {
+            None
+        }
+    }
+}
+
 // napi-derive disables automatic registration under cfg(test). Register only these test
 // exports explicitly; expose the real FlexStream::stop through a plain JS object.
 #[napi::bindgen_prelude::ctor]
@@ -223,14 +270,7 @@ pub fn repro_p9_bridge(
         terminal.clone(),
         report.clone(),
     )?;
-    let settle = make_settle_tsfn(
-        &env,
-        phase.clone(),
-        weak,
-        user,
-        terminal.clone(),
-        report.clone(),
-    )?;
+    let settle = make_settle_tsfn(&env, phase.clone(), weak, user, report.clone())?;
     let mut bridge = PairingBridge {
         whisper: None,
         on_chunk: chunk.as_ref().clone(),
@@ -255,6 +295,40 @@ pub fn repro_p9_bridge(
         last_primary_frame_index: 0,
         last_primary_dropped: 0,
     };
+    if matches!(
+        scenario.as_str(),
+        "whisper-process"
+            | "whisper-flush"
+            | "whisper-process-cleanup"
+            | "whisper-flush-cleanup"
+            | "whisper-flush-primary"
+    ) {
+        let mut whisper = whisper_integration::WhisperBridge::new(
+            flexaudio_vad::WhisperVadParams::default(),
+            flexaudio_vad::WhisperVadOptions::default(),
+            VadTap::Primary,
+        )
+        .map_err(|error| whisper_integration::throw_error(&env, error))?;
+        whisper.inject_shutdown_failure(scenario.starts_with("whisper-process"));
+        bridge.whisper = Some(whisper);
+        let mut stream = flexaudio::Stream::open(
+            StreamConfig::default(),
+            Box::new(ShutdownFixtureBackend {
+                sink: None,
+                cleanup_failure: scenario.ends_with("cleanup") || scenario.ends_with("primary"),
+                capture_failure: scenario.ends_with("primary"),
+                stopped: false,
+            }),
+        )
+        .map_err(|error| boundary::throw_error(&env, error))?;
+        stream
+            .enable_capture_tap()
+            .map_err(|error| boundary::throw_error(&env, error))?;
+        stream
+            .start()
+            .map_err(|error| boundary::throw_error(&env, error))?;
+        return FlexStream::spawn(&env, stream, bridge, None, chunk, settle, terminal);
+    }
     #[cfg(target_os = "linux")]
     if scenario == "exhaust" || scenario == "reaper" {
         // Reduce only this probe child's thread allowance after Node/TSFN initialization.

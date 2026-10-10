@@ -24,7 +24,7 @@ pub enum OutputTap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AudioPath {
-    /// Native capture, optionally attributed to a Mix child.
+    /// Capture transport, native or canonical, optionally attributed to a Mix child.
     Capture {
         /// Child lane, if applicable.
         lane: Option<MixLane>,
@@ -44,7 +44,7 @@ pub enum AudioPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LossReason {
-    /// Raw capture ring capacity exceeded.
+    /// Capture PCM ring capacity exceeded, before native or canonical processing intake.
     RawOverflow,
     /// Mix child FIFO capacity exceeded.
     MixFifoOverflow,
@@ -95,7 +95,8 @@ impl AudioLoss {
                 .ok_or_else(|| Error::InvalidArg("loss channels must be positive".into()))?,
         })
     }
-    /// Raw ring overflow with native format and exact scalar count, or unknown.
+    /// Capture PCM ring overflow with the discard-point format and exact scalar count,
+    /// or unknown. The canonical capture queue reports its own 48 kHz stereo format.
     pub fn raw_overflow(
         lane: Option<MixLane>,
         samples: Option<NonZeroU64>,

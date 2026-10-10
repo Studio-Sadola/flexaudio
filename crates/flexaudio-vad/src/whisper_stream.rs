@@ -263,7 +263,8 @@ impl WhisperVad {
         }
     }
 
-    /// Close only published hints after an attached converter fails, without successful EOF.
+    /// Close only published hints after attached conversion or capture transport fails,
+    /// without successful EOF.
     pub(crate) fn abort(&mut self) -> Result<WhisperVadFailure, WhisperVadError> {
         let mut terminal = self.reserve_batch(0)?;
         Ok(self.fail(WhisperVadError::Inference, &mut terminal))
