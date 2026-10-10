@@ -28,6 +28,7 @@
 
 #![warn(missing_docs)]
 
+use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -40,8 +41,12 @@ use cpal::{Device, SampleFormat};
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::clock::monotonic_now_ns;
 use flexaudio_core::types::{DeviceInfo, Error, Event, Result, SourceKind};
+use flexaudio_core::{ErrorContext, ErrorGroup, Operation};
 
 mod capture_owner;
+
+mod callback_mailbox;
+mod generation;
 mod input_config;
 #[cfg(target_os = "macos")]
 mod mac_permission;
@@ -96,6 +101,11 @@ pub struct CpalMicBackend {
     event_tx: mpsc::Sender<Event>,
     /// A confirmed runtime denial cannot be restarted on this backend instance.
     terminal_error: Option<Error>,
+    /// Runtime failures are materialized on the control thread, never the callback.
+    callback_errors: Arc<callback_mailbox::CallbackMailbox>,
+    generation: Arc<generation::Generation>,
+    shutdown_result: Option<Result<()>>,
+    pending_events: VecDeque<Event>,
 }
 
 impl CpalMicBackend {
@@ -103,7 +113,7 @@ impl CpalMicBackend {
     ///
     /// `device_id`:
     /// - `None` → default input device (`host.default_input_device()`).
-    /// - `Some(id)` → first device in `host.input_devices()` where `device.name()? == id`
+    /// - `Some(id)` → unique device in `host.input_devices()` where `device.name()? == id`
     ///   (id is a device name returned by [`list_devices`]).
     ///
     /// Query and cache the selected device's native format. If the device is missing, does
@@ -139,14 +149,80 @@ impl CpalMicBackend {
 
     fn with_format(device_id: Option<String>, native: (u32, u16)) -> Self {
         let (event_tx, events) = mpsc::channel();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let callback_errors = Arc::new(callback_mailbox::CallbackMailbox::new(stop_flag.clone()));
+        let generation = Arc::new(generation::Generation::new(
+            stop_flag.clone(),
+            event_tx.clone(),
+        ));
         Self {
-            stop_flag: Arc::new(AtomicBool::new(false)),
+            stop_flag,
             handle: None,
             native,
             device_id,
             events,
             event_tx,
             terminal_error: None,
+            callback_errors,
+            generation,
+            shutdown_result: None,
+            pending_events: VecDeque::new(),
+        }
+    }
+
+    fn teardown(&mut self) -> Result<()> {
+        if let Some(result) = &self.shutdown_result {
+            return result.clone();
+        }
+        self.generation.cancel();
+        let result = match self.handle.take() {
+            Some(handle) => {
+                handle.thread().unpark();
+                handle.join().map_err(|_| {
+                    Error::Backend("microphone capture owner panicked".into())
+                        .with_context(ErrorContext::new(Operation::Join))
+                })
+            }
+            None => Ok(()),
+        };
+        if let Err(error) = &result {
+            let _ = self.event_tx.send(Event::ShutdownError {
+                error: error.clone(),
+            });
+        }
+        self.reconcile_events();
+        self.shutdown_result = Some(result.clone());
+        result
+    }
+
+    fn retain_terminal(&mut self, event: &Event) {
+        if self.terminal_error.is_none() {
+            self.terminal_error = match event {
+                Event::PermissionDenied { permission, detail } => Some(Error::PermissionDenied {
+                    permission: *permission,
+                    detail: detail.clone(),
+                }),
+                Event::TerminalError { error } => Some(error.clone()),
+                _ => None,
+            };
+        }
+    }
+
+    fn reconcile_events(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            self.retain_terminal(&event);
+            self.pending_events.push_back(event);
+        }
+        if let Some(error) = self.callback_errors.take() {
+            let error = match error {
+                cpal::StreamError::DeviceNotAvailable => Error::DeviceLost,
+                cpal::StreamError::BackendSpecific { err } => {
+                    Error::Backend(format!("microphone capture failed: {err}"))
+                }
+            };
+            let event = Event::TerminalError { error };
+            self.retain_terminal(&event);
+            self.pending_events.push_back(event);
         }
     }
 }
@@ -160,27 +236,31 @@ impl Default for CpalMicBackend {
 /// Resolve the input device for `device_id` from the cpal host.
 ///
 /// - `None` → `host.default_input_device()` (or [`Error::DeviceNotFound`] if unavailable).
-/// - `Some(id)` → Return the first device in `host.input_devices()` where `device.name()? == id`,
-///   or [`Error::DeviceNotFound`] if none match.
+/// - `Some(id)` → Return the unique name match, or reject ambiguous selection.
 ///
-/// Skip devices whose names cannot be read because they cannot be compared. If
-/// `input_devices()` itself fails (for example, because ALSA is unavailable), map it to
-/// [`Error::DeviceNotFound`].
+/// Query failures return Backend; DeviceNotFound means a complete lookup had no match.
 fn resolve_input_device(host: &cpal::Host, device_id: Option<&str>) -> Result<Device> {
     match device_id {
         None => host.default_input_device().ok_or(Error::DeviceNotFound),
-        // First device whose name matches.
         Some(id) => {
-            let devices = host.input_devices().map_err(|_| Error::DeviceNotFound)?;
+            let devices = host.input_devices().map_err(|error| {
+                Error::Backend(format!("enumerate microphone devices: {error}"))
+                    .with_context(ErrorContext::new(Operation::Enumerate))
+            })?;
+            let mut selected = None;
             for device in devices {
-                // Skip devices whose names cannot be read because they cannot be compared.
-                if let Ok(name) = device.name() {
-                    if name == id {
-                        return Ok(device);
+                let name = device.name().map_err(|error| {
+                    Error::Backend(format!("query microphone device name: {error}"))
+                        .with_context(ErrorContext::new(Operation::Enumerate))
+                })?;
+                if name == id {
+                    if selected.is_some() {
+                        return Err(Error::AmbiguousDeviceName);
                     }
+                    selected = Some(device);
                 }
             }
-            Err(Error::DeviceNotFound)
+            selected.ok_or(Error::DeviceNotFound)
         }
     }
 }
@@ -200,36 +280,40 @@ fn query_native_format(device_id: Option<&str>) -> Option<(u32, u16)> {
 /// Walk `host.input_devices()` and convert each device to [`DeviceInfo`]:
 /// - `id` / `name`: cpal has no persistent device ID, so use the device name for both. The
 ///   index can change after reconnecting, while the name remains the same for the same setup.
-/// - `sample_rate` / `channels`: from `default_input_config()`. Skip devices whose config
-///   cannot be read (for example, devices that cannot actually be opened).
+/// - `sample_rate` / `channels`: from `default_input_config()`. For devices whose config
+///   cannot be read: return Backend rather than an incomplete inventory.
 /// - `source_kind = Mic` / `is_loopback = false`.
 /// - `is_default`: `true` when the name matches `host.default_input_device()`.
 ///
-/// Return an empty `Vec` without panicking if no devices exist or host initialization fails.
+/// Return an empty `Vec` only after a successful query found no devices.
 /// IDs may collide when multiple devices share a name, but cpal provides no more stable key,
 /// so this is accepted.
 pub fn list_devices() -> Result<Vec<DeviceInfo>> {
     let host = cpal_default_host()?;
 
-    // Default input device name (for is_default); if unavailable, no device is marked default.
-    let default_name = host.default_input_device().and_then(|d| d.name().ok());
-
-    // Treat input_devices() failures (such as missing ALSA) as an empty list.
-    let devices = match host.input_devices() {
-        Ok(it) => it,
-        Err(_) => return Ok(Vec::new()),
-    };
+    let default_name = host
+        .default_input_device()
+        .map(|device| device.name())
+        .transpose()
+        .map_err(|error| {
+            Error::Backend(format!("query default microphone name: {error}"))
+                .with_context(ErrorContext::new(Operation::Enumerate))
+        })?;
+    let devices = host.input_devices().map_err(|error| {
+        Error::Backend(format!("enumerate microphone devices: {error}"))
+            .with_context(ErrorContext::new(Operation::Enumerate))
+    })?;
 
     let mut out = Vec::new();
     for device in devices {
-        // Skip devices whose name cannot be read because an ID cannot be created.
-        let Ok(name) = device.name() else {
-            continue;
-        };
-        // Skip devices whose default input config is unavailable; they may be advertised but cannot be opened.
-        let Ok(config) = device.default_input_config() else {
-            continue;
-        };
+        let name = device.name().map_err(|error| {
+            Error::Backend(format!("query microphone device name: {error}"))
+                .with_context(ErrorContext::new(Operation::Enumerate))
+        })?;
+        let config = device.default_input_config().map_err(|error| {
+            Error::Backend(format!("query microphone input configuration: {error}"))
+                .with_context(ErrorContext::new(Operation::Enumerate))
+        })?;
         let is_default = default_name.as_deref() == Some(name.as_str());
         out.push(DeviceInfo {
             id: name.clone(),
@@ -250,6 +334,7 @@ impl CaptureBackend for CpalMicBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
+        self.reconcile_events();
         if let Some(error) = self.terminal_error.as_ref() {
             return Err(error.clone());
         }
@@ -257,71 +342,81 @@ impl CaptureBackend for CpalMicBackend {
         if self.handle.is_some() {
             return Ok(());
         }
-        // Reset the flag so start can be called again after stop.
-        self.stop_flag.store(false, Ordering::SeqCst);
+        // Each owner receives fresh state; an old generation can never publish
+        // grants or close PCM on a later generation.
+        self.stop_flag = Arc::new(AtomicBool::new(false));
+        self.callback_errors = Arc::new(callback_mailbox::CallbackMailbox::new(
+            self.stop_flag.clone(),
+        ));
+        self.generation = Arc::new(generation::Generation::new(
+            self.stop_flag.clone(),
+            self.event_tx.clone(),
+        ));
 
         let stop_flag = self.stop_flag.clone();
         // cpal::Device is !Send, so pass only the device_id string and resolve it on the thread.
         let device_id = self.device_id.clone();
-        let event_tx = self.event_tx.clone();
+        let generation = self.generation.clone();
+        let callback_errors = self.callback_errors.clone();
         // Ready channel reports build/play success or failure from the owner thread to start().
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
 
         let handle = thread::Builder::new()
             .name("flexaudio-mic-cpal".into())
             .spawn(move || {
-                capture_owner::run(sink, device_id, stop_flag, ready_tx, event_tx);
+                capture_owner::run(
+                    sink,
+                    device_id,
+                    stop_flag,
+                    ready_tx,
+                    generation,
+                    callback_errors,
+                );
             })
-            .map_err(|e| Error::Backend(format!("spawn cpal mic thread: {e}")))?;
+            .map_err(|e| {
+                self.generation.cancel();
+                Error::Backend(format!("spawn cpal mic thread: {e}"))
+                    .with_context(ErrorContext::new(Operation::Start))
+            })?;
+        self.handle = Some(handle);
+        let previous_shutdown = self.shutdown_result.take();
 
         // Wait for the owner thread to build and play the stream.
-        match ready_rx.recv() {
-            Ok(Ok(())) => {
-                self.handle = Some(handle);
-                Ok(())
-            }
-            Ok(Err(e)) => {
-                // Build/play failed. The owner thread exits after sending ready, so join it.
-                let _ = handle.join();
+        let readiness = ready_rx.recv().unwrap_or_else(|_| {
+            Err(
+                Error::Backend("cpal mic thread exited before reporting readiness".into())
+                    .with_context(ErrorContext::new(Operation::Start)),
+            )
+        });
+        match readiness {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let cleanup = self.teardown();
                 if let Error::NativeFormatChanged { actual, .. } = &e {
                     self.native = *actual;
                 }
-                Err(e)
-            }
-            // The owner thread died before sending ready (should not normally happen).
-            Err(_) => {
-                let _ = handle.join();
-                Err(Error::Backend(
-                    "cpal mic thread exited before reporting readiness".into(),
-                ))
+                if previous_shutdown.is_some() {
+                    self.shutdown_result = previous_shutdown;
+                }
+                match cleanup {
+                    Ok(()) => Err(e),
+                    Err(cleanup) => Err(Error::Multiple(ErrorGroup::new(e, cleanup, Vec::new()))),
+                }
             }
         }
     }
 
     fn stop(&mut self) {
-        // Do nothing if there is no handle (safe for re-entry and repeated stop calls).
-        self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
-            // The owner thread is parked. Wake it so it drops the Stream and exits.
-            h.thread().unpark();
-            let _ = h.join();
-        }
+        let _ = self.teardown();
+    }
+
+    fn stop_checked(&mut self) -> Result<()> {
+        self.teardown()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
-        let event = self.events.try_recv().ok()?;
-        let terminal = match &event {
-            Event::PermissionDenied { permission, detail } => Some(Error::PermissionDenied {
-                permission: *permission,
-                detail: detail.clone(),
-            }),
-            Event::TerminalError { error } => Some(error.clone()),
-            _ => None,
-        };
-        if self.terminal_error.is_none() {
-            self.terminal_error = terminal;
-        }
-        Some(event)
+        self.reconcile_events();
+        self.pending_events.pop_front()
     }
 }
 
@@ -370,21 +465,19 @@ fn build_stream(
     sink: RawSink,
     device_id: Option<&str>,
     stop_flag: Arc<AtomicBool>,
+    callback_errors: Arc<callback_mailbox::CallbackMailbox>,
 ) -> Result<cpal::Stream> {
     let host = cpal_default_host()?;
-    // None selects default; Some selects the first name match. A mismatch is DeviceNotFound.
+    // None selects default; Some must uniquely match an advertised CPAL name.
     let device = resolve_input_device(&host, device_id)?;
 
-    // If the default input config is unavailable, the advertised device cannot actually be
-    // opened (including ALSA "default" PCM on a server without a sound card). Treat this as
-    // having no usable input device and map it to DeviceNotFound.
     // The same checked configuration is passed to CPAL below. Never feed a sink
     // configured from a fallback or stale device format with different samples.
     let supported = input_config::checked(
         || {
-            device
-                .default_input_config()
-                .map_err(|_| Error::DeviceNotFound)
+            device.default_input_config().map_err(|error| {
+                Error::Backend(format!("query microphone input configuration: {error}"))
+            })
         },
         |config| (config.sample_rate().0, config.channels()),
         (sink.native_rate(), sink.native_channels()),
@@ -392,11 +485,7 @@ fn build_stream(
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
 
-    let err_fn = |e: cpal::StreamError| {
-        // Error callback outside the RT path. Swallow for now because logging is not wired up.
-        // TODO: Map this to Event::DeviceLost or similar in the integration layer.
-        let _ = e;
-    };
+    let err_fn = move |error: cpal::StreamError| callback_errors.record(error);
 
     // Preallocate conversion scratch for the maximum block size (native sample rate × channels
     // × MAX_SCRATCH_SECONDS). This avoids first-use/growth allocations in RT callbacks during
@@ -485,10 +574,10 @@ fn build_stream(
                 None,
             )
         }
-        other => {
-            return Err(Error::Backend(format!(
-                "unsupported cpal sample format: {other:?}"
-            )));
+        _ => {
+            return Err(Error::UnsupportedFormat(
+                "microphone sample encoding is unsupported".into(),
+            ));
         }
     };
 
@@ -497,192 +586,5 @@ fn build_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use flexaudio_core::raw_ring;
-
-    #[test]
-    fn backend_terminal_query_failure_preserves_cause_and_rejects_restart() {
-        let mut backend = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
-        let error = Error::Backend("injected authorization query failure".into());
-        let event = Event::TerminalError {
-            error: error.clone(),
-        };
-        backend.event_tx.send(event.clone()).unwrap();
-        assert_eq!(backend.poll_event(), Some(event));
-        backend.stop();
-        let (prod, _cons) = raw_ring(16);
-        assert_eq!(
-            backend.start(RawSink::new(prod, FALLBACK_FORMAT.0, FALLBACK_FORMAT.1)),
-            Err(error)
-        );
-    }
-
-    #[test]
-    fn backend_permission_event_retains_terminal_cause_and_rejects_restart() {
-        let mut backend = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
-        let event = Event::PermissionDenied {
-            permission: flexaudio_core::types::Permission::Microphone,
-            detail: "injected late denial".into(),
-        };
-        backend.event_tx.send(event.clone()).unwrap();
-        assert_eq!(backend.poll_event(), Some(event));
-        backend.stop();
-        let (prod, _cons) = raw_ring(16);
-        let result = backend.start(RawSink::new(prod, FALLBACK_FORMAT.0, FALLBACK_FORMAT.1));
-        assert!(
-            matches!(result, Err(Error::PermissionDenied { permission: flexaudio_core::types::Permission::Microphone, detail }) if detail == "injected late denial")
-        );
-        assert_eq!(backend.poll_event(), None);
-    }
-
-    /// Verify that [`fill_scratch`] does not reallocate within capacity and converts correctly,
-    /// ensuring no steady-state allocations in RT callbacks.
-    #[test]
-    fn fill_scratch_no_realloc_in_steady_state() {
-        // Allocate for the maximum expected block size.
-        let cap = 480 * 2; // equivalent to 10 ms at 48 kHz stereo
-        let mut scratch: Vec<f32> = Vec::with_capacity(cap);
-        let before = scratch.capacity();
-
-        // Filling in-capacity blocks repeatedly does not change capacity (no reallocation).
-        let data: Vec<i16> = (0..cap as i16).collect();
-        for _ in 0..100 {
-            fill_scratch(&mut scratch, &data, |s| s as f32 / -(i16::MIN as f32));
-            assert_eq!(scratch.len(), data.len());
-            assert_eq!(
-                scratch.capacity(),
-                before,
-                "capacity does not grow in steady state"
-            );
-        }
-        // Conversion is correct (i16::MIN maps to -1.0).
-        let mut one = Vec::with_capacity(1);
-        fill_scratch(&mut one, &[i16::MIN], |s| s as f32 / -(i16::MIN as f32));
-        assert_eq!(one[0], -1.0);
-    }
-
-    /// `new` + `native_format` do not panic, whether or not an input device exists.
-    /// `new` always succeeds with either device_id = None (default) or Some (specific device).
-    #[test]
-    fn new_and_native_format_do_not_panic() {
-        // Default input device (device_id = None).
-        let backend = CpalMicBackend::new(None);
-        let (rate, channels) = backend.native_format();
-        // Format values are always positive (FALLBACK_FORMAT when no device exists).
-        assert!(rate > 0);
-        assert!(channels > 0);
-
-        // Even for a nonexistent device_id, new succeeds without panicking and returns
-        // FALLBACK_FORMAT (resolution failure is deferred until start/build_stream).
-        let backend = CpalMicBackend::new(Some("__no_such_device__".into()));
-        let (rate, channels) = backend.native_format();
-        assert_eq!((rate, channels), FALLBACK_FORMAT);
-    }
-
-    /// `start` with a nonexistent device_id returns [`Error::DeviceNotFound`] without
-    /// panicking. Host microphone denial can precede device resolution on macOS/Windows
-    /// and skips this hardware assertion.
-    #[test]
-    fn start_with_unknown_device_id_yields_device_not_found() {
-        let mut backend = CpalMicBackend::new(Some("__no_such_device__".into()));
-        let (rate, channels) = backend.native_format();
-        let cap = (rate as usize * channels as usize).max(1);
-        let (prod, _cons) = raw_ring(cap);
-        let sink = RawSink::new(prod, rate, channels);
-
-        match backend.start(sink) {
-            Err(Error::DeviceNotFound) => {}
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            Err(
-                error @ Error::PermissionDenied {
-                    permission: flexaudio_core::types::Permission::Microphone,
-                    ..
-                },
-            ) => {
-                eprintln!("Skipping start_with_unknown_device_id_yields_device_not_found: host microphone permission is denied: {error}");
-            }
-            other => panic!("unknown device_id should return DeviceNotFound: {other:?}"),
-        }
-    }
-
-    /// [`list_devices`] returns `Ok(Vec)` without panicking, whether or not devices exist.
-    /// Every returned device is `Mic`, is not loopback, and has the stable key `id == name`.
-    #[test]
-    fn list_devices_never_panics_and_is_consistent() {
-        let devices = list_devices().expect("list_devices is designed not to return Err");
-        for d in &devices {
-            assert_eq!(d.source_kind, SourceKind::Mic);
-            assert!(!d.is_loopback, "microphones are not loopback devices");
-            // Stable key: cpal uses the device name as the ID.
-            assert_eq!(d.id, d.name);
-            assert!(!d.id.is_empty(), "id (= name) is nonempty");
-            assert!(d.sample_rate > 0);
-            assert!(d.channels > 0);
-        }
-        // At most one default input device.
-        assert!(devices.iter().filter(|d| d.is_default).count() <= 1);
-    }
-
-    /// `start` may return `Err(DeviceNotFound)` where no input device exists (servers/CI).
-    /// Host microphone denial is also an environment outcome on macOS/Windows. Where
-    /// an input device is accessible, capture starts and stops on stop.
-    #[test]
-    fn start_then_stop_tolerates_missing_device() {
-        let mut backend = CpalMicBackend::new(None);
-        let (rate, channels) = backend.native_format();
-        let cap = (rate as usize * channels as usize).max(1); // about one second
-        let (prod, _cons) = raw_ring(cap);
-        let sink = RawSink::new(prod, rate, channels);
-
-        match backend.start(sink) {
-            Ok(()) => {
-                // In environments where start succeeds, stop must be safe.
-                backend.stop();
-                // Repeated stop calls are safe too.
-                backend.stop();
-            }
-            Err(Error::DeviceNotFound) => {
-                // Accept this when no input device is present (CI/server).
-            }
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            Err(
-                error @ Error::PermissionDenied {
-                    permission: flexaudio_core::types::Permission::Microphone,
-                    ..
-                },
-            ) => {
-                eprintln!("Skipping start_then_stop_tolerates_missing_device: host microphone permission is denied: {error}");
-            }
-            Err(other) => panic!("unexpected error from start(): {other:?}"),
-        }
-    }
-
-    /// End-to-end test that records from a real microphone. Run with
-    /// `cargo test -p flexaudio-mic -- --ignored` on a laptop or other machine with an input
-    /// device. Ignored by default because servers/CI usually have no input device.
-    #[test]
-    #[ignore = "requires a real microphone; run `cargo test -p flexaudio-mic -- --ignored` on a laptop"]
-    fn end_to_end_captures_real_audio() {
-        use std::time::Duration;
-
-        let mut backend = CpalMicBackend::new(None);
-        let (rate, channels) = backend.native_format();
-        let cap = rate as usize * channels as usize * 2; // about two seconds
-        let (prod, mut cons) = raw_ring(cap);
-        let sink = RawSink::new(prod, rate, channels);
-
-        backend
-            .start(sink)
-            .expect("start() should succeed with a real input device");
-
-        // Capture for a few hundred milliseconds and verify that samples arrive.
-        thread::sleep(Duration::from_millis(500));
-        backend.stop();
-
-        let mut buf = vec![0.0f32; cap];
-        let got = cons.pop_slice(&mut buf);
-        assert!(got > 0, "expected captured samples, got none");
-        // Samples stay within [-1, 1] (conversion is valid).
-        assert!(buf[..got].iter().all(|&s| (-1.5..=1.5).contains(&s)));
-    }
+    include!("tests.rs");
 }

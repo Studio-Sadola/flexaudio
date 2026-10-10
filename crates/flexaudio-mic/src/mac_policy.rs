@@ -13,6 +13,7 @@ pub(crate) const PENDING_GRACE: Duration = Duration::from_secs(5);
 pub(crate) const PENDING_DETAIL: &str = "Microphone permission has not been decided. macOS delivers silence until microphone permission is granted. If the process was started from ssh, launchd, or another context that cannot show the consent prompt, run it from Terminal or an app bundle with a nonempty NSMicrophoneUsageDescription. Grant access to the responsible app in System Settings > Privacy & Security > Microphone, then retry from that host if necessary.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub(crate) enum Status {
     Authorized,
     Denied,
@@ -40,6 +41,7 @@ struct PromptState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 enum Decision {
     Granted,
     Refused,
@@ -221,7 +223,7 @@ impl ConsentPoll {
         match status {
             Status::Authorized => {
                 self.finished = true;
-                Ok(None)
+                Ok(self.pending_emitted.then_some(Event::PermissionGranted))
             }
             Status::NotDetermined => {
                 if elapsed >= PENDING_GRACE && !self.pending_emitted {

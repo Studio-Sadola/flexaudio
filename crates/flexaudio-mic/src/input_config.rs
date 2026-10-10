@@ -9,6 +9,16 @@ pub(crate) fn checked<C>(
 ) -> Result<C> {
     let config = discover()?;
     let actual = native_format(&config);
+    if actual.0 == 0 || actual.1 == 0 {
+        return Err(Error::InvalidArg(
+            "native microphone rate and channels must be positive".into(),
+        ));
+    }
+    if actual.1 > 2 {
+        return Err(Error::UnsupportedFormat(
+            "native microphone channels must be one or two".into(),
+        ));
+    }
     if actual != advertised {
         return Err(Error::NativeFormatChanged { advertised, actual });
     }
@@ -21,6 +31,23 @@ mod tests {
     use crate::mac_policy::{preflight, PromptCoordinator, Provider, Status};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn invalid_or_multichannel_native_config_is_rejected_before_capture() {
+        for native in [(0, 1), (48_000, 0)] {
+            assert!(matches!(
+                checked(|| Ok(native), |config| *config, native),
+                Err(Error::InvalidArg(_))
+            ));
+        }
+        for channels in [3, 6] {
+            let native = (48_000, channels);
+            assert!(matches!(
+                checked(|| Ok(native), |config| *config, native),
+                Err(Error::UnsupportedFormat(_))
+            ));
+        }
+    }
 
     struct PromptingProvider(AtomicBool);
 
