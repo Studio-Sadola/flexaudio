@@ -21,7 +21,8 @@ tract-onnx = "=0.23.7"
 
 # Used for resampling before process_pcm (any SR → VAD rate). This sinc resampler includes
 # anti-aliasing; keep its major version aligned with flexaudio-core.
-rubato = { workspace = true }
+# Capture phase alignment is derived from this engine's initialization/kernel convention.
+rubato = "=3.0.0"
 
 [[example]]
 name = "probe"

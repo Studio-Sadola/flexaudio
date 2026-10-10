@@ -62,7 +62,7 @@ impl WhisperVad {
         Self::with_backend(params, options, Box::new(CheckedSilero(engine)))
     }
 
-    fn with_backend(
+    pub(crate) fn with_backend(
         params: WhisperVadParams,
         options: WhisperVadOptions,
         engine: Box<dyn InferenceBackend>,
@@ -273,6 +273,16 @@ impl WhisperVad {
             first_frame_index: self.first_frame,
             values: &self.last_probs,
         }
+    }
+
+    /// Close only published hints after an attached converter fails, without successful EOF.
+    pub(crate) fn abort(&mut self) -> Result<WhisperVadFailure, WhisperVadError> {
+        let mut terminal = self.reserve_batch(0)?;
+        Ok(self.fail(WhisperVadError::Inference, &mut terminal))
+    }
+
+    pub(crate) fn epoch(&self) -> u32 {
+        self.epoch
     }
 
     fn infer(&mut self, frame: &[f32]) -> Result<f32, WhisperVadError> {
