@@ -77,8 +77,8 @@ fn second_filter_accepts_forced_equality_and_merges_short_first() {
     .unwrap();
     processor.frames = 20;
     let mut out = Vec::new();
-    processor.raw(0, 4096, &mut out);
-    processor.seal(&mut out);
+    processor.raw(0, 4096, &mut |segment| out.push(segment));
+    processor.seal(&mut |segment| out.push(segment));
     out.extend(processor.finish().unwrap());
     assert_eq!(pairs(&out), [(0, 260)]);
     let mut processor = WhisperVadPostProcessor::new(WhisperVadParams {
@@ -88,8 +88,8 @@ fn second_filter_accepts_forced_equality_and_merges_short_first() {
     .unwrap();
     processor.frames = 20;
     let mut out = Vec::new();
-    processor.raw(0, 1000, &mut out);
-    processor.raw(1500, 4500, &mut out);
+    processor.raw(0, 1000, &mut |segment| out.push(segment));
+    processor.raw(1500, 4500, &mut |segment| out.push(segment));
     out.extend(processor.finish().unwrap());
     assert_eq!(pairs(&out), [(0, 280)]);
 }
@@ -266,8 +266,8 @@ fn raw_merge_gap_strict_boundary_and_chain() {
         let mut processor = WhisperVadPostProcessor::new(params()).unwrap();
         processor.frames = 100;
         let mut out = Vec::new();
-        processor.raw(0, 1000, &mut out);
-        processor.raw(1000 + gap, 5000 + gap, &mut out);
+        processor.raw(0, 1000, &mut |segment| out.push(segment));
+        processor.raw(1000 + gap, 5000 + gap, &mut |segment| out.push(segment));
         out.extend(processor.finish().unwrap());
         assert_eq!(out.len(), if gap < 3200 { 1 } else { 2 });
     }
@@ -275,7 +275,7 @@ fn raw_merge_gap_strict_boundary_and_chain() {
     processor.frames = 100;
     let mut out = Vec::new();
     for (s, e) in [(0, 1000), (2000, 3000), (4000, 5000)] {
-        processor.raw(s, e, &mut out);
+        processor.raw(s, e, &mut |segment| out.push(segment));
     }
     out.extend(processor.finish().unwrap());
     assert_eq!(pairs(&out), [(0, 310)]);
@@ -287,8 +287,8 @@ fn padding_half_gap_odd_equality_full_and_zero() {
         processor.params.pad = pad;
         processor.frames = 100;
         let mut out = Vec::new();
-        processor.raw(5000, 6000, &mut out);
-        processor.raw(6000 + gap, 12000, &mut out);
+        processor.raw(5000, 6000, &mut |segment| out.push(segment));
+        processor.raw(6000 + gap, 12000, &mut |segment| out.push(segment));
         out.extend(processor.finish().unwrap());
         let applied = if gap < 2 * pad { gap / 2 } else { pad };
         assert_eq!(
@@ -301,7 +301,7 @@ fn padding_half_gap_odd_equality_full_and_zero() {
     }
 }
 #[test]
-fn rounding_is_reference_double_half_up() {
+fn rounding_preserves_reference_double_expression() {
     for (sample, ms) in [
         (79, 0),
         (80, 10),
@@ -310,6 +310,7 @@ fn rounding_is_reference_double_half_up() {
         (160, 10),
         (161, 10),
         (240, 20),
+        (2320, 140),
         (i32::MAX as u64, 134217730),
     ] {
         assert_eq!(rounded_ms(sample), ms);

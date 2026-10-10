@@ -31,7 +31,30 @@ fn pinned_whisper_cpp_golden_in_random_partitions() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/whisper_vad_golden.json");
     let data=std::fs::read_to_string(&path).unwrap_or_else(|error|panic!("Required pinned whisper.cpp golden fixture is missing or unreadable: {} ({error}). The coordinator must provide it; this conformance test must not be skipped.",path.display()));
-    let fixture: Fixture = serde_json::from_str(&data).expect("valid pinned golden fixture schema");
+    check_fixture(&data);
+}
+
+#[test]
+fn optional_extreme_pinned_whisper_cpp_golden_in_random_partitions() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/whisper_vad_golden_extreme.json");
+    match std::fs::read_to_string(&path) {
+        Ok(data) => check_fixture(&data),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "Optional extreme pinned whisper.cpp fixture is absent; skipping: {}",
+                path.display()
+            );
+        }
+        Err(error) => panic!(
+            "Optional extreme fixture is unreadable: {} ({error})",
+            path.display()
+        ),
+    }
+}
+
+fn check_fixture(data: &str) {
+    let fixture: Fixture = serde_json::from_str(data).expect("valid pinned golden fixture schema");
     assert!(
         fixture.pin == "85a69493" || fixture.pin == "85a69493a601d4ff5a834064f7b7bac250bd8739",
         "unexpected oracle pin: {}",

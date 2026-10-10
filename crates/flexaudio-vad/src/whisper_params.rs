@@ -80,7 +80,10 @@ impl WhisperVadParams {
         let max_speech = if self.max_speech_duration_s > 100_000.0 {
             sentinel
         } else {
-            // The validated bound makes this truncating float conversion exact to the pin.
+            // Validation guarantees finite, nonnegative seconds, and this branch
+            // bounds them by 100_000. Truncation therefore yields an integer in
+            // 0..=100_000, exactly representable and safely within i64; the
+            // following multiplication/subtractions also remain within i64.
             let seconds = self.max_speech_duration_s.trunc() as i64;
             let budget = 16_000 * seconds - 512 - 2 * i64::try_from(pad).expect("bounded pad");
             if budget < 0 || budget > i64::from(i32::MAX) {

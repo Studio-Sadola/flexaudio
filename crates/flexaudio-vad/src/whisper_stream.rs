@@ -4,7 +4,8 @@
 
 use crate::infer::SileroEngine;
 use crate::whisper_params::{FRAME, MAX_FRAMES};
-use crate::whisper_preview::{Preview, PreviewEvents};
+use crate::whisper_postprocess::{MAX_FINISH_SEGMENTS, MAX_SEGMENTS_PER_FRAME};
+use crate::whisper_preview::{Preview, MAX_PREVIEW_EVENTS};
 use crate::{
     EpochEndReason, FrameProbabilities, InferenceBackend, PreviewCloseReason, VadError,
     WhisperSpeechSegment, WhisperVadError, WhisperVadEvent, WhisperVadEventKind as Kind,
@@ -33,7 +34,9 @@ enum Lifecycle {
 /// Additive whisper-compatible session. Input must be finite mono f32 in [-1,1] at 16 kHz.
 ///
 /// Final segments reproduce pin 85a69493 on identical probabilities. Model probabilities
-/// can differ from upstream v5. Finalization can wait indefinitely for a surviving neighbor.
+/// can differ from upstream v5. Equivalence excludes the pin's int32 overflow/UB
+/// near INT_MAX logical samples (about 37 hours); sample arithmetic uses u64 and
+/// padded EOF ends are clamped. Finalization can wait indefinitely for a surviving neighbor.
 /// All input is borrowed only for the duration of a call. One instance has one mutable owner.
 /// Reset abandons pending finals; finish infers one zero-padded partial frame at true EOF.
 pub struct WhisperVad {
@@ -110,7 +113,6 @@ impl WhisperVad {
         }
         let complete = total / FRAME - self.frames;
         let mut batch = self.reserve_batch(complete)?;
-        let mut terminal = self.reserve_batch(0)?;
         let mut probs = Vec::new();
         probs
             .try_reserve(usize::try_from(complete).map_err(|_| overflow(Operation::Capacity))?)
@@ -131,23 +133,15 @@ impl WhisperVad {
             }
             let prob = match self.infer(&pending) {
                 Ok(prob) => prob,
-                Err(error) => return Err(self.fail(error, &mut terminal)),
+                Err(error) => return Err(self.fail(error, &mut batch)),
             };
             if let Some(preview) = &mut preview {
-                let mut hints = PreviewEvents::default();
-                preview.feed(prob, frame_index * 32, (frame_index + 1) * 32, &mut hints);
+                let hints = preview.feed(prob, frame_index * 32, (frame_index + 1) * 32);
                 Self::stage(&mut batch, self.epoch, self.seq, hints);
             }
-            let segments = match processor.process(&[prob]) {
-                Ok(segments) => segments,
-                Err(error) => return Err(self.fail(error, &mut terminal)),
-            };
-            Self::stage(
-                &mut batch,
-                self.epoch,
-                self.seq,
-                segments.into_iter().map(Kind::Segment),
-            );
+            processor.feed_frame(prob, &mut |segment| {
+                Self::stage(&mut batch, self.epoch, self.seq, [Kind::Segment(segment)]);
+            });
             probs.push(prob);
             pending_len = 0;
             frame_index += 1;
@@ -174,37 +168,34 @@ impl WhisperVad {
         }
         self.require_running()?;
         let mut batch = self.reserve_batch(1)?;
-        let mut terminal = self.reserve_batch(0)?;
         let mut processor = self.postprocessor.clone();
         let mut preview = self.preview.clone();
         let mut probs = Vec::with_capacity(1);
         let mut tail_segments = Vec::new();
+        tail_segments
+            .try_reserve(usize::try_from(MAX_SEGMENTS_PER_FRAME).expect("constant bound"))
+            .map_err(|_| overflow(Operation::Capacity))?;
         if self.pending_len != 0 {
             let mut frame = self.pending;
             frame[self.pending_len..].fill(0.0);
             let p = match self.infer(&frame) {
                 Ok(p) => p,
-                Err(error) => return Err(self.fail(error, &mut terminal)),
+                Err(error) => return Err(self.fail(error, &mut batch)),
             };
             if let Some(preview) = &mut preview {
-                let mut hints = PreviewEvents::default();
-                preview.feed(p, self.frames * 32, self.actual_samples / 16, &mut hints);
+                let hints = preview.feed(p, self.frames * 32, self.actual_samples / 16);
                 Self::stage(&mut batch, self.epoch, self.seq, hints);
             }
-            tail_segments = match processor.process(&[p]) {
-                Ok(segments) => segments,
-                Err(error) => return Err(self.fail(error, &mut terminal)),
-            };
+            processor.feed_frame(p, &mut |segment| tail_segments.push(segment));
             probs.push(p);
         }
         if let Some(preview) = &mut preview {
-            let mut hints = PreviewEvents::default();
-            preview.close(PreviewCloseReason::Finish, &mut hints);
+            let hints = preview.close(PreviewCloseReason::Finish);
             Self::stage(&mut batch, self.epoch, self.seq, hints);
         }
         let remaining = match processor.finish() {
             Ok(segments) => segments,
-            Err(error) => return Err(self.fail(error, &mut terminal)),
+            Err(error) => return Err(self.fail(error, &mut batch)),
         };
         Self::stage(
             &mut batch,
@@ -249,11 +240,8 @@ impl WhisperVad {
             self.close_epoch(PreviewCloseReason::Reset, EpochEndReason::Reset, &mut batch);
         }
         self.postprocessor.reset();
-        if let Some(preview) = &self.preview {
-            // Preserve the immutable preview configuration, discard its timeline.
-            let mut fresh = preview.clone();
-            fresh.reset();
-            self.preview = Some(fresh);
+        if let Some(preview) = &mut self.preview {
+            preview.reset();
         }
         self.state = Lifecycle::Running;
         self.epoch = next_epoch;
@@ -305,10 +293,16 @@ impl WhisperVad {
     }
 
     fn reserve_batch(&self, frames: u64) -> Result<Vec<WhisperVadEvent>, WhisperVadError> {
-        // Three events per frame and eight closing/final events safely bound this algorithm.
+        // A frame emits at most five canonical segments (see feed_frame's
+        // raw/seal proof) plus three preview events. EOF adds at most four
+        // canonical segments, three preview closure events and one epochEnd.
+        // This also reserves fatal closure in the same batch; failed staged
+        // events are discarded before closing the published preview state.
+        let closing =
+            u64::try_from(MAX_FINISH_SEGMENTS).expect("constant bound") + MAX_PREVIEW_EVENTS + 1;
         let budget = frames
-            .checked_mul(3)
-            .and_then(|v| v.checked_add(8))
+            .checked_mul(MAX_SEGMENTS_PER_FRAME + MAX_PREVIEW_EVENTS)
+            .and_then(|v| v.checked_add(closing))
             .ok_or_else(|| overflow(Operation::EventSequence))?;
         self.seq
             .checked_add(budget)
@@ -342,8 +336,7 @@ impl WhisperVad {
         batch: &mut Vec<WhisperVadEvent>,
     ) {
         if let Some(preview) = &mut self.preview {
-            let mut kinds = PreviewEvents::default();
-            preview.close(close, &mut kinds);
+            let kinds = preview.close(close);
             Self::stage(batch, self.epoch, self.seq, kinds);
         }
         Self::stage(
@@ -360,6 +353,8 @@ impl WhisperVad {
         error: WhisperVadError,
         terminal: &mut Vec<WhisperVadEvent>,
     ) -> WhisperVadFailure {
+        // Reuse the preflighted batch, discarding unpublished staged events.
+        terminal.clear();
         if self.state == Lifecycle::Running {
             self.close_epoch(PreviewCloseReason::Error, EpochEndReason::Error, terminal);
         }

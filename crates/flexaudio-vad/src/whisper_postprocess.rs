@@ -26,6 +26,14 @@ use crate::whisper_params::{DerivedParams, FRAME, MAX_FRAMES};
 use crate::{WhisperSpeechSegment, WhisperVadError, WhisperVadOperation, WhisperVadParams};
 
 const MERGE_GAP: u64 = 3200;
+const SPLIT_SILENCE_SAMPLES: u64 = 1568; // 98 ms at 16 kHz.
+
+// loop_frame calls raw at most twice. Each raw can emit once from seal and
+// once from resolve_neighbor; feed's final seal can emit once more. Each
+// resolve_neighbor takes waiting before emitting, so it emits at most once.
+pub(crate) const MAX_SEGMENTS_PER_FRAME: u64 = 2 * 2 + 1;
+// EOF calls raw once (<=2), seal once (<=1), then emits waiting (<=1).
+pub(crate) const MAX_FINISH_SEGMENTS: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 struct Group {
@@ -38,6 +46,9 @@ struct Group {
 ///
 /// Retains a candidate group and a waiting survivor, never the full probability history.
 /// Finalization waits for the nearest surviving successor or EOF and has no latency bound.
+/// Equivalence excludes the pin's signed-int overflow/undefined behavior near INT_MAX
+/// logical samples (about 37 hours), including padded-end arithmetic. This port
+/// uses u64 sample arithmetic and clamps padded EOF ends to logical length.
 #[derive(Debug, Clone)]
 pub struct WhisperVadPostProcessor {
     params: DerivedParams,
@@ -96,10 +107,13 @@ impl WhisperVadPostProcessor {
             }
         }
         let mut out = Vec::new();
-        out.try_reserve(probabilities.len().saturating_add(2))
-            .map_err(|_| capacity())?;
+        let budget = count
+            .checked_mul(MAX_SEGMENTS_PER_FRAME)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(capacity)?;
+        out.try_reserve(budget).map_err(|_| capacity())?;
         for &p in probabilities {
-            self.feed(p, &mut out);
+            self.feed_frame(p, &mut |segment| out.push(segment));
         }
         Ok(out)
     }
@@ -110,12 +124,13 @@ impl WhisperVadPostProcessor {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        out.try_reserve(3).map_err(|_| capacity())?;
+        out.try_reserve(MAX_FINISH_SEGMENTS)
+            .map_err(|_| capacity())?;
         let length = self.frames * FRAME;
         if self.has_current && length - self.start > self.params.min_speech {
-            self.raw(self.start, length, &mut out);
+            self.raw(self.start, length, &mut |segment| out.push(segment));
         }
-        self.seal(&mut out);
+        self.seal(&mut |segment| out.push(segment));
         if let Some(group) = self.waiting.take() {
             out.push(segment(
                 group.padded_start.expect("survivor padding"),
@@ -144,7 +159,9 @@ impl WhisperVadPostProcessor {
         self.next_start = 0;
     }
 
-    fn feed(&mut self, p: f32, out: &mut Vec<WhisperSpeechSegment>) {
+    /// Allocation-free shared frame path. Callers preflight the complete frame
+    /// count and validate probabilities before invoking this internal method.
+    pub(crate) fn feed_frame(&mut self, p: f32, out: &mut impl FnMut(WhisperSpeechSegment)) {
         let sample = self.frames * FRAME;
         self.frames += 1;
         self.loop_frame(p, sample, out);
@@ -163,7 +180,7 @@ impl WhisperVadPostProcessor {
         }
     }
 
-    fn loop_frame(&mut self, p: f32, sample: u64, out: &mut Vec<WhisperSpeechSegment>) {
+    fn loop_frame(&mut self, p: f32, sample: u64, out: &mut impl FnMut(WhisperSpeechSegment)) {
         if p >= self.params.threshold && self.temp_end != 0 {
             self.temp_end = 0;
             if self.next_start < self.prev_end {
@@ -199,7 +216,7 @@ impl WhisperVadPostProcessor {
             if self.temp_end == 0 {
                 self.temp_end = sample;
             }
-            if sample - self.temp_end > 1568 {
+            if sample - self.temp_end > SPLIT_SILENCE_SAMPLES {
                 self.prev_end = self.temp_end;
             }
             if sample - self.temp_end < self.params.min_silence {
@@ -214,7 +231,7 @@ impl WhisperVadPostProcessor {
         }
     }
 
-    fn raw(&mut self, start: u64, end: u64, out: &mut Vec<WhisperSpeechSegment>) {
+    fn raw(&mut self, start: u64, end: u64, out: &mut impl FnMut(WhisperSpeechSegment)) {
         if let Some(g) = &mut self.candidate {
             if start - g.end < MERGE_GAP {
                 g.end = end;
@@ -231,7 +248,7 @@ impl WhisperVadPostProcessor {
         self.resolve_neighbor(out);
     }
 
-    fn resolve_neighbor(&mut self, out: &mut Vec<WhisperSpeechSegment>) {
+    fn resolve_neighbor(&mut self, out: &mut impl FnMut(WhisperSpeechSegment)) {
         let Some(next) = &mut self.candidate else {
             return;
         };
@@ -248,7 +265,7 @@ impl WhisperVadPostProcessor {
             // Full padding must also wait for sufficient known logical audio length.
             // The successor's end is already at or beyond previous.end + pad,
             // except for enormous pads, where the half-gap branch applies.
-            out.push(segment(
+            out(segment(
                 previous.padded_start.expect("survivor padding"),
                 previous.end + pad,
             ));
@@ -258,7 +275,7 @@ impl WhisperVadPostProcessor {
         }
     }
 
-    fn seal(&mut self, out: &mut Vec<WhisperSpeechSegment>) {
+    fn seal(&mut self, out: &mut impl FnMut(WhisperSpeechSegment)) {
         self.resolve_neighbor(out);
         if let Some(g) = self.candidate.take() {
             if g.end - g.start >= self.params.min_speech {
@@ -269,7 +286,9 @@ impl WhisperVadPostProcessor {
     }
 }
 
-// Keep the reference double expression and truncation; output is exactly cs * 10.
+// Preserve the pin's double expression and truncation, then return exactly cs * 10.
+// This is not exact half-up: floating-point evaluation makes samples=2320 yield
+// 140 ms rather than 150 ms. Do not "fix" it with integer or half-up rounding.
 fn rounded_ms(samples: u64) -> u64 {
     (((samples as f64 / 16000.0) * 100.0 + 0.5).trunc() as u64) * 10
 }
