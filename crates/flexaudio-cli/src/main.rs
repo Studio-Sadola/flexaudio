@@ -75,6 +75,12 @@ use clap::{Parser, ValueEnum};
 use flexaudio::core::{AudioChunk, Error, OutputFormat, SourceKind, StreamConfig};
 use flexaudio::{ProcessMode, Stream};
 
+mod capture_events;
+mod device_events;
+use capture_events::drain_capture_events;
+#[cfg(test)]
+use capture_events::report_capture_event;
+
 /// Capture source kinds (for CLI arguments).
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SourceArg {
@@ -445,7 +451,7 @@ impl SwitchScheduler {
                 Ok(()) => {
                     eprintln!("[switch] -> {label}");
                 }
-                Err(e @ Error::PermissionDenied { .. }) => return Err(e),
+                Err(e) if e.permission().is_some() => return Err(e),
                 Err(e) => {
                     eprintln!(
                         "[switch] Warning: failed to switch to {label} (recording continues): {e}"
@@ -837,10 +843,10 @@ fn list_processes() -> std::result::Result<(), String> {
 /// - `[-] REMOVED <id>` — device removed (`id` is `node.name` only)
 /// - `[*] DEFAULT <source> -> <id>` — default device changed
 fn watch_devices_loop() -> std::result::Result<(), String> {
-    use flexaudio::core::DeviceEvent;
-
-    // Report the number of existing devices at startup (stderr). Enumeration failure is non-fatal.
-    let existing = flexaudio::devices().map(|d| d.len()).unwrap_or(0);
+    // Discovery failure must not masquerade as an empty authoritative inventory.
+    let existing = flexaudio::devices()
+        .map_err(|error| format!("Failed to enumerate devices: {error}"))?
+        .len();
     eprintln!(
         "Started device hot-plug monitoring ({existing} existing devices). Press Ctrl-C to stop."
     );
@@ -856,38 +862,15 @@ fn watch_devices_loop() -> std::result::Result<(), String> {
         .map_err(|e| format!("Failed to register Ctrl-C handler: {e}"))?;
     }
 
-    // Start monitoring. Degrade to Ok if PipeWire is unavailable (there will simply be no events).
+    // Linux monitoring startup failures propagate to the caller.
     let mut watcher = flexaudio::watch_devices()
         .map_err(|e| format!("Failed to start device monitoring: {e}"))?;
 
     while running.load(Ordering::SeqCst) {
         while let Some(ev) = watcher.poll_event() {
-            match ev {
-                DeviceEvent::Added(info) => {
-                    eprintln!(
-                        "[+] ADDED   {:<7} {} ({})",
-                        source_kind_label(info.source_kind),
-                        info.name,
-                        info.id,
-                    );
-                }
-                DeviceEvent::Removed { id } => {
-                    eprintln!("[-] REMOVED {id}");
-                }
-                DeviceEvent::DefaultChanged { kind, id } => {
-                    eprintln!(
-                        "[*] DEFAULT {:<7} -> {}",
-                        source_kind_label(kind.into()),
-                        id,
-                    );
-                }
-                DeviceEvent::DefaultCleared { .. } | DeviceEvent::RescanRequired { .. } => {
-                    eprintln!("[?] UNKNOWN device event: pending 0.5 CLI support");
-                }
-                // Future variants remain observable without exposing raw diagnostics.
-                _ => {
-                    eprintln!("[?] UNKNOWN device event");
-                }
+            if let Err(error) = device_events::report_device_event(ev, &mut flexaudio::devices) {
+                watcher.stop();
+                return Err(error);
             }
         }
         // Hot-plug events are infrequent. Sleep to avoid spinning; 100 ms is responsive enough.
@@ -895,6 +878,9 @@ fn watch_devices_loop() -> std::result::Result<(), String> {
     }
 
     watcher.stop();
+    while let Some(event) = watcher.poll_event() {
+        device_events::report_device_event(event, &mut flexaudio::devices)?;
+    }
     eprintln!();
     eprintln!("Stopped device hot-plug monitoring (Ctrl-C).");
     Ok(())
@@ -920,50 +906,6 @@ fn truncate(s: &str, max: usize) -> String {
         t.push('…');
         t
     }
-}
-
-/// Report advisory events and return confirmed denial to the caller.
-fn report_capture_event(event: flexaudio::Event) -> Result<(), Error> {
-    match event {
-        flexaudio::Event::TerminalError { error } => Err(error),
-        flexaudio::Event::PermissionDenied { permission, detail } => {
-            Err(Error::PermissionDenied { permission, detail })
-        }
-        flexaudio::Event::PermissionPending { detail, .. }
-        | flexaudio::Event::SilenceWhileSourceActive { detail } => {
-            eprintln!("Warning: {detail}");
-            Ok(())
-        }
-        flexaudio::Event::RecoverableError { .. }
-        | flexaudio::Event::ShutdownError { .. }
-        | flexaudio::Event::AudioLoss { .. }
-        | flexaudio::Event::Clipped
-        | flexaudio::Event::PermissionGranted => {
-            eprintln!("Unknown event: pending 0.5 CLI support");
-            Ok(())
-        }
-        _ => {
-            eprintln!("Unknown event");
-            Ok(())
-        }
-    }
-}
-
-/// Both output paths share terminal-failure handling, including final shutdown.
-fn drain_capture_events(stream: &mut Stream) -> std::result::Result<(), String> {
-    let result = (|| {
-        while let Some(event) = stream.poll_event() {
-            report_capture_event(event)?;
-        }
-        match stream.terminal_error() {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    })();
-    result.map_err(|error| {
-        stream.stop();
-        describe_error(error)
-    })
 }
 
 /// WAV output path (legacy behavior). Collect N seconds (>0), write a 16-bit WAV, and print a
@@ -1525,17 +1467,26 @@ fn fmt_dbfs(db: f64) -> String {
 ///
 /// Replace a missing-device (`DeviceNotFound`) error with guidance to run on real hardware.
 fn describe_error(err: Error) -> String {
-    match err {
+    let mut message = match &err {
         Error::DeviceNotFound => {
             "The specified device/endpoint was not found. Check the ID with `--list-devices`."
                 .into()
         }
-        error @ Error::PermissionDenied { .. } => error.to_string(),
+        error if error.permission().is_some() => err.to_string(),
         Error::DeviceLost => {
             "The input device was lost during capture (for example, disconnected).".into()
         }
-        other => format!("Failed to initialize stream: {other}"),
+        _ => format!("Failed to initialize stream: {err}"),
+    };
+    // The user's terminal explicitly opts into structured permission diagnostics.
+    // Display remains safe for other library consumers, including wrapped errors.
+    if let Error::PermissionDenied { detail, .. } = err.root() {
+        if !detail.is_empty() {
+            message.push_str("\nPermission detail: ");
+            message.push_str(detail);
+        }
     }
+    message
 }
 
 #[cfg(test)]
@@ -1831,7 +1782,7 @@ mod tests {
             let message = describe_error(error);
             assert!(message.contains(&permission.to_string()));
             assert!(message.contains("recording permission denied"));
-            assert!(!message.contains("denied by user"));
+            assert!(message.contains("Permission detail: denied by user"));
             assert!(message.contains("Restart"));
         }
         report_capture_event(flexaudio::Event::SilenceWhileSourceActive {
@@ -2411,7 +2362,9 @@ mod reproduction_tests {
     struct ReproFinalEventBackend {
         inner: flexaudio::MockBackend,
         stopped: bool,
-        final_event: Option<flexaudio::Event>,
+        final_events: std::collections::VecDeque<flexaudio::Event>,
+        running_events: std::collections::VecDeque<flexaudio::Event>,
+        cleanup_error: Option<Error>,
     }
 
     impl flexaudio::core::CaptureBackend for ReproFinalEventBackend {
@@ -2425,22 +2378,33 @@ mod reproduction_tests {
             self.inner.stop();
             self.stopped = true;
         }
+        fn stop_checked(&mut self) -> flexaudio::core::Result<()> {
+            self.stop();
+            self.cleanup_error.take().map_or(Ok(()), Err)
+        }
         fn poll_event(&mut self) -> Option<flexaudio::Event> {
             if self.stopped {
-                self.final_event.take()
+                self.final_events.pop_front()
             } else {
-                None
+                self.running_events.pop_front()
             }
         }
     }
 
     fn repro_wav_capture(final_event: Option<flexaudio::Event>) -> std::result::Result<(), String> {
-        let name = match &final_event {
-            Some(flexaudio::Event::Error(_)) => "repro_final_legacy",
-            Some(_) => "repro_final_typed",
-            None => "repro_final_control",
-        };
-        let dir = test_dir(name);
+        repro_capture_events(Vec::new(), final_event.into_iter().collect(), None)
+    }
+
+    fn repro_capture_events(
+        running_events: Vec<flexaudio::Event>,
+        final_events: Vec<flexaudio::Event>,
+        cleanup_error: Option<Error>,
+    ) -> std::result::Result<(), String> {
+        static NEXT_CAPTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = test_dir(&format!(
+            "capture-{}",
+            NEXT_CAPTURE.fetch_add(1, Ordering::Relaxed)
+        ));
         let mut cli = cli_from(&["--seconds", "1"]);
         cli.out = dir.join("rec.wav");
         let config = StreamConfig::default();
@@ -2448,18 +2412,29 @@ mod reproduction_tests {
         let backend = ReproFinalEventBackend {
             inner: flexaudio::MockBackend::new(48_000, 1, 440.0),
             stopped: false,
-            final_event,
+            final_events: final_events.into(),
+            running_events: running_events.into(),
+            cleanup_error,
         };
         let mut stream = Stream::open(config, Box::new(backend)).expect("mock open");
         stream.start().expect("mock start");
         let result = run_wav(&cli, &mut stream, output, None);
         stream.stop();
+        assert!(
+            stream.poll_event().is_none(),
+            "all final diagnostics must be drained"
+        );
+        if result.is_ok() {
+            assert!(
+                hound::WavReader::open(&cli.out).unwrap().duration() > 0,
+                "successful warning-only recording must still deliver audio"
+            );
+        }
         std::fs::remove_dir_all(dir).expect("remove test output");
         result
     }
 
     #[test]
-    #[ignore = "repro: C F48"]
     fn repro_p12_f48_legacy_fatal_final_event() {
         let result = repro_wav_capture(Some(flexaudio::Event::Error(
             "normalizer push failed: injected fatal DSP failure".into(),
@@ -2479,6 +2454,125 @@ mod reproduction_tests {
         assert!(result
             .expect_err("typed final error must fail")
             .contains("injected terminal failure"));
+    }
+
+    #[test]
+    fn repro_p12_reopen_warnings_continue_until_recovery() {
+        use flexaudio::core::{ErrorContext, Operation};
+        let warning = || flexaudio::Event::RecoverableError {
+            error: Error::Backend("normalizer push failed: recoverable reopen failure".into())
+                .with_context(ErrorContext::new(Operation::Reopen)),
+        };
+        repro_capture_events(
+            vec![warning(), warning(), flexaudio::Event::StreamRecovered],
+            vec![
+                warning(),
+                flexaudio::Event::Clipped,
+                flexaudio::Event::PermissionGranted,
+                flexaudio::Event::AudioLoss {
+                    loss: flexaudio::core::AudioLoss::raw_overflow(
+                        None,
+                        std::num::NonZeroU64::new(4),
+                        48_000,
+                        1,
+                    )
+                    .unwrap(),
+                },
+            ],
+            None,
+        )
+        .expect("typed reopen warnings must continue recording, even at final drain");
+    }
+
+    #[test]
+    fn repro_p12_poll_panic_warning_does_not_fail_recording() {
+        repro_capture_events(
+            vec![flexaudio::Event::RecoverableError {
+                error: Error::Backend("backend event polling panicked".into()),
+            }],
+            Vec::new(),
+            None,
+        )
+        .expect("typed poll panic warning must permit clean completion");
+    }
+
+    #[test]
+    fn repro_p12_shutdown_failure_drains_and_fails() {
+        let error = repro_capture_events(
+            Vec::new(),
+            vec![
+                flexaudio::Event::ShutdownError {
+                    error: Error::Backend("cleanup failed".into()),
+                },
+                flexaudio::Event::Clipped,
+                flexaudio::Event::PermissionGranted,
+            ],
+            Some(Error::Backend("producer shutdown failed".into())),
+        )
+        .expect_err("cleanup failure must fail even after a valid recording");
+        assert!(error.contains("producer shutdown failed"));
+    }
+
+    #[test]
+    fn typed_fatality_and_legacy_redaction_do_not_depend_on_text() {
+        for message in [
+            "reopen failed: secret-token",
+            "normalizer push failed: secret-token",
+        ] {
+            let error = report_capture_event(flexaudio::Event::Error(message.into())).unwrap_err();
+            let displayed = describe_error(error);
+            assert!(displayed.contains("legacy capture failure"));
+            assert!(!displayed.contains("secret-token"));
+            report_capture_event(flexaudio::Event::RecoverableError {
+                error: Error::Backend("normalizer push failed: recoverable warning".into()),
+            })
+            .expect("the event type determines fatality");
+        }
+    }
+
+    #[test]
+    fn wrapped_permission_detail_follows_safe_guidance() {
+        use flexaudio::core::{ErrorContext, ErrorGroup, Operation};
+        let error = Error::Multiple(ErrorGroup::new(
+            Error::PermissionDenied {
+                permission: flexaudio::Permission::SystemAudio,
+                detail: "target process access restricted".into(),
+            }
+            .with_context(ErrorContext::new(Operation::Start)),
+            Error::Backend("cleanup failed".into()),
+            Vec::new(),
+        ));
+        assert!(!error
+            .to_string()
+            .contains("target process access restricted"));
+        let message = describe_error(error);
+        assert!(
+            message.find("recording permission denied").unwrap()
+                < message
+                    .find("Permission detail: target process access restricted")
+                    .unwrap()
+        );
+        assert!(message.contains("related failure: backend error: cleanup failed"));
+    }
+
+    #[test]
+    fn config_error_keeps_library_message_and_default_chunk_duration() {
+        let cli = cli_from(&[]);
+        assert_eq!(config_for_kind(&cli, SourceKind::Mic).chunk_ms, 20);
+        let config = StreamConfig {
+            chunk_ms: 10,
+            ..StreamConfig::default()
+        };
+        let error = match Stream::open(
+            config,
+            Box::new(flexaudio::MockBackend::new(48_000, 1, 0.0)),
+        ) {
+            Ok(_) => panic!("non-20 chunk duration must fail before capture"),
+            Err(error) => error,
+        };
+        let safe_message = error.to_string();
+        assert!(describe_error(error).contains(&safe_message));
+        assert!(Cli::try_parse_from(["flexaudio-cli", "--chunk-ms", "10"]).is_err());
     }
 
     #[test]
