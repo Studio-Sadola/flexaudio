@@ -1,5 +1,12 @@
 # flexaudio
 
+Rust の 0.5 への移行: `AudioChunk` と `SecondaryChunk` の構造体リテラルには、
+新しい公開フィールド `frame_index: u64` が必要です。各タップの基準となる 48 kHz
+タイムライン上で、チャンクの最初のフレームを指します。再オープン後も連続し、
+キューで音声が失われると飛びが現れます。生成元のタイムラインから設定してください。
+時点 0 から始まる合成チャンクを 1 個作る場合は `frame_index: 0` を使います。
+C の `FlexChunk` v1 のレイアウトは変わりません。
+
 [English](README.md) | **日本語**
 
 **Rust 向けの、汎用的で柔軟なクロスプラットフォーム音声キャプチャライブラリです。**
@@ -43,6 +50,11 @@ stream.stop();
   その OS でサポートされていないソースを指定すると、`Error::Unsupported` が返ります。
 - プロセス単位のキャプチャには、`StreamConfig` の `target_pid` が必要です。
 - `SourceKind::Mix` は、3 つのプラットフォームすべてでマイクとシステム出力を組み合わせます。
+- **0.5 の VAD:** 従来の `Vad` に加え、`WhisperVad` が whisper.cpp 互換の後処理と
+  キャプチャに接続するタップを提供します。Rust・Node.js・Python・C に対応し、
+  どちらも埋め込みモデルでオフライン動作します。
+- **型付き診断:** 音声損失、クリッピング、権限、一時的／終端のエラーのイベントと、
+  保持されたキャプチャ／後片付けの失敗を確認できます。
 
 ---
 
@@ -50,19 +62,19 @@ stream.stop();
 
 ```toml
 [dependencies]
-flexaudio = "0.4"
+flexaudio = "0.5"
 ```
 
 または、次のコマンドを使います。
 
 ```sh
-cargo add flexaudio@0.4
+cargo add flexaudio@0.5
 ```
 
 音声区間検出（VAD）のアドオンは、別のクレートです。
 
 ```sh
-cargo add flexaudio-vad
+cargo add flexaudio-vad@0.5
 ```
 
 ---
@@ -101,7 +113,8 @@ stream.stop();
   まだ開始されていないキャプチャストリームを作成します。
 - `Stream::start` / `Stream::stop` — キャプチャを制御します。
   `stop_checked()` はキャプチャと後片付けの失敗を返し、`shutdown_report()` は完了結果を保持します。
-  停止したストリームは再利用できません。再びキャプチャするには、新しいストリームを開いてください。
+  停止したストリームは再利用できず、`start()` は `InvalidState` を返します。
+  再びキャプチャするには、新しいストリームを開いてください。この規則は 0.4 でも適用されていました。
   繰り返し停止しても、後片付けやイベントの通知は重複しません。
 - `Stream::poll_chunk` / `Stream::poll_event` — `AudioChunk` と `Event` を取り出します。
 - `Stream::terminal_error() -> Option<Error>` — 停止後も保持される終端エラーを確認します。
@@ -123,12 +136,60 @@ stream.stop();
   Linux で開始に失敗するとエラーを返します。Windows/macOS では、現在は何も行わないウォッチャーを返します。
 - 再エクスポートされる型: `StreamConfig`, `SourceKind`, `ProcessMode`, `OutputFormat`,
   `AudioChunk`, `SecondaryChunk`, `ChunkFlags`, `DeviceInfo`, `ProcessInfo`,
-  `DeviceEvent`, `Event`, `Permission`, `Error`, `Result`。
+  `DeviceEvent`, `DefaultDeviceKind`, `Event`, `Permission`, `Error`, `ErrorKind`,
+  `ErrorContext`, `AudioLoss`, `ShutdownReport`, `Result`。
 
 音声区間検出（`flexaudio-vad`）では、`Vad::new` / `Vad::process` でストリーミングの
 `SpeechStart` / `SpeechEnd` イベントを取得し、`get_speech_timestamps` でバッチ処理による区間分割を行います。
 Silero VAD モデルはバイナリに埋め込まれているため、実行時のモデルファイルやネットワークアクセスを必要とせず、
-完全にオフラインで動作します。
+完全にオフラインで動作します。0.5 では `WhisperVad` / `WhisperVadPostProcessor` /
+`whisper_speech_segments` が whisper.cpp から移植した後処理を提供します。確定区間は
+10 ms 刻みの整数ミリ秒で返し、任意の暫定発話／分割イベントと、末尾の不完全フレームを
+パディングして推論する機能があります。互換性の対象は固定された後処理アルゴリズムです。
+異なるモデルバージョンで推論確率が一致するとは限りません。`WhisperVadTap` は
+基準となるキャプチャへ接続し、エポックの時計の基点と flush／停止時の終了イベントを届けます。
+転送中に音声が欠落すると、そのエポックを失敗させ、確定区間を捏造しません。
+同じストリームで従来の VAD と WhisperVad を同時に有効にすることはできません。
+
+---
+
+## 0.5 への移行
+
+完全な移行手順は [0.5.0 の変更履歴](CHANGELOG.md#050---2026-10-11) を参照してください。
+チャンクは 20 ms、ネイティブ入力はモノラル／ステレオを使ってください。他のチャンク長は
+`InvalidArg`、2 チャンネルを超える入力は `UnsupportedFormat` になります。
+Mix の片側で致命的なエラーが起きると両側を停止し、どちら側の失敗かを保持します。
+
+`Error::kind()` / `root()` / `permission()` で、メッセージを解析せずにラップされたエラーを
+分類できます。`Display` はライブラリが記述した説明を保持し、デバイス名、権限の詳細、内部の
+呼び出し名は伏せます。必要な診断は構造化された情報から明示的に取得してください。
+第三者バックエンドの従来のエラー文字列は、安全な説明に置き換えます。
+`AudioLoss`、`Clipped`、`RecoverableError`、`ShutdownError`、`PermissionGranted` と、
+デバイスの `DefaultCleared`／`RescanRequired` に対応してください。
+`DefaultChanged.kind` は `DefaultDeviceKind` になりました。損失後の出力には
+`DISCONTINUITY` が付き、`PADDED=8` と `CLIPPED=16` が出力の状態を示します。
+すべてのバインディングで peak／RMS はノイズ除去とゲイン適用後の配信サンプルから計測します。
+
+Node.js では u64 カウンター（VAD の `atSample`、チャンク損失数、音声損失数を含む）を
+bigint で計算してください。PTS は number のままです。チャンクの型には `frameIndex` が
+必須となり、イベントの型は判別可能な閉じた union になりました。
+`terminalError()`／`shutdownReport()` は値がない場合 `undefined` を返します。
+コールバックの例外は `uncaughtException` として通知されます。
+
+Python のコアの失敗は `.audio_error` を持つ型付き例外になります。
+`InvalidArgumentError`／`UnsupportedFormatError` は `ValueError` のサブクラス、
+その他は `RuntimeError` のサブクラスです。`terminal_error()` は `AudioError` を返します。
+列挙／ウォッチャーの失敗は例外になり、`stop()` と通常のコンテキスト終了も後片付けの失敗を
+送出する場合があります。本体で既に例外が起きている場合は、それを主因として保持し、
+後片付けの情報を添えます。停止後のノイズ除去の末尾も受け取るには、キューの音声を取り出してください。
+
+C の v1 の物理レイアウトと従来の定数は維持しますが、enum のフィールドは `int32_t`、
+入力の真偽値は `uint8_t` になります。未知の識別値は不正な引数です。
+新しい -5..-12 を含む、負の根本原因の結果コードすべてをエラーとして扱ってください。
+詳細は v2 の不透明なエラー／イベント／ウォッチャー／停止結果の参照 API を使います。
+
+CLI は一時的な失敗、音声損失、クリッピングでは録音を継続し、終端エラーや後片付けの
+失敗では失敗を返します。安全な案内の後に、構造化された権限の詳細を表示します。
 
 ---
 
@@ -281,7 +342,8 @@ JS のイベントループをブロックしないようにしています。
 
 アプリケーションは、ホスト OS が必要とする用途説明や機能宣言を行う必要があります。
 録音の許可が拒否されたと確認できた場合は、`Error::PermissionDenied { permission, detail }` を返します。
-メッセージは対象の権限と原因、変更するプライバシー設定、アプリを再起動して再試行する手順を示します。
+安全な `Display` は対象の権限と、その OS のプライバシー設定／再起動の手順を示します。
+元の詳細は構造化された情報から取得でき、CLI はそれを明示的に表示します。
 キャプチャ中に拒否を検出すると `Event::PermissionDenied { permission, detail }` を発行し、
 キャプチャ（Mix では両方の入力）を終了して、それ以降の音声の配信と自動的な再オープンを抑止します。
 権限を修正した後は新しいストリームを作成してください。終端エラーのあるストリームの
@@ -289,16 +351,19 @@ JS のイベントループをブロックしないようにしています。
 
 macOS の許可監視で認可状態を照会できない場合は、
 `Event::TerminalError { error }` によりキャプチャを安全側に停止し、元のバックエンドエラーを保持します。
-この場合、権限が拒否されたと推測することはありません。各バインディングはこれを `error`
-イベントとして通知し、同じ終端エラーを参照できます。マイクの構成が事前に通知したネイティブ形式と
+この場合、権限が拒否されたと推測することはありません。N-API/Python は `terminalError`
+イベントとして通知します。C v1 では従来の Error 種別 5 に投影し、v2 では終端の型情報を保持します。
+同じ終端エラーを参照できます。マイクの構成が事前に通知したネイティブ形式と
 異なる場合は、キャプチャを構築する前に `Error::NativeFormatChanged { advertised, actual }`
 で拒否します。誤った形式でサンプルを解釈して配信せず、現在のデバイス形式を使ってストリームを作り直してください。
 
 Rust では `Stream::terminal_error()`、N-API では `terminalError()` を提供し、N-API の
-`stop()` は終端エラーがあると拒否されます。即時の通知には `onEvent` を渡してください。
-Python の `poll_chunk()` は `RuntimeError` を送出し、`terminal_error()` はイベントを消費せずに
-エラーを確認できます。C の `flexaudio_poll_chunk()` と `flexaudio_terminal_error()` は
-`FLEX_FAILURE` (-2) を返し、説明は `flexaudio_last_error()` で取得できます。
+`stop()` はキャプチャまたは後片付けの失敗で拒否されます。即時の通知には `onEvent` を渡し、
+`shutdownReport()` で停止結果を確認してください。Python の `poll_chunk()` は終端の失敗で
+`RuntimeError` の型付きサブクラスを送出し、`terminal_error()` はイベントを消費せずに
+保持された `AudioError` を返します。C の `flexaudio_poll_chunk()` と `flexaudio_terminal_error()` は
+主因の結果コード（例: `FLEX_PERMISSION_DENIED` (-7)、バックエンドの失敗は `FLEX_FAILURE` (-2)）を
+返し、安全な説明は `flexaudio_last_error()` で取得できます。
 C の権限イベント種別は引き続き 3 です。N-API/Python の権限イベントの type は
 `permissionDenied` のままで、`permission`（`microphone` または `systemAudio`）と `message` が追加されます。
 
@@ -314,6 +379,9 @@ C の権限イベント種別は引き続き 3 です。N-API/Python の権限�
   キャプチャのオープンを進めます。同意が未決定の間は、キャプチャの全期間にわたり認可状態を確認します。
   最初の 60 秒間は 500 ms ごと、その後は 2 秒ごとに確認します。
   遅れて拒否／制限が確認されると終端の権限イベントを発行し、許可を確認するとポーリングを終了します。
+  保留の通知を既に発行していた場合、遅れて許可されるとそのキャプチャ世代で 1 回だけ
+  `PermissionGranted` を発行します（マイクのみ）。N-API/Python は `permissionGranted`、
+  C は v2 のイベント種別 9 として公開します。
   ダイアログが未回答であることだけでは、拒否と判断できません。
 - キャプチャ開始から 5 秒後もマイクへの同意が未決定の場合、Mix のマイク入力も含め、
   `Event::PermissionPending { permission, detail }` をキャプチャ世代ごとに 1 回発行します。
@@ -376,8 +444,8 @@ C の権限イベント種別は引き続き 3 です。N-API/Python の権限�
   ユーザーには音声デバイスへのアクセス権が必要です。通常は、`audio` グループへの所属、
   または実行中の PipeWire や PulseAudio セッションによって提供されます。
 - システム出力とプロセス単位のキャプチャには、実行中の **PipeWire** セッションが必要です。
-  PipeWire がない場合も、`devices()` は cpal が検出したマイクを返し、PipeWire のデバイスだけが含まれなくなります。
-  `watch_devices()` はエラーにせず、何も行わないウォッチャーとして動作します。
+  PipeWire がない場合やウォッチャーの開始に失敗した場合、`watch_devices()` はエラーを返します。
+  デバイス列挙はすべての提供元の完全な一覧を必要とし、不完全な照会や照会の失敗はエラーになります。
   ポータルを利用するデスクトップ環境では、ユーザーにキャプチャの許可を求める場合があります。
 
 ---
@@ -398,7 +466,7 @@ flexaudio は [Semantic Versioning](https://semver.org/) に従います。
 クレートが **0.x** 系である間は、公開 API は**まだ安定していません**。
 SemVer に従い、**マイナー**バージョンの更新（`0.2 → 0.3`）には互換性を壊す変更が含まれる場合がありますが、
 **パッチ**バージョンの更新（`0.2.0 → 0.2.1`）は後方互換性を保ちます。
-互換性のある更新だけを受け取るには、バージョンを `0.4` に固定してください。
+互換性のある更新だけを受け取るには、バージョンを `0.5` に固定してください。
 [`CHANGELOG.md`](CHANGELOG.md) を参照してください。
 
 ---

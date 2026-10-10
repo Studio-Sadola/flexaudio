@@ -70,6 +70,8 @@ jobs:
           -p flexaudio-encode -p flexaudio-denoise
           -p flexaudio-ffi -p flexaudio-py
           --all-targets -- -D warnings
+      - name: Install cbindgen (header test compares include/flexaudio.h with its output)
+        run: cargo install cbindgen --locked --version 0.29.4
       - name: Doc (deny warnings, docs.rs-equivalent for Linux crates)
         env:
           RUSTDOCFLAGS: -D warnings
@@ -315,6 +317,8 @@ jobs:
           -p flexaudio-encode -p flexaudio-denoise
           -p flexaudio-ffi -p flexaudio-py
           --all-targets -- -D warnings
+      - name: Install cbindgen (header test compares include/flexaudio.h with its output)
+        run: cargo install cbindgen --locked --version 0.29.4
       - name: Test (ignored real-audio tests auto-skip)
         run: >-
           cargo test

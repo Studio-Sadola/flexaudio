@@ -7,7 +7,7 @@ per-process loopback) written in Rust. Built with PyO3 and maturin.
 ## Install
 
 ```sh
-pip install flexaudio
+pip install "flexaudio>=0.5,<0.6"
 ```
 
 ## Usage
