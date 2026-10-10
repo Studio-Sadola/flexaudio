@@ -600,9 +600,9 @@ uint64_t flexaudio_dropped_chunks(const struct FlexStream *s);
 int32_t flexaudio_poll_chunk(struct FlexStream *s, struct FlexChunk *out);
 
 // Return the producer frame index in canonical 48 kHz units without changing v1 layout.
-// NULL or a freed/zeroed chunk returns zero.
+// NULL, a freed chunk, or caller-owned PCM returns zero and sets last_error.
 // # Safety
-// Non-NULL must point to a live chunk returned by poll_chunk or poll_chunk_v2.
+// Non-NULL must point to an aligned, readable FlexChunk. PCM is never dereferenced.
 uint64_t flexaudio_chunk_frame_index(const struct FlexChunk *chunk);
 
 // Free the `data` filled by `flexaudio_poll_chunk` and set `data=NULL` / `len=0`.

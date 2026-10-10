@@ -119,6 +119,8 @@ struct OutputTap {
     out_frame_origin: u64,
     /// PTS anchor: associates an output frame index with `device_pts` (ns).
     pts_anchor: Option<PtsAnchor>,
+    /// Exact capture clock; legacy output taps retain their original arithmetic.
+    canonical_clock: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -210,8 +212,17 @@ impl Normalizer {
     /// Enable a pre-output-conversion canonical branch for off-callback consumers.
     /// Its stop tail contains valid frames only, never transport padding.
     pub fn with_capture_tap(mut self) -> Result<Self> {
-        self.capture = Some(OutputTap::new(OutputFormat::default())?);
+        let mut capture = OutputTap::new(OutputFormat::default())?;
+        capture.canonical_clock = true;
+        self.capture = Some(capture);
         Ok(self)
+    }
+
+    /// Canonical frames produced but not emitted, discarded when this generation is rebuilt.
+    pub fn buffered_capture_frames(&self) -> usize {
+        self.capture
+            .as_ref()
+            .map_or(0, OutputTap::buffered_out_frames)
     }
 
     /// Retrieve valid canonical stereo frames; allow a short final tail only at stop.
@@ -289,16 +300,16 @@ impl Normalizer {
         // ratio and update each tap's PTS anchor. This is approximate because the resampler retains
         // a remainder internally. Set anchors independently for primary and secondary.
         self.primary
-            .update_pts_anchor(self.total_inner_frames, device_pts_ns);
+            .update_pts_anchor(self.total_inner_frames, device_pts_ns)?;
         if let Some(sec) = self.secondary.as_mut() {
-            sec.update_pts_anchor(self.total_inner_frames, device_pts_ns);
+            sec.update_pts_anchor(self.total_inner_frames, device_pts_ns)?;
         }
 
         if let Some(capture) = self.capture.as_mut() {
             // One rational PTS anchor per source generation. Arrival-time jitter must
             // not reanchor old samples or create a VAD epoch on every push.
             if capture.pts_anchor.is_none() {
-                capture.update_pts_anchor(self.total_inner_frames, device_pts_ns);
+                capture.update_pts_anchor(self.total_inner_frames, device_pts_ns)?;
             }
         }
 
@@ -368,13 +379,29 @@ impl Normalizer {
             if !tail.is_empty() {
                 self.inner_scratch.clear();
                 self.inner_scratch.extend_from_slice(&tail);
+                // A denoiser's primed delay line emits silence even without input.
+                // Preserve legacy output while keeping an empty capture epoch empty.
+                let empty_capture = if self.total_inner_frames == 0 {
+                    self.capture.take()
+                } else {
+                    None
+                };
                 let _ = self.distribute_inner();
+                if let Some(capture) = empty_capture {
+                    self.capture = Some(capture);
+                }
             }
         }
         // 2. Drain each tap's stage 2 resampler remainder and pad partial chunks with silence.
         self.primary.flush();
         if let Some(sec) = self.secondary.as_mut() {
             sec.flush();
+        }
+        if let Some(capture) = self.capture.as_mut() {
+            // Canonical capture emits only real frames, never fixed-chunk padding.
+            if let Some(stage) = capture.stage2.as_mut() {
+                let _ = stage.flush_into(&mut capture.out_buf);
+            }
         }
     }
 
@@ -393,9 +420,11 @@ impl Normalizer {
         }
         let inner = std::mem::take(&mut self.inner_scratch);
         let r_primary = self.primary.feed_inner(&inner);
-        if let Some(capture) = self.capture.as_mut() {
-            capture.feed_inner(&inner)?;
-        }
+        let r_capture = self
+            .capture
+            .as_mut()
+            .map(|capture| capture.feed_inner(&inner))
+            .unwrap_or(Ok(()));
         let r_secondary = self
             .secondary
             .as_mut()
@@ -404,7 +433,7 @@ impl Normalizer {
         // Restore the buffer so its capacity can be reused.
         self.inner_scratch = inner;
         self.inner_scratch.clear();
-        r_primary.and(r_secondary)
+        r_primary.and(r_capture).and(r_secondary)
     }
 
     /// Mix interleaved audio with any channel count to stereo interleaved and push it to `dst`.
@@ -455,6 +484,7 @@ impl OutputTap {
             out_channels,
             out_frame_origin: 0,
             pts_anchor: None,
+            canonical_clock: false,
         })
     }
 
@@ -511,16 +541,22 @@ impl OutputTap {
     /// The output frame position is an approximation mapped from the total internal frame count
     /// to the output rate (not exact because the resampler retains a remainder). `in_sample_rate`
     /// cancels out, so only the output and internal rates are needed.
-    fn update_pts_anchor(&mut self, total_inner_frames: u64, device_pts_ns: i64) {
-        let projected_out_frame = u64::try_from(
-            u128::from(total_inner_frames) * u128::from(self.output.sample_rate)
-                / u128::from(SAMPLE_RATE),
-        )
-        .expect("bounded normalizer output timeline");
+    fn update_pts_anchor(&mut self, total_inner_frames: u64, device_pts_ns: i64) -> Result<()> {
+        let projected_out_frame = if self.canonical_clock {
+            u64::try_from(
+                u128::from(total_inner_frames) * u128::from(self.output.sample_rate)
+                    / u128::from(SAMPLE_RATE),
+            )
+            .map_err(|_| Error::InvalidState("canonical output timeline exhausted".into()))?
+        } else {
+            // Preserve aecdc40's floating-point projection for caller-visible taps.
+            (total_inner_frames as f64 * self.output.sample_rate as f64 / SAMPLE_RATE as f64) as u64
+        };
         self.pts_anchor = Some(PtsAnchor {
             out_frame: projected_out_frame,
             pts_ns: device_pts_ns,
         });
+        Ok(())
     }
 
     /// Extrapolate `device_pts` (ns) for output frame index `out_frame` from the anchor using the
@@ -528,6 +564,11 @@ impl OutputTap {
     fn pts_for_out_frame(&self, out_frame: u64) -> i64 {
         match self.pts_anchor {
             None => crate::clock::monotonic_now_ns(),
+            Some(anchor) if !self.canonical_clock => {
+                let frame_delta = out_frame as i64 - anchor.out_frame as i64;
+                let ns_per_out_frame = 1_000_000_000_i64 / self.output.sample_rate as i64;
+                anchor.pts_ns + frame_delta * ns_per_out_frame
+            }
             Some(anchor) => {
                 let frame_delta = i128::from(out_frame) - i128::from(anchor.out_frame);
                 let pts = i128::from(anchor.pts_ns)

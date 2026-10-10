@@ -247,6 +247,22 @@ pub unsafe extern "C" fn flexaudio_poll_chunk_v2(s: *mut FlexStream, out: *mut F
             );
         }
         let stream = &mut *s;
+        if let Some(error) = stream.inner.terminal_error() {
+            // Keep closing event carriers, while freeing every queued PCM allocation.
+            let queued = mem::take(&mut stream.ready_chunks);
+            for mut chunk in queued {
+                if chunk.chunk.frames == 0 {
+                    stream.ready_chunks.push_back(chunk);
+                } else {
+                    flexaudio_chunk_free_v2(&mut chunk);
+                }
+            }
+            if let Some(carrier) = stream.ready_chunks.pop_front() {
+                out.write(carrier);
+                return 1;
+            }
+            return reject(code::FLEX_FAILURE, &error.to_string());
+        }
         if let Some(chunk) = stream.ready_chunks.pop_front() {
             out.write(chunk);
             return 1;
@@ -473,6 +489,51 @@ mod tests {
     use std::time::{Duration, Instant};
 
     struct PushBackend(Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>);
+
+    #[test]
+    fn queued_pcm_is_suppressed_after_permission_denial() {
+        struct Denied;
+        impl flexaudio::CaptureBackend for Denied {
+            fn native_format(&self) -> (u32, u16) {
+                (48_000, 2)
+            }
+            fn start(&mut self, _: flexaudio::core::backend::RawSink) -> flexaudio::Result<()> {
+                Err(flexaudio::Error::PermissionDenied {
+                    permission: flexaudio::core::types::Permission::Microphone,
+                    detail: "denied by user".into(),
+                })
+            }
+            fn stop(&mut self) {}
+        }
+        let mut inner = flexaudio::Stream::open(Default::default(), Box::new(Denied)).unwrap();
+        assert!(inner.start().is_err());
+        let mut stream = FlexStream {
+            inner,
+            whisper: None,
+            whisper_events: Vec::new(),
+            whisper_origin: (0, 0),
+            whisper_error: None,
+            whisper_error_reported: false,
+            ready_chunks: Default::default(),
+            denoiser: None,
+            vad: None,
+        };
+        let mut chunk = empty_carrier((0, 0));
+        chunk.frames = 960;
+        chunk.data = vec![0.25; 1920];
+        let chunk = stream.versioned_chunk(crate::convert::chunk_to_c(chunk));
+        stream.ready_chunks.push_back(chunk);
+        unsafe {
+            let mut out = mem::zeroed();
+            let status = flexaudio_poll_chunk_v2(&mut stream, &mut out);
+            flexaudio_chunk_free_v2(&mut out);
+            assert_eq!(
+                status,
+                code::FLEX_FAILURE,
+                "queued PCM was delivered after denial"
+            );
+        }
+    }
     impl flexaudio::CaptureBackend for PushBackend {
         fn native_format(&self) -> (u32, u16) {
             (48_000, 2)

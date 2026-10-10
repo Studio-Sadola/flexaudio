@@ -240,6 +240,14 @@ impl Stream {
     /// Both boundaries are delivered together when a segment finalizes. If flushing fails,
     /// reset VAD and denoise before raising the flush error; the consumed chunk is not returned.
     fn poll_chunk(&mut self) -> PyResult<Option<PyAudioChunk>> {
+        if let Some(error) = self.inner.terminal_error() {
+            // Closing event carriers remain deliverable; captured PCM does not.
+            self.ready_chunks.retain(|chunk| chunk.samples().is_empty());
+            return match self.ready_chunks.pop_front() {
+                Some(carrier) => Ok(Some(carrier)),
+                None => Err(to_py_err(error)),
+            };
+        }
         if let Some(chunk) = self.ready_chunks.pop_front() {
             return Ok(Some(chunk));
         }
@@ -385,12 +393,17 @@ impl Stream {
             mic_gain,
             system_gain,
         )?;
-        self.inner.switch_source(config).map_err(to_py_err)?;
+        if self.whisper.is_some() {
+            self.inner
+                .switch_source_with_denoise(config, denoise)
+                .map_err(to_py_err)?;
+        } else {
+            self.inner.switch_source(config).map_err(to_py_err)?;
+        }
 
         // Replace addons only after the switch succeeds (keep old addons on failure).
         self.vad = new_vad;
         if self.whisper.is_some() {
-            self.inner.set_denoise(denoise);
             self.denoiser = None;
         } else {
             self.denoiser = new_denoiser;
@@ -604,6 +617,17 @@ mod tests {
                 output_rate: 48_000,
                 output_channels: 2,
             };
+            stream.ready_chunks.push_back(chunk_to_py(fa::AudioChunk {
+                data: vec![0.25; 1920],
+                frames: 960,
+                frame_index: 0,
+                pts_ns: 0,
+                seq: 0,
+                flags: fa::ChunkFlags::empty(),
+                dropped_before: 0,
+                peak: 0.25,
+                rms: 0.25,
+            }));
             let error = match stream.poll_chunk() {
                 Err(error) => error,
                 Ok(_) => panic!("terminal polling must raise"),
@@ -702,6 +726,22 @@ stream.stop()
             )
             .expect("switch validation errors");
         });
+    }
+
+    #[test]
+    fn whisper_source_switch_uses_atomic_generation_denoise_contract() {
+        let source = include_str!("stream.rs")
+            .split("fn switch_source(")
+            .nth(1)
+            .unwrap()
+            .split("/// Context manager support")
+            .next()
+            .unwrap();
+        let compact: String = source.split_whitespace().collect();
+        assert!(
+            compact.contains("self.inner.switch_source_with_denoise(config,denoise)"),
+            "Python currently publishes the generation through switch_source before set_denoise"
+        );
     }
 }
 

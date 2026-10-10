@@ -1,5 +1,12 @@
 # flexaudio
 
+Rust migration to 0.5: `AudioChunk` and `SecondaryChunk` struct literals must
+include the new public `frame_index: u64` field. It is the first frame's index
+on the tap's canonical 48 kHz timeline, continues across reopen, and exposes
+queue drops as gaps. Set it from the producing timeline when constructing
+chunks; use `frame_index: 0` for a single synthetic chunk starting at zero.
+The C `FlexChunk` v1 layout is unchanged.
+
 **English** | [Japanese](README.ja.md)
 
 **General-purpose, flexible, cross-platform audio capture for Rust.**

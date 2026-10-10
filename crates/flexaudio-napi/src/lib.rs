@@ -1545,9 +1545,6 @@ impl FlexStream {
 
         let handle = thread::spawn(move || {
             loop {
-                if thread_stop.load(Ordering::SeqCst) {
-                    break;
-                }
                 // Process commands together in the same iteration as polling.
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
@@ -1607,6 +1604,11 @@ impl FlexStream {
                             );
                         }
                     }
+                }
+                // A stop request may race an already accepted flush command.
+                // Drain accepted commands before exiting so their promises settle.
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
                 }
                 if let Some(error) = stream.terminal_error() {
                     *thread_terminal.lock().unwrap_or_else(lock_poisoned) =

@@ -19,6 +19,7 @@
 //!
 //! Regenerate the `include/flexaudio.h` header with cbindgen (using `cbindgen.toml`).
 
+mod chunk_storage;
 mod convert;
 mod denoise;
 mod error;
@@ -445,18 +446,24 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
 }
 
 /// Return the producer frame index in canonical 48 kHz units without changing v1 layout.
-/// NULL or a freed/zeroed chunk returns zero.
+/// NULL, a freed chunk, or caller-owned PCM returns zero and sets last_error.
 /// # Safety
-/// Non-NULL must point to a live chunk returned by poll_chunk or poll_chunk_v2.
+/// Non-NULL must point to an aligned, readable FlexChunk. PCM is never dereferenced.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_chunk_frame_index(chunk: *const FlexChunk) -> u64 {
-    let Some(chunk) = chunk.as_ref() else {
-        return 0;
-    };
-    if chunk.data.is_null() {
+    error::clear_last_error();
+    if chunk.is_null() || !chunk.is_aligned() {
+        error::set_last_error("InvalidArgument: invalid chunk pointer");
         return 0;
     }
-    u64::from((*chunk.data.sub(2)).to_bits()) | (u64::from((*chunk.data.sub(1)).to_bits()) << 32)
+    let chunk = &*chunk;
+    match chunk_storage::frame_index(chunk.data, chunk.len) {
+        Some(index) => index,
+        None => {
+            error::set_last_error("InvalidArgument: chunk PCM is not owned by flexaudio");
+            0
+        }
+    }
 }
 
 /// Free the `data` filled by `flexaudio_poll_chunk` and set `data=NULL` / `len=0`.
