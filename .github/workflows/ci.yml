@@ -95,7 +95,7 @@ jobs:
           pip install -q 'maturin[patchelf]'
           maturin build --manifest-path bindings/flexaudio-py/Cargo.toml --out /tmp/wheels
           pip install --no-index --find-links /tmp/wheels flexaudio
-          python -m unittest bindings/flexaudio-py/tests/test_contracts.py -v
+          python -m unittest bindings/flexaudio-py/tests/test_contracts.py bindings/flexaudio-py/tests/test_whisper_buffer.py -v
           # Discovery fails closed: without a PipeWire daemon (this runner) devices()
           # raises a typed BackendError instead of returning a partial list.
           python -c "
@@ -130,6 +130,32 @@ jobs:
       # a long-lived keeper thread; the Windows tests below guard against regressions.
       - name: Test (ignored real-audio tests auto-skip)
         run: cargo test -p flexaudio -p flexaudio-os-windows -p flexaudio-mic -p flexaudio-core -p flexaudio-cli
+
+  python-wheel-windows:
+    name: Python wheel (Windows x64 / abi3)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+      # Match release-pypi.yml, including the dynamic CRT release configuration.
+      - name: Configure reproducible MSVC release (dynamic CRT)
+        run: python .github/scripts/configure-msvc-release.py --target x86_64-pc-windows-msvc --target-dir target
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: "1.98.1"
+          target: x64
+          args: --locked --release --out dist --manifest-path bindings/flexaudio-py/Cargo.toml
+      - name: Install wheel and exercise float32 input
+        run: |
+          python -m pip install --no-index --find-links dist flexaudio
+          python -m unittest bindings/flexaudio-py/tests/test_whisper_buffer.py -v
 
   windows-napi-reproducibility:
     name: Reproducible Windows x64 N-API release

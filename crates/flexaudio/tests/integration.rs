@@ -254,7 +254,8 @@ fn open_start_stop_is_clean() {
 /// `switch_backend(MockBackend(48000/stereo/220Hz))`, then collect more chunks. Assert:
 /// 1. Every chunk seq is contiguous from 0 (swapping does not change seq).
 /// 2. Flags are limited to empty / DISCONTINUITY alone for a swap / RECOVERED|DISCONTINUITY
-///    for watchdog recovery. The swap marker appears at most once and no earlier than the
+///    for watchdog recovery, with PADDED allowed only on the final stop tail.
+///    The swap marker appears at most once and no earlier than the
 ///    boundary; at least one discontinuity notification appears at or after the boundary.
 /// 3. frames/data.len remain fixed at output format (default 48k/2 -> 960 frames/1920 samples).
 /// 4. Rebuilding the first stage for 44100/mono -> 48000/stereo does not panic or break.
@@ -342,9 +343,17 @@ fn switch_backend_keeps_seq_continuous_and_flags_discontinuity() {
     //       - RECOVERED|DISCONTINUITY: watchdog recovery, valid if extreme load stalls ingest
     //         for over 2 seconds (not tested here, but may occur).
     let recovery_flags = ChunkFlags::RECOVERED | ChunkFlags::DISCONTINUITY;
-    for c in &all {
+    for (i, c) in all.iter().enumerate() {
+        // C1: stop flush pads a partial final chunk. PADDED may accompany the
+        // existing swap/recovery flags only on that tail; it is not a loss or
+        // SILENCE marker (the tail contains real samples as well as padding).
+        let flags = if i + 1 == all.len() {
+            c.flags & !ChunkFlags::PADDED
+        } else {
+            c.flags
+        };
         assert!(
-            c.flags.is_empty() || c.flags == ChunkFlags::DISCONTINUITY || c.flags == recovery_flags,
+            flags.is_empty() || flags == ChunkFlags::DISCONTINUITY || flags == recovery_flags,
             "flag outside allowed set (swap/recovery flagging is broken): seq={} flags={:?}",
             c.seq,
             c.flags

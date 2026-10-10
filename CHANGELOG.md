@@ -16,11 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Python: `WhisperVad` buffer input no longer calls the removed CPython
+  `PyObject_AsReadBuffer`, which is not part of the abi3 stable ABI. The
+  Windows x64 wheel failed to link, and on other platforms the symbol was only
+  resolved at load time. Buffers are now read through stable-ABI APIs with the
+  same float32 and layout validation. CI now builds and smoke-tests the Windows
+  wheel the same way the release does.
 - Fix the npm release workflow failing on the original tag push when GitHub's
   run listing had not indexed the current run yet. It now validates the current
   run directly and retries the listing with bounded backoff, failing closed if
-  the run remains unlisted. No library code changed. Version 0.5.0 was published
-  to crates.io and PyPI, but not npm.
+  the run remains unlisted.
+- Version 0.5.0 was published to crates.io only; npm and PyPI start at 0.5.1.
+  The Rust crates are otherwise unchanged from 0.5.0.
 
 ## [0.5.0] - 2026-10-11
 
