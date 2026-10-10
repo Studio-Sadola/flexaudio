@@ -82,6 +82,19 @@ pub(crate) fn guard_ptr<T>(f: impl FnOnce() -> *mut T) -> *mut T {
     }
 }
 
+/// Guard a borrowed pointer without converting shared storage to a mutable pointer.
+pub(crate) fn guard_const_ptr<T>(f: impl FnOnce() -> *const T) -> *const T {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => {
+            error::set_audio_error(flexaudio::Error::Backend(
+                "panic caught at FFI boundary".into(),
+            ));
+            std::ptr::null()
+        }
+    }
+}
+
 /// Wrap a bool-returning function in a panic guard. On panic, return false.
 fn guard_bool(f: impl FnOnce() -> bool) -> bool {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(false)
@@ -239,7 +252,8 @@ pub unsafe extern "C" fn flexaudio_free(s: *mut FlexStream) {
     });
 }
 
-/// Start capture.
+/// Start capture. Repeated calls while running succeed without starting again.
+/// After stop, the stream is spent: start returns FLEX_INVALID_STATE; open a new stream.
 ///
 /// # Safety
 /// `s` must be a valid handle (NULL is InvalidArg).
@@ -263,6 +277,11 @@ pub unsafe extern "C" fn flexaudio_start(s: *mut FlexStream) -> i32 {
                 stream.shutdown_event_index = 0;
                 stream.last_output = None;
                 code::FLEX_OK
+            }
+            Err(flexaudio::Error::InvalidState(_)) if stream.shutdown.is_some() => {
+                fail(flexaudio::Error::InvalidState(
+                    "stream already stopped and spent; open a new stream".into(),
+                ))
             }
             Err(e) => fail(e),
         }
@@ -717,8 +736,11 @@ pub unsafe extern "C" fn flexaudio_terminal_error(s: *const FlexStream) -> i32 {
 
 /// List available devices, allocate an array, and set `out_array` / `out_count`.
 ///
-/// Return 0 on success. Free the allocated array with `flexaudio_devices_free`. In a headless
-/// environment, an empty result (`out_array=NULL` / `out_count=0`) is still successful.
+/// Return 0 only for complete discovery. An empty complete inventory sets
+/// `out_array=NULL` / `out_count=0`. Incomplete or failed discovery (including an
+/// unreachable PipeWire daemon on Linux) returns a typed error code and sets
+/// `flexaudio_last_error` / `flexaudio_last_error_info_v2`; it is not an empty success.
+/// Free the allocated array with `flexaudio_devices_free`.
 ///
 /// # Safety
 /// `out_array` / `out_count` must be valid output pointers (NULL is InvalidArg).
@@ -930,7 +952,7 @@ mod permission_tests {
             assert!(message.contains(fa::Permission::Microphone.guidance()));
             let mut event = std::mem::MaybeUninit::<FlexEvent>::uninit();
             assert_eq!(flexaudio_poll_event(&mut stream, event.as_mut_ptr()), 1);
-            assert_eq!(event.assume_init().kind as i32, 3);
+            assert_eq!(event.assume_init().kind, 3);
             assert_eq!(flexaudio_terminal_error(&stream), -2);
             assert_eq!(flexaudio_stop(&mut stream), code::FLEX_PERMISSION_DENIED);
             assert_eq!(flexaudio_poll_chunk(&mut stream, chunk.as_mut_ptr()), -2);

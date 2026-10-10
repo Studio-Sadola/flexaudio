@@ -408,13 +408,13 @@ mod tests {
                     assert!(seen.insert(p.pid), "pid {} listed twice", p.pid);
                 }
             }
-            Err(
+            Err(error) => match error.root() {
                 Error::Backend(_)
                 | Error::Unsupported
                 | Error::UnsupportedOsVersion
-                | Error::PermissionDenied { .. },
-            ) => {}
-            Err(other) => panic!("unexpected error variant: {other:?}"),
+                | Error::PermissionDenied { .. } => {}
+                other => panic!("unexpected error variant: {other:?}"),
+            },
         });
     }
 }

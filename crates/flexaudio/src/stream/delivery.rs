@@ -138,7 +138,7 @@ impl Stream {
             .backend
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        self.shared.stop_backend_owned(&mut backend);
+        self.shared.stop_backend_owned(&mut backend, None);
         self.shared.terminal.error()
     }
 

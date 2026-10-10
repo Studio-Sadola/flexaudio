@@ -110,6 +110,7 @@ The facade crate `flexaudio` re-exports everything you need:
   OS and build a (not-yet-started) capture stream.
 - `Stream::start` / `Stream::stop` — control capture. `stop_checked()` returns
   capture and cleanup failures; `shutdown_report()` retains the completed outcome.
+  A stopped stream is spent; open a new stream to capture again.
   Repeated stop does not repeat teardown or duplicate events.
 - `Stream::poll_chunk` / `Stream::poll_event` — pull `AudioChunk`s and `Event`s.
 - `Stream::terminal_error() -> Option<Error>` — inspect a stored terminal failure,
@@ -118,8 +119,11 @@ The facade crate `flexaudio` re-exports everything you need:
   stream (chunk `seq` stays continuous; the first chunk after a switch carries a
   discontinuity flag).
 - `flexaudio::devices() -> Result<Vec<DeviceInfo>>` — enumerate microphones
-  (cpal, all platforms) and system output endpoints (Linux: PipeWire sinks and
-  sources; Windows: active render endpoints; macOS: output devices) in one list.
+  (CPAL, all platforms) and system output endpoints (Linux: PipeWire sinks;
+  Windows: active render endpoints; macOS: output devices) in one list.
+  Linux microphone IDs are CPAL IDs; PipeWire Audio/Source nodes are not advertised
+  as microphones. Incomplete or failed discovery returns an error, including
+  when the PipeWire daemon is unreachable on Linux.
 - `flexaudio::processes() -> Result<Vec<ProcessInfo>>` — list audio output
   session/stream owners on Linux/Windows and Core Audio processes on macOS,
   including input-only processes (see
@@ -204,9 +208,9 @@ sources ignore valid exclusions. The same controls are available in each binding
   The requested system device is not used while exclusion is active because
   WASAPI process loopback cannot target an output endpoint.
 - **macOS:** PIDs are resolved to Core Audio process objects once at capture
-  start (a snapshot). A process without an audio object then is not excluded;
-  reopen capture when a new audio helper appears. Failed lookups fail capture
-  unless the process has exited. PIDs must fit `1..=2147483647`.
+  start (a snapshot). Unresolved exclusions fail closed, including live processes
+  without an audio object. Only a process confirmed gone (`ESRCH`) is omitted.
+  Reopen capture when a new audio helper appears. PIDs must fit `1..=2147483647`.
   A requested system device is honored alongside exclusion.
 - **Linux:** exact PID matching, without descendants. Pulse-proxied streams
   use `application.process.id`; native clients use `pipewire.sec.pid`.

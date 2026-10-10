@@ -8,6 +8,8 @@ struct CheckedBackend {
     samples: bool,
     diagnostics_only: bool,
     events: VecDeque<Event>,
+    stop_error: Option<Error>,
+    final_events: VecDeque<Event>,
 }
 impl CaptureBackend for CheckedBackend {
     fn native_format(&self) -> (u32, u16) {
@@ -27,7 +29,10 @@ impl CaptureBackend for CheckedBackend {
     }
     fn stop_checked(&mut self) -> Result<()> {
         self.stops.fetch_add(1, Ordering::SeqCst);
-        if self.cleanup_failure {
+        self.events.append(&mut self.final_events);
+        if let Some(error) = &self.stop_error {
+            Err(error.clone())
+        } else if self.cleanup_failure {
             Err(Error::Backend("owner cleanup failed".into()))
         } else {
             Ok(())
@@ -44,6 +49,8 @@ fn backend() -> CheckedBackend {
         samples: true,
         diagnostics_only: false,
         events: VecDeque::new(),
+        stop_error: None,
+        final_events: VecDeque::new(),
     }
 }
 
@@ -85,6 +92,217 @@ fn repeated_checked_stop_retains_cleanup_and_valid_output_without_duplicate_even
         matches!(stream.poll_event(), Some(Event::ShutdownError { error: Error::Context { context, .. } }) if context.operation() == Operation::Stop)
     );
     assert!(stream.poll_event().is_none());
+}
+
+#[test]
+fn checked_backend_primary_is_never_recorded_as_cleanup() {
+    for final_notice in [false, true] {
+        let mut backend = backend();
+        let primary = Error::DeviceLost.with_context(
+            ErrorContext::new(Operation::Normalize).with_lane(flexaudio_core::MixLane::SystemAudio),
+        );
+        backend.stop_error = Some(primary.clone());
+        let events = if final_notice {
+            &mut backend.final_events
+        } else {
+            &mut backend.events
+        };
+        events.push_back(Event::TerminalError {
+            error: primary.clone(),
+        });
+        let stops = backend.stops.clone();
+        let mut stream = Stream::open(StreamConfig::default(), Box::new(backend)).unwrap();
+        stream.start().unwrap();
+        assert_eq!(stream.stop_checked(), Err(primary.clone()));
+        assert_eq!(stream.stop_checked(), Err(primary.clone()));
+        assert_eq!(stream.terminal_error(), Some(primary.clone()));
+        let report = stream.shutdown_report().unwrap();
+        assert_eq!(report.primary(), Some(&primary));
+        assert!(report.cleanup().is_empty());
+        assert_eq!(
+            stream.poll_event(),
+            Some(Event::TerminalError { error: primary })
+        );
+        assert!(stream.poll_event().is_none());
+        assert!(stream.poll_chunk().is_none());
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn backend_cleanup_return_and_notice_share_one_report_and_event() {
+    for final_notice in [false, true] {
+        let mut backend = backend();
+        let cleanup = Error::Backend("owner cleanup failed".into()).with_context(
+            ErrorContext::new(Operation::Join).with_lane(flexaudio_core::MixLane::Microphone),
+        );
+        backend.stop_error = Some(cleanup.clone());
+        let events = if final_notice {
+            &mut backend.final_events
+        } else {
+            &mut backend.events
+        };
+        events.push_back(Event::ShutdownError {
+            error: cleanup.clone(),
+        });
+        let mut stream = Stream::open(StreamConfig::default(), Box::new(backend)).unwrap();
+        stream.start().unwrap();
+        let cleanup = cleanup.with_context(ErrorContext::new(Operation::Stop));
+        assert_eq!(stream.stop_checked(), Err(cleanup.clone()));
+        assert_eq!(stream.stop_checked(), Err(cleanup.clone()));
+        let report = stream.shutdown_report().unwrap();
+        assert!(report.primary().is_none());
+        assert_eq!(report.cleanup(), std::slice::from_ref(&cleanup));
+        assert!(stream.terminal_error().is_none());
+        assert_eq!(
+            stream.poll_event(),
+            Some(Event::ShutdownError { error: cleanup })
+        );
+        assert!(stream.poll_event().is_none());
+        assert!(stream.poll_chunk().is_some());
+    }
+}
+
+#[test]
+fn grouped_backend_stop_preserves_primary_and_each_distinct_cleanup_once() {
+    let mut backend = backend();
+    let primary = Error::DeviceLost.with_context(
+        ErrorContext::new(Operation::Normalize).with_lane(flexaudio_core::MixLane::SystemAudio),
+    );
+    let cleanup: Vec<_> = [
+        flexaudio_core::MixLane::Microphone,
+        flexaudio_core::MixLane::SystemAudio,
+    ]
+    .into_iter()
+    .map(|lane| {
+        Error::Backend("owner cleanup failed".into())
+            .with_context(ErrorContext::new(Operation::Join).with_lane(lane))
+    })
+    .collect();
+    backend.stop_error = Some(Error::Multiple(ErrorGroup::new(
+        primary.clone(),
+        cleanup[0].clone(),
+        vec![cleanup[1].clone()],
+    )));
+    backend.final_events.push_back(Event::TerminalError {
+        error: primary.clone(),
+    });
+    for error in &cleanup {
+        backend.final_events.push_back(Event::ShutdownError {
+            error: error.clone(),
+        });
+    }
+    let mut stream = Stream::open(StreamConfig::default(), Box::new(backend)).unwrap();
+    stream.start().unwrap();
+    let cleanup: Vec<_> = cleanup
+        .into_iter()
+        .map(|error| error.with_context(ErrorContext::new(Operation::Stop)))
+        .collect();
+    let expected = Error::Multiple(ErrorGroup::new(
+        primary.clone(),
+        cleanup[0].clone(),
+        vec![cleanup[1].clone()],
+    ));
+    assert_eq!(stream.stop_checked(), Err(expected.clone()));
+    assert_eq!(stream.stop_checked(), Err(expected));
+    let report = stream.shutdown_report().unwrap();
+    assert_eq!(report.primary(), Some(&primary));
+    assert_eq!(report.cleanup(), cleanup);
+    assert_eq!(
+        stream.poll_event(),
+        Some(Event::TerminalError { error: primary })
+    );
+    for error in cleanup {
+        assert_eq!(stream.poll_event(), Some(Event::ShutdownError { error }));
+    }
+    assert!(stream.poll_event().is_none());
+}
+
+#[test]
+fn backend_mix_loss_marks_next_delivered_chunk_on_each_tap_once() {
+    struct LossBackend {
+        loss: Option<AudioLoss>,
+    }
+    impl CaptureBackend for LossBackend {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 2)
+        }
+        fn start(&mut self, mut sink: RawSink) -> Result<()> {
+            sink.push(&[0.25; 3840], 0);
+            Ok(())
+        }
+        fn stop(&mut self) {}
+        fn poll_event(&mut self) -> Option<Event> {
+            self.loss.take().map(|loss| Event::AudioLoss { loss })
+        }
+    }
+    for lane in [
+        flexaudio_core::MixLane::Microphone,
+        flexaudio_core::MixLane::SystemAudio,
+    ] {
+        for samples in [None, NonZeroU64::new(7)] {
+            for loss in [
+                AudioLoss::mix_fifo_overflow(lane, samples),
+                AudioLoss::raw_overflow(Some(lane), samples, 48_000, 2).unwrap(),
+            ] {
+                let config = StreamConfig {
+                    secondary_output: Some(OutputFormat::default()),
+                    ..Default::default()
+                };
+                let mut stream =
+                    Stream::open(config, Box::new(LossBackend { loss: Some(loss) })).unwrap();
+                stream.enable_capture_tap().unwrap();
+                // Schedule mailbox reconciliation before intake deterministically, including
+                // an idle observation. No independent event/PCM ordering is assumed.
+                Stream::open_backend_once(&stream.shared, GenerationChange::Initial).unwrap();
+                assert_eq!(drain_backend_events(&stream.shared), MailboxDrain::Empty);
+                assert_eq!(stream.poll_event(), Some(Event::AudioLoss { loss }));
+                let primary = stream.shared.chunk_producer.lock().unwrap().take().unwrap();
+                let secondary = stream.shared.secondary_producer.lock().unwrap().take();
+                stream.shared.stopping.store(true, Ordering::SeqCst);
+                run_intake(
+                    stream.shared.clone(),
+                    primary,
+                    secondary,
+                    (48_000, 2),
+                    OutputFormat::default(),
+                    Some(OutputFormat::default()),
+                );
+                assert!(stream
+                    .poll_chunk()
+                    .unwrap()
+                    .flags
+                    .contains(ChunkFlags::DISCONTINUITY));
+                assert!(!stream
+                    .poll_chunk()
+                    .unwrap()
+                    .flags
+                    .contains(ChunkFlags::DISCONTINUITY));
+                assert!(stream
+                    .poll_secondary()
+                    .unwrap()
+                    .flags
+                    .contains(ChunkFlags::DISCONTINUITY));
+                assert!(!stream
+                    .poll_secondary()
+                    .unwrap()
+                    .flags
+                    .contains(ChunkFlags::DISCONTINUITY));
+                assert!(stream
+                    .poll_capture()
+                    .unwrap()
+                    .flags
+                    .contains(ChunkFlags::DISCONTINUITY));
+                assert!(!stream
+                    .poll_capture()
+                    .unwrap()
+                    .flags
+                    .contains(ChunkFlags::DISCONTINUITY));
+                stream.stop_checked().unwrap();
+                assert!(stream.poll_event().is_none());
+            }
+        }
+    }
 }
 #[test]
 fn legacy_failure_is_terminal_and_cleanup_does_not_replace_the_primary() {

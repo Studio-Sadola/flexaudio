@@ -5,7 +5,7 @@ use crate::v2_records::*;
 use crate::v2_storage::*;
 use crate::{
     error::{self, code},
-    guard_i32, guard_ptr,
+    guard_const_ptr, guard_i32, guard_ptr,
     types::{FlexDeviceInfo, FlexStream},
     watch::FlexWatcher,
 };
@@ -375,20 +375,18 @@ pub unsafe extern "C" fn flexaudio_error_context_v2(
 pub unsafe extern "C" fn flexaudio_event_error_v2(
     value: *const FlexEventV2,
 ) -> *const FlexErrorInfoV2 {
-    guard_ptr(|| {
+    guard_const_ptr(|| {
         error::clear_last_error();
         if !valid(value) {
             invalid();
-            return ptr::null_mut();
+            return ptr::null();
         }
         let v = &*value;
         v.error
             .as_ref()
             .map(|e| e as *const FlexErrorInfoV2)
             .unwrap_or(ptr::null())
-            .cast_mut()
     })
-    .cast_const()
 }
 /// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
 /// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
@@ -396,20 +394,18 @@ pub unsafe extern "C" fn flexaudio_event_error_v2(
 /// value must be a live readable owner.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_event_message_v2(value: *const FlexEventV2) -> *const c_char {
-    guard_ptr(|| {
+    guard_const_ptr(|| {
         error::clear_last_error();
         if !valid(value) {
             invalid();
-            return ptr::null_mut();
+            return ptr::null();
         }
         let v = &*value;
         v.message
             .as_ref()
             .map(|s| s.as_ptr())
             .unwrap_or(ptr::null())
-            .cast_mut()
     })
-    .cast_const()
 }
 /// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
 /// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
@@ -419,20 +415,18 @@ pub unsafe extern "C" fn flexaudio_event_message_v2(value: *const FlexEventV2) -
 pub unsafe extern "C" fn flexaudio_device_event_device_v2(
     value: *const FlexDeviceEventV2,
 ) -> *const FlexDeviceInfo {
-    guard_ptr(|| {
+    guard_const_ptr(|| {
         error::clear_last_error();
         if !valid(value) {
             invalid();
-            return ptr::null_mut();
+            return ptr::null();
         }
         let v = &*value;
         v.device
             .as_ref()
             .map(|e| e as *const FlexDeviceInfo)
             .unwrap_or(ptr::null())
-            .cast_mut()
     })
-    .cast_const()
 }
 /// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
 /// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
@@ -442,19 +436,15 @@ pub unsafe extern "C" fn flexaudio_device_event_device_v2(
 pub unsafe extern "C" fn flexaudio_device_event_id_v2(
     value: *const FlexDeviceEventV2,
 ) -> *const c_char {
-    guard_ptr(|| {
+    guard_const_ptr(|| {
         error::clear_last_error();
         if !valid(value) {
             invalid();
-            return ptr::null_mut();
+            return ptr::null();
         }
         let v = &*value;
-        v.id.as_ref()
-            .map(|s| s.as_ptr())
-            .unwrap_or(ptr::null())
-            .cast_mut()
+        v.id.as_ref().map(|s| s.as_ptr()).unwrap_or(ptr::null())
     })
-    .cast_const()
 }
 /// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
 /// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
@@ -464,16 +454,15 @@ pub unsafe extern "C" fn flexaudio_device_event_id_v2(
 pub unsafe extern "C" fn flexaudio_error_message_v2(
     value: *const FlexErrorInfoV2,
 ) -> *const c_char {
-    guard_ptr(|| {
+    guard_const_ptr(|| {
         error::clear_last_error();
         if !valid(value) {
             invalid();
-            return ptr::null_mut();
+            return ptr::null();
         }
         let v = &*value;
-        v.message.as_ptr().cast_mut()
+        v.message.as_ptr()
     })
-    .cast_const()
 }
 /// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
 /// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
@@ -484,11 +473,11 @@ pub unsafe extern "C" fn flexaudio_error_secondary_v2(
     value: *const FlexErrorInfoV2,
     index: usize,
 ) -> *const FlexErrorInfoV2 {
-    guard_ptr(|| {
+    guard_const_ptr(|| {
         error::clear_last_error();
         if !valid(value) {
             invalid();
-            return ptr::null_mut();
+            return ptr::null();
         }
         let v = &*value;
         if index >= v.secondary.len() {
@@ -499,9 +488,7 @@ pub unsafe extern "C" fn flexaudio_error_secondary_v2(
             .get(index)
             .map(|e| e as *const FlexErrorInfoV2)
             .unwrap_or(ptr::null())
-            .cast_mut()
     })
-    .cast_const()
 }
 /// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
 /// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
@@ -511,20 +498,18 @@ pub unsafe extern "C" fn flexaudio_error_secondary_v2(
 pub unsafe extern "C" fn flexaudio_shutdown_primary_v2(
     value: *const FlexShutdownReportV2,
 ) -> *const FlexErrorInfoV2 {
-    guard_ptr(|| {
+    guard_const_ptr(|| {
         error::clear_last_error();
         if !valid(value) {
             invalid();
-            return ptr::null_mut();
+            return ptr::null();
         }
         let v = &*value;
         v.primary
             .as_ref()
             .map(|e| e as *const FlexErrorInfoV2)
             .unwrap_or(ptr::null())
-            .cast_mut()
     })
-    .cast_const()
 }
 /// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
 /// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
@@ -535,11 +520,11 @@ pub unsafe extern "C" fn flexaudio_shutdown_cleanup_v2(
     value: *const FlexShutdownReportV2,
     index: usize,
 ) -> *const FlexErrorInfoV2 {
-    guard_ptr(|| {
+    guard_const_ptr(|| {
         error::clear_last_error();
         if !valid(value) {
             invalid();
-            return ptr::null_mut();
+            return ptr::null();
         }
         let v = &*value;
         if index >= v.cleanup.len() {
@@ -550,7 +535,5 @@ pub unsafe extern "C" fn flexaudio_shutdown_cleanup_v2(
             .get(index)
             .map(|e| e as *const FlexErrorInfoV2)
             .unwrap_or(ptr::null())
-            .cast_mut()
     })
-    .cast_const()
 }

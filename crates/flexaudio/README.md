@@ -34,6 +34,9 @@ stream.stop();
 - `Stream::switch_source` — hot-swap source without stopping the stream.
 - `devices()` enumerates devices; `watch_devices()` reports hotplug notifications
   on Linux via PipeWire. Windows/macOS return a no-op watcher.
+  Discovery returns a complete inventory or an error, including when PipeWire is
+  unavailable. Linux microphone entries use only CPAL device-name IDs; PipeWire
+  source-node IDs are omitted because the microphone backend cannot open them.
 - `processes()` lists audio output session/stream owners on Linux/Windows and
   Core Audio processes on macOS, including input-only processes. Idle/stopped
   processes are included and the caller is excluded; use `pid` as `target_pid`

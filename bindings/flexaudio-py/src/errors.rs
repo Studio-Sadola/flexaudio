@@ -32,7 +32,12 @@ pub(crate) fn lane_name(lane: fa::MixLane) -> PyResult<&'static str> {
     })
 }
 
-#[pyclass(module = "flexaudio", name = "NativeFormat", frozen)]
+#[pyclass(
+    module = "flexaudio",
+    name = "NativeFormat",
+    frozen,
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub(crate) struct NativeFormat {
     #[pyo3(get)]
@@ -58,7 +63,12 @@ impl From<(u32, u16)> for NativeFormat {
     }
 }
 
-#[pyclass(module = "flexaudio", name = "ErrorContext", frozen)]
+#[pyclass(
+    module = "flexaudio",
+    name = "ErrorContext",
+    frozen,
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub(crate) struct ErrorContext(fa::ErrorContext);
 #[pymethods]
@@ -105,7 +115,7 @@ impl ErrorContext {
     }
 }
 
-#[pyclass(module = "flexaudio", name = "AudioError", frozen)]
+#[pyclass(module = "flexaudio", name = "AudioError", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub(crate) struct AudioError(pub(crate) fa::Error);
 impl AudioError {
@@ -194,7 +204,7 @@ impl AudioError {
     }
 }
 
-#[pyclass(module = "flexaudio", name = "AudioLoss", frozen)]
+#[pyclass(module = "flexaudio", name = "AudioLoss", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub(crate) struct AudioLoss(pub(crate) fa::AudioLoss);
 #[pymethods]
@@ -273,7 +283,12 @@ impl AudioLoss {
     }
 }
 
-#[pyclass(module = "flexaudio", name = "ShutdownReport", frozen)]
+#[pyclass(
+    module = "flexaudio",
+    name = "ShutdownReport",
+    frozen,
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub(crate) struct ShutdownReport(pub(crate) fa::ShutdownReport);
 #[pymethods]
@@ -429,7 +444,7 @@ mod tests {
                 let class = error.get_type(py);
                 assert!(classes
                     .iter()
-                    .all(|previous: &Bound<'_, pyo3::types::PyType>| !previous.is(class)));
+                    .all(|previous: &Bound<'_, pyo3::types::PyType>| !previous.is(&class)));
                 classes.push(class.clone());
                 let payload = error.value(py).getattr("audio_error").unwrap();
                 assert_eq!(

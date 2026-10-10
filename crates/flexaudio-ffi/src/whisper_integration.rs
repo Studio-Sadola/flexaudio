@@ -346,8 +346,7 @@ pub unsafe extern "C" fn flexaudio_flush_whisper_vad(s: *mut FlexStream) -> i32 
             return code::FLEX_OK;
         }
         if let Err(error) = stream.queue_whisper_input() {
-            crate::error::set_audio_error(error);
-            return code::FLEX_FAILURE;
+            return crate::vad::vad_failure(error);
         }
         if let Some(tap) = stream.whisper.as_mut() {
             let result = tap.flush();

@@ -73,23 +73,37 @@ fn either_child_denial_stops_both_lanes_and_gates_stream() {
         while stream.terminal_error().is_none() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(stream
-            .terminal_error()
-            .is_some_and(|error| error.permission() == Some(permission)));
+        let primary = stream.terminal_error().unwrap();
+        assert_eq!(primary.permission(), Some(permission));
+        assert!(matches!(&primary, Error::Context { context, .. }
+        if context.operation() == Operation::Normalize
+            && context.lane() == Some(if deny_mic {
+                MixLane::Microphone
+            } else {
+                MixLane::SystemAudio
+            })));
         assert!(stream.poll_chunk().is_none());
         assert!(stream.poll_secondary().is_none());
-        assert!(mic_stops.load(Ordering::SeqCst) > 0);
-        assert!(system_stops.load(Ordering::SeqCst) > 0);
-        assert!(
-            matches!(stream.poll_event(), Some(Event::TerminalError { error }) if error.permission() == Some(permission))
+        assert_eq!(mic_stops.load(Ordering::SeqCst), 1);
+        assert_eq!(system_stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stream.poll_event(),
+            Some(Event::TerminalError {
+                error: primary.clone()
+            })
         );
-        // The facade also reports the backend's checked capture failure as a
-        // shutdown result; both projections must retain the same permission.
-        assert!(
-            matches!(stream.poll_event(), Some(Event::ShutdownError { error }) if error.permission() == Some(permission))
-        );
+        // Denial is the capture primary, not an independent cleanup failure.
+        // Both children stopped successfully, so no ShutdownError is warranted.
         assert!(stream.poll_event().is_none());
+        assert_eq!(stream.stop_checked(), Err(primary.clone()));
+        assert_eq!(stream.stop_checked(), Err(primary.clone()));
+        let report = stream.shutdown_report().unwrap();
+        assert_eq!(report.primary(), Some(&primary));
+        assert!(report.cleanup().is_empty());
         stream.stop();
+        assert!(stream.poll_event().is_none());
+        assert_eq!(mic_stops.load(Ordering::SeqCst), 1);
+        assert_eq!(system_stops.load(Ordering::SeqCst), 1);
     }
 }
 

@@ -182,7 +182,14 @@ the output formats and buffering; there is no fixed delay between taps.
 
 `stream` also exposes `pause()` / `resume()`, `setGain(x)`, and the read-only
 `isPaused()`, `gain()`, `nativeFormat()` (`{ sampleRate, channels }`) and
-`droppedChunks()` (a `bigint` running total).
+`droppedChunks()` (a `bigint` running total). After `stop()`, the stream is spent;
+call `openStream` to capture again.
+
+Use `bigint` arithmetic for u64 counters: primary/secondary `seq`,
+`droppedChunks()`, `chunkDropped.count`, loss `samples` (when known),
+`rescanRequired.droppedEvents`, and VAD `atSample`. For example, increment a
+sequence with `chunk.seq + 1n`. `ptsNs` and VAD `atNs` remain `number` timestamps;
+`frames`, `flags`, and the u32 `droppedBefore` field also remain `number`.
 
 ## Voice activity detection, noise suppression, FLAC
 
@@ -196,7 +203,9 @@ const { Vad, Denoiser, FlacEncoder, openStream } = require('@studio-sadola/flexa
 const vad = new Vad({ threshold: 0.5, minSilenceMs: 100 });
 for (const ev of vad.process(samples, 48000, 2)) {
   // ev.type: 'speechStart' | 'speechEnd'
-  // ev.atSample is on the VAD's internal rate — seconds = ev.atSample / 16000
+  // ev.atSample is a bigint on the VAD's internal 16 kHz sample clock.
+  const wholeSeconds = ev.atSample / 16000n; // exact bigint quotient
+  const seconds = Number(ev.atSample) / 16000; // approximate number for display
 }
 
 // Noise suppression: 48 kHz only, returns the denoised copy (mono here).

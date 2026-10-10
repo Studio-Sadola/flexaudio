@@ -793,38 +793,45 @@ fn v2_capture_primary_suppresses_denoise_tail_and_preserves_cleanup() {
 }
 
 #[test]
-fn v2_repeated_stop_delivers_one_denoise_tail_and_restart_keeps_addon() {
+fn v2_repeated_stop_delivers_one_denoise_tail_and_spent_stream_keeps_addon() {
     let (mut stream, state, _) = stream(None, true);
-    for _ in 0..2 {
-        release(push_and_poll(&mut stream, &state));
-        assert_eq!(unsafe { crate::flexaudio_stop(&mut stream) }, 0);
-        assert_eq!(unsafe { crate::flexaudio_stop(&mut stream) }, 0);
-        let mut tail = MaybeUninit::<FlexChunk>::uninit();
-        assert_eq!(
-            unsafe { crate::flexaudio_poll_chunk(&mut stream, tail.as_mut_ptr()) },
-            1
-        );
-        let tail = unsafe { tail.assume_init() };
-        assert_eq!(tail.len, 480);
-        let data = unsafe { std::slice::from_raw_parts(tail.data, tail.len) };
-        let (peak, rms) = crate::integration::peak_rms(data);
-        assert_eq!((tail.peak, tail.rms), (peak, rms));
-        release(tail);
-        assert_eq!(unsafe { crate::flexaudio_stop(&mut stream) }, 0);
-        assert_eq!(
-            unsafe {
-                crate::flexaudio_poll_chunk(
-                    &mut stream,
-                    MaybeUninit::<FlexChunk>::uninit().as_mut_ptr(),
-                )
-            },
-            0
-        );
-        assert!(stream.denoiser.is_some());
-        assert_eq!(unsafe { crate::flexaudio_start(&mut stream) }, 0);
-        assert!(unsafe { flexaudio_shutdown_report_v2(&stream) }.is_null());
-    }
+    release(push_and_poll(&mut stream, &state));
     assert_eq!(unsafe { crate::flexaudio_stop(&mut stream) }, 0);
+    assert_eq!(unsafe { crate::flexaudio_stop(&mut stream) }, 0);
+    let mut output = MaybeUninit::<FlexChunk>::uninit();
+    assert_eq!(
+        unsafe { crate::flexaudio_poll_chunk(&mut stream, output.as_mut_ptr()) },
+        1
+    );
+    let tail = unsafe { output.assume_init() };
+    assert_eq!(tail.len, 480);
+    let data = unsafe { std::slice::from_raw_parts(tail.data, tail.len) };
+    let (peak, rms) = crate::integration::peak_rms(data);
+    assert_eq!((tail.peak, tail.rms), (peak, rms));
+    release(tail);
+    assert_eq!(unsafe { crate::flexaudio_stop(&mut stream) }, 0);
+    let mut empty = MaybeUninit::<FlexChunk>::uninit();
+    assert_eq!(
+        unsafe { crate::flexaudio_poll_chunk(&mut stream, empty.as_mut_ptr()) },
+        0
+    );
+    assert_eq!(
+        unsafe { crate::flexaudio_start(&mut stream) },
+        code::FLEX_INVALID_STATE
+    );
+    let last_error = crate::flexaudio_last_error();
+    assert!(!last_error.is_null());
+    let message = unsafe { CStr::from_ptr(last_error) }.to_str().unwrap();
+    assert!(
+        message.contains("already stopped") || message.contains("spent"),
+        "restart must explain the spent stream: {message}"
+    );
+    assert!(stream.denoiser.is_some());
+    assert_eq!(unsafe { crate::flexaudio_stop(&mut stream) }, 0);
+    assert_eq!(
+        unsafe { crate::flexaudio_poll_chunk(&mut stream, empty.as_mut_ptr()) },
+        0
+    );
 }
 
 #[test]

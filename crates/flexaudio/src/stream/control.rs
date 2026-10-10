@@ -134,7 +134,7 @@ fn drain_backend_events_locked(
                 } else {
                     shared.deny_permission(permission, detail);
                 }
-                shared.stop_backend_owned(be);
+                shared.stop_backend_owned(be, delivery);
                 return MailboxDrain::Terminal;
             }
             Some(Event::Error(detail)) => {
@@ -144,7 +144,7 @@ fn drain_backend_events_locked(
                 } else {
                     shared.fail_terminal(error);
                 }
-                shared.stop_backend_owned(be);
+                shared.stop_backend_owned(be, delivery);
                 return MailboxDrain::Terminal;
             }
             Some(Event::RecoverableError { error }) if is_terminal_kind(&error) => {
@@ -154,7 +154,7 @@ fn drain_backend_events_locked(
                 } else {
                     shared.fail_terminal(error);
                 }
-                shared.stop_backend_owned(be);
+                shared.stop_backend_owned(be, delivery);
                 return MailboxDrain::Terminal;
             }
             Some(Event::TerminalError { error }) => {
@@ -164,8 +164,21 @@ fn drain_backend_events_locked(
                     let delivery = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
                     shared.fail_terminal_locked(error, &delivery);
                 }
-                shared.stop_backend_owned(be);
+                shared.stop_backend_owned(be, delivery);
                 return MailboxDrain::Terminal;
+            }
+            Some(Event::ShutdownError { error }) => shared.record_backend_cleanup(error),
+            Some(Event::AudioLoss { loss }) => {
+                if matches!(
+                    loss.path(),
+                    flexaudio_core::AudioPath::Capture { .. }
+                        | flexaudio_core::AudioPath::MixFifo { .. }
+                ) {
+                    // Reuse intake's pending discontinuity fan-out for capture-side
+                    // losses reported by a backend, including either Mix lane.
+                    shared.discontinuity_pending.store(true, Ordering::SeqCst);
+                }
+                shared.push_event(Event::AudioLoss { loss });
             }
             Some(event) => shared.push_event(event),
             None => return MailboxDrain::Empty,
@@ -174,14 +187,13 @@ fn drain_backend_events_locked(
     MailboxDrain::BudgetExhausted
 }
 
-fn drain_final_backend_events(
+pub(super) fn drain_final_backend_events(
     shared: &SharedState,
     be: &mut Box<dyn CaptureBackend>,
     delivery: &MutexGuard<'_, ()>,
 ) {
     for _ in 0..MAX_FINAL_EVENT_BATCHES {
-        if drain_backend_events_locked(shared, be, Some(delivery)) != MailboxDrain::BudgetExhausted
-        {
+        if drain_backend_events_locked(shared, be, Some(delivery)) == MailboxDrain::Empty {
             return;
         }
     }
@@ -189,7 +201,7 @@ fn drain_final_backend_events(
         Error::Backend("backend event mailbox could not be reconciled; capture terminated before delivering buffered audio".into()),
         delivery,
     );
-    shared.stop_backend_owned(be);
+    shared.stop_backend_owned(be, Some(delivery));
 }
 
 /// One shutdown path for explicit stop, source replacement, and recovery.
@@ -202,8 +214,7 @@ pub(super) fn stop_backend_reconciling(
 ) {
     let delivery = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
     drain_final_backend_events(shared, be, &delivery);
-    shared.stop_backend_owned(be);
-    drain_final_backend_events(shared, be, &delivery);
+    shared.stop_backend_owned(be, Some(&delivery));
     if stop_intake {
         shared.begin_stopping(&delivery);
     }

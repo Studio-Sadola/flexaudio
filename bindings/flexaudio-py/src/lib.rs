@@ -139,7 +139,9 @@ pub(crate) fn bool_repr(b: bool) -> &'static str {
 // Module functions
 // ---------------------------------------------------------------------------
 
-/// List available devices. An empty list is valid in a headless environment.
+/// List the complete device inventory. An empty complete inventory is valid.
+/// Incomplete or failed discovery raises a typed exception, including when the
+/// PipeWire daemon is unreachable on Linux.
 #[pyfunction]
 fn devices() -> PyResult<Vec<marshal::PyDeviceInfo>> {
     let list = fa::devices().map_err(to_py_err)?;

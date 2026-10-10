@@ -138,7 +138,8 @@ pub struct FlexWatcher {
 /// Start monitoring device connection and default changes, then return a watcher handle.
 ///
 /// On Linux, continuously monitor the PipeWire registry. Startup failure returns NULL
-/// with last_error. Unsupported operating systems return a valid no-op handle. Release it with
+/// with `flexaudio_last_error` and typed `flexaudio_last_error_info_v2`, rather than
+/// a no-op handle. Unsupported operating systems return a valid no-op handle. Release it with
 /// `flexaudio_watcher_free`.
 #[no_mangle]
 pub extern "C" fn flexaudio_watch_devices() -> *mut FlexWatcher {

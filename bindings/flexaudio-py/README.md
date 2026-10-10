@@ -16,7 +16,7 @@ pip install flexaudio
 import flexaudio
 import numpy as np
 
-# List a complete device inventory (query failures raise typed exceptions).
+# List a complete device inventory (incomplete or failed discovery raises typed exceptions).
 for d in flexaudio.devices():
     print(d.id, d.name, d.source_kind, d.is_default)
 
@@ -33,6 +33,9 @@ with flexaudio.open("mic") as stream:
         print(event.type, event.count, event.message)
 # leaving the `with` block stops the stream
 ```
+
+Incomplete or failed device discovery raises a typed exception, including when
+Linux has no reachable PipeWire daemon. Watcher startup failure also raises.
 
 ### Sources
 
@@ -69,6 +72,7 @@ add-ons `vad` and `denoise` (see below).
 
 `Stream.switch_source(...)` hot-swaps the input source without stopping the
 stream. `pause()` / `resume()` / `is_paused()` control delivery.
+`stop()` spends the stream; open a new stream to capture again.
 `Stream.native_format()` returns the source's native `(sample_rate, channels)`
 and `Stream.dropped_chunks()` returns the cumulative number of dropped chunks.
 

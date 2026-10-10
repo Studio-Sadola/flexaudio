@@ -309,7 +309,7 @@ impl PyStreamEvent {
     fn __repr__(&self) -> String {
         format!("StreamEvent(type={:?})", self.kind)
     }
-    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    pub(crate) fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
         d.set_item("type", &self.kind)?;
         if let Some(permission) = &self.permission {

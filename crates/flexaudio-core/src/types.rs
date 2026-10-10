@@ -391,11 +391,10 @@ pub struct StreamConfig {
     /// exclusion is active, such a stream is never captured until its application
     /// PID is known.
     ///
-    /// On macOS, each listed PID with a Core Audio process object at capture start
-    /// is excluded. This is a start-time snapshot: a PID with no audio object at
-    /// start is not excluded. If lookup of a requested PID fails, start fails
-    /// unless that process is confirmed to have exited. PIDs must be in
-    /// `1..=i32::MAX`.
+    /// On macOS, listed PIDs are resolved to Core Audio process objects once at
+    /// capture start (a snapshot). Unresolved exclusions fail closed, including
+    /// live processes without an audio object. Only a process confirmed gone
+    /// (`ESRCH`) is omitted. PIDs must be in `1..=i32::MAX`.
     ///
     /// On Windows, WASAPI excludes one process tree per capture. The root is this
     /// process when `exclude_self` is true, otherwise the first listed PID. Any

@@ -525,6 +525,7 @@ export declare class FlexStream {
    * inside `onChunk` does not freeze JS because joining happens off the JS thread.
    * Rejects with AudioException on capture or cleanup failure. Capture failure suppresses
    * further PCM and the normal terminator. Cleanup-only failure preserves valid graceful output.
+   * The stopped stream is spent; call openStream to capture again.
    */
   stop(): Promise<void>
   /** Stored terminal failure, including after stop; does not consume onEvent. */

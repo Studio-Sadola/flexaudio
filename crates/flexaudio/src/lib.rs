@@ -36,13 +36,14 @@ pub use flexaudio_core::types::{
 /// - Microphone input ([`core::SourceKind::Mic`], `is_loopback = false`) via
 ///   [`flexaudio_mic::list_devices`] (cpal, all OSes).
 /// - System audio output ([`core::SourceKind::SystemLoopback`], `is_loopback = true`) via
-///   OS-specific backends (Linux: PipeWire Audio/Sink. PipeWire also lists Audio/Source
-///   (microphones) on Linux, so these may duplicate cpal entries. Windows/macOS: output
+///   OS-specific backends (Linux: PipeWire Audio/Sink; Windows/macOS: output
 ///   endpoint enumeration). Use a returned `id` with `--source system --device-id <ID>` to
 ///   select that output.
 ///
 /// Each [`DeviceInfo`] uses the most stable available key for `id` (cpal=device name /
 /// PipeWire=`node.name`). The OS default device has `is_default` set.
+/// Linux microphones use only cpal IDs, which the microphone backend can resolve.
+/// PipeWire Audio/Source IDs are omitted because they cannot select a cpal input.
 ///
 /// Success means a complete authoritative inventory across every provider.
 /// A confirmed empty inventory is valid; query failure returns Err, even if another
@@ -51,26 +52,27 @@ pub fn devices() -> Result<Vec<DeviceInfo>> {
     // Microphone input (cpal) is common to all OSes. Linux extends this with PipeWire devices,
     // so mut is needed there; other OSes do not extend it. The allow handles this difference.
     #[allow(unused_mut)]
-    let mut all = flexaudio_mic::list_devices()
-        .map_err(|error| error.with_context(ErrorContext::new(Operation::Enumerate)))?;
+    // Each provider owns its Enumerate context; preserve native context without wrapping twice.
+    let mut all = flexaudio_mic::list_devices()?;
 
     // System output endpoints are OS-specific.
     #[cfg(target_os = "linux")]
     {
-        let linux = flexaudio_os_linux::list_devices()
-            .map_err(|error| error.with_context(ErrorContext::new(Operation::Enumerate)))?;
-        all.extend(linux);
+        let linux = flexaudio_os_linux::list_devices()?;
+        all.extend(
+            linux
+                .into_iter()
+                .filter(|device| device.source_kind == SourceKind::SystemLoopback),
+        );
     }
     #[cfg(target_os = "windows")]
     {
-        let win = flexaudio_os_windows::list_output_devices()
-            .map_err(|error| error.with_context(ErrorContext::new(Operation::Enumerate)))?;
+        let win = flexaudio_os_windows::list_output_devices()?;
         all.extend(win);
     }
     #[cfg(target_os = "macos")]
     {
-        let mac = flexaudio_os_macos::list_output_devices()
-            .map_err(|error| error.with_context(ErrorContext::new(Operation::Enumerate)))?;
+        let mac = flexaudio_os_macos::list_output_devices()?;
         all.extend(mac);
     }
 

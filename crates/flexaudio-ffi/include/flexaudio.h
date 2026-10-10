@@ -552,7 +552,8 @@ struct FlexStream *flexaudio_open_with_exclude_pids(const struct FlexConfig *con
 // `s` must be a handle returned by `flexaudio_open` (or NULL). Do not use `s` after freeing it.
 void flexaudio_free(struct FlexStream *s);
 
-// Start capture.
+// Start capture. Repeated calls while running succeed without starting again.
+// After stop, the stream is spent: start returns FLEX_INVALID_STATE; open a new stream.
 //
 // # Safety
 // `s` must be a valid handle (NULL is InvalidArg).
@@ -710,8 +711,11 @@ int32_t flexaudio_terminal_error(const struct FlexStream *s);
 
 // List available devices, allocate an array, and set `out_array` / `out_count`.
 //
-// Return 0 on success. Free the allocated array with `flexaudio_devices_free`. In a headless
-// environment, an empty result (`out_array=NULL` / `out_count=0`) is still successful.
+// Return 0 only for complete discovery. An empty complete inventory sets
+// `out_array=NULL` / `out_count=0`. Incomplete or failed discovery (including an
+// unreachable PipeWire daemon on Linux) returns a typed error code and sets
+// `flexaudio_last_error` / `flexaudio_last_error_info_v2`; it is not an empty success.
+// Free the allocated array with `flexaudio_devices_free`.
 //
 // # Safety
 // `out_array` / `out_count` must be valid output pointers (NULL is InvalidArg).
@@ -1089,7 +1093,8 @@ void flexaudio_vad_free(struct FlexVad *v);
 // Start monitoring device connection and default changes, then return a watcher handle.
 //
 // On Linux, continuously monitor the PipeWire registry. Startup failure returns NULL
-// with last_error. Unsupported operating systems return a valid no-op handle. Release it with
+// with `flexaudio_last_error` and typed `flexaudio_last_error_info_v2`, rather than
+// a no-op handle. Unsupported operating systems return a valid no-op handle. Release it with
 // `flexaudio_watcher_free`.
 struct FlexWatcher *flexaudio_watch_devices(void);
 

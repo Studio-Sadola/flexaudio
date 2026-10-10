@@ -101,6 +101,46 @@ mod capture_owner {
 }
 // LIVE_ADAPTER
 
+// Exercise the live facade aggregation with silent providers. PipeWire DeviceInfo
+// construction and error wrapping are extracted from the Linux adapter unchanged.
+mod facade {
+    use flexaudio_core::{DeviceInfo, Error, ErrorContext, Operation, Result, SourceKind};
+    mod flexaudio_mic {
+        pub fn list_devices() -> flexaudio_core::Result<Vec<flexaudio_core::DeviceInfo>> {
+            crate::list_devices()
+        }
+    }
+    pub mod flexaudio_os_linux {
+        use super::*;
+        use std::cell::Cell;
+        thread_local! { pub static FAIL_QUERY: Cell<bool> = const { Cell::new(false) }; }
+        struct NodeRecord {
+            media_class: String, node_name: String, description: String,
+            rate: Option<u32>, channels: Option<u16>,
+        }
+        struct EnumState {
+            nodes: Vec<NodeRecord>, default_sink: Option<String>, default_source: Option<String>,
+        }
+        fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
+            if FAIL_QUERY.get() { return Err("PipeWire discovery could not connect to the daemon".into()); }
+            let state = EnumState {
+                nodes: vec![
+                    NodeRecord { media_class: "Audio/Source".into(), node_name: "alsa_input.card0".into(), description: "USB microphone".into(), rate: Some(48_000), channels: Some(1) },
+                    NodeRecord { media_class: "Audio/Sink".into(), node_name: "alsa_output.card0".into(), description: "Speakers".into(), rate: Some(48_000), channels: Some(2) },
+                ],
+                default_sink: Some("alsa_output.card0".into()), default_source: Some("alsa_input.card0".into()),
+            };
+            let mut out = Vec::new();
+            const NATIVE_RATE: u32 = 48_000;
+            const NATIVE_CHANNELS: u16 = 2;
+            // LIVE_PIPEWIRE_DEVICE_INFO
+            Ok(out)
+        }
+        // LIVE_PIPEWIRE_LIST_DEVICES
+    }
+    // LIVE_FACADE_DEVICES
+}
+
 fn device(key: u32, name: &str) -> cpal::Device {
     cpal::Device { key, name: Ok(name.into()), config: Ok(cpal::SupportedStreamConfig { sample_rate: cpal::SampleRate(48_000), channels: 1 }) }
 }
@@ -283,18 +323,43 @@ fn failed_start_preserves_primary_join_cause_and_previous_shutdown_result() {
     }
 }
 #[test]
-#[ignore = "repro: NEW Linux mic identity"]
 fn repro_p5_pipewire_mic_identity() {
-    // The Linux live DeviceInfo construction is separately checked by
-    // repro_p7_mic_identity_control. Facade routes Mic IDs to this resolver.
+    // Retain the original mismatch: CPAL knows the name, while PipeWire knows
+    // node.name. Only IDs usable by the mic backend may enter the facade inventory.
     host(vec![device(1, "USB microphone")], None);
-    let result = resolve_input_device(&cpal::default_host(), Some("alsa_input.card0"));
-    assert!(result.is_ok(), "NEW mic identity: advertised PipeWire node.name ID returned {result:?} from CPAL name resolver");
+    let native = facade::flexaudio_os_linux::list_devices().unwrap();
+    assert!(native.iter().any(|d| d.source_kind == SourceKind::Mic && d.id == "alsa_input.card0"));
+    let advertised = facade::devices().unwrap();
+    let microphones: Vec<_> = advertised.iter().filter(|d| d.source_kind == SourceKind::Mic).collect();
+    assert_eq!(microphones.len(), 1, "PipeWire must not duplicate the cpal microphone");
+    for info in microphones {
+        let selected = resolve_input_device(&cpal::default_host(), Some(&info.id)).unwrap();
+        assert_eq!(selected.key, 1, "the advertised ID must select the requested microphone");
+        let (producer, _) = flexaudio_core::raw_ring(16);
+        assert!(build_stream(RawSink::new(producer, info.sample_rate, info.channels), Some(&info.id), Arc::new(AtomicBool::new(false)), Arc::new(callback_mailbox::CallbackMailbox::new(Arc::new(AtomicBool::new(false))))).is_ok());
+    }
+    assert!(advertised.iter().any(|d| d.source_kind == SourceKind::SystemLoopback && d.id == "alsa_output.card0"));
+    assert!(matches!(resolve_input_device(&cpal::default_host(), Some("alsa_input.card0")), Err(Error::DeviceNotFound)), "an unadvertised PipeWire ID must never select the default microphone");
 }
 #[test]
 fn repro_p5_pipewire_mic_identity_control() {
     host(vec![device(1, "USB microphone")], None);
     assert_eq!(resolve_input_device(&cpal::default_host(), Some("USB microphone")).unwrap().key, 1);
+}
+#[test]
+fn facade_discovery_failure_has_one_enumerate_context() {
+    // Both actual provider wrappers attach Enumerate. The facade must propagate
+    // them once and must reject partial success when the other provider succeeds.
+    for fail_pipewire in [false, true] {
+        host(vec![device(1, "USB microphone")], if fail_pipewire { None } else { Some("microphone discovery failed") });
+        facade::flexaudio_os_linux::FAIL_QUERY.set(fail_pipewire);
+        let error = facade::devices().unwrap_err();
+        assert_eq!(error.root().kind(), flexaudio_core::ErrorKind::Backend);
+        let Error::Context { source, context } = error else { panic!("missing Enumerate context") };
+        assert_eq!(context.operation(), Operation::Enumerate);
+        assert!(matches!(*source, Error::Backend(_)), "Enumerate must appear exactly once");
+    }
+    facade::flexaudio_os_linux::FAIL_QUERY.set(false);
 }
 #[test]
 fn repro_p5_callback_panic_attempt() {

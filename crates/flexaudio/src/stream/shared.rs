@@ -110,11 +110,21 @@ impl SharedState {
     }
 
     pub(super) fn record_cleanup(&self, error: Error) {
-        self.cleanup
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(error.clone());
+        let mut cleanup = self.cleanup.lock().unwrap_or_else(|e| e.into_inner());
+        if cleanup.contains(&error) {
+            return;
+        }
+        cleanup.push(error.clone());
+        drop(cleanup);
         self.push_event(Event::ShutdownError { error });
+    }
+
+    /// Returned stop failures and backend notices share one classification/publication path.
+    pub(super) fn record_backend_cleanup(&self, error: Error) {
+        if self.terminal.error().as_ref() == Some(&error) {
+            return;
+        }
+        self.record_cleanup(error.with_context(ErrorContext::new(Operation::Stop)));
     }
 
     pub(super) fn fail_terminal(&self, error: Error) {
@@ -122,10 +132,41 @@ impl SharedState {
         self.fail_terminal_locked(error, &delivery);
     }
 
-    pub(super) fn stop_backend_owned(&self, be: &mut Box<dyn CaptureBackend>) {
+    pub(super) fn stop_backend_owned(
+        &self,
+        be: &mut Box<dyn CaptureBackend>,
+        delivery: Option<&MutexGuard<'_, ()>>,
+    ) {
         if !self.backend_stopped.swap(true, Ordering::SeqCst) {
-            if let Err(error) = stop_backend_catching(be) {
-                self.record_cleanup(error);
+            // Runtime terminal handling has already closed delivery. Keep its
+            // delivery lock free during the owner's join, so polling and resume
+            // can observe the latched failure without waiting for native stop.
+            let result = stop_backend_catching(be);
+            let delivery_guard;
+            let delivery = match delivery {
+                Some(delivery) => delivery,
+                None => {
+                    delivery_guard = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
+                    &delivery_guard
+                }
+            };
+            // Mix may discover its primary during stop. Reconcile that terminal notice
+            // before classifying the returned report, so the primary is never cleanup.
+            control::drain_final_backend_events(self, be, delivery);
+            if let Err(error) = result {
+                // Remove only the context added by stop_backend_catching; backend
+                // contexts (including lane and native status) remain on each cause.
+                let error = match error {
+                    Error::Context { source, context }
+                        if context == ErrorContext::new(Operation::Stop) =>
+                    {
+                        *source
+                    }
+                    error => error,
+                };
+                for error in backend_failures(error) {
+                    self.record_backend_cleanup(error);
+                }
             }
         }
     }
@@ -162,5 +203,20 @@ impl SharedState {
                 error => Event::TerminalError { error },
             });
         }
+    }
+}
+
+/// A checked report may group the capture primary and several independent cleanups.
+fn backend_failures(error: Error) -> Vec<Error> {
+    match error {
+        Error::Multiple(group) => std::iter::once(group.primary())
+            .chain(group.secondary())
+            .flat_map(|error| backend_failures(error.clone()))
+            .collect(),
+        Error::Context { source, context } => backend_failures(*source)
+            .into_iter()
+            .map(|error| error.with_context(context))
+            .collect(),
+        error => vec![error],
     }
 }

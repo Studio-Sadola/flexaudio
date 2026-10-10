@@ -100,14 +100,19 @@ stream.stop();
 - `flexaudio::open(StreamConfig) -> Result<Stream>` — ソースと OS に応じてバックエンドを選び、
   まだ開始されていないキャプチャストリームを作成します。
 - `Stream::start` / `Stream::stop` — キャプチャを制御します。
+  `stop_checked()` はキャプチャと後片付けの失敗を返し、`shutdown_report()` は完了結果を保持します。
+  停止したストリームは再利用できません。再びキャプチャするには、新しいストリームを開いてください。
+  繰り返し停止しても、後片付けやイベントの通知は重複しません。
 - `Stream::poll_chunk` / `Stream::poll_event` — `AudioChunk` と `Event` を取り出します。
 - `Stream::terminal_error() -> Option<Error>` — 停止後も保持される終端エラーを確認します。
   `Stream::resume()` は `Result<()>` を返します。
 - `Stream::switch_source` — ストリームを停止せずに入力ソースを切り替えます。
   チャンクの `seq` は連続性を保ち、切り替え後の最初のチャンクには不連続を示すフラグが付きます。
-- `flexaudio::devices() -> Result<Vec<DeviceInfo>>` — マイク（cpal、全プラットフォーム）と
-  システム出力エンドポイント（Linux: PipeWire の sink と source、Windows: 有効な再生エンドポイント、
+- `flexaudio::devices() -> Result<Vec<DeviceInfo>>` — マイク（CPAL、全プラットフォーム）と
+  システム出力エンドポイント（Linux: PipeWire の sink、Windows: 有効な再生エンドポイント、
   macOS: 出力デバイス）を 1 つのリストに列挙します。
+  Linux のマイク ID は CPAL の ID です。PipeWire の Audio/Source ノードはマイクとして列挙しません。
+  不完全な列挙や列挙の失敗はエラーを返します。Linux で PipeWire デーモンへ接続できない場合も同様です。
 - `flexaudio::processes() -> Result<Vec<ProcessInfo>>` — Linux/Windows では音声出力のセッション／ストリームを持つプロセスを、
   macOS では入力のみのプロセスを含む Core Audio のプロセスを列挙します
   （[キャプチャ可能なプロセスの列挙](#listing-capturable-processes)を参照）。
@@ -115,7 +120,7 @@ stream.stop();
   プロセス単位のキャプチャには `pid` を `target_pid` として渡してください。
 - `flexaudio::watch_devices() -> Result<DeviceWatcher>` — デバイスの接続・取り外しに関する通知
   （追加／削除／デフォルトの変更）をポーリングで受け取れます。
-  Linux のみ対応し、Windows/macOS では何も行わないウォッチャーを返します。
+  Linux で開始に失敗するとエラーを返します。Windows/macOS では、現在は何も行わないウォッチャーを返します。
 - 再エクスポートされる型: `StreamConfig`, `SourceKind`, `ProcessMode`, `OutputFormat`,
   `AudioChunk`, `SecondaryChunk`, `ChunkFlags`, `DeviceInfo`, `ProcessInfo`,
   `DeviceEvent`, `Event`, `Permission`, `Error`, `Result`。
@@ -192,9 +197,10 @@ Windows のシステムキャプチャでは、`exclude_self` / `exclude_pids` �
   WASAPI のプロセスループバックは出力エンドポイントを指定できないため、
   除外が有効な間は、指定されたシステムデバイスを使用しません。
 - **macOS:** キャプチャ開始時に、PID を Core Audio のプロセスオブジェクトへ
-  1 回だけ解決します（スナップショット）。その時点で音声オブジェクトを持たないプロセスは
-  除外されません。新しい音声ヘルパーが現れた場合は、キャプチャを開き直してください。
-  プロセスが終了している場合を除き、検索の失敗はキャプチャの失敗になります。
+  1 回だけ解決します（スナップショット）。音声オブジェクトを持たない実行中のプロセスを含め、
+  除外対象を解決できない場合は、安全のためキャプチャを失敗させます。
+  終了が確認されたプロセス（`ESRCH`）だけを除外リストから省きます。
+  新しい音声ヘルパーが現れた場合は、キャプチャを開き直してください。
   PID は `1..=2147483647` に収まる必要があります。
   指定されたシステムデバイスは、除外と併せて使用されます。
 - **Linux:** 子孫を含めず、PID の完全一致で除外します。Pulse 経由のストリームでは

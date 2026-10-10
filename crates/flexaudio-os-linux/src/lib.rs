@@ -2084,6 +2084,8 @@ struct EnumState {
 ///   monitor); `is_loopback = true` / `source_kind = SystemLoopback`.
 /// - `media.class == "Audio/Source"` → recording devices such as microphones;
 ///   `is_loopback = false` / `source_kind = Mic`.
+///   These are PipeWire graph identities, not cpal device-name IDs. The flexaudio
+///   facade omits these entries and obtains its openable microphone IDs from cpal.
 ///
 /// Map these to [`DeviceInfo`]. `id` is the persistent `node.name`; `name` is `node.description`
 /// (or `node.name` if absent). `sample_rate` / `channels` use `audio.rate` / `audio.channels` if

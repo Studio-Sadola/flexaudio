@@ -50,7 +50,7 @@ impl Stream {
                 }
                 // Failed acquisition still owns anything the backend may have started.
                 // Quiesce it before draining its rejected-buffer summaries.
-                shared.stop_backend_owned(&mut be);
+                shared.stop_backend_owned(&mut be, None);
                 drain_unpublished_capture(shared, &consumer, &diagnostics, (rate, channels));
                 return Err(error);
             }
@@ -306,7 +306,7 @@ impl Stream {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     self.shared.fail_terminal(error.clone());
-                    self.shared.stop_backend_owned(&mut be);
+                    self.shared.stop_backend_owned(&mut be, None);
                 }
                 return Err(error);
             }

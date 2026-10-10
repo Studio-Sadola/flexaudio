@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 MIC = ROOT / "crates/flexaudio-mic/src/lib.rs"
 LINUX = ROOT / "crates/flexaudio-os-linux/src/lib.rs"
+FACADE = ROOT / "crates/flexaudio/src/lib.rs"
 
 
 def between(source, first, last):
@@ -33,8 +34,12 @@ def mic_source():
     # whose consent behavior is already covered by the repository's own tests.
     source = source.replace(between(source, "mod capture_owner;", "/// Fallback format"), "")
     config = clean((MIC.parent / "input_config.rs").read_text().split("#[cfg(test)]")[0])
+    devices = between(FACADE.read_text(), "pub fn devices()", "/// Start a [`DeviceWatcher`]")
+    device_info = between(LINUX.read_text(), "    for n in &state.nodes {", "    Ok(out)\n}")
+    linux_devices = between(LINUX.read_text(), "pub fn list_devices()", "/// PipeWire registry enumeration implementation")
     return (HERE / "mic_fixture.rs").read_text().replace("// LIVE_INPUT_CONFIG", config).replace(
-        "// LIVE_ADAPTER", clean(source))
+        "// LIVE_ADAPTER", clean(source)).replace("// LIVE_FACADE_DEVICES", devices).replace(
+        "// LIVE_PIPEWIRE_DEVICE_INFO", device_info).replace("// LIVE_PIPEWIRE_LIST_DEVICES", linux_devices)
 
 
 def linux_source():
@@ -83,7 +88,7 @@ def main():
     # cargo build's top-level rlibs identify the selected dependency versions.
     core = ROOT / "target/debug/libflexaudio_core.rlib"
     if not core.exists():
-        subprocess.run(["cargo", "build", *packages], cwd=ROOT, env=env, check=True)
+        subprocess.run(["cargo", "build", "--offline", *packages], cwd=ROOT, env=env, check=True)
     source = {"p5": mic_source, "p7": linux_source}[package]()
     with tempfile.TemporaryDirectory(prefix="fa-repro-") as folder:
         rust = Path(folder) / "fixture.rs"

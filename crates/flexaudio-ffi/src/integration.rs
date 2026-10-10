@@ -537,20 +537,20 @@ mod tests {
     fn denoise_requires_48k_output() {
         // Denoise enabled + non-48k → Err.
         let mut c = base_config();
-        c.denoise = true;
+        c.denoise = 1;
         c.output_rate = 16_000;
         assert!(build_addons(&c).is_err());
 
         // Denoise enabled + explicit 48k → Ok and creates Denoiser.
         let mut c48 = base_config();
-        c48.denoise = true;
+        c48.denoise = 1;
         c48.output_rate = 48_000;
         let (dn, _) = build_addons(&c48).expect("48k should succeed");
         assert!(dn.is_some());
 
         // Denoise enabled + default (output_rate=0 → 48000) → Ok.
         let mut cdef = base_config();
-        cdef.denoise = true;
+        cdef.denoise = 1;
         let (dn2, _) = build_addons(&cdef).expect("Default 48k should succeed");
         assert!(dn2.is_some());
     }

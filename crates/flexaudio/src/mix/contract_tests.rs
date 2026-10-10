@@ -120,6 +120,10 @@ fn fatal_lane(lane: MixLane) {
         stream.stop_checked().unwrap_err().kind(),
         ErrorKind::DeviceLost
     );
+    assert!(stream.shutdown_report().unwrap().cleanup().is_empty());
+    // terminal_error() reads the retained cause without consuming its one event.
+    assert_eq!(stream.poll_event(), Some(Event::TerminalError { error }));
+    assert!(stream.poll_event().is_none());
 }
 #[test]
 fn mic_fatal_stops_both_lanes_with_context() {
@@ -185,6 +189,40 @@ fn checked_shutdown_retains_both_child_errors_once() {
     assert!(mix.poll_event().is_none());
     assert_eq!(mic_stops.load(Ordering::SeqCst), 1);
     assert_eq!(system_stops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn facade_checked_shutdown_retains_both_child_errors_once() {
+    let mut mic = Child::new(vec![]);
+    mic.stop_error = true;
+    let mut system = Child::new(vec![]);
+    system.stop_error = true;
+    let mut stream = crate::Stream::open(
+        Default::default(),
+        Box::new(CompositeBackend::new(
+            Box::new(mic),
+            Box::new(system),
+            1.0,
+            1.0,
+        )),
+    )
+    .unwrap();
+    stream.start().unwrap();
+    let result = stream.stop_checked();
+    assert!(matches!(&result, Err(Error::Multiple(group)) if group.secondary().count() == 1));
+    assert_eq!(stream.stop_checked(), result);
+    let report = stream.shutdown_report().unwrap();
+    assert!(report.primary().is_none());
+    assert_eq!(report.cleanup().len(), 2);
+    let errors: Vec<_> = std::iter::from_fn(|| stream.poll_event())
+        .filter_map(|event| match event {
+            Event::ShutdownError { error } => Some(error),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors, report.cleanup());
+    assert_eq!(context_lane(&errors[0]), Some(MixLane::Microphone));
+    assert_eq!(context_lane(&errors[1]), Some(MixLane::SystemAudio));
 }
 
 #[test]

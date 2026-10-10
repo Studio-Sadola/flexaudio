@@ -143,7 +143,7 @@ pub unsafe extern "C" fn flexaudio_vad_flush(
 }
 
 /// Map addon failures by their typed variant; raw inference diagnostics stay private.
-fn vad_failure(error: flexaudio_vad::VadError) -> i32 {
+pub(crate) fn vad_failure(error: flexaudio_vad::VadError) -> i32 {
     use flexaudio_vad::VadError;
     let error = match error {
         VadError::InvalidFormat(message) | VadError::InvalidConfig(message) => {
