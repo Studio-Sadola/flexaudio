@@ -16,7 +16,7 @@ pip install flexaudio
 import flexaudio
 import numpy as np
 
-# List available devices (empty list on a headless machine, never raises).
+# List a complete device inventory (query failures raise typed exceptions).
 for d in flexaudio.devices():
     print(d.id, d.name, d.source_kind, d.is_default)
 
@@ -63,7 +63,8 @@ are `None` when the OS does not expose them. On Linux, `executable` is
 unreadable.
 
 Optional keyword arguments: `device_id`, `output_rate` (default 48000),
-`output_channels` (default 2), `chunk_ms` (default 20), plus the integrated
+`output_channels` (default 2), `chunk_ms` (only 20 is supported; other values
+raise `InvalidArgumentError`), plus the integrated
 add-ons `vad` and `denoise` (see below).
 
 `Stream.switch_source(...)` hot-swaps the input source without stopping the
@@ -105,7 +106,11 @@ Platform behavior:
 
 `open()` (and `switch_source()`) accept `denoise=True` and `vad={...}` to run
 noise suppression and voice-activity detection inside `poll_chunk()`. The
-processing order is denoise -> VAD.
+processing order is denoise -> VAD. `peak` and `rms` measure the final delivered
+float PCM after denoise and gain, before integer encoding. Graceful `stop()`
+queues the actual 480-frame (10 ms) denoiser tail and pending VAD boundaries;
+continue polling after stop to receive them. Repeated stop does not repeat tails.
+Capture terminal failure suppresses remaining PCM and audio tails.
 
 ```python
 with flexaudio.open("mic", denoise=True, vad={"threshold": 0.5}) as stream:
@@ -173,6 +178,41 @@ with flexaudio.watch_devices() as watcher:
     if ev is not None:
         print(ev.type, ev.id, ev.device, ev.source_kind)
 ```
+
+Linux watcher startup failure raises a typed exception; unsupported operating
+systems retain the no-op watcher. `stop()` retains queued device events for draining.
+`defaultCleared` means no default device exists. `rescanRequired` carries a
+cumulative `dropped_events` count: discard the incremental inventory and call
+`devices()` again. A failed query cannot make stale inventory authoritative.
+
+### Typed failures and events
+
+Core failures have distinct exception classes: `InvalidArgumentError` and
+`UnsupportedFormatError` inherit `ValueError`; `InvalidStateError`,
+`DeviceNotFoundError`, `RecordingPermissionError`, `UnsupportedOsVersionError`,
+`DeviceLostError`, `BackendError`, `NativeFormatChangedError`, `UnsupportedError`,
+and `AmbiguousDeviceNameError` inherit `RuntimeError`. Each exposes read-only
+`audio_error`, including `kind`, a safe `message`, outer-to-inner `contexts`,
+and ordered `secondary` failures. Native format changes retain `advertised`
+and `actual` format records; native call/status details are explicit structured
+access only. Existing Python argument extraction and addon exceptions keep their types.
+
+`StreamEvent.to_dict()` and `DeviceEvent.to_dict()` produce closed variant records
+with the same type tags as JavaScript and snake_case field names. Typed terminal,
+recoverable, and shutdown events carry `error`; `audioLoss` carries `loss` with
+path, reason, optional positive scalar-interleaved sample count, rate, and channels.
+`None` counts mean unknown. `clipped` is a coalesced upstream Mix advisory without
+exact chunk attribution; flags 8 (`PADDED`) and 16 (`CLIPPED`) instead describe
+that delivered chunk. Padding alone does not imply a gap.
+
+`permissionGranted` reports microphone consent once after `permissionPending`
+in the same live capture generation. It remains advisory and does not guarantee
+nonzero PCM. `error` and `terminalError` are terminal; `recoverableError` continues
+capture. `terminal_error()` retains the typed capture primary. `shutdown_report()`
+returns the final typed primary and ordered `cleanup_errors`, or `None` before
+shutdown. Checked `stop()` raises any capture or cleanup failure, including on
+repeat calls. During context exit an active body exception remains primary and
+receives the cleanup failure as its exception context.
 
 `samples` may be a Python `list`, an `array.array`, or a NumPy `ndarray`.
 

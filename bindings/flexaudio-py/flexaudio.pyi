@@ -1,7 +1,9 @@
 """Public API for the native flexaudio extension (Python 3.8 and later).
 
 Argument extraction can raise TypeError or OverflowError. Core invalid arguments
-and unsupported formats raise ValueError; other core errors raise RuntimeError.
+and unsupported formats raise distinct ValueError subclasses; other core errors
+raise distinct RuntimeError subclasses. Their read-only audio_error preserves
+root kinds, contexts, related errors and native format records.
 VAD construction raises ValueError for invalid settings and RuntimeError for
 model/inference failures. Denoiser construction/process raise ValueError for
 invalid channel counts/sample lengths. FLAC operations raise ValueError for
@@ -22,9 +24,233 @@ from typing import List, Literal, Optional, Sequence, Tuple, TypedDict, Union
 
 StreamEventType = Literal[
     "chunkDropped", "stalled", "recovered", "permissionDenied", "permissionPending",
-    "silenceWhileSourceActive", "deviceLost", "error", "unknown"
+    "silenceWhileSourceActive", "deviceLost", "error", "terminalError",
+    "recoverableError", "shutdownError", "audioLoss", "clipped", "permissionGranted", "unknown"
 ]
 RecordingPermission = Literal["microphone", "systemAudio"]
+
+MixLane = Literal["microphone", "systemAudio"]
+
+class NativeFormatDict(TypedDict):
+    sample_rate: int
+    channels: int
+class HResultDict(TypedDict):
+    type: Literal["hresult"]
+    call: str
+    bits: int
+class OsStatusDict(TypedDict):
+    type: Literal["osStatus"]
+    call: str
+    value: int
+NativeStatus = Union[HResultDict, OsStatusDict]
+class ErrorContextDict(TypedDict):
+    operation: Literal["enumerate", "start", "normalize", "flush", "reopen", "rollback", "stop", "join", "link"]
+    lane: Optional[MixLane]
+    native_status: Optional[NativeStatus]
+class _AudioErrorFields(TypedDict):
+    message: str
+    contexts: List[ErrorContextDict]
+    secondary: List["AudioErrorDict"]
+class InvalidArgumentErrorDict(_AudioErrorFields):
+    kind: Literal["invalidArg"]
+class InvalidStateErrorDict(_AudioErrorFields):
+    kind: Literal["invalidState"]
+class DeviceNotFoundErrorDict(_AudioErrorFields):
+    kind: Literal["deviceNotFound"]
+class RecordingPermissionErrorDict(_AudioErrorFields):
+    kind: Literal["permissionDenied"]
+    permission: RecordingPermission
+class UnsupportedOsVersionErrorDict(_AudioErrorFields):
+    kind: Literal["unsupportedOsVersion"]
+class DeviceLostErrorDict(_AudioErrorFields):
+    kind: Literal["deviceLost"]
+class BackendErrorDict(_AudioErrorFields):
+    kind: Literal["backend"]
+class UnsupportedFormatErrorDict(_AudioErrorFields):
+    kind: Literal["unsupportedFormat"]
+class NativeFormatChangedErrorDict(_AudioErrorFields):
+    kind: Literal["nativeFormatChanged"]
+    advertised: NativeFormatDict
+    actual: NativeFormatDict
+class UnsupportedErrorDict(_AudioErrorFields):
+    kind: Literal["unsupported"]
+class AmbiguousDeviceNameErrorDict(_AudioErrorFields):
+    kind: Literal["ambiguousDeviceName"]
+AudioErrorDict = Union[InvalidArgumentErrorDict, InvalidStateErrorDict, DeviceNotFoundErrorDict, RecordingPermissionErrorDict, UnsupportedOsVersionErrorDict, DeviceLostErrorDict, BackendErrorDict, UnsupportedFormatErrorDict, NativeFormatChangedErrorDict, UnsupportedErrorDict, AmbiguousDeviceNameErrorDict]
+
+class NativeFormat:
+    @property
+    def sample_rate(self) -> int: ...
+    @property
+    def channels(self) -> int: ...
+    def to_dict(self) -> NativeFormatDict: ...
+class ErrorContext:
+    @property
+    def operation(self) -> Literal["enumerate", "start", "normalize", "flush", "reopen", "rollback", "stop", "join", "link"]: ...
+    @property
+    def lane(self) -> Optional[MixLane]: ...
+    @property
+    def native_status(self) -> Optional[NativeStatus]: ...
+    def to_dict(self) -> ErrorContextDict: ...
+class AudioError:
+    @property
+    def kind(self) -> Literal["invalidArg", "invalidState", "deviceNotFound", "permissionDenied", "unsupportedOsVersion", "deviceLost", "backend", "unsupportedFormat", "nativeFormatChanged", "unsupported", "ambiguousDeviceName"]: ...
+    @property
+    def message(self) -> str: ...
+    @property
+    def contexts(self) -> List[ErrorContext]: ...
+    @property
+    def secondary(self) -> List[AudioError]: ...
+    @property
+    def permission(self) -> Optional[RecordingPermission]: ...
+    @property
+    def advertised(self) -> Optional[NativeFormat]: ...
+    @property
+    def actual(self) -> Optional[NativeFormat]: ...
+    def to_dict(self) -> AudioErrorDict: ...
+class InvalidArgumentError(ValueError):
+    @property
+    def audio_error(self) -> AudioError: ...
+class UnsupportedFormatError(ValueError):
+    @property
+    def audio_error(self) -> AudioError: ...
+class InvalidStateError(RuntimeError):
+    @property
+    def audio_error(self) -> AudioError: ...
+class DeviceNotFoundError(RuntimeError):
+    @property
+    def audio_error(self) -> AudioError: ...
+class RecordingPermissionError(RuntimeError):
+    @property
+    def audio_error(self) -> AudioError: ...
+class UnsupportedOsVersionError(RuntimeError):
+    @property
+    def audio_error(self) -> AudioError: ...
+class DeviceLostError(RuntimeError):
+    @property
+    def audio_error(self) -> AudioError: ...
+class BackendError(RuntimeError):
+    @property
+    def audio_error(self) -> AudioError: ...
+class NativeFormatChangedError(RuntimeError):
+    @property
+    def audio_error(self) -> AudioError: ...
+class UnsupportedError(RuntimeError):
+    @property
+    def audio_error(self) -> AudioError: ...
+class AmbiguousDeviceNameError(RuntimeError):
+    @property
+    def audio_error(self) -> AudioError: ...
+
+class CapturePathDict(TypedDict):
+    type: Literal["capture"]
+    lane: Optional[MixLane]
+class MixFifoPathDict(TypedDict):
+    type: Literal["mixFifo"]
+    lane: MixLane
+class OutputPathDict(TypedDict):
+    type: Literal["output"]
+    tap: Literal["primary", "secondary"]
+AudioPath = Union[CapturePathDict, MixFifoPathDict, OutputPathDict]
+LossReason = Literal["rawOverflow", "mixFifoOverflow", "corruptBuffer", "malformedBuffer", "callbackRejected", "outputOverflow"]
+class AudioLossDict(TypedDict):
+    path: AudioPath
+    reason: LossReason
+    samples: Optional[int]
+    sample_rate: int
+    channels: int
+class AudioLoss:
+    @property
+    def path(self) -> AudioPath: ...
+    @property
+    def reason(self) -> LossReason: ...
+    @property
+    def samples(self) -> Optional[int]: ...
+    @property
+    def sample_rate(self) -> int: ...
+    @property
+    def channels(self) -> int: ...
+    def to_dict(self) -> AudioLossDict: ...
+class ShutdownReportDict(TypedDict):
+    primary: Optional[AudioErrorDict]
+    cleanup_errors: List[AudioErrorDict]
+class ShutdownReport:
+    @property
+    def primary(self) -> Optional[AudioError]: ...
+    @property
+    def cleanup_errors(self) -> List[AudioError]: ...
+    def to_dict(self) -> ShutdownReportDict: ...
+
+class ChunkDroppedEventDict(TypedDict):
+    type: Literal["chunkDropped"]
+    count: int
+class StalledEventDict(TypedDict):
+    type: Literal["stalled"]
+class RecoveredEventDict(TypedDict):
+    type: Literal["recovered"]
+class PermissionDeniedEventDict(TypedDict):
+    type: Literal["permissionDenied"]
+    permission: RecordingPermission
+    message: str
+class PermissionPendingEventDict(TypedDict):
+    type: Literal["permissionPending"]
+    permission: RecordingPermission
+    message: str
+class PermissionGrantedEventDict(TypedDict):
+    type: Literal["permissionGranted"]
+    permission: Literal["microphone"]
+class SilenceWhileSourceActiveEventDict(TypedDict):
+    type: Literal["silenceWhileSourceActive"]
+    message: str
+class DeviceLostEventDict(TypedDict):
+    type: Literal["deviceLost"]
+class LegacyErrorEventDict(TypedDict):
+    type: Literal["error"]
+    message: str
+class TerminalErrorEventDict(TypedDict):
+    type: Literal["terminalError"]
+    error: AudioErrorDict
+class RecoverableErrorEventDict(TypedDict):
+    type: Literal["recoverableError"]
+    error: AudioErrorDict
+class ShutdownErrorEventDict(TypedDict):
+    type: Literal["shutdownError"]
+    error: AudioErrorDict
+class AudioLossEventDict(TypedDict):
+    type: Literal["audioLoss"]
+    loss: AudioLossDict
+class ClippedEventDict(TypedDict):
+    type: Literal["clipped"]
+class UnknownEventDict(TypedDict):
+    type: Literal["unknown"]
+    message: str
+StreamEventDict = Union[ChunkDroppedEventDict, StalledEventDict, RecoveredEventDict, PermissionDeniedEventDict, PermissionPendingEventDict, PermissionGrantedEventDict, SilenceWhileSourceActiveEventDict, DeviceLostEventDict, LegacyErrorEventDict, TerminalErrorEventDict, RecoverableErrorEventDict, ShutdownErrorEventDict, AudioLossEventDict, ClippedEventDict, UnknownEventDict]
+
+class DeviceInfoDict(TypedDict):
+    id: str
+    name: str
+    source_kind: Literal["mic", "system", "process", "mix"]
+    sample_rate: int
+    channels: int
+    is_loopback: bool
+    is_default: bool
+class DeviceAddedEventDict(TypedDict):
+    type: Literal["added"]
+    device: DeviceInfoDict
+class DeviceRemovedEventDict(TypedDict):
+    type: Literal["removed"]
+    id: str
+class DefaultChangedEventDict(TypedDict):
+    type: Literal["defaultChanged"]
+    source_kind: Literal["mic", "system"]
+    id: str
+class DefaultClearedEventDict(TypedDict):
+    type: Literal["defaultCleared"]
+    source_kind: Literal["mic", "system"]
+class RescanRequiredEventDict(TypedDict):
+    type: Literal["rescanRequired"]
+    dropped_events: int
+DeviceEventDict = Union[DeviceAddedEventDict, DeviceRemovedEventDict, DefaultChangedEventDict, DefaultClearedEventDict, RescanRequiredEventDict, UnknownEventDict]
 
 class VadSettings(TypedDict, total=False):
     threshold: float
@@ -105,7 +331,9 @@ class StreamEvent:
     and carries permission and a cause/remedy message. silenceWhileSourceActive
     means the system-audio diagnosis is inconclusive; capture continues because
     missing permission and genuine digital silence remain possible. error carries
-    a message and may represent a terminal backend failure; consult terminal_error.
+    a safe message and is terminal. terminalError preserves the typed capture failure;
+    recoverableError is advisory, while shutdownError reports cleanup failure.
+    permissionGranted reports late microphone consent following Pending.
 
     On macOS, system/process capture can confirm SystemAudio denial with an active
     self-probe after sustained exact zeros and eligible external output activity.
@@ -122,6 +350,11 @@ class StreamEvent:
     def count(self) -> Optional[int]: ...
     @property
     def message(self) -> Optional[str]: ...
+    @property
+    def error(self) -> Optional[AudioError]: ...
+    @property
+    def loss(self) -> Optional[AudioLoss]: ...
+    def to_dict(self) -> StreamEventDict: ...
 
 class DeviceEvent:
     def __repr__(self) -> str: ...
@@ -132,10 +365,16 @@ class DeviceEvent:
     @property
     def id(self) -> Optional[str]: ...
     @property
-    def source_kind(self) -> Optional[str]: ...
+    def source_kind(self) -> Optional[Literal["mic", "system"]]: ...
+    @property
+    def dropped_events(self) -> Optional[int]: ...
+    @property
+    def message(self) -> Optional[str]: ...
+    def to_dict(self) -> DeviceEventDict: ...
 
 class Stream:
     def stop(self) -> None: ...
+    def shutdown_report(self) -> Optional[ShutdownReport]: ...
     def flush_whisper_vad(self) -> None: ...
     def pause(self) -> None: ...
     def resume(self) -> None: ...
@@ -157,7 +396,7 @@ class Stream:
         """
         ...
     def poll_event(self) -> Optional[StreamEvent]: ...
-    def terminal_error(self) -> Optional[StreamEvent]:
+    def terminal_error(self) -> Optional[AudioError]:
         """Retained terminal failure, including after stop; does not consume events.
 
         poll_chunk, resume and switch_source raise RuntimeError once terminal.

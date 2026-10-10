@@ -88,32 +88,67 @@ pub(crate) fn resolve_output(config: &FlexConfig) -> OutputFormat {
     }
 }
 
-/// Convert `FlexSourceKind` to [`SourceKind`].
-fn source_kind_from_c(kind: FlexSourceKind) -> SourceKind {
+/// Validate a raw source code without constructing an invalid Rust enum.
+pub(crate) fn source_kind_from_c(kind: i32) -> Result<SourceKind, ()> {
     match kind {
-        FlexSourceKind::Mic => SourceKind::Mic,
-        FlexSourceKind::System => SourceKind::SystemLoopback,
-        FlexSourceKind::Process => SourceKind::ProcessLoopback,
-        FlexSourceKind::Mix => SourceKind::Mix,
+        0 => Ok(SourceKind::Mic),
+        1 => Ok(SourceKind::SystemLoopback),
+        2 => Ok(SourceKind::ProcessLoopback),
+        3 => Ok(SourceKind::Mix),
+        _ => invalid_config("source kind must be 0..=3"),
     }
 }
 
-/// Convert [`SourceKind`] to `FlexSourceKind`.
-pub(crate) fn source_kind_to_c(kind: SourceKind) -> FlexSourceKind {
+/// Convert a trusted source kind to its fixed-width C code.
+pub(crate) fn source_kind_to_c(kind: SourceKind) -> i32 {
     match kind {
-        SourceKind::Mic => FlexSourceKind::Mic,
-        SourceKind::SystemLoopback => FlexSourceKind::System,
-        SourceKind::ProcessLoopback => FlexSourceKind::Process,
-        SourceKind::Mix => FlexSourceKind::Mix,
+        SourceKind::Mic => FlexSourceKind::Mic as i32,
+        SourceKind::SystemLoopback => FlexSourceKind::System as i32,
+        SourceKind::ProcessLoopback => FlexSourceKind::Process as i32,
+        SourceKind::Mix => FlexSourceKind::Mix as i32,
     }
 }
 
-/// Convert `FlexProcessMode` to [`ProcessMode`].
-fn process_mode_from_c(mode: FlexProcessMode) -> ProcessMode {
+fn process_mode_from_c(mode: i32) -> Result<ProcessMode, ()> {
     match mode {
-        FlexProcessMode::Include => ProcessMode::Include,
-        FlexProcessMode::Exclude => ProcessMode::Exclude,
+        value if value == FlexProcessMode::Include as i32 => Ok(ProcessMode::Include),
+        value if value == FlexProcessMode::Exclude as i32 => Ok(ProcessMode::Exclude),
+        _ => invalid_config("process mode must be 0 or 1"),
     }
+}
+
+fn invalid_config<T>(message: &str) -> Result<T, ()> {
+    crate::error::set_audio_error(flexaudio::Error::InvalidArg(message.into()));
+    Err(())
+}
+
+/// Validate all raw discriminants, including fields ignored by a source kind.
+pub(crate) fn validate_config(config: &FlexConfig) -> Result<(), ()> {
+    source_kind_from_c(config.kind)?;
+    process_mode_from_c(config.mode)?;
+    for (field, value) in [
+        ("exclude_self", config.exclude_self),
+        ("denoise", config.denoise),
+        ("has_vad", config.has_vad),
+    ] {
+        if value > 1 {
+            return invalid_config(&format!("{field} must be 0 or 1"));
+        }
+    }
+    if config.chunk_ms != 0 && config.chunk_ms != DEFAULT_CHUNK_MS {
+        return invalid_config("chunk_ms must be 20 (or 0 for the default)");
+    }
+    Ok(())
+}
+
+/// Check structural pointer constraints before forming a Rust reference.
+pub(crate) fn valid_pointer<T>(pointer: *const T) -> bool {
+    !pointer.is_null() && pointer.is_aligned()
+}
+
+/// Check the slice size and structural pointer constraints before dereferencing.
+pub(crate) fn valid_array<T>(pointer: *const T, len: usize) -> bool {
+    len <= (isize::MAX as usize) / std::mem::size_of::<T>() && (len == 0 || valid_pointer(pointer))
 }
 
 /// Convert a NUL-terminated C string to `Option<String>`. NULL becomes `None`.
@@ -131,7 +166,9 @@ unsafe fn opt_string_from_c(ptr: *const c_char, field: &str) -> Result<Option<St
     match CStr::from_ptr(ptr).to_str() {
         Ok(s) => Ok(Some(s.to_string())),
         Err(_) => {
-            set_last_error(format!("{field} is not valid UTF-8"));
+            crate::error::set_audio_error(flexaudio::Error::InvalidArg(format!(
+                "{field} is not valid UTF-8"
+            )));
             Err(())
         }
     }
@@ -160,6 +197,7 @@ pub unsafe fn build_config(
     config: &FlexConfig,
     exclude_pids: Vec<u32>,
 ) -> Result<StreamConfig, ()> {
+    validate_config(config)?;
     let device_id = opt_string_from_c(config.device_id, "device_id")?;
     let mix_mic_device_id = opt_string_from_c(config.mix_mic_device_id, "mix_mic_device_id")?;
     let mix_system_device_id =
@@ -168,7 +206,7 @@ pub unsafe fn build_config(
     let output = resolve_output(config);
 
     Ok(StreamConfig {
-        kind: source_kind_from_c(config.kind),
+        kind: source_kind_from_c(config.kind)?,
         device_id,
         // process_id 0 is a sentinel meaning "none".
         target_pid: if config.process_id == 0 {
@@ -177,8 +215,8 @@ pub unsafe fn build_config(
             Some(config.process_id)
         },
         // mode is process-only; exclude_self is system-only. The facade handles them separately.
-        mode: process_mode_from_c(config.mode),
-        exclude_self: config.exclude_self,
+        mode: process_mode_from_c(config.mode)?,
+        exclude_self: config.exclude_self != 0,
         exclude_pids,
         chunk_ms: if config.chunk_ms == 0 {
             DEFAULT_CHUNK_MS
@@ -290,16 +328,24 @@ pub fn vad_config_from_c(c: &FlexVadConfig) -> VadConfig {
     }
 }
 
+/// Preserve the signed v1 range without wrapping exact u64 values negative.
+fn signed_position(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or_else(|_| {
+        set_last_error("v1 counter exceeds INT64_MAX; value saturated");
+        i64::MAX
+    })
+}
+
 /// Convert [`VadEvent`] to `FlexVadEvent` (start = 0 / end = 1).
 pub fn vad_event_to_c(ev: VadEvent) -> FlexVadEvent {
     match ev {
         VadEvent::SpeechStart { at_sample } => FlexVadEvent {
             kind: 0,
-            at_sample: at_sample as i64,
+            at_sample: signed_position(at_sample),
         },
         VadEvent::SpeechEnd { at_sample } => FlexVadEvent {
             kind: 1,
-            at_sample: at_sample as i64,
+            at_sample: signed_position(at_sample),
         },
     }
 }
@@ -324,7 +370,13 @@ pub fn vad_events_to_c(events: Vec<VadEvent>) -> (*mut FlexVadEvent, usize) {
 /// # Safety
 /// `ptr`/`len` must be values returned by `vad_events_to_c` (or NULL/0).
 pub unsafe fn free_vad_events(ptr: *mut FlexVadEvent, len: usize) {
-    if ptr.is_null() {
+    if ptr.is_null() && len == 0 {
+        return;
+    }
+    if !valid_array(ptr, len) || ptr.is_null() || len == 0 {
+        crate::error::set_audio_error(flexaudio::Error::InvalidArg(
+            "invalid VAD event array".into(),
+        ));
         return;
     }
     // FlexVadEvent is Copy and owns no heap data, so reconstructing and dropping the boxed
@@ -337,66 +389,78 @@ pub unsafe fn free_vad_events(ptr: *mut FlexVadEvent, len: usize) {
 /// carries only the kind and count).
 pub fn event_to_c(ev: Event) -> FlexEvent {
     match ev {
-        Event::TerminalError { error } => event_to_c(Event::Error(error.to_string())),
+        Event::TerminalError { error }
+        | Event::RecoverableError { error }
+        | Event::ShutdownError { error } => {
+            crate::error::set_audio_error(error);
+            FlexEvent {
+                kind: FlexEventKind::Error as i32,
+                count: 0,
+            }
+        }
         Event::ChunkDropped { count } => FlexEvent {
-            kind: FlexEventKind::ChunkDropped,
-            count: count as i64,
+            kind: FlexEventKind::ChunkDropped as i32,
+            count: signed_position(count),
         },
         Event::StreamStalled => FlexEvent {
-            kind: FlexEventKind::Stalled,
+            kind: FlexEventKind::Stalled as i32,
             count: 0,
         },
         Event::StreamRecovered => FlexEvent {
-            kind: FlexEventKind::Recovered,
+            kind: FlexEventKind::Recovered as i32,
             count: 0,
         },
-        Event::PermissionPending { detail, .. } => {
-            set_last_error(detail);
+        Event::PermissionPending { permission, .. } => {
+            set_last_error(format!(
+                "Recording permission is pending. {}",
+                permission.guidance()
+            ));
             FlexEvent {
-                kind: FlexEventKind::PermissionPending,
+                kind: FlexEventKind::PermissionPending as i32,
                 count: 0,
             }
         }
         Event::PermissionDenied { permission, detail } => {
-            set_last_error(flexaudio::Error::PermissionDenied { permission, detail }.to_string());
+            crate::error::set_audio_error(flexaudio::Error::PermissionDenied {
+                permission,
+                detail,
+            });
             FlexEvent {
-                kind: FlexEventKind::PermissionDenied,
+                kind: FlexEventKind::PermissionDenied as i32,
                 count: 0,
             }
         }
-        Event::SilenceWhileSourceActive { detail } => {
-            set_last_error(detail);
+        Event::SilenceWhileSourceActive { .. } => {
+            set_last_error("Capture is silent while the source is active; check recording permissions and source output");
             FlexEvent {
-                kind: FlexEventKind::SilenceWhileSourceActive,
+                kind: FlexEventKind::SilenceWhileSourceActive as i32,
                 count: 0,
             }
         }
         Event::DeviceLost => FlexEvent {
-            kind: FlexEventKind::DeviceLost,
+            kind: FlexEventKind::DeviceLost as i32,
             count: 0,
         },
-        Event::Error(msg) => {
-            set_last_error(msg);
+        Event::Error(_) => {
+            crate::error::set_audio_error(flexaudio::Error::Backend(
+                "legacy capture failure".into(),
+            ));
             FlexEvent {
-                kind: FlexEventKind::Error,
+                kind: FlexEventKind::Error as i32,
                 count: 0,
             }
         }
-        Event::RecoverableError { .. }
-        | Event::ShutdownError { .. }
-        | Event::AudioLoss { .. }
-        | Event::Clipped
-        | Event::PermissionGranted => {
-            set_last_error("unknown event: pending 0.5 binding support".to_string());
+        Event::AudioLoss { .. } | Event::Clipped | Event::PermissionGranted => {
+            // New advisory events have no representable v1 payload.
             FlexEvent {
-                kind: FlexEventKind::Unknown,
+                kind: FlexEventKind::Unknown as i32,
                 count: 0,
             }
         }
         _ => {
             set_last_error("unknown event".to_string());
             FlexEvent {
-                kind: FlexEventKind::Unknown,
+                kind: FlexEventKind::Unknown as i32,
                 count: 0,
             }
         }
@@ -430,7 +494,11 @@ pub fn device_info_to_c(info: DeviceInfo) -> FlexDeviceInfo {
 /// # Safety
 /// `arr`/`count` must be returned by `flexaudio_devices` (or NULL/0).
 pub unsafe fn free_device_array(arr: *mut FlexDeviceInfo, count: usize) {
-    if arr.is_null() {
+    if arr.is_null() && count == 0 {
+        return;
+    }
+    if !valid_array(arr, count) || arr.is_null() || count == 0 {
+        crate::error::set_audio_error(flexaudio::Error::InvalidArg("invalid device array".into()));
         return;
     }
     // Reconstruct as a Vec after allocation of exactly the element count with into_boxed_slice
@@ -448,11 +516,11 @@ pub unsafe fn free_device_array(arr: *mut FlexDeviceInfo, count: usize) {
 }
 
 /// Convert `Option<bool>` (active output or unknown) to the C three-state value.
-pub(crate) fn output_activity_to_c(active: Option<bool>) -> FlexOutputActivity {
+pub(crate) fn output_activity_to_c(active: Option<bool>) -> i32 {
     match active {
-        None => FlexOutputActivity::Unknown,
-        Some(false) => FlexOutputActivity::Inactive,
-        Some(true) => FlexOutputActivity::Active,
+        None => FlexOutputActivity::Unknown as i32,
+        Some(false) => FlexOutputActivity::Inactive as i32,
+        Some(true) => FlexOutputActivity::Active as i32,
     }
 }
 
@@ -489,7 +557,11 @@ pub fn process_info_to_c(info: ProcessInfo) -> FlexProcessInfo {
 /// `arr`/`count` must be returned by `flexaudio_processes` (or NULL/0). Call this function
 /// only once for a given `arr`.
 pub unsafe fn free_process_array(arr: *mut FlexProcessInfo, count: usize) {
-    if arr.is_null() {
+    if arr.is_null() && count == 0 {
+        return;
+    }
+    if !valid_array(arr, count) || arr.is_null() || count == 0 {
+        crate::error::set_audio_error(flexaudio::Error::InvalidArg("invalid process array".into()));
         return;
     }
     // Reconstruct as a Vec; Box<[T]> was allocated for exactly the element count (capacity = count).
@@ -513,12 +585,69 @@ mod tests {
         let event = event_to_c(Event::TerminalError {
             error: error.clone(),
         });
-        assert_eq!(event.kind, FlexEventKind::Error);
+        assert_eq!(event.kind, FlexEventKind::Error as i32);
         // SAFETY: event_to_c just stored a live thread-local C string; no call has replaced it.
         let message = unsafe { CStr::from_ptr(crate::error::last_error_ptr()) }
             .to_str()
             .unwrap();
         assert_eq!(message, error.to_string());
+    }
+
+    #[test]
+    fn v1_projects_new_events_and_saturates_signed_counters() {
+        use crate::error::{clear_last_error, last_audio_error};
+        let error = flexaudio::Error::DeviceLost
+            .with_context(flexaudio::ErrorContext::new(flexaudio::Operation::Reopen));
+        for event in [
+            Event::TerminalError {
+                error: error.clone(),
+            },
+            Event::RecoverableError {
+                error: error.clone(),
+            },
+            Event::ShutdownError {
+                error: error.clone(),
+            },
+        ] {
+            clear_last_error();
+            let projected = event_to_c(event);
+            assert_eq!(projected.kind, FlexEventKind::Error as i32);
+            assert_eq!(projected.count, 0);
+            assert_eq!(last_audio_error(), Some(error.clone()));
+        }
+        for event in [
+            Event::PermissionGranted,
+            Event::Clipped,
+            Event::AudioLoss {
+                loss: flexaudio::AudioLoss::raw_overflow(None, None, 48000, 2).unwrap(),
+            },
+        ] {
+            clear_last_error();
+            let projected = event_to_c(event);
+            assert_eq!(projected.kind, FlexEventKind::Unknown as i32);
+            assert_eq!(projected.count, 0);
+            assert!(crate::error::last_error_ptr().is_null());
+        }
+        for count in [i64::MAX as u64 + 1, u64::MAX] {
+            clear_last_error();
+            assert_eq!(event_to_c(Event::ChunkDropped { count }).count, i64::MAX);
+            assert!(!crate::error::last_error_ptr().is_null());
+            clear_last_error();
+            for event in [
+                VadEvent::SpeechStart { at_sample: count },
+                VadEvent::SpeechEnd { at_sample: count },
+            ] {
+                assert_eq!(vad_event_to_c(event).at_sample, i64::MAX);
+                assert!(!crate::error::last_error_ptr().is_null());
+            }
+        }
+        clear_last_error();
+        let legacy = event_to_c(Event::Error("secret diagnostic must stay private".into()));
+        assert_eq!(legacy.kind, FlexEventKind::Error as i32);
+        let message = unsafe { CStr::from_ptr(crate::error::last_error_ptr()) }
+            .to_str()
+            .unwrap();
+        assert_eq!(message, "backend error: legacy capture failure");
     }
 
     // All-zero fields in FlexVadConfig mean all defaults.
@@ -535,13 +664,13 @@ mod tests {
     }
 
     // Build FlexConfig for tests (NULL strings = defaults, numeric 0 = sentinel).
-    fn make_config(kind: FlexSourceKind) -> FlexConfig {
+    fn make_config(kind: i32) -> FlexConfig {
         FlexConfig {
             kind,
             device_id: ptr::null(),
             process_id: 0,
-            mode: FlexProcessMode::Include,
-            exclude_self: false,
+            mode: FlexProcessMode::Include as i32,
+            exclude_self: 0,
             output_rate: 0,
             output_channels: 0,
             chunk_ms: 0,
@@ -550,15 +679,15 @@ mod tests {
             mix_system_device_id: ptr::null(),
             mix_mic_gain: 0.0,
             mix_system_gain: 0.0,
-            denoise: false,
-            has_vad: false,
+            denoise: 0,
+            has_vad: 0,
             vad: zero_vad_config(),
         }
     }
 
     #[test]
     fn build_config_applies_defaults_for_sentinels() {
-        let c = make_config(FlexSourceKind::Mic);
+        let c = make_config(FlexSourceKind::Mic as i32);
         let cfg = unsafe { build_config(&c, Vec::new()) }.unwrap();
         assert_eq!(cfg.kind, SourceKind::Mic);
         // Sentinel 0 selects the default.
@@ -582,10 +711,10 @@ mod tests {
 
     #[test]
     fn build_config_reflects_explicit_values() {
-        let mut c = make_config(FlexSourceKind::Process);
+        let mut c = make_config(FlexSourceKind::Process as i32);
         c.process_id = 4321;
-        c.mode = FlexProcessMode::Exclude;
-        c.exclude_self = true;
+        c.mode = FlexProcessMode::Exclude as i32;
+        c.exclude_self = 1;
         c.output_rate = 16_000;
         c.output_channels = 1;
         c.chunk_ms = 20;
@@ -604,11 +733,11 @@ mod tests {
     #[test]
     fn build_config_maps_gain_sentinel_and_explicit() {
         // 0.0 is a sentinel for default 1.0 (same convention as output_rate 0→48000).
-        let c = make_config(FlexSourceKind::Mic);
+        let c = make_config(FlexSourceKind::Mic as i32);
         let cfg = unsafe { build_config(&c, Vec::new()) }.unwrap();
         assert_eq!(cfg.gain, 1.0);
         // Explicit values pass through unchanged.
-        let mut c2 = make_config(FlexSourceKind::Mic);
+        let mut c2 = make_config(FlexSourceKind::Mic as i32);
         c2.gain = 0.5;
         let cfg2 = unsafe { build_config(&c2, Vec::new()) }.unwrap();
         assert_eq!(cfg2.gain, 0.5);
@@ -617,7 +746,7 @@ mod tests {
     #[test]
     fn build_config_reads_device_id() {
         let id = CString::new("dev-x").unwrap();
-        let mut c = make_config(FlexSourceKind::Mic);
+        let mut c = make_config(FlexSourceKind::Mic as i32);
         c.device_id = id.as_ptr();
         let cfg = unsafe { build_config(&c, Vec::new()) }.unwrap();
         assert_eq!(cfg.device_id.as_deref(), Some("dev-x"));
@@ -627,7 +756,7 @@ mod tests {
     fn build_config_reflects_mix_fields() {
         let mic_id = CString::new("mic-a").unwrap();
         let sys_id = CString::new("sink-b").unwrap();
-        let mut c = make_config(FlexSourceKind::Mix);
+        let mut c = make_config(FlexSourceKind::Mix as i32);
         c.mix_mic_device_id = mic_id.as_ptr();
         c.mix_system_device_id = sys_id.as_ptr();
         c.mix_mic_gain = 0.5;
@@ -643,12 +772,12 @@ mod tests {
     #[test]
     fn source_kind_roundtrips() {
         for (c, k) in [
-            (FlexSourceKind::Mic, SourceKind::Mic),
-            (FlexSourceKind::System, SourceKind::SystemLoopback),
-            (FlexSourceKind::Process, SourceKind::ProcessLoopback),
-            (FlexSourceKind::Mix, SourceKind::Mix),
+            (FlexSourceKind::Mic as i32, SourceKind::Mic),
+            (FlexSourceKind::System as i32, SourceKind::SystemLoopback),
+            (FlexSourceKind::Process as i32, SourceKind::ProcessLoopback),
+            (FlexSourceKind::Mix as i32, SourceKind::Mix),
         ] {
-            assert_eq!(source_kind_from_c(c), k);
+            assert_eq!(source_kind_from_c(c).unwrap(), k);
             assert_eq!(source_kind_to_c(k), c);
         }
     }
@@ -739,7 +868,7 @@ mod tests {
                 permission,
                 detail: "Permission is pending; capture may remain silent until granted".into(),
             });
-            assert_eq!(event.kind as i32, 8);
+            assert_eq!(event.kind, 8);
             assert_eq!(event.count, 0);
             // SAFETY: event_to_c stored a live thread-local C string; no call has replaced it.
             let message = unsafe { CStr::from_ptr(crate::error::last_error_ptr()) }
@@ -747,7 +876,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 message,
-                "Permission is pending; capture may remain silent until granted"
+                format!("Recording permission is pending. {}", permission.guidance())
             );
         }
         assert_eq!(FlexEventKind::PermissionDenied as i32, 3);
@@ -770,7 +899,7 @@ mod tests {
                 permission,
                 detail: "denied by user".into(),
             });
-            assert_eq!(event.kind as i32, 3);
+            assert_eq!(event.kind, 3);
             // SAFETY: last_error_ptr points to a live thread-local C string.
             let message = unsafe { CStr::from_ptr(last_error_ptr()) }
                 .to_str()
@@ -780,13 +909,13 @@ mod tests {
         let advisory = event_to_c(Event::SilenceWhileSourceActive {
             detail: "check recording privacy settings".into(),
         });
-        assert_eq!(advisory.kind as i32, 7);
+        assert_eq!(advisory.kind, 7);
         // SAFETY: No intervening call has changed the thread-local C string.
         assert_eq!(
             unsafe { CStr::from_ptr(last_error_ptr()) }
                 .to_str()
                 .unwrap(),
-            "check recording privacy settings"
+            "Capture is silent while the source is active; check recording permissions and source output"
         );
         assert_eq!(FlexEventKind::Unknown as i32, 6);
         assert_eq!(crate::error::code::FLEX_FAILURE, -2);
@@ -796,16 +925,16 @@ mod tests {
     fn event_to_c_maps_each_variant() {
         assert_eq!(
             event_to_c(Event::ChunkDropped { count: 5 }).kind,
-            FlexEventKind::ChunkDropped
+            FlexEventKind::ChunkDropped as i32
         );
         assert_eq!(event_to_c(Event::ChunkDropped { count: 5 }).count, 5);
         assert_eq!(
             event_to_c(Event::StreamStalled).kind,
-            FlexEventKind::Stalled
+            FlexEventKind::Stalled as i32
         );
         assert_eq!(
             event_to_c(Event::StreamRecovered).kind,
-            FlexEventKind::Recovered
+            FlexEventKind::Recovered as i32
         );
         assert_eq!(
             event_to_c(Event::PermissionDenied {
@@ -813,14 +942,14 @@ mod tests {
                 detail: "denied by user".into()
             })
             .kind,
-            FlexEventKind::PermissionDenied
+            FlexEventKind::PermissionDenied as i32
         );
         assert_eq!(
             event_to_c(Event::DeviceLost).kind,
-            FlexEventKind::DeviceLost
+            FlexEventKind::DeviceLost as i32
         );
         let err = event_to_c(Event::Error("boom".to_string()));
-        assert_eq!(err.kind, FlexEventKind::Error);
+        assert_eq!(err.kind, FlexEventKind::Error as i32);
         assert_eq!(err.count, 0);
     }
 
@@ -839,7 +968,7 @@ mod tests {
         let boxed: Box<[FlexDeviceInfo]> = infos.into_iter().map(device_info_to_c).collect();
         let count = boxed.len();
         let first = &boxed[0];
-        assert_eq!(first.source_kind, FlexSourceKind::Mic);
+        assert_eq!(first.source_kind, FlexSourceKind::Mic as i32);
         assert!(first.is_default);
         let id = unsafe { CStr::from_ptr(first.id) }.to_str().unwrap();
         assert_eq!(id, "id-1");
@@ -870,13 +999,13 @@ mod tests {
         let count = boxed.len();
         let first = &boxed[0];
         assert_eq!(first.pid, 4321);
-        assert_eq!(first.output_activity, FlexOutputActivity::Active);
+        assert_eq!(first.output_activity, FlexOutputActivity::Active as i32);
         let bundle = unsafe { CStr::from_ptr(first.bundle_id) }.to_str().unwrap();
         assert_eq!(bundle, "com.apple.Music");
         let second = &boxed[1];
         assert!(second.executable.is_null(), "None becomes NULL");
         assert!(second.bundle_id.is_null());
-        assert_eq!(second.output_activity, FlexOutputActivity::Unknown);
+        assert_eq!(second.output_activity, FlexOutputActivity::Unknown as i32);
         let name = unsafe { CStr::from_ptr(second.name) }.to_str().unwrap();
         assert_eq!(name, "pid 99");
         let ptr = Box::into_raw(boxed) as *mut FlexProcessInfo;
@@ -887,23 +1016,29 @@ mod tests {
 
     #[test]
     fn output_activity_maps_all_three_states() {
-        assert_eq!(output_activity_to_c(None), FlexOutputActivity::Unknown);
+        assert_eq!(
+            output_activity_to_c(None),
+            FlexOutputActivity::Unknown as i32
+        );
         assert_eq!(
             output_activity_to_c(Some(false)),
-            FlexOutputActivity::Inactive
+            FlexOutputActivity::Inactive as i32
         );
-        assert_eq!(output_activity_to_c(Some(true)), FlexOutputActivity::Active);
+        assert_eq!(
+            output_activity_to_c(Some(true)),
+            FlexOutputActivity::Active as i32
+        );
     }
 
     #[test]
     fn resolve_output_applies_sentinels() {
         // Sentinel 0 maps to 48000 / 2; explicit values pass through unchanged.
-        let c = make_config(FlexSourceKind::Mic);
+        let c = make_config(FlexSourceKind::Mic as i32);
         let out = resolve_output(&c);
         assert_eq!(out.sample_rate, 48_000);
         assert_eq!(out.channels, 2);
 
-        let mut c2 = make_config(FlexSourceKind::Mic);
+        let mut c2 = make_config(FlexSourceKind::Mic as i32);
         c2.output_rate = 16_000;
         c2.output_channels = 1;
         let out2 = resolve_output(&c2);

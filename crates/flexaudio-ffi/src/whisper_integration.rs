@@ -135,6 +135,7 @@ unsafe fn validate<'a>(config: *const FlexStreamConfigV2) -> Result<&'a FlexConf
         ));
     }
     let base = &*config.config;
+    crate::convert::validate_config(base).map_err(|()| code::FLEX_INVALID_ARG)?;
     if !config.whisper_vad.is_null() {
         if !config.whisper_vad.is_aligned() {
             return Err(reject(
@@ -143,17 +144,26 @@ unsafe fn validate<'a>(config: *const FlexStreamConfigV2) -> Result<&'a FlexConf
             ));
         }
         let options = &*config.whisper_vad;
-        if base.has_vad {
+        if base.has_vad != 0 {
             return Err(reject(
                 FLEX_WHISPER_CONFLICTING_VAD,
                 "ConflictingVad: legacy and whisper VAD are mutually exclusive",
             ));
         }
-        if options.tap != FLEX_WHISPER_PRIMARY {
-            return Err(reject(
-                FLEX_WHISPER_UNSUPPORTED_TAP,
-                "UnsupportedTap: only primary is supported",
-            ));
+        match options.tap {
+            FLEX_WHISPER_PRIMARY => {}
+            FLEX_WHISPER_SECONDARY => {
+                return Err(reject(
+                    FLEX_WHISPER_UNSUPPORTED_TAP,
+                    "UnsupportedTap: only primary is supported",
+                ))
+            }
+            _ => {
+                return Err(reject(
+                    code::FLEX_INVALID_ARG,
+                    "InvalidArgument: unknown whisper tap",
+                ))
+            }
         }
         if options.provisional > 1 {
             return Err(reject(
@@ -207,14 +217,17 @@ pub unsafe extern "C" fn flexaudio_open_v2(
         };
         let stream = crate::flexaudio_open(config);
         if stream.is_null() {
-            code::FLEX_FAILURE
+            crate::error::last_audio_error()
+                .as_ref()
+                .map_or(code::FLEX_FAILURE, crate::error::root_code)
         } else {
             if whisper.is_some() {
                 if let Err(error) = (*stream).inner.enable_capture_tap() {
                     crate::flexaudio_free(stream);
-                    return reject(code::FLEX_FAILURE, &error.to_string());
+                    crate::error::set_audio_error(error);
+                    return code::FLEX_FAILURE;
                 }
-                (*stream).inner.set_denoise(config.denoise);
+                (*stream).inner.set_denoise(config.denoise != 0);
                 (*stream).denoiser = None;
             }
             (*stream).whisper = whisper;
@@ -261,7 +274,8 @@ pub unsafe extern "C" fn flexaudio_poll_chunk_v2(s: *mut FlexStream, out: *mut F
                 out.write(carrier);
                 return 1;
             }
-            return reject(code::FLEX_FAILURE, &error.to_string());
+            crate::error::set_audio_error(error);
+            return code::FLEX_FAILURE;
         }
         if let Some(chunk) = stream.ready_chunks.pop_front() {
             out.write(chunk);
@@ -286,7 +300,8 @@ pub unsafe extern "C" fn flexaudio_poll_chunk_v2(s: *mut FlexStream, out: *mut F
                     }
                 }
                 if let Some(error) = stream.inner.terminal_error() {
-                    return reject(code::FLEX_FAILURE, &error.to_string());
+                    crate::error::set_audio_error(error);
+                    return code::FLEX_FAILURE;
                 }
                 0
             }
@@ -331,7 +346,8 @@ pub unsafe extern "C" fn flexaudio_flush_whisper_vad(s: *mut FlexStream) -> i32 
             return code::FLEX_OK;
         }
         if let Err(error) = stream.queue_whisper_input() {
-            return reject(code::FLEX_FAILURE, &error.to_string());
+            crate::error::set_audio_error(error);
+            return code::FLEX_FAILURE;
         }
         if let Some(tap) = stream.whisper.as_mut() {
             let result = tap.flush();
@@ -399,7 +415,7 @@ impl FlexStream {
             self.accept_whisper(result);
         }
     }
-    fn versioned_chunk(&mut self, chunk: FlexChunk) -> FlexChunkV2 {
+    pub(crate) fn versioned_chunk(&mut self, chunk: FlexChunk) -> FlexChunkV2 {
         let events: Box<[_]> = mem::take(&mut self.whisper_events)
             .into_iter()
             .map(attached_to_c)
@@ -508,6 +524,9 @@ mod tests {
         let mut inner = flexaudio::Stream::open(Default::default(), Box::new(Denied)).unwrap();
         assert!(inner.start().is_err());
         let mut stream = FlexStream {
+            shutdown: None,
+            shutdown_event_index: 0,
+            last_output: None,
             inner,
             whisper: None,
             whisper_events: Vec::new(),
@@ -584,6 +603,9 @@ mod tests {
             .unwrap();
             inner.start().unwrap();
             let mut stream = FlexStream {
+                shutdown: None,
+                shutdown_event_index: 0,
+                last_output: None,
                 inner,
                 whisper: Some(whisper),
                 whisper_events: Vec::new(),
@@ -725,8 +747,8 @@ mod tests {
             options.tap = FLEX_WHISPER_PRIMARY;
             assert_eq!(options.tap, FLEX_WHISPER_PRIMARY);
             assert!(validate(&config).is_ok());
-            base.has_vad = true;
-            assert!(base.has_vad);
+            base.has_vad = 1;
+            assert_eq!(base.has_vad, 1);
             assert_eq!(
                 flexaudio_open_v2(&config, &mut out),
                 FLEX_WHISPER_CONFLICTING_VAD

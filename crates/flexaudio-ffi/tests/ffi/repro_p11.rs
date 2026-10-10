@@ -29,6 +29,9 @@ fn stream(denoise: bool) -> (FlexStream, Arc<Mutex<Option<fa::core::backend::Raw
     inner.start().unwrap();
     (
         FlexStream {
+            shutdown: None,
+            shutdown_event_index: 0,
+            last_output: None,
             whisper: None,
             whisper_events: Vec::new(),
             whisper_origin: (0, 0),
@@ -67,7 +70,6 @@ fn free(mut chunk: FlexChunk) {
     unsafe { crate::flexaudio_chunk_free(&mut chunk) }
 }
 #[test]
-#[ignore = "repro: C F42"]
 fn repro_ffi_stop_denoise_tail() {
     let (mut stream, sink) = stream(true);
     push(&sink, &[0.5; 960]);
@@ -131,19 +133,76 @@ fn repro_ffi_resume_fresh_denoise_control() {
     stream.inner.stop();
 }
 #[test]
-#[ignore = "repro: C F44"]
 fn repro_ffi_error_kinds_collapsed() {
-    let missing = crate::fail(fa::Error::DeviceNotFound);
-    let lost = crate::fail(fa::Error::DeviceLost);
-    assert_ne!(
-        missing, lost,
-        "C return values erase DeviceNotFound versus DeviceLost"
-    );
+    let roots = [
+        (
+            fa::Error::InvalidArg("invalid test input".into()),
+            code::FLEX_INVALID_ARG,
+        ),
+        (
+            fa::Error::InvalidState("invalid test state".into()),
+            code::FLEX_INVALID_STATE,
+        ),
+        (fa::Error::DeviceNotFound, code::FLEX_DEVICE_NOT_FOUND),
+        (fa::Error::DeviceLost, code::FLEX_DEVICE_LOST),
+        (
+            fa::Error::PermissionDenied {
+                permission: fa::Permission::Microphone,
+                detail: "private diagnostic".into(),
+            },
+            code::FLEX_PERMISSION_DENIED,
+        ),
+        (
+            fa::Error::UnsupportedOsVersion,
+            code::FLEX_UNSUPPORTED_OS_VERSION,
+        ),
+        (
+            fa::Error::Backend("backend test failure".into()),
+            code::FLEX_FAILURE,
+        ),
+        (
+            fa::Error::UnsupportedFormat("unsupported test format".into()),
+            code::FLEX_UNSUPPORTED_FORMAT,
+        ),
+        (
+            fa::Error::NativeFormatChanged {
+                advertised: (48000, 2),
+                actual: (16000, 1),
+            },
+            code::FLEX_NATIVE_FORMAT_CHANGED,
+        ),
+        (fa::Error::Unsupported, code::FLEX_UNSUPPORTED),
+        (
+            fa::Error::AmbiguousDeviceName,
+            code::FLEX_AMBIGUOUS_DEVICE_NAME,
+        ),
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for (error, expected) in roots {
+        let result = crate::fail(error.clone());
+        assert_eq!(result, expected);
+        assert!(seen.insert(result), "distinct root kind collapsed");
+        let context = error.with_context(fa::ErrorContext::new(fa::Operation::Stop));
+        let grouped = fa::Error::Multiple(fa::ErrorGroup::new(
+            context,
+            fa::Error::Backend("related cleanup failure".into()),
+            Vec::new(),
+        ));
+        assert_eq!(
+            crate::fail(grouped),
+            expected,
+            "wrapper changed the primary root code"
+        );
+    }
 }
+
 #[test]
 fn repro_ffi_error_control() {
     clear_last_error();
-    assert_eq!(crate::fail(fa::Error::DeviceNotFound), code::FLEX_FAILURE);
+    assert_eq!(
+        crate::fail(fa::Error::DeviceNotFound),
+        code::FLEX_DEVICE_NOT_FOUND
+    );
     assert!(!crate::flexaudio_last_error().is_null());
     assert_eq!(
         unsafe { crate::flexaudio_stop(std::ptr::null_mut()) },
@@ -186,11 +245,11 @@ fn repro_ffi_metrics_no_addons_control() {
 }
 fn config() -> FlexConfig {
     FlexConfig {
-        kind: FlexSourceKind::Mic,
+        kind: FlexSourceKind::Mic as i32,
         device_id: std::ptr::null(),
         process_id: 0,
-        mode: FlexProcessMode::Include,
-        exclude_self: false,
+        mode: FlexProcessMode::Include as i32,
+        exclude_self: 0,
         output_rate: 0,
         output_channels: 0,
         chunk_ms: 0,
@@ -199,8 +258,8 @@ fn config() -> FlexConfig {
         mix_system_device_id: std::ptr::null(),
         mix_mic_gain: 0.0,
         mix_system_gain: 0.0,
-        denoise: false,
-        has_vad: false,
+        denoise: 0,
+        has_vad: 0,
         vad: FlexVadConfig {
             threshold: 0.0,
             neg_threshold: 0.0,
@@ -213,38 +272,40 @@ fn config() -> FlexConfig {
     }
 }
 #[test]
-fn repro_ffi_invalid_discriminant_child() {
-    if std::env::var_os("FLEXAUDIO_REPRO_F52_CHILD").is_none() {
-        return;
-    }
-    let mut config = config();
-    // Deliberately emulate an untrusted C integer. The current ABI's enum field makes this
-    // invalid Rust; isolate the probe in a subprocess rather than corrupting the test runner.
-    unsafe {
-        std::ptr::addr_of_mut!(config.kind).cast::<i32>().write(999);
-        assert!(
-            crate::convert::build_config(&config, Vec::new()).is_err(),
-            "invalid C discriminant 999 was accepted instead of InvalidArg"
+fn repro_ffi_invalid_discriminant() {
+    for invalid in [-1, 4, 999, i32::MIN, i32::MAX] {
+        let mut raw = config();
+        raw.kind = invalid;
+        // Incoming integers remain valid Rust; rejected before any backend acquisition.
+        assert!(unsafe { crate::convert::build_config(&raw, Vec::new()) }.is_err());
+        assert!(unsafe { crate::flexaudio_open(&raw) }.is_null());
+        assert_eq!(
+            crate::error::root_code(&crate::error::last_audio_error().unwrap()),
+            code::FLEX_INVALID_ARG
         );
     }
-}
-#[test]
-#[ignore = "repro: C F52"]
-fn repro_ffi_invalid_discriminant() {
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "repro_p11_tests::repro_ffi_invalid_discriminant_child",
-            "--nocapture",
-        ])
-        .env("FLEXAUDIO_REPRO_F52_CHILD", "1")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "invalid C discriminant was not safely rejected: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for invalid in [-1, 2, 999, i32::MIN, i32::MAX] {
+        let mut raw = config();
+        raw.mode = invalid; // ignored by microphone, still strictly validated
+        assert!(unsafe { crate::convert::build_config(&raw, Vec::new()) }.is_err());
+        assert!(unsafe { crate::flexaudio_open(&raw) }.is_null());
+    }
+    for index in 0..3 {
+        let mut raw = config();
+        match index {
+            0 => raw.exclude_self = 2,
+            1 => raw.denoise = 2,
+            _ => raw.has_vad = 255,
+        }
+        assert!(unsafe { crate::convert::build_config(&raw, Vec::new()) }.is_err());
+        assert!(unsafe { crate::flexaudio_open(&raw) }.is_null());
+    }
+    for duration in [1, 10, 21, u32::MAX] {
+        let mut raw = config();
+        raw.chunk_ms = duration;
+        assert!(unsafe { crate::convert::build_config(&raw, Vec::new()) }.is_err());
+        assert!(unsafe { crate::flexaudio_open(&raw) }.is_null());
+    }
 }
 #[test]
 fn repro_ffi_valid_discriminant_control() {
@@ -299,17 +360,105 @@ fn repro_ffi_flac_drop_finalizes_control() {
 }
 
 #[test]
-#[ignore = "repro: C F42"]
 fn repro_ffi_standalone_flush_api() {
-    let header = include_str!("../../include/flexaudio.h");
-    assert!(
-        header.contains("flexaudio_vad_flush("),
-        "C VAD cannot flush active speech at EOF"
-    );
-    assert!(
-        header.contains("flexaudio_denoise_flush("),
-        "C denoise cannot retrieve retained tail"
-    );
+    use crate::denoise::*;
+    use crate::vad::*;
+    unsafe {
+        for channels in [1, 2] {
+            let handle = flexaudio_denoise_new(channels);
+            assert!(!handle.is_null());
+            let mut pcm: Vec<f32> = (0..1001 * usize::from(channels))
+                .map(|index| (index as f32 * 0.1).sin() * 0.5)
+                .collect();
+            let mut reference = Denoiser::new(channels).unwrap();
+            let mut reference_pcm = pcm.clone();
+            reference.process(&mut reference_pcm).unwrap();
+            let expected_tail = reference.flush();
+            assert_eq!(
+                flexaudio_denoise_process(handle, pcm.as_mut_ptr(), pcm.len()),
+                code::FLEX_OK
+            );
+            assert_eq!(pcm, reference_pcm);
+            let mut out = std::ptr::null_mut();
+            let mut len = 999;
+            assert_eq!(
+                flexaudio_denoise_flush(handle, &mut out, &mut len),
+                code::FLEX_OK
+            );
+            assert_eq!(len, 480 * usize::from(channels));
+            assert_eq!(std::slice::from_raw_parts(out, len), expected_tail);
+            flexaudio_denoise_samples_free(out, len);
+            assert_eq!(
+                flexaudio_denoise_flush(handle, &mut out, &mut len),
+                code::FLEX_OK
+            );
+            assert!(out.is_null());
+            assert_eq!(len, 0);
+            flexaudio_denoise_samples_free(out, len);
+            // A new processing interval is independently flushable.
+            assert_eq!(
+                flexaudio_denoise_process(handle, pcm.as_mut_ptr(), pcm.len()),
+                code::FLEX_OK
+            );
+            assert_eq!(
+                flexaudio_denoise_flush(handle, &mut out, &mut len),
+                code::FLEX_OK
+            );
+            assert_eq!(len, 480 * usize::from(channels));
+            flexaudio_denoise_samples_free(out, len);
+            flexaudio_denoise_free(handle);
+        }
+        // Use the same injected active-speech config as the original Rust control.
+        let mut vad = FlexVad {
+            inner: flexaudio_vad::Vad::new(flexaudio_vad::VadConfig {
+                threshold: 0.0,
+                neg_threshold: Some(0.0),
+                min_speech_ms: 0,
+                min_silence_ms: 0,
+                speech_pad_ms: 0,
+                max_speech_ms: 0,
+                sample_rate: 16000,
+            })
+            .unwrap(),
+        };
+        let mut events = std::ptr::null_mut();
+        let mut len = 999;
+        assert_eq!(
+            flexaudio_vad_process(
+                &mut vad,
+                [0.25; 16000].as_ptr(),
+                16000,
+                16000,
+                1,
+                &mut events,
+                &mut len
+            ),
+            code::FLEX_OK
+        );
+        assert!(events.is_null());
+        assert_eq!(len, 0);
+        assert_eq!(
+            flexaudio_vad_flush(&mut vad, std::ptr::null_mut(), &mut len),
+            code::FLEX_INVALID_ARG
+        );
+        assert_eq!(
+            flexaudio_vad_flush(&mut vad, &mut events, &mut len),
+            code::FLEX_OK
+        );
+        assert_eq!(len, 2);
+        let view = std::slice::from_raw_parts(events, len);
+        assert_eq!(view[0].kind, 0);
+        assert_eq!(view[1].kind, 1);
+        assert!(view[1].at_sample > view[0].at_sample);
+        flexaudio_vad_events_free(events, len);
+        assert_eq!(
+            flexaudio_vad_flush(&mut vad, &mut events, &mut len),
+            code::FLEX_OK
+        );
+        assert!(events.is_null());
+        assert_eq!(len, 0);
+        flexaudio_vad_events_free(events, len);
+    }
 }
 #[test]
 fn repro_ffi_standalone_flush_control() {
@@ -331,4 +480,28 @@ fn repro_ffi_standalone_flush_control() {
         .unwrap()
         .is_empty());
     assert_eq!(vad.flush().unwrap().len(), 2);
+}
+
+#[test]
+fn standalone_denoise_sample_free_validates_owned_length() {
+    use crate::denoise::*;
+    unsafe {
+        let denoiser = flexaudio_denoise_new(1);
+        assert!(!denoiser.is_null());
+        let mut input = [0.25; 137];
+        assert_eq!(
+            flexaudio_denoise_process(denoiser, input.as_mut_ptr(), input.len()),
+            0
+        );
+        let mut samples = std::ptr::null_mut();
+        let mut len = 0;
+        assert_eq!(flexaudio_denoise_flush(denoiser, &mut samples, &mut len), 0);
+        assert_eq!(len, 480);
+        flexaudio_denoise_samples_free(samples, len - 1);
+        assert!(!crate::flexaudio_last_error().is_null());
+        assert!(crate::chunk_storage::frame_index(samples, len).is_some());
+        flexaudio_denoise_samples_free(samples, len);
+        assert!(crate::chunk_storage::frame_index(samples, len).is_none());
+        flexaudio_denoise_free(denoiser);
+    }
 }

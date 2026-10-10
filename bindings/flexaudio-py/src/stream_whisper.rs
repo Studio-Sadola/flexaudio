@@ -127,6 +127,9 @@ mod tests {
             inner.start().unwrap();
             let mut stream = Stream {
                 inner,
+                shutdown: None,
+                local_events: Default::default(),
+                output_end: None,
                 whisper: Some(whisper),
                 whisper_events: Vec::new(),
                 whisper_origin: (0, 0),

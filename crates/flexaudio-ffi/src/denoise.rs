@@ -14,13 +14,15 @@ use std::slice;
 
 use flexaudio_denoise::Denoiser;
 
-use crate::error::{clear_last_error, code, set_last_error};
+use crate::convert::{valid_array, valid_pointer};
+use crate::error::{clear_last_error, code, set_audio_error};
 use crate::{guard_i32, guard_ptr};
 
 /// Opaque noise suppression handle containing [`flexaudio_denoise::Denoiser`].
 /// Create it with `flexaudio_denoise_new` and release it with `flexaudio_denoise_free`.
 pub struct FlexDenoiser {
     pub(crate) inner: Denoiser,
+    pending: bool,
 }
 
 /// Creates a denoiser for the given channel count (1 = mono, 2 = interleaved stereo).
@@ -32,9 +34,12 @@ pub extern "C" fn flexaudio_denoise_new(channels: u16) -> *mut FlexDenoiser {
     guard_ptr(|| {
         clear_last_error();
         match Denoiser::new(channels) {
-            Ok(inner) => Box::into_raw(Box::new(FlexDenoiser { inner })),
+            Ok(inner) => Box::into_raw(Box::new(FlexDenoiser {
+                inner,
+                pending: false,
+            })),
             Err(e) => {
-                set_last_error(e.to_string());
+                set_audio_error(flexaudio::Error::InvalidArg(e.to_string()));
                 std::ptr::null_mut()
             }
         }
@@ -58,28 +63,98 @@ pub unsafe extern "C" fn flexaudio_denoise_process(
 ) -> i32 {
     guard_i32(|| {
         clear_last_error();
-        let Some(dn) = d.as_mut() else {
-            set_last_error("flexaudio_denoise_process: denoiser pointer is null");
-            return code::FLEX_INVALID_ARG;
-        };
+        if !valid_pointer(d) || !valid_array(samples, len) {
+            return set_audio_error(flexaudio::Error::InvalidArg(
+                "invalid denoiser handle or sample array".into(),
+            ));
+        }
+        let dn = &mut *d;
         if len == 0 {
             // Empty input is a no-op and is safe even when NULL.
             return code::FLEX_OK;
         }
-        if samples.is_null() {
-            set_last_error("flexaudio_denoise_process: samples pointer is null");
-            return code::FLEX_INVALID_ARG;
-        }
         let buf = slice::from_raw_parts_mut(samples, len);
         match dn.inner.process(buf) {
-            Ok(()) => code::FLEX_OK,
+            Ok(()) => {
+                dn.pending = true;
+                code::FLEX_OK
+            }
             Err(e) => {
                 // A length that is not divisible by the channel count is an argument error.
-                set_last_error(e.to_string());
+                set_audio_error(flexaudio::Error::InvalidArg(e.to_string()));
                 code::FLEX_INVALID_ARG
             }
         }
     })
+}
+
+/// Drain actual interleaved delayed samples into a library-owned array.
+///
+/// Valid output destinations initialize to NULL/0, including on errors. Repeated
+/// flush without new nonempty input returns NULL/0. Release samples with
+/// `flexaudio_denoise_samples_free`, never C free.
+///
+/// # Safety
+/// `d` must be a live handle; `out`/`out_len` must be aligned writable destinations.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_denoise_flush(
+    d: *mut FlexDenoiser,
+    out: *mut *mut f32,
+    out_len: *mut usize,
+) -> i32 {
+    guard_i32(|| {
+        clear_last_error();
+        if !valid_pointer(out) || !valid_pointer(out_len) {
+            return set_audio_error(flexaudio::Error::InvalidArg(
+                "invalid denoise output destination".into(),
+            ));
+        }
+        out.write(std::ptr::null_mut());
+        out_len.write(0);
+        if !valid_pointer(d) {
+            return set_audio_error(flexaudio::Error::InvalidArg(
+                "invalid denoiser handle".into(),
+            ));
+        }
+        let dn = &mut *d;
+        if !dn.pending {
+            return code::FLEX_OK;
+        }
+        let samples = dn.inner.flush();
+        dn.pending = false;
+        if !samples.is_empty() {
+            let (pointer, len) = crate::chunk_storage::store(samples, 0);
+            out_len.write(len);
+            out.write(pointer);
+        }
+        code::FLEX_OK
+    })
+}
+
+/// Release the sample array returned by `flexaudio_denoise_flush`. NULL/0 is safe.
+///
+/// # Safety
+/// `samples`/`len` must be the exact live allocation returned by flush, or NULL/0.
+/// Release each allocation once.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_denoise_samples_free(samples: *mut f32, len: usize) {
+    guard_i32(|| {
+        if samples.is_null() && len == 0 {
+            return code::FLEX_OK;
+        }
+        if !valid_array(samples, len) || samples.is_null() || len == 0 {
+            return set_audio_error(flexaudio::Error::InvalidArg(
+                "invalid denoise sample array".into(),
+            ));
+        }
+        if crate::chunk_storage::frame_index(samples, len).is_none() {
+            return set_audio_error(flexaudio::Error::InvalidArg(
+                "denoise samples are not a live library allocation with this length".into(),
+            ));
+        }
+        crate::chunk_storage::release(samples, len);
+        code::FLEX_OK
+    });
 }
 
 /// Resets the RNN state, carry buffer, and delay line to their initial state.
@@ -90,11 +165,14 @@ pub unsafe extern "C" fn flexaudio_denoise_process(
 pub unsafe extern "C" fn flexaudio_denoise_reset(d: *mut FlexDenoiser) -> i32 {
     guard_i32(|| {
         clear_last_error();
-        let Some(dn) = d.as_mut() else {
-            set_last_error("flexaudio_denoise_reset: denoiser pointer is null");
-            return code::FLEX_INVALID_ARG;
-        };
+        if !valid_pointer(d) {
+            return set_audio_error(flexaudio::Error::InvalidArg(
+                "invalid denoiser handle".into(),
+            ));
+        }
+        let dn = &mut *d;
         dn.inner.reset();
+        dn.pending = false;
         code::FLEX_OK
     })
 }
@@ -108,6 +186,11 @@ pub unsafe extern "C" fn flexaudio_denoise_reset(d: *mut FlexDenoiser) -> i32 {
 pub unsafe extern "C" fn flexaudio_denoise_free(d: *mut FlexDenoiser) {
     guard_i32(|| {
         if !d.is_null() {
+            if !valid_pointer(d) {
+                return set_audio_error(flexaudio::Error::InvalidArg(
+                    "invalid denoiser handle".into(),
+                ));
+            }
             drop(Box::from_raw(d));
         }
         code::FLEX_OK
@@ -155,5 +238,78 @@ mod tests {
             code::FLEX_INVALID_ARG
         );
         unsafe { flexaudio_denoise_free(std::ptr::null_mut()) };
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use std::ptr;
+
+    #[test]
+    fn denoise_flush_validates_before_consuming_tail_and_initializes_errors() {
+        unsafe {
+            let handle = flexaudio_denoise_new(1);
+            assert!(!handle.is_null());
+            let mut out = ptr::dangling_mut();
+            let mut len = 99;
+            assert_eq!(
+                flexaudio_denoise_flush(handle, &mut out, &mut len),
+                code::FLEX_OK
+            );
+            assert!(out.is_null());
+            assert_eq!(len, 0);
+            let mut samples = [0.25; 961];
+            assert_eq!(
+                flexaudio_denoise_process(handle, samples.as_mut_ptr(), samples.len()),
+                code::FLEX_OK
+            );
+            let unaligned_out = ptr::dangling_mut::<u8>().cast::<*mut f32>();
+            assert_eq!(
+                flexaudio_denoise_flush(handle, unaligned_out, &mut len),
+                code::FLEX_INVALID_ARG
+            );
+            assert_eq!(
+                flexaudio_denoise_flush(handle, ptr::null_mut(), &mut len),
+                code::FLEX_INVALID_ARG
+            );
+            let unaligned_samples = ptr::dangling_mut::<u8>().cast::<f32>();
+            assert_eq!(
+                flexaudio_denoise_process(handle, unaligned_samples, 1),
+                code::FLEX_INVALID_ARG
+            );
+            assert_eq!(
+                flexaudio_denoise_process(handle, samples.as_mut_ptr(), usize::MAX),
+                code::FLEX_INVALID_ARG
+            );
+            assert_eq!(
+                flexaudio_denoise_flush(handle, &mut out, &mut len),
+                code::FLEX_OK
+            );
+            assert!(!out.is_null());
+            assert_eq!(len, 480);
+            flexaudio_denoise_samples_free(out, len);
+            out = ptr::dangling_mut();
+            len = 99;
+            assert_eq!(
+                flexaudio_denoise_flush(ptr::null_mut(), &mut out, &mut len),
+                code::FLEX_INVALID_ARG
+            );
+            assert!(out.is_null());
+            assert_eq!(len, 0);
+            assert_eq!(
+                flexaudio_denoise_flush(ptr::dangling_mut::<u8>().cast(), &mut out, &mut len),
+                code::FLEX_INVALID_ARG
+            );
+            flexaudio_denoise_samples_free(unaligned_samples, 1);
+            assert_eq!(
+                crate::error::last_audio_error().unwrap().kind(),
+                flexaudio::ErrorKind::InvalidArg
+            );
+            flexaudio_denoise_samples_free(samples.as_mut_ptr(), usize::MAX);
+            flexaudio_denoise_samples_free(ptr::null_mut(), 1);
+            flexaudio_denoise_samples_free(ptr::null_mut(), 0);
+            flexaudio_denoise_free(handle);
+        }
     }
 }
