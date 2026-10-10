@@ -9,8 +9,9 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::CLSCTX_ALL;
 use windows::Win32::System::Threading::CreateEventW;
 
-use crate::common::{map_hr, EventHandle};
+use crate::common::{map_hr, map_hr_at, EventHandle};
 use crate::lifecycle::{keepalive_error, StreamClient};
+use flexaudio_core::Operation;
 
 /// COM objects and the render event stay on the capture owner thread.
 pub(crate) struct SilentRender {
@@ -77,16 +78,12 @@ impl SilentRender {
 
 impl StreamClient for SilentRender {
     fn start(&mut self) -> Result<()> {
-        unsafe { self.client.Start() }.map_err(|e| {
-            keepalive_error(
-                "cannot start classic loopback silent keepalive",
-                map_hr("Start", e),
-            )
-        })
+        unsafe { self.client.Start() }.map_err(|e| keepalive_error(map_hr("Start", e)))
     }
 
     fn stop(&mut self) -> Result<()> {
-        unsafe { self.client.Stop() }.map_err(|e| map_hr("silent keepalive Stop", e))
+        unsafe { self.client.Stop() }
+            .map_err(|e| map_hr_at(Operation::Stop, "silent keepalive Stop", e))
     }
 
     fn fill_silence(&mut self) -> Result<()> {

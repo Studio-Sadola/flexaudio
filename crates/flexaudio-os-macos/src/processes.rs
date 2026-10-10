@@ -34,7 +34,7 @@ use objc2_core_audio::{
 use flexaudio_core::process_list::executable_basename;
 use flexaudio_core::types::{ProcessInfo, Result};
 
-use crate::common::{map_os_status, read_cfstring_property, read_system_object_list, NO_ERR};
+use crate::common::{map_os_status_at, read_cfstring_property, read_system_object_list, NO_ERR};
 
 // libproc (always present in libSystem). Writes the PID's executable path to the buffer and
 // returns the number of bytes written, excluding NUL. Returns 0 or less on failure.
@@ -49,15 +49,21 @@ const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
 ///
 /// Versions earlier than 14.4 return [`Error::UnsupportedOsVersion`](flexaudio_core::types::Error).
 /// If the process object list itself cannot be read, map the `OSStatus` to a typed error
-/// ([`map_os_status`]). Skip objects whose PID cannot be read.
+/// ([`map_os_status_at`]). Skip objects whose PID cannot be read.
 /// Includes all processes known to Core Audio, including input-only processes. No property can
 /// exclude only processes that have never had output (`Devices` lists devices in use now, and
 /// `IsRunningOutput` indicates whether output is active now).
 pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     crate::version::ensure_process_tap_supported()?;
 
-    let objects = read_system_object_list(kAudioHardwarePropertyProcessObjectList)
-        .map_err(|status| map_os_status("AudioObjectGetPropertyData(ProcessObjectList)", status))?;
+    let objects =
+        read_system_object_list(kAudioHardwarePropertyProcessObjectList).map_err(|status| {
+            map_os_status_at(
+                flexaudio_core::Operation::Enumerate,
+                "AudioObjectGetPropertyData(ProcessObjectList)",
+                status,
+            )
+        })?;
 
     let mut out = Vec::with_capacity(objects.len());
     for object in objects {

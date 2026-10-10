@@ -44,6 +44,8 @@ mod common;
 #[cfg(target_os = "windows")]
 mod keepalive;
 #[cfg(target_os = "windows")]
+mod owner;
+#[cfg(target_os = "windows")]
 mod process;
 #[cfg(target_os = "windows")]
 mod processes;

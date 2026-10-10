@@ -32,6 +32,7 @@ use windows::Win32::System::Threading::{
 
 use crate::keepalive::SilentRender;
 use crate::lifecycle::{check_wait_result, Session, StreamClient};
+use flexaudio_core::{ErrorContext, NativeStatus, Operation, ShutdownReport};
 
 /// Classify access-denied and device-unavailable HRESULTs as typed [`Error`] variants.
 ///
@@ -40,7 +41,7 @@ use crate::lifecycle::{check_wait_result, Session, StreamClient};
 ///   system/process capture. Microphone consent is checked in `flexaudio-mic`.
 /// - Exclusive-use/policy conflicts → [`Error::Backend`]; these do not establish
 ///   a recording-consent denial.
-/// - Device unavailable or invalidated → [`Error::DeviceNotFound`]:
+/// - Device invalidation → [`Error::DeviceLost`]; missing endpoint → [`Error::DeviceNotFound`]:
 ///   `AUDCLNT_E_DEVICE_INVALIDATED` (the endpoint/device disappeared or was
 ///   invalidated) and `E_NOTFOUND` (the item/endpoint does not exist).
 ///
@@ -66,7 +67,8 @@ pub(crate) fn classify_hr(code: i32) -> Option<Error> {
         AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => {
             Some(Error::Backend("exclusive audio mode is disallowed".into()))
         }
-        AUDCLNT_E_DEVICE_INVALIDATED | E_NOTFOUND => Some(Error::DeviceNotFound),
+        AUDCLNT_E_DEVICE_INVALIDATED => Some(Error::DeviceLost),
+        E_NOTFOUND => Some(Error::DeviceNotFound),
         _ => None,
     }
 }
@@ -76,11 +78,25 @@ pub(crate) fn classify_hr(code: i32) -> Option<Error> {
 /// [`classify_hr`] maps access-denied and device-unavailable codes to typed
 /// variants ([`Error::PermissionDenied`] / [`Error::DeviceNotFound`]); unknown
 /// codes fall back to a contextual [`Error::Backend`].
-pub(crate) fn map_hr(ctx: &str, e: windows::core::Error) -> Error {
-    if let Some(mapped) = classify_hr(e.code().0) {
-        return mapped;
-    }
-    Error::Backend(format!("{ctx}: {e}"))
+pub(crate) fn map_hr(call: &'static str, e: windows::core::Error) -> Error {
+    map_hr_at(Operation::Start, call, e)
+}
+
+pub(crate) fn map_hr_at(
+    operation: Operation,
+    call: &'static str,
+    e: windows::core::Error,
+) -> Error {
+    let code = e.code();
+    // Derive the explanation from the OS status, never an attached external message.
+    classify_hr(code.0)
+        .unwrap_or_else(|| Error::Backend(windows::core::Error::from(code).message().to_string()))
+        .with_context(
+            ErrorContext::new(operation).with_native_status(NativeStatus::HResult {
+                call,
+                bits: code.0 as u32,
+            }),
+        )
 }
 
 /// Monotonic clock in ns. Uses the core [`monotonic_now_ns`] directly. The
@@ -124,7 +140,7 @@ impl Drop for ComThread {
 
 /// Parse `WAVEFORMATEX` (or `WAVEFORMATEXTENSIBLE` if needed) and return
 /// `Ok((rate, channels))` if the subformat is IEEE float. PCM integer formats
-/// are unsupported and return [`Error::Backend`]. Shared-mode MixFormat is
+/// are unsupported and return [`Error::UnsupportedFormat`]. Shared-mode MixFormat is
 /// typically float on real hardware.
 ///
 /// `WAVEFORMATEX` / `WAVEFORMATEXTENSIBLE` use `#[repr(C, packed(1))]`, so
@@ -132,12 +148,16 @@ impl Drop for ComThread {
 /// `read_unaligned` without taking references.
 ///
 /// # Safety
-/// `pwfx` must point to a valid `WAVEFORMATEX` (returned by `GetMixFormat`).
+/// `pwfx` must point to a valid `WAVEFORMATEX` (returned by `GetMixFormat`),
+/// including its declared extension bytes when `cbSize >= 22`.
 pub(crate) unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32, u16), Error> {
     use core::ptr::addr_of;
 
     if pwfx.is_null() {
-        return Err(Error::Backend("GetMixFormat returned null format".into()));
+        return Err(
+            Error::Backend("native format query returned no description".into())
+                .with_context(ErrorContext::new(Operation::Start)),
+        );
     }
     // Read packed fields by copying their values.
     let format_tag = addr_of!((*pwfx).wFormatTag).read_unaligned();
@@ -145,6 +165,24 @@ pub(crate) unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32,
     let channels = addr_of!((*pwfx).nChannels).read_unaligned();
     let bits = addr_of!((*pwfx).wBitsPerSample).read_unaligned();
     let cb_size = addr_of!((*pwfx).cbSize).read_unaligned();
+    let alignment = addr_of!((*pwfx).nBlockAlign).read_unaligned();
+    let byte_rate = addr_of!((*pwfx).nAvgBytesPerSec).read_unaligned();
+
+    if rate == 0 || channels == 0 {
+        return Err(Error::InvalidArg(
+            "native rate and channels must be positive".into(),
+        ));
+    }
+    if channels > 2 || bits != 32 || alignment != channels * 4 {
+        return Err(Error::UnsupportedFormat(
+            "native input must be mono or stereo f32 with complete frames".into(),
+        ));
+    }
+    if rate.checked_mul(u32::from(alignment)) != Some(byte_rate) {
+        return Err(Error::UnsupportedFormat(
+            "native byte rate does not match frame alignment".into(),
+        ));
+    }
 
     // Constants are u32. Compare with `==` so identifiers in match patterns are not mistaken for bindings.
     let tag = format_tag as u32;
@@ -153,7 +191,15 @@ pub(crate) unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32,
     } else if tag == WAVE_FORMAT_EXTENSIBLE {
         // Treat as EXTENSIBLE if cbSize is at least 22 bytes, the extension size.
         if (cb_size as usize) >= 22 {
-            let sub = addr_of!((*(pwfx as *const WAVEFORMATEXTENSIBLE)).SubFormat).read_unaligned();
+            let extension = pwfx.cast::<WAVEFORMATEXTENSIBLE>();
+            let valid_bits = addr_of!((*extension).Samples.wValidBitsPerSample).read_unaligned();
+            let mask = addr_of!((*extension).dwChannelMask).read_unaligned();
+            if valid_bits != 32 || (mask != 0 && mask.count_ones() != u32::from(channels)) {
+                return Err(Error::UnsupportedFormat(
+                    "native valid bits or speaker mask do not match the float format".into(),
+                ));
+            }
+            let sub = addr_of!((*extension).SubFormat).read_unaligned();
             sub == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
         } else {
             false
@@ -163,7 +209,7 @@ pub(crate) unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32,
     };
 
     if !is_float {
-        return Err(Error::Backend(format!(
+        return Err(Error::UnsupportedFormat(format!(
             "unsupported mix format (not IEEE float): tag={tag} bits={bits}"
         )));
     }
@@ -209,7 +255,8 @@ impl StreamClient for CaptureClient<'_> {
         unsafe { self.0.Start() }.map_err(|e| map_hr("IAudioClient::Start(capture)", e))
     }
     fn stop(&mut self) -> Result<(), Error> {
-        unsafe { self.0.Stop() }.map_err(|e| map_hr("IAudioClient::Stop(capture)", e))
+        unsafe { self.0.Stop() }
+            .map_err(|e| map_hr_at(Operation::Stop, "IAudioClient::Stop(capture)", e))
     }
     fn fill_silence(&mut self) -> Result<(), Error> {
         Ok(())
@@ -326,7 +373,7 @@ pub(crate) unsafe fn capture_loop(
     })();
     let stopped = session.stop();
     // Session drops before capture/event/COM, and render stops after capture.
-    result.and(stopped)
+    ShutdownReport::new(result.err(), stopped.err().into_iter().collect()).result()
 }
 
 /// Shared sequence that initializes `client` in shared mode with
@@ -413,13 +460,13 @@ mod tests {
         ));
     }
 
-    /// Device-unavailable/invalidated HRESULTs are classified as DeviceNotFound.
+    /// Missing endpoints and invalidated devices retain distinct error kinds.
     #[test]
     fn classify_hr_maps_device_codes_to_device_not_found() {
         // AUDCLNT_E_DEVICE_INVALIDATED
         assert!(matches!(
             classify_hr(0x88890004u32 as i32),
-            Some(Error::DeviceNotFound)
+            Some(Error::DeviceLost)
         ));
         // E_NOTFOUND
         assert!(matches!(
@@ -445,7 +492,6 @@ mod repro_tests {
     use super::*;
 
     #[test]
-    #[ignore = "repro: C F18 / D M7 invalidation"]
     fn repro_p6_device_invalidation_is_device_lost() {
         assert!(matches!(
             classify_hr(0x88890004u32 as i32),
@@ -454,13 +500,25 @@ mod repro_tests {
     }
 
     #[test]
-    #[ignore = "repro: C F17 / D M7 native context"]
     fn repro_p6_classified_hresult_retains_operation() {
         let error = map_hr(
             "IAudioClient::Initialize",
             windows::core::Error::from(windows::core::HRESULT(0x8889000Au32 as i32)),
         );
-        assert!(error.to_string().contains("IAudioClient::Initialize"));
+        assert_eq!(error.kind(), flexaudio_core::ErrorKind::Backend);
+        let Error::Context { context, .. } = &error else {
+            panic!("missing native context")
+        };
+        assert_eq!(context.operation(), Operation::Start);
+        assert_eq!(
+            context.native_status(),
+            Some(NativeStatus::HResult {
+                call: "IAudioClient::Initialize",
+                bits: 0x8889000A
+            })
+        );
+        assert!(!error.to_string().contains("IAudioClient::Initialize"));
+        assert!(error.to_string().contains("exclusive use"));
     }
 
     fn float_format() -> WAVEFORMATEX {
@@ -476,7 +534,36 @@ mod repro_tests {
     }
 
     #[test]
-    #[ignore = "repro: C F34 NEW Windows validator"]
+    fn supported_float_formats_remain_accepted() {
+        let mut format = float_format();
+        // SAFETY: a complete, initialized native description with no extension.
+        assert_eq!(unsafe { parse_mix_format(&format) }, Ok((48_000, 2)));
+        format.nChannels = 1;
+        format.nBlockAlign = 4;
+        format.nAvgBytesPerSec = 192_000;
+        // SAFETY: complete mono native description.
+        assert_eq!(unsafe { parse_mix_format(&format) }, Ok((48_000, 1)));
+        let mut format = WAVEFORMATEXTENSIBLE {
+            Format: float_format(),
+            Samples: windows::Win32::Media::Audio::WAVEFORMATEXTENSIBLE_0 {
+                wValidBitsPerSample: 32,
+            },
+            dwChannelMask: 3,
+            SubFormat: KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+        };
+        format.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE as u16;
+        format.Format.cbSize = 22;
+        for mask in [3, 0] {
+            format.dwChannelMask = mask; // An unspecified speaker mask is allowed.
+                                         // SAFETY: the complete initialized extension matches cbSize.
+            assert_eq!(
+                unsafe { parse_mix_format(std::ptr::addr_of!(format.Format)) },
+                Ok((48_000, 2))
+            );
+        }
+    }
+
+    #[test]
     fn repro_p6_float_sample_width_must_be_32() {
         let mut format = float_format();
         format.wBitsPerSample = 64;
@@ -487,7 +574,6 @@ mod repro_tests {
     }
 
     #[test]
-    #[ignore = "repro: C F34 NEW Windows validator"]
     fn repro_p6_inconsistent_frame_alignment_is_rejected() {
         let mut format = float_format();
         format.nBlockAlign = 4; // Stereo f32 requires eight bytes per frame.
@@ -496,7 +582,6 @@ mod repro_tests {
     }
 
     #[test]
-    #[ignore = "repro: C F34 NEW Windows validator"]
     fn repro_p6_inconsistent_byte_rate_is_rejected() {
         let mut format = float_format();
         format.nAvgBytesPerSec = 1;
@@ -505,7 +590,6 @@ mod repro_tests {
     }
 
     #[test]
-    #[ignore = "repro: C F34 NEW Windows validator"]
     fn repro_p6_extensible_channel_mask_matches_channel_count() {
         let mut format = WAVEFORMATEXTENSIBLE {
             Format: float_format(),

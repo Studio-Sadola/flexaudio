@@ -5,6 +5,7 @@ use std::sync::{Mutex, MutexGuard};
 use flexaudio_core::types::{Error, Result};
 
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub(crate) enum StartAction {
     Start,
     AlreadyRunning,
@@ -17,6 +18,9 @@ pub(crate) struct TerminalFailure {
 }
 
 impl TerminalFailure {
+    pub(crate) fn error(&self) -> Option<Error> {
+        self.state().clone()
+    }
     fn state(&self) -> MutexGuard<'_, Option<Error>> {
         match self.error.lock() {
             Ok(error) => error,
