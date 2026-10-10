@@ -3038,3 +3038,274 @@ mod tests {
         assert_eq!(ev.at_ns, Some(1_500_000_000));
     }
 }
+
+#[cfg(test)]
+mod reproduction_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "repro: C F44"]
+    fn repro_p9_error_kind() {
+        let missing = to_napi_err(flexaudio::Error::DeviceNotFound);
+        let lost = to_napi_err(flexaudio::Error::DeviceLost);
+        assert_ne!(
+            missing.status, lost.status,
+            "distinct core kinds collapse to GenericFailure"
+        );
+    }
+
+    #[test]
+    #[ignore = "repro: C F44"]
+    fn repro_p9_invalid_arg_kind() {
+        let mapped = to_napi_err(flexaudio::Error::InvalidArg("invalid rate".into()));
+        assert_eq!(mapped.status, Status::InvalidArg);
+    }
+
+    #[test]
+    fn repro_p9_error_control() {
+        let mapped = to_napi_err(flexaudio::Error::Backend("control cause".into()));
+        assert_eq!(mapped.status, Status::GenericFailure);
+        assert!(mapped.reason.contains("control cause"));
+    }
+
+    #[test]
+    #[ignore = "repro: D L7 counters"]
+    fn repro_p9_counter_cast() {
+        let event = event_to_js(Event::ChunkDropped { count: u64::MAX });
+        assert!(
+            event.count.unwrap() >= 0,
+            "positive u64 drop count becomes negative i64"
+        );
+    }
+    #[test]
+    fn repro_p9_counter_control() {
+        assert_eq!(event_to_js(Event::ChunkDropped { count: 7 }).count, Some(7));
+    }
+
+    #[test]
+    #[ignore = "repro: D M9"]
+    fn repro_p9_event_union() {
+        // A widening to arbitrary strings prevents exhaustive checking of the public event contract.
+        let declarations = include_str!("../index.d.ts");
+        let stream = declarations
+            .split("export interface JsStreamEvent {")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(
+            !stream.contains("type: string"),
+            "JsStreamEvent.type accepts arbitrary strings"
+        );
+    }
+
+    #[test]
+    #[ignore = "repro: D M9"]
+    fn repro_p9_device_event_union() {
+        let declarations = include_str!("../index.d.ts");
+        let device = declarations
+            .split("export interface JsDeviceEvent {")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(
+            !device.contains("type: string"),
+            "JsDeviceEvent.type accepts arbitrary strings"
+        );
+    }
+
+    #[test]
+    fn repro_p9_event_union_control() {
+        let declarations = include_str!("../index.d.ts");
+        let vad = declarations
+            .split("export interface JsVadEvent {")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(!vad.contains("type: string"));
+        assert!(vad.contains("speechStart"));
+    }
+}
+
+// Build the test addon with cargo rustc --lib -- --cfg test.
+#[cfg(test)]
+mod reproduction_bridge {
+    use super::*;
+
+    // napi-derive disables automatic registration under cfg(test). Register only these test
+    // exports explicitly; expose the real FlexStream::stop through a plain JS object.
+    #[allow(unexpected_cfgs)]
+    #[cfg(flexaudio_repro_addon)]
+    #[napi::bindgen_prelude::ctor]
+    fn register_test_exports() {
+        napi::bindgen_prelude::register_module_export(None, "__reproP9Bridge\0", export_bridge);
+        napi::bindgen_prelude::register_module_export(None, "__openMockStream\0", export_mock);
+    }
+
+    fn js_stream(env: &Env, stream: FlexStream) -> napi::Result<JsObject> {
+        let mut object = env.create_object()?;
+        let stop = env.create_function_from_closure("stop", move |ctx| stream.stop(*ctx.env))?;
+        object.set_named_property("stop", stop)?;
+        Ok(object)
+    }
+
+    unsafe fn export_bridge(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
+        let env = Env::from_raw(raw_env);
+        let function = env.create_function_from_closure("__reproP9Bridge", |ctx| {
+            let scenario = ctx.get::<napi::JsString>(0)?.into_utf8()?.as_str()?.to_owned();
+            let callback = ctx.get::<napi::JsFunction>(1)?;
+            let callback = unsafe { Function::from_napi_value(ctx.env.raw(), callback.raw())? };
+            let stream = repro_p9_bridge(*ctx.env, scenario, callback)?;
+            js_stream(ctx.env, stream)
+        })?;
+        Ok(function.raw())
+    }
+
+    unsafe fn export_mock(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
+        let env = Env::from_raw(raw_env);
+        let function = env.create_function_from_closure("__openMockStream", |ctx| {
+            let rate = ctx.get::<napi::JsNumber>(0)?.get_uint32()?;
+            let channels = u16::try_from(ctx.get::<napi::JsNumber>(1)?.get_uint32()?)
+                .map_err(|_| NapiError::new(Status::InvalidArg, "channels exceed u16"))?;
+            let frequency = ctx.get::<napi::JsNumber>(2)?.get_double()?;
+            let callback = ctx.get::<napi::JsFunction>(3)?;
+            let callback = unsafe { Function::from_napi_value(ctx.env.raw(), callback.raw())? };
+            let stream = open_mock_stream(*ctx.env, rate, channels, frequency, callback,
+                None, None, None, None, None)?;
+            js_stream(ctx.env, stream)
+        })?;
+        Ok(function.raw())
+    }
+
+    #[napi(js_name = "__reproP9Bridge")]
+    pub fn repro_p9_bridge(
+        env: Env,
+        scenario: String,
+        on_chunk: Function<JsAudioChunk, Unknown>,
+    ) -> napi::Result<FlexStream> {
+        let phase = Arc::new(Mutex::new(StopPhase::Running));
+        let terminal: TerminalError = Arc::new(Mutex::new(None));
+        let user = make_user_chunk_cb(&env, &on_chunk)?;
+        let weak: ChunkTsfnWeakCell = Arc::new(OnceLock::new());
+        let chunk = make_chunk_tsfn(
+            &env,
+            phase.clone(),
+            user.clone(),
+            weak.clone(),
+            terminal.clone(),
+        )?;
+        let settle = make_settle_tsfn(&env, phase.clone(), weak, user, terminal.clone())?;
+        let mut bridge = PairingBridge {
+            on_chunk: chunk.as_ref().clone(),
+            stop_phase: phase.clone(),
+            vad: None,
+            vad_tap: VadTap::Primary,
+            vad_rate: 16000,
+            vad_last_dropped: 0,
+            vad_anchor_sample: 0,
+            vad_anchor_pts: 0,
+            pending_flush_events: Vec::new(),
+            output_rate: 48000,
+            output_channels: 1,
+            secondary: Some(SecondaryTapCfg {
+                rate: 48000,
+                channels: 1,
+                encoding: SecEncoding::F32,
+            }),
+            primary_fifo: VecDeque::new(),
+            secondary_fifo: VecDeque::new(),
+            last_emitted_primary_pts: 0,
+        };
+        #[cfg(target_os = "linux")]
+        if scenario == "exhaust" || scenario == "reaper" {
+            // Reduce only this probe child's thread allowance after Node/TSFN initialization.
+            #[repr(C)]
+            struct Limit {
+                soft: u64,
+                hard: u64,
+            }
+            unsafe extern "C" {
+                fn getrlimit(resource: i32, limit: *mut Limit) -> i32;
+                fn setrlimit(resource: i32, limit: *const Limit) -> i32;
+            }
+            let mut stream = flexaudio::Stream::open(
+                StreamConfig::default(),
+                Box::new(flexaudio::MockBackend::new(48000, 2, 440.0)),
+            )
+            .map_err(to_napi_err)?;
+            let restrict_threads = || {
+                let mut limit = Limit { soft: 0, hard: 0 };
+                // SAFETY: Linux RLIMIT_NPROC=6 and a valid Linux x64 rlimit.
+                unsafe {
+                    assert_eq!(getrlimit(6, &mut limit), 0);
+                    limit.soft = 0;
+                    assert_eq!(setrlimit(6, &limit), 0);
+                }
+            };
+            if scenario == "reaper" {
+                stream.start().map_err(to_napi_err)?;
+                let created = FlexStream::spawn(stream, bridge, None, chunk, settle, terminal);
+                restrict_threads();
+                return Ok(created);
+            }
+            restrict_threads();
+            return Ok(FlexStream::spawn(
+                stream, bridge, None, chunk, settle, terminal,
+            ));
+        }
+        let handle = thread::spawn(move || {
+            if scenario == "panic" {
+                panic!("repro: C F37 bridge failure");
+            }
+            let primary_pts = if scenario == "orphan" { 100_000_000 } else { 0 };
+            let secondary_pts = if scenario == "residual" {
+                100_000_000
+            } else {
+                0
+            };
+            bridge.on_secondary(SecondaryChunk {
+                samples: vec![0.25; 960],
+                frames: 960,
+                pts_ns: secondary_pts,
+                seq: 7,
+                flags: ChunkFlags::empty(),
+                dropped_before: 3,
+                peak: 0.25,
+                rms: 0.25,
+            });
+            bridge.secondary_fifo.back_mut().unwrap().vad_events = Some(vec![JsVadEvent {
+                kind: "speechEnd".into(),
+                at_sample: 960,
+                at_ns: Some(20_000_000),
+            }]);
+            bridge.on_primary(AudioChunk {
+                data: vec![0.25; 960],
+                frames: 960,
+                pts_ns: primary_pts,
+                seq: 7,
+                flags: ChunkFlags::empty(),
+                dropped_before: 3,
+                peak: 0.25,
+                rms: 0.25,
+            });
+            bridge.drain_pairs();
+            bridge.flush_vad_final();
+        });
+        Ok(FlexStream {
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            inner: Arc::new(Mutex::new(StreamInner {
+                handle: Some(handle),
+                cmd_tx: None,
+            })),
+            stop_phase: phase,
+            chunk_tsfn: chunk,
+            settle_tsfn: settle,
+            terminal,
+        })
+    }
+}

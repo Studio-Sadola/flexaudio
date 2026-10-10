@@ -149,3 +149,56 @@ mod tests {
         w.stop();
     }
 }
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "repro: F26"]
+    fn repro_p2_watcher_start_error() {
+        // Environment is restricted to a child process, so concurrently running
+        // tests and the user's PipeWire session are untouched. No daemon is started.
+        if std::env::var_os("FLEXAUDIO_REPRO_WATCHER_CHILD").is_none() {
+            let directory = std::env::temp_dir()
+                .join(format!("flexaudio-repro-watcher-{}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "device_watcher::repro_tests::repro_p2_watcher_start_error",
+                    "--exact",
+                    "--include-ignored",
+                    "--nocapture",
+                ])
+                .env("FLEXAUDIO_REPRO_WATCHER_CHILD", "1")
+                .env("XDG_RUNTIME_DIR", &directory)
+                .env("PIPEWIRE_RUNTIME_DIR", &directory)
+                .env("PIPEWIRE_REMOTE", "absent-repro-server")
+                .output()
+                .unwrap();
+            std::fs::remove_dir(directory).unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            return;
+        }
+        let original = flexaudio_os_linux::PwDeviceWatcher::start()
+            .err()
+            .expect("fixture must fail native watcher startup");
+        let result = watch_devices();
+        assert!(
+            result.is_err(),
+            "F26: native startup error={original}; facade returned Ok(NoopWatcher)"
+        );
+    }
+    #[test]
+    fn repro_p2_watcher_start_error_control() {
+        // Intentional no-op is benign on unsupported platforms, unlike failed
+        // Linux startup. Exercise the same facade wrapper and pull interface.
+        let mut watcher = DeviceWatcher {
+            inner: Box::new(NoopWatcher),
+        };
+        assert!(watcher.poll_event().is_none());
+        watcher.stop();
+    }
+}

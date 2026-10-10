@@ -270,3 +270,30 @@ mod tests {
         let _ = encode_err_to_py(flexaudio_encode::EncodeError::Unsupported("x".into()));
     }
 }
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+    #[test]
+    #[ignore = "repro: C F44"]
+    fn repro_p10_f44_device_errors_keep_distinct_kinds() {
+        Python::initialize();
+        Python::attach(|py| {
+            let missing = to_py_err(fa::Error::DeviceNotFound);
+            let lost = to_py_err(fa::Error::DeviceLost);
+            assert!(
+                !missing.get_type(py).is(&lost.get_type(py)),
+                "DeviceNotFound and DeviceLost both map to RuntimeError with no typed kind"
+            );
+        });
+    }
+    #[test]
+    fn repro_p10_control_invalid_arg_is_value_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            let error = to_py_err(fa::Error::InvalidArg("benign validation".into()));
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert!(error.to_string().contains("benign validation"));
+        });
+    }
+}

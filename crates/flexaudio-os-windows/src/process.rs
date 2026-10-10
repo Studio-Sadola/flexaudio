@@ -512,3 +512,36 @@ mod tests {
         assert!(got > 0, "expected captured samples, got none");
     }
 }
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "repro: C F36 activation signalling"]
+    fn repro_p6_activation_signalling_failure_is_returned() {
+        // A null event deterministically fails SetEvent; no activation or device is opened.
+        let handler = ActivationHandler {
+            done: HANDLE::default(),
+        };
+        assert!(handler.ActivateCompleted(None).is_err());
+    }
+
+    #[test]
+    #[ignore = "repro: C F37 / D L13 owner failure"]
+    fn repro_p6_stop_reports_owner_error() {
+        let mut backend = WasapiProcessBackend::new(1, ProcessMode::Include);
+        backend.handle = Some(thread::spawn(|| {
+            Err(Error::Backend("injected owner shutdown failure".into()))
+        }));
+        backend.stop();
+        assert!(
+            backend.pending_error.is_some(),
+            "control: join retained the error"
+        );
+        assert!(
+            backend.poll_event().is_some(),
+            "explicit stop must expose the error without another start"
+        );
+    }
+}

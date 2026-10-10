@@ -211,7 +211,10 @@ fn permission_denied_on_reopen_closes_stream() {
         let mut be = stream.shared.backend.lock().unwrap();
         be.stop();
     }
-    assert_eq!(Stream::open_backend_once(&stream.shared), Err(denial()));
+    assert_eq!(
+        Stream::open_backend_once(&stream.shared, GenerationChange::Recovery),
+        Err(denial())
+    );
     assert_terminal(&mut stream);
     assert_eq!(starts.load(Ordering::SeqCst), 2);
     assert_eq!(stream.poll_event(), Some(denied_event()));

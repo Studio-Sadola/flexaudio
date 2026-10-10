@@ -122,6 +122,32 @@ When `denoise` / `has_vad` is enabled, each chunk passes through **denoise → V
 NULL if `output_rate` is not 48000). Confirmed VAD events are stored in
 `FlexChunk::vad_events` and freed along with `data` by `flexaudio_chunk_free`.
 
+VAD emits `SpeechStart` and `SpeechEnd` together when a segment is finalized,
+not when speech first begins. On `DISCONTINUITY` (`flags & 1`), an open pre-gap
+segment is flushed before the post-gap PCM is processed. Flushed events come
+first and retain their pre-gap `at_sample` values; VAD then restarts its sample
+clock at zero. Positions are measured at the VAD rate (16000 or 8000 Hz), not
+in the chunk's PCM or `pts_ns` timeline.
+
+Consumers distinguish timelines by the discontinuity chunk: the core always
+delivers 20 ms chunks, which cannot complete a fresh 32 ms VAD inference frame.
+Consequently **all events on the discontinuity chunk belong to the pre-gap
+timeline**, and all events on subsequent chunks belong to the new timeline.
+Handle that chunk's events under the previous timeline before advancing your
+VAD timeline; the chunk's PCM itself already belongs to the post-gap timeline.
+For example, a flushed pair at 0/512 on the discontinuity chunk is old; a pair
+at 0/1024 delivered later is new. Do not infer the boundary from a decrease in
+`at_sample`: delayed post-gap speech need not produce one. A mixed event list
+from larger chunks would require an explicit flushed-event count or timeline
+identifier; larger chunks are not supported by the current core.
+
+If the discontinuity flush fails, VAD reset is still attempted and denoise is
+still reset before `flexaudio_poll_chunk` returns `FLEX_FAILURE` and records the
+flush error in `flexaudio_last_error()`. That poll consumes the chunk. When
+reset succeeds, later chunks process normally without repeating that flush
+error. If VAD reset itself fails, its failure remains latched and subsequent
+processing reports it until a reset succeeds.
+
 ```c
 FlexConfig cfg = {0};
 cfg.kind = FLEX_SOURCE_KIND_MIC;

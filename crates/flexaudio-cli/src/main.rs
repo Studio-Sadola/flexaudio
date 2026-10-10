@@ -628,6 +628,37 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     let out_rate = output.sample_rate;
     let out_ch = output.channels;
 
+    // `--split-seconds × output rate` is the per-file frame threshold. Reject a product that
+    // overflows u64 here, before any device access, so the writer never has to fall back on a
+    // saturated threshold (`parse_sources` has already bounded the `--sources` alternative).
+    if cli.split_seconds > 0
+        && cli
+            .split_seconds
+            .checked_mul(u64::from(cli.output_rate))
+            .is_none()
+    {
+        return Err(describe_error(Error::InvalidArg(format!(
+            "--split-seconds {} is too large for --output-rate {} (the per-file frame count \
+             overflows)",
+            cli.split_seconds, cli.output_rate
+        ))));
+    }
+
+    // Validate that the recording deadline (`start + total duration`) is representable before
+    // opening the stream, so an unsatisfiable duration (for example `--seconds` near u64::MAX)
+    // fails with a typed argument error before any device access or capture start. `Instant::now()
+    // .checked_add` is enough to prove representability. The later `checked_add` calls in run_wav /
+    // run_stdout_stream remain as defensive guards (they must not panic).
+    let total_duration = match &segments {
+        Some(segs) => SwitchScheduler::total_duration(segs),
+        None => Duration::from_secs(cli.seconds),
+    };
+    if Instant::now().checked_add(total_duration).is_none() {
+        return Err(describe_error(Error::InvalidArg(
+            "the recording duration is too large: its deadline overflows the clock".into(),
+        )));
+    }
+
     // Open the stream. `open` selects a `Box<dyn CaptureBackend>` internally based on config.kind.
     // Do not start it yet (two-stage flow). Read native_format from the opened Stream.
     let config = config_for_kind(cli, kind);
@@ -957,8 +988,14 @@ fn run_wav(
     let mut writer = RotatingWavWriter::new(&cli.out, output, cli.split_seconds);
     let mut chunk_count: u64 = 0;
 
-    // Poll chunks for the full recording duration and write them all.
-    let deadline = start + total;
+    // Poll chunks for the full recording duration and write them all. A duration that no clock can
+    // reach (for example `--seconds` near u64::MAX) is a typed argument error, not a panic.
+    let Some(deadline) = start.checked_add(total) else {
+        stream.stop();
+        return Err(describe_error(Error::InvalidArg(
+            "the recording duration is too large: its deadline overflows the clock".into(),
+        )));
+    };
     while Instant::now() < deadline {
         // Switch sources at segment boundaries, independently of output-file rotation.
         if let Some(sch) = scheduler.as_mut() {
@@ -1102,6 +1139,8 @@ fn run_stdout_stream(
 
     let start = Instant::now();
     // Finite recording deadline: sum of segment durations with `--sources`, otherwise `--seconds`.
+    // A duration that no clock can reach (for example `--seconds` near u64::MAX) is a typed argument
+    // error, not a panic.
     let deadline = if infinite {
         None
     } else {
@@ -1109,7 +1148,15 @@ fn run_stdout_stream(
             Some(segs) => SwitchScheduler::total_duration(segs),
             None => Duration::from_secs(cli.seconds),
         };
-        Some(start + dur)
+        match start.checked_add(dur) {
+            Some(deadline) => Some(deadline),
+            None => {
+                stream.stop();
+                return Err(describe_error(Error::InvalidArg(
+                    "the recording duration is too large: its deadline overflows the clock".into(),
+                )));
+            }
+        }
     };
     // Hot-swap scheduler (only with `--sources`; stdout remains one pipe).
     let mut scheduler = segments.map(|segs| SwitchScheduler::new(cli, segs, start));
@@ -1338,7 +1385,10 @@ impl RotatingWavWriter {
         Self {
             base: out.to_path_buf(),
             spec,
-            frames_per_file: split_seconds * output.sample_rate as u64,
+            // Saturating, never panicking: `run` rejects a `--split-seconds` whose product with the
+            // output rate overflows u64 before this is constructed, and a saturated threshold only
+            // means "no file ever reaches the boundary".
+            frames_per_file: split_seconds.saturating_mul(u64::from(output.sample_rate)),
             writer: None,
             frames_in_current: 0,
             files: Vec::new(),
@@ -2254,6 +2304,16 @@ mod tests {
         assert!(err.contains("cannot be combined"), "err: {err}");
     }
 
+    /// A recording deadline that no clock can reach (--seconds near u64::MAX) is rejected by `run`
+    /// with the overflow InvalidArg *before* the stream is opened/started: the returned message is
+    /// the preflight overflow error, not a device/open error, and no device is required here.
+    #[test]
+    fn run_rejects_duration_overflow_before_opening_stream() {
+        let cli = cli_from(&["--seconds", "18446744073709551615"]);
+        let err = run(&cli).expect_err("overflow must be rejected before open");
+        assert!(err.contains("deadline overflows the clock"), "err: {err}");
+    }
+
     /// s16 quantization in `write_chunk`: f32 -> i16. Uses the shared canonical `quantize_i16`
     /// (scale 32768, round, clamp, NaN->0). Negative full scale `-1.0` becomes `-32768`; values
     /// outside the range saturate.
@@ -2311,5 +2371,151 @@ mod tests {
     fn fmt_dbfs_finite_and_infinite() {
         assert!(fmt_dbfs(-6.0).contains("dBFS"));
         assert!(fmt_dbfs(f64::NEG_INFINITY).contains("silence"));
+    }
+}
+
+#[cfg(test)]
+mod reproduction_tests {
+    use super::*;
+    fn cli_from(args: &[&str]) -> Cli {
+        let mut full = vec!["flexaudio-cli"];
+        full.extend_from_slice(args);
+        Cli::try_parse_from(full).unwrap()
+    }
+    fn test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("flexaudio-repro-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    // Offline audit reproductions. These exercise the existing CLI paths without devices.
+    struct ReproFinalEventBackend {
+        inner: flexaudio::MockBackend,
+        stopped: bool,
+        final_event: Option<flexaudio::Event>,
+    }
+
+    impl flexaudio::core::CaptureBackend for ReproFinalEventBackend {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 1)
+        }
+        fn start(&mut self, sink: flexaudio::core::RawSink) -> flexaudio::core::Result<()> {
+            self.inner.start(sink)
+        }
+        fn stop(&mut self) {
+            self.inner.stop();
+            self.stopped = true;
+        }
+        fn poll_event(&mut self) -> Option<flexaudio::Event> {
+            if self.stopped {
+                self.final_event.take()
+            } else {
+                None
+            }
+        }
+    }
+
+    fn repro_wav_capture(final_event: Option<flexaudio::Event>) -> std::result::Result<(), String> {
+        let name = match &final_event {
+            Some(flexaudio::Event::Error(_)) => "repro_final_legacy",
+            Some(_) => "repro_final_typed",
+            None => "repro_final_control",
+        };
+        let dir = test_dir(name);
+        let mut cli = cli_from(&["--seconds", "1"]);
+        cli.out = dir.join("rec.wav");
+        let config = StreamConfig::default();
+        let output = config.output;
+        let backend = ReproFinalEventBackend {
+            inner: flexaudio::MockBackend::new(48_000, 1, 440.0),
+            stopped: false,
+            final_event,
+        };
+        let mut stream = Stream::open(config, Box::new(backend)).expect("mock open");
+        stream.start().expect("mock start");
+        let result = run_wav(&cli, &mut stream, output, None);
+        stream.stop();
+        std::fs::remove_dir_all(dir).expect("remove test output");
+        result
+    }
+
+    #[test]
+    #[ignore = "repro: C F48"]
+    fn repro_p12_f48_legacy_fatal_final_event() {
+        let result = repro_wav_capture(Some(flexaudio::Event::Error(
+            "normalizer push failed: injected fatal DSP failure".into(),
+        )));
+        assert!(
+            result.is_err(),
+            "fatal final event was reported but recording returned success"
+        );
+    }
+
+    #[test]
+    fn repro_p12_f48_control_and_typed_terminal() {
+        assert!(repro_wav_capture(None).is_ok());
+        let result = repro_wav_capture(Some(flexaudio::Event::TerminalError {
+            error: Error::Backend("injected terminal failure".into()),
+        }));
+        assert!(result
+            .expect_err("typed final error must fail")
+            .contains("injected terminal failure"));
+    }
+
+    #[test]
+    fn repro_p12_f50_split_overflow() {
+        let cli = cli_from(&["--split-seconds", "18446744073709551615"]);
+        let result = std::panic::catch_unwind(|| {
+            RotatingWavWriter::new(
+                Path::new("unused.wav"),
+                cli.output_format(),
+                cli.split_seconds,
+            )
+        });
+        assert!(result.is_ok(), "accepted split duration must not panic");
+    }
+
+    #[test]
+    fn repro_p12_f50_deadline_overflow() {
+        let cli = cli_from(&["--seconds", "18446744073709551615"]);
+        let config = StreamConfig::default();
+        let output = config.output;
+        let mut stream = Stream::open(
+            config,
+            Box::new(flexaudio::MockBackend::new(48_000, 1, 0.0)),
+        )
+        .expect("mock open");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_wav(&cli, &mut stream, output, None)
+        }));
+        stream.stop();
+        assert!(result.is_ok(), "accepted recording duration must not panic");
+    }
+
+    #[test]
+    fn repro_p12_f50_control() {
+        let cli = cli_from(&["--split-seconds", "1"]);
+        let writer = RotatingWavWriter::new(
+            Path::new("unused.wav"),
+            cli.output_format(),
+            cli.split_seconds,
+        );
+        assert_eq!(writer.frames_per_file, u64::from(cli.output_rate));
+        assert!(Instant::now()
+            .checked_add(Duration::from_secs(cli.seconds))
+            .is_some());
+    }
+
+    #[test]
+    fn repro_p12_split_path_and_permission_controls() {
+        assert!(validate_output_path(Path::new(".")).is_err());
+        assert!(validate_output_path(Path::new("recording.wav")).is_ok());
+        let message = describe_error(Error::PermissionDenied {
+            permission: flexaudio::Permission::SystemAudio,
+            detail: "target process access restricted".into(),
+        });
+        assert!(message.contains("system audio"));
+        assert!(message.contains("target process access restricted"));
+        assert!(!message.contains("Microphone permission denied"));
     }
 }

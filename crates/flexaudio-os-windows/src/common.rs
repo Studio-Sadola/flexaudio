@@ -439,3 +439,85 @@ mod tests {
         assert!(classify_hr(0x88890008u32 as i32).is_none());
     }
 }
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "repro: C F18 / D M7 invalidation"]
+    fn repro_p6_device_invalidation_is_device_lost() {
+        assert!(matches!(
+            classify_hr(0x88890004u32 as i32),
+            Some(Error::DeviceLost)
+        ));
+    }
+
+    #[test]
+    #[ignore = "repro: C F17 / D M7 native context"]
+    fn repro_p6_classified_hresult_retains_operation() {
+        let error = map_hr(
+            "IAudioClient::Initialize",
+            windows::core::Error::from(windows::core::HRESULT(0x8889000Au32 as i32)),
+        );
+        assert!(error.to_string().contains("IAudioClient::Initialize"));
+    }
+
+    fn float_format() -> WAVEFORMATEX {
+        WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_IEEE_FLOAT as u16,
+            nChannels: 2,
+            nSamplesPerSec: 48_000,
+            nAvgBytesPerSec: 384_000,
+            nBlockAlign: 8,
+            wBitsPerSample: 32,
+            cbSize: 0,
+        }
+    }
+
+    #[test]
+    #[ignore = "repro: C F34 NEW Windows validator"]
+    fn repro_p6_float_sample_width_must_be_32() {
+        let mut format = float_format();
+        format.wBitsPerSample = 64;
+        format.nBlockAlign = 16;
+        format.nAvgBytesPerSec = 768_000;
+        // SAFETY: a complete, initialized WAVEFORMATEX; no native calls or sample reads.
+        assert!(unsafe { parse_mix_format(&format) }.is_err());
+    }
+
+    #[test]
+    #[ignore = "repro: C F34 NEW Windows validator"]
+    fn repro_p6_inconsistent_frame_alignment_is_rejected() {
+        let mut format = float_format();
+        format.nBlockAlign = 4; // Stereo f32 requires eight bytes per frame.
+                                // SAFETY: a complete, initialized WAVEFORMATEX.
+        assert!(unsafe { parse_mix_format(&format) }.is_err());
+    }
+
+    #[test]
+    #[ignore = "repro: C F34 NEW Windows validator"]
+    fn repro_p6_inconsistent_byte_rate_is_rejected() {
+        let mut format = float_format();
+        format.nAvgBytesPerSec = 1;
+        // SAFETY: a complete, initialized WAVEFORMATEX.
+        assert!(unsafe { parse_mix_format(&format) }.is_err());
+    }
+
+    #[test]
+    #[ignore = "repro: C F34 NEW Windows validator"]
+    fn repro_p6_extensible_channel_mask_matches_channel_count() {
+        let mut format = WAVEFORMATEXTENSIBLE {
+            Format: float_format(),
+            Samples: windows::Win32::Media::Audio::WAVEFORMATEXTENSIBLE_0 {
+                wValidBitsPerSample: 32,
+            },
+            dwChannelMask: 1, // One speaker bit cannot describe two channels.
+            SubFormat: KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+        };
+        format.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE as u16;
+        format.Format.cbSize = 22;
+        // SAFETY: the complete extension is present and initialized, including cbSize.
+        assert!(unsafe { parse_mix_format(std::ptr::addr_of!(format.Format)) }.is_err());
+    }
+}

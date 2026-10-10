@@ -359,72 +359,13 @@ fn fill_scratch<T: Copy>(scratch: &mut Vec<f32>, data: &[T], convert: impl Fn(T)
     }
 }
 
-/// f32 peak-amplitude threshold for identifying priming transient buffers.
-///
-/// flexaudio's f32 samples are contractually in `[-1.0, 1.0]`. When a Linux PipeWire ALSA
-/// compatibility bridge (`default` PCM) opens a stream from a cold state, it emits full-scale
-/// rectangular priming buffers for the first few hundred ms, far outside this range (measured
-/// peak ≈ 3.3; the channels are nearly opposite-phase, so source-stage DC is ≈0, but later
-/// resampling turns it into huge DC and clipping). Since valid audio is capped at 1.0 by the
-/// contract, a peak clearly above 1.0 identifies a transient. Set the limit just above 1.0 so
-/// valid audio at exactly ±1.0 is not caught.
-const PRIMING_PEAK_LIMIT: f32 = 1.001;
-
-/// Guard that discards priming transient buffers immediately after capture starts.
-///
-/// Transient buffers are full-scale rectangles outside `[-1.0, 1.0]`; discard only buffers
-/// whose peak exceeds [`PRIMING_PEAK_LIMIT`].
-///
-/// Discarding a fixed duration would add leading silence even on systems without transients
-/// (Mac / Windows / warm Linux). Checking only the peak means no buffers are discarded when
-/// there is no transient, and the guard automatically follows the transient's actual duration.
-///
-/// Discard buffers only while the leading buffers look transient (out of range). Once one
-/// in-range buffer arrives, latch open and pass everything from then on. Transients occur
-/// only at startup and decay monotonically, so they do not recur. Used only in RT callbacks;
-/// detection is a single buffer scan with `abs` comparisons.
-struct TransientGuard {
-    /// Whether a valid (in-range) buffer has already passed. Always pass buffers after this is `true`.
-    latched: bool,
-}
-
-impl TransientGuard {
-    fn new() -> Self {
-        Self { latched: false }
-    }
-
-    /// Given an interleaved f32 buffer, return `true` if it is a priming transient and should
-    /// be discarded. Once any in-range buffer passes, always return `false` (pass it through).
-    fn should_drop(&mut self, data: &[f32]) -> bool {
-        if self.latched || data.is_empty() {
-            // Already past the transient, or the buffer is empty (nothing to discard).
-            self.latched = true;
-            return false;
-        }
-        // Find the peak amplitude in one pass over the buffer.
-        let mut peak = 0.0f32;
-        for &s in data {
-            let a = s.abs();
-            if a > peak {
-                peak = a;
-            }
-        }
-        // Clearly outside the contract range: this is a priming transient.
-        let is_transient = peak > PRIMING_PEAK_LIMIT;
-        if !is_transient {
-            self.latched = true;
-        }
-        is_transient
-    }
-}
-
 /// Build (but do not yet play) an input stream for the device selected by `device_id`.
 /// `device_id = None` selects the default input device. Return [`Error::DeviceNotFound`] if
 /// no device matches.
 ///
 /// Select a callback for each sample format: pass F32 through directly and convert I16/U16/I32
-/// to `f32` in `[-1.0, 1.0]` before sending to [`RawSink::push`]. [`TransientGuard`] discards
-/// priming transient buffers after startup (for the PipeWire ALSA bridge).
+/// to `f32` in `[-1.0, 1.0]` before sending to [`RawSink::push`]. Every buffer is delivered;
+/// discarding leading buffers by amplitude was unproved and dropped real audio.
 fn build_stream(
     sink: RawSink,
     device_id: Option<&str>,
@@ -465,8 +406,7 @@ fn build_stream(
         .saturating_mul(MAX_SCRATCH_SECONDS)
         .max(1);
 
-    // Move the sink into the callback. Non-F32 formats capture the converter. Since transient
-    // detection uses f32 values, converted formats are checked after conversion.
+    // Move the sink into the callback. Non-F32 formats capture the converter.
     //
     // cpal data callbacks cross an FFI (C ABI) boundary, where a panic could cause undefined
     // behavior. No current path is known to panic, but wrap each callback body in catch_unwind
@@ -474,7 +414,6 @@ fn build_stream(
     let stream = match sample_format {
         SampleFormat::F32 => {
             let mut sink = sink;
-            let mut guard = TransientGuard::new();
             device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -482,10 +421,7 @@ fn build_stream(
                         if stop_flag.load(Ordering::SeqCst) {
                             return;
                         }
-                        // Already interleaved f32. Discard if this is a priming transient.
-                        if guard.should_drop(data) {
-                            return;
-                        }
+                        // Already interleaved f32.
                         sink.push(data, monotonic_now_ns());
                     }));
                 },
@@ -497,7 +433,6 @@ fn build_stream(
             let mut sink = sink;
             // Conversion scratch, preallocated for the maximum block size to avoid growth in RT.
             let mut scratch: Vec<f32> = Vec::with_capacity(scratch_cap);
-            let mut guard = TransientGuard::new();
             device.build_input_stream(
                 &config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
@@ -506,9 +441,6 @@ fn build_stream(
                             return;
                         }
                         fill_scratch(&mut scratch, data, |s| s as f32 / -(i16::MIN as f32));
-                        if guard.should_drop(&scratch) {
-                            return;
-                        }
                         sink.push(&scratch, monotonic_now_ns());
                     }));
                 },
@@ -519,7 +451,6 @@ fn build_stream(
         SampleFormat::U16 => {
             let mut sink = sink;
             let mut scratch: Vec<f32> = Vec::with_capacity(scratch_cap);
-            let mut guard = TransientGuard::new();
             device.build_input_stream(
                 &config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
@@ -529,9 +460,6 @@ fn build_stream(
                         }
                         // Map u16 [0, 65535] to [-1, 1) around midpoint 32768.
                         fill_scratch(&mut scratch, data, |s| (s as f32 - 32_768.0) / 32_768.0);
-                        if guard.should_drop(&scratch) {
-                            return;
-                        }
                         sink.push(&scratch, monotonic_now_ns());
                     }));
                 },
@@ -542,7 +470,6 @@ fn build_stream(
         SampleFormat::I32 => {
             let mut sink = sink;
             let mut scratch: Vec<f32> = Vec::with_capacity(scratch_cap);
-            let mut guard = TransientGuard::new();
             device.build_input_stream(
                 &config,
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
@@ -551,9 +478,6 @@ fn build_stream(
                             return;
                         }
                         fill_scratch(&mut scratch, data, |s| s as f32 / -(i32::MIN as f32));
-                        if guard.should_drop(&scratch) {
-                            return;
-                        }
                         sink.push(&scratch, monotonic_now_ns());
                     }));
                 },
@@ -611,58 +535,6 @@ mod tests {
         assert_eq!(backend.poll_event(), None);
     }
 
-    /// Generate `frames` of interleaved stereo f32 samples.
-    /// Samples alternate between `±peak` (a square wave with peak amplitude `peak`).
-    fn make_buf(frames: usize, peak: f32) -> Vec<f32> {
-        let mut v = Vec::with_capacity(frames * 2);
-        for i in 0..frames {
-            let s = if i % 2 == 0 { peak } else { -peak };
-            v.push(s); // L
-            v.push(s); // R
-        }
-        v
-    }
-
-    /// Verify that [`TransientGuard`] discards only the leading buffers above
-    /// [`PRIMING_PEAK_LIMIT`] in an out-of-range full-scale transient → decay → in-range
-    /// sequence, then latches open and passes all later buffers.
-    #[test]
-    fn transient_guard_drops_priming_then_latches_open() {
-        let frames = 1024;
-        let mut g = TransientGuard::new();
-
-        // Out-of-range full-scale square wave (measured priming transient equivalent, peak≈3.3): discard.
-        assert!(g.should_drop(&make_buf(frames, 3.3)));
-        // Decaying but still out of range (peak=1.5 > LIMIT): discard.
-        assert!(g.should_drop(&make_buf(frames, 1.5)));
-        // Back in range (valid audio, peak=0.88): pass and latch open.
-        assert!(!g.should_drop(&make_buf(frames, 0.88)));
-        // After latching, always pass later buffers, even if out of range (prevents recurrence).
-        assert!(!g.should_drop(&make_buf(frames, 3.3)));
-    }
-
-    /// In environments without transients (Mac/Windows/warm Linux), audio is in range from
-    /// the start, so [`TransientGuard`] discards no buffers and adds no leading silence.
-    #[test]
-    fn transient_guard_passes_clean_audio_from_the_start() {
-        let frames = 1024;
-        let mut g = TransientGuard::new();
-        // Do not misclassify digital full scale ±1.0 (LIMIT is just above 1.0).
-        assert!(!g.should_drop(&make_buf(frames, 1.0)));
-        assert!(!g.should_drop(&make_buf(frames, 0.5)));
-        // Do not discard silence (all zeros) either.
-        assert!(!g.should_drop(&vec![0.0f32; frames * 2]));
-    }
-
-    /// Do not discard an empty buffer; latch open.
-    #[test]
-    fn transient_guard_handles_empty_buffer() {
-        let mut g = TransientGuard::new();
-        assert!(!g.should_drop(&[]));
-        // Latching on empty means even later out-of-range buffers pass through.
-        assert!(!g.should_drop(&make_buf(1024, 3.3)));
-    }
-
     /// Verify that [`fill_scratch`] does not reallocate within capacity and converts correctly,
     /// ensuring no steady-state allocations in RT callbacks.
     #[test]
@@ -708,8 +580,8 @@ mod tests {
     }
 
     /// `start` with a nonexistent device_id returns [`Error::DeviceNotFound`] without
-    /// panicking (consistent with cold-start/TransientGuard behavior). Host microphone
-    /// denial can precede device resolution on macOS/Windows and skips this hardware assertion.
+    /// panicking. Host microphone denial can precede device resolution on macOS/Windows
+    /// and skips this hardware assertion.
     #[test]
     fn start_with_unknown_device_id_yields_device_not_found() {
         let mut backend = CpalMicBackend::new(Some("__no_such_device__".into()));
