@@ -13,24 +13,24 @@ readme = "README.md"
 documentation = "https://docs.rs/flexaudio"
 
 [dependencies]
-flexaudio-core = { path = "../flexaudio-core", version = "0.5.0" }
+flexaudio-core = { path = "../flexaudio-core", version = "0.5.1" }
 # Bundle the microphone input backend (cpal, all OSes) for device enumeration (`devices()`).
-flexaudio-mic = { path = "../flexaudio-mic", version = "0.5.0" }
+flexaudio-mic = { path = "../flexaudio-mic", version = "0.5.1" }
 # Inject recording-time noise suppression (RNNoise) into the internal canonical form (facade intake wiring point).
 # Keep core independent of denoise; this facade plugs its implementation into core’s InnerProcessor abstraction.
-flexaudio-denoise = { path = "../flexaudio-denoise", version = "0.5.0" }
+flexaudio-denoise = { path = "../flexaudio-denoise", version = "0.5.1" }
 
 # Bundle the system output sink (PipeWire) for device enumeration (Linux only).
 [target.'cfg(target_os = "linux")'.dependencies]
-flexaudio-os-linux = { path = "../flexaudio-os-linux", version = "0.5.0" }
+flexaudio-os-linux = { path = "../flexaudio-os-linux", version = "0.5.1" }
 
 # Bundle system / process loopback (WASAPI) (Windows only).
 [target.'cfg(target_os = "windows")'.dependencies]
-flexaudio-os-windows = { path = "../flexaudio-os-windows", version = "0.5.0" }
+flexaudio-os-windows = { path = "../flexaudio-os-windows", version = "0.5.1" }
 
 # Bundle system / process loopback (CoreAudio Process Taps) (macOS only).
 [target.'cfg(target_os = "macos")'.dependencies]
-flexaudio-os-macos = { path = "../flexaudio-os-macos", version = "0.5.0" }
+flexaudio-os-macos = { path = "../flexaudio-os-macos", version = "0.5.1" }
 
 [package.metadata.docs.rs]
 default-target = "x86_64-unknown-linux-gnu"
