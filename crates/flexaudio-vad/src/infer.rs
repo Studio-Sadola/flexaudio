@@ -61,7 +61,9 @@ impl SileroEngine {
             || !(0.0..=1.0).contains(&probability)
             || self.state.iter().any(|value| !value.is_finite())
         {
-            return Err(VadError::Inference("nonfinite state or invalid probability".into()));
+            return Err(VadError::Inference(
+                "nonfinite state or invalid probability".into(),
+            ));
         }
         Ok(probability)
     }
