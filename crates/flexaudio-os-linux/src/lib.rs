@@ -36,6 +36,16 @@ use std::thread::{self, JoinHandle};
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::clock::monotonic_now_ns;
 use flexaudio_core::types::{DeviceEvent, DeviceInfo, Error, ProcessMode, Result, SourceKind};
+use flexaudio_core::{ErrorContext, Event, Operation};
+
+mod discovery;
+use discovery::EnumerationFailure;
+mod owner;
+use owner::{
+    finish_worker, poll_backend_event, push_backend_event, rollback_worker, BackendEvents,
+};
+mod watcher_queue;
+use watcher_queue::{lock_events, transition_default, WatchEventQueue, WatchEvents};
 
 use pipewire as pw;
 use pw::spa;
@@ -51,13 +61,53 @@ const NATIVE_CHANNELS: u16 = 2;
 
 /// Maximum number of events in the watch queue. Prevents unbounded `VecDeque` growth if the
 /// consumer does not call `poll_event` for a while or devices are repeatedly added and removed.
-/// When full, the oldest event is dropped.
+/// When full, the oldest delta is dropped and a sticky rescan notice precedes remaining deltas.
 const MAX_WATCH_EVENTS: usize = 1024;
 
 /// Deadline (milliseconds) for [`enumerate_pw`]'s synchronous wait loop. `done` usually arrives
 /// quickly, but this prevents `while !done { run() }` from looping or hanging forever if it does
-/// not. On timeout, stop and return the data collected so far.
+/// not. On timeout, return an error without publishing an incomplete inventory.
 const ENUMERATE_DEADLINE_MS: u128 = 2_000;
+
+/// Deadline (milliseconds) for [`run_pw_loop`]'s capture stream to negotiate its format.
+///
+/// Readiness is reported only once `param_changed` stores a negotiated format. A stream that
+/// never negotiates (for example the sink disappeared mid-setup) must not block `start()`
+/// forever, so a one-shot timer reports failure and quits the loop at this deadline.
+const NEGOTIATE_DEADLINE_MS: u128 = 2_000;
+
+/// Single-shot readiness report from the capture loop thread back to `start()`.
+///
+/// The loop thread reports success only after the stream has negotiated its format (see
+/// [`add_capture_listener`]'s `param_changed`), or failure from the negotiation deadline timer.
+/// `sent` makes the report single-shot, so a late deadline cannot overwrite a successful report.
+struct Readiness {
+    /// Channel back to `start()`.
+    tx: mpsc::Sender<std::result::Result<(), String>>,
+    /// Whether a report (success or failure) has already been sent.
+    sent: std::cell::Cell<bool>,
+}
+
+impl Readiness {
+    /// Report that the stream is set up and its format negotiated. No-op if already reported.
+    fn report_ready(&self) {
+        if !self.sent.replace(true) {
+            let _ = self.tx.send(Ok(()));
+        }
+    }
+
+    /// Report a setup failure. No-op if a report has already been sent.
+    fn report_failure(&self, msg: String) {
+        if !self.sent.replace(true) {
+            let _ = self.tx.send(Err(msg));
+        }
+    }
+
+    /// Whether a report has already been sent (success or failure).
+    fn is_reported(&self) -> bool {
+        self.sent.get()
+    }
+}
 
 /// Call [`pipewire::init`] once per process.
 ///
@@ -131,6 +181,8 @@ pub struct PwSystemBackend {
     stop_tx: Option<pw::channel::Sender<Terminate>>,
     /// Handle for the PipeWire loop thread. Set to `Some` by `start`.
     handle: Option<JoinHandle<()>>,
+    shutdown: Option<Result<()>>,
+    events: BackendEvents,
 }
 
 /// Zero-sized stop message sent to the loop thread.
@@ -159,6 +211,8 @@ impl PwSystemBackend {
             running: Arc::new(AtomicBool::new(false)),
             stop_tx: None,
             handle: None,
+            shutdown: None,
+            events: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -197,26 +251,20 @@ impl CaptureBackend for PwSystemBackend {
             return Ok(());
         }
 
-        // If a device_id is set on the regular monitor path, check that the sink exists first.
-        // Return DeviceNotFound if it does not. If enumerate_pw returns Err (e.g. daemon absent),
-        // continue through normal setup so the connection failure is returned as Backend (do not
-        // confuse daemon absence with "no such sink"). The exclude_self fan-in path targets no
-        // specific sink, so skip this check there.
-        // The fan-in path is now chosen by the whole exclusion set below, not by
-        // `exclude_self` alone.
-        // The effective exclusion set decides the path: non-empty means fan-in
-        // (link every app output except these pids), empty means sink-monitor.
+        // Resolve requested sinks only against a complete inventory. The fan-in exclusion
+        // path is not device-scoped, so only the ordinary monitor path performs this lookup.
         let excluded =
             effective_exclusion(self.exclude_self, &self.exclude_pids, std::process::id());
         let fan_in = !excluded.is_empty();
         let device_id = self.device_id.clone();
         if !fan_in {
             if let Some(id) = device_id.as_deref() {
-                if let Ok(devs) = enumerate_pw() {
-                    let found = devs.iter().any(|d| d.is_loopback && d.id == id);
-                    if !found {
-                        return Err(Error::DeviceNotFound);
-                    }
+                let devs = list_devices()?;
+                if !devs
+                    .iter()
+                    .any(|device| device.is_loopback && device.id == id)
+                {
+                    return Err(Error::DeviceNotFound);
                 }
             }
         }
@@ -239,6 +287,8 @@ impl CaptureBackend for PwSystemBackend {
         // `exclude_pids` joins the same mechanism: the excluded PID is now the
         // whole `excluded` set, and an empty set (neither flag nor pids) is what
         // keeps the plain sink-monitor path.
+        let generation_events: BackendEvents = Arc::new(Mutex::new(VecDeque::new()));
+        let events_for_thread = generation_events.clone();
         let handle = thread::Builder::new()
             .name(
                 if fan_in {
@@ -252,17 +302,29 @@ impl CaptureBackend for PwSystemBackend {
                 if fan_in {
                     // Delegate to the Exclude mechanism, which records everything outside the
                     // excluded PID set. Stop/ready channels and Terminate are shared with system.
-                    run_pw_process_loop(PidSelect::Exclude(excluded), sink, stop_rx, &ready_tx);
+                    run_pw_process_loop(
+                        PidSelect::Exclude(excluded),
+                        sink,
+                        stop_rx,
+                        &ready_tx,
+                        events_for_thread,
+                    );
                 } else {
-                    run_pw_loop(device_id, sink, stop_rx, &ready_tx);
+                    run_pw_loop(device_id, sink, stop_rx, &ready_tx, events_for_thread);
                 }
             })
-            .map_err(|e| Error::Backend(format!("spawn pipewire thread: {e}")))?;
+            .map_err(|e| {
+                running.store(false, Ordering::SeqCst);
+                Error::Backend(format!("spawn pipewire thread: {e}"))
+                    .with_context(ErrorContext::new(Operation::Start))
+            })?;
 
         // Wait for setup. Treat thread exit without a ready message (recv error) as failure.
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 // Setup succeeded. Keep the stop sender and thread handle.
+                self.events = generation_events;
+                self.shutdown = None;
                 self.stop_tx = Some(stop_tx);
                 self.handle = Some(handle);
                 Ok(())
@@ -279,42 +341,39 @@ impl CaptureBackend for PwSystemBackend {
                 // classification like macOS/Windows is not possible. A missing requested sink
                 // is detected earlier via enumerate_pw and returned as DeviceNotFound.
                 running.store(false, Ordering::SeqCst);
-                let _ = handle.join();
-                Err(Error::Backend(msg))
+                Err(rollback_worker(
+                    owner::startup_error(&generation_events, msg),
+                    handle,
+                ))
             }
             Err(_) => {
                 // The thread exited without sending ready (e.g. an unexpected panic).
                 running.store(false, Ordering::SeqCst);
-                let _ = handle.join();
-                Err(Error::Backend(
-                    "pipewire setup thread terminated before signaling readiness".into(),
+                Err(rollback_worker(
+                    Error::Backend(
+                        "pipewire setup thread terminated before signaling readiness".into(),
+                    )
+                    .with_context(ErrorContext::new(Operation::Start)),
+                    handle,
                 ))
             }
         }
     }
 
     fn stop(&mut self) {
-        // Safe on duplicate stop or stop before start.
-        if !self.running.swap(false, Ordering::SeqCst) {
-            // running is false: not started or already stopped. Join any leftover thread just in case.
-            if let Some(h) = self.handle.take() {
-                let _ = h.join();
-            }
-            self.stop_tx = None;
-            return;
-        }
+        let _ = self.stop_checked();
+    }
 
-        // Notify the loop thread to stop (the receiver callback calls loop.quit()). Send before
-        // dropping the sender. Ignore failure (the receiver is gone because the thread already exited).
+    fn stop_checked(&mut self) -> Result<()> {
+        self.running.store(false, Ordering::SeqCst);
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(Terminate);
         }
+        finish_worker(&mut self.handle, &mut self.shutdown, &self.events)
+    }
 
-        // Wait for run() to exit and the thread to finish. On thread exit, Stream→Core→Context→
-        // MainLoop are dropped in order, all on the loop thread.
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+    fn poll_event(&mut self) -> Option<Event> {
+        poll_backend_event(&self.events)
     }
 }
 
@@ -372,7 +431,8 @@ impl Drop for PwSystemBackend {
 ///
 /// # `mode`: Include / Exclude
 ///
-/// - [`ProcessMode::Include`] (default): Capture only the target PID's node (fan-out link, typically one node).
+/// - [`ProcessMode::Include`] (default): Capture every `Stream/Output/Audio` node owned by the
+///   target PID (fan-out links; one process can own several output streams).
 /// - [`ProcessMode::Exclude`]: Fan-in link all app outputs (`Stream/Output/Audio`) except the target
 ///   PID to our capture input (the Include predicate inverted across multiple nodes). Keep nodes
 ///   with unresolved PIDs pending until their Client arrives, so the wrong process is not excluded.
@@ -408,6 +468,8 @@ pub struct PwProcessBackend {
     stop_tx: Option<pw::channel::Sender<Terminate>>,
     /// Handle for the PipeWire loop thread. Set to `Some` by `start`.
     handle: Option<JoinHandle<()>>,
+    shutdown: Option<Result<()>>,
+    events: BackendEvents,
 }
 
 impl PwProcessBackend {
@@ -424,6 +486,8 @@ impl PwProcessBackend {
             running: Arc::new(AtomicBool::new(false)),
             stop_tx: None,
             handle: None,
+            shutdown: None,
+            events: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -450,7 +514,8 @@ impl CaptureBackend for PwProcessBackend {
         }
 
         // Convert mode to a node-selection predicate.
-        // - Include: Link only the target PID's node (typically one node).
+        // - Include: Link every Stream/Output/Audio node owned by the target PID (a process can
+        //   own several output streams).
         // - Exclude: Link all Stream/Output/Audio nodes except the target PID (fan-in).
         let select = match self.mode {
             ProcessMode::Include => PidSelect::Include(self.target_pid),
@@ -470,12 +535,18 @@ impl CaptureBackend for PwProcessBackend {
         let running = self.running.clone();
         running.store(true, Ordering::SeqCst);
 
+        let generation_events: BackendEvents = Arc::new(Mutex::new(VecDeque::new()));
+        let events_for_thread = generation_events.clone();
         let handle = thread::Builder::new()
             .name("flexaudio-pw-process".into())
             .spawn(move || {
-                run_pw_process_loop(select, sink, stop_rx, &ready_tx);
+                run_pw_process_loop(select, sink, stop_rx, &ready_tx, events_for_thread);
             })
-            .map_err(|e| Error::Backend(format!("spawn pipewire process thread: {e}")))?;
+            .map_err(|e| {
+                running.store(false, Ordering::SeqCst);
+                Error::Backend(format!("spawn pipewire process thread: {e}"))
+                    .with_context(ErrorContext::new(Operation::Start))
+            })?;
 
         // Wait for setup. Treat thread exit without sending ready as failure.
         match ready_rx.recv() {
@@ -483,6 +554,8 @@ impl CaptureBackend for PwProcessBackend {
                 // Setup succeeded (connection through registry listener registration). The
                 // thread now waits for the target PID and creates a link-factory link once its
                 // output ports and our input ports are available.
+                self.events = generation_events;
+                self.shutdown = None;
                 self.stop_tx = Some(stop_tx);
                 self.handle = Some(handle);
                 Ok(())
@@ -494,40 +567,40 @@ impl CaptureBackend for PwProcessBackend {
                 // target PID is an expected wait for a registry event, not an error, so do not
                 // return DeviceNotFound here.
                 running.store(false, Ordering::SeqCst);
-                let _ = handle.join();
-                Err(Error::Backend(msg))
+                Err(rollback_worker(
+                    owner::startup_error(&generation_events, msg),
+                    handle,
+                ))
             }
             Err(_) => {
                 // The thread exited without sending ready (e.g. an unexpected panic).
                 running.store(false, Ordering::SeqCst);
-                let _ = handle.join();
-                Err(Error::Backend(
-                    "pipewire process setup thread terminated before signaling readiness".into(),
+                Err(rollback_worker(
+                    Error::Backend(
+                        "pipewire process setup thread terminated before signaling readiness"
+                            .into(),
+                    )
+                    .with_context(ErrorContext::new(Operation::Start)),
+                    handle,
                 ))
             }
         }
     }
 
     fn stop(&mut self) {
-        // Safe on duplicate stop or stop before start (same as PwSystemBackend::stop).
-        if !self.running.swap(false, Ordering::SeqCst) {
-            if let Some(h) = self.handle.take() {
-                let _ = h.join();
-            }
-            self.stop_tx = None;
-            return;
-        }
+        let _ = self.stop_checked();
+    }
 
-        // Notify the loop thread to stop (the receiver callback calls loop.quit()).
+    fn stop_checked(&mut self) -> Result<()> {
+        self.running.store(false, Ordering::SeqCst);
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(Terminate);
         }
+        finish_worker(&mut self.handle, &mut self.shutdown, &self.events)
+    }
 
-        // Wait for run() to exit and the thread to finish. On exit, Stream→Registry→Core→Context→
-        // MainLoop are dropped in order, all on the loop thread.
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+    fn poll_event(&mut self) -> Option<Event> {
+        poll_backend_event(&self.events)
     }
 }
 
@@ -549,10 +622,11 @@ fn run_pw_process_loop(
     sink: RawSink,
     stop_rx: pw::channel::Receiver<Terminate>,
     ready_tx: &mpsc::Sender<std::result::Result<(), String>>,
+    events: BackendEvents,
 ) {
     // Setup (connection, stream creation, and registry listener registration) is in a separate function.
     // Keep its return values alive for the whole run (dropping them stops watching and linking).
-    let (main_loop, _keep) = match setup_pw_process(select, sink) {
+    let (main_loop, _keep) = match setup_pw_process(select, sink, events.clone()) {
         Ok(t) => t,
         Err(msg) => {
             // Report setup failure and exit (without panicking).
@@ -598,8 +672,7 @@ type BoundNode = (pw::node::Node, pw::node::NodeListener);
 /// - `links`: Map of [`pw::link::Link`] proxies created by link-factory, grouped by the registry
 ///   global id of each linked output node. Keep them alive on the loop thread because dropping
 ///   them breaks the links. Registry callbacks insert/remove/clear entries, so share the map via
-///   `Rc<RefCell<…>>`. Include has at most one entry; Exclude may have many (dropping an entry
-///   disconnects its links).
+///   `Rc<RefCell<…>>`. Either mode may have many entries (dropping an entry disconnects its links).
 /// - `_bound_nodes`: bound Node proxies + their info listeners, keyed by registry global id — dropping an entry unregisters that node's info listener.
 #[allow(clippy::type_complexity)]
 struct ProcessKeep {
@@ -733,25 +806,8 @@ fn pair_ports(out_ports: &[(u32, String)], in_ports: &[(u32, String)]) -> Vec<(u
     pairs
 }
 
-/// Decide whether a fan-in link for one target node can be committed now.
-/// Globals arrive one port at a time on BOTH sides: the capture stream's own
-/// inputs and the target's outputs. A partial pairing latched into `linked`
-/// is never revisited, so commit only when (a) every capture input exists,
-/// (b) every target output the node declared exists, and (c) each channel the
-/// capture can take is paired — `min(out, capture)` so a 5.1 source links its
-/// front pair instead of waiting forever.
-///
-/// A declared count of `Some(0)` is treated as "not known yet", not as "this
-/// node has no outputs": a node that has published ports but declares zero of
-/// them has not finished describing itself, so committing a plan against it
-/// would latch whatever arrived first. Only `None` (no info yet) falls back to
-/// "whatever ports are visible are all of them".
-///
-/// Known bound: (b) trusts that every declared output port eventually surfaces
-/// as a registry `Port` global. If one never does — props without `node.id` or
-/// `port.direction`, or a registry permission that hides it — `out_ports_len >=
-/// n` is unsatisfiable and the node is never linked. There is no timeout and no
-/// fallback to the ports that did arrive.
+/// Commit only a known mono/stereo layout after every declared port arrives.
+/// Unknown and incomplete layouts stay unlinked until registry information completes.
 fn link_plan_is_complete(
     expected_out: Option<u32>, // bound info's n_output_ports, if known
     out_ports_len: usize,
@@ -759,10 +815,9 @@ fn link_plan_is_complete(
     pairs_len: usize,
     capture_channels: usize, // NATIVE_CHANNELS as usize
 ) -> bool {
-    in_ports_len >= capture_channels
-        && out_ports_len > 0
-        && expected_out.is_none_or(|n| n > 0 && out_ports_len >= n as usize)
-        && pairs_len >= out_ports_len.min(capture_channels)
+    in_ports_len == capture_channels
+        && expected_out.is_some_and(|n| n > 0 && n <= 2 && out_ports_len == n as usize)
+        && pairs_len == capture_channels
 }
 
 /// Resolve a node's app PID, shared by capture and enumeration.
@@ -867,12 +922,14 @@ fn effective_exclusion(
 
 /// Node-selection predicate for the fan-in capture loop.
 ///
-/// `Include(pid)` links the one output node owned by `pid`; `Exclude(set)`
-/// links every resolved output node whose pid is NOT in `set` (used by
-/// `ProcessMode::Exclude`, `exclude_self`, and `exclude_pids`).
+/// `Include(pid)` links every output node owned by `pid` (a process can own
+/// several streams); `Exclude(set)` links every resolved output node whose pid
+/// is NOT in `set` (used by `ProcessMode::Exclude`, `exclude_self`, and
+/// `exclude_pids`).
 #[derive(Clone, PartialEq, Eq)]
 enum PidSelect {
-    /// Link only nodes whose resolved PID matches this PID (Include; typically one node).
+    /// Link every `Stream/Output/Audio` node whose resolved PID matches this PID (Include; a
+    /// process can own several output streams).
     Include(u32),
     /// Link every `Stream/Output/Audio` node whose resolved pid is not in this
     /// set (Exclude / `exclude_self` / `exclude_pids`). The set holds the pids
@@ -940,7 +997,7 @@ impl PidSelect {
 ///   Client PID; see [`resolve_node_pid`]). Reevaluate on each global event, regardless of
 ///   whether Client or Node arrives first.
 ///   application.process.id takes precedence — see pid_from_props.
-/// - The [`PidSelect`] predicate chooses nodes to link. Include selects one Stream/Output/Audio
+/// - The [`PidSelect`] predicate chooses nodes to link. Include selects every Stream/Output/Audio
 ///   node owned by the target PID; Exclude selects every such node with a resolved PID outside
 ///   the excluded set (unresolved PIDs wait for their Client). Once a target's output ports and
 ///   our input ports are available, the loop-thread registry callback creates channel-matched
@@ -959,6 +1016,7 @@ impl PidSelect {
 fn setup_pw_process(
     select: PidSelect,
     sink: RawSink,
+    events: BackendEvents,
 ) -> std::result::Result<(pw::main_loop::MainLoopRc, ProcessKeep), String> {
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
@@ -1000,9 +1058,14 @@ fn setup_pw_process(
     let user_data = UserData {
         format: spa::param::audio::AudioInfoRaw::new(),
         sink,
+        scratch: Default::default(),
+        events: events.clone(),
+        // The fan-out path reports readiness at connect time (see run_pw_process_loop) and does
+        // not wait for negotiation on this listener.
+        readiness: None,
     };
     // Register callbacks (shared helper; same param_changed/process behavior as system capture).
-    let listener = add_capture_listener(&stream, user_data)?;
+    let listener = add_capture_listener(&stream, user_data, &main_loop)?;
 
     // Connect our stream once (Direction::Input, target=None, no AUTOCONNECT). This creates input
     // ports (input_FL/FR); data does not arrive until linked (link establishment negotiates the
@@ -1043,9 +1106,9 @@ fn setup_pw_process(
     // Ports: registry port global id → registration data (owning node.id / direction / channel).
     let ports: Rc<RefCell<HashMap<u32, PortEntry>>> = Rc::new(RefCell::new(HashMap::new()));
     // Currently linked output nodes: registry global id → Link proxies created for that node.
-    // Keep them for the entire run because dropping them disconnects the links. Include has at
-    // most one entry; Exclude may have many. Remove an entry to disconnect one node or clear the
-    // map to disconnect all.
+    // Keep them for the entire run because dropping them disconnects the links. Either mode may
+    // have many entries (a process can own several output streams). Remove an entry to disconnect
+    // one node or clear the map to disconnect all.
     let linked: Rc<RefCell<HashMap<u32, Vec<pw::link::Link>>>> =
         Rc::new(RefCell::new(HashMap::new()));
     // Bound Node proxies + their info listeners, keyed by registry global id.
@@ -1054,8 +1117,9 @@ fn setup_pw_process(
     let bound_nodes: Rc<RefCell<HashMap<u32, BoundNode>>> = Rc::new(RefCell::new(HashMap::new()));
 
     // Reconcile selection before adding links, including when a Client arrives
-    // after its Node and reveals Pulse provenance. Include keeps one node;
-    // Exclude links all decidable nodes outside the exclusion set.
+    // after its Node and reveals Pulse provenance. Both Include and Exclude link
+    // every matching node: one process can own several output streams, and each
+    // must be recorded.
     #[allow(clippy::too_many_arguments)]
     fn try_link(
         core: &pw::core::CoreRc,
@@ -1066,148 +1130,164 @@ fn setup_pw_process(
         client_pid: &RefCell<HashMap<u32, ClientEntry>>,
         ports: &RefCell<HashMap<u32, PortEntry>>,
         linked: &RefCell<HashMap<u32, Vec<pw::link::Link>>>,
-    ) {
-        {
-            let nodes = nodes.borrow();
-            let client_pid = client_pid.borrow();
-            linked.borrow_mut().retain(|id, _| {
-                nodes
-                    .get(id)
-                    .is_some_and(|entry| select.selects_node(entry, &client_pid))
-            });
-        }
-        // Include keeps its representative node while it remains selected.
-        if matches!(select, PidSelect::Include(_)) && !linked.borrow().is_empty() {
-            return;
-        }
-
-        // Reread our node id from the stream (it may be unset just after connect).
-        // When unset, this returns SPA_ID_INVALID (=ID_ANY=u32::MAX) or 0.
-        let sid = stream.node_id();
-        if sid != 0 && sid != pw::constants::ID_ANY {
-            self_node_id.set(Some(sid));
-        }
-        let Some(self_nid) = self_node_id.get() else {
-            return;
-        };
-
-        // Use the predicate to select output node ids to link.
-        // - Include: one node whose resolved PID equals pid.
-        // - Exclude: every node with a resolved PID outside the excluded set (unresolved PIDs excluded).
-        let targets: Vec<u32> = {
-            let nodes = nodes.borrow();
-            let client_pid = client_pid.borrow();
-            let linked = linked.borrow();
-            let mut ids: Vec<u32> = nodes
-                .iter()
-                .filter(|(id, entry)| {
-                    if linked.contains_key(id) {
-                        return false;
-                    }
-                    select.selects_node(entry, &client_pid)
-                })
-                .map(|(&id, _)| id)
-                .collect();
-            if matches!(select, PidSelect::Include(_)) {
-                ids.truncate(1); // Include links one representative node
+        events: &BackendEvents,
+        main_loop: &pw::main_loop::MainLoopRc,
+    ) -> Result<()> {
+        let result = (|| -> Result<()> {
+            {
+                let nodes = nodes.borrow();
+                let client_pid = client_pid.borrow();
+                linked.borrow_mut().retain(|id, _| {
+                    nodes
+                        .get(id)
+                        .is_some_and(|entry| select.selects_node(entry, &client_pid))
+                });
             }
-            ids
-        };
+            // Reread our node id from the stream (it may be unset just after connect).
+            // When unset, this returns SPA_ID_INVALID (=ID_ANY=u32::MAX) or 0.
+            let sid = stream.node_id();
+            if sid != 0 && sid != pw::constants::ID_ANY {
+                self_node_id.set(Some(sid));
+            }
+            let Some(self_nid) = self_node_id.get() else {
+                return Ok(());
+            };
 
-        if targets.is_empty() {
-            return;
-        }
+            // Use the predicate to select output node ids to link.
+            // - Include: every node whose resolved PID equals pid (one process can
+            //   own several output streams).
+            // - Exclude: every node with a resolved PID outside the excluded set (unresolved PIDs excluded).
+            let targets: Vec<u32> = {
+                let nodes = nodes.borrow();
+                let client_pid = client_pid.borrow();
+                let linked = linked.borrow();
+                nodes
+                    .iter()
+                    .filter(|(id, entry)| {
+                        if linked.contains_key(id) {
+                            return false;
+                        }
+                        select.selects_node(entry, &client_pid)
+                    })
+                    .map(|(&id, _)| id)
+                    .collect()
+            };
 
-        // Get our input ports from the ports table (shared by all target nodes).
-        let in_ports: Vec<(u32, String)> = {
-            let ports = ports.borrow();
-            ports
-                .iter()
-                .filter(|(_pid, p)| p.node_id == self_nid && p.direction == "in")
-                .map(|(&pid, p)| (pid, p.channel.clone()))
-                .collect()
-        };
-        // Cannot link until our input ports appear (reevaluate on the next global event).
-        if in_ports.is_empty() {
-            return;
-        }
+            if targets.is_empty() {
+                return Ok(());
+            }
 
-        for target_node_id in targets {
-            // Get the target node's output ports from the ports table.
-            let out_ports: Vec<(u32, String)> = {
+            // Get our input ports from the ports table (shared by all target nodes).
+            let in_ports: Vec<(u32, String)> = {
                 let ports = ports.borrow();
                 ports
                     .iter()
-                    .filter(|(_pid, p)| p.node_id == target_node_id && p.direction == "out")
+                    .filter(|(_pid, p)| p.node_id == self_nid && p.direction == "in")
                     .map(|(&pid, p)| (pid, p.channel.clone()))
                     .collect()
             };
-            // Cannot link this node until its output ports appear (reevaluate next time).
-            if out_ports.is_empty() {
-                continue;
+            // Cannot link until our input ports appear (reevaluate on the next global event).
+            if in_ports.is_empty() {
+                return Ok(());
             }
 
-            // Pair ports by channel (FL→FL/FR→FR; duplicate mono; fall back to order if unavailable).
-            let pairs = pair_ports(&out_ports, &in_ports);
-            // The node's own declared output-port count, if its bound info has
-            // arrived. Borrow of `nodes` ends with this block — nothing below is
-            // allowed to hold it across `create_object`.
-            let expected_out: Option<u32> = nodes
-                .borrow()
-                .get(&target_node_id)
-                .and_then(|entry| entry.n_output_ports);
-            // Commit only a complete plan. Port globals arrive one at a time on
-            // BOTH sides, and a partial pairing inserted into `linked` below is
-            // fossilised, because a linked node is never re-paired: half-arrived
-            // capture inputs link FL alone, and a half-arrived target (one output
-            // port of a declared stereo node) makes `pair_ports`' mono rule
-            // duplicate FL onto both inputs. Leaving the node OUT of `linked`
-            // here is deliberate: the next port global re-evaluates it, and by
-            // then the missing port exists. (Subsumes the old is-empty check: a
-            // complete plan has at least one pair.)
-            if !link_plan_is_complete(
-                expected_out,
-                out_ports.len(),
-                in_ports.len(),
-                pairs.len(),
-                NATIVE_CHANNELS as usize,
-            ) {
-                continue;
-            }
-            let want = pairs.len();
-
-            // Link each pair with link-factory.
-            let mut created: Vec<pw::link::Link> = Vec::with_capacity(want);
-            for (out_port_id, in_port_id) in pairs {
-                let link_props = properties! {
-                    *pw::keys::LINK_OUTPUT_NODE => target_node_id.to_string(),
-                    *pw::keys::LINK_OUTPUT_PORT => out_port_id.to_string(),
-                    *pw::keys::LINK_INPUT_NODE => self_nid.to_string(),
-                    *pw::keys::LINK_INPUT_PORT => in_port_id.to_string(),
+            for target_node_id in targets {
+                // Get the target node's output ports from the ports table.
+                let out_ports: Vec<(u32, String)> = {
+                    let ports = ports.borrow();
+                    ports
+                        .iter()
+                        .filter(|(_pid, p)| p.node_id == target_node_id && p.direction == "out")
+                        .map(|(&pid, p)| (pid, p.channel.clone()))
+                        .collect()
                 };
-                match core.create_object::<pw::link::Link>("link-factory", &link_props) {
-                    Ok(link) => created.push(link),
-                    Err(_e) => {
-                        // Link creation failed for this pair. Stop here to avoid a partial link.
-                        break;
-                    }
+                // Cannot link this node until its output ports appear (reevaluate next time).
+                if out_ports.is_empty() {
+                    continue;
                 }
-            }
 
-            // Mark the node linked only when every pair succeeds. Treating a partial link (e.g.
-            // FL connected but FR failed) as complete would leave the target effectively mono.
-            // If any pair is missing, drop links created here, leave this node unlinked, and
-            // reevaluate on the next global event (e.g. when remaining ports appear or a transient
-            // link failure can be retried). Continue processing other target nodes.
-            if created.len() != want {
-                // Drop created links so no partial link remains.
-                drop(created);
-                continue;
-            }
+                // Pair ports by channel (FL→FL/FR→FR; duplicate mono; fall back to order if unavailable).
+                let pairs = pair_ports(&out_ports, &in_ports);
+                // The node's own declared output-port count, if its bound info has
+                // arrived. Borrow of `nodes` ends with this block — nothing below is
+                // allowed to hold it across `create_object`.
+                let expected_out: Option<u32> = nodes
+                    .borrow()
+                    .get(&target_node_id)
+                    .and_then(|entry| entry.n_output_ports);
+                if expected_out.is_some_and(|count| count > 2) || out_ports.len() > 2 {
+                    return Err(Error::UnsupportedFormat(
+                        "pipewire input supports at most two channels".into(),
+                    )
+                    .with_context(ErrorContext::new(Operation::Link)));
+                }
+                // Commit only a complete plan. Port globals arrive one at a time on
+                // BOTH sides, and a partial pairing inserted into `linked` below is
+                // fossilised, because a linked node is never re-paired: half-arrived
+                // capture inputs link FL alone, and a half-arrived target (one output
+                // port of a declared stereo node) makes `pair_ports`' mono rule
+                // duplicate FL onto both inputs. Leaving the node OUT of `linked`
+                // here is deliberate: the next port global re-evaluates it, and by
+                // then the missing port exists. (Subsumes the old is-empty check: a
+                // complete plan has at least one pair.)
+                if !link_plan_is_complete(
+                    expected_out,
+                    out_ports.len(),
+                    in_ports.len(),
+                    pairs.len(),
+                    NATIVE_CHANNELS as usize,
+                ) {
+                    continue;
+                }
+                // Stereo channel ordering must be known before committing a route. Pairing
+                // unknown names by HashMap iteration order can silently swap the channels.
+                let stereo_ports = |ports: &[(u32, String)]| {
+                    ports.len() == 2
+                        && ports.iter().filter(|(_, channel)| channel == "FL").count() == 1
+                        && ports.iter().filter(|(_, channel)| channel == "FR").count() == 1
+                };
+                if !stereo_ports(&in_ports) || (out_ports.len() == 2 && !stereo_ports(&out_ports)) {
+                    return Err(Error::UnsupportedFormat(
+                        "pipewire channel routing is unknown or unsupported".into(),
+                    )
+                    .with_context(ErrorContext::new(Operation::Link)));
+                }
+                let want = pairs.len();
 
-            // All pairs are linked. Keep the Link proxies grouped by node.
-            linked.borrow_mut().insert(target_node_id, created);
+                // Link each pair with link-factory.
+                let mut created: Vec<pw::link::Link> = Vec::with_capacity(want);
+                for (out_port_id, in_port_id) in pairs {
+                    let link_props = properties! {
+                        *pw::keys::LINK_OUTPUT_NODE => target_node_id.to_string(),
+                        *pw::keys::LINK_OUTPUT_PORT => out_port_id.to_string(),
+                        *pw::keys::LINK_INPUT_NODE => self_nid.to_string(),
+                        *pw::keys::LINK_INPUT_PORT => in_port_id.to_string(),
+                    };
+                    let link = core
+                        .create_object::<pw::link::Link>("link-factory", &link_props)
+                        .map_err(|error| {
+                            Error::Backend(format!("pipewire link creation failed: {error}"))
+                                .with_context(ErrorContext::new(Operation::Link))
+                        })?;
+                    created.push(link);
+                }
+
+                // All pairs are linked. Keep the Link proxies grouped by node.
+                linked.borrow_mut().insert(target_node_id, created);
+            }
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            linked.borrow_mut().clear();
+            push_backend_event(
+                events,
+                Event::TerminalError {
+                    error: error.clone(),
+                },
+            );
+            main_loop.quit();
         }
+        result
     }
 
     // registry global / global_remove listeners.
@@ -1217,6 +1297,8 @@ fn setup_pw_process(
     // that used to capture it by copy gets its own clone.
     let select_for_global = select.clone();
     let select_for_remove = select.clone();
+    let events_for_global = events.clone();
+    let loop_for_global = main_loop.clone();
     let core_for_global = core.clone();
     let stream_for_global = stream.clone();
     let self_node_for_global = self_node_id.clone();
@@ -1228,6 +1310,8 @@ fn setup_pw_process(
     let registry_for_global = registry.clone();
     let bound_for_global = bound_nodes.clone();
 
+    let events_for_remove = events.clone();
+    let loop_for_remove = main_loop.clone();
     let core_for_remove = core.clone();
     let stream_for_remove = stream.clone();
     let self_node_for_remove = self_node_id.clone();
@@ -1294,6 +1378,8 @@ fn setup_pw_process(
                             registry_for_global.bind(global);
                         if let Ok(node) = bound {
                             let node_id = global.id;
+                            let events_for_info = events_for_global.clone();
+                            let loop_for_info = loop_for_global.clone();
                             let nodes_for_info = nodes_for_global.clone();
                             let client_pid_for_info = client_pid_for_global.clone();
                             let ports_for_info = ports_for_global.clone();
@@ -1358,7 +1444,7 @@ fn setup_pw_process(
 
                                         // All state borrows have ended. Reconciliation also
                                         // unlinks a Pulse node whose app PID was invalidated.
-                                        try_link(
+                                        let _ = try_link(
                                             &core_for_info,
                                             &stream_for_info,
                                             &select_for_info,
@@ -1367,6 +1453,8 @@ fn setup_pw_process(
                                             &client_pid_for_info,
                                             &ports_for_info,
                                             &linked_for_info,
+                                            &events_for_info,
+                                            &loop_for_info,
                                         );
                                     }));
                                 })
@@ -1409,7 +1497,7 @@ fn setup_pw_process(
 
                 // State changed regardless of whether this was a Client, Node, or Port; reevaluate.
                 // We are on the loop thread, so it is safe to access the `!Send` core/stream.
-                try_link(
+                let _ = try_link(
                     &core_for_global,
                     &stream_for_global,
                     &select_for_global,
@@ -1418,6 +1506,8 @@ fn setup_pw_process(
                     &client_pid_for_global,
                     &ports_for_global,
                     &linked_for_global,
+                    &events_for_global,
+                    &loop_for_global,
                 );
             }));
         })
@@ -1512,7 +1602,7 @@ fn setup_pw_process(
 
                 // Once waiting again, immediately retry links if another target is already ready.
                 if relink_needed {
-                    try_link(
+                    let _ = try_link(
                         &core_for_remove,
                         &stream_for_remove,
                         &select_for_remove,
@@ -1521,6 +1611,8 @@ fn setup_pw_process(
                         &client_pid_for_remove,
                         &ports_for_remove,
                         &linked_for_remove,
+                        &events_for_remove,
+                        &loop_for_remove,
                     );
                 }
             }));
@@ -1549,6 +1641,12 @@ struct UserData {
     format: spa::param::audio::AudioInfoRaw,
     /// Destination for raw frames. `process` pushes through `&mut`.
     sink: RawSink,
+    scratch: std::rc::Rc<std::cell::RefCell<Vec<f32>>>,
+    events: BackendEvents,
+    /// Readiness report for the system-monitor path: `param_changed` reports success once a
+    /// format is negotiated. `None` for the process fan-out path, which reports readiness at
+    /// connect time and does not wait for negotiation on this listener.
+    readiness: Option<std::rc::Rc<Readiness>>,
 }
 
 /// Register `param_changed` / `process` callbacks on a capture stream.
@@ -1563,50 +1661,75 @@ struct UserData {
 fn add_capture_listener(
     stream: &pw::stream::StreamRc,
     user_data: UserData,
+    main_loop: &pw::main_loop::MainLoopRc,
 ) -> std::result::Result<pw::stream::StreamListener<UserData>, String> {
-    // Preallocate the thread-local scratch buffer used by the real-time process callback to
-    // convert data to f32, up to the maximum expected block size, during stream setup on this
-    // loop thread. This avoids steady-state reserve calls inside process (real-time allocation
-    // risks xruns). setup_pw / setup_pw_process call this after registration, so reserve happens
-    // once during non-real-time setup.
-    PROC_SCRATCH.with(|cell| {
-        let mut s = cell.borrow_mut();
-        let cap = s.capacity();
-        if cap < PROC_SCRATCH_CAP {
-            s.reserve(PROC_SCRATCH_CAP - cap);
-        }
-    });
+    // Listener-owned storage is prepared on the setup thread and travels with the listener
+    // to PipeWire's RT thread. The process callback never grows this allocation.
+    let scratch = user_data.scratch.clone();
+    scratch.borrow_mut().reserve(PROC_SCRATCH_CAP);
 
+    let diagnostics = user_data.sink.diagnostics();
+    let loop_for_format = main_loop.clone();
     stream
         .add_local_listener_with_user_data(user_data)
-        .param_changed(|_stream, user_data, id, param| {
+        .param_changed(move |_stream, user_data, id, param| {
             // A panic crossing FFI is UB, so wrap the callback body in catch_unwind.
             let _ = catch_unwind(AssertUnwindSafe(|| {
-                // NULL clears the format.
-                let Some(param) = param else {
-                    return;
-                };
                 if id != pw::spa::param::ParamType::Format.as_raw() {
                     return;
                 }
-                let (media_type, media_subtype) = match format_utils::parse_format(param) {
-                    Ok(v) => v,
-                    Err(_) => return,
+                // NULL clears the format; it is not successful negotiation.
+                let Some(param) = param else {
+                    user_data.format = spa::param::audio::AudioInfoRaw::new();
+                    return;
                 };
-                // Accept raw audio only.
-                if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
+                // Parsing may mutate its destination even on failure. Validate a fresh value
+                // before replacing the format used by the process callback.
+                let mut format = spa::param::audio::AudioInfoRaw::new();
+                if format.parse(param).is_ok() && format.channels() > 2 {
+                    push_backend_event(
+                        &user_data.events,
+                        Event::TerminalError {
+                            error: Error::UnsupportedFormat(
+                                "pipewire input supports at most two channels".into(),
+                            )
+                            .with_context(ErrorContext::new(Operation::Start)),
+                        },
+                    );
+                    if let Some(readiness) = &user_data.readiness {
+                        readiness.report_failure("unsupported pipewire channel count".into());
+                    }
+                    loop_for_format.quit();
                     return;
                 }
-                // Store the negotiated format (used by process for the channel count).
-                if user_data.format.parse(param).is_err() {
-                    // Keep the previous value if parsing fails.
+                let mut format = spa::param::audio::AudioInfoRaw::new();
+                let accepted = matches!(
+                    format_utils::parse_format(param),
+                    Ok((MediaType::Audio, MediaSubtype::Raw))
+                ) && format.parse(param).is_ok()
+                    && format.format() == spa::param::audio::AudioFormat::F32LE
+                    && format.channels() != 0
+                    && format.channels() == u32::from(user_data.sink.native_channels())
+                    && format.rate() != 0;
+                if !accepted {
+                    if let Some(readiness) = &user_data.readiness {
+                        if !readiness.is_reported() {
+                            readiness.report_failure("unacceptable pipewire capture format".into());
+                            loop_for_format.quit();
+                        }
+                    }
+                    return;
+                }
+                user_data.format = format;
+                if let Some(readiness) = &user_data.readiness {
+                    readiness.report_ready();
                 }
             }));
         })
-        .process(|stream, user_data| {
+        .process(move |stream, user_data| {
             // Runs on the real-time thread. Avoid blocking and allocation.
             // A panic crossing FFI is UB, so wrap the callback body in catch_unwind.
-            let _ = catch_unwind(AssertUnwindSafe(|| {
+            let result = catch_unwind(AssertUnwindSafe(|| {
                 // Do nothing if there is no buffer (do not panic).
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
@@ -1616,57 +1739,101 @@ fn add_capture_listener(
                     return;
                 }
                 let data = &mut datas[0];
-                // Save the valid byte count and offset (ring position) before borrowing data().
+                // Save the chunk fields before borrowing data(). `flags` and `stride` come from
+                // the SPA chunk and describe the validity and layout of the bytes.
                 let chunk = data.chunk();
                 let size = chunk.size() as usize;
                 let offset = chunk.offset() as usize;
+                let stride = chunk.stride();
+                if chunk
+                    .flags()
+                    .contains(pw::spa::buffer::ChunkFlags::CORRUPTED)
+                {
+                    diagnostics.record_corrupt_buffer(None);
+                    return;
+                }
                 if size == 0 {
                     return;
                 }
                 let Some(bytes) = data.data() else {
                     return;
                 };
-                // [offset, offset+size) is the valid region. Reject out-of-range values defensively.
-                let end = offset.saturating_add(size);
-                if end > bytes.len() {
+                // Data::data() spans maxsize. SPA offsets are modulo maxsize and chunk sizes
+                // are clamped to maxsize; still reject a region that exceeds mapped memory.
+                if bytes.is_empty() {
                     return;
                 }
+                let offset = offset % bytes.len();
+                let size = size.min(bytes.len());
+                let Some(end) = offset.checked_add(size).filter(|end| *end <= bytes.len()) else {
+                    return;
+                };
                 let valid = &bytes[offset..end];
-                // Read only whole f32 values (ignore trailing bytes).
-                let n_floats = valid.len() / std::mem::size_of::<f32>();
-                if n_floats == 0 {
+                // Interleaved f32: `channels` samples per frame. The negotiated channel count
+                // (see param_changed) decides the audio bytes actually carried by each frame.
+                let channels = user_data.format.channels() as usize;
+                if channels == 0 {
+                    return;
+                }
+                let frame_bytes = channels * std::mem::size_of::<f32>();
+                // spa_chunk.stride is the byte distance between consecutive frames. It can be
+                // larger than the audio frame when the producer pads each frame.
+                if stride > 0 && (stride as usize) < frame_bytes {
+                    diagnostics.record_malformed_buffer(None);
+                    return;
+                }
+                let step = if stride > 0 {
+                    stride as usize
+                } else {
+                    frame_bytes
+                };
+                // The last complete frame need not include trailing padding.
+                let n_frames = if valid.len() >= frame_bytes {
+                    1 + (valid.len() - frame_bytes) / step
+                } else {
+                    0
+                };
+                let n_floats = n_frames * channels;
+                if n_frames == 0 {
                     return;
                 }
                 // Read the bytes as interleaved f32. `data` alignment is not guaranteed, so use
                 // from_le_bytes instead of align_to. Fill the preallocated reusable buffer and
                 // push once (RawSink::push is nonblocking and drops data when full).
-                PROC_SCRATCH.with(|cell| {
-                    let mut scratch = cell.borrow_mut();
-                    // At the preallocated PROC_SCRATCH_CAP, reserve is a no-op in steady state,
-                    // avoiding real-time allocation. Grow once only if a block exceeds the
-                    // expected size, then keep that capacity.
-                    let cap = scratch.capacity();
-                    if n_floats > cap {
-                        scratch.reserve(n_floats - cap);
+                {
+                    let Ok(mut scratch) = scratch.try_borrow_mut() else {
+                        diagnostics.record_callback_rejected(None);
+                        return;
+                    };
+                    if n_floats > scratch.capacity() {
+                        diagnostics.record_malformed_buffer(None);
+                        return;
                     }
                     scratch.clear();
-                    for i in 0..n_floats {
-                        let b = i * 4;
-                        let v = f32::from_le_bytes([
-                            valid[b],
-                            valid[b + 1],
-                            valid[b + 2],
-                            valid[b + 3],
-                        ]);
-                        scratch.push(v);
+                    for frame in 0..n_frames {
+                        // Audio bytes of this frame; any trailing padding up to `step` is skipped.
+                        let base = frame * step;
+                        for i in 0..channels {
+                            let b = base + i * 4;
+                            let v = f32::from_le_bytes([
+                                valid[b],
+                                valid[b + 1],
+                                valid[b + 2],
+                                valid[b + 3],
+                            ]);
+                            scratch.push(v);
+                        }
                     }
                     // PTS: currently use the monotonic arrival time (`monotonic_now_ns`) as a
                     // substitute. This monotonic approximation works because the downstream
                     // ClockNormalizer establishes the initial origin. It can later be replaced
                     // with the device clock from `pw_buffer.time`.
                     user_data.sink.push(&scratch, monotonic_now_ns());
-                });
+                }
             }));
+            if result.is_err() {
+                diagnostics.record_callback_rejected(None);
+            }
         })
         .register()
         .map_err(|e| format!("register pipewire stream listener failed: {e}"))
@@ -1701,16 +1868,26 @@ fn build_format_pod_bytes() -> std::result::Result<Vec<u8>, String> {
 /// PipeWire loop thread body.
 ///
 /// Creates, runs, and destroys `MainLoop`/`Context`/`Core`/`Stream` (all `!Send`) only inside this
-/// function, without crossing thread boundaries. Reports setup success or failure to the caller
-/// through `ready_tx`, then runs `main_loop.run()` until a stop request on success.
+/// function, without crossing thread boundaries. Reports readiness to the caller through
+/// `ready_tx` once the stream has negotiated its format, then runs `main_loop.run()` until a stop
+/// request on success.
 fn run_pw_loop(
     device_id: Option<String>,
     sink: RawSink,
     stop_rx: pw::channel::Receiver<Terminate>,
     ready_tx: &mpsc::Sender<std::result::Result<(), String>>,
+    events: BackendEvents,
 ) {
+    // Single-shot readiness report. It is filled by `param_changed` (success) or by the
+    // negotiation deadline timer below (failure).
+    let readiness = std::rc::Rc::new(Readiness {
+        tx: ready_tx.clone(),
+        sent: std::cell::Cell::new(false),
+    });
+
     // Setup is in a separate function. Keep its return values alive for the whole run (dropping them stops it).
-    let (main_loop, _stream, _listener) = match setup_pw(device_id, sink) {
+    let (main_loop, _stream, _listener) = match setup_pw(device_id, sink, readiness.clone(), events)
+    {
         Ok(t) => t,
         Err(msg) => {
             // Report setup failure and exit (without panicking).
@@ -1728,16 +1905,36 @@ fn run_pw_loop(
         main_loop_for_quit.quit();
     });
 
-    // Report setup success. run() now blocks.
-    if ready_tx.send(Ok(())).is_err() {
-        // The caller is gone (e.g. start was dropped). Do not run.
+    // Readiness is reported only once the format is negotiated (see `param_changed`), never at
+    // connect time: reporting at connect time told the caller capture was running even if the
+    // stream never negotiated. A one-shot timer bounds the wait, so a stream that never
+    // negotiates cannot block `start()` forever; if a report was already sent, it is a no-op.
+    let readiness_for_timer = readiness.clone();
+    let main_loop_for_timeout = main_loop.clone();
+    let _timer = main_loop.loop_().add_timer(move |_expirations| {
+        if !readiness_for_timer.is_reported() {
+            readiness_for_timer.report_failure("pipewire format negotiation timed out".into());
+            main_loop_for_timeout.quit();
+        }
+    });
+    if let Err(e) = _timer
+        .update_timer(
+            Some(std::time::Duration::from_millis(
+                NEGOTIATE_DEADLINE_MS as u64,
+            )),
+            None,
+        )
+        .into_result()
+    {
+        readiness.report_failure(format!("arm pipewire negotiation deadline failed: {e}"));
+        main_loop.quit();
         return;
     }
 
-    // Run until Terminate or process exit.
+    // Run until Terminate, the negotiation deadline, or process exit.
     main_loop.run();
-    // On exit, drop _attached → _listener → _stream → main_loop in reverse declaration order,
-    // destroying the PipeWire resources on this thread.
+    // On exit, drop _timer → _attached → _listener → _stream → main_loop in reverse declaration
+    // order, destroying the PipeWire resources on this thread.
 }
 
 /// PipeWire setup. Returns `Err(String)` on failure (does not panic).
@@ -1752,10 +1949,15 @@ fn run_pw_loop(
 ///
 /// The caller ([`run_pw_loop`]) attaches the stop channel receiver to the loop. This avoids making
 /// `AttachedReceiver` a self-referential struct borrowing the return tuple (which contains `MainLoopRc`).
+///
+/// `readiness` is stored in the stream's [`UserData`] so `param_changed` can report success once
+/// the format is negotiated (readiness must not be reported at connect time, see [`run_pw_loop`]).
 #[allow(clippy::type_complexity)]
 fn setup_pw(
     device_id: Option<String>,
     sink: RawSink,
+    readiness: std::rc::Rc<Readiness>,
+    events: BackendEvents,
 ) -> std::result::Result<
     (
         pw::main_loop::MainLoopRc,
@@ -1805,11 +2007,15 @@ fn setup_pw(
     let user_data = UserData {
         format: spa::param::audio::AudioInfoRaw::new(),
         sink,
+        scratch: Default::default(),
+        events: events.clone(),
+        // `param_changed` reports readiness through this handle once the format is negotiated.
+        readiness: Some(readiness),
     };
 
     // Register callbacks. Store the negotiated format in `param_changed` and send buffers
     // dequeued by `process` to RawSink (shared helper).
-    let listener = add_capture_listener(&stream, user_data)?;
+    let listener = add_capture_listener(&stream, user_data, &main_loop)?;
 
     // Requested format params: f32 / 48000 / 2 channels. Since rate/channels are explicit,
     // PipeWire automatically inserts audioconvert to convert mismatched graphs to 48 kHz/stereo/f32.
@@ -1838,13 +2044,6 @@ fn setup_pw(
 /// blocks are hundreds to thousands of frames (far less than one second), so this prevents
 /// reserve calls in the real-time path.
 const PROC_SCRATCH_CAP: usize = (NATIVE_RATE as usize) * (NATIVE_CHANNELS as usize);
-
-thread_local! {
-    /// Scratch buffer for f32 conversion in the `process` callback. [`add_capture_listener`]
-    /// preallocates it to [`PROC_SCRATCH_CAP`] during stream setup, so no reallocation occurs
-    /// inside the real-time process callback.
-    static PROC_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
-}
 
 // ============================================================================
 // Device enumeration (Linux/PipeWire implementation of `devices()`)
@@ -1878,6 +2077,19 @@ struct EnumState {
     default_source: Option<String>,
 }
 
+/// Only nodes can represent entries in the audio inventory. A props-less node
+/// cannot be classified safely; unrelated globals do not require device identity.
+fn enumeration_properties<'a>(
+    object_type: &pw::types::ObjectType,
+    props: Option<&'a spa::utils::dict::DictRef>,
+) -> std::result::Result<Option<&'a spa::utils::dict::DictRef>, EnumerationFailure> {
+    if props.is_none() && *object_type == pw::types::ObjectType::Node {
+        Err(EnumerationFailure::Identity)
+    } else {
+        Ok(props)
+    }
+}
+
 /// Enumerate audio devices (microphones and system output sinks) through PipeWire.
 ///
 /// Wait for one round of registry global events:
@@ -1885,6 +2097,8 @@ struct EnumState {
 ///   monitor); `is_loopback = true` / `source_kind = SystemLoopback`.
 /// - `media.class == "Audio/Source"` → recording devices such as microphones;
 ///   `is_loopback = false` / `source_kind = Mic`.
+///   These are PipeWire graph identities, not cpal device-name IDs. The flexaudio
+///   facade omits these entries and obtains its openable microphone IDs from cpal.
 ///
 /// Map these to [`DeviceInfo`]. `id` is the persistent `node.name`; `name` is `node.description`
 /// (or `node.name` if absent). `sample_rate` / `channels` use `audio.rate` / `audio.channels` if
@@ -1893,13 +2107,11 @@ struct EnumState {
 ///
 /// Run a short-lived `MainLoop` and call `quit()` when `core.sync()` reports `done` to signal
 /// enumeration completion. Treat a missing PipeWire daemon, connection failure, or registry
-/// retrieval failure as `Ok(empty Vec)` without panicking; enumeration is equivalent to no devices.
+/// retrieval failure as an error. Only a completed empty inventory returns `Ok([])`.
 pub fn list_devices() -> Result<Vec<DeviceInfo>> {
-    match enumerate_pw() {
-        Ok(v) => Ok(v),
-        // Treat daemon absence and similar failures as "no devices" (do not break the caller).
-        Err(_msg) => Ok(Vec::new()),
-    }
+    enumerate_pw().map_err(|message| {
+        Error::Backend(message).with_context(ErrorContext::new(Operation::Enumerate))
+    })
 }
 
 /// PipeWire registry enumeration implementation. Returns `Err(String)` on failure (does not panic).
@@ -1925,6 +2137,7 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
         .get_registry_rc()
         .map_err(|e| format!("get pipewire registry failed: {e}"))?;
 
+    let failure = Rc::new(std::cell::Cell::new(None::<EnumerationFailure>));
     let state = Rc::new(RefCell::new(EnumState::default()));
     // Keeps default metadata property listeners alive. Push Metadata proxies and listeners bound
     // in the global callback here.
@@ -1932,6 +2145,7 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
     let meta_keep: Rc<RefCell<Vec<MetaKeep>>> = Rc::new(RefCell::new(Vec::new()));
 
     // Registry global listener: collect Audio nodes and default metadata.
+    let failure_for_global = failure.clone();
     let state_for_global = state.clone();
     let registry_for_global = registry.clone();
     let meta_keep_for_global = meta_keep.clone();
@@ -1939,9 +2153,14 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
         .add_listener_local()
         .global(move |global| {
             // A panic crossing FFI is UB, so wrap the callback body in catch_unwind.
-            let _ = catch_unwind(AssertUnwindSafe(|| {
-                let Some(props) = global.props else {
-                    return;
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let props = match enumeration_properties(&global.type_, global.props) {
+                    Ok(Some(props)) => props,
+                    Ok(None) => return,
+                    Err(failure) => {
+                        failure_for_global.set(Some(failure));
+                        return;
+                    }
                 };
                 match global.type_ {
                     pw::types::ObjectType::Node => {
@@ -1952,7 +2171,7 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
                         }
                         let node_name = props.get(*pw::keys::NODE_NAME).unwrap_or("");
                         if node_name.is_empty() {
-                            // Skip nodes without a stable key; they cannot be enumerated.
+                            failure_for_global.set(Some(EnumerationFailure::Identity));
                             return;
                         }
                         let description = props
@@ -1966,6 +2185,13 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
                         let channels = props
                             .get(*pw::keys::AUDIO_CHANNELS)
                             .and_then(|s| s.parse::<u16>().ok());
+                        if props.get("audio.rate").is_some() && rate.is_none_or(|rate| rate == 0)
+                            || props.get(*pw::keys::AUDIO_CHANNELS).is_some()
+                                && channels.is_none_or(|channels| channels == 0)
+                        {
+                            failure_for_global.set(Some(EnumerationFailure::Format));
+                            return;
+                        }
                         state_for_global.borrow_mut().nodes.push(NodeRecord {
                             node_name: node_name.to_string(),
                             description: description.to_string(),
@@ -1984,14 +2210,18 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
                         let metadata: pw::metadata::Metadata =
                             match registry_for_global.bind(global) {
                                 Ok(m) => m,
-                                Err(_) => return,
+                                Err(_) => {
+                                    failure_for_global.set(Some(EnumerationFailure::Metadata));
+                                    return;
+                                }
                             };
+                        let failure_for_meta = failure_for_global.clone();
                         let state_for_meta = state_for_global.clone();
                         let listener = metadata
                             .add_listener_local()
                             .property(move |_subject, key, _type, value| {
                                 // Property callbacks also cross FFI, so wrap them in catch_unwind.
-                                catch_unwind(AssertUnwindSafe(|| {
+                                if catch_unwind(AssertUnwindSafe(|| {
                                     // value is JSON (e.g. {"name":"alsa_output...."}). Extract name.
                                     if let (Some(key), Some(value)) = (key, value) {
                                         if key == "default.audio.sink" {
@@ -2003,7 +2233,10 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
                                         }
                                     }
                                 }))
-                                .ok();
+                                .is_err()
+                                {
+                                    failure_for_meta.set(Some(EnumerationFailure::Callback));
+                                }
                                 0
                             })
                             .register();
@@ -2014,6 +2247,9 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
                     _ => {}
                 }
             }));
+            if result.is_err() {
+                failure_for_global.set(Some(EnumerationFailure::Callback));
+            }
         })
         .register();
 
@@ -2025,16 +2261,22 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
     // again and quit on the second done. This waits for both global enumeration and default
     // metadata properties. done is guaranteed, so the loop cannot run forever.
     let done = Rc::new(std::cell::Cell::new(false));
+    let aborted = Rc::new(std::cell::Cell::new(false));
     let stage = Rc::new(std::cell::Cell::new(0u8));
     let pending1 = core
         .sync(0)
         .map_err(|e| format!("pipewire sync failed: {e}"))?;
     let pending1 = Rc::new(std::cell::Cell::new(pending1.seq()));
 
+    let failure_for_cb = failure.clone();
     let done_for_cb = done.clone();
+    let aborted_for_cb = aborted.clone();
     let stage_for_cb = stage.clone();
     let pending1_for_cb = pending1.clone();
     let loop_for_cb = main_loop.clone();
+    let failure_for_core = failure.clone();
+    let aborted_for_core = aborted.clone();
+    let loop_for_core = main_loop.clone();
     let core_weak = core.downgrade();
     let _core_listener = core
         .add_listener_local()
@@ -2047,18 +2289,24 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
                 0 if seq == pending1_for_cb.get() => {
                     // Stage 1 complete → issue a second sync to wait for metadata properties.
                     stage_for_cb.set(1);
-                    if let Some(core) = core_weak.upgrade() {
-                        match core.sync(0) {
-                            Ok(p) => pending1_for_cb.set(p.seq()),
-                            Err(_) => {
-                                // Stop here if the second sync cannot be issued.
-                                done_for_cb.set(true);
-                                loop_for_cb.quit();
-                            }
-                        }
-                    } else {
-                        done_for_cb.set(true);
+                    let Some(core) = core_weak.upgrade() else {
+                        // Without the core the second sync cannot be issued, so
+                        // enumeration is incomplete. Do not report completion;
+                        // quit so the wait loop stops instead of waiting forever.
+                        failure_for_cb.set(Some(EnumerationFailure::CoreGone));
+                        aborted_for_cb.set(true);
                         loop_for_cb.quit();
+                        return;
+                    };
+                    match core.sync(0) {
+                        Ok(p) => pending1_for_cb.set(p.seq()),
+                        Err(_) => {
+                            // The second sync was refused: enumeration did not
+                            // complete, so `done` stays unset. Quit the wait loop.
+                            failure_for_cb.set(Some(EnumerationFailure::SecondSync));
+                            aborted_for_cb.set(true);
+                            loop_for_cb.quit();
+                        }
                     }
                 }
                 1 if seq == pending1_for_cb.get() => {
@@ -2071,17 +2319,44 @@ fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
         })
         .register();
 
-    // Run until done (both sync round trips complete). If run() repeatedly returns immediately
-    // without done (e.g. spurious quit), stop at the deadline to avoid a busy loop or hang and
-    // return what has been collected. Enumeration is best-effort and must not panic or hang if
-    // incomplete.
+    let _error_listener = core
+        .add_listener_local()
+        .error(move |_id, _seq, _code, _message| {
+            failure_for_core.set(Some(EnumerationFailure::CoreError));
+            aborted_for_core.set(true);
+            loop_for_core.quit();
+        })
+        .register();
+
+    // Wait for done (both sync round trips complete). `run()` blocks until `quit()` and would
+    // hang forever when no event ever arrives, so iterate with a finite timeout instead: each
+    // iteration returns within its timeout, and the loop stops once the deadline passes even if
+    // `done` never arrives. `iterate` also dispatches the core `done` callback, which sets
+    // `done` and calls `quit()` on the normal path. It is best-effort and must not panic.
     let deadline = std::time::Instant::now();
-    while !done.get() {
-        main_loop.run();
-        if deadline.elapsed().as_millis() >= ENUMERATE_DEADLINE_MS {
-            // Deadline exceeded before done. Stop and return what has been collected.
+    while !done.get() && !aborted.get() {
+        let elapsed_ms = deadline.elapsed().as_millis();
+        if elapsed_ms >= ENUMERATE_DEADLINE_MS {
+            // Deadline exceeded; stop waiting for a completion that may never arrive.
             break;
         }
+        let remaining =
+            std::time::Duration::from_millis((ENUMERATE_DEADLINE_MS - elapsed_ms) as u64);
+        if main_loop
+            .loop_()
+            .iterate(pw::loop_::Timeout::Finite(remaining))
+            < 0
+        {
+            failure.set(Some(EnumerationFailure::Iterate));
+            aborted.set(true);
+        }
+    }
+
+    if let Some(failure) = failure.get() {
+        return Err(failure.message().into());
+    }
+    if !done.get() || aborted.get() {
+        return Err(EnumerationFailure::Deadline.message().into());
     }
 
     // Build DeviceInfo values from the collected raw nodes.
@@ -2158,14 +2433,13 @@ fn extract_json_name(value: &str) -> Option<String> {
 ///
 /// # PipeWire unavailable
 /// If the PipeWire daemon is unavailable or connection fails, [`start`](Self::start) returns
-/// [`Error::Backend`] without panicking. The facade degrades this to a no-op watcher (there is
-/// nothing to publish if there are no device changes). An available but empty PipeWire session
-/// works normally.
+/// [`Error::Backend`] without panicking. The facade propagates this startup error to the caller.
+/// An available but empty PipeWire session works normally.
 ///
 /// ```no_run
 /// use flexaudio_os_linux::PwDeviceWatcher;
 ///
-/// // Returns Err if PipeWire is unavailable (the facade degrades to NoopWatcher).
+/// // Returns Err if PipeWire is unavailable.
 /// if let Ok(mut watcher) = PwDeviceWatcher::start() {
 ///     while let Some(ev) = watcher.poll_event() {
 ///         println!("device event: {ev:?}");
@@ -2174,9 +2448,9 @@ fn extract_json_name(value: &str) -> Option<String> {
 /// }
 /// ```
 pub struct PwDeviceWatcher {
-    /// Event queue (unbounded because hot-plug events are infrequent and must not be dropped). `Send`.
+    /// Bounded event queue with a sticky invalidation outside the delta queue. `Send`.
     /// Watcher callbacks push here; [`poll_event`](Self::poll_event) pops events.
-    events: Arc<Mutex<VecDeque<DeviceEvent>>>,
+    events: WatchEventQueue,
     /// Watching flag (guards against duplicate starts and is used by drop). `Send`.
     running: Arc<AtomicBool>,
     /// Sender for stopping the watcher thread. Set to `Some` by [`start`](Self::start).
@@ -2195,7 +2469,7 @@ impl PwDeviceWatcher {
     /// Return [`Error::Backend`] if PipeWire is unavailable or connection fails (without panicking).
     pub fn start() -> Result<Self> {
         // Create the event queue before start and clone it into setup.
-        let events: Arc<Mutex<VecDeque<DeviceEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let events: WatchEventQueue = Arc::new(Mutex::new(WatchEvents::default()));
 
         // Stop channel for the watcher thread (receiver is attached to the loop).
         let (stop_tx, stop_rx) = pw::channel::channel::<Terminate>();
@@ -2225,31 +2499,36 @@ impl PwDeviceWatcher {
                 // Setup failed (PipeWire unavailable, connection/registry failure, etc.). The
                 // thread has already returned, so join it for cleanup.
                 running.store(false, Ordering::SeqCst);
-                let _ = handle.join();
-                Err(Error::Backend(msg))
+                Err(rollback_worker(
+                    Error::Backend(msg).with_context(ErrorContext::new(Operation::Start)),
+                    handle,
+                ))
             }
             Err(_) => {
                 // The thread exited without sending ready (e.g. an unexpected panic).
                 running.store(false, Ordering::SeqCst);
-                let _ = handle.join();
-                Err(Error::Backend(
-                    "pipewire watch thread terminated before signaling readiness".into(),
+                Err(rollback_worker(
+                    Error::Backend(
+                        "pipewire watch thread terminated before signaling readiness".into(),
+                    )
+                    .with_context(ErrorContext::new(Operation::Start)),
+                    handle,
                 ))
             }
         }
     }
 
     /// Pop the next hot-plug event from the queue, or return `None` if empty.
-    /// Nonblocking. Returns `None` on lock failure without panicking.
+    /// Poisoned queues are salvaged and emit rescan before any retained deltas.
     pub fn poll_event(&mut self) -> Option<DeviceEvent> {
-        self.events.lock().ok().and_then(|mut q| q.pop_front())
+        lock_events(&self.events).poll()
     }
 
     /// Stop watching (safe on duplicate stop or stop before start).
     ///
     /// As with [`PwSystemBackend::stop`], sending `Terminate` invokes the receiver callback
     /// attached to the loop, which calls `main_loop.quit()` on the watcher thread and exits
-    /// `run()`. Wait for cleanup to finish with `join()`.
+    /// `run()`. Wait for cleanup to finish with `join()`, retaining pending events for polling.
     pub fn stop(&mut self) {
         // Safe on duplicate stop or stop before start.
         if !self.running.swap(false, Ordering::SeqCst) {
@@ -2303,7 +2582,7 @@ struct WatchState {
 /// this function. Reports setup success or failure to the caller through `ready_tx`, then runs
 /// `main_loop.run()` until [`Terminate`] on success.
 fn run_watch_loop(
-    events: Arc<Mutex<VecDeque<DeviceEvent>>>,
+    events: WatchEventQueue,
     stop_rx: pw::channel::Receiver<Terminate>,
     ready_tx: &mpsc::Sender<std::result::Result<(), String>>,
 ) {
@@ -2378,9 +2657,7 @@ struct WatchListeners {
 /// `done` only sets the initial-scan-complete flag instead of calling `quit()`. It then continues
 /// receiving global/global_remove events indefinitely.
 #[allow(clippy::type_complexity)]
-fn setup_watch(
-    events: Arc<Mutex<VecDeque<DeviceEvent>>>,
-) -> std::result::Result<WatchKeep, String> {
+fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String> {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
@@ -2398,6 +2675,7 @@ fn setup_watch(
         .map_err(|e| format!("get pipewire registry failed: {e}"))?;
 
     // Local watcher-thread state (!Send), shared with each closure through Rc.
+    let query_failure = Rc::new(Cell::new(None::<EnumerationFailure>));
     let state = Rc::new(RefCell::new(WatchState::default()));
     // Clone and move the event queue (events: Arc<Mutex<VecDeque>>) into each closure.
 
@@ -2406,6 +2684,7 @@ fn setup_watch(
     let meta_keep: MetaKeepStore = Rc::new(RefCell::new(Vec::new()));
 
     // Registry global / global_remove listeners.
+    let failure_for_global = query_failure.clone();
     let state_for_global = state.clone();
     let events_for_global = events.clone();
     let registry_for_global = registry.clone();
@@ -2430,7 +2709,8 @@ fn setup_watch(
                         }
                         let node_name = props.get(*pw::keys::NODE_NAME).unwrap_or("");
                         if node_name.is_empty() {
-                            // Skip nodes without a stable key; they cannot be handled.
+                            failure_for_global.set(Some(EnumerationFailure::Identity));
+                            lock_events(&events_for_global).invalidate();
                             return;
                         }
                         let description = props
@@ -2486,7 +2766,11 @@ fn setup_watch(
                         let metadata: pw::metadata::Metadata =
                             match registry_for_global.bind(global) {
                                 Ok(m) => m,
-                                Err(_) => return,
+                                Err(_) => {
+                                    failure_for_global.set(Some(EnumerationFailure::Metadata));
+                                    lock_events(&events_for_global).invalidate();
+                                    return;
+                                }
                             };
                         let state_for_meta = state_for_global.clone();
                         let events_for_meta = events_for_global.clone();
@@ -2495,42 +2779,33 @@ fn setup_watch(
                             .property(move |_subject, key, _type, value| {
                                 // Property callbacks also cross FFI, so wrap them in catch_unwind.
                                 catch_unwind(AssertUnwindSafe(|| {
-                                    // value is JSON (e.g. {"name":"alsa_output...."}). Extract name.
-                                    if let (Some(key), Some(value)) = (key, value) {
-                                        let new_name = extract_json_name(value);
-                                        let mut st = state_for_meta.borrow_mut();
-                                        if key == "default.audio.sink" {
-                                            if st.default_sink != new_name {
-                                                st.default_sink = new_name.clone();
-                                                // Publish only changes after the initial scan completes.
-                                                if st.initial_scan_done {
-                                                    if let Some(id) = new_name {
-                                                        drop(st);
-                                                        enqueue_event(
-                                                            &events_for_meta,
-                                                            DeviceEvent::DefaultChanged {
-                                                                kind: SourceKind::SystemLoopback,
-                                                                id,
-                                                            },
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        } else if key == "default.audio.source"
-                                            && st.default_source != new_name
-                                        {
-                                            st.default_source = new_name.clone();
-                                            if st.initial_scan_done {
-                                                if let Some(id) = new_name {
-                                                    drop(st);
-                                                    enqueue_event(
-                                                        &events_for_meta,
-                                                        DeviceEvent::DefaultChanged {
-                                                            kind: SourceKind::Mic,
-                                                            id,
-                                                        },
-                                                    );
-                                                }
+                                    // A null key clears every default property for this subject.
+                                    for (property, kind) in [
+                                        (
+                                            "default.audio.sink",
+                                            flexaudio_core::DefaultDeviceKind::SystemAudio,
+                                        ),
+                                        (
+                                            "default.audio.source",
+                                            flexaudio_core::DefaultDeviceKind::Microphone,
+                                        ),
+                                    ] {
+                                        if key.is_some_and(|key| key != property) {
+                                            continue;
+                                        }
+                                        let next = key.and(value).and_then(extract_json_name);
+                                        let mut state = state_for_meta.borrow_mut();
+                                        let publish = state.initial_scan_done;
+                                        let previous = if property == "default.audio.sink" {
+                                            &mut state.default_sink
+                                        } else {
+                                            &mut state.default_source
+                                        };
+                                        let event = transition_default(previous, next, kind);
+                                        drop(state);
+                                        if publish {
+                                            if let Some(event) = event {
+                                                enqueue_event(&events_for_meta, event);
                                             }
                                         }
                                     }
@@ -2565,12 +2840,14 @@ fn setup_watch(
     // second done, initial globals and default metadata's initial property dump are available, so
     // later global/global_remove/property changes can be published as user-driven device or
     // default changes.
+    let aborted = Rc::new(Cell::new(false));
     let stage = Rc::new(Cell::new(0u8));
     let pending = core
         .sync(0)
         .map_err(|e| format!("pipewire sync failed: {e}"))?;
     let pending = Rc::new(Cell::new(pending.seq()));
 
+    let aborted_for_cb = aborted.clone();
     let stage_for_cb = stage.clone();
     let pending_for_cb = pending.clone();
     let state_for_done = state.clone();
@@ -2591,15 +2868,12 @@ fn setup_watch(
                         match core.sync(0) {
                             Ok(p) => pending_for_cb.set(p.seq()),
                             Err(_) => {
-                                // If the second sync cannot be issued, treat the initial scan as complete.
-                                stage_for_cb.set(2);
-                                state_for_done.borrow_mut().initial_scan_done = true;
+                                aborted_for_cb.set(true);
                                 loop_for_done.quit();
                             }
                         }
                     } else {
-                        stage_for_cb.set(2);
-                        state_for_done.borrow_mut().initial_scan_done = true;
+                        aborted_for_cb.set(true);
                         loop_for_done.quit();
                     }
                 }
@@ -2621,8 +2895,26 @@ fn setup_watch(
     // and calls quit(), so this exits as in enumerate_pw. Return only after the initial globals
     // and default metadata property dump are available. run_watch_loop handles persistent
     // watching. Once stage reaches 2, done no longer calls quit(), so that run() continues.
-    while !state.borrow().initial_scan_done {
-        main_loop.run();
+    let deadline = std::time::Instant::now();
+    while !state.borrow().initial_scan_done && !aborted.get() {
+        let elapsed = deadline.elapsed().as_millis();
+        if elapsed >= ENUMERATE_DEADLINE_MS {
+            return Err("pipewire watch initial scan timed out".into());
+        }
+        let remaining = std::time::Duration::from_millis((ENUMERATE_DEADLINE_MS - elapsed) as u64);
+        if main_loop
+            .loop_()
+            .iterate(pw::loop_::Timeout::Finite(remaining))
+            < 0
+        {
+            aborted.set(true);
+        }
+    }
+    if aborted.get() {
+        return Err("pipewire watch initial scan aborted".into());
+    }
+    if let Some(failure) = query_failure.get() {
+        return Err(failure.message().into());
     }
 
     Ok((
@@ -2637,25 +2929,55 @@ fn setup_watch(
     ))
 }
 
-/// Push one event to the queue. Do nothing if locking fails (do not panic).
-///
-/// If the consumer does not call `poll_event` for a while or devices are repeatedly added and
-/// removed, `VecDeque` can grow without bound. Limit it to [`MAX_WATCH_EVENTS`], dropping the
-/// oldest event before adding a new one when full.
-fn enqueue_event(events: &Arc<Mutex<VecDeque<DeviceEvent>>>, ev: DeviceEvent) {
-    if let Ok(mut q) = events.lock() {
-        // If at capacity, drop the oldest event before pushing.
-        while q.len() >= MAX_WATCH_EVENTS {
-            q.pop_front();
-        }
-        q.push_back(ev);
-    }
+/// Push one delta to the bounded queue, salvaging poison and preserving sticky invalidation.
+fn enqueue_event(events: &WatchEventQueue, ev: DeviceEvent) {
+    lock_events(events).push(ev, MAX_WATCH_EVENTS);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use flexaudio_core::raw_ring::raw_ring;
+
+    #[test]
+    fn enumeration_missing_properties_only_fail_for_nodes() {
+        use pw::types::ObjectType;
+
+        for object_type in [
+            ObjectType::Core,
+            ObjectType::Module,
+            ObjectType::Client,
+            ObjectType::Metadata,
+            ObjectType::Device,
+            ObjectType::Port,
+            ObjectType::Other("unrelated interface".into()),
+        ] {
+            assert!(matches!(
+                enumeration_properties(&object_type, None),
+                Ok(None)
+            ));
+        }
+        assert!(matches!(
+            enumeration_properties(&ObjectType::Node, None),
+            Err(EnumerationFailure::Identity)
+        ));
+
+        // A dictionary (including an empty one) remains available to the normal
+        // media.class/node.name checks in the registry callback.
+        let properties = properties! { "node.name" => "fixture.audio" };
+        let props: &spa::utils::dict::DictRef = properties.as_ref();
+        assert!(std::ptr::eq(
+            enumeration_properties(&ObjectType::Node, Some(props))
+                .unwrap()
+                .unwrap(),
+            props,
+        ));
+        let empty = pw::properties::PropertiesBox::new();
+        assert!(matches!(
+            enumeration_properties(&ObjectType::Node, Some(empty.as_ref())),
+            Ok(Some(_))
+        ));
+    }
 
     /// Verify `PwSystemBackend: Send` as required by the [`CaptureBackend`] contract (proves
     /// PipeWire's `!Send` values are confined to the dedicated thread). Passing compilation is enough.
@@ -2698,7 +3020,7 @@ mod tests {
                 // waiting succeeds even if targets have not appeared. Complete the stop cycle.
                 be.stop();
             }
-            Err(Error::Backend(_)) => {
+            Err(error) if error.kind() == flexaudio_core::ErrorKind::Backend => {
                 // PipeWire unavailable/registry failure is expected. The key is no panic.
             }
             Err(other) => panic!("unexpected error variant: {other:?}"),
@@ -2724,12 +3046,20 @@ mod tests {
         assert_eq!(extract_json_name("not json"), None);
     }
 
-    /// `list_devices` returns `Ok(Vec)` without panicking, even on a headless machine without
-    /// PipeWire (daemon absence is treated as no enumerable devices = empty Vec). If devices are
+    /// Discovery returns a complete inventory or Backend failure. If devices are
     /// returned, verify Sink→SystemLoopback / Source→Mic consistency and nonempty ids (=node.name).
     #[test]
-    fn list_devices_is_graceful_without_pipewire() {
-        let devices = list_devices().expect("list_devices is designed not to return Err");
+    fn list_devices_is_complete_or_backend_error() {
+        let devices = match list_devices() {
+            Ok(devices) => devices,
+            Err(error) => {
+                assert_eq!(error.kind(), flexaudio_core::ErrorKind::Backend);
+                assert!(
+                    matches!(error, Error::Context { context, .. } if context.operation() == Operation::Enumerate)
+                );
+                return;
+            }
+        };
         for d in &devices {
             assert!(!d.id.is_empty(), "id (=node.name) is nonempty");
             match d.source_kind {
@@ -2769,7 +3099,7 @@ mod tests {
                 // PipeWire and an active sink are available. Complete the stop cycle.
                 be.stop();
             }
-            Err(Error::Backend(_)) => {
+            Err(error) if error.kind() == flexaudio_core::ErrorKind::Backend => {
                 // PipeWire unavailable/no sink is expected. The key is no panic.
             }
             Err(other) => panic!("unexpected error variant: {other:?}"),
@@ -2778,7 +3108,7 @@ mod tests {
 
     /// Start with a `device_id` for a nonexistent sink. If PipeWire is running, the sink is not
     /// listed and [`Error::DeviceNotFound`] is returned. Without PipeWire, enumerate_pw treats
-    /// the failure as empty and the regular connection path returns [`Error::Backend`]. Verify
+    /// the failure as an error with Enumerate context. Verify
     /// no panic and no Ok in either case.
     #[test]
     fn start_with_unknown_device_id_is_not_found_or_backend() {
@@ -2787,7 +3117,7 @@ mod tests {
         let mut be = PwSystemBackend::new(false, Some("flexaudio-no-such-sink-zzz".to_string()));
         match be.start(sink) {
             Err(Error::DeviceNotFound) => {}
-            Err(Error::Backend(_)) => {}
+            Err(error) if error.kind() == flexaudio_core::ErrorKind::Backend => {}
             Ok(()) => {
                 be.stop();
                 panic!("start should not succeed for an unknown device_id");
@@ -2882,7 +3212,7 @@ mod tests {
                 // Duplicate stop is also safe.
                 be.stop();
             }
-            Err(Error::Backend(_)) => {
+            Err(error) if error.kind() == flexaudio_core::ErrorKind::Backend => {
                 // PipeWire unavailable/registry failure is expected. The key is no panic.
             }
             Err(other) => panic!("unexpected error variant: {other:?}"),
@@ -3505,8 +3835,8 @@ mod tests {
                 2,
                 2,
                 2,
-                true,
-                "5.1 source links its front pair instead of waiting forever",
+                false,
+                "multichannel input is unsupported",
             ),
             case(
                 None,
@@ -3514,8 +3844,8 @@ mod tests {
                 2,
                 2,
                 2,
-                true,
-                "declared count unknown — current ports fully paired",
+                false,
+                "unknown layout cannot establish complete routing",
             ),
             case(None, 0, 2, 0, 2, false, "nothing to link"),
             case(
@@ -3567,7 +3897,7 @@ mod tests {
                 // Duplicate stop is also safe.
                 be.stop();
             }
-            Err(Error::Backend(_)) => {
+            Err(error) if error.kind() == flexaudio_core::ErrorKind::Backend => {
                 // PipeWire unavailable/registry failure is expected. The key is no panic.
             }
             Err(other) => panic!("unexpected error variant: {other:?}"),
@@ -3625,8 +3955,8 @@ mod tests {
     }
 
     /// Verify `start()` does not panic in a headless environment without PipeWire. It may return
-    /// `Ok` when a PipeWire session exists or `Err(Backend)` otherwise; the key is no panic (the
-    /// facade degrades Err to a no-op watcher). On Ok, also verify the stop cycle completes safely.
+    /// `Ok` when a PipeWire session exists or `Err(Backend)` otherwise; the key is no panic (Linux
+    /// facade propagates startup errors). On Ok, also verify the stop cycle completes safely.
     #[test]
     fn watcher_graceful_without_pipewire() {
         match PwDeviceWatcher::start() {
@@ -3636,7 +3966,7 @@ mod tests {
                 let _ = w.poll_event();
                 w.stop();
             }
-            Err(Error::Backend(_)) => {
+            Err(error) if error.kind() == flexaudio_core::ErrorKind::Backend => {
                 // PipeWire unavailable is expected. The key is no panic.
             }
             Err(other) => panic!("unexpected error variant: {other:?}"),
@@ -3658,7 +3988,7 @@ mod tests {
     /// PipeWire; tests only the event queue logic).
     #[test]
     fn enqueue_and_drain_is_fifo() {
-        let events: Arc<Mutex<VecDeque<DeviceEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let events: WatchEventQueue = Arc::new(Mutex::new(WatchEvents::default()));
         let mic = DeviceInfo {
             id: "mic.a".into(),
             name: "Mic A".into(),
@@ -3673,13 +4003,13 @@ mod tests {
         enqueue_event(
             &events,
             DeviceEvent::DefaultChanged {
-                kind: SourceKind::SystemLoopback,
+                kind: flexaudio_core::DefaultDeviceKind::SystemAudio,
                 id: "sink.x".into(),
             },
         );
         // Equivalent to poll_event (pop in FIFO order).
         let mut drained = Vec::new();
-        while let Some(ev) = events.lock().unwrap().pop_front() {
+        while let Some(ev) = lock_events(&events).poll() {
             drained.push(ev);
         }
         assert_eq!(
@@ -3688,7 +4018,7 @@ mod tests {
                 DeviceEvent::Added(mic),
                 DeviceEvent::Removed { id: "mic.a".into() },
                 DeviceEvent::DefaultChanged {
-                    kind: SourceKind::SystemLoopback,
+                    kind: flexaudio_core::DefaultDeviceKind::SystemAudio,
                     id: "sink.x".into(),
                 },
             ]
@@ -3700,7 +4030,7 @@ mod tests {
     /// within the limit and retains the newest entries.
     #[test]
     fn enqueue_event_caps_queue_and_drops_oldest() {
-        let events: Arc<Mutex<VecDeque<DeviceEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let events: WatchEventQueue = Arc::new(Mutex::new(WatchEvents::default()));
         // Push the limit + 10 events. Use node numbers in ids to track which remain.
         let total = MAX_WATCH_EVENTS + 10;
         for i in 0..total {
@@ -3711,7 +4041,12 @@ mod tests {
                 },
             );
         }
-        let q = events.lock().unwrap();
+        assert_eq!(
+            lock_events(&events).poll(),
+            Some(DeviceEvent::RescanRequired { dropped_events: 10 })
+        );
+        let queue = events.lock().unwrap();
+        let q = &queue.deltas;
         // Length never exceeds the limit.
         assert_eq!(
             q.len(),

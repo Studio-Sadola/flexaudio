@@ -16,6 +16,7 @@ pub struct RawSink {
     producer: RawProducer,
     native_rate: u32,
     native_channels: u16,
+    diagnostics: crate::CaptureDiagnostics,
 }
 
 impl RawSink {
@@ -23,6 +24,7 @@ impl RawSink {
     pub fn new(producer: RawProducer, native_rate: u32, native_channels: u16) -> Self {
         Self {
             producer,
+            diagnostics: crate::CaptureDiagnostics::new(native_rate, native_channels),
             native_rate,
             native_channels,
         }
@@ -42,6 +44,11 @@ impl RawSink {
     pub fn push(&mut self, interleaved: &[f32], pts_ns: i64) -> usize {
         let _ = pts_ns;
         self.producer.push_slice(interleaved)
+    }
+
+    /// Clone the rejection handle before entering a realtime callback.
+    pub fn diagnostics(&self) -> crate::CaptureDiagnostics {
+        self.diagnostics.clone()
     }
 
     /// Backend native sample rate (Hz).
@@ -85,12 +92,23 @@ pub trait CaptureBackend: Send {
     /// Stop capture.
     fn stop(&mut self);
 
+    /// Checked stop. External backends retain compatibility, but must override this
+    /// to expose hidden owner failures.
+    fn stop_checked(&mut self) -> Result<()> {
+        self.stop();
+        Ok(())
+    }
+
     /// Poll a backend notification on the control thread. Confirmed permission
     /// denial and [`Event::TerminalError`] are terminal; the stream stops capture
     /// and suppresses recovery.
     /// Return promptly and return `None` when empty. After `stop`, final owner
     /// notifications must remain pollable until drained; do not discard denial
     /// when stopping or replacing a capture generation.
+    /// Typed error messages must be safe library-authored explanations; OS error text is
+    /// allowed, but device names, private environment diagnostics and internal call labels
+    /// are not. Legacy [`Event::Error`] strings are conservatively terminal and replaced
+    /// with a library-authored explanation at the facade boundary.
     fn poll_event(&mut self) -> Option<Event> {
         None
     }

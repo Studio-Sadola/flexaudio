@@ -33,7 +33,22 @@ use rubato::{
     WindowFunction,
 };
 
-use crate::types::{Error, OutputFormat, Result, CHANNELS, SAMPLE_RATE};
+use crate::types::{
+    ChunkFlags, Error, ErrorContext, ErrorGroup, Operation, OutputFormat, Result, CHANNELS,
+    SAMPLE_RATE,
+};
+
+/// A library-constructed chunk retaining padding provenance.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct NormalizedChunk {
+    /// Interleaved output PCM.
+    pub samples: Vec<f32>,
+    /// Presentation timestamp of the first frame.
+    pub pts_ns: i64,
+    /// Integrity flags; padding alone is not a discontinuity.
+    pub flags: ChunkFlags,
+}
 
 /// Frames per internal canonical-form chunk (20ms @ 48kHz). Stage 1 split boundary.
 pub const CHUNK_FRAMES: usize = 960;
@@ -74,8 +89,13 @@ pub trait InnerProcessor: Send {
 /// Accumulate interleaved samples with `push`, then retrieve completed output chunks one at a
 /// time with `pop_chunk` (primary) and `pop_secondary` (secondary).
 pub struct Normalizer {
+    flush_result: Option<Result<()>>,
     in_sample_rate: u32,
     in_channels: usize,
+    /// Interleaved input awaiting a complete native frame.
+    pending_input: Vec<f32>,
+    /// Timestamp of the first sample retained in `pending_input`.
+    pending_input_pts: Option<i64>,
 
     // --- Stage 1 (internal normalization: → 48k/stereo, shared by all output taps) ---
     /// Passthrough when the input is 48000 Hz (no resampler).
@@ -93,6 +113,7 @@ pub struct Normalizer {
     // --- Output taps (each has its own stage 2, output buffer, and PTS state) ---
     /// Primary output tap (its [`OutputFormat`] is `output`).
     primary: OutputTap,
+    capture: Option<OutputTap>,
     /// Secondary output tap (when configured). Has stage 2 and PTS state independent of primary.
     secondary: Option<OutputTap>,
 }
@@ -114,6 +135,9 @@ struct OutputTap {
     out_frame_origin: u64,
     /// PTS anchor: associates an output frame index with `device_pts` (ns).
     pts_anchor: Option<PtsAnchor>,
+    /// Exact capture clock; legacy output taps retain their original arithmetic.
+    canonical_clock: bool,
+    padding: std::collections::VecDeque<std::ops::Range<u64>>,
 }
 
 #[derive(Clone, Copy)]
@@ -157,8 +181,8 @@ impl Normalizer {
     /// Create a normalizer for the input sample rate, input channel count, and output format.
     ///
     /// Stage 1 normalizes input to 48k/stereo (`in_sample_rate == 48000` bypasses sample-rate
-    /// conversion; `in_channels` of 1 duplicates mono to stereo, 2 is unchanged, and 3 or more
-    /// uses the front two channels). Stage 2 converts the canonical form to `output` (passthrough
+    /// conversion; `in_channels` of 1 duplicates mono to stereo and 2 is unchanged.
+    /// Input above two channels is rejected with UnsupportedFormat). Stage 2 converts the canonical form to `output` (passthrough
     /// when `output == {48000, 2}`).
     ///
     /// Expects the caller to have run [`OutputFormat::validate`] on `output` (this method does not
@@ -168,7 +192,18 @@ impl Normalizer {
     /// would silently stop the non-RT capture thread, so failures return [`Error::Backend`] and
     /// propagate to the caller.
     pub fn new(in_sample_rate: u32, in_channels: u16, output: OutputFormat) -> Result<Self> {
-        let in_channels = in_channels.max(1) as usize;
+        if in_sample_rate == 0 || in_channels == 0 {
+            return Err(Error::InvalidArg(
+                "native rate and channels must be positive".into(),
+            ));
+        }
+        if in_channels > 2 {
+            return Err(Error::UnsupportedFormat(
+                "native input supports only mono or stereo".into(),
+            ));
+        }
+        output.validate()?;
+        let in_channels = usize::from(in_channels);
 
         // Stage 1 resampler (→48000). Runs once for all output taps.
         let stage1_resampler = if in_sample_rate == SAMPLE_RATE {
@@ -178,13 +213,17 @@ impl Normalizer {
         };
 
         Ok(Self {
+            flush_result: None,
             in_sample_rate,
             in_channels,
+            pending_input: Vec::new(),
+            pending_input_pts: None,
             stage1_resampler,
             inner_scratch: Vec::with_capacity(CHUNK_FRAMES * INNER_CH * 4),
             total_inner_frames: 0,
             inner_processor: None,
             primary: OutputTap::new(output)?,
+            capture: None,
             secondary: None,
         })
     }
@@ -197,6 +236,46 @@ impl Normalizer {
     pub fn with_secondary(mut self, secondary: OutputFormat) -> Result<Self> {
         self.secondary = Some(OutputTap::new(secondary)?);
         Ok(self)
+    }
+
+    /// Enable a pre-output-conversion canonical branch for off-callback consumers.
+    /// Its stop tail contains valid frames only, never transport padding.
+    pub fn with_capture_tap(mut self) -> Result<Self> {
+        let mut capture = OutputTap::new(OutputFormat::default())?;
+        capture.canonical_clock = true;
+        self.capture = Some(capture);
+        Ok(self)
+    }
+
+    /// Canonical frames produced but not emitted, discarded when this generation is rebuilt.
+    pub fn buffered_capture_frames(&self) -> usize {
+        self.capture
+            .as_ref()
+            .map_or(0, OutputTap::buffered_out_frames)
+    }
+
+    /// Retrieve valid canonical stereo frames; allow a short final tail only at stop.
+    pub fn pop_capture(&mut self, stopping: bool) -> Option<(Vec<f32>, i64)> {
+        self.pop_capture_with_metadata(stopping)
+            .map(|chunk| (chunk.samples, chunk.pts_ns))
+    }
+
+    /// Retrieve valid canonical frames with no transport padding.
+    pub fn pop_capture_with_metadata(&mut self, stopping: bool) -> Option<NormalizedChunk> {
+        let tap = self.capture.as_mut()?;
+        let frames = tap.buffered_out_frames();
+        if frames == 0 || (frames < CHUNK_FRAMES && !stopping) {
+            return None;
+        }
+        let take = frames.min(CHUNK_FRAMES);
+        let pts = tap.pts_for_out_frame(tap.out_frame_origin);
+        let data = tap.out_buf.drain(..take * INNER_CH).collect();
+        tap.out_frame_origin += take as u64;
+        Some(NormalizedChunk {
+            samples: data,
+            pts_ns: pts,
+            flags: ChunkFlags::empty(),
+        })
     }
 
     /// Inject a processor to apply once to the internal canonical form before the stage 2 split.
@@ -237,8 +316,8 @@ impl Normalizer {
 
     /// Accumulate interleaved input samples.
     ///
-    /// `interleaved` must have a length divisible by `in_channels`. `device_pts_ns` is the
-    /// device-provided PTS for the first frame in this push.
+    /// Incomplete trailing frames are retained until a later push completes them.
+    /// `device_pts_ns` is the device-provided PTS for the first frame in this push.
     ///
     /// Returns [`Error::Backend`] if rubato's `process` fails. This avoids silently stopping the
     /// capture thread with a panic and lets the caller stop the stream explicitly.
@@ -246,25 +325,55 @@ impl Normalizer {
         if interleaved.is_empty() {
             return Ok(());
         }
-        let in_frames = interleaved.len() / self.in_channels;
+        if let Some(Err(error)) = &self.flush_result {
+            return Err(error.clone());
+        }
+        self.flush_result = None;
+        if self.pending_input.is_empty() {
+            self.pending_input_pts = Some(device_pts_ns);
+        }
+        self.pending_input.extend_from_slice(interleaved);
+        let in_frames = self.pending_input.len() / self.in_channels;
         if in_frames == 0 {
             return Ok(());
         }
+        let device_pts_ns = self.pending_input_pts.unwrap_or(device_pts_ns);
 
         // Approximate the future output frame position for the start of this push by the sample-rate
         // ratio and update each tap's PTS anchor. This is approximate because the resampler retains
         // a remainder internally. Set anchors independently for primary and secondary.
         self.primary
-            .update_pts_anchor(self.total_inner_frames, device_pts_ns);
+            .update_pts_anchor(self.total_inner_frames, device_pts_ns)?;
         if let Some(sec) = self.secondary.as_mut() {
-            sec.update_pts_anchor(self.total_inner_frames, device_pts_ns);
+            sec.update_pts_anchor(self.total_inner_frames, device_pts_ns)?;
+        }
+
+        if let Some(capture) = self.capture.as_mut() {
+            // One rational PTS anchor per source generation. Arrival-time jitter must
+            // not reanchor old samples or create a VAD epoch on every push.
+            if capture.pts_anchor.is_none() {
+                capture.update_pts_anchor(self.total_inner_frames, device_pts_ns)?;
+            }
         }
 
         // Stage 1: mix channels → stereo interleaved → normalize to 48k. Collect what this push
         // generates in inner_scratch.
         self.inner_scratch.clear();
         let mut stereo = Vec::with_capacity(in_frames * INNER_CH);
-        Self::mix_to_stereo(interleaved, self.in_channels, in_frames, &mut stereo);
+        Self::mix_to_stereo(
+            &self.pending_input,
+            self.in_channels,
+            in_frames,
+            &mut stereo,
+        );
+        self.pending_input.drain(..in_frames * self.in_channels);
+        self.pending_input_pts = if self.pending_input.is_empty() {
+            None
+        } else {
+            Some(device_pts_ns.saturating_add(
+                (in_frames as i64).saturating_mul(1_000_000_000) / self.in_sample_rate as i64,
+            ))
+        };
         match &mut self.stage1_resampler {
             None => {
                 // Sample-rate passthrough. Use directly as the internal canonical form.
@@ -292,35 +401,87 @@ impl Normalizer {
     /// Returns (`out_chunk_frames` interleaved frames at `output.channels`, PTS in ns for the
     /// first sample). Returns `None` if a full chunk is not buffered.
     pub fn pop_chunk(&mut self) -> Option<(Vec<f32>, i64)> {
-        self.primary.pop()
+        self.pop_chunk_with_metadata()
+            .map(|chunk| (chunk.samples, chunk.pts_ns))
     }
 
     /// Retrieve one completed secondary output chunk (`None` if no secondary tap is configured).
     pub fn pop_secondary(&mut self) -> Option<(Vec<f32>, i64)> {
+        self.pop_secondary_with_metadata()
+            .map(|chunk| (chunk.samples, chunk.pts_ns))
+    }
+
+    /// Retrieve primary PCM with its integrity flags.
+    pub fn pop_chunk_with_metadata(&mut self) -> Option<NormalizedChunk> {
+        self.primary.pop()
+    }
+
+    /// Retrieve secondary PCM with its integrity flags.
+    pub fn pop_secondary_with_metadata(&mut self) -> Option<NormalizedChunk> {
         self.secondary.as_mut().and_then(OutputTap::pop)
     }
 
-    /// Flush on stop. Feed the processor's trailing tail (e.g. denoise), drain each tap's stage 2
-    /// resampler remainder, and pad a final partial chunk with silence to align it to the fixed
-    /// 20ms boundary so it can be retrieved with `pop_chunk` / `pop_secondary`.
-    ///
-    /// Continue on a best-effort basis if resampler flushing fails, so the stop path does not fail
-    /// (at most the final few milliseconds are lost).
-    pub fn flush(&mut self) {
-        // 1. Feed the processor's trailing tail (e.g. denoise delay line) as the internal canonical form.
-        if let Some(proc) = self.inner_processor.as_mut() {
-            let tail = proc.flush();
-            if !tail.is_empty() {
-                self.inner_scratch.clear();
-                self.inner_scratch.extend_from_slice(&tail);
-                let _ = self.distribute_inner();
+    /// Drain stage 1, processor tail and all output stages, retaining independent failures.
+    /// Repeated flush returns the same result without generating duplicate PCM.
+    /// Valid output remains drainable on cleanup-only failure.
+    pub fn flush(&mut self) -> Result<()> {
+        if let Some(result) = &self.flush_result {
+            return result.clone();
+        }
+        let mut errors = Vec::new();
+        if !self.pending_input.is_empty() {
+            errors.push(Error::Backend("incomplete native frame at flush".into()));
+            self.pending_input.clear();
+            self.pending_input_pts = None;
+        }
+        self.inner_scratch.clear();
+        if let Some(stage) = self.stage1_resampler.as_mut() {
+            match stage.flush_into(&mut self.inner_scratch) {
+                Ok(produced) => self.total_inner_frames += produced,
+                Err(error) => errors.push(error),
+            }
+            if let Some(processor) = self.inner_processor.as_mut() {
+                processor.process(&mut self.inner_scratch);
+            }
+            if let Err(error) = self.distribute_inner() {
+                errors.push(error);
             }
         }
-        // 2. Drain each tap's stage 2 resampler remainder and pad partial chunks with silence.
-        self.primary.flush();
-        if let Some(sec) = self.secondary.as_mut() {
-            sec.flush();
+        if let Some(processor) = self.inner_processor.as_mut() {
+            self.inner_scratch = processor.flush();
+            // Keep the canonical capture epoch empty for a primed silent processor.
+            let empty_capture = if self.total_inner_frames == 0 {
+                self.capture.take()
+            } else {
+                None
+            };
+            if let Err(error) = self.distribute_inner() {
+                errors.push(error);
+            }
+            if let Some(capture) = empty_capture {
+                self.capture = Some(capture);
+            }
         }
+        if let Err(error) = self.primary.flush() {
+            errors.push(error);
+        }
+        if let Some(secondary) = self.secondary.as_mut() {
+            if let Err(error) = secondary.flush() {
+                errors.push(error);
+            }
+        }
+        if let Some(capture) = self.capture.as_mut() {
+            // Preserve canonical valid-frame tails without transport padding.
+            if let Some(stage) = capture.stage2.as_mut() {
+                if let Err(error) = stage.flush_into(&mut capture.out_buf) {
+                    errors.push(error);
+                }
+            }
+        }
+        let result = combine_failures(errors)
+            .map_err(|error| error.with_context(ErrorContext::new(Operation::Flush)));
+        self.flush_result = Some(result.clone());
+        result
     }
 
     /// Number of output frames buffered but not yet retrieved from `out_buf` (primary tap).
@@ -338,6 +499,11 @@ impl Normalizer {
         }
         let inner = std::mem::take(&mut self.inner_scratch);
         let r_primary = self.primary.feed_inner(&inner);
+        let r_capture = self
+            .capture
+            .as_mut()
+            .map(|capture| capture.feed_inner(&inner))
+            .unwrap_or(Ok(()));
         let r_secondary = self
             .secondary
             .as_mut()
@@ -346,10 +512,15 @@ impl Normalizer {
         // Restore the buffer so its capacity can be reused.
         self.inner_scratch = inner;
         self.inner_scratch.clear();
-        r_primary.and(r_secondary)
+        combine_failures(
+            [r_primary, r_capture, r_secondary]
+                .into_iter()
+                .filter_map(Result::err)
+                .collect(),
+        )
     }
 
-    /// Mix interleaved audio with any channel count to stereo interleaved and push it to `dst`.
+    /// Convert validated mono/stereo input to stereo interleaved and push it to `dst`.
     fn mix_to_stereo(src: &[f32], in_ch: usize, in_frames: usize, dst: &mut Vec<f32>) {
         match in_ch {
             1 => {
@@ -363,1023 +534,29 @@ impl Normalizer {
                 // Keep 2 channels unchanged (only the required samples).
                 dst.extend_from_slice(&src[..in_frames * 2]);
             }
-            _ => {
-                // For now, use the front two channels for inputs with more than 2 channels.
-                // TODO(ITU-R BS.775): Apply proper downmix coefficients for 5.1 and other layouts.
-                for f in 0..in_frames {
-                    let base = f * in_ch;
-                    dst.push(src[base]);
-                    dst.push(src[base + 1]);
-                }
-            }
+            _ => unreachable!("native channel count validated by constructor"),
         }
-    }
-}
-
-impl OutputTap {
-    /// Create an output tap from an output format (expects `output` to be validated).
-    fn new(output: OutputFormat) -> Result<Self> {
-        let out_channels = (output.channels.max(1)) as usize;
-        let out_chunk_frames = output.chunk_frames().max(1);
-
-        // Skip stage 2 (passthrough) when output exactly matches the internal canonical form.
-        let stage2 = if output.sample_rate == SAMPLE_RATE && out_channels == INNER_CH {
-            None
-        } else {
-            Some(OutputStage::new(output.sample_rate, out_channels)?)
-        };
-
-        Ok(Self {
-            output,
-            stage2,
-            out_buf: Vec::with_capacity(out_chunk_frames * out_channels * 4),
-            out_chunk_frames,
-            out_channels,
-            out_frame_origin: 0,
-            pts_anchor: None,
-        })
-    }
-
-    /// Pass the processed internal canonical form (48k/stereo interleaved, any length) through
-    /// stage 2 and append the resulting output frames to `out_buf`.
-    fn feed_inner(&mut self, inner_stereo: &[f32]) -> Result<()> {
-        if inner_stereo.is_empty() {
-            return Ok(());
-        }
-        match &mut self.stage2 {
-            None => {
-                // Stage 2 passthrough (`output == {48000, 2}`). Append unchanged.
-                self.out_buf.extend_from_slice(inner_stereo);
-            }
-            Some(stage) => stage.process_inner(inner_stereo, &mut self.out_buf)?,
-        }
-        Ok(())
-    }
-
-    /// Retrieve one completed output chunk. Returns `None` if a full chunk is not buffered.
-    fn pop(&mut self) -> Option<(Vec<f32>, i64)> {
-        let need = self.out_chunk_frames * self.out_channels;
-        if self.out_buf.len() < need {
-            return None;
-        }
-        let pts = self.pts_for_out_frame(self.out_frame_origin);
-        let chunk: Vec<f32> = self.out_buf.drain(..need).collect();
-        self.out_frame_origin += self.out_chunk_frames as u64;
-        Some((chunk, pts))
-    }
-
-    /// Flush on stop. Drain the stage 2 resampler remainder and pad a final partial chunk with
-    /// silence to align it to the fixed 20ms boundary for retrieval with `pop`.
-    fn flush(&mut self) {
-        if let Some(stage) = self.stage2.as_mut() {
-            // Ignore resampler flush errors on a best-effort basis (only the final few ms are lost).
-            let _ = stage.flush_into(&mut self.out_buf);
-        }
-        let need = self.out_chunk_frames * self.out_channels;
-        let rem = self.out_buf.len() % need;
-        if rem != 0 {
-            let pad = need - rem;
-            self.out_buf.resize(self.out_buf.len() + pad, 0.0);
-        }
-    }
-
-    /// Number of output frames buffered but not yet retrieved from `out_buf`.
-    fn buffered_out_frames(&self) -> usize {
-        self.out_buf.len() / self.out_channels
-    }
-
-    /// Set the PTS anchor for the output frame position corresponding to the start of this push.
-    ///
-    /// The output frame position is an approximation mapped from the total internal frame count
-    /// to the output rate (not exact because the resampler retains a remainder). `in_sample_rate`
-    /// cancels out, so only the output and internal rates are needed.
-    fn update_pts_anchor(&mut self, total_inner_frames: u64, device_pts_ns: i64) {
-        let projected_out_frame = (total_inner_frames as f64 * self.output.sample_rate as f64
-            / SAMPLE_RATE as f64) as u64;
-        self.pts_anchor = Some(PtsAnchor {
-            out_frame: projected_out_frame,
-            pts_ns: device_pts_ns,
-        });
-    }
-
-    /// Extrapolate `device_pts` (ns) for output frame index `out_frame` from the anchor using the
-    /// output sample rate.
-    fn pts_for_out_frame(&self, out_frame: u64) -> i64 {
-        match self.pts_anchor {
-            None => crate::clock::monotonic_now_ns(),
-            Some(anchor) => {
-                let frame_delta = out_frame as i64 - anchor.out_frame as i64;
-                let ns_per_out_frame = 1_000_000_000_i64 / self.output.sample_rate as i64;
-                anchor.pts_ns + frame_delta * ns_per_out_frame
-            }
-        }
-    }
-}
-
-impl ResamplerState {
-    /// Create a fixed-ratio resampler with `channels` channels from `in_sr` to `out_sr`.
-    ///
-    /// Returns [`Error::Backend`] if rubato construction fails (avoids a panic silently stopping
-    /// the thread).
-    fn new(in_sr: u32, out_sr: u32, channels: usize) -> Result<Self> {
-        let ratio = out_sr as f64 / in_sr as f64;
-        // Fixed input chunk of about 20ms worth of input frames (rubato retains any remainder internally).
-        let chunk_in_frames = (in_sr as usize / 50).max(64);
-
-        let params = SincInterpolationParameters {
-            sinc_len: 128,
-            f_cutoff: 0.95,
-            interpolation: SincInterpolationType::Linear,
-            oversampling_factor: 128,
-            window: WindowFunction::BlackmanHarris2,
-        };
-
-        let inner = Async::<f32>::new_sinc(
-            ratio,
-            1.0, // Fixed ratio (no variable resampling needed)
-            &params,
-            chunk_in_frames,
-            channels,
-            FixedAsync::Input,
-        )
-        .map_err(|e| Error::Backend(format!("rubato sinc resampler construction failed: {e}")))?;
-
-        let max_out_frames = inner.output_frames_max();
-
-        Ok(Self {
-            inner,
-            channels,
-            chunk_in_frames,
-            max_out_frames,
-            in_accum: Vec::with_capacity(chunk_in_frames * channels * 4),
-            out_scratch: vec![0.0; max_out_frames * channels],
-        })
-    }
-
-    /// Resample as much of `in_accum` as possible in `chunk_in_frames` units and append the
-    /// resulting interleaved samples to `out_buf`. Returns the number of output frames generated.
-    ///
-    /// Returns [`Error::Backend`] if constructing a rubato adapter or calling `process_into_buffer`
-    /// fails (avoids a panic silently stopping the capture thread).
-    fn drain_into(&mut self, out_buf: &mut Vec<f32>) -> Result<u64> {
-        let step = self.chunk_in_frames * self.channels;
-        let mut produced = 0u64;
-
-        while self.in_accum.len() >= step {
-            let in_adapter =
-                InterleavedSlice::new(&self.in_accum[..step], self.channels, self.chunk_in_frames)
-                    .map_err(|e| {
-                        Error::Backend(format!("rubato interleaved input adapter failed: {e}"))
-                    })?;
-
-            let mut out_adapter = InterleavedSlice::new_mut(
-                &mut self.out_scratch[..],
-                self.channels,
-                self.max_out_frames,
-            )
-            .map_err(|e| {
-                Error::Backend(format!("rubato interleaved output adapter failed: {e}"))
-            })?;
-
-            let indexing = Indexing {
-                input_offset: 0,
-                output_offset: 0,
-                partial_len: None,
-                active_channels_mask: None,
-            };
-
-            let (_in_used, out_written) = self
-                .inner
-                .process_into_buffer(&in_adapter, &mut out_adapter, Some(&indexing))
-                .map_err(|e| Error::Backend(format!("rubato process_into_buffer failed: {e}")))?;
-
-            let n_samples = out_written * self.channels;
-            out_buf.extend_from_slice(&self.out_scratch[..n_samples]);
-            produced += out_written as u64;
-
-            // Remove consumed input (`FixedAsync::Input` always consumes `chunk_in_frames`).
-            self.in_accum.drain(..step);
-        }
-        Ok(produced)
-    }
-
-    /// On stop, process the less-than-one-chunk remainder in `in_accum` using `partial_len`, append
-    /// the resulting interleaved samples to `out_buf`, and return the number of output frames.
-    ///
-    /// This drains the remaining input (just under 20ms at most), leaving `in_accum` empty. It does
-    /// not flush the resampler's internal filter group delay (a few ms).
-    fn flush_into(&mut self, out_buf: &mut Vec<f32>) -> Result<u64> {
-        let remaining = self.in_accum.len() / self.channels;
-        if remaining == 0 {
-            return Ok(0);
-        }
-        // Pad input with silence to one full chunk and pass only the valid length via `partial_len`.
-        self.in_accum
-            .resize(self.chunk_in_frames * self.channels, 0.0);
-
-        let in_adapter = InterleavedSlice::new(
-            &self.in_accum[..self.chunk_in_frames * self.channels],
-            self.channels,
-            self.chunk_in_frames,
-        )
-        .map_err(|e| Error::Backend(format!("rubato interleaved input adapter failed: {e}")))?;
-
-        let mut out_adapter = InterleavedSlice::new_mut(
-            &mut self.out_scratch[..],
-            self.channels,
-            self.max_out_frames,
-        )
-        .map_err(|e| Error::Backend(format!("rubato interleaved output adapter failed: {e}")))?;
-
-        let indexing = Indexing {
-            input_offset: 0,
-            output_offset: 0,
-            partial_len: Some(remaining),
-            active_channels_mask: None,
-        };
-
-        let (_in_used, out_written) = self
-            .inner
-            .process_into_buffer(&in_adapter, &mut out_adapter, Some(&indexing))
-            .map_err(|e| Error::Backend(format!("rubato flush process_into_buffer failed: {e}")))?;
-
-        let n_samples = out_written * self.channels;
-        out_buf.extend_from_slice(&self.out_scratch[..n_samples]);
-        self.in_accum.clear();
-        Ok(out_written as u64)
-    }
-}
-
-impl OutputStage {
-    /// Create the output stage for the output sample rate and channel count.
-    ///
-    /// If `out_sample_rate == 48000`, sample-rate conversion is bypassed (only channel conversion
-    /// is performed). rubato construction failures propagate as [`Error::Backend`].
-    fn new(out_sample_rate: u32, out_channels: usize) -> Result<Self> {
-        let resampler = if out_sample_rate == SAMPLE_RATE {
-            None
-        } else {
-            // Convert from the 48000-Hz internal canonical form to `out_sample_rate` with `out_channels` channels.
-            Some(ResamplerState::new(
-                SAMPLE_RATE,
-                out_sample_rate,
-                out_channels,
-            )?)
-        };
-        Ok(Self {
-            out_channels,
-            resampler,
-            ch_scratch: Vec::with_capacity(CHUNK_FRAMES * out_channels),
-        })
-    }
-
-    /// Process the internal canonical form (48k/stereo interleaved, any length) and append
-    /// interleaved samples in the output format to `out_buf`. Length must be a multiple of
-    /// `INNER_CH` (stereo).
-    fn process_inner(&mut self, inner_stereo: &[f32], out_buf: &mut Vec<f32>) -> Result<()> {
-        let frames = inner_stereo.len() / INNER_CH;
-        if frames == 0 {
-            return Ok(());
-        }
-
-        // Channel conversion: stereo → out_channels.
-        self.ch_scratch.clear();
-        match self.out_channels {
-            1 => {
-                // stereo → mono (L/R average).
-                for f in 0..frames {
-                    let l = inner_stereo[f * 2];
-                    let r = inner_stereo[f * 2 + 1];
-                    self.ch_scratch.push((l + r) * 0.5);
-                }
-            }
-            2 => {
-                self.ch_scratch
-                    .extend_from_slice(&inner_stereo[..frames * 2]);
-            }
-            _ => {
-                // Validation should limit this to 1 or 2. If another count reaches here, duplicate L as a fallback.
-                for f in 0..frames {
-                    let l = inner_stereo[f * 2];
-                    for _ in 0..self.out_channels {
-                        self.ch_scratch.push(l);
-                    }
-                }
-            }
-        }
-
-        // Sample-rate conversion: 48000 → out_sample_rate. On passthrough, copy ch_scratch directly to output.
-        match &mut self.resampler {
-            None => {
-                out_buf.extend_from_slice(&self.ch_scratch);
-            }
-            Some(rs) => {
-                rs.in_accum.extend_from_slice(&self.ch_scratch);
-                rs.drain_into(out_buf)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// On stop, drain any sample-rate resampler remainder into `out_buf` (a passthrough stage has
-    /// no remainder, so this is a no-op).
-    fn flush_into(&mut self, out_buf: &mut Vec<f32>) -> Result<()> {
-        if let Some(rs) = self.resampler.as_mut() {
-            rs.flush_into(out_buf)?;
-        }
-        Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::f32::consts::PI;
+mod tests;
 
-    /// Helper for the default output ({48000, 2}).
-    fn default_out() -> OutputFormat {
-        OutputFormat::default()
-    }
+#[cfg(test)]
+mod repro_tests;
 
-    #[test]
-    fn mono_48k_to_stereo_duplicates_channels() {
-        let mut n = Normalizer::new(48_000, 1, default_out()).expect("normalizer");
-        assert!(n.is_passthrough());
-        assert!(n.is_output_passthrough());
-        // 960 frames of mono input (exactly one chunk because of passthrough).
-        let mono: Vec<f32> = (0..CHUNK_FRAMES).map(|i| (i as f32) * 0.001).collect();
-        n.push(&mono, 0).expect("push");
-        let (chunk, _pts) = n.pop_chunk().expect("one chunk");
-        assert_eq!(chunk.len(), CHUNK_FRAMES * 2);
-        // L == R holds for every frame.
-        for f in 0..CHUNK_FRAMES {
-            assert_eq!(chunk[f * 2], chunk[f * 2 + 1], "L==R at frame {f}");
-            assert_eq!(chunk[f * 2], mono[f]);
-        }
-    }
+mod output;
+mod resampler;
 
-    #[test]
-    fn passthrough_preserves_frame_count() {
-        let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
-        assert!(n.is_passthrough());
-        assert!(n.is_output_passthrough());
-        // Two chunks plus a remainder.
-        let frames = CHUNK_FRAMES * 2 + 100;
-        let stereo: Vec<f32> = (0..frames * 2).map(|i| (i as f32) * 1e-4).collect();
-        n.push(&stereo, 0).expect("push");
-
-        let mut got_frames = 0usize;
-        while let Some((c, _)) = n.pop_chunk() {
-            assert_eq!(c.len(), CHUNK_FRAMES * 2);
-            got_frames += CHUNK_FRAMES;
-        }
-        // Exactly two chunks can be retrieved; 100 remainder frames are left.
-        assert_eq!(got_frames, CHUNK_FRAMES * 2);
-        assert_eq!(n.buffered_out_frames(), 100);
-    }
-
-    #[test]
-    fn stereo_44100_to_48000_yields_about_50_chunks_per_second() {
-        let mut n = Normalizer::new(44_100, 2, default_out()).expect("normalizer");
-        assert!(!n.is_passthrough());
-
-        // One second of 44100Hz stereo sine wave.
-        let in_frames = 44_100;
-        let freq = 440.0_f32;
-        let mut interleaved = Vec::with_capacity(in_frames * 2);
-        for i in 0..in_frames {
-            let s = (2.0 * PI * freq * (i as f32) / 44_100.0).sin() * 0.5;
-            interleaved.push(s); // L
-            interleaved.push(s); // R
-        }
-
-        // Must not panic even with small, separate pushes (simulating small buffers from real hardware).
-        let mut pts = 0i64;
-        for block in interleaved.chunks(441 * 2) {
-            n.push(block, pts).expect("push");
-            pts += (block.len() as i64 / 2) * 1_000_000_000 / 44_100;
-        }
-
-        let mut chunks = 0usize;
-        while let Some((c, _pts)) = n.pop_chunk() {
-            assert_eq!(c.len(), CHUNK_FRAMES * 2);
-            chunks += 1;
-        }
-        assert!(
-            (47..=50).contains(&chunks),
-            "expected ~50 chunks, got {chunks}"
-        );
-    }
-
-    #[test]
-    fn pts_increases_monotonically_across_chunks() {
-        let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
-        let frames = CHUNK_FRAMES * 3;
-        let stereo = vec![0.0f32; frames * 2];
-        n.push(&stereo, 100_000_000).expect("push");
-
-        let mut last = i64::MIN;
-        let mut count = 0;
-        while let Some((_, pts)) = n.pop_chunk() {
-            assert!(pts >= last, "pts must be non-decreasing");
-            last = pts;
-            count += 1;
-        }
-        assert_eq!(count, 3);
-    }
-
-    // --- Stage 2 (output) tests ---
-
-    /// 48k/stereo input + {16000, 1} output → 320-frame mono chunks.
-    #[test]
-    fn output_16k_mono_yields_320_frame_mono_chunks() {
-        let out = OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        };
-        let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
-        assert!(n.is_passthrough()); // Stage 1 sample-rate passthrough (48k input).
-        assert!(!n.is_output_passthrough()); // Stage 2 is active.
-
-        // One second of 48k stereo sine wave (pushed in small blocks).
-        let in_frames = 48_000;
-        let freq = 440.0_f32;
-        let mut pts = 0i64;
-        for blk in 0..(in_frames / 480) {
-            let mut block = Vec::with_capacity(480 * 2);
-            for j in 0..480 {
-                let i = blk * 480 + j;
-                let s = (2.0 * PI * freq * (i as f32) / 48_000.0).sin() * 0.5;
-                block.push(s);
-                block.push(s);
-            }
-            n.push(&block, pts).expect("push");
-            pts += 480 * 1_000_000_000 / 48_000;
-        }
-
-        let mut chunks = 0usize;
-        while let Some((c, _)) = n.pop_chunk() {
-            assert_eq!(c.len(), 320, "16k mono 20ms = 320 sample (mono)");
-            chunks += 1;
-        }
-        // 16000/320 = 50 chunks/second; approximately 50 after resampler latency.
-        assert!(
-            (47..=50).contains(&chunks),
-            "expected ~50 chunks, got {chunks}"
-        );
-    }
-
-    /// Output {16000, 2} → 320 frames / 640 samples (stereo).
-    #[test]
-    fn output_16k_stereo_yields_320_frame_640_sample_chunks() {
-        let out = OutputFormat {
-            sample_rate: 16_000,
-            channels: 2,
-        };
-        let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
-        let in_frames = 48_000;
-        let stereo: Vec<f32> = (0..in_frames * 2)
-            .map(|i| ((i / 2) as f32 * 0.0001).sin() * 0.3)
-            .collect();
-        for block in stereo.chunks(480 * 2) {
-            n.push(block, 0).expect("push");
-        }
-        let mut chunks = 0usize;
-        while let Some((c, _)) = n.pop_chunk() {
-            assert_eq!(c.len(), 640, "16k stereo 20ms = 320 frame * 2 = 640 sample");
-            chunks += 1;
-        }
-        assert!(
-            (47..=50).contains(&chunks),
-            "expected ~50 chunks, got {chunks}"
-        );
-    }
-
-    /// Output {8000, 2} → 160 frames / 320 samples.
-    #[test]
-    fn output_8k_stereo_yields_160_frame_chunks() {
-        let out = OutputFormat {
-            sample_rate: 8_000,
-            channels: 2,
-        };
-        let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
-        let stereo: Vec<f32> = (0..48_000 * 2)
-            .map(|i| (i as f32 * 1e-5).sin() * 0.2)
-            .collect();
-        for block in stereo.chunks(480 * 2) {
-            n.push(block, 0).expect("push");
-        }
-        let mut chunks = 0usize;
-        while let Some((c, _)) = n.pop_chunk() {
-            assert_eq!(c.len(), 320, "8k stereo 20ms = 160 frame * 2 = 320 sample");
-            chunks += 1;
-        }
-        assert!(
-            (47..=50).contains(&chunks),
-            "expected ~50 chunks, got {chunks}"
-        );
-    }
-
-    /// stereo→mono averages L/R (opposite phase, L=+a and R=-a, approaches 0).
-    #[test]
-    fn stereo_to_mono_is_lr_average() {
-        // Use 48000/mono output to test sample-rate passthrough and channel conversion only.
-        let out = OutputFormat {
-            sample_rate: 48_000,
-            channels: 1,
-        };
-        let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
-        // Perfectly opposite phase (L=+0.5, R=-0.5) → average 0.
-        let mut stereo = Vec::with_capacity(CHUNK_FRAMES * 2);
-        for _ in 0..CHUNK_FRAMES {
-            stereo.push(0.5);
-            stereo.push(-0.5);
-        }
-        n.push(&stereo, 0).expect("push");
-        let (chunk, _) = n.pop_chunk().expect("one mono chunk");
-        assert_eq!(chunk.len(), CHUNK_FRAMES); // 960 mono samples.
-        for &s in &chunk {
-            assert!(
-                s.abs() < 1e-6,
-                "opposite-phase average should be near 0: {s}"
-            );
-        }
-    }
-
-    // --- Value-check helpers (verify amplitude and frequency preservation) ---
-
-    /// RMS of a sample sequence (linear). For a sine wave, this is A/√2 for amplitude A.
-    fn rms(samples: &[f32]) -> f32 {
-        if samples.is_empty() {
-            return 0.0;
-        }
-        let sum_sq: f64 = samples.iter().map(|&x| (x as f64) * (x as f64)).sum();
-        (sum_sq / samples.len() as f64).sqrt() as f32
-    }
-
-    /// Count zero crossings from positive to negative or negative to positive. There are two
-    /// crossings per cycle, so estimated frequency = (crossings / 2) / seconds. Pass the middle
-    /// section to avoid transients at the start and end.
-    fn zero_crossings(samples: &[f32]) -> usize {
-        let mut crossings = 0;
-        for w in samples.windows(2) {
-            // Count strict sign changes only (ignore exact zero).
-            if (w[0] < 0.0 && w[1] >= 0.0) || (w[0] >= 0.0 && w[1] < 0.0) {
-                crossings += 1;
-            }
-        }
-        crossings
-    }
-
-    /// Resampling a 44.1kHz/mono 440Hz sine wave to 48kHz/stereo preserves its amplitude (RMS)
-    /// and frequency (estimated by zero crossings). Process one second and measure only the
-    /// middle chunks to avoid resampler ringing.
-    #[test]
-    fn resample_44100_to_48000_preserves_amplitude_and_frequency() {
-        let mut n = Normalizer::new(44_100, 1, default_out()).expect("normalizer");
-        let freq = 440.0_f32;
-        let amp = 0.5_f32;
-        let in_rate = 44_100usize;
-        // Process two seconds to get enough chunks and leave room to discard transients.
-        let total_frames = in_rate * 2;
-        let mut pts = 0i64;
-        for blk in 0..(total_frames / 441) {
-            let mut block = Vec::with_capacity(441);
-            for j in 0..441 {
-                let i = blk * 441 + j;
-                block.push((2.0 * PI * freq * (i as f32) / in_rate as f32).sin() * amp);
-            }
-            n.push(&block, pts).expect("push");
-            pts += 441 * 1_000_000_000 / in_rate as i64;
-        }
-
-        // Concatenate all chunks (48k/stereo/960 frames output).
-        let mut left: Vec<f32> = Vec::new();
-        while let Some((c, _)) = n.pop_chunk() {
-            assert_eq!(c.len(), CHUNK_FRAMES * 2);
-            // Keep only the L channel (mono→stereo duplication means L==R).
-            for f in 0..CHUNK_FRAMES {
-                assert_eq!(c[f * 2], c[f * 2 + 1], "L==R for mono input");
-                left.push(c[f * 2]);
-            }
-        }
-        assert!(
-            left.len() >= 48_000,
-            "need at least 1 second of output: {}",
-            left.len()
-        );
-
-        // Discard 0.25 seconds (12000 samples) of transients at each end and measure the middle second.
-        let start = 12_000;
-        let mid = &left[start..start + 48_000];
-
-        // Amplitude: sine-wave RMS is amp/√2 ≈ 0.3536. Allow ±5% through the resampler.
-        let got_rms = rms(mid);
-        let expect_rms = amp / std::f32::consts::SQRT_2;
-        let rms_err = ((got_rms - expect_rms) / expect_rms).abs();
-        assert!(
-            rms_err < 0.05,
-            "RMS preservation error too large: got={got_rms} expect={expect_rms} err={rms_err}"
-        );
-
-        // Frequency: expect ≈ 2*440 = 880 crossings in the middle second (48000 samples), within ±2%.
-        let crossings = zero_crossings(mid);
-        let est_freq = crossings as f32 / 2.0; // One second, so crossings/2 = Hz.
-        let freq_err = ((est_freq - freq) / freq).abs();
-        assert!(
-            freq_err < 0.02,
-            "Frequency preservation error too large: crossings={crossings} estimate={est_freq}Hz err={freq_err}"
-        );
-    }
-
-    /// Verify the channel count and sample values of 16k/mono output: converting 48k/stereo
-    /// 440Hz input to 16k/mono preserves amplitude and frequency in 1-channel, 320-sample chunks.
-    #[test]
-    fn output_16k_mono_preserves_values() {
-        let out = OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        };
-        let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
-        let freq = 440.0_f32;
-        let amp = 0.5_f32;
-        let in_rate = 48_000usize;
-        let total_frames = in_rate * 2;
-        let mut pts = 0i64;
-        for blk in 0..(total_frames / 480) {
-            let mut block = Vec::with_capacity(480 * 2);
-            for j in 0..480 {
-                let i = blk * 480 + j;
-                let s = (2.0 * PI * freq * (i as f32) / in_rate as f32).sin() * amp;
-                block.push(s); // L
-                block.push(s); // R
-            }
-            n.push(&block, pts).expect("push");
-            pts += 480 * 1_000_000_000 / in_rate as i64;
-        }
-
-        let mut mono: Vec<f32> = Vec::new();
-        while let Some((c, _)) = n.pop_chunk() {
-            assert_eq!(c.len(), 320, "16k/mono 20ms = 320 samples (1ch)");
-            mono.extend_from_slice(&c);
-        }
-        assert!(
-            mono.len() >= 16_000,
-            "need at least 1 second: {}",
-            mono.len()
-        );
-
-        // Discard transients and measure the middle second (16000 samples).
-        let start = 4_000;
-        let mid = &mono[start..start + 16_000];
-
-        // Averaging in-phase L==R leaves the level unchanged → RMS ≈ amp/√2.
-        let got_rms = rms(mid);
-        let expect_rms = amp / std::f32::consts::SQRT_2;
-        let rms_err = ((got_rms - expect_rms) / expect_rms).abs();
-        assert!(
-            rms_err < 0.05,
-            "16k/mono RMS preservation error: got={got_rms} expect={expect_rms} err={rms_err}"
-        );
-
-        // Frequency: expect ≈ 880 crossings in the middle second (16000 samples), within ±2%.
-        let est_freq = zero_crossings(mid) as f32 / 2.0;
-        let freq_err = ((est_freq - freq) / freq).abs();
-        assert!(
-            freq_err < 0.02,
-            "16k/mono frequency preservation error: estimate={est_freq}Hz err={freq_err}"
-        );
-    }
-
-    /// PTS increases monotonically, and the delta between adjacent chunks is about 20ms
-    /// (1e7 ns, within tolerance). Check measured values to verify PTS anchor extrapolation on
-    /// the 48k passthrough path.
-    #[test]
-    fn pts_delta_is_about_20ms_between_chunks() {
-        let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
-        // Push 480 frames (10ms) at a time with PTS (simulating small buffers from real hardware).
-        let mut device_pts = 1_000_000_000i64; // Arbitrary origin.
-        let block_frames = 480usize;
-        for _ in 0..20 {
-            let stereo = vec![0.1f32; block_frames * 2];
-            n.push(&stereo, device_pts).expect("push");
-            device_pts += block_frames as i64 * 1_000_000_000 / 48_000;
-        }
-
-        let mut pts_list = Vec::new();
-        while let Some((_, pts)) = n.pop_chunk() {
-            pts_list.push(pts);
-        }
-        assert!(
-            pts_list.len() >= 5,
-            "need enough chunks: {}",
-            pts_list.len()
-        );
-
-        // 20ms = 20_000_000 ns. Allow ±5% (1e6 ns).
-        for w in pts_list.windows(2) {
-            let delta = w[1] - w[0];
-            assert!(
-                delta > 0,
-                "PTS must increase strictly: {} -> {}",
-                w[0],
-                w[1]
-            );
-            assert!(
-                (delta - 20_000_000).abs() <= 1_000_000,
-                "adjacent PTS delta is not about 20ms: {delta} ns"
-            );
-        }
-    }
-
-    /// Empty or partial input (less than a multiple of `in_channels`) returns `Ok` without
-    /// panicking and produces no chunks (boundary defense).
-    #[test]
-    fn push_empty_and_subframe_are_noops() {
-        let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
-        // Empty input.
-        n.push(&[], 0).expect("empty push ok");
-        // Only one sample for stereo (2ch) → `in_frames=0`, so return early.
-        n.push(&[0.5], 0).expect("subframe push ok");
-        assert!(
-            n.pop_chunk().is_none(),
-            "partial input alone must not produce a chunk"
-        );
-        assert_eq!(n.buffered_out_frames(), 0);
-    }
-
-    /// Zero-frequency (silent DC) input produces all-zero output (verifies the peak/RMS-zero path).
-    #[test]
-    fn silence_input_yields_zero_output() {
-        let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
-        let stereo = vec![0.0f32; CHUNK_FRAMES * 2];
-        n.push(&stereo, 0).expect("push");
-        let (chunk, _) = n.pop_chunk().expect("one chunk");
-        assert!(
-            chunk.iter().all(|&s| s == 0.0),
-            "silent input must produce silent output"
-        );
-    }
-
-    // --- Secondary tap (dual output) tests ---
-
-    /// Without a secondary tap, `pop_secondary` always returns `None` and `has_secondary` is false.
-    #[test]
-    fn no_secondary_tap_by_default() {
-        let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
-        assert!(!n.has_secondary());
-        assert_eq!(n.secondary_output(), None);
-        let stereo = vec![0.1f32; CHUNK_FRAMES * 2];
-        n.push(&stereo, 0).expect("push");
-        assert!(n.pop_secondary().is_none(), "no secondary tap means None");
-    }
-
-    /// Generate primary 48k/stereo and secondary 16k/mono from a single stage 1 pass. Primary
-    /// emits 960-frame stereo chunks and secondary emits 320-frame mono chunks, both at about
-    /// 50 chunks per second.
-    #[test]
-    fn dual_output_primary_and_secondary_shapes() {
-        let secondary = OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        };
-        let mut n = Normalizer::new(48_000, 2, default_out())
-            .expect("normalizer")
-            .with_secondary(secondary)
-            .expect("secondary");
-        assert!(n.has_secondary());
-        assert_eq!(n.secondary_output(), Some(secondary));
-
-        // Push one second of 48k/stereo in 480-frame blocks.
-        let mut pts = 0i64;
-        for _ in 0..100 {
-            let block = vec![0.2f32; 480 * 2];
-            n.push(&block, pts).expect("push");
-            pts += 480 * 1_000_000_000 / 48_000;
-        }
-
-        let mut primary_chunks = 0usize;
-        while let Some((c, _)) = n.pop_chunk() {
-            assert_eq!(
-                c.len(),
-                CHUNK_FRAMES * 2,
-                "primary is 48k/stereo = 1920 samples"
-            );
-            primary_chunks += 1;
-        }
-        let mut secondary_chunks = 0usize;
-        while let Some((c, _)) = n.pop_secondary() {
-            assert_eq!(c.len(), 320, "secondary is 16k/mono = 320 samples");
-            secondary_chunks += 1;
-        }
-        assert!(
-            (47..=50).contains(&primary_chunks),
-            "primary ~50 chunks: {primary_chunks}"
-        );
-        assert!(
-            (47..=50).contains(&secondary_chunks),
-            "secondary ~50 chunks: {secondary_chunks}"
-        );
-    }
-
-    /// Both taps share the PTS axis from the same pushes and increase monotonically with 20ms
-    /// between adjacent chunks (each tap has an independent PTS anchor).
-    #[test]
-    fn dual_output_taps_share_pts_axis() {
-        let secondary = OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        };
-        let mut n = Normalizer::new(48_000, 2, default_out())
-            .expect("normalizer")
-            .with_secondary(secondary)
-            .expect("secondary");
-
-        let mut device_pts = 1_000_000_000i64;
-        for _ in 0..40 {
-            let block = vec![0.1f32; 480 * 2];
-            n.push(&block, device_pts).expect("push");
-            device_pts += 480 * 1_000_000_000 / 48_000;
-        }
-
-        let mut primary_pts = Vec::new();
-        while let Some((_, p)) = n.pop_chunk() {
-            primary_pts.push(p);
-        }
-        let mut secondary_pts = Vec::new();
-        while let Some((_, p)) = n.pop_secondary() {
-            secondary_pts.push(p);
-        }
-        assert!(primary_pts.len() >= 5 && secondary_pts.len() >= 5);
-        for w in primary_pts.windows(2) {
-            assert!((w[1] - w[0] - 20_000_000).abs() <= 1_000_000);
-        }
-        for w in secondary_pts.windows(2) {
-            assert!((w[1] - w[0] - 20_000_000).abs() <= 1_000_000);
-        }
-        // The first PTS for both taps starts near the same push origin (within tens of ms).
-        assert!(
-            (primary_pts[0] - secondary_pts[0]).abs() < 100_000_000,
-            "primary and secondary start PTS should be close: {} vs {}",
-            primary_pts[0],
-            secondary_pts[0]
-        );
-    }
-
-    // --- InnerProcessor (denoise hook equivalent) and stop flush ---
-
-    /// Test processor: doubles every sample (has no trailing tail).
-    struct DoubleProcessor;
-    impl InnerProcessor for DoubleProcessor {
-        fn process(&mut self, s: &mut [f32]) {
-            for x in s.iter_mut() {
-                *x *= 2.0;
-            }
-        }
-        fn flush(&mut self) -> Vec<f32> {
-            Vec::new()
-        }
-    }
-
-    /// Test processor: fixed delay line holding `hold` samples (simulates a denoise delay line).
-    /// Output is delayed by `hold` samples (the first `hold` are silent). Returns the final
-    /// `hold` samples from `flush`.
-    struct DelayProcessor {
-        held: Vec<f32>,
-    }
-    impl DelayProcessor {
-        fn new(hold: usize) -> Self {
-            Self {
-                held: vec![0.0; hold],
-            }
-        }
-    }
-    impl InnerProcessor for DelayProcessor {
-        fn process(&mut self, s: &mut [f32]) {
-            self.held.extend_from_slice(s);
-            let n = s.len();
-            s.copy_from_slice(&self.held[..n]);
-            self.held.drain(..n);
-        }
-        fn flush(&mut self) -> Vec<f32> {
-            std::mem::take(&mut self.held)
-        }
-    }
-
-    /// InnerProcessor is applied to the internal canonical form before the stage 2 split (output
-    /// doubles directly on the primary 48k/stereo passthrough path).
-    #[test]
-    fn inner_processor_applies_before_stage2() {
-        let mut n = Normalizer::new(48_000, 2, default_out())
-            .expect("normalizer")
-            .with_inner_processor(Box::new(DoubleProcessor));
-        let stereo: Vec<f32> = (0..CHUNK_FRAMES * 2).map(|i| (i as f32) * 1e-4).collect();
-        n.push(&stereo, 0).expect("push");
-        let (chunk, _) = n.pop_chunk().expect("one chunk");
-        for (i, &s) in chunk.iter().enumerate() {
-            assert!(
-                (s - stereo[i] * 2.0).abs() < 1e-6,
-                "sample {i} should be doubled"
-            );
-        }
-    }
-
-    /// InnerProcessor affects both primary and secondary taps (secondary 16k/mono is also doubled).
-    #[test]
-    fn inner_processor_affects_both_taps() {
-        let secondary = OutputFormat {
-            sample_rate: 48_000,
-            channels: 2,
-        };
-        // Set secondary to 48k/stereo (passthrough) so the doubling can be observed directly.
-        let mut n = Normalizer::new(48_000, 2, default_out())
-            .expect("normalizer")
-            .with_secondary(secondary)
-            .expect("secondary")
-            .with_inner_processor(Box::new(DoubleProcessor));
-        let stereo = vec![0.25f32; CHUNK_FRAMES * 2];
-        n.push(&stereo, 0).expect("push");
-        let (p, _) = n.pop_chunk().expect("primary chunk");
-        let (s, _) = n.pop_secondary().expect("secondary chunk");
-        assert!(
-            p.iter().all(|&x| (x - 0.5).abs() < 1e-6),
-            "primary is doubled"
-        );
-        assert!(
-            s.iter().all(|&x| (x - 0.5).abs() < 1e-6),
-            "secondary is doubled"
-        );
-    }
-
-    /// Stop flush feeds the processor's trailing tail so it can be retrieved as the final chunk.
-    /// The held portion of the delay-line processor appears in an additional chunk after flush.
-    #[test]
-    fn stop_flush_emits_processor_tail() {
-        // Delay line holding 4 samples (2 stereo frames).
-        let mut n = Normalizer::new(48_000, 2, default_out())
-            .expect("normalizer")
-            .with_inner_processor(Box::new(DelayProcessor::new(4)));
-        // Push one chunk of identifiable, non-zero input.
-        let stereo: Vec<f32> = (0..CHUNK_FRAMES * 2)
-            .map(|i| (i as f32 + 1.0) * 1e-4)
-            .collect();
-        n.push(&stereo, 0).expect("push");
-
-        // Before flush: one chunk (the first 4 samples are silent due to the delay).
-        let (c0, _) = n.pop_chunk().expect("first chunk");
-        assert_eq!(c0.len(), CHUNK_FRAMES * 2);
-        assert!(
-            c0[..4].iter().all(|&x| x == 0.0),
-            "first 4 samples should be silent due to the delay"
-        );
-        assert!(
-            n.pop_chunk().is_none(),
-            "only one chunk should be available before flush"
-        );
-
-        // Flush emits the delay line's final 4 samples in an additional chunk (padded with silence).
-        n.flush();
-        let (c1, _) = n.pop_chunk().expect("flushed tail chunk");
-        assert_eq!(c1.len(), CHUNK_FRAMES * 2, "final chunk is padded to 20ms");
-        // The final 4 samples are the last 4 input samples.
-        let last4 = &stereo[stereo.len() - 4..];
-        for (i, &x) in c1[..4].iter().enumerate() {
-            assert!(
-                (x - last4[i]).abs() < 1e-6,
-                "flush tail should match the end of the input"
-            );
-        }
-    }
-
-    /// Stop flush also drains the secondary tap's stage 2 resampler remainder (the tail reaches
-    /// 16k/mono output too).
-    #[test]
-    fn stop_flush_drains_secondary_resampler() {
-        let secondary = OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        };
-        let mut n = Normalizer::new(48_000, 2, default_out())
-            .expect("normalizer")
-            .with_secondary(secondary)
-            .expect("secondary");
-        // Push an amount just under one chunk (leaving a remainder in the resampler).
-        let stereo = vec![0.3f32; CHUNK_FRAMES * 2];
-        n.push(&stereo, 0).expect("push");
-
-        // Count secondary chunks available before flush.
-        let mut before = 0usize;
-        while n.pop_secondary().is_some() {
-            before += 1;
-        }
-        n.flush();
-        // Flush drains the remainder, adding at least one final chunk.
-        let mut after = 0usize;
-        while let Some((c, _)) = n.pop_secondary() {
-            assert_eq!(c.len(), 320, "secondary aligns to the fixed 20ms boundary");
-            after += 1;
-        }
-        assert!(after >= 1, "flush should emit the secondary tap's tail");
-        let _ = before;
+fn combine_failures(errors: Vec<Error>) -> Result<()> {
+    let mut errors = errors.into_iter();
+    match (errors.next(), errors.next()) {
+        (None, _) => Ok(()),
+        (Some(error), None) => Err(error),
+        (Some(primary), Some(first)) => Err(Error::Multiple(ErrorGroup::new(
+            primary,
+            first,
+            errors.collect(),
+        ))),
     }
 }

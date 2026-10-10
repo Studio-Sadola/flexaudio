@@ -31,6 +31,9 @@ function assert(cond, msg) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// VAD sample positions are bigint; JSON.stringify throws on bigint without a replacer.
+const show = (value) => JSON.stringify(value, (_key, v) => (typeof v === 'bigint' ? `${v}n` : v));
+
 // [A] Dual output (secondary tap, s16, zero-based clock, paired time window).
 async function dualOutput() {
   const chunks = []; // { pts, secPts, secLen }
@@ -126,7 +129,7 @@ async function flushVadMidStream() {
   const ends = events.filter((e) => e.type === 'speechEnd');
   const starts = events.filter((e) => e.type === 'speechStart');
   console.log(`[B1] after flushVad: ${starts.length} speechStart, ${ends.length} speechEnd`);
-  assert(ends.length >= 1, `expected a speechEnd after flushVad, got ${JSON.stringify(events)}`);
+  assert(ends.length >= 1, `expected a speechEnd after flushVad, got ${show(events)}`);
   assert(starts.length >= 1, `flushVad should also emit the paired speechStart`);
   checkVadEvents(events);
   console.log('[B2] atNs recording-0-based & monotonic OK');
@@ -156,7 +159,7 @@ async function flushVadOnStop() {
 
   const ends = events.filter((e) => e.type === 'speechEnd');
   console.log(`[C1] speechEnd delivered via stop auto-flush: ${ends.length}`);
-  assert(ends.length >= 1, `stop() must auto-run flushVad and deliver a final speechEnd, got ${JSON.stringify(events)}`);
+  assert(ends.length >= 1, `stop() must auto-run flushVad and deliver a final speechEnd, got ${show(events)}`);
   checkVadEvents(events);
   console.log('[C] FLUSHVAD ON STOP OK');
 }

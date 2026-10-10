@@ -8,9 +8,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **0.x stability note:** while in the `0.x` series the public API is not yet
 > stable. Per SemVer, a **minor** bump (`0.2 → 0.3`) may include breaking
 > changes; **patch** bumps (`0.2.0 → 0.2.1`) remain backward-compatible. Pin to
-> `0.3` to receive only compatible updates.
+> `0.5` to receive only compatible updates.
 
 ## [Unreleased]
+
+## [0.5.0] - 2026-10-11
+
+### Added
+
+- **WhisperVad:** whisper.cpp-compatible VAD postprocessing ported from
+  whisper.cpp, with standalone sessions, probability postprocessing and batch
+  segmentation in Rust, N-API, Python and C. It uses the embedded Silero model;
+  compatibility describes the pinned postprocessing algorithm, not identical
+  probabilities from different model versions. Final segments use integer
+  milliseconds on a 10 ms grid. Optional provisional speech/cut events support
+  realtime previews; `finish()` infers a zero-padded partial final frame.
+- Attached `WhisperVadTap` and binding capture options perform canonical
+  48 kHz stereo-to-16 kHz mono conversion, carry capture-clock epoch anchors,
+  and deliver closure events on flush/stop. Legacy VAD and WhisperVad cannot be
+  enabled on the same stream. Capture transport gaps fail the WhisperVad epoch
+  and close published hints without fabricating successful final segments.
+- Typed `ErrorKind`, `Error::kind()`, `root()`, `permission()` and
+  `with_context()`, `Error::Context`, nonempty `Error::Multiple` groups, and
+  `AmbiguousDeviceName`. Errors retain operation, Mix lane and numeric native
+  status alongside the primary cause and ordered related failures.
+- `ShutdownReport`, `Stream::stop_checked()` and `shutdown_report()` retain
+  capture and cleanup outcomes. Repeated stop reuses the result without repeated
+  teardown, tails or events. A stopped stream is spent: `start()` returns
+  `InvalidState`; this was already true in 0.4 and is now explicit.
+- `AudioLoss`, `Clipped`, `RecoverableError`, `ShutdownError` and
+  `PermissionGranted` stream events. `PermissionGranted` was requested by
+  tranext and reports late microphone consent after a pending advisory.
+  Loss includes path, reason, format and an optional scalar-sample count;
+  capture-tap overflow is also reported. The next output after observed loss
+  carries `DISCONTINUITY`. Mix clipping is a coalesced advisory without exact
+  output-chunk attribution.
+- `DeviceEvent::DefaultCleared` and `RescanRequired` allow consumers to clear
+  defaults or rebuild an inventory after dropped/unreliable device deltas.
+  `ChunkFlags::PADDED = 8` and `CLIPPED = 16` preserve existing flag values.
+- C opaque v2 accessors for typed stream/device events, watcher records,
+  error information and shutdown reports; standalone `flexaudio_vad_flush`,
+  `flexaudio_denoise_flush`, `flexaudio_denoise_samples_free`, and the
+  standalone/attached Whisper VAD C API.
+
+### Changed
+
+- Error `Display` retains library-authored explanations and public operation,
+  lane and numeric status context, while redacting device names, permission
+  detail and internal call labels. Structured access retains opt-in diagnostics.
+  Legacy backend error strings from third-party backends are replaced by a safe
+  explanation at the facade boundary.
+- Peak/RMS are measured from delivered float samples after denoise/gain in all
+  bindings, including final tails, before quantization or encoding.
+- The CLI warns and continues recording on transient/recoverable failures,
+  loss and clipping; terminal and cleanup failures still fail the recording.
+  Permission failures print structured permission detail after safe guidance.
+
+### Breaking
+
+These behavior changes are approved by the maintainer for the 0.5 minor release.
+Pin to `0.5` for compatible patch updates and apply these migration notes:
+
+- **Discovery and watchers:** incomplete or failed discovery returns an error
+  instead of partial/empty success (for example, no PipeWire daemon on Linux).
+  Linux watcher startup failure returns an error; C `flexaudio_watch_devices()`
+  returns NULL with typed error information instead of a no-op handle. Handle
+  discovery/startup failures explicitly. Intentional Windows/macOS no-op
+  watchers remain unchanged. Linux `devices()` no longer lists PipeWire
+  Audio/Source nodes as microphones because they could not be opened; use the
+  advertised CPAL microphone IDs.
+- **Capture validation:** `chunk_ms != 20` returns `InvalidArg` (omitted options
+  and the C zero sentinel still select 20). Native inputs above two channels
+  return `UnsupportedFormat`; select mono/stereo input rather than relying on
+  silent front-channel selection. macOS unresolved exclusions fail closed,
+  except for processes confirmed gone; resolve live audio helpers and reopen
+  capture when the process set changes.
+- **Rust:** `AudioChunk` and `SecondaryChunk` require `frame_index: u64` in
+  struct literals: the first frame's index on that tap's canonical 48 kHz
+  timeline, exposing queue drops as gaps. Use the producing timeline (zero for
+  a synthetic chunk starting at zero). `Normalizer::flush()` returns
+  `Result<()>`; handle failure. `DeviceEvent::DefaultChanged.kind` changes from
+  `SourceKind` to `DefaultDeviceKind` (`Microphone` / `SystemAudio`); update matches and
+  constructors. Handle new error/event variants. Fatal Mix lane errors stop
+  both lanes and retain lane context; legacy `Event::Error` is terminal, so
+  custom backends must use `RecoverableError` for retryable failures.
+- **N-API / JavaScript:** u64 counters are `bigint`, including
+  `JsVadEvent.atSample`, `chunkDropped.count` and loss counts. `seq` and
+  `droppedChunks` were already bigint; PTS remains `number`. Avoid number
+  coercion and update arithmetic/serialization. Chunk interfaces require
+  `frameIndex`. Stream/device event types are closed discriminated unions with
+  new arms; switch on `type` and narrow the payload. Use `shutdownReport()` for
+  cleanup outcomes; `terminalError()` and `shutdownReport()` return `undefined`
+  when absent. Callback exceptions surface through `uncaughtException`; hosts
+  must handle them instead of relying on silently discarded exceptions.
+- **Python:** failures use typed exceptions with `.audio_error`.
+  `InvalidArgumentError` / `UnsupportedFormatError` subclass `ValueError`;
+  the other core exception classes subclass `RuntimeError`.
+  `Stream.terminal_error()` returns an `AudioError` instead of an event record.
+  Discovery and watcher startup raise on failure, replacing the documented
+  never-raises behavior. `stop()` and normal context exit can raise cleanup
+  failures; if the context body already failed, its exception remains primary
+  with cleanup context attached. Inspect typed errors/reports and drain queued
+  output, including the denoise tail now delivered on stop.
+- **C source/result compatibility:** v1 physical layouts are preserved, but
+  enum-valued fields are now `int32_t` and input booleans are `uint8_t`.
+  Update declarations/initializers; all legacy constants keep their values.
+  Unknown discriminants and invalid boolean values return `FLEX_INVALID_ARG`.
+  v1 result APIs now return the primary root code for core errors rather than
+  collapsing them to `FLEX_FAILURE` (-2): `InvalidArg` (-1), `InvalidState` (-4),
+  `DeviceNotFound` (-5), `DeviceLost` (-6), `PermissionDenied` (-7),
+  `UnsupportedOsVersion` (-8), `Unsupported` (-9), `UnsupportedFormat` (-10),
+  `NativeFormatChanged` (-11), and `AmbiguousDeviceName` (-12).
+  The new constants -5 through -12 are `FLEX_DEVICE_NOT_FOUND`,
+  `FLEX_DEVICE_LOST`, `FLEX_PERMISSION_DENIED`, `FLEX_UNSUPPORTED_OS_VERSION`,
+  `FLEX_UNSUPPORTED`, `FLEX_UNSUPPORTED_FORMAT`, `FLEX_NATIVE_FORMAT_CHANGED`,
+  and `FLEX_AMBIGUOUS_DEVICE_NAME`. Backend errors still use `FLEX_FAILURE`;
+  caught panics retain `FLEX_PANIC` (-3). Treat all negative results as failures
+  and use typed v2 accessors for details without parsing messages.
+
+### Fixed
+
+- Preserve final producer buffers and resampler/denoise tails on graceful stop,
+  including short 44.1 kHz inputs; retain flush, owner/join and rollback failures
+  in one checked shutdown path. Keep Windows capture failure primary when
+  cleanup also fails. Terminal capture failures suppress invalid tails.
+- Preserve padding/clipping metadata and output-loss discontinuities on both
+  taps. Report PipeWire corrupt/short-stride/rejected callback buffers and Mix
+  FIFO losses; honor padded PipeWire strides and bound startup/enumeration.
+- Flush legacy VAD with the pre-gap anchor before reset across bindings, and
+  preserve secondary/VAD closure delivery and terminator counters in N-API.
+- Reject ambiguous microphone name selection and unreadable mandatory device
+  metadata/configurations. Retain structured native errors and reject unsafe
+  native format/layout changes instead of misinterpreting samples.
+- Include the whisper.cpp third-party notice in Rust, npm, Python and C packages.
 
 ## [0.4.0] - 2026-10-08
 
@@ -418,7 +548,8 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
   publication and interactive approval of new packages in scopes
   requiring 2FA. (1840fbb)
 
-[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.2.0...v0.3.0

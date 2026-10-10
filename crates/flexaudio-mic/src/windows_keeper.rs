@@ -76,13 +76,7 @@ fn initialize_enumerator() -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// Convert a `catch_unwind` payload to a diagnostic error string.
-fn panic_message(payload: Box<dyn Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        format!("cpal WASAPI keeper initialization panicked: {message}")
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        format!("cpal WASAPI keeper initialization panicked: {message}")
-    } else {
-        "cpal WASAPI keeper initialization panicked with a non-string payload".to_owned()
-    }
+/// Panic payloads can contain private paths or device names; never retain them.
+fn panic_message(_payload: Box<dyn Any + Send>) -> String {
+    "cpal WASAPI keeper initialization panicked".to_owned()
 }

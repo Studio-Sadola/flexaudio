@@ -47,7 +47,7 @@ pub enum FlexDeviceEventKind {
 #[repr(C)]
 pub struct FlexDeviceEvent {
     /// Event kind.
-    pub kind: FlexDeviceEventKind,
+    pub kind: i32,
     /// Stable ID (valid for `Added`/`Removed`/`DefaultChanged`; release with
     /// `flexaudio_device_event_free`). NULL for `Unknown`.
     pub id: *mut c_char,
@@ -55,7 +55,7 @@ pub struct FlexDeviceEvent {
     pub name: *mut c_char,
     /// For `Added`, the device source kind. For `DefaultChanged`, the side whose default changed
     /// (`Mic` = default source / `System` = default sink). Unused for other kinds (`Mic`).
-    pub source_kind: FlexSourceKind,
+    pub source_kind: i32,
     /// Native sample rate (`Added` only; 0 otherwise).
     pub sample_rate: u32,
     /// Native channel count (`Added` only; 0 otherwise).
@@ -70,7 +70,7 @@ pub struct FlexDeviceEvent {
 fn device_event_to_c(ev: DeviceEvent) -> FlexDeviceEvent {
     match ev {
         DeviceEvent::Added(info) => FlexDeviceEvent {
-            kind: FlexDeviceEventKind::Added,
+            kind: FlexDeviceEventKind::Added as i32,
             id: string_to_c(info.id),
             name: string_to_c(info.name),
             source_kind: source_kind_to_c(info.source_kind),
@@ -80,33 +80,46 @@ fn device_event_to_c(ev: DeviceEvent) -> FlexDeviceEvent {
             is_default: info.is_default,
         },
         DeviceEvent::Removed { id } => FlexDeviceEvent {
-            kind: FlexDeviceEventKind::Removed,
+            kind: FlexDeviceEventKind::Removed as i32,
             id: string_to_c(id),
             name: std::ptr::null_mut(),
-            source_kind: FlexSourceKind::Mic,
+            source_kind: FlexSourceKind::Mic as i32,
             sample_rate: 0,
             channels: 0,
             is_loopback: false,
             is_default: false,
         },
         DeviceEvent::DefaultChanged { kind, id } => FlexDeviceEvent {
-            kind: FlexDeviceEventKind::DefaultChanged,
+            kind: FlexDeviceEventKind::DefaultChanged as i32,
             id: string_to_c(id),
             name: std::ptr::null_mut(),
-            source_kind: source_kind_to_c(kind),
+            source_kind: source_kind_to_c(kind.into()),
             sample_rate: 0,
             channels: 0,
             is_loopback: false,
             is_default: false,
         },
         // DeviceEvent is #[non_exhaustive]. Preserve unknown kinds as Unknown; do not discard them.
-        other => {
-            set_last_error(format!("unknown device event: {other:?}"));
+        DeviceEvent::DefaultCleared { .. } | DeviceEvent::RescanRequired { .. } => {
+            // New deltas have no representable v1 payload; use the v2 polling API.
             FlexDeviceEvent {
-                kind: FlexDeviceEventKind::Unknown,
+                kind: FlexDeviceEventKind::Unknown as i32,
                 id: std::ptr::null_mut(),
                 name: std::ptr::null_mut(),
-                source_kind: FlexSourceKind::Mic,
+                source_kind: FlexSourceKind::Mic as i32,
+                sample_rate: 0,
+                channels: 0,
+                is_loopback: false,
+                is_default: false,
+            }
+        }
+        _ => {
+            set_last_error("unknown device event".to_string());
+            FlexDeviceEvent {
+                kind: FlexDeviceEventKind::Unknown as i32,
+                id: std::ptr::null_mut(),
+                name: std::ptr::null_mut(),
+                source_kind: FlexSourceKind::Mic as i32,
                 sample_rate: 0,
                 channels: 0,
                 is_loopback: false,
@@ -119,14 +132,14 @@ fn device_event_to_c(ev: DeviceEvent) -> FlexDeviceEvent {
 /// Opaque device watcher handle containing [`flexaudio::DeviceWatcher`]. Create with
 /// `flexaudio_watch_devices` and release with `flexaudio_watcher_free`.
 pub struct FlexWatcher {
-    inner: DeviceWatcher,
+    pub(crate) inner: DeviceWatcher,
 }
 
 /// Start monitoring device connection and default changes, then return a watcher handle.
 ///
-/// On Linux, continuously monitor the PipeWire registry. If PipeWire is unavailable or the OS is
-/// unsupported, degrade to a no-op and return a valid handle (no device events arrive; poll always
-/// returns 0). Only failures return NULL + last_error. Release the returned handle with
+/// On Linux, continuously monitor the PipeWire registry. Startup failure returns NULL
+/// with `flexaudio_last_error` and typed `flexaudio_last_error_info_v2`, rather than
+/// a no-op handle. Unsupported operating systems return a valid no-op handle. Release it with
 /// `flexaudio_watcher_free`.
 #[no_mangle]
 pub extern "C" fn flexaudio_watch_devices() -> *mut FlexWatcher {
@@ -135,7 +148,9 @@ pub extern "C" fn flexaudio_watch_devices() -> *mut FlexWatcher {
         match flexaudio::watch_devices() {
             Ok(inner) => Box::into_raw(Box::new(FlexWatcher { inner })),
             Err(e) => {
-                set_last_error(e.to_string());
+                crate::error::set_audio_error(e.clone());
+                #[cfg(test)]
+                crate::error::record_open_failure(e);
                 std::ptr::null_mut()
             }
         }
@@ -156,14 +171,12 @@ pub unsafe extern "C" fn flexaudio_watcher_poll(
 ) -> i32 {
     guard_i32(|| {
         clear_last_error();
-        let Some(watcher) = w.as_mut() else {
-            set_last_error("flexaudio_watcher_poll: watcher pointer is null");
-            return code::FLEX_INVALID_ARG;
-        };
-        if out.is_null() {
-            set_last_error("flexaudio_watcher_poll: out pointer is null");
-            return code::FLEX_INVALID_ARG;
+        if !crate::convert::valid_pointer(w) || !crate::convert::valid_pointer(out) {
+            return crate::error::set_audio_error(flexaudio::Error::InvalidArg(
+                "invalid watcher handle or event destination".into(),
+            ));
         }
+        let watcher = &mut *w;
         match watcher.inner.poll_event() {
             Some(ev) => {
                 out.write(device_event_to_c(ev));
@@ -182,6 +195,11 @@ pub unsafe extern "C" fn flexaudio_watcher_poll(
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_device_event_free(ev: *mut FlexDeviceEvent) {
     guard_i32(|| {
+        if !ev.is_null() && !crate::convert::valid_pointer(ev) {
+            return crate::error::set_audio_error(flexaudio::Error::InvalidArg(
+                "invalid device event pointer".into(),
+            ));
+        }
         if let Some(ev) = ev.as_mut() {
             if !ev.id.is_null() {
                 drop(CString::from_raw(ev.id));
@@ -204,6 +222,11 @@ pub unsafe extern "C" fn flexaudio_device_event_free(ev: *mut FlexDeviceEvent) {
 pub unsafe extern "C" fn flexaudio_watcher_free(w: *mut FlexWatcher) {
     guard_i32(|| {
         if !w.is_null() {
+            if !crate::convert::valid_pointer(w) {
+                return crate::error::set_audio_error(flexaudio::Error::InvalidArg(
+                    "invalid watcher handle".into(),
+                ));
+            }
             // Dropping DeviceWatcher calls stop().
             drop(Box::from_raw(w));
         }
@@ -217,23 +240,34 @@ mod tests {
     use flexaudio::{DeviceInfo, SourceKind};
     use std::ffi::CStr;
 
-    /// One watch → poll → free cycle (safely degrades when PipeWire is unavailable).
+    /// One watch → poll → free cycle, or a typed startup failure without a panic.
     #[test]
     fn watch_poll_free_smoke() {
+        if std::env::var("FLEXAUDIO_RUN_NATIVE_TESTS").as_deref() != Ok("1") {
+            return;
+        }
         let w = flexaudio_watch_devices();
-        assert!(
-            !w.is_null(),
-            "watch_devices is designed to degrade and always return a handle"
-        );
+        if w.is_null() {
+            let error = crate::error::take_open_failure()
+                .expect("NULL must retain a typed watcher startup failure, not a panic");
+            let message = crate::error::last_error_ptr();
+            assert!(!message.is_null());
+            assert_eq!(
+                unsafe { CStr::from_ptr(message) }.to_str().unwrap(),
+                error.to_string(),
+            );
+            unsafe { flexaudio_watcher_free(w) };
+            return;
+        }
         let mut ev = std::mem::MaybeUninit::<FlexDeviceEvent>::uninit();
-        // Returns 0 when degraded (none currently available); it must not be negative.
+        // A valid watcher returns either no event or one owned event.
         let rc = unsafe { flexaudio_watcher_poll(w, ev.as_mut_ptr()) };
+        unsafe { flexaudio_watcher_free(w) };
         assert!(rc >= 0, "poll returned an error: {rc}");
         if rc == 1 {
             // Release the event if one was retrieved.
             unsafe { flexaudio_device_event_free(ev.as_mut_ptr()) };
         }
-        unsafe { flexaudio_watcher_free(w) };
     }
 
     /// NULL handle and NULL output destination are InvalidArg. Freeing NULL is safe.
@@ -244,14 +278,32 @@ mod tests {
             unsafe { flexaudio_watcher_poll(std::ptr::null_mut(), ev.as_mut_ptr()) },
             code::FLEX_INVALID_ARG
         );
-        let w = flexaudio_watch_devices();
         assert_eq!(
-            unsafe { flexaudio_watcher_poll(w, std::ptr::null_mut()) },
+            unsafe { flexaudio_watcher_poll(std::ptr::null_mut(), std::ptr::null_mut()) },
             code::FLEX_INVALID_ARG
         );
-        unsafe { flexaudio_watcher_free(w) };
         unsafe { flexaudio_watcher_free(std::ptr::null_mut()) };
         unsafe { flexaudio_device_event_free(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn new_device_deltas_use_unknown_v1_without_fabricated_ids() {
+        for event in [
+            DeviceEvent::DefaultCleared {
+                kind: flexaudio::DefaultDeviceKind::SystemAudio,
+            },
+            DeviceEvent::RescanRequired {
+                dropped_events: u64::MAX,
+            },
+        ] {
+            let mut projected = device_event_to_c(event);
+            assert_eq!(projected.kind, FlexDeviceEventKind::Unknown as i32);
+            assert!(projected.id.is_null());
+            assert!(projected.name.is_null());
+            unsafe {
+                flexaudio_device_event_free(&mut projected);
+            }
+        }
     }
 
     /// C conversion and string release are consistent for each DeviceEvent variant.
@@ -267,8 +319,8 @@ mod tests {
             is_loopback: false,
             is_default: true,
         }));
-        assert_eq!(added.kind, FlexDeviceEventKind::Added);
-        assert_eq!(added.source_kind, FlexSourceKind::Mic);
+        assert_eq!(added.kind, FlexDeviceEventKind::Added as i32);
+        assert_eq!(added.source_kind, FlexSourceKind::Mic as i32);
         assert_eq!(added.sample_rate, 48_000);
         assert!(added.is_default);
         assert_eq!(
@@ -287,7 +339,7 @@ mod tests {
         let mut removed = device_event_to_c(DeviceEvent::Removed {
             id: "node-2".to_string(),
         });
-        assert_eq!(removed.kind, FlexDeviceEventKind::Removed);
+        assert_eq!(removed.kind, FlexDeviceEventKind::Removed as i32);
         assert!(removed.name.is_null());
         assert_eq!(
             unsafe { CStr::from_ptr(removed.id) }.to_str().unwrap(),
@@ -297,11 +349,11 @@ mod tests {
 
         // DefaultChanged: id + source_kind.
         let mut def = device_event_to_c(DeviceEvent::DefaultChanged {
-            kind: SourceKind::SystemLoopback,
+            kind: flexaudio::DefaultDeviceKind::SystemAudio,
             id: "sink-3".to_string(),
         });
-        assert_eq!(def.kind, FlexDeviceEventKind::DefaultChanged);
-        assert_eq!(def.source_kind, FlexSourceKind::System);
+        assert_eq!(def.kind, FlexDeviceEventKind::DefaultChanged as i32);
+        assert_eq!(def.source_kind, FlexSourceKind::System as i32);
         assert_eq!(
             unsafe { CStr::from_ptr(def.id) }.to_str().unwrap(),
             "sink-3"

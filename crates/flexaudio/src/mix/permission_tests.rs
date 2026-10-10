@@ -73,23 +73,46 @@ fn either_child_denial_stops_both_lanes_and_gates_stream() {
         while stream.terminal_error().is_none() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(
-            matches!(stream.terminal_error(), Some(Error::PermissionDenied { permission: p, .. }) if p == permission)
-        );
+        let primary = stream.terminal_error().unwrap();
+        assert_eq!(primary.permission(), Some(permission));
+        assert!(matches!(&primary, Error::Context { context, .. }
+        if context.operation() == Operation::Normalize
+            && context.lane() == Some(if deny_mic {
+                MixLane::Microphone
+            } else {
+                MixLane::SystemAudio
+            })));
         assert!(stream.poll_chunk().is_none());
         assert!(stream.poll_secondary().is_none());
-        assert!(mic_stops.load(Ordering::SeqCst) > 0);
-        assert!(system_stops.load(Ordering::SeqCst) > 0);
-        assert_eq!(stream.poll_event(), Some(denial(permission)));
+        assert_eq!(mic_stops.load(Ordering::SeqCst), 1);
+        assert_eq!(system_stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stream.poll_event(),
+            Some(Event::TerminalError {
+                error: primary.clone()
+            })
+        );
+        // Denial is the capture primary, not an independent cleanup failure.
+        // Both children stopped successfully, so no ShutdownError is warranted.
         assert!(stream.poll_event().is_none());
+        assert_eq!(stream.stop_checked(), Err(primary.clone()));
+        assert_eq!(stream.stop_checked(), Err(primary.clone()));
+        let report = stream.shutdown_report().unwrap();
+        assert_eq!(report.primary(), Some(&primary));
+        assert!(report.cleanup().is_empty());
         stream.stop();
+        assert!(stream.poll_event().is_none());
+        assert_eq!(mic_stops.load(Ordering::SeqCst), 1);
+        assert_eq!(system_stops.load(Ordering::SeqCst), 1);
     }
 }
 
 #[test]
 fn both_child_advisories_are_forwarded_without_stopping() {
     let stops = Arc::new(AtomicUsize::new(0));
-    let mic_event = Event::Error("mic notice".into());
+    let mic_event = Event::RecoverableError {
+        error: Error::Backend("mic notice".into()),
+    };
     let system_event = Event::SilenceWhileSourceActive {
         detail: "system notice".into(),
     };
@@ -175,11 +198,18 @@ fn busy_child_cannot_starve_other_mailbox() {
         stops,
     });
     let system = Box::new(Busy {
-        event: Event::Error("notice".into()),
+        event: Event::RecoverableError {
+            error: Error::Backend("notice".into()),
+        },
     });
     let mut mix = CompositeBackend::new(mic, system, 1.0, 1.0);
-    assert!(matches!(mix.poll_event(), Some(Event::Error(_))));
-    assert_eq!(mix.poll_event(), Some(denial(Permission::Microphone)));
+    assert!(matches!(
+        mix.poll_event(),
+        Some(Event::RecoverableError { .. })
+    ));
+    assert!(
+        matches!(mix.poll_event(), Some(Event::TerminalError { error }) if error.permission() == Some(Permission::Microphone))
+    );
 }
 
 #[test]
@@ -243,10 +273,9 @@ fn terminal_error_waits_until_both_mix_children_have_stopped() {
     let (attempted_tx, attempted_rx) = mpsc::channel();
     // Resume must reject the recorded failure without reversing backend -> delivery
     // lock order or waiting for the child that only this test can release.
-    assert!(matches!(
-        stream.resume(),
-        Err(Error::PermissionDenied { .. })
-    ));
+    assert!(stream
+        .resume()
+        .is_err_and(|error| error.permission() == Some(Permission::Microphone)));
     let (observed_tx, observed_rx) = mpsc::channel();
     let observer = thread::spawn(move || {
         attempted_tx.send(()).unwrap();
@@ -264,10 +293,10 @@ fn terminal_error_waits_until_both_mix_children_have_stopped() {
         Err(mpsc::RecvTimeoutError::Timeout)
     );
     release_tx.send(()).unwrap();
-    assert!(matches!(
-        observed_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-        Some(Error::PermissionDenied { .. })
-    ));
+    assert!(observed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .is_some_and(|error| error.permission() == Some(Permission::Microphone)));
     let mut stream = observer.join().unwrap();
     stream.stop();
 }

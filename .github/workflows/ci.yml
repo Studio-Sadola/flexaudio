@@ -70,6 +70,8 @@ jobs:
           -p flexaudio-encode -p flexaudio-denoise
           -p flexaudio-ffi -p flexaudio-py
           --all-targets -- -D warnings
+      - name: Install cbindgen (header test compares include/flexaudio.h with its output)
+        run: cargo install cbindgen --locked --version 0.29.4
       - name: Doc (deny warnings, docs.rs-equivalent for Linux crates)
         env:
           RUSTDOCFLAGS: -D warnings
@@ -93,7 +95,16 @@ jobs:
           pip install -q 'maturin[patchelf]'
           maturin build --manifest-path bindings/flexaudio-py/Cargo.toml --out /tmp/wheels
           pip install --no-index --find-links /tmp/wheels flexaudio
-          python -c "import flexaudio; assert isinstance(flexaudio.devices(), list); print('flexaudio import OK; devices:', len(flexaudio.devices()))"
+          python -m unittest bindings/flexaudio-py/tests/test_contracts.py -v
+          # Discovery fails closed: without a PipeWire daemon (this runner) devices()
+          # raises a typed BackendError instead of returning a partial list.
+          python -c "
+          import flexaudio
+          try:
+              print('flexaudio import OK; devices:', len(flexaudio.devices()))
+          except flexaudio.BackendError as error:
+              print('flexaudio import OK; discovery failed closed:', error)
+          "
 
   build-test-windows:
     name: Build & Test (Windows / WASAPI)
@@ -306,6 +317,8 @@ jobs:
           -p flexaudio-encode -p flexaudio-denoise
           -p flexaudio-ffi -p flexaudio-py
           --all-targets -- -D warnings
+      - name: Install cbindgen (header test compares include/flexaudio.h with its output)
+        run: cargo install cbindgen --locked --version 0.29.4
       - name: Test (ignored real-audio tests auto-skip)
         run: >-
           cargo test

@@ -34,11 +34,13 @@ use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSObject, NSString};
 
 use flexaudio_core::backend::RawSink;
 use flexaudio_core::types::Error;
+use flexaudio_core::{ErrorContext, Operation, ShutdownReport};
+
+mod buffer;
+use buffer::{push_buffer_list, BufferReport};
 
 use crate::capture_health::SampleMailbox;
-use crate::common::{
-    map_os_status, now_ns, tap_format_is_float, tap_native_format, FALLBACK_FORMAT, NO_ERR,
-};
+use crate::common::{map_os_status, map_os_status_at, tap_native_format, NO_ERR};
 
 /// Tap kind. INCLUDE = mixdown of the selected processes / EXCLUDE = everything except them.
 pub(crate) enum TapKind {
@@ -85,6 +87,8 @@ pub(crate) struct TapChain {
     pub(crate) observations: Arc<SampleMailbox>,
     /// Confirmed native format for the advisory duration, or unknown (no inference).
     pub(crate) observed_format: Option<(u32, u16)>,
+    buffer_report: Arc<BufferReport>,
+    shutdown_report: Option<ShutdownReport>,
     /// Block passed to the IOProc (must live until `DestroyIOProcID`). Dropped last.
     _block: RcBlock<
         dyn Fn(
@@ -107,32 +111,84 @@ pub(crate) struct TapChain {
 
 impl Drop for TapChain {
     fn drop(&mut self) {
-        // Late-callback guard. Set the stop flag (Release) before calling `AudioDeviceStop`.
-        // Even if an in-flight IOProc runs after `AudioDeviceStop` returns, the Acquire load at
-        // the start of the block sees this store and returns without touching `RefCell<RawSink>`.
-        self.stopped.store(true, Ordering::Release);
-        // Teardown order: Stop → DestroyIOProcID → DestroyAggregateDevice → DestroyProcessTap.
-        // Ignore failures (best-effort cleanup).
-        unsafe {
-            if self.io_proc_id.is_some() {
-                let _ = AudioDeviceStop(self.aggregate_id, self.io_proc_id);
-                let _ = AudioDeviceDestroyIOProcID(self.aggregate_id, self.io_proc_id);
-            }
-            if self.aggregate_id != 0 {
-                let _ = AudioHardwareDestroyAggregateDevice(self.aggregate_id);
-            }
-            if self.tap_id != 0 {
-                let _ = AudioHardwareDestroyProcessTap(self.tap_id);
-            }
-        }
-        // On exit, `_block` → `_desc` are dropped in declaration order.
+        let _ = self.stop_checked();
     }
 }
 
+/// Attempt each native release once, preserving every OSStatus on the owner thread.
+unsafe fn release_resources(
+    aggregate: AudioObjectID,
+    io_proc: AudioDeviceIOProcID,
+    tap: AudioObjectID,
+) -> Vec<Error> {
+    let mut errors = Vec::new();
+    if io_proc.is_some() {
+        for (call, status) in [
+            ("AudioDeviceStop", AudioDeviceStop(aggregate, io_proc)),
+            (
+                "AudioDeviceDestroyIOProcID",
+                AudioDeviceDestroyIOProcID(aggregate, io_proc),
+            ),
+        ] {
+            if status != NO_ERR {
+                errors.push(map_os_status_at(Operation::Stop, call, status));
+            }
+        }
+    }
+    if aggregate != 0 {
+        let status = AudioHardwareDestroyAggregateDevice(aggregate);
+        if status != NO_ERR {
+            errors.push(map_os_status_at(
+                Operation::Stop,
+                "AudioHardwareDestroyAggregateDevice",
+                status,
+            ));
+        }
+    }
+    if tap != 0 {
+        let status = AudioHardwareDestroyProcessTap(tap);
+        if status != NO_ERR {
+            errors.push(map_os_status_at(
+                Operation::Stop,
+                "AudioHardwareDestroyProcessTap",
+                status,
+            ));
+        }
+    }
+    errors
+}
+
+unsafe fn rollback(
+    error: Error,
+    aggregate: AudioObjectID,
+    io_proc: AudioDeviceIOProcID,
+    tap: AudioObjectID,
+) -> Error {
+    ShutdownReport::new(Some(error), release_resources(aggregate, io_proc, tap))
+        .result()
+        .expect_err("startup failed")
+}
+
 impl TapChain {
-    /// Close user delivery before publishing a terminal permission failure.
     pub(crate) fn gate_delivery(&self) {
         self.stopped.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_buffer_error(&self) -> Option<Error> {
+        self.buffer_report.take_error()
+    }
+
+    pub(crate) fn stop_checked(&mut self) -> Result<(), Error> {
+        if self.shutdown_report.is_none() {
+            self.gate_delivery();
+            let errors =
+                unsafe { release_resources(self.aggregate_id, self.io_proc_id, self.tap_id) };
+            self.shutdown_report = Some(ShutdownReport::new(None, errors));
+        }
+        self.shutdown_report
+            .as_ref()
+            .expect("completed tap shutdown")
+            .result()
     }
 }
 
@@ -204,32 +260,28 @@ pub(crate) unsafe fn build_tap_chain(
         return Err(map_os_status("AudioHardwareCreateProcessTap", status));
     }
     if tap_id == 0 {
-        return Err(Error::Backend(
-            "AudioHardwareCreateProcessTap returned null tap id".into(),
-        ));
+        return Err(
+            Error::Backend("native tap creation returned no audio object".into())
+                .with_context(ErrorContext::new(Operation::Start)),
+        );
     }
 
-    // Log the tap's native format (rate/channels) for debugging. Stream's native_format uses the
-    // backend fallback during construction, so this read is informational only.
-    if std::env::var_os("FLEXAUDIO_DEBUG").is_some() {
-        match tap_native_format(tap_id) {
-            Some((rate, ch)) => eprintln!(
-                "[flexaudio-os-macos] tap ASBD: rate={rate} channels={ch} (fallback would be {FALLBACK_FORMAT:?})"
-            ),
-            None => eprintln!(
-                "[flexaudio-os-macos] tap ASBD unavailable; using fallback {FALLBACK_FORMAT:?}"
-            ),
-        }
-    }
-
-    // Check the ASBD float bit. The IOProc reads mData as *const f32, so non-float samples could
-    // cause UB. Reject with a Backend error only when the float bit is confirmed absent.
-    // If the ASBD cannot be read (None), the format is unknown, so assume float and continue
-    // (real hardware taps are always float).
-    if let Some(false) = tap_format_is_float(tap_id) {
-        let _ = unsafe { AudioHardwareDestroyProcessTap(tap_id) };
-        return Err(Error::Backend(
-            "tap format is not float (kAudioFormatFlagIsFloat unset); IOProc reads f32".into(),
+    // Unknown or unsupported ASBDs fail before any callback can read samples.
+    let native = match tap_native_format(tap_id) {
+        Ok(native) => native,
+        Err(error) => return Err(rollback(error, 0, None, tap_id)),
+    };
+    let advertised = (sink.native_rate(), sink.native_channels());
+    if native != advertised {
+        return Err(rollback(
+            Error::NativeFormatChanged {
+                advertised,
+                actual: native,
+            }
+            .with_context(ErrorContext::new(Operation::Start)),
+            0,
+            None,
+            tap_id,
         ));
     }
 
@@ -237,13 +289,14 @@ pub(crate) unsafe fn build_tap_chain(
     let aggregate_id = match create_aggregate_device(name, &uuid_str) {
         Ok(id) => id,
         Err(e) => {
-            let _ = AudioHardwareDestroyProcessTap(tap_id);
-            return Err(e);
+            return Err(rollback(e, 0, None, tap_id));
         }
     };
 
     // 4) Create the IOProc block. Move `sink` into the block (interior mutability via RefCell).
     //    The block is assumed to be called from a single RT thread.
+    let buffer_report = Arc::new(BufferReport::new(&sink));
+    let report_for_block = buffer_report.clone();
     let sink_cell = RefCell::new(sink);
 
     // Preallocate the largest expected planar→interleaved scratch buffer during setup (outside
@@ -253,8 +306,8 @@ pub(crate) unsafe fn build_tap_chain(
     // health observations rather than allocating on the RT path. Move it into a `RefCell<Vec<f32>>` owned
     // only by the block; do not use thread_local, so it stays alive with the block even when the
     // owner and RT threads differ.
-    let observed_format = tap_native_format(tap_id);
-    let (native_rate, native_ch) = observed_format.unwrap_or(FALLBACK_FORMAT);
+    let observed_format = Some(native);
+    let (native_rate, native_ch) = native;
     let max_scratch = ((native_rate as usize / 10).max(1)) * (native_ch as usize).max(1);
     let scratch_cell = RefCell::new({
         let mut v: Vec<f32> = Vec::new();
@@ -285,7 +338,11 @@ pub(crate) unsafe fn build_tap_chain(
                 if stopped_for_block.load(Ordering::Acquire) {
                     return;
                 }
-                // RT callback. If borrowing fails (reentrancy), do nothing.
+                let Some(_guard) = report_for_block.enter() else {
+                    observations_for_block.invalidate();
+                    return;
+                };
+                // Exclusive access is guarded atomically, including native reentrancy.
                 if let Ok(mut sink) = sink_cell.try_borrow_mut() {
                     if let Ok(mut scratch) = scratch_cell.try_borrow_mut() {
                         // SAFETY: `in_input` is a valid AudioBufferList provided by CoreAudio.
@@ -295,16 +352,23 @@ pub(crate) unsafe fn build_tap_chain(
                                 &mut scratch,
                                 in_input.as_ptr(),
                                 &observations_for_block,
+                                &report_for_block,
                             )
                         };
                     } else {
+                        report_for_block.callback_rejected();
                         observations_for_block.invalidate();
                     }
                 } else {
+                    report_for_block.callback_rejected();
                     observations_for_block.invalidate();
+                }
+                if report_for_block.failed() {
+                    stopped_for_block.store(true, Ordering::Release);
                 }
             }));
             if result.is_err() {
+                report_for_block.callback_rejected();
                 observations_for_block.invalidate();
             }
         },
@@ -320,9 +384,13 @@ pub(crate) unsafe fn build_tap_chain(
         RcBlock::as_ptr(&block),
     );
     if status != NO_ERR || io_proc_id.is_none() {
-        let _ = AudioHardwareDestroyAggregateDevice(aggregate_id);
-        let _ = AudioHardwareDestroyProcessTap(tap_id);
-        return Err(map_os_status("AudioDeviceCreateIOProcIDWithBlock", status));
+        let error = if status == NO_ERR {
+            Error::Backend("native callback registration returned no owner".into())
+                .with_context(ErrorContext::new(Operation::Start))
+        } else {
+            map_os_status("AudioDeviceCreateIOProcIDWithBlock", status)
+        };
+        return Err(rollback(error, aggregate_id, io_proc_id, tap_id));
     }
 
     // 6) Start.
@@ -330,10 +398,12 @@ pub(crate) unsafe fn build_tap_chain(
     if status != NO_ERR {
         // Mark stopped before teardown so a late IO callback becomes a no-op (ported from rodrigoaddor/flexaudio@671d294).
         stopped.store(true, Ordering::Release);
-        let _ = AudioDeviceDestroyIOProcID(aggregate_id, io_proc_id);
-        let _ = AudioHardwareDestroyAggregateDevice(aggregate_id);
-        let _ = AudioHardwareDestroyProcessTap(tap_id);
-        return Err(map_os_status("AudioDeviceStart", status));
+        return Err(rollback(
+            map_os_status("AudioDeviceStart", status),
+            aggregate_id,
+            io_proc_id,
+            tap_id,
+        ));
     }
 
     Ok(TapChain {
@@ -343,6 +413,8 @@ pub(crate) unsafe fn build_tap_chain(
         stopped,
         observations,
         observed_format,
+        buffer_report,
+        shutdown_report: None,
         _block: block,
         _desc: desc,
     })
@@ -408,9 +480,10 @@ pub(crate) fn create_aggregate_device(
         return Err(map_os_status("AudioHardwareCreateAggregateDevice", status));
     }
     if device_id == 0 {
-        return Err(Error::Backend(
-            "AudioHardwareCreateAggregateDevice returned null device id".into(),
-        ));
+        return Err(
+            Error::Backend("native aggregate creation returned no device".into())
+                .with_context(ErrorContext::new(Operation::Start)),
+        );
     }
     Ok(device_id)
 }
@@ -419,87 +492,6 @@ pub(crate) fn create_aggregate_device(
 fn new_uuid_string() -> String {
     use objc2_foundation::NSUUID;
     NSUUID::new().UUIDString().to_string()
-}
-
-/// Send the IOProc's `AudioBufferList` to [`RawSink::push`] as interleaved f32.
-///
-/// - Interleaved (`mNumberBuffers == 1`): push as is.
-/// - Planar (`mNumberBuffers >= 2`): interleave each frame as L,R,L,R… and push (reuse the
-///   preallocated `scratch` Vec to avoid allocations).
-/// - Treat size 0 / null as silence and do not push.
-///
-/// `scratch` is a Vec allocated by the block during setup (outside RT). During steady state,
-/// `resize` stays within capacity. Oversized buffers are dropped and invalidate the observation.
-///
-/// # Safety
-/// `list` must point to a valid `AudioBufferList` (provided by CoreAudio to the IOProc).
-unsafe fn push_buffer_list(
-    sink: &mut RawSink,
-    scratch: &mut Vec<f32>,
-    list: *const AudioBufferList,
-    observations: &SampleMailbox,
-) {
-    if list.is_null() {
-        observations.invalidate();
-        return;
-    }
-    let num_buffers = (*list).mNumberBuffers as usize;
-    if num_buffers == 0 {
-        observations.invalidate();
-        return;
-    }
-    // mBuffers is the start of a variable-length array. Read `num_buffers` entries as a slice.
-    let buffers = std::slice::from_raw_parts((*list).mBuffers.as_ptr(), num_buffers);
-
-    if num_buffers == 1 {
-        // Interleaved: push as f32 without conversion.
-        let buf = &buffers[0];
-        let n = buf.mDataByteSize as usize / core::mem::size_of::<f32>();
-        if n == 0 || buf.mData.is_null() {
-            observations.invalidate();
-            return;
-        }
-        let slice = std::slice::from_raw_parts(buf.mData as *const f32, n);
-        let delivered = sink.push(slice, now_ns());
-        observations.observe(slice, delivered);
-        return;
-    }
-
-    // Planar: each buffer holds one channel. Use the shortest buffer's frame count.
-    let channels = num_buffers;
-    let mut min_frames = usize::MAX;
-    for b in buffers.iter() {
-        if b.mData.is_null() {
-            observations.invalidate();
-            return;
-        }
-        let frames = b.mDataByteSize as usize / core::mem::size_of::<f32>();
-        min_frames = min_frames.min(frames);
-    }
-    if min_frames == 0 || min_frames == usize::MAX {
-        observations.invalidate();
-        return;
-    }
-
-    // Reuse preallocated scratch to interleave (avoiding allocations on the RT path).
-    // Since channels == num_buffers == buffers.len(), enumerate `buffers` directly.
-    let total = min_frames * channels;
-    if total > scratch.capacity() {
-        // Observation loss is preferable to allocating from Core Audio's real-time callback.
-        observations.invalidate();
-        return;
-    }
-    scratch.resize(total, 0.0);
-    for (ch, buf) in buffers.iter().enumerate() {
-        let src = std::slice::from_raw_parts(buf.mData as *const f32, min_frames);
-        let mut idx = ch;
-        for &s in src.iter() {
-            scratch[idx] = s;
-            idx += channels;
-        }
-    }
-    let delivered = sink.push(&scratch[..total], now_ns());
-    observations.observe(&scratch[..total], delivered);
 }
 
 #[cfg(test)]
@@ -519,5 +511,235 @@ mod tests {
     fn object_ids_array_preserves_count() {
         let arr = object_ids_to_nsarray(&[1, 2, 3]);
         assert_eq!(arr.count(), 3);
+    }
+}
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+    use flexaudio_core::raw_ring;
+    use objc2_core_audio_types::AudioBuffer;
+
+    // The native trailing array is represented by two full AudioBuffer entries.
+    // repr(C) gives the same header, padding, and array offset as AudioBufferList.
+    #[repr(C)]
+    struct TwoBuffers {
+        count: u32,
+        buffers: [AudioBuffer; 2],
+    }
+
+    fn buffer(samples: &mut [f32], channels: u32) -> AudioBuffer {
+        AudioBuffer {
+            mNumberChannels: channels,
+            mDataByteSize: u32::try_from(std::mem::size_of_val(samples)).unwrap(),
+            mData: samples.as_mut_ptr().cast(),
+        }
+    }
+
+    #[test]
+    fn repro_p7mac_grouped_channels_preserve_frame_order() {
+        let mut front = [0.001, 0.002, 0.011, 0.012];
+        let mut rear = [0.003, 0.004, 0.013, 0.014];
+        let list = TwoBuffers {
+            count: 2,
+            buffers: [buffer(&mut front, 2), buffer(&mut rear, 2)],
+        };
+        let (producer, mut consumer) = raw_ring(32);
+        let mut sink = RawSink::new(producer, 48_000, 4);
+        let mut scratch = Vec::with_capacity(32);
+        let report = BufferReport::new(&sink);
+        // SAFETY: repr(C) header and two entries match a two-buffer native list;
+        // sample storage is aligned, initialized, and alive throughout the call.
+        unsafe {
+            push_buffer_list(
+                &mut sink,
+                &mut scratch,
+                std::ptr::from_ref(&list).cast(),
+                &SampleMailbox::default(),
+                &report,
+            );
+        }
+        let mut actual = [0.0; 8];
+        let copied = consumer.pop_slice(&mut actual);
+        assert_eq!(
+            copied, 0,
+            "multichannel data must never be reordered or delivered"
+        );
+        assert_eq!(
+            report.take_error().unwrap().kind(),
+            flexaudio_core::ErrorKind::UnsupportedFormat
+        );
+        assert!(report.take_error().is_none());
+    }
+
+    #[test]
+    fn repro_p7mac_unequal_planes_do_not_silently_truncate() {
+        let mut left = [0.001, 0.002, 0.003];
+        let mut right = [0.004, 0.005];
+        let list = TwoBuffers {
+            count: 2,
+            buffers: [buffer(&mut left, 1), buffer(&mut right, 1)],
+        };
+        let (producer, mut consumer) = raw_ring(32);
+        let mut sink = RawSink::new(producer, 48_000, 2);
+        let mut scratch = Vec::with_capacity(32);
+        let report = BufferReport::new(&sink);
+        // SAFETY: same layout and storage invariants as the grouped-buffer fixture.
+        unsafe {
+            push_buffer_list(
+                &mut sink,
+                &mut scratch,
+                std::ptr::from_ref(&list).cast(),
+                &SampleMailbox::default(),
+                &report,
+            );
+        }
+        // Reject this inconsistent frame layout; do not publish a shortened valid-looking block.
+        assert_eq!(consumer.pop(), None);
+        assert!(report.take_error().is_none());
+        let losses = report_for_loss(&sink);
+        assert_eq!(losses.len(), 1);
+        assert_eq!(
+            losses[0].reason(),
+            flexaudio_core::LossReason::MalformedBuffer
+        );
+        assert_eq!(losses[0].samples(), None);
+        assert_eq!((losses[0].sample_rate(), losses[0].channels()), (48_000, 2));
+        assert!(report_for_loss(&sink).is_empty());
+    }
+
+    fn report_for_loss(sink: &RawSink) -> Vec<flexaudio_core::AudioLoss> {
+        sink.diagnostics().drain().unwrap()
+    }
+
+    #[test]
+    fn repro_p7mac_buffer_channels_must_match_sink() {
+        let mut samples = [0.001, 0.002];
+        let list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer(&mut samples, 2)],
+        };
+        let (producer, mut consumer) = raw_ring(16);
+        let mut sink = RawSink::new(producer, 48_000, 1);
+        let report = BufferReport::new(&sink);
+        // SAFETY: valid single-buffer list and live, aligned f32 storage.
+        unsafe {
+            push_buffer_list(
+                &mut sink,
+                &mut Vec::new(),
+                &list,
+                &SampleMailbox::default(),
+                &report,
+            );
+        }
+        assert_eq!(
+            consumer.pop(),
+            None,
+            "stereo bytes must not enter a mono sink"
+        );
+        let error = report
+            .take_error()
+            .expect("format mismatch must be observable");
+        assert!(matches!(
+            error.root(),
+            Error::NativeFormatChanged {
+                advertised: (48_000, 1),
+                actual: (48_000, 2)
+            }
+        ));
+        assert!(
+            matches!(error, Error::Context { context, .. } if context.operation() == Operation::Normalize)
+        );
+    }
+
+    #[test]
+    fn supported_stereo_planes_and_interleaved_frames_keep_order() {
+        let mut left = [0.1, 0.2, 0.3];
+        let mut right = [-0.1, -0.2, -0.3];
+        let list = TwoBuffers {
+            count: 2,
+            buffers: [buffer(&mut left, 1), buffer(&mut right, 1)],
+        };
+        let (producer, mut consumer) = raw_ring(32);
+        let mut sink = RawSink::new(producer, 48_000, 2);
+        let report = BufferReport::new(&sink);
+        let mut scratch = Vec::with_capacity(6);
+        let capacity = scratch.capacity();
+        // SAFETY: complete native layout with live aligned f32 storage.
+        unsafe {
+            push_buffer_list(
+                &mut sink,
+                &mut scratch,
+                std::ptr::from_ref(&list).cast(),
+                &SampleMailbox::default(),
+                &report,
+            )
+        };
+        let mut actual = [0.0; 6];
+        assert_eq!(consumer.pop_slice(&mut actual), 6);
+        assert_eq!(actual, [0.1, -0.1, 0.2, -0.2, 0.3, -0.3]);
+        assert_eq!(scratch.capacity(), capacity);
+        let list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer(&mut actual, 2)],
+        };
+        // SAFETY: complete single-buffer layout with live aligned f32 storage.
+        unsafe {
+            push_buffer_list(
+                &mut sink,
+                &mut scratch,
+                &list,
+                &SampleMailbox::default(),
+                &report,
+            )
+        };
+        let mut interleaved = [0.0; 6];
+        assert_eq!(consumer.pop_slice(&mut interleaved), 6);
+        assert_eq!(interleaved, actual);
+        assert!(report.take_error().is_none());
+        assert!(report_for_loss(&sink).is_empty());
+    }
+
+    #[test]
+    fn malformed_and_idle_buffers_remain_distinct() {
+        let (producer, mut consumer) = raw_ring(32);
+        let mut sink = RawSink::new(producer, 48_000, 2);
+        let report = BufferReport::new(&sink);
+        let mut data = [0.1, 0.2];
+        let mut list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer(&mut data, 2)],
+        };
+        // An incomplete stereo frame.
+        list.mBuffers[0].mDataByteSize = 4;
+        // SAFETY: live native layout; declared bytes are within data's allocation.
+        unsafe {
+            push_buffer_list(
+                &mut sink,
+                &mut Vec::new(),
+                &list,
+                &SampleMailbox::default(),
+                &report,
+            )
+        };
+        assert_eq!(consumer.pop(), None);
+        assert_eq!(
+            report_for_loss(&sink)[0].reason(),
+            flexaudio_core::LossReason::MalformedBuffer
+        );
+        list.mBuffers[0].mDataByteSize = 0;
+        list.mBuffers[0].mData = std::ptr::null_mut();
+        // SAFETY: size-zero native buffers need no sample storage.
+        unsafe {
+            push_buffer_list(
+                &mut sink,
+                &mut Vec::new(),
+                &list,
+                &SampleMailbox::default(),
+                &report,
+            )
+        };
+        assert!(report_for_loss(&sink).is_empty());
+        assert!(report.take_error().is_none());
     }
 }

@@ -4,7 +4,7 @@
 // into this directory as `flexaudio.node` (run-smoke.sh does this).
 //
 // Checks:
-//  1. devices() returns an array and does not throw when it is empty.
+//  1. devices() returns an array, or throws a typed backend error when discovery fails.
 //  2. __openMockStream(48000, 2, 440.0, onChunk) emits 440 Hz sine wave chunks.
 //     - Assert data.length === frames*channels and peak > 0 for each chunk.
 //     - Confirm that at least one chunk arrives.
@@ -29,9 +29,16 @@ function assert(cond, msg) {
 
 async function main() {
   // --- 1. devices() ---
-  const devs = native.devices();
-  assert(Array.isArray(devs), 'devices() must return an array');
-  console.log(`[1] devices() -> ${devs.length} device(s) (array OK)`);
+  // Discovery fails closed: without a PipeWire daemon (CI runners) devices() throws a
+  // typed backend error instead of returning a partial array.
+  try {
+    const devs = native.devices();
+    assert(Array.isArray(devs), 'devices() must return an array');
+    console.log(`[1] devices() -> ${devs.length} device(s) (array OK)`);
+  } catch (error) {
+    assert(error?.audioError?.kind === 'backend', `devices() threw an untyped error: ${error}`);
+    console.log(`[1] devices() failed closed with a typed backend error: ${error.message}`);
+  }
 
   // --- 2. __openMockStream ---
   const SAMPLE_RATE = 48000;

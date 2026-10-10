@@ -13,8 +13,33 @@
 
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+
+// Device lookup completed without a match.
+#define FLEX_DEVICE_NOT_FOUND -5
+
+// Active device lost.
+#define FLEX_DEVICE_LOST -6
+
+// Recording permission denied.
+#define FLEX_PERMISSION_DENIED -7
+
+// Unsupported OS version.
+#define FLEX_UNSUPPORTED_OS_VERSION -8
+
+// Unsupported operation.
+#define FLEX_UNSUPPORTED -9
+
+// Unsupported PCM format.
+#define FLEX_UNSUPPORTED_FORMAT -10
+
+// Negotiated native format changed.
+#define FLEX_NATIVE_FORMAT_CHANGED -11
+
+// Device selection is ambiguous.
+#define FLEX_AMBIGUOUS_DEVICE_NAME -12
 
 // Success.
 #define FLEX_OK 0
@@ -31,84 +56,127 @@
 // The handle state does not allow the operation (such as writing to finalized FLAC).
 #define FLEX_INVALID_STATE -4
 
-// Audio source kind to record (corresponds to [`flexaudio::SourceKind`]).
-typedef enum FlexSourceKind {
-    // Microphone input.
-    FLEX_SOURCE_KIND_MIC = 0,
-    // Loopback of all system output.
-    FLEX_SOURCE_KIND_SYSTEM = 1,
-    // Output loopback for a specific process.
-    FLEX_SOURCE_KIND_PROCESS = 2,
-    // Record microphone and system audio mixed into one stream.
-    FLEX_SOURCE_KIND_MIX = 3,
-} FlexSourceKind;
+#define FLEX_SOURCE_KIND_MIC 0
 
-// Whether to include or exclude the target PID for process sources (corresponds to [`flexaudio::ProcessMode`]).
-typedef enum FlexProcessMode {
-    // Capture only the target PID (and its process tree).
-    FLEX_PROCESS_MODE_INCLUDE = 0,
-    // Capture all system audio except the target PID.
-    FLEX_PROCESS_MODE_EXCLUDE = 1,
-} FlexProcessMode;
+#define FLEX_SOURCE_KIND_SYSTEM 1
 
-// Stream event kind (corresponds to [`flexaudio::Event`]).
-typedef enum FlexEventKind {
-    // Chunks were dropped because the chunk ring was full (count in `FlexEvent::count`).
-    FLEX_EVENT_KIND_CHUNK_DROPPED = 0,
-    // Data stopped arriving and the stream stalled.
-    FLEX_EVENT_KIND_STALLED = 1,
-    // Data resumed after a stall.
-    FLEX_EVENT_KIND_RECOVERED = 2,
-    // A required permission was denied; terminal, including a confirmed macOS self-probe failure.
-    // Retrieve the cause and remedy with flexaudio_last_error; capture stops.
-    FLEX_EVENT_KIND_PERMISSION_DENIED = 3,
-    // The capture device was lost.
-    FLEX_EVENT_KIND_DEVICE_LOST = 4,
-    // Other backend error (retrieve the message with `flexaudio_last_error`).
-    FLEX_EVENT_KIND_ERROR = 5,
-    // Event not matching a known kind (reserved for future variants).
-    FLEX_EVENT_KIND_UNKNOWN = 6,
-    // Exact-zero system capture with an inconclusive permission diagnosis; advisory only.
-    // Missing permission and genuine digital silence remain possible.
-    // Retrieve the explanation with flexaudio_last_error; capture continues.
-    FLEX_EVENT_KIND_SILENCE_WHILE_SOURCE_ACTIVE = 7,
-    // Recording consent remains undecided; advisory only, capture continues.
-    // Retrieve guidance with flexaudio_last_error; capture may stay silent until granted.
-    FLEX_EVENT_KIND_PERMISSION_PENDING = 8,
-} FlexEventKind;
+#define FLEX_SOURCE_KIND_PROCESS 2
 
-// Whether the process is currently outputting audio (corresponds to [`flexaudio::ProcessInfo::is_output_active`]).
-//
-// `Unknown` when the OS does not expose this state (Rust `None`).
-typedef enum FlexOutputActivity {
-    // The OS does not expose the state or it could not be read.
-    FLEX_OUTPUT_ACTIVITY_UNKNOWN = 0,
-    // Not outputting (Linux = node is not Running / Windows = session is Inactive /
-    // macOS = IsRunningOutput is 0).
-    FLEX_OUTPUT_ACTIVITY_INACTIVE = 1,
-    // Outputting audio.
-    FLEX_OUTPUT_ACTIVITY_ACTIVE = 2,
-} FlexOutputActivity;
+#define FLEX_SOURCE_KIND_MIX 3
 
-// Device connection event kind (corresponds to [`flexaudio::DeviceEvent`]).
-typedef enum FlexDeviceEventKind {
-    // A device was added (`device`/`name`, etc. are populated).
-    FLEX_DEVICE_EVENT_KIND_ADDED = 0,
-    // A device was removed (`id` only).
-    FLEX_DEVICE_EVENT_KIND_REMOVED = 1,
-    // The OS default device changed (`id` and `source_kind`).
-    FLEX_DEVICE_EVENT_KIND_DEFAULT_CHANGED = 2,
-    // An event that does not match a known kind (for future variants).
-    FLEX_DEVICE_EVENT_KIND_UNKNOWN = 3,
-} FlexDeviceEventKind;
+#define FLEX_PROCESS_MODE_INCLUDE 0
+
+#define FLEX_PROCESS_MODE_EXCLUDE 1
+
+#define FLEX_EVENT_KIND_CHUNK_DROPPED 0
+
+#define FLEX_EVENT_KIND_STALLED 1
+
+#define FLEX_EVENT_KIND_RECOVERED 2
+
+#define FLEX_EVENT_KIND_PERMISSION_DENIED 3
+
+#define FLEX_EVENT_KIND_DEVICE_LOST 4
+
+#define FLEX_EVENT_KIND_ERROR 5
+
+#define FLEX_EVENT_KIND_UNKNOWN 6
+
+#define FLEX_EVENT_KIND_SILENCE_WHILE_SOURCE_ACTIVE 7
+
+#define FLEX_EVENT_KIND_PERMISSION_PENDING 8
+
+#define FLEX_OUTPUT_ACTIVITY_UNKNOWN 0
+
+#define FLEX_OUTPUT_ACTIVITY_INACTIVE 1
+
+#define FLEX_OUTPUT_ACTIVITY_ACTIVE 2
+
+#define FLEX_DEVICE_EVENT_KIND_ADDED 0
+
+#define FLEX_DEVICE_EVENT_KIND_REMOVED 1
+
+#define FLEX_DEVICE_EVENT_KIND_DEFAULT_CHANGED 2
+
+#define FLEX_DEVICE_EVENT_KIND_UNKNOWN 3
+
+// Late microphone consent; permission getter returns 1.
+#define FLEX_EVENT_KIND_PERMISSION_GRANTED 9
+
+// Validated interval sample loss.
+#define FLEX_EVENT_KIND_AUDIO_LOSS 10
+
+// Cleanup failure; does not replace the capture primary.
+#define FLEX_EVENT_KIND_SHUTDOWN_ERROR 11
+
+// Fatal typed capture failure.
+#define FLEX_EVENT_KIND_TERMINAL_ERROR 12
+
+// Advisory typed failure; capture may continue.
+#define FLEX_EVENT_KIND_RECOVERABLE_ERROR 13
+
+// Coalesced upstream clipping, without exact chunk attribution.
+#define FLEX_EVENT_KIND_CLIPPED 14
+
+// The default endpoint no longer exists; no fabricated device ID.
+#define FLEX_DEVICE_EVENT_KIND_DEFAULT_CLEARED 4
+
+// Incremental inventory is invalid; obtain a complete inventory again.
+#define FLEX_DEVICE_EVENT_KIND_RESCAN_REQUIRED 5
+
+#define FLEX_STREAM_VERSION_2 2
+
+#define FLEX_WHISPER_PRIMARY 1
+
+#define FLEX_WHISPER_SECONDARY 2
+
+#define FLEX_WHISPER_UNSUPPORTED_TAP -5
+
+#define FLEX_WHISPER_UNSUPPORTED_CONVERSION_CLOCK -6
+
+#define FLEX_WHISPER_CONFLICTING_VAD -7
+
+#define FLEX_WHISPER_EPOCH_START 6
+
+#define FLEX_WHISPER_SEGMENT 1
+
+#define FLEX_WHISPER_SPEECH_START 2
+
+#define FLEX_WHISPER_SPEECH_END 3
+
+#define FLEX_WHISPER_CUT 4
+
+#define FLEX_WHISPER_EPOCH_END 5
+
+#define FLEX_WHISPER_HYSTERESIS 1
+
+#define FLEX_WHISPER_FINISH 2
+
+#define FLEX_WHISPER_RESET 3
+
+#define FLEX_WHISPER_ERROR 4
+
+#define FLEX_WHISPER_LIMIT 5
 
 // Opaque noise suppression handle containing [`flexaudio_denoise::Denoiser`].
 // Create it with `flexaudio_denoise_new` and release it with `flexaudio_denoise_free`.
 typedef struct FlexDenoiser FlexDenoiser;
 
+// Owned watcher event. Device and string views are borrowed until explicit free.
+typedef struct FlexDeviceEventV2 FlexDeviceEventV2;
+
+// Owned immutable error tree. Borrowed views live until this tree's explicit free.
+typedef struct FlexErrorInfoV2 FlexErrorInfoV2;
+
+// Owned event with immutable payloads. Free with flexaudio_event_free_v2.
+typedef struct FlexEventV2 FlexEventV2;
+
 // Opaque handle for FLAC output. Create it with `flexaudio_flac_create`, append chunks with
 // `flexaudio_flac_write`, finalize with `flexaudio_flac_finalize`, and release with `flexaudio_flac_free`.
 typedef struct FlexFlac FlexFlac;
+
+// Owned completed shutdown report; all child pointers are borrowed.
+typedef struct FlexShutdownReportV2 FlexShutdownReportV2;
 
 // Opaque handle for a recording stream. It contains [`flexaudio::Stream`] and any enabled
 // addons (denoise / VAD); C code holds only a pointer. Create with `flexaudio_open` and
@@ -126,6 +194,12 @@ typedef struct FlexVad FlexVad;
 // Opaque device watcher handle containing [`flexaudio::DeviceWatcher`]. Create with
 // `flexaudio_watch_devices` and release with `flexaudio_watcher_free`.
 typedef struct FlexWatcher FlexWatcher;
+
+// Opaque exclusively owned session. Construct off the capture callback.
+typedef struct FlexWhisperVad FlexWhisperVad;
+
+// Opaque probability-only segmentation owner.
+typedef struct FlexWhisperVadPostProcessor FlexWhisperVadPostProcessor;
 
 // VAD (voice activity detection) configuration. Passed to `FlexConfig::vad` and `flexaudio_vad_new`.
 //
@@ -158,22 +232,23 @@ typedef struct FlexVadConfig {
 // Sentinel values mean "unspecified" for strings and optional values (`device_id` NULL selects the default device,
 // `process_id` 0 means none, and `output_rate`/`output_channels`/`chunk_ms` 0 select defaults).
 typedef struct FlexConfig {
-    // Source kind.
-    enum FlexSourceKind kind;
+    // Source kind integer (FlexSourceKind code); unknown values are rejected.
+    int32_t kind;
     // ID of the selected device (UTF-8, NUL-terminated). NULL selects the default device.
     const char *device_id;
     // Target PID for a process source. 0 means none (may cause an error when starting a process source).
     uint32_t process_id;
-    // Whether to include or exclude the target PID (process sources only).
-    enum FlexProcessMode mode;
+    // Include/exclude integer (FlexProcessMode code), validated even for other sources.
+    int32_t mode;
     // Whether to exclude this process's playback from system audio (system source only;
     // for mix, applies to the system side).
-    bool exclude_self;
+    // Boolean integer: only 0 and 1 are valid.
+    uint8_t exclude_self;
     // Output sample rate (Hz). 0 selects 48000.
     uint32_t output_rate;
     // Output channel count. 0 selects 2.
     uint16_t output_channels;
-    // Chunk duration (ms). 0 selects 20.
+    // Chunk duration (ms). 0 selects 20; all other non-20 values are rejected.
     uint32_t chunk_ms;
     // Input gain at start (linear multiplier). 0 selects 1.0 (default). For runtime mute, use
     // `flexaudio_set_gain(s, 0.0)`.
@@ -192,10 +267,12 @@ typedef struct FlexConfig {
     // Whether to apply noise suppression (RNNoise) to the stream. Enabled when `true`. The output rate must be
     // 48000 or `flexaudio_open` fails (NULL + last_error). denoise
     // processes data in place just before `poll_chunk` returns (before VAD).
-    bool denoise;
+    // Boolean integer: only 0 and 1 are valid.
+    uint8_t denoise;
     // Whether to apply VAD (voice activity detection) to the stream. When `true`, each polled chunk is processed
     // by VAD according to `vad` and populates `FlexChunk::vad_events`.
-    bool has_vad;
+    // Boolean integer: only 0 and 1 are valid.
+    uint8_t has_vad;
     // VAD configuration (used only when `has_vad` is `true`; ignored when `false`).
     struct FlexVadConfig vad;
 } FlexConfig;
@@ -220,7 +297,7 @@ typedef struct FlexChunk {
     // Pointer to interleaved f32 samples. Release with `flexaudio_chunk_free`.
     float *data;
     // Number of elements in `data` (= `frames * channels`).
-    uintptr_t len;
+    size_t len;
     // Number of frames in the chunk.
     uint32_t frames;
     // Monotonic presentation timestamp (ns) of the first sample.
@@ -231,16 +308,20 @@ typedef struct FlexChunk {
     uint32_t flags;
     // Number of chunks dropped before this chunk arrived.
     uint32_t dropped_before;
-    // Maximum absolute sample value (linear amplitude).
+    // Maximum absolute delivered sample value after denoise (linear amplitude).
     float peak;
-    // Root-mean-square value of all samples (linear).
+    // Root-mean-square of delivered samples after denoise (linear).
     float rms;
     // Events finalized by VAD for this chunk. NULL when VAD is disabled or there are no events
     // (`vad_events_len = 0`). When non-NULL, `flexaudio_chunk_free` releases it
     // together with `data`.
+    // On DISCONTINUITY, flushed pre-gap events precede any post-gap events. The core's fixed
+    // 20 ms chunks are shorter than a fresh 32 ms VAD frame, so this chunk contains only pre-gap
+    // events; all events on subsequent chunks use the new sample clock, restarted at zero.
+    // SpeechStart and SpeechEnd are delivered together when a segment is finalized.
     struct FlexVadEvent *vad_events;
     // Number of `vad_events`. 0 when VAD is disabled or there are no events.
-    uintptr_t vad_events_len;
+    size_t vad_events_len;
 } FlexChunk;
 
 // One captured event, populated by `flexaudio_poll_event`.
@@ -250,7 +331,7 @@ typedef struct FlexChunk {
 // PermissionPending has kind 8 and does not stop capture.
 typedef struct FlexEvent {
     // Event kind.
-    enum FlexEventKind kind;
+    int32_t kind;
     // Number dropped for `ChunkDropped`; 0 for other kinds.
     int64_t count;
 } FlexEvent;
@@ -265,7 +346,7 @@ typedef struct FlexDeviceInfo {
     // Human-readable display name (released by `flexaudio_devices_free`).
     char *name;
     // Source kind used to capture this device.
-    enum FlexSourceKind source_kind;
+    int32_t source_kind;
     // Native (default) sample rate (Hz).
     uint32_t sample_rate;
     // Native (default) channel count.
@@ -291,8 +372,46 @@ typedef struct FlexProcessInfo {
     // macOS bundle ID, or NULL if unavailable (always NULL outside macOS).
     char *bundle_id;
     // Whether it is outputting audio (`Unknown` if unavailable).
-    enum FlexOutputActivity output_activity;
+    int32_t output_activity;
 } FlexProcessInfo;
+
+typedef struct FlexAudioLossV2 {
+    // 0 capture, 1 Mix FIFO, 2 output.
+    uint32_t path;
+    // 0 none, 1 microphone, 2 system audio.
+    uint32_t lane;
+    // 0 primary, 1 secondary; used only for output path.
+    uint32_t tap;
+    // 0 raw overflow, 1 FIFO overflow, 2 corrupt, 3 malformed, 4 callback rejected, 5 output overflow.
+    uint32_t reason;
+    // 0 unknown, 1 known positive scalar interleaved sample count.
+    uint32_t count_known;
+    uint64_t samples;
+    uint32_t sample_rate;
+    uint16_t channels;
+} FlexAudioLossV2;
+
+typedef struct FlexNativeFormatV2 {
+    uint32_t sample_rate;
+    uint16_t channels;
+} FlexNativeFormatV2;
+
+typedef struct FlexNativeFormatChangeV2 {
+    struct FlexNativeFormatV2 advertised;
+    struct FlexNativeFormatV2 actual;
+} FlexNativeFormatChangeV2;
+
+typedef struct FlexErrorContextV2 {
+    // 0 enumerate, 1 start, 2 normalize, 3 flush, 4 reopen, 5 rollback, 6 stop, 7 join, 8 link.
+    uint32_t operation;
+    // 0 none, 1 microphone, 2 system audio.
+    uint32_t lane;
+    // 0 none, 1 HRESULT, 2 OSStatus.
+    uint32_t native_code_kind;
+    int64_t native_code;
+    // Borrowed from the error owner; never free separately.
+    const char *native_call;
+} FlexErrorContextV2;
 
 // One retrieved device event, populated by `flexaudio_watcher_poll`.
 //
@@ -306,7 +425,7 @@ typedef struct FlexProcessInfo {
 // [`flexaudio_device_event_free`] (do not use C `free`).
 typedef struct FlexDeviceEvent {
     // Event kind.
-    enum FlexDeviceEventKind kind;
+    int32_t kind;
     // Stable ID (valid for `Added`/`Removed`/`DefaultChanged`; release with
     // `flexaudio_device_event_free`). NULL for `Unknown`.
     char *id;
@@ -314,7 +433,7 @@ typedef struct FlexDeviceEvent {
     char *name;
     // For `Added`, the device source kind. For `DefaultChanged`, the side whose default changed
     // (`Mic` = default source / `System` = default sink). Unused for other kinds (`Mic`).
-    enum FlexSourceKind source_kind;
+    int32_t source_kind;
     // Native sample rate (`Added` only; 0 otherwise).
     uint32_t sample_rate;
     // Native channel count (`Added` only; 0 otherwise).
@@ -324,6 +443,110 @@ typedef struct FlexDeviceEvent {
     // Whether this is the OS default device (`Added` only).
     bool is_default;
 } FlexDeviceEvent;
+
+// Pinned segmentation parameters. NULL uses defaults; every supplied zero is literal.
+typedef struct FlexWhisperVadParams {
+    float threshold;
+    int32_t min_speech_duration_ms;
+    int32_t min_silence_duration_ms;
+    float max_speech_duration_s;
+    int32_t speech_pad_ms;
+} FlexWhisperVadParams;
+
+// Fixed-width new-mode attachment settings. Only primary is supported by this binding.
+typedef struct FlexWhisperVadStreamOptions {
+    struct FlexWhisperVadParams params;
+    // 0 or 1, never a default sentinel.
+    uint8_t provisional;
+    // FLEX_WHISPER_PRIMARY or FLEX_WHISPER_SECONDARY.
+    uint32_t tap;
+} FlexWhisperVadStreamOptions;
+
+// Versioned envelope around the frozen v1 configuration. All pointers are borrowed during open.
+typedef struct FlexStreamConfigV2 {
+    uint32_t size;
+    uint32_t version;
+    const struct FlexConfig *config;
+    // NULL disables whisper attachment.
+    const struct FlexWhisperVadStreamOptions *whisper_vad;
+} FlexStreamConfigV2;
+
+// Half-open final interval on the 10 ms grid; its end may exceed physical EOF.
+typedef struct FlexWhisperSpeechSegment {
+    uint64_t start_ms;
+    uint64_t end_ms;
+} FlexWhisperSpeechSegment;
+
+typedef struct FlexWhisperSpeechStart {
+    uint64_t at_ms;
+} FlexWhisperSpeechStart;
+
+typedef struct FlexWhisperSpeechEnd {
+    uint64_t at_ms;
+    uint32_t reason;
+} FlexWhisperSpeechEnd;
+
+typedef struct FlexWhisperCut {
+    uint64_t start_ms;
+    uint64_t end_ms;
+    uint32_t reason;
+} FlexWhisperCut;
+
+typedef struct FlexWhisperEpochEnd {
+    uint32_t reason;
+} FlexWhisperEpochEnd;
+
+// Read only the payload selected by the event's type tag.
+typedef union FlexWhisperVadPayload {
+    struct FlexWhisperSpeechSegment segment;
+    struct FlexWhisperSpeechStart speech_start;
+    struct FlexWhisperSpeechEnd speech_end;
+    struct FlexWhisperCut cut;
+    struct FlexWhisperEpochEnd epoch_end;
+} FlexWhisperVadPayload;
+
+typedef struct FlexWhisperEpochStart {
+    uint64_t capture_sample;
+    int64_t pts_ns;
+} FlexWhisperEpochStart;
+
+// Attached union is distinct from the standalone event union.
+typedef union FlexAttachedWhisperVadPayload {
+    union FlexWhisperVadPayload vad;
+    struct FlexWhisperEpochStart epoch_start;
+} FlexAttachedWhisperVadPayload;
+
+// Versioned attached event. Epoch start is sequence 0 before all VAD payloads.
+typedef struct FlexAttachedWhisperVadEvent {
+    uint32_t size;
+    uint32_t version;
+    uint32_t type;
+    uint32_t epoch;
+    uint64_t seq;
+    union FlexAttachedWhisperVadPayload data;
+} FlexAttachedWhisperVadEvent;
+
+// Owns v1 PCM/events and attached events until flexaudio_chunk_free_v2.
+typedef struct FlexChunkV2 {
+    uint32_t size;
+    uint32_t version;
+    struct FlexChunk chunk;
+    struct FlexAttachedWhisperVadEvent *whisper_vad_events;
+    size_t whisper_vad_events_len;
+} FlexChunkV2;
+
+// Preview policy. provisional must be 0 (disabled) or 1 (enabled).
+typedef struct FlexWhisperVadOptions {
+    uint8_t provisional;
+} FlexWhisperVadOptions;
+
+// Standalone ordered event. All times are epoch-relative integer milliseconds.
+typedef struct FlexWhisperVadEvent {
+    uint32_t type;
+    uint32_t epoch;
+    uint64_t seq;
+    union FlexWhisperVadPayload data;
+} FlexWhisperVadEvent;
 
 // Open a stream from the configuration (without starting it). On failure, return NULL and
 // set last_error.
@@ -361,21 +584,29 @@ struct FlexStream *flexaudio_open(const struct FlexConfig *config);
 // NULL and misaligned pointers are rejected before dereferencing.
 struct FlexStream *flexaudio_open_with_exclude_pids(const struct FlexConfig *config,
                                                     const uint32_t *exclude_pids,
-                                                    uintptr_t exclude_pids_len);
+                                                    size_t exclude_pids_len);
 
-// Stop the stream, then free it. NULL-safe.
+// Run checked stop, then free the stream. NULL-safe. Cleanup failure remains in last_error.
+// Attached v2 streams must be polled through their terminal carrier before free.
+// If attached chunks remain unread, keep the handle alive and set last_error; poll
+// with poll_chunk_v2 and call free again rather than silently losing closure events.
+// Ordinary streams release unread PCM tails on free; call stop and poll first to retain them.
 //
 // # Safety
 // `s` must be a handle returned by `flexaudio_open` (or NULL). Do not use `s` after freeing it.
 void flexaudio_free(struct FlexStream *s);
 
-// Start capture.
+// Start capture. Repeated calls while running succeed without starting again.
+// After stop, the stream is spent: start returns FLEX_INVALID_STATE; open a new stream.
 //
 // # Safety
 // `s` must be a valid handle (NULL is InvalidArg).
 int32_t flexaudio_start(struct FlexStream *s);
 
-// Stop capture.
+// Stop capture and finish denoise/VAD once. Graceful PCM tails remain pollable.
+// Return the primary root error code for capture or cleanup failure. Repeated stop
+// returns the retained outcome without duplicate tails or cleanup events.
+// Inspect shutdown_report_v2 for the separate capture primary and cleanup errors.
 //
 // # Safety
 // `s` must be a valid handle (NULL is InvalidArg).
@@ -448,6 +679,12 @@ uint64_t flexaudio_dropped_chunks(const struct FlexStream *s);
 // `s` must be a valid handle, and `out` must point to a valid `FlexChunk` destination.
 int32_t flexaudio_poll_chunk(struct FlexStream *s, struct FlexChunk *out);
 
+// Return the producer frame index in canonical 48 kHz units without changing v1 layout.
+// NULL, a freed chunk, or caller-owned PCM returns zero and sets last_error.
+// # Safety
+// Non-NULL must point to an aligned, readable FlexChunk. PCM is never dereferenced.
+uint64_t flexaudio_chunk_frame_index(const struct FlexChunk *chunk);
+
 // Free the `data` filled by `flexaudio_poll_chunk` and set `data=NULL` / `len=0`.
 // Safe for NULL and repeated calls.
 //
@@ -460,13 +697,16 @@ void flexaudio_chunk_free(struct FlexChunk *chunk);
 // Return 1 when an event is retrieved, 0 when none is available, or a negative value on error.
 // Error, PermissionDenied (kind 3), SilenceWhileSourceActive (kind 7), and
 // PermissionPending (kind 8, advisory only: capture continues)
-// store their explanation in last_error. PermissionDenied is terminal, including
+// store safe explanations in last_error. Typed failures project to Error (5):
+// v1 cannot distinguish terminal/recoverable/cleanup; inspect terminal_error or use v2.
+// Counts above INT64_MAX saturate with a range-loss diagnostic. PermissionDenied is terminal, including
 // a confirmed macOS self-probe failure. SilenceWhileSourceActive means the
 // permission diagnosis is inconclusive; both advisory kinds continue capture.
 //
 // # Safety
 // `s` must be a valid handle, and `out` must point to a valid `FlexEvent` destination.
-int32_t flexaudio_poll_event(struct FlexStream *s, struct FlexEvent *out);
+int32_t flexaudio_poll_event(struct FlexStream *s,
+                             struct FlexEvent *out);
 
 // Hot-swap the input source without stopping capture. `config.gain` is ignored because gain is
 // stream state; change it with `flexaudio_set_gain`. `config.denoise` / `config.has_vad` /
@@ -503,7 +743,7 @@ int32_t flexaudio_switch_source(struct FlexStream *s, const struct FlexConfig *c
 int32_t flexaudio_switch_source_with_exclude_pids(struct FlexStream *s,
                                                   const struct FlexConfig *config,
                                                   const uint32_t *exclude_pids,
-                                                  uintptr_t exclude_pids_len);
+                                                  size_t exclude_pids_len);
 
 // Return FLEX_OK when no terminal failure is stored, or FLEX_FAILURE (-2) and
 // set flexaudio_last_error to the terminal reason. Does not consume events and
@@ -515,18 +755,21 @@ int32_t flexaudio_terminal_error(const struct FlexStream *s);
 
 // List available devices, allocate an array, and set `out_array` / `out_count`.
 //
-// Return 0 on success. Free the allocated array with `flexaudio_devices_free`. In a headless
-// environment, an empty result (`out_array=NULL` / `out_count=0`) is still successful.
+// Return 0 only for complete discovery. An empty complete inventory sets
+// `out_array=NULL` / `out_count=0`. Incomplete or failed discovery (including an
+// unreachable PipeWire daemon on Linux) returns a typed error code and sets
+// `flexaudio_last_error` / `flexaudio_last_error_info_v2`; it is not an empty success.
+// Free the allocated array with `flexaudio_devices_free`.
 //
 // # Safety
 // `out_array` / `out_count` must be valid output pointers (NULL is InvalidArg).
-int32_t flexaudio_devices(struct FlexDeviceInfo **out_array, uintptr_t *out_count);
+int32_t flexaudio_devices(struct FlexDeviceInfo **out_array, size_t *out_count);
 
 // Free the array allocated by `flexaudio_devices` and each `id` / `name`. NULL-safe.
 //
 // # Safety
 // `arr` / `count` must be values returned by `flexaudio_devices` (or NULL/0).
-void flexaudio_devices_free(struct FlexDeviceInfo *arr, uintptr_t count);
+void flexaudio_devices_free(struct FlexDeviceInfo *arr, size_t count);
 
 // List processes with audio output sessions (streams) that can be captured individually,
 // allocate an array, and set `out_array` / `out_count`. The calling process is excluded.
@@ -544,7 +787,7 @@ void flexaudio_devices_free(struct FlexDeviceInfo *arr, uintptr_t count);
 //
 // # Safety
 // `out_array` / `out_count` must be valid output pointers (NULL is InvalidArg).
-int32_t flexaudio_processes(struct FlexProcessInfo **out_array, uintptr_t *out_count);
+int32_t flexaudio_processes(struct FlexProcessInfo **out_array, size_t *out_count);
 
 // Free the array allocated by `flexaudio_processes` and each string. NULL-safe.
 // Call **once only**; calling twice with the same pointer causes a double-free and undefined
@@ -553,7 +796,7 @@ int32_t flexaudio_processes(struct FlexProcessInfo **out_array, uintptr_t *out_c
 // # Safety
 // `arr` / `count` must be values returned by `flexaudio_processes` (or NULL/0). Call this
 // function only once for the same `arr`.
-void flexaudio_processes_free(struct FlexProcessInfo *arr, uintptr_t count);
+void flexaudio_processes_free(struct FlexProcessInfo *arr, size_t count);
 
 // Return the most recent error message for the current thread.
 //
@@ -576,7 +819,24 @@ struct FlexDenoiser *flexaudio_denoise_new(uint16_t channels);
 // # Safety
 // `d` must be a valid handle. `samples` must point to a valid mutable array of `len`
 // elements; NULL is allowed when `len=0`.
-int32_t flexaudio_denoise_process(struct FlexDenoiser *d, float *samples, uintptr_t len);
+int32_t flexaudio_denoise_process(struct FlexDenoiser *d, float *samples, size_t len);
+
+// Drain actual interleaved delayed samples into a library-owned array.
+//
+// Valid output destinations initialize to NULL/0, including on errors. Repeated
+// flush without new nonempty input returns NULL/0. Release samples with
+// `flexaudio_denoise_samples_free`, never C free.
+//
+// # Safety
+// `d` must be a live handle; `out`/`out_len` must be aligned writable destinations.
+int32_t flexaudio_denoise_flush(struct FlexDenoiser *d, float **out, size_t *out_len);
+
+// Release the sample array returned by `flexaudio_denoise_flush`. NULL/0 is safe.
+//
+// # Safety
+// `samples`/`len` must be the exact live allocation returned by flush, or NULL/0.
+// Release each allocation once.
+void flexaudio_denoise_samples_free(float *samples, size_t len);
 
 // Resets the RNN state, carry buffer, and delay line to their initial state.
 //
@@ -615,11 +875,13 @@ struct FlexFlac *flexaudio_flac_create(const char *path,
 // `f` must be a valid handle and `samples` a valid array of `len` elements (NULL is allowed when `len=0`).
 int32_t flexaudio_flac_write(struct FlexFlac *f,
                              const float *samples,
-                             uintptr_t len);
+                             size_t len);
 
 // Write any remaining data, finalize and close the current file. Further writes return InvalidState.
 //
-// Calling finalize more than once is safe (no-op returning 0). Returns 0 on success and a negative value on error.
+// Calling finalize more than once after success is safe (no-op returning 0). A failed write or
+// finalize retains its first error for all later writes and finalization attempts.
+// Returns 0 on success and a negative value on error.
 //
 // # Safety
 // `f` must be a valid handle (NULL is InvalidArg).
@@ -635,6 +897,186 @@ int32_t flexaudio_flac_finalize(struct FlexFlac *f);
 // `f` must be a handle returned by `flexaudio_flac_create` (or NULL).
 // Do not use `f` after release.
 void flexaudio_flac_free(struct FlexFlac *f);
+
+// Poll one owned event. Valid out initializes to NULL before the queue is touched.
+// # Safety
+// stream must be live and exclusively borrowed; out must be writable.
+int32_t flexaudio_poll_event_v2(struct FlexStream *stream, struct FlexEventV2 **out);
+
+// Poll one owned watcher event. Invalid output never consumes a delta.
+// # Safety
+// watcher must be live and exclusively borrowed; out must be writable.
+int32_t flexaudio_watcher_poll_v2(struct FlexWatcher *watcher, struct FlexDeviceEventV2 **out);
+
+// Owned clone of the calling thread's typed error, NULL when absent. Free explicitly.
+struct FlexErrorInfoV2 *flexaudio_last_error_info_v2(void);
+
+// Owned capture primary snapshot, valid independently of the stream and TLS.
+// # Safety
+// stream must be a live readable stream handle.
+struct FlexErrorInfoV2 *flexaudio_terminal_error_info_v2(const struct FlexStream *stream);
+
+// Owned completed report snapshot; NULL before shutdown completes.
+// # Safety
+// stream must be a live readable stream handle.
+struct FlexShutdownReportV2 *flexaudio_shutdown_report_v2(const struct FlexStream *stream);
+
+// Free the owned tree; NULL is safe. Borrowed children must never be freed separately.
+// # Safety
+// value must be a live owned FlexEventV2 returned by this library, or NULL.
+void flexaudio_event_free_v2(struct FlexEventV2 *value);
+
+// Free the owned tree; NULL is safe. Borrowed children must never be freed separately.
+// # Safety
+// value must be a live owned FlexDeviceEventV2 returned by this library, or NULL.
+void flexaudio_device_event_free_v2(struct FlexDeviceEventV2 *value);
+
+// Free the owned tree; NULL is safe. Borrowed children must never be freed separately.
+// # Safety
+// value must be a live owned FlexErrorInfoV2 returned by this library, or NULL.
+void flexaudio_error_info_free_v2(struct FlexErrorInfoV2 *value);
+
+// Free the owned tree; NULL is safe. Borrowed children must never be freed separately.
+// # Safety
+// value must be a live owned FlexShutdownReportV2 returned by this library, or NULL.
+void flexaudio_shutdown_report_free_v2(struct FlexShutdownReportV2 *value);
+
+// Return 1 when present, 0 for a different arm, negative InvalidArg for invalid pointers.
+// Output is untouched when absent. Borrowed fields remain valid only while value lives.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_event_kind_v2(const struct FlexEventV2 *value, int32_t *out);
+
+// Return 1 when present, 0 for a different arm, negative InvalidArg for invalid pointers.
+// Output is untouched when absent. Borrowed fields remain valid only while value lives.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_event_count_v2(const struct FlexEventV2 *value, uint64_t *out);
+
+// Return 1 when present, 0 for a different arm, negative InvalidArg for invalid pointers.
+// Output is untouched when absent. Borrowed fields remain valid only while value lives.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_event_permission_v2(const struct FlexEventV2 *value, int32_t *out);
+
+// Return 1 when present, 0 for a different arm, negative InvalidArg for invalid pointers.
+// Output is untouched when absent. Borrowed fields remain valid only while value lives.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_event_loss_v2(const struct FlexEventV2 *value, struct FlexAudioLossV2 *out);
+
+// Return 1 when present, 0 for a different arm, negative InvalidArg for invalid pointers.
+// Output is untouched when absent. Borrowed fields remain valid only while value lives.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_device_event_kind_v2(const struct FlexDeviceEventV2 *value, int32_t *out);
+
+// Return 1 when present, 0 for a different arm, negative InvalidArg for invalid pointers.
+// Output is untouched when absent. Borrowed fields remain valid only while value lives.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_device_event_default_kind_v2(const struct FlexDeviceEventV2 *value, int32_t *out);
+
+// Return 1 when present, 0 for a different arm, negative InvalidArg for invalid pointers.
+// Output is untouched when absent. Borrowed fields remain valid only while value lives.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_device_event_dropped_events_v2(const struct FlexDeviceEventV2 *value,
+                                                 uint64_t *out);
+
+// Return 1 when present, 0 for a different arm, negative InvalidArg for invalid pointers.
+// Output is untouched when absent. Borrowed fields remain valid only while value lives.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_error_kind_v2(const struct FlexErrorInfoV2 *value, int32_t *out);
+
+// Return 1 when present, 0 for a different arm, negative InvalidArg for invalid pointers.
+// Output is untouched when absent. Borrowed fields remain valid only while value lives.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_error_permission_v2(const struct FlexErrorInfoV2 *value, int32_t *out);
+
+// Return 1 when present, 0 for a different arm, negative InvalidArg for invalid pointers.
+// Output is untouched when absent. Borrowed fields remain valid only while value lives.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_error_context_count_v2(const struct FlexErrorInfoV2 *value, size_t *out);
+
+// Return 1 when present, 0 for a different arm, negative InvalidArg for invalid pointers.
+// Output is untouched when absent. Borrowed fields remain valid only while value lives.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_error_secondary_count_v2(const struct FlexErrorInfoV2 *value, size_t *out);
+
+// Return 1 when present, 0 for a different arm, negative InvalidArg for invalid pointers.
+// Output is untouched when absent. Borrowed fields remain valid only while value lives.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_shutdown_cleanup_count_v2(const struct FlexShutdownReportV2 *value, size_t *out);
+
+// Return 1 when present, 0 for a different arm, negative InvalidArg for invalid pointers.
+// Output is untouched when absent. Borrowed fields remain valid only while value lives.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_error_native_format_v2(const struct FlexErrorInfoV2 *value,
+                                         struct FlexNativeFormatChangeV2 *out);
+
+// Retrieve an outer-to-inner context record. Invalid index returns InvalidArg.
+// # Safety
+// value must be a live owner; out must be writable and aligned.
+int32_t flexaudio_error_context_v2(const struct FlexErrorInfoV2 *value,
+                                   size_t index,
+                                   struct FlexErrorContextV2 *out);
+
+// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
+// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
+// # Safety
+// value must be a live readable owner.
+const struct FlexErrorInfoV2 *flexaudio_event_error_v2(const struct FlexEventV2 *value);
+
+// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
+// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
+// # Safety
+// value must be a live readable owner.
+const char *flexaudio_event_message_v2(const struct FlexEventV2 *value);
+
+// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
+// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
+// # Safety
+// value must be a live readable owner.
+const struct FlexDeviceInfo *flexaudio_device_event_device_v2(const struct FlexDeviceEventV2 *value);
+
+// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
+// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
+// # Safety
+// value must be a live readable owner.
+const char *flexaudio_device_event_id_v2(const struct FlexDeviceEventV2 *value);
+
+// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
+// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
+// # Safety
+// value must be a live readable owner.
+const char *flexaudio_error_message_v2(const struct FlexErrorInfoV2 *value);
+
+// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
+// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
+// # Safety
+// value must be a live readable owner.
+const struct FlexErrorInfoV2 *flexaudio_error_secondary_v2(const struct FlexErrorInfoV2 *value,
+                                                           size_t index);
+
+// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
+// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
+// # Safety
+// value must be a live readable owner.
+const struct FlexErrorInfoV2 *flexaudio_shutdown_primary_v2(const struct FlexShutdownReportV2 *value);
+
+// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
+// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
+// # Safety
+// value must be a live readable owner.
+const struct FlexErrorInfoV2 *flexaudio_shutdown_cleanup_v2(const struct FlexShutdownReportV2 *value,
+                                                            size_t index);
 
 // Create a VAD from a config. A NULL `config` uses the defaults (Silero-compatible).
 //
@@ -657,17 +1099,27 @@ struct FlexVad *flexaudio_vad_new(const struct FlexVadConfig *config);
 // `out` / `out_len` must point to valid writable locations.
 int32_t flexaudio_vad_process(struct FlexVad *v,
                               const float *samples,
-                              uintptr_t len,
+                              size_t len,
                               uint32_t in_rate,
                               uint16_t in_ch,
                               struct FlexVadEvent **out,
-                              uintptr_t *out_len);
+                              size_t *out_len);
 
-// Free an event array allocated by `flexaudio_vad_process`. NULL / 0 is safe.
+// Finalize pending speech at EOF and return a library-owned VAD event array.
+//
+// Valid destinations initialize to NULL/0, also on error. A repeated successful
+// flush returns NULL/0 unless new input arrived. Free with `flexaudio_vad_events_free`.
+//
+// # Safety
+// `v` must be a live handle; `out`/`out_len` must be aligned writable destinations.
+int32_t flexaudio_vad_flush(struct FlexVad *v, struct FlexVadEvent **out, size_t *out_len);
+
+// Free an event array allocated by `flexaudio_vad_process` or `flexaudio_vad_flush`. NULL / 0 is safe.
 //
 // # Safety
 // `events` / `len` must come from `flexaudio_vad_process` (or be NULL / 0).
-void flexaudio_vad_events_free(struct FlexVadEvent *events, uintptr_t len);
+void flexaudio_vad_events_free(struct FlexVadEvent *events,
+                               size_t len);
 
 // Reset VAD state (internal state / context / remainder buffer / resampler).
 //
@@ -684,9 +1136,9 @@ void flexaudio_vad_free(struct FlexVad *v);
 
 // Start monitoring device connection and default changes, then return a watcher handle.
 //
-// On Linux, continuously monitor the PipeWire registry. If PipeWire is unavailable or the OS is
-// unsupported, degrade to a no-op and return a valid handle (no device events arrive; poll always
-// returns 0). Only failures return NULL + last_error. Release the returned handle with
+// On Linux, continuously monitor the PipeWire registry. Startup failure returns NULL
+// with `flexaudio_last_error` and typed `flexaudio_last_error_info_v2`, rather than
+// a no-op handle. Unsupported operating systems return a valid no-op handle. Release it with
 // `flexaudio_watcher_free`.
 struct FlexWatcher *flexaudio_watch_devices(void);
 
@@ -711,5 +1163,119 @@ void flexaudio_device_event_free(struct FlexDeviceEvent *ev);
 // # Safety
 // `w` must be a handle returned by `flexaudio_watch_devices`, or NULL. Do not use `w` after release.
 void flexaudio_watcher_free(struct FlexWatcher *w);
+
+// Open a versioned primary stream, returning a typed result code and last_error.
+// Attachment uses the producer canonical branch before output conversion.
+// # Safety
+// Config and its borrowed fields must be valid; out must be writable.
+int32_t flexaudio_open_v2(const struct FlexStreamConfigV2 *config, struct FlexStream **out);
+
+// Poll a versioned chunk: 1 available, 0 absent, negative result on error.
+// # Safety
+// Stream must be exclusively owned; out must be writable, with any prior chunk already freed.
+int32_t flexaudio_poll_chunk_v2(struct FlexStream *s, struct FlexChunkV2 *out);
+
+// Free all allocations in a versioned chunk, then clear its fields. NULL is safe.
+// # Safety
+// Non-NULL must be a chunk returned by poll_chunk_v2 and must not have been freed already.
+void flexaudio_chunk_free_v2(struct FlexChunkV2 *chunk);
+
+// Flush a whisper epoch. Disabled attachment is a no-op.
+// Failures return their root code immediately; closing events remain available via poll_chunk_v2.
+// # Safety
+// s must be a valid, exclusively owned stream handle.
+int32_t flexaudio_flush_whisper_vad(struct FlexStream *s);
+
+// Borrow attached events until chunk_free_v2; NULL when none are present.
+// # Safety
+// chunk must point to a live versioned chunk; len must be writable when non-NULL.
+const struct FlexAttachedWhisperVadEvent *flexaudio_chunk_whisper_vad_events(const struct FlexChunkV2 *chunk,
+                                                                             size_t *len);
+
+// Five pinned defaults. Supplied structs use literal fields, including zero.
+struct FlexWhisperVadParams flexaudio_whisper_vad_default_params(void);
+
+// Create a session; NULL params/options use defaults. Returns NULL plus last_error on error.
+// # Safety
+// Optional pointers must refer to initialized aligned structs.
+struct FlexWhisperVad *flexaudio_whisper_vad_new(const struct FlexWhisperVadParams *params,
+                                                 const struct FlexWhisperVadOptions *options);
+
+// Feed normalized mono16k PCM. On failure still drain/free the owned terminal event array.
+// # Safety
+// Handle is exclusively owned; input/output allocations must be valid for their lengths.
+int32_t flexaudio_whisper_vad_process(struct FlexWhisperVad *v,
+                                      const float *samples,
+                                      size_t len,
+                                      struct FlexWhisperVadEvent **out,
+                                      size_t *out_len);
+
+// Return owned events, including terminal closure on failure.
+// # Safety
+// Handle and mandatory outputs must be valid and exclusively owned during mutation.
+int32_t flexaudio_whisper_vad_finish(struct FlexWhisperVad *v,
+                                     struct FlexWhisperVadEvent **out,
+                                     size_t *out_len);
+
+// Return owned events, including terminal closure on failure.
+// # Safety
+// Handle and mandatory outputs must be valid and exclusively owned during mutation.
+int32_t flexaudio_whisper_vad_reset(struct FlexWhisperVad *v,
+                                    struct FlexWhisperVadEvent **out,
+                                    size_t *out_len);
+
+// Borrow latest probabilities until the next session mutation/free. Empty arrays return NULL.
+// # Safety
+// Handle and all mandatory output pointers must be valid.
+int32_t flexaudio_whisper_vad_probabilities(const struct FlexWhisperVad *v,
+                                            uint64_t *first_frame,
+                                            const float **out,
+                                            size_t *out_len);
+
+// Create the inference-independent 16k/512 probability processor. NULL uses defaults.
+// # Safety
+// Params must be NULL or a valid aligned struct.
+struct FlexWhisperVadPostProcessor *flexaudio_whisper_postprocessor_new(const struct FlexWhisperVadParams *p);
+
+// Feed finite [0,1] probabilities. Validation preserves processor state.
+// # Safety
+// Handle, input and output allocations must be valid for their lengths.
+int32_t flexaudio_whisper_postprocessor_process(struct FlexWhisperVadPostProcessor *v,
+                                                const float *samples,
+                                                size_t len,
+                                                struct FlexWhisperSpeechSegment **out,
+                                                size_t *out_len);
+
+// Finish probability segmentation without inference.
+// # Safety
+// Handle and outputs must be valid and exclusively owned during mutation.
+int32_t flexaudio_whisper_postprocessor_finish(struct FlexWhisperVadPostProcessor *v,
+                                               struct FlexWhisperSpeechSegment **out,
+                                               size_t *out_len);
+
+// Discard the probability timeline.
+// # Safety
+// Handle must be valid and exclusively owned.
+int32_t flexaudio_whisper_postprocessor_reset(struct FlexWhisperVadPostProcessor *v);
+
+// Release an exclusively owned handle. NULL is safe.
+// # Safety
+// Non-NULL must be a live handle of this exact type returned by its constructor.
+void flexaudio_whisper_vad_free(struct FlexWhisperVad *v);
+
+// Release an exclusively owned handle. NULL is safe.
+// # Safety
+// Non-NULL must be a live handle of this exact type returned by its constructor.
+void flexaudio_whisper_postprocessor_free(struct FlexWhisperVadPostProcessor *v);
+
+// Release an owned result array with its original length. NULL/0 is safe.
+// # Safety
+// Non-NULL must be an array of this exact type and original length returned by this API.
+void flexaudio_whisper_events_free(struct FlexWhisperVadEvent *v, size_t len);
+
+// Release an owned result array with its original length. NULL/0 is safe.
+// # Safety
+// Non-NULL must be an array of this exact type and original length returned by this API.
+void flexaudio_whisper_segments_free(struct FlexWhisperSpeechSegment *v, size_t len);
 
 #endif  /* FLEXAUDIO_H */

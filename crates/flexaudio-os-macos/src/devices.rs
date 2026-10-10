@@ -29,7 +29,7 @@ use objc2_core_audio_types::AudioBufferList;
 use flexaudio_core::types::{DeviceInfo, Result, SourceKind};
 
 use crate::common::{
-    map_os_status, read_cfstring_property, read_system_object_list, FALLBACK_FORMAT,
+    map_os_status_at, read_cfstring_property, read_system_object_list, FALLBACK_FORMAT,
 };
 
 /// Create a property address for the given scope and element.
@@ -43,7 +43,7 @@ fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
 
 /// Read `kAudioHardwarePropertyDevices` from the system object and return all `AudioObjectID`s.
 ///
-/// On failure, return the normalized [`Error`](flexaudio_core::types::Error) from [`map_os_status`].
+/// On failure, return the normalized [`Error`](flexaudio_core::types::Error) from [`map_os_status_at`].
 /// The reader, [`read_system_object_list`], is shared with process enumeration.
 ///
 /// Accept a reader so tests can distinguish retrieval failure from a valid empty list without calling
@@ -51,8 +51,13 @@ fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
 type SystemObjectListReader = fn(u32) -> std::result::Result<Vec<AudioObjectID>, i32>;
 
 fn all_device_ids(reader: SystemObjectListReader) -> Result<Vec<AudioObjectID>> {
-    reader(kAudioHardwarePropertyDevices)
-        .map_err(|status| map_os_status("AudioObjectGetPropertyData(Devices)", status))
+    reader(kAudioHardwarePropertyDevices).map_err(|status| {
+        map_os_status_at(
+            flexaudio_core::Operation::Enumerate,
+            "AudioObjectGetPropertyData(Devices)",
+            status,
+        )
+    })
 }
 
 /// Read the device's `kAudioDevicePropertyNominalSampleRate` (output scope, Float64).
@@ -240,7 +245,7 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
 /// Convert the `id` (device name) from [`list_output_devices`] to the UID required by a tap.
 /// Use the first match if names are duplicated. Return `Ok(None)` if no device matches (the caller
 /// returns [`Error::DeviceNotFound`](flexaudio_core::types::Error)). If the device list cannot be read,
-/// return the corresponding error from [`map_os_status`].
+/// return the corresponding error from [`map_os_status_at`].
 pub(crate) fn uid_for_device_name(name: &str) -> Result<Option<String>> {
     for id in all_device_ids(read_system_object_list)? {
         if !is_output_device(id) {
@@ -295,17 +300,25 @@ mod tests {
         let empty = all_device_ids(empty_reader);
         assert!(matches!(empty, Ok(ids) if ids.is_empty()));
 
-        match all_device_ids(failing_reader) {
-            Err(Error::Backend(message)) => {
-                assert_eq!(message, "AudioObjectGetPropertyData(Devices): OSStatus -1")
-            }
-            other => panic!("expected OSStatus-bearing error, got {other:?}"),
-        }
-
-        assert!(matches!(
-            all_device_ids(permission_denied_reader),
-            Err(Error::PermissionDenied { .. })
-        ));
+        let error = all_device_ids(failing_reader).unwrap_err();
+        assert!(matches!(error.root(), Error::Backend(message) if message == "OSStatus -1"));
+        let Error::Context { context, .. } = error else {
+            panic!("missing native context")
+        };
+        assert_eq!(context.operation(), flexaudio_core::Operation::Enumerate);
+        assert_eq!(
+            context.native_status(),
+            Some(flexaudio_core::NativeStatus::OsStatus {
+                call: "AudioObjectGetPropertyData(Devices)",
+                value: -1
+            })
+        );
+        assert_eq!(
+            all_device_ids(permission_denied_reader)
+                .unwrap_err()
+                .permission(),
+            Some(flexaudio_core::Permission::SystemAudio)
+        );
     }
 
     /// Resolving a nonexistent name to a UID returns `None`.

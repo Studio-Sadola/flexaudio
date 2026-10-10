@@ -2,7 +2,7 @@
 //!
 //! When full, pop the oldest item and push the new one (DROP_OLDEST). Count dropped items
 //! with [`AtomicU64`] and record the count in the next chunk's `dropped_before`. Consumers
-//! use `try_pop()`.
+//! use `try_pop()`, which also marks the first delivery after an eviction DISCONTINUITY.
 //!
 //! ringbuf's overwrite operation (`push_overwrite`) requires the producer to pop the oldest
 //! item, which also touches the consumer index and breaks the lock-free SPSC assumption
@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use ringbuf::traits::{Consumer, Observer, RingBuffer};
 use ringbuf::HeapRb;
 
-use crate::types::AudioChunk;
+use crate::types::{AudioChunk, ChunkFlags};
 
 type Shared = Arc<Mutex<HeapRb<AudioChunk>>>;
 
@@ -34,7 +34,11 @@ pub fn chunk_ring(capacity_chunks: usize) -> (ChunkProducer, ChunkConsumer) {
             rb: rb.clone(),
             dropped: dropped.clone(),
         },
-        ChunkConsumer { rb, dropped },
+        ChunkConsumer {
+            rb,
+            dropped,
+            observed_drops: 0,
+        },
     )
 }
 
@@ -54,7 +58,14 @@ impl ChunkProducer {
     ///
     /// Return `Some(total_dropped)` if this push dropped a chunk (for deciding whether to
     /// fire [`crate::types::Event::ChunkDropped`]); otherwise return `None`.
-    pub fn push(&mut self, mut chunk: AudioChunk) -> Option<u64> {
+    pub fn push(&mut self, chunk: AudioChunk) -> Option<u64> {
+        self.push_with_evicted(chunk).map(|(total, _)| total)
+    }
+
+    /// Publish through the same DROP_OLDEST path, retaining the evicted PCM for exact loss
+    /// accounting. The returned count is cumulative; the evicted chunk is one interval loss.
+    /// This runs on the processing thread, never the realtime callback.
+    pub fn push_with_evicted(&mut self, mut chunk: AudioChunk) -> Option<(u64, AudioChunk)> {
         // Poisoning (a panic while another thread held the lock) does not corrupt the ring,
         // so recover the inner value and continue instead of causing a second panic.
         let mut rb = self.rb.lock().unwrap_or_else(|e| e.into_inner());
@@ -74,11 +85,7 @@ impl ChunkProducer {
 
         debug_assert_eq!(evicted.is_some(), will_evict);
 
-        if will_evict {
-            Some(total)
-        } else {
-            None
-        }
+        evicted.map(|chunk| (total, chunk))
     }
 
     /// Cumulative number of chunks discarded by DROP_OLDEST.
@@ -91,14 +98,25 @@ impl ChunkProducer {
 pub struct ChunkConsumer {
     rb: Shared,
     dropped: Arc<AtomicU64>,
+    observed_drops: u64,
 }
 
 impl ChunkConsumer {
     /// Take the oldest chunk, or return `None` without blocking if empty.
+    /// Mark the first delivery after newly observed evictions DISCONTINUITY, including
+    /// a surviving chunk that was inserted before those evictions occurred.
     pub fn try_pop(&mut self) -> Option<AudioChunk> {
         // Poisoning does not corrupt the ring, so recover and continue.
         let mut rb = self.rb.lock().unwrap_or_else(|e| e.into_inner());
-        rb.try_pop()
+        let mut chunk = rb.try_pop()?;
+        let dropped = self.dropped.load(Ordering::Relaxed);
+        if dropped != self.observed_drops {
+            // The oldest survivor can predate the overflow. Mark the next delivery,
+            // rather than only the newly pushed chunk, while holding the ring lock.
+            chunk.flags |= ChunkFlags::DISCONTINUITY;
+            self.observed_drops = dropped;
+        }
+        Some(chunk)
     }
 
     /// Number of chunks currently buffered in the ring.
@@ -128,6 +146,7 @@ mod tests {
 
     fn chunk(seq: u64) -> AudioChunk {
         AudioChunk {
+            frame_index: seq * 960,
             data: vec![0.0; 1920],
             frames: 960,
             pts_ns: seq as i64 * 20_000_000,
@@ -248,5 +267,50 @@ mod tests {
         p.push(chunk(2)); // Discard seq0.
         assert_eq!(p.dropped_count(), 1);
         assert_eq!(c.dropped_count(), 1, "consumer sees the same dropped count");
+    }
+    #[test]
+    fn dropped_chunk_preserves_its_exact_frame_gap() {
+        let (mut producer, mut consumer) = chunk_ring(1);
+        producer.push(chunk(0));
+        let first = consumer.try_pop().unwrap();
+        producer.push(chunk(1));
+        producer.push(chunk(2));
+        let next = consumer.try_pop().unwrap();
+        assert_eq!(
+            next.frame_index - first.frame_index - first.frames as u64,
+            960
+        );
+        assert_eq!(next.dropped_before, 1);
+    }
+
+    #[test]
+    fn eviction_returns_actual_pcm_and_marks_oldest_survivor_once() {
+        let (mut producer, mut consumer) = chunk_ring(3);
+        let mut tail = chunk(0);
+        tail.frames = 13;
+        tail.data.truncate(26);
+        producer.push(tail.clone());
+        producer.push(chunk(1));
+        producer.push(chunk(2));
+        let (total, evicted) = producer.push_with_evicted(chunk(3)).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(evicted, tail);
+        let next = consumer.try_pop().unwrap();
+        assert_eq!(next.seq, 1);
+        assert_eq!(
+            next.dropped_before, 0,
+            "survivor was queued before eviction"
+        );
+        assert!(next.flags.contains(ChunkFlags::DISCONTINUITY));
+        assert!(!consumer
+            .try_pop()
+            .unwrap()
+            .flags
+            .contains(ChunkFlags::DISCONTINUITY));
+        assert!(!consumer
+            .try_pop()
+            .unwrap()
+            .flags
+            .contains(ChunkFlags::DISCONTINUITY));
     }
 }

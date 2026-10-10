@@ -29,7 +29,8 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use crate::common::{map_hr, ComThread};
+use crate::common::{map_hr_at, ComThread};
+use flexaudio_core::Operation;
 
 /// `QueryFullProcessImageNameW` buffer length in UTF-16 units: the 32767-character limit plus NUL,
 /// enough for long paths with the `\\?\` prefix.
@@ -76,15 +77,26 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>> {
 /// # Safety
 /// COM must be initialized on the calling thread.
 unsafe fn collect_sessions() -> Result<Vec<SessionRecord>> {
-    let enumerator: IMMDeviceEnumerator =
-        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            .map_err(|e| map_hr("CoCreateInstance(MMDeviceEnumerator)", e))?;
+    let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        .map_err(|e| {
+        map_hr_at(
+            Operation::Enumerate,
+            "CoCreateInstance(MMDeviceEnumerator)",
+            e,
+        )
+    })?;
     let collection = enumerator
         .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
-        .map_err(|e| map_hr("IMMDeviceEnumerator::EnumAudioEndpoints", e))?;
+        .map_err(|e| {
+            map_hr_at(
+                Operation::Enumerate,
+                "IMMDeviceEnumerator::EnumAudioEndpoints",
+                e,
+            )
+        })?;
     let endpoint_count = collection
         .GetCount()
-        .map_err(|e| map_hr("IMMDeviceCollection::GetCount", e))?;
+        .map_err(|e| map_hr_at(Operation::Enumerate, "IMMDeviceCollection::GetCount", e))?;
 
     let mut sessions = Vec::new();
     let mut any_endpoint_read = false;
@@ -93,21 +105,33 @@ unsafe fn collect_sessions() -> Result<Vec<SessionRecord>> {
         let device = match collection.Item(index) {
             Ok(d) => d,
             Err(e) => {
-                last_error = Some(map_hr("IMMDeviceCollection::Item", e));
+                last_error = Some(map_hr_at(
+                    Operation::Enumerate,
+                    "IMMDeviceCollection::Item",
+                    e,
+                ));
                 continue;
             }
         };
         let manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
             Ok(m) => m,
             Err(e) => {
-                last_error = Some(map_hr("IMMDevice::Activate(IAudioSessionManager2)", e));
+                last_error = Some(map_hr_at(
+                    Operation::Enumerate,
+                    "IMMDevice::Activate(IAudioSessionManager2)",
+                    e,
+                ));
                 continue;
             }
         };
         let session_list = match manager.GetSessionEnumerator() {
             Ok(list) => list,
             Err(e) => {
-                last_error = Some(map_hr("IAudioSessionManager2::GetSessionEnumerator", e));
+                last_error = Some(map_hr_at(
+                    Operation::Enumerate,
+                    "IAudioSessionManager2::GetSessionEnumerator",
+                    e,
+                ));
                 continue;
             }
         };

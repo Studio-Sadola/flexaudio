@@ -46,6 +46,9 @@ use flexaudio_core::types::{Error, Event, Result};
 
 use crate::activity::ActivityQuery;
 use crate::capture_health::SilenceDetector;
+use crate::owner::{stop_owner, OwnerShutdown};
+use flexaudio_core::{ErrorContext, Operation, ShutdownReport};
+
 use crate::common::{translate_pid_to_object, FALLBACK_FORMAT};
 use crate::native_probe::NativeProbe;
 use crate::probe::{GenerationProbe, ProbeControl, ProbeDecision, PublicationGate, PROBE_TIMEOUT};
@@ -80,7 +83,17 @@ fn resolve_exclusion(
     probe: impl FnOnce() -> std::io::Result<()>,
 ) -> Result<Option<u32>> {
     match translation {
-        Ok(0) => Ok(None),
+        Ok(0) if is_host => Err(Error::Backend(
+            "host process exclusion could not be resolved".into(),
+        )
+        .with_context(ErrorContext::new(Operation::Start))),
+        Ok(0) => match probe() {
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+            _ => Err(
+                Error::Backend("process exclusion could not be resolved".into())
+                    .with_context(ErrorContext::new(Operation::Start)),
+            ),
+        },
         Ok(object_id) => Ok(Some(object_id)),
         Err(error) if !is_host => match probe() {
             Err(probe_error) if probe_error.raw_os_error() == Some(libc::ESRCH) => Ok(None),
@@ -132,7 +145,8 @@ pub struct MacSystemBackend {
     /// Owner-reported terminal failure, retained after stop and mailbox consumption.
     terminal: Arc<TerminalFailure>,
     /// Handle to the thread that owns the tap chain (`Some` after start).
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<Result<()>>>,
+    shutdown: OwnerShutdown,
     /// Owner-thread notifications for the current capture generation.
     events: Option<mpsc::Receiver<Event>>,
     /// Native format `(rate, channels)`. The actual values are determined after tap creation
@@ -152,9 +166,9 @@ impl MacSystemBackend {
     ///
     /// Cache fallback native format `(48000, 2)`. The actual format comes from the tap's ASBD
     /// when the tap is created at `start`, but `native_format` must return a value at
-    /// construction time, so use a safe fallback that does not require a tap. The Normalizer
-    /// uses 20 ms output-time chunks, so the first resampling stage absorbs modest errors in
-    /// the native-format estimate.
+    /// construction time, so use a fallback that does not require a tap. Startup verifies
+    /// the tap's full native description against the sink and rejects mismatches with
+    /// `NativeFormatChanged` before delivering samples.
     pub fn new(exclude_self: bool, device_id: Option<String>) -> Self {
         Self {
             exclude_self,
@@ -164,14 +178,15 @@ impl MacSystemBackend {
             publication: Arc::new(PublicationGate::default()),
             terminal: Arc::new(TerminalFailure::default()),
             handle: None,
+            shutdown: OwnerShutdown::default(),
             events: None,
             native: FALLBACK_FORMAT,
         }
     }
 
     /// Exclude these pids' output in addition to `exclude_self`. Each pid is
-    /// translated to its Core Audio process object at `start`; pids with no
-    /// audio object (not producing sound) are skipped, not errors.
+    /// translated to its Core Audio process object at `start`. Unresolved host
+    /// or live processes fail capture; only confirmed exited processes are skipped.
     ///
     /// Pids must be in `1..=i32::MAX`; invalid values fail capture readiness.
     /// A translation failure for a non-host pid is skipped only when `kill(pid, 0)`
@@ -181,8 +196,8 @@ impl MacSystemBackend {
     /// readiness, because capturing without excluding it could echo our own output.
     ///
     /// The resolution happens once, when the capture starts: a helper that has
-    /// not yet rendered audio has no Core Audio process object and is therefore
-    /// not excluded. Open the capture while the app is already playing, or
+    /// not yet rendered audio may have no Core Audio process object, causing start
+    /// to fail. Open the capture while the app is already playing, or
     /// reopen it when a new helper appears.
     pub fn with_exclude_pids(mut self, pids: Vec<u32>) -> Self {
         self.exclude_pids = pids;
@@ -231,8 +246,8 @@ impl CaptureBackend for MacSystemBackend {
             .name("flexaudio-macos-system".into())
             .spawn(move || {
                 // Resolve PIDs through Core Audio on the owning thread, as in process.rs.
-                // A missing audio object remains a snapshot limitation; translation errors
-                // require confirmed process exit. Resolve exclusions before device access.
+                // Missing audio objects and translation errors require confirmed process
+                // exit before an exclusion may be omitted. Resolve exclusions before device access.
                 let mut ids = Vec::with_capacity(excluded.len());
                 let own_pid = std::process::id();
                 for pid in excluded {
@@ -240,7 +255,7 @@ impl CaptureBackend for MacSystemBackend {
                         Ok(pid) => pid,
                         Err(e) => {
                             let _ = ready_tx.send(Err(e));
-                            return;
+                            return Ok(());
                         }
                     };
                     match resolve_exclusion(
@@ -252,7 +267,7 @@ impl CaptureBackend for MacSystemBackend {
                         Ok(Some(object_id)) => ids.push(object_id),
                         Err(e) => {
                             let _ = ready_tx.send(Err(e));
-                            return;
+                            return Ok(());
                         }
                     }
                 }
@@ -263,11 +278,11 @@ impl CaptureBackend for MacSystemBackend {
                         Ok(Some(uid)) => Some(uid),
                         Ok(None) => {
                             let _ = ready_tx.send(Err(Error::DeviceNotFound));
-                            return;
+                            return Ok(());
                         }
                         Err(e) => {
                             let _ = ready_tx.send(Err(e));
-                            return;
+                            return Ok(());
                         }
                     }
                 } else {
@@ -282,44 +297,66 @@ impl CaptureBackend for MacSystemBackend {
                     terminal,
                     ready_tx,
                     event_tx,
-                );
+                )
             })
-            .map_err(|e| Error::Backend(format!("spawn macos system thread: {e}")))?;
+            .map_err(|_| {
+                ShutdownReport::new(
+                    Some(
+                        Error::Backend("capture owner thread could not be started".into())
+                            .with_context(ErrorContext::new(Operation::Start)),
+                    ),
+                    stop_owner(&self.publication, &self.stop_flag, None),
+                )
+                .result()
+                .expect_err("owner spawn failed")
+            })?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.handle = Some(handle);
+                self.shutdown.reset();
                 self.events = Some(event_rx);
                 Ok(())
             }
             Ok(Err(e)) => {
-                if matches!(e, Error::PermissionDenied { .. }) {
+                if e.permission().is_some() {
                     self.terminal.record(e.clone());
                 }
-                self.stop_flag.store(false, Ordering::SeqCst);
-                let _ = handle.join();
-                Err(e)
+                ShutdownReport::new(
+                    Some(e),
+                    stop_owner(&self.publication, &self.stop_flag, Some(handle)),
+                )
+                .result()
             }
-            Err(_) => {
-                self.stop_flag.store(false, Ordering::SeqCst);
-                let _ = handle.join();
-                Err(Error::Backend(
-                    "macos system thread exited before reporting readiness".into(),
-                ))
-            }
+            Err(_) => ShutdownReport::new(
+                Some(
+                    Error::Backend("capture owner exited before reporting readiness".into())
+                        .with_context(ErrorContext::new(Operation::Start)),
+                ),
+                stop_owner(&self.publication, &self.stop_flag, Some(handle)),
+            )
+            .result(),
         }
     }
 
     fn stop(&mut self) {
-        // Poison still sets cancellation, so shutdown remains fail-closed.
-        let _ = self.publication.cancel(&self.stop_flag);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        let _ = self.stop_checked();
+    }
+
+    fn stop_checked(&mut self) -> Result<()> {
+        self.shutdown.finish(
+            &self.publication,
+            &self.stop_flag,
+            &self.terminal,
+            self.handle.take(),
+        )
     }
 
     fn poll_event(&mut self) -> Option<Event> {
-        self.events.as_ref()?.try_recv().ok()
+        self.events
+            .as_ref()
+            .and_then(|events| events.try_recv().ok())
+            .or_else(|| self.shutdown.poll_event())
     }
 }
 
@@ -343,7 +380,7 @@ pub(crate) fn run_tap_thread(
     terminal_failure: Arc<TerminalFailure>,
     ready_tx: mpsc::Sender<Result<()>>,
     event_tx: mpsc::Sender<Event>,
-) {
+) -> Result<()> {
     let activity = ActivityQuery::new(&kind);
     // CATapDescription / aggregate display name (private, so collisions are harmless; debug only).
     let label = match &kind {
@@ -352,18 +389,17 @@ pub(crate) fn run_tap_thread(
         TapKind::ExcludeProcessesOnDevice { .. } => "flexaudio-system-device-tap",
     };
     // SAFETY: build_tap_chain calls CoreAudio. Move sink into the block.
-    let chain: TapChain = match unsafe { build_tap_chain(kind, label, sink) } {
+    let mut chain: TapChain = match unsafe { build_tap_chain(kind, label, sink) } {
         Ok(c) => c,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
-            return;
+            return Ok(());
         }
     };
 
     if ready_tx.send(Ok(())).is_err() {
         // The caller has gone away. Drop the chain to clean up.
-        drop(chain);
-        return;
+        return chain.stop_checked();
     }
 
     let origin = std::time::Instant::now();
@@ -373,6 +409,12 @@ pub(crate) fn run_tap_thread(
         .map(|(rate, channels)| SilenceDetector::new(rate, channels));
     // Process queries and message allocation stay on this owner thread, never in the IOProc.
     while !stop_flag.load(Ordering::SeqCst) {
+        if let Some(error) = chain.take_buffer_error() {
+            chain.gate_delivery();
+            terminal_failure.record(error.clone());
+            let _ = event_tx.send(Event::TerminalError { error });
+            break;
+        }
         thread::park_timeout(std::time::Duration::from_millis(100));
         if stop_flag.load(Ordering::SeqCst) {
             break;
@@ -430,14 +472,39 @@ pub(crate) fn run_tap_thread(
         }
     }
 
-    // Stop. Dropping the chain tears down Stop→IOProc→aggregate→tap in order.
-    drop(chain);
+    // Quiesce the callback, then report even a final-buffer failure with no following PCM.
+    let result = chain.stop_checked();
+    if let Some(error) = chain.take_buffer_error() {
+        terminal_failure.record(error.clone());
+        let _ = event_tx.send(Event::TerminalError { error });
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use flexaudio_core::raw_ring;
+
+    #[test]
+    fn checked_system_stop_keeps_capture_primary_and_owner_cleanup() {
+        let mut backend = MacSystemBackend::new(false, None);
+        backend.terminal.record(Error::DeviceLost);
+        backend.handle = Some(thread::spawn(|| {
+            Err(Error::Backend("injected cleanup failure".into()))
+        }));
+        let result = backend.stop_checked();
+        let Error::Multiple(group) = result.as_ref().unwrap_err() else {
+            panic!("primary and cleanup must survive")
+        };
+        assert_eq!(group.primary(), &Error::DeviceLost);
+        assert_eq!(group.secondary().count(), 1);
+        assert_eq!(backend.stop_checked(), result);
+        assert!(
+            matches!(backend.poll_event(), Some(Event::ShutdownError { error }) if matches!(error, Error::Context { context, .. } if context.operation() == Operation::Stop))
+        );
+        assert!(backend.poll_event().is_none());
+    }
 
     #[test]
     fn repeated_start_returns_terminal_cause_before_running_noop_and_after_stop() {
@@ -451,7 +518,7 @@ mod tests {
             let mut backend = MacSystemBackend::new(false, None);
             // This completed Rust thread represents a registered owner handle;
             // neither this test nor these early start branches create native objects.
-            backend.handle = Some(thread::spawn(|| {}));
+            backend.handle = Some(thread::spawn(|| Ok(())));
             let sink = || {
                 let (producer, _consumer) = raw_ring(16);
                 RawSink::new(producer, 48_000, 2)
@@ -500,9 +567,9 @@ mod tests {
     }
 
     #[test]
-    fn exclusion_without_audio_object_skips_without_probe() {
+    fn exclusion_without_audio_object_skips_only_confirmed_exit() {
         let result = resolve_exclusion(Ok(0), false, || {
-            panic!("successful translation must not probe the process")
+            Err(std::io::Error::from_raw_os_error(libc::ESRCH))
         });
         assert!(matches!(result, Ok(None)));
     }
@@ -685,5 +752,20 @@ mod tests {
             Err(Error::DeviceNotFound) | Err(Error::UnsupportedOsVersion) => {}
             other => panic!("expected DeviceNotFound or UnsupportedOsVersion, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+
+    #[test]
+    fn repro_p7mac_unresolved_host_exclusion_fails_closed() {
+        assert!(resolve_exclusion(Ok(0), true, || Ok(())).is_err());
+    }
+
+    #[test]
+    fn repro_p7mac_unresolved_live_exclusion_fails_closed() {
+        assert!(resolve_exclusion(Ok(0), false, || Ok(())).is_err());
     }
 }

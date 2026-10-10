@@ -2,6 +2,7 @@
 # Generation command: cbindgen --config cbindgen.toml --crate flexaudio-ffi --output include/flexaudio.h
 
 language = "C"
+usize_is_size_t = true
 pragma_once = true
 include_guard = "FLEXAUDIO_H"
 # Also emit Rust doc comments as C header docs.

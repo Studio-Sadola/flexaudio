@@ -5,7 +5,7 @@
 //! (Stream / Vad / Denoiser / FlacEncoder / DeviceWatcher) live in separate modules.
 
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 
 use ::flexaudio as fa;
 use fa::{AudioChunk, DeviceEvent, DeviceInfo, Event, ProcessInfo};
@@ -137,8 +137,8 @@ pub(crate) fn process_info_to_py(info: ProcessInfo) -> PyProcessInfo {
 /// VAD (`open(..., vad=...)`) is enabled (empty when disabled or no events). When denoise is enabled,
 /// `data` already contains denoised audio (order: denoise → VAD).
 ///
-/// Note: `peak` / `rms` are computed by the core **before denoising**. With denoise enabled, they may
-/// differ from the actual `data` signal (after denoising); these core statistics are passed through.
+/// `peak` / `rms` describe the final delivered float samples after denoise and gain,
+/// before any integer encoding.
 #[pyclass(module = "flexaudio", name = "AudioChunk", frozen)]
 pub struct PyAudioChunk {
     // Interleaved f32 samples. The `data` getter converts them to little-endian bytes.
@@ -147,6 +147,9 @@ pub struct PyAudioChunk {
     // Events finalized by integrated VAD (start/end and absolute sample position). The getter
     // converts them to PyVadEvent. Empty when disabled.
     vad_events: Vec<(bool, u64)>,
+    whisper_events: Option<Vec<flexaudio_vad::AttachedWhisperVadEvent>>,
+    #[pyo3(get)]
+    frame_index: u64,
     #[pyo3(get)]
     frames: usize,
     #[pyo3(get)]
@@ -176,6 +179,21 @@ impl PyAudioChunk {
         PyBytes::new(py, &buf)
     }
 
+    /// New-mode events are absent when whisper attachment is disabled.
+    #[getter]
+    fn whisper_vad_events(&self, py: Python<'_>) -> PyResult<Option<Vec<Py<PyAny>>>> {
+        self.whisper_events
+            .as_ref()
+            .map(|events| {
+                events
+                    .iter()
+                    .cloned()
+                    .map(|event| crate::whisper_marshal::attached_to_py(py, event))
+                    .collect()
+            })
+            .transpose()
+    }
+
     /// Integrated VAD events finalized for this chunk. Empty when VAD is disabled.
     #[getter]
     fn vad_events(&self) -> Vec<PyVadEvent> {
@@ -201,6 +219,39 @@ impl PyAudioChunk {
 }
 
 impl PyAudioChunk {
+    pub(crate) fn set_whisper_events(
+        &mut self,
+        events: Vec<flexaudio_vad::AttachedWhisperVadEvent>,
+    ) {
+        self.whisper_events = Some(events);
+    }
+
+    pub(crate) fn extend_vad_events(&mut self, events: Vec<(bool, u64)>) {
+        self.vad_events.extend(events);
+    }
+    pub(crate) fn has_audio_or_vad(&self) -> bool {
+        !self.samples.is_empty() || !self.vad_events.is_empty()
+    }
+
+    /// Update metrics from the final delivered float PCM.
+    pub(crate) fn update_metrics(&mut self) {
+        self.peak = self
+            .samples
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        self.rms = if self.samples.is_empty() {
+            0.0
+        } else {
+            (self
+                .samples
+                .iter()
+                .map(|&sample| f64::from(sample).powi(2))
+                .sum::<f64>()
+                / self.samples.len() as f64)
+                .sqrt() as f32
+        };
+    }
+
     /// Mutable sample reference for in-place denoising (used during poll).
     pub(crate) fn samples_mut(&mut self) -> &mut [f32] {
         &mut self.samples
@@ -219,6 +270,8 @@ impl PyAudioChunk {
 
 pub(crate) fn chunk_to_py(chunk: AudioChunk) -> PyAudioChunk {
     PyAudioChunk {
+        frame_index: chunk.frame_index,
+        whisper_events: None,
         frames: chunk.frames,
         pts_ns: chunk.pts_ns,
         seq: chunk.seq,
@@ -235,10 +288,9 @@ pub(crate) fn chunk_to_py(chunk: AudioChunk) -> PyAudioChunk {
 // StreamEvent (pyclass and getters)
 // ---------------------------------------------------------------------------
 
-/// Event emitted while a stream is running. `type` identifies the kind; `count` and `message` are optional by kind.
+/// Stream notification with compatible optional properties and a closed serialization view.
 #[pyclass(module = "flexaudio", name = "StreamEvent", frozen)]
 pub struct PyStreamEvent {
-    /// Present on permissionDenied and permissionPending: microphone | systemAudio.
     #[pyo3(get)]
     permission: Option<String>,
     #[pyo3(get, name = "type")]
@@ -247,78 +299,100 @@ pub struct PyStreamEvent {
     count: Option<u64>,
     #[pyo3(get)]
     message: Option<String>,
+    #[pyo3(get)]
+    error: Option<crate::errors::AudioError>,
+    #[pyo3(get)]
+    loss: Option<crate::errors::AudioLoss>,
 }
-
 #[pymethods]
 impl PyStreamEvent {
     fn __repr__(&self) -> String {
-        format!(
-            "StreamEvent(type={:?}, count={:?}, message={:?})",
-            self.kind, self.count, self.message
-        )
+        format!("StreamEvent(type={:?})", self.kind)
+    }
+    pub(crate) fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("type", &self.kind)?;
+        if let Some(permission) = &self.permission {
+            d.set_item("permission", permission)?;
+        }
+        if let Some(count) = self.count {
+            d.set_item("count", count)?;
+        }
+        if let Some(message) = &self.message {
+            d.set_item("message", message)?;
+        }
+        if let Some(error) = &self.error {
+            d.set_item("error", error.to_dict(py)?)?;
+        }
+        if let Some(loss) = &self.loss {
+            d.set_item("loss", loss.to_dict(py)?)?;
+        }
+        Ok(d)
     }
 }
-
 pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
-    match ev {
-        Event::TerminalError { error } => event_to_py(Event::Error(error.to_string())),
-        Event::ChunkDropped { count } => PyStreamEvent {
-            kind: "chunkDropped".to_string(),
-            permission: None,
-            count: Some(count),
-            message: None,
-        },
-        Event::StreamStalled => PyStreamEvent {
-            kind: "stalled".to_string(),
-            permission: None,
-            count: None,
-            message: None,
-        },
-        Event::StreamRecovered => PyStreamEvent {
-            kind: "recovered".to_string(),
-            permission: None,
-            count: None,
-            message: None,
-        },
-        Event::PermissionPending { permission, detail } => PyStreamEvent {
-            kind: "permissionPending".to_string(),
-            permission: Some(permission.as_str().to_string()),
-            count: None,
-            message: Some(detail),
-        },
-        Event::PermissionDenied { permission, detail } => PyStreamEvent {
-            kind: "permissionDenied".to_string(),
-            permission: Some(permission.as_str().to_string()),
-            count: None,
-            message: Some(fa::Error::PermissionDenied { permission, detail }.to_string()),
-        },
-        Event::SilenceWhileSourceActive { detail } => PyStreamEvent {
-            kind: "silenceWhileSourceActive".to_string(),
-            permission: None,
-            count: None,
-            message: Some(detail),
-        },
-        Event::DeviceLost => PyStreamEvent {
-            kind: "deviceLost".to_string(),
-            permission: None,
-            count: None,
-            message: None,
-        },
-        Event::Error(msg) => PyStreamEvent {
-            kind: "error".to_string(),
-            permission: None,
-            count: None,
-            message: Some(msg),
-        },
-        // Event is #[non_exhaustive]. For future variants, pass unknown kinds to Python as "unknown"
-        // plus their debug representation (do not swallow them).
-        other => PyStreamEvent {
-            kind: "unknown".to_string(),
-            permission: None,
-            count: None,
-            message: Some(format!("unknown event: {other:?}")),
-        },
+    let mut result = PyStreamEvent {
+        kind: String::new(),
+        permission: None,
+        count: None,
+        message: None,
+        error: None,
+        loss: None,
+    };
+    result.kind = match ev {
+        Event::TerminalError { error } => {
+            result.error = Some(crate::errors::AudioError(error));
+            "terminalError"
+        }
+        Event::RecoverableError { error } => {
+            result.error = Some(crate::errors::AudioError(error));
+            "recoverableError"
+        }
+        Event::ShutdownError { error } => {
+            result.error = Some(crate::errors::AudioError(error));
+            "shutdownError"
+        }
+        Event::AudioLoss { loss } => {
+            result.loss = Some(crate::errors::AudioLoss(loss));
+            "audioLoss"
+        }
+        Event::Clipped => "clipped",
+        Event::PermissionGranted => {
+            result.permission = Some("microphone".into());
+            "permissionGranted"
+        }
+        Event::ChunkDropped { count } => {
+            result.count = Some(count);
+            "chunkDropped"
+        }
+        Event::StreamStalled => "stalled",
+        Event::StreamRecovered => "recovered",
+        Event::PermissionPending { permission, .. } => {
+            result.permission = Some(permission.as_str().into());
+            result.message = Some(format!("Recording permission is pending. {}", permission.guidance()));
+            "permissionPending"
+        }
+        Event::PermissionDenied { permission, detail } => {
+            result.permission = Some(permission.as_str().into());
+            result.message = Some(fa::Error::PermissionDenied { permission, detail }.to_string());
+            "permissionDenied"
+        }
+        Event::SilenceWhileSourceActive { .. } => {
+            result.message = Some("Capture is silent while the source is active; check recording permissions and source access.".into());
+            "silenceWhileSourceActive"
+        }
+        Event::DeviceLost => "deviceLost",
+        Event::Error(_) => {
+            result.message = Some("capture failed".into());
+            "error"
+        }
+        _ => {
+            result.message = Some("unknown event".into());
+            "unknown"
+        }
     }
+    .into();
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -390,10 +464,42 @@ pub struct PyDeviceEvent {
     id: Option<String>,
     #[pyo3(get)]
     source_kind: Option<String>,
+    #[pyo3(get)]
+    dropped_events: Option<u64>,
+    #[pyo3(get)]
+    message: Option<String>,
 }
 
 #[pymethods]
 impl PyDeviceEvent {
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("type", &self.kind)?;
+        if let Some(info) = &self.device {
+            let device = PyDict::new(py);
+            device.set_item("id", &info.id)?;
+            device.set_item("name", &info.name)?;
+            device.set_item("source_kind", source_kind_str(info.source_kind))?;
+            device.set_item("sample_rate", info.sample_rate)?;
+            device.set_item("channels", info.channels)?;
+            device.set_item("is_loopback", info.is_loopback)?;
+            device.set_item("is_default", info.is_default)?;
+            d.set_item("device", device)?;
+        }
+        if let Some(id) = &self.id {
+            d.set_item("id", id)?;
+        }
+        if let Some(kind) = &self.source_kind {
+            d.set_item("source_kind", kind)?;
+        }
+        if let Some(count) = self.dropped_events {
+            d.set_item("dropped_events", count)?;
+        }
+        if let Some(message) = &self.message {
+            d.set_item("message", message)?;
+        }
+        Ok(d)
+    }
     /// Device info for an added event (`None` otherwise).
     #[getter]
     fn device(&self) -> Option<PyDeviceInfo> {
@@ -416,34 +522,43 @@ impl PyDeviceEvent {
 }
 
 pub(crate) fn device_event_to_py(ev: DeviceEvent) -> PyDeviceEvent {
-    match ev {
-        DeviceEvent::Added(info) => PyDeviceEvent {
-            kind: "added".to_string(),
-            device: Some(info),
-            id: None,
-            source_kind: None,
-        },
-        DeviceEvent::Removed { id } => PyDeviceEvent {
-            kind: "removed".to_string(),
-            device: None,
-            id: Some(id),
-            source_kind: None,
-        },
-        DeviceEvent::DefaultChanged { kind, id } => PyDeviceEvent {
-            kind: "defaultChanged".to_string(),
-            device: None,
-            id: Some(id),
-            source_kind: Some(source_kind_str(kind).to_string()),
-        },
-        // DeviceEvent is #[non_exhaustive]. For future variants, pass unknown kinds as
-        // "unknown" (do not swallow them).
-        other => PyDeviceEvent {
-            kind: "unknown".to_string(),
-            device: None,
-            id: Some(format!("{other:?}")),
-            source_kind: None,
-        },
+    let mut result = PyDeviceEvent {
+        kind: String::new(),
+        device: None,
+        id: None,
+        source_kind: None,
+        dropped_events: None,
+        message: None,
+    };
+    result.kind = match ev {
+        DeviceEvent::Added(info) => {
+            result.device = Some(info);
+            "added"
+        }
+        DeviceEvent::Removed { id } => {
+            result.id = Some(id);
+            "removed"
+        }
+        DeviceEvent::DefaultChanged { kind, id } => {
+            result.source_kind = Some(source_kind_str(kind.into()).into());
+            result.id = Some(id);
+            "defaultChanged"
+        }
+        DeviceEvent::DefaultCleared { kind } => {
+            result.source_kind = Some(source_kind_str(kind.into()).into());
+            "defaultCleared"
+        }
+        DeviceEvent::RescanRequired { dropped_events } => {
+            result.dropped_events = Some(dropped_events);
+            "rescanRequired"
+        }
+        _ => {
+            result.message = Some("unknown device event; rescan required".into());
+            "unknown"
+        }
     }
+    .into();
+    result
 }
 
 #[cfg(test)]
@@ -459,8 +574,9 @@ mod tests {
         let event = event_to_py(Event::TerminalError {
             error: error.clone(),
         });
-        assert_eq!(event.kind, "error");
-        assert_eq!(event.message, Some(error.to_string()));
+        assert_eq!(event.kind, "terminalError");
+        assert_eq!(event.error.unwrap().0, error);
+        assert_eq!(event.message, None);
         assert_eq!(event.permission, None);
     }
 
@@ -475,8 +591,11 @@ mod tests {
             assert_eq!(mapped.permission.as_deref(), Some(permission.as_str()));
             assert_eq!(mapped.count, None);
             assert_eq!(
-                mapped.message.as_deref(),
-                Some("Permission is pending; capture may remain silent until granted")
+                mapped.message,
+                Some(format!(
+                    "Recording permission is pending. {}",
+                    permission.guidance()
+                ))
             );
         }
     }
@@ -504,7 +623,7 @@ mod tests {
         assert_eq!(advisory.permission, None);
         assert_eq!(
             advisory.message.as_deref(),
-            Some("check recording privacy settings")
+            Some("Capture is silent while the source is active; check recording permissions and source access.")
         );
     }
 
@@ -526,12 +645,13 @@ mod tests {
         assert_eq!(event_to_py(Event::DeviceLost).kind, "deviceLost");
         let errev = event_to_py(Event::Error("boom".to_string()));
         assert_eq!(errev.kind, "error");
-        assert_eq!(errev.message.as_deref(), Some("boom"));
+        assert_eq!(errev.message.as_deref(), Some("capture failed"));
     }
 
     #[test]
     fn chunk_to_py_carries_fields() {
         let chunk = AudioChunk {
+            frame_index: 0,
             data: vec![0.0, 1.0, -1.0, 0.5],
             frames: 2,
             pts_ns: 123,
@@ -604,11 +724,137 @@ mod tests {
         assert!(removed.device.is_none());
 
         let changed = device_event_to_py(DeviceEvent::DefaultChanged {
-            kind: SourceKind::SystemLoopback,
+            kind: fa::DefaultDeviceKind::SystemAudio,
             id: "new-default".to_string(),
         });
         assert_eq!(changed.kind, "defaultChanged");
         assert_eq!(changed.id.as_deref(), Some("new-default"));
         assert_eq!(changed.source_kind.as_deref(), Some("system"));
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+
+    #[test]
+    fn every_new_event_has_exact_typed_dictionary_without_legacy_fields() {
+        Python::initialize();
+        Python::attach(|py| {
+            for (event, tag, field) in [
+                (
+                    Event::TerminalError {
+                        error: fa::Error::DeviceLost,
+                    },
+                    "terminalError",
+                    "error",
+                ),
+                (
+                    Event::RecoverableError {
+                        error: fa::Error::Backend("retry".into()),
+                    },
+                    "recoverableError",
+                    "error",
+                ),
+                (
+                    Event::ShutdownError {
+                        error: fa::Error::Backend("cleanup".into()),
+                    },
+                    "shutdownError",
+                    "error",
+                ),
+                (Event::PermissionGranted, "permissionGranted", "permission"),
+                (
+                    Event::AudioLoss {
+                        loss: fa::AudioLoss::raw_overflow(
+                            Some(fa::MixLane::SystemAudio),
+                            std::num::NonZeroU64::new(u64::MAX),
+                            48_000,
+                            2,
+                        )
+                        .unwrap(),
+                    },
+                    "audioLoss",
+                    "loss",
+                ),
+            ] {
+                let d = event_to_py(event).to_dict(py).unwrap();
+                assert_eq!(d.len(), 2);
+                assert_eq!(
+                    d.get_item("type")
+                        .unwrap()
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    tag
+                );
+                assert!(d.contains(field).unwrap());
+                assert!(!d.contains("message").unwrap());
+                assert!(!d.contains("count").unwrap());
+                if field == "loss" {
+                    assert_eq!(
+                        d.get_item("loss")
+                            .unwrap()
+                            .unwrap()
+                            .get_item("samples")
+                            .unwrap()
+                            .extract::<u64>()
+                            .unwrap(),
+                        u64::MAX
+                    );
+                }
+            }
+            assert_eq!(event_to_py(Event::Clipped).to_dict(py).unwrap().len(), 1);
+            let loss = crate::errors::AudioLoss(
+                fa::AudioLoss::output_overflow(fa::OutputTap::Secondary, None, 16_000, 1).unwrap(),
+            );
+            assert!(loss
+                .to_dict(py)
+                .unwrap()
+                .get_item("samples")
+                .unwrap()
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn default_clear_and_rescan_keep_exact_payloads_and_counts() {
+        Python::initialize();
+        Python::attach(|py| {
+            for kind in [
+                fa::DefaultDeviceKind::Microphone,
+                fa::DefaultDeviceKind::SystemAudio,
+            ] {
+                let event = device_event_to_py(DeviceEvent::DefaultCleared { kind });
+                assert_eq!(event.kind, "defaultCleared");
+                assert_eq!(event.id, None);
+                let d = event.to_dict(py).unwrap();
+                assert_eq!(d.len(), 2);
+                assert!(!d.contains("id").unwrap());
+                assert_eq!(
+                    d.get_item("source_kind")
+                        .unwrap()
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    source_kind_str(kind.into())
+                );
+            }
+            let d = device_event_to_py(DeviceEvent::RescanRequired {
+                dropped_events: u64::MAX,
+            })
+            .to_dict(py)
+            .unwrap();
+            assert_eq!(
+                d.get_item("dropped_events")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                u64::MAX
+            );
+            assert_eq!(d.len(), 2);
+        });
     }
 }

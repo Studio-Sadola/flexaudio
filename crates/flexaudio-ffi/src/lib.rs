@@ -19,14 +19,24 @@
 //!
 //! Regenerate the `include/flexaudio.h` header with cbindgen (using `cbindgen.toml`).
 
+mod chunk_storage;
 mod convert;
 mod denoise;
 mod error;
 mod flac;
 mod integration;
+mod legacy_codes;
+pub use legacy_codes::*;
+mod shutdown;
 mod types;
+mod v2;
+mod v2_records;
+mod v2_storage;
 mod vad;
 mod watch;
+mod whisper_integration;
+mod whisper_types;
+mod whisper_vad;
 
 // This crate builds C libraries rather than an rlib, so compile the FFI regression tests
 // as a unit-test module while keeping their source under tests/.
@@ -53,7 +63,9 @@ pub(crate) fn guard_i32(f: impl FnOnce() -> i32) -> i32 {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(v) => v,
         Err(_) => {
-            set_last_error("panic caught at FFI boundary");
+            error::set_audio_error(flexaudio::Error::Backend(
+                "panic caught at FFI boundary".into(),
+            ));
             code::FLEX_PANIC
         }
     }
@@ -64,8 +76,36 @@ pub(crate) fn guard_ptr<T>(f: impl FnOnce() -> *mut T) -> *mut T {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(v) => v,
         Err(_) => {
-            set_last_error("panic caught at FFI boundary");
+            error::set_audio_error(flexaudio::Error::Backend(
+                "panic caught at FFI boundary".into(),
+            ));
             std::ptr::null_mut()
+        }
+    }
+}
+
+/// Guard a borrowed pointer without converting shared storage to a mutable pointer.
+pub(crate) fn guard_const_ptr<T>(f: impl FnOnce() -> *const T) -> *const T {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => {
+            error::set_audio_error(flexaudio::Error::Backend(
+                "panic caught at FFI boundary".into(),
+            ));
+            std::ptr::null()
+        }
+    }
+}
+
+/// Guard a scalar or record value, retaining a safe typed diagnostic on panic.
+pub(crate) fn guard_value<T>(fallback: T, f: impl FnOnce() -> T) -> T {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(_) => {
+            error::set_audio_error(flexaudio::Error::Backend(
+                "panic caught at FFI boundary".into(),
+            ));
+            fallback
         }
     }
 }
@@ -77,8 +117,7 @@ fn guard_bool(f: impl FnOnce() -> bool) -> bool {
 
 /// Small helper that records a `flexaudio::Error` in last_error and returns FAILURE.
 fn fail(err: flexaudio::Error) -> i32 {
-    set_last_error(err.to_string());
-    code::FLEX_FAILURE
+    error::set_audio_error(err)
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +189,7 @@ unsafe fn open_with_exclude_pids(
         let exclude_pids = match convert::copy_exclude_pids(exclude_pids, exclude_pids_len) {
             Ok(pids) => pids,
             Err(e) => {
-                set_last_error(e.to_string());
+                error::set_audio_error(e);
                 return std::ptr::null_mut();
             }
         };
@@ -167,6 +206,15 @@ unsafe fn open_with_exclude_pids(
         };
         match flexaudio::open(stream_config) {
             Ok(inner) => Box::into_raw(Box::new(FlexStream {
+                shutdown: None,
+                shutdown_event_index: 0,
+                last_output: None,
+                whisper: None,
+                whisper_events: Vec::new(),
+                whisper_origin: (0, 0),
+                whisper_error: None,
+                whisper_error_reported: false,
+                ready_chunks: std::collections::VecDeque::new(),
                 inner,
                 denoiser,
                 vad,
@@ -174,14 +222,18 @@ unsafe fn open_with_exclude_pids(
             Err(e) => {
                 #[cfg(test)]
                 error::record_open_failure(e.clone());
-                set_last_error(e.to_string());
+                error::set_audio_error(e);
                 std::ptr::null_mut()
             }
         }
     })
 }
 
-/// Stop the stream, then free it. NULL-safe.
+/// Run checked stop, then free the stream. NULL-safe. Cleanup failure remains in last_error.
+/// Attached v2 streams must be polled through their terminal carrier before free.
+/// If attached chunks remain unread, keep the handle alive and set last_error; poll
+/// with poll_chunk_v2 and call free again rather than silently losing closure events.
+/// Ordinary streams release unread PCM tails on free; call stop and poll first to retain them.
 ///
 /// # Safety
 /// `s` must be a handle returned by `flexaudio_open` (or NULL). Do not use `s` after freeing it.
@@ -189,17 +241,34 @@ unsafe fn open_with_exclude_pids(
 pub unsafe extern "C" fn flexaudio_free(s: *mut FlexStream) {
     // Use the i32 guard to catch panics; discard its return value.
     guard_i32(|| {
+        clear_last_error();
         if s.is_null() {
             return code::FLEX_OK;
         }
+        if !s.is_aligned() {
+            return v2::invalid();
+        }
         let mut stream = Box::from_raw(s);
-        stream.inner.stop();
+        let result = stream.stop_binding();
+        if stream.whisper.is_some()
+            && (!stream.ready_chunks.is_empty() || !stream.whisper_events.is_empty())
+        {
+            set_last_error(
+                "PendingWhisperVadEvents: poll_chunk_v2 until drained, then call free again",
+            );
+            let _ = Box::into_raw(stream);
+            return code::FLEX_FAILURE;
+        }
         drop(stream);
-        code::FLEX_OK
+        match result {
+            Ok(()) => code::FLEX_OK,
+            Err(error) => fail(error),
+        }
     });
 }
 
-/// Start capture.
+/// Start capture. Repeated calls while running succeed without starting again.
+/// After stop, the stream is spent: start returns FLEX_INVALID_STATE; open a new stream.
 ///
 /// # Safety
 /// `s` must be a valid handle (NULL is InvalidArg).
@@ -207,18 +276,37 @@ pub unsafe extern "C" fn flexaudio_free(s: *mut FlexStream) {
 pub unsafe extern "C" fn flexaudio_start(s: *mut FlexStream) -> i32 {
     guard_i32(|| {
         clear_last_error();
+        if !s.is_null() && !s.is_aligned() {
+            return v2::invalid();
+        }
         let Some(stream) = s.as_mut() else {
             set_last_error("flexaudio_start: stream pointer is null");
             return code::FLEX_INVALID_ARG;
         };
         match stream.inner.start() {
-            Ok(()) => code::FLEX_OK,
+            Ok(()) => {
+                for mut chunk in stream.ready_chunks.drain(..) {
+                    crate::whisper_integration::flexaudio_chunk_free_v2(&mut chunk);
+                }
+                stream.shutdown = None;
+                stream.shutdown_event_index = 0;
+                stream.last_output = None;
+                code::FLEX_OK
+            }
+            Err(flexaudio::Error::InvalidState(_)) if stream.shutdown.is_some() => {
+                fail(flexaudio::Error::InvalidState(
+                    "stream already stopped and spent; open a new stream".into(),
+                ))
+            }
             Err(e) => fail(e),
         }
     })
 }
 
-/// Stop capture.
+/// Stop capture and finish denoise/VAD once. Graceful PCM tails remain pollable.
+/// Return the primary root error code for capture or cleanup failure. Repeated stop
+/// returns the retained outcome without duplicate tails or cleanup events.
+/// Inspect shutdown_report_v2 for the separate capture primary and cleanup errors.
 ///
 /// # Safety
 /// `s` must be a valid handle (NULL is InvalidArg).
@@ -226,12 +314,17 @@ pub unsafe extern "C" fn flexaudio_start(s: *mut FlexStream) -> i32 {
 pub unsafe extern "C" fn flexaudio_stop(s: *mut FlexStream) -> i32 {
     guard_i32(|| {
         clear_last_error();
+        if !s.is_null() && !s.is_aligned() {
+            return v2::invalid();
+        }
         let Some(stream) = s.as_mut() else {
             set_last_error("flexaudio_stop: stream pointer is null");
             return code::FLEX_INVALID_ARG;
         };
-        stream.inner.stop();
-        code::FLEX_OK
+        match stream.stop_binding() {
+            Ok(()) => code::FLEX_OK,
+            Err(error) => fail(error),
+        }
     })
 }
 
@@ -243,6 +336,9 @@ pub unsafe extern "C" fn flexaudio_stop(s: *mut FlexStream) -> i32 {
 pub unsafe extern "C" fn flexaudio_pause(s: *mut FlexStream) -> i32 {
     guard_i32(|| {
         clear_last_error();
+        if !s.is_null() && !s.is_aligned() {
+            return v2::invalid();
+        }
         let Some(stream) = s.as_mut() else {
             set_last_error("flexaudio_pause: stream pointer is null");
             return code::FLEX_INVALID_ARG;
@@ -260,6 +356,9 @@ pub unsafe extern "C" fn flexaudio_pause(s: *mut FlexStream) -> i32 {
 pub unsafe extern "C" fn flexaudio_resume(s: *mut FlexStream) -> i32 {
     guard_i32(|| {
         clear_last_error();
+        if !s.is_null() && !s.is_aligned() {
+            return v2::invalid();
+        }
         let Some(stream) = s.as_mut() else {
             set_last_error("flexaudio_resume: stream pointer is null");
             return code::FLEX_INVALID_ARG;
@@ -277,7 +376,7 @@ pub unsafe extern "C" fn flexaudio_resume(s: *mut FlexStream) -> i32 {
 /// `s` must be a valid handle (or NULL).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_is_paused(s: *const FlexStream) -> bool {
-    guard_bool(|| match s.as_ref() {
+    guard_bool(|| match if v2::valid(s) { s.as_ref() } else { None } {
         Some(stream) => stream.inner.is_paused(),
         None => false,
     })
@@ -294,6 +393,9 @@ pub unsafe extern "C" fn flexaudio_is_paused(s: *const FlexStream) -> bool {
 pub unsafe extern "C" fn flexaudio_set_gain(s: *mut FlexStream, gain: f32) -> i32 {
     guard_i32(|| {
         clear_last_error();
+        if !s.is_null() && !s.is_aligned() {
+            return v2::invalid();
+        }
         let Some(stream) = s.as_mut() else {
             set_last_error("flexaudio_set_gain: stream pointer is null");
             return code::FLEX_INVALID_ARG;
@@ -301,7 +403,7 @@ pub unsafe extern "C" fn flexaudio_set_gain(s: *mut FlexStream, gain: f32) -> i3
         match stream.inner.set_gain(gain) {
             Ok(()) => code::FLEX_OK,
             Err(e) => {
-                set_last_error(e.to_string());
+                error::set_audio_error(e);
                 code::FLEX_INVALID_ARG
             }
         }
@@ -314,9 +416,11 @@ pub unsafe extern "C" fn flexaudio_set_gain(s: *mut FlexStream, gain: f32) -> i3
 /// `s` must be a valid handle (or NULL).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_gain(s: *const FlexStream) -> f32 {
-    catch_unwind(AssertUnwindSafe(|| match s.as_ref() {
-        Some(stream) => stream.inner.gain(),
-        None => 1.0,
+    catch_unwind(AssertUnwindSafe(|| {
+        match if v2::valid(s) { s.as_ref() } else { None } {
+            Some(stream) => stream.inner.gain(),
+            None => 1.0,
+        }
     }))
     .unwrap_or(1.0)
 }
@@ -337,11 +441,14 @@ pub unsafe extern "C" fn flexaudio_native_format(
 ) -> i32 {
     guard_i32(|| {
         clear_last_error();
+        if !s.is_null() && !s.is_aligned() {
+            return v2::invalid();
+        }
         let Some(stream) = s.as_ref() else {
             set_last_error("flexaudio_native_format: stream pointer is null");
             return code::FLEX_INVALID_ARG;
         };
-        if sr.is_null() || ch.is_null() {
+        if sr.is_null() || !sr.is_aligned() || ch.is_null() || !ch.is_aligned() {
             set_last_error("flexaudio_native_format: output pointer is null");
             return code::FLEX_INVALID_ARG;
         }
@@ -359,9 +466,11 @@ pub unsafe extern "C" fn flexaudio_native_format(
 /// `s` must be a valid handle (or NULL).
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_dropped_chunks(s: *const FlexStream) -> u64 {
-    catch_unwind(AssertUnwindSafe(|| match s.as_ref() {
-        Some(stream) => stream.inner.dropped_chunks(),
-        None => 0,
+    catch_unwind(AssertUnwindSafe(|| {
+        match if v2::valid(s) { s.as_ref() } else { None } {
+            Some(stream) => stream.inner.dropped_chunks(),
+            None => 0,
+        }
     }))
     .unwrap_or(0)
 }
@@ -389,16 +498,24 @@ pub unsafe extern "C" fn flexaudio_dropped_chunks(s: *const FlexStream) -> u64 {
 pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut FlexChunk) -> i32 {
     guard_i32(|| {
         clear_last_error();
+        if !s.is_null() && !s.is_aligned() {
+            return v2::invalid();
+        }
         let Some(stream) = s.as_mut() else {
             set_last_error("flexaudio_poll_chunk: stream pointer is null");
             return code::FLEX_INVALID_ARG;
         };
-        if out.is_null() {
+        if out.is_null() || !out.is_aligned() {
             set_last_error("flexaudio_poll_chunk: out pointer is null");
             return code::FLEX_INVALID_ARG;
         }
+        if stream.whisper.is_some() {
+            set_last_error("InvalidState: attached streams require flexaudio_poll_chunk_v2");
+            return code::FLEX_INVALID_ARG;
+        }
         if let Some(error) = stream.inner.terminal_error() {
-            return fail(error);
+            fail(error);
+            return code::FLEX_FAILURE;
         }
         // Write the result after add-ons (denoise → VAD); pass through unchanged if disabled.
         match stream.poll_processed() {
@@ -407,12 +524,38 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
                 1
             }
             Ok(None) => match stream.inner.terminal_error() {
-                Some(error) => fail(error),
+                Some(error) => {
+                    fail(error);
+                    code::FLEX_FAILURE
+                }
                 None => 0,
             },
             Err(error) => {
                 set_last_error(error.to_string());
                 code::FLEX_FAILURE
+            }
+        }
+    })
+}
+
+/// Return the producer frame index in canonical 48 kHz units without changing v1 layout.
+/// NULL, a freed chunk, or caller-owned PCM returns zero and sets last_error.
+/// # Safety
+/// Non-NULL must point to an aligned, readable FlexChunk. PCM is never dereferenced.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_chunk_frame_index(chunk: *const FlexChunk) -> u64 {
+    guard_value(0, || {
+        error::clear_last_error();
+        if chunk.is_null() || !chunk.is_aligned() {
+            error::set_last_error("InvalidArgument: invalid chunk pointer");
+            return 0;
+        }
+        let chunk = &*chunk;
+        match chunk_storage::frame_index(chunk.data, chunk.len) {
+            Some(index) => index,
+            None => {
+                error::set_last_error("InvalidArgument: chunk PCM is not owned by flexaudio");
+                0
             }
         }
     })
@@ -426,6 +569,9 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_chunk_free(chunk: *mut FlexChunk) {
     guard_i32(|| {
+        if !chunk.is_null() && !chunk.is_aligned() {
+            return v2::invalid();
+        }
         if let Some(chunk) = chunk.as_mut() {
             convert::free_chunk_data(chunk);
         }
@@ -438,7 +584,9 @@ pub unsafe extern "C" fn flexaudio_chunk_free(chunk: *mut FlexChunk) {
 /// Return 1 when an event is retrieved, 0 when none is available, or a negative value on error.
 /// Error, PermissionDenied (kind 3), SilenceWhileSourceActive (kind 7), and
 /// PermissionPending (kind 8, advisory only: capture continues)
-/// store their explanation in last_error. PermissionDenied is terminal, including
+/// store safe explanations in last_error. Typed failures project to Error (5):
+/// v1 cannot distinguish terminal/recoverable/cleanup; inspect terminal_error or use v2.
+/// Counts above INT64_MAX saturate with a range-loss diagnostic. PermissionDenied is terminal, including
 /// a confirmed macOS self-probe failure. SilenceWhileSourceActive means the
 /// permission diagnosis is inconclusive; both advisory kinds continue capture.
 ///
@@ -448,15 +596,18 @@ pub unsafe extern "C" fn flexaudio_chunk_free(chunk: *mut FlexChunk) {
 pub unsafe extern "C" fn flexaudio_poll_event(s: *mut FlexStream, out: *mut FlexEvent) -> i32 {
     guard_i32(|| {
         clear_last_error();
+        if !s.is_null() && !s.is_aligned() {
+            return v2::invalid();
+        }
         let Some(stream) = s.as_mut() else {
             set_last_error("flexaudio_poll_event: stream pointer is null");
             return code::FLEX_INVALID_ARG;
         };
-        if out.is_null() {
+        if out.is_null() || !out.is_aligned() {
             set_last_error("flexaudio_poll_event: out pointer is null");
             return code::FLEX_INVALID_ARG;
         }
-        match stream.inner.poll_event() {
+        match stream.poll_binding_event() {
             // event_to_c stores Error/Unknown messages in last_error.
             Some(ev) => {
                 out.write(convert::event_to_c(ev));
@@ -528,6 +679,9 @@ unsafe fn switch_source_with_exclude_pids(
             set_last_error("flexaudio_switch_source: stream pointer is not aligned");
             return code::FLEX_INVALID_ARG;
         }
+        if !s.is_null() && !s.is_aligned() {
+            return v2::invalid();
+        }
         let Some(stream) = s.as_mut() else {
             set_last_error("flexaudio_switch_source: stream pointer is null");
             return code::FLEX_INVALID_ARG;
@@ -546,7 +700,7 @@ unsafe fn switch_source_with_exclude_pids(
         let exclude_pids = match convert::copy_exclude_pids(exclude_pids, exclude_pids_len) {
             Ok(pids) => pids,
             Err(e) => {
-                set_last_error(e.to_string());
+                error::set_audio_error(e);
                 return code::FLEX_INVALID_ARG;
             }
         };
@@ -557,7 +711,7 @@ unsafe fn switch_source_with_exclude_pids(
         match stream.inner.switch_source(stream_config) {
             Ok(()) => code::FLEX_OK,
             Err(e @ flexaudio::Error::InvalidArg(_)) => {
-                set_last_error(e.to_string());
+                error::set_audio_error(e);
                 code::FLEX_INVALID_ARG
             }
             Err(e) => fail(e),
@@ -575,13 +729,19 @@ unsafe fn switch_source_with_exclude_pids(
 pub unsafe extern "C" fn flexaudio_terminal_error(s: *const FlexStream) -> i32 {
     guard_i32(|| {
         clear_last_error();
+        if !s.is_null() && !s.is_aligned() {
+            return v2::invalid();
+        }
         // SAFETY: The caller supplies a valid handle or NULL as documented.
         let Some(stream) = (unsafe { s.as_ref() }) else {
             set_last_error("flexaudio_terminal_error: stream pointer is null");
             return code::FLEX_INVALID_ARG;
         };
         match stream.inner.terminal_error() {
-            Some(error) => fail(error),
+            Some(error) => {
+                fail(error);
+                code::FLEX_FAILURE
+            }
             None => code::FLEX_OK,
         }
     })
@@ -593,8 +753,11 @@ pub unsafe extern "C" fn flexaudio_terminal_error(s: *const FlexStream) -> i32 {
 
 /// List available devices, allocate an array, and set `out_array` / `out_count`.
 ///
-/// Return 0 on success. Free the allocated array with `flexaudio_devices_free`. In a headless
-/// environment, an empty result (`out_array=NULL` / `out_count=0`) is still successful.
+/// Return 0 only for complete discovery. An empty complete inventory sets
+/// `out_array=NULL` / `out_count=0`. Incomplete or failed discovery (including an
+/// unreachable PipeWire daemon on Linux) returns a typed error code and sets
+/// `flexaudio_last_error` / `flexaudio_last_error_info_v2`; it is not an empty success.
+/// Free the allocated array with `flexaudio_devices_free`.
 ///
 /// # Safety
 /// `out_array` / `out_count` must be valid output pointers (NULL is InvalidArg).
@@ -605,7 +768,11 @@ pub unsafe extern "C" fn flexaudio_devices(
 ) -> i32 {
     guard_i32(|| {
         clear_last_error();
-        if out_array.is_null() || out_count.is_null() {
+        if out_array.is_null()
+            || !out_array.is_aligned()
+            || out_count.is_null()
+            || !out_count.is_aligned()
+        {
             set_last_error("flexaudio_devices: output pointer is null");
             return code::FLEX_INVALID_ARG;
         }
@@ -680,7 +847,11 @@ pub unsafe extern "C" fn flexaudio_processes(
 ) -> i32 {
     guard_i32(|| {
         clear_last_error();
-        if out_array.is_null() || out_count.is_null() {
+        if out_array.is_null()
+            || !out_array.is_aligned()
+            || out_count.is_null()
+            || !out_count.is_aligned()
+        {
             set_last_error("flexaudio_processes: output pointer is null");
             return code::FLEX_INVALID_ARG;
         }
@@ -774,6 +945,15 @@ mod permission_tests {
     #[test]
     fn terminal_poll_failure_keeps_code_reason_and_event_after_stop() {
         let mut stream = FlexStream {
+            shutdown: None,
+            shutdown_event_index: 0,
+            last_output: None,
+            whisper: None,
+            whisper_events: Vec::new(),
+            whisper_origin: (0, 0),
+            whisper_error: None,
+            whisper_error_reported: false,
+            ready_chunks: std::collections::VecDeque::new(),
             inner: denied_stream(),
             denoiser: None,
             vad: None,
@@ -783,16 +963,17 @@ mod permission_tests {
         unsafe {
             assert_eq!(flexaudio_poll_chunk(&mut stream, chunk.as_mut_ptr()), -2);
             let message = CStr::from_ptr(flexaudio_last_error()).to_str().unwrap();
-            assert!(message.contains("denied by user"));
+            assert!(message.contains("recording permission denied"));
+            assert!(!message.contains("denied by user"));
             assert!(message.contains(&fa::Permission::Microphone.to_string()));
             assert!(message.contains(fa::Permission::Microphone.guidance()));
             let mut event = std::mem::MaybeUninit::<FlexEvent>::uninit();
             assert_eq!(flexaudio_poll_event(&mut stream, event.as_mut_ptr()), 1);
-            assert_eq!(event.assume_init().kind as i32, 3);
+            assert_eq!(event.assume_init().kind, 3);
             assert_eq!(flexaudio_terminal_error(&stream), -2);
-            assert_eq!(flexaudio_stop(&mut stream), 0);
+            assert_eq!(flexaudio_stop(&mut stream), code::FLEX_PERMISSION_DENIED);
             assert_eq!(flexaudio_poll_chunk(&mut stream, chunk.as_mut_ptr()), -2);
-            assert_eq!(flexaudio_resume(&mut stream), -2);
+            assert_eq!(flexaudio_resume(&mut stream), code::FLEX_PERMISSION_DENIED);
             assert_eq!(flexaudio_terminal_error(&stream), -2);
         }
     }
@@ -805,6 +986,15 @@ mod permission_tests {
         )
         .expect("open mock");
         let stream = FlexStream {
+            shutdown: None,
+            shutdown_event_index: 0,
+            last_output: None,
+            whisper: None,
+            whisper_events: Vec::new(),
+            whisper_origin: (0, 0),
+            whisper_error: None,
+            whisper_error_reported: false,
+            ready_chunks: std::collections::VecDeque::new(),
             inner,
             denoiser: None,
             vad: None,
@@ -817,3 +1007,15 @@ mod permission_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/ffi/repro_p11.rs"]
+mod repro_p11_tests;
+
+#[cfg(test)]
+#[path = "../tests/ffi/header.rs"]
+mod header_tests;
+
+#[cfg(test)]
+#[path = "../tests/ffi/v2.rs"]
+mod v2_tests;

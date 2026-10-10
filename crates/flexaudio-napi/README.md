@@ -18,7 +18,7 @@ offline — no model files to ship, no network at runtime.
 ## Install
 
 ```sh
-npm install @studio-sadola/flexaudio@0.4
+npm install @studio-sadola/flexaudio@0.5
 ```
 
 The correct prebuilt native binary for your platform is pulled in automatically
@@ -182,7 +182,14 @@ the output formats and buffering; there is no fixed delay between taps.
 
 `stream` also exposes `pause()` / `resume()`, `setGain(x)`, and the read-only
 `isPaused()`, `gain()`, `nativeFormat()` (`{ sampleRate, channels }`) and
-`droppedChunks()` (a `bigint` running total).
+`droppedChunks()` (a `bigint` running total). After `stop()`, the stream is spent;
+call `openStream` to capture again.
+
+Use `bigint` arithmetic for u64 counters: primary/secondary `seq`,
+`droppedChunks()`, `chunkDropped.count`, loss `samples` (when known),
+`rescanRequired.droppedEvents`, and VAD `atSample`. For example, increment a
+sequence with `chunk.seq + 1n`. `ptsNs` and VAD `atNs` remain `number` timestamps;
+`frames`, `flags`, and the u32 `droppedBefore` field also remain `number`.
 
 ## Voice activity detection, noise suppression, FLAC
 
@@ -196,7 +203,9 @@ const { Vad, Denoiser, FlacEncoder, openStream } = require('@studio-sadola/flexa
 const vad = new Vad({ threshold: 0.5, minSilenceMs: 100 });
 for (const ev of vad.process(samples, 48000, 2)) {
   // ev.type: 'speechStart' | 'speechEnd'
-  // ev.atSample is on the VAD's internal rate — seconds = ev.atSample / 16000
+  // ev.atSample is a bigint on the VAD's internal 16 kHz sample clock.
+  const wholeSeconds = ev.atSample / 16000n; // exact bigint quotient
+  const seconds = Number(ev.atSample) / 16000; // approximate number for display
 }
 
 // Noise suppression: 48 kHz only, returns the denoised copy (mono here).
@@ -226,11 +235,64 @@ const stream = openStream(
 `denoise` requires `outputRate: 48000` (RNNoise is 48 kHz only) — any other rate
 makes `openStream` throw.
 
+## Whisper-compatible standalone VAD
+
+`WhisperVad` uses the embedded Silero v6 model and the segmentation rules from
+whisper.cpp pin `85a69493a601d4ff5a834064f7b7bac250bd8739`. Feed normalized
+mono `Float32Array` PCM at 16000 Hz. Run its synchronous inference in a Node
+Worker when used during recording.
+The embedded model SHA-256 is
+`7776b81ad1b0350c15d7f1555943b9232eb53e9ca5d989c6d0cea9ebc8664d87`;
+using v6 does not promise the same probabilities as whisper.cpp's v5 model.
+
+```js
+const { WhisperVad } = require('@studio-sadola/flexaudio');
+const vad = new WhisperVad({ provisional: true });
+for (const mono16k of decodedChunks) consume(vad.process(mono16k));
+consume(vad.finish()); // True EOF; infer one zero-padded partial frame if needed.
+```
+
+The immutable parameters are `threshold` (0.5), `minSpeechDurationMs` (250),
+`minSilenceDurationMs` (100), `maxSpeechDurationS` (finite f32::MAX), and
+`speechPadMs` (30). Integer duration fields accept 0..134217; zero is literal.
+Unknown keys, invalid types, out-of-range PCM and nonfinite values throw errors
+with stable `code` values. Drain the exception's `terminalEvents` through the
+same consumer before handling a fatal failure; validation errors carry `[]`.
+
+`segment` contains epoch-relative integer `startMs`/`endMs` on the 10 ms grid.
+Final endpoints can exceed physical EOF, and finalization has no latency bound:
+the fixed 200 ms merge can undo maximum-duration splits. Optional provisional
+speech hints and nonoverlapping `provisionalCut` pieces of at most 30000 ms use
+separate event types. Every published hint closes before `epochEnd`.
+`epoch` and `seq` identify ordered events. Standalone events have no capture origin.
+
+`finish()` closes the epoch once; repeated finish returns `[]`. `reset()` closes
+published hints, abandons pending final segments and starts the next epoch.
+`lastFrameProbabilities()` returns an owned `{ firstFrameIndex, values }` copy
+for the latest successful call, including an EOF tail. Processing an empty
+array clears that batch without advancing the frame timeline. One model frame
+consumes 512 samples (32 ms); that stride differs from the final 10 ms grid.
+
+`openStream` accepts `whisperVad: { params: { ... }, provisional: true, tap }`.
+Legacy `vad`/`vadTap` are mutually exclusive with attachment; secondary requires
+an enabled secondary output. One VAD owner consumes the producer's shared 48 kHz
+stereo branch before output conversion. The selected chunk carries
+`whisperVadEvents`, beginning each epoch with its exact `captureSample` bigint and
+`ptsNs` origin. Every audio chunk exposes `frameIndex: bigint` in 48 kHz units;
+output taps keep independent producer timelines across native restarts and gaps.
+`flushWhisperVad()` delivers an empty closing carrier before its promise resolves;
+`stop()` drains capture and closes its last epoch before settlement.
+
+Standalone tests do not open audio devices. After building/copying the addon as
+in `__test__/run-smoke.sh`, run
+`node __test__/whisper-vad.test.mjs` from this crate. The script uses `node:test`
+and reports each of its twelve cases.
+
 ## Building the loader (`index.js` / `index.d.ts`)
 
 The JavaScript loader (`index.js`) and TypeScript declarations (`index.d.ts`)
-follow the **napi-rs** convention and are **generated** by the napi CLI from the
-`#[napi]` exports in `src/lib.rs`:
+follow the **napi-rs** convention. The napi CLI generates exports from the
+`#[napi]` definitions in `src/`:
 
 ```sh
 npm install
@@ -238,9 +300,10 @@ npx napi build --platform --release   # also produces the .node binary
 ```
 
 `napi build` writes `index.js`, `index.d.ts`, and the platform `.node` artifact.
-`index.js` and `index.d.ts` are committed (regenerate them after changing the
-`#[napi]` exports); the `.node` binaries are git-ignored. Do not hand-edit the
-generated files — change the doc comments in `src/lib.rs` and rebuild.
+`index.js` and `index.d.ts` are committed; the `.node` binaries are git-ignored.
+The declarations also maintain the strict whisper event unions and parameter
+types used by the custom marshaller. Preserve those declarations and review the
+generated diff when regenerating exports.
 
 ## Permissions
 

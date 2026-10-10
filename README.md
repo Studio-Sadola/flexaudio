@@ -1,5 +1,12 @@
 # flexaudio
 
+Rust migration to 0.5: `AudioChunk` and `SecondaryChunk` struct literals must
+include the new public `frame_index: u64` field. It is the first frame's index
+on the tap's canonical 48 kHz timeline, continues across reopen, and exposes
+queue drops as gaps. Set it from the producing timeline when constructing
+chunks; use `frame_index: 0` for a single synthetic chunk starting at zero.
+The C `FlexChunk` v1 layout is unchanged.
+
 **English** | [Japanese](README.ja.md)
 
 **General-purpose, flexible, cross-platform audio capture for Rust.**
@@ -45,6 +52,11 @@ Three capture sources × three operating systems. ✅ = implemented and verified
   `Error::Unsupported`.
 - Per-process capture requires a `target_pid` in `StreamConfig`.
 - `SourceKind::Mix` combines microphone and system capture on all three platforms.
+- **0.5 VAD:** `WhisperVad` adds whisper.cpp-compatible postprocessing and an
+  attached capture tap alongside the existing `Vad`, in Rust, Node.js, Python
+  and C. Both use an embedded model and run offline.
+- **Typed diagnostics:** inspect loss, clipping, permission and recoverable/fatal
+  events, plus retained capture and cleanup failures.
 
 ---
 
@@ -52,19 +64,19 @@ Three capture sources × three operating systems. ✅ = implemented and verified
 
 ```toml
 [dependencies]
-flexaudio = "0.4"
+flexaudio = "0.5"
 ```
 
 or:
 
 ```sh
-cargo add flexaudio@0.4
+cargo add flexaudio@0.5
 ```
 
 The Voice Activity Detection add-on is a separate crate:
 
 ```sh
-cargo add flexaudio-vad
+cargo add flexaudio-vad@0.5
 ```
 
 ---
@@ -101,7 +113,11 @@ The facade crate `flexaudio` re-exports everything you need:
 
 - `flexaudio::open(StreamConfig) -> Result<Stream>` — pick a backend by source +
   OS and build a (not-yet-started) capture stream.
-- `Stream::start` / `Stream::stop` — control capture.
+- `Stream::start` / `Stream::stop` — control capture. `stop_checked()` returns
+  capture and cleanup failures; `shutdown_report()` retains the completed outcome.
+  A stopped stream is spent (`start()` returns `InvalidState`); open a new stream
+  to capture again. This lifecycle rule already applied in 0.4.
+  Repeated stop does not repeat teardown or duplicate events.
 - `Stream::poll_chunk` / `Stream::poll_event` — pull `AudioChunk`s and `Event`s.
 - `Stream::terminal_error() -> Option<Error>` — inspect a stored terminal failure,
   including after stop. `Stream::resume()` returns `Result<()>`.
@@ -109,25 +125,77 @@ The facade crate `flexaudio` re-exports everything you need:
   stream (chunk `seq` stays continuous; the first chunk after a switch carries a
   discontinuity flag).
 - `flexaudio::devices() -> Result<Vec<DeviceInfo>>` — enumerate microphones
-  (cpal, all platforms) and system output endpoints (Linux: PipeWire sinks and
-  sources; Windows: active render endpoints; macOS: output devices) in one list.
+  (CPAL, all platforms) and system output endpoints (Linux: PipeWire sinks;
+  Windows: active render endpoints; macOS: output devices) in one list.
+  Linux microphone IDs are CPAL IDs; PipeWire Audio/Source nodes are not advertised
+  as microphones. Incomplete or failed discovery returns an error, including
+  when the PipeWire daemon is unreachable on Linux.
 - `flexaudio::processes() -> Result<Vec<ProcessInfo>>` — list audio output
   session/stream owners on Linux/Windows and Core Audio processes on macOS,
   including input-only processes (see
   [Listing capturable processes](#listing-capturable-processes)). Idle/stopped
   processes are included; use `is_output_active` to check current playback and
   `pid` as `target_pid` for per-process capture.
-- `flexaudio::watch_devices() -> Result<DeviceWatcher>` — pull-style hotplug
-  (added / removed / default-changed) notifications (Linux only; Windows/macOS
-  return a no-op watcher).
+- `flexaudio::watch_devices() -> Result<DeviceWatcher>` — pull-style device
+  notifications. Linux startup failure returns an error; Windows/macOS currently
+  provide an intentional no-op watcher.
 - Re-exported types: `StreamConfig`, `SourceKind`, `ProcessMode`, `OutputFormat`,
   `AudioChunk`, `SecondaryChunk`, `ChunkFlags`, `DeviceInfo`, `ProcessInfo`,
-  `DeviceEvent`, `Event`, `Permission`, `Error`, `Result`.
+  `DeviceEvent`, `DefaultDeviceKind`, `Event`, `Permission`, `Error`, `ErrorKind`,
+  `ErrorContext`, `AudioLoss`, `ShutdownReport`, `Result`.
 
 Voice activity detection (`flexaudio-vad`): `Vad::new` / `Vad::process` for
 streaming `SpeechStart` / `SpeechEnd` events, and `get_speech_timestamps` for
 batch segmentation. The Silero VAD model is embedded in the binary, so VAD runs
-fully offline with no runtime model file or network access.
+fully offline with no runtime model file or network access. In 0.5,
+`WhisperVad` / `WhisperVadPostProcessor` / `whisper_speech_segments` add
+postprocessing ported from whisper.cpp: final millisecond segments on a 10 ms
+grid, optional provisional speech/cut events, and padded final-frame inference.
+Compatibility concerns the pinned postprocessing algorithm; different model
+versions need not produce identical probabilities. `WhisperVadTap` attaches to
+canonical capture with epoch clock anchors and flush/stop closure delivery.
+Transport gaps fail the affected epoch without inventing final segments.
+Legacy VAD and WhisperVad are mutually exclusive on a stream.
+
+---
+
+## Migrating to 0.5
+
+See [the 0.5.0 changelog](CHANGELOG.md#050---2026-10-11) for the complete
+migration. Use 20 ms chunks and mono/stereo native input; other chunk sizes
+return `InvalidArg`, and native input above two channels is `UnsupportedFormat`.
+A fatal Mix lane error stops both lanes and retains its lane context.
+
+`Error::kind()` / `root()` / `permission()` classify wrapped errors without
+parsing messages. `Display` keeps library-authored explanations while redacting
+device names, permission detail and internal call labels; structured access
+provides opt-in diagnostics. Third-party legacy backend strings are replaced by
+a safe explanation. Handle `AudioLoss`, `Clipped`, `RecoverableError`,
+`ShutdownError` and `PermissionGranted` events, plus device `DefaultCleared` /
+`RescanRequired`. `DefaultChanged.kind` is now `DefaultDeviceKind`. Loss marks
+subsequent output `DISCONTINUITY`; `PADDED=8` and `CLIPPED=16` describe output
+integrity. Peak/RMS reflect delivered samples after denoise/gain in every binding.
+
+For Node.js, use bigint arithmetic for u64 counters (including VAD `atSample`,
+chunk-drop and loss counts); PTS stays number. Chunk interfaces require
+`frameIndex`, and event types are closed discriminated unions. Lifecycle getters
+`terminalError()` / `shutdownReport()` return `undefined` when absent. Callback
+exceptions surface as `uncaughtException`.
+
+For Python, core failures raise typed exceptions carrying `.audio_error`:
+`InvalidArgumentError` / `UnsupportedFormatError` are `ValueError` subclasses;
+others are `RuntimeError` subclasses. `terminal_error()` returns `AudioError`.
+Discovery/watcher failures raise; `stop()` and normal context exit may raise
+cleanup failures. If the body already failed, it stays primary with cleanup
+context attached. Drain queued output to receive the denoise tail after stop.
+
+For C, v1 physical layouts and legacy constants remain, but enum fields are
+`int32_t` and input booleans are `uint8_t`. Unknown discriminants are invalid
+arguments. Handle all negative root result codes, including the new -5..-12
+codes, and use opaque v2 error/event/watcher/shutdown accessors for details.
+
+The CLI continues on transient failures, loss and clipping, fails on terminal
+or cleanup errors, and prints structured permission detail after safe guidance.
 
 ---
 
@@ -195,9 +263,9 @@ sources ignore valid exclusions. The same controls are available in each binding
   The requested system device is not used while exclusion is active because
   WASAPI process loopback cannot target an output endpoint.
 - **macOS:** PIDs are resolved to Core Audio process objects once at capture
-  start (a snapshot). A process without an audio object then is not excluded;
-  reopen capture when a new audio helper appears. Failed lookups fail capture
-  unless the process has exited. PIDs must fit `1..=2147483647`.
+  start (a snapshot). Unresolved exclusions fail closed, including live processes
+  without an audio object. Only a process confirmed gone (`ESRCH`) is omitted.
+  Reopen capture when a new audio helper appears. PIDs must fit `1..=2147483647`.
   A requested system device is honored alongside exclusion.
 - **Linux:** exact PID matching, without descendants. Pulse-proxied streams
   use `application.process.id`; native clients use `pipewire.sec.pid`.
@@ -280,9 +348,9 @@ JS event loop.
 
 Applications must declare the usage descriptions or capabilities required by
 their host OS. Confirmed recording denial returns
-`Error::PermissionDenied { permission, detail }`; the message identifies the
-permission, explains the cause, and tells the user which privacy setting to
-change and to restart the app and retry. A denial detected during capture emits
+`Error::PermissionDenied { permission, detail }`; safe `Display` identifies the
+permission and gives platform privacy-setting/restart guidance. The original
+detail is available through structured access; the CLI prints it explicitly. A denial detected during capture emits
 `Event::PermissionDenied { permission, detail }`, terminates capture (both lanes
 for Mix), and suppresses further audio and automatic reopening. Create a new
 stream after correcting permission; `start`, `resume`, and `switch_source` on a
@@ -290,18 +358,21 @@ terminally failed stream return its stored error.
 
 If the macOS consent monitor cannot query authorization, capture fails
 closed with `Event::TerminalError { error }` and retains the original backend
-error; it does not invent a permission denial. Bindings report this as an `error`
-event and expose the same terminal failure. A microphone configuration that
+error; it does not invent a permission denial. N-API/Python report this as a
+`terminalError` event; C v1 projects it as legacy Error kind 5 and v2 retains
+typed terminality. The same terminal failure remains queryable. A microphone configuration that
 differs from its advertised native format is rejected before capture builds with
 `Error::NativeFormatChanged { advertised, actual }`; recreate the stream using the
 current device format instead of delivering incorrectly interpreted samples.
 
 Rust exposes `Stream::terminal_error()`. N-API exposes `terminalError()` and
-rejects `stop()` on terminal failure; provide `onEvent` for immediate
-notifications. Python `poll_chunk()` raises `RuntimeError` and exposes
-`terminal_error()` without consuming events. C `flexaudio_poll_chunk()` and
-`flexaudio_terminal_error()` return `FLEX_FAILURE` (-2) with the explanation in
-`flexaudio_last_error()`. Permission event kind remains 3 in C. N-API/Python
+rejects `stop()` on capture or cleanup failure; provide `onEvent` for immediate
+notifications and inspect `shutdownReport()`. Python `poll_chunk()` raises a typed
+`RuntimeError` subclass on terminal failure; `terminal_error()` returns the
+stored `AudioError` without consuming events. C `flexaudio_poll_chunk()` and
+`flexaudio_terminal_error()` return the primary root result code (for example,
+`FLEX_PERMISSION_DENIED` (-7) or `FLEX_FAILURE` (-2) for a backend failure), with
+the safe explanation in `flexaudio_last_error()`. Permission event kind remains 3 in C. N-API/Python
 permission events keep type `permissionDenied` and add `permission`
 (`microphone` or `systemAudio`) and `message`.
 
@@ -320,7 +391,10 @@ permission events keep type `permissionDenied` and add `permission`
   While consent remains undecided, the backend checks authorization throughout
   capture: every 500 ms for the first 60 seconds, then every 2 seconds. A late
   denied/restricted status produces a terminal permission event; authorization
-  stops polling. An unanswered prompt is not proof of denial.
+  stops polling. If a pending advisory was published, late authorization emits
+  `PermissionGranted` once for that capture generation (microphone only),
+  exposed as `permissionGranted` in N-API/Python and v2 event kind 9 in C.
+  An unanswered prompt is not proof of denial.
 - If microphone consent is still undecided five seconds after capture starts,
   flexaudio emits `Event::PermissionPending { permission, detail }` once per
   capture generation, including the mic lane of Mix. This is an advisory:
@@ -393,10 +467,10 @@ permission events keep type `permissionDenied` and add `permission`
   access to the audio device (typically the `audio` group / a running PipeWire
   or PulseAudio session).
 - System and per-process capture require a running **PipeWire** session. If
-  PipeWire is absent, `devices()` still returns microphones found by cpal; only
-  the PipeWire devices are missing. `watch_devices()` degrades to a no-op rather
-  than failing. Under a portal-based desktop, the user may be prompted to grant
-  capture access.
+  PipeWire is absent or watcher startup fails, `watch_devices()` returns an error.
+  Device discovery requires a complete inventory from every provider; an incomplete
+  or failed query returns an error. Under a portal-based desktop, the user may be
+  prompted to grant capture access.
 
 ---
 
@@ -415,7 +489,7 @@ The workspace pins MSRV via `rust-version` in each crate.
 flexaudio follows [Semantic Versioning](https://semver.org/). While the crate is
 in the **0.x** series, the public API is **not yet stable**: per SemVer, a bump
 of the **minor** version (`0.2 → 0.3`) may contain breaking changes, while
-**patch** bumps (`0.2.0 → 0.2.1`) are backward-compatible. Pin to `0.4` to opt
+**patch** bumps (`0.2.0 → 0.2.1`) are backward-compatible. Pin to `0.5` to opt
 into compatible updates only. See [`CHANGELOG.md`](CHANGELOG.md).
 
 ---

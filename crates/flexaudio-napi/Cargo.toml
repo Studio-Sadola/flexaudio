@@ -17,6 +17,13 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+# cargo test --workspace builds this live addon for the Node integration test.
+[[example]]
+name = "capture_test_addon"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+test = false
+
 [dependencies]
 flexaudio = { path = "../flexaudio" }
 
@@ -37,3 +44,6 @@ napi-derive = "2.16"
 [build-dependencies]
 # Call napi_build::setup() from build.rs (for cdylib symbol settings, etc.). Build-time only.
 napi-build = "2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(flexaudio_repro_addon)'] }

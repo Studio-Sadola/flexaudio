@@ -34,6 +34,21 @@ mod config;
 mod infer;
 mod resample;
 mod segmenter;
+mod whisper_capture;
+mod whisper_params;
+mod whisper_postprocess;
+mod whisper_preview;
+mod whisper_stream;
+mod whisper_tap;
+mod whisper_tap_types;
+mod whisper_types;
+
+pub use whisper_params::WhisperVadParams;
+pub use whisper_postprocess::WhisperVadPostProcessor;
+pub use whisper_stream::{whisper_speech_segments, WhisperVad};
+pub use whisper_tap::WhisperVadTap;
+pub use whisper_tap_types::*;
+pub use whisper_types::*;
 
 pub use config::VadConfig;
 pub use resample::PcmFormat;

@@ -75,6 +75,12 @@ use clap::{Parser, ValueEnum};
 use flexaudio::core::{AudioChunk, Error, OutputFormat, SourceKind, StreamConfig};
 use flexaudio::{ProcessMode, Stream};
 
+mod capture_events;
+mod device_events;
+use capture_events::drain_capture_events;
+#[cfg(test)]
+use capture_events::report_capture_event;
+
 /// Capture source kinds (for CLI arguments).
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SourceArg {
@@ -445,7 +451,7 @@ impl SwitchScheduler {
                 Ok(()) => {
                     eprintln!("[switch] -> {label}");
                 }
-                Err(e @ Error::PermissionDenied { .. }) => return Err(e),
+                Err(e) if e.permission().is_some() => return Err(e),
                 Err(e) => {
                     eprintln!(
                         "[switch] Warning: failed to switch to {label} (recording continues): {e}"
@@ -628,6 +634,37 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     let out_rate = output.sample_rate;
     let out_ch = output.channels;
 
+    // `--split-seconds × output rate` is the per-file frame threshold. Reject a product that
+    // overflows u64 here, before any device access, so the writer never has to fall back on a
+    // saturated threshold (`parse_sources` has already bounded the `--sources` alternative).
+    if cli.split_seconds > 0
+        && cli
+            .split_seconds
+            .checked_mul(u64::from(cli.output_rate))
+            .is_none()
+    {
+        return Err(describe_error(Error::InvalidArg(format!(
+            "--split-seconds {} is too large for --output-rate {} (the per-file frame count \
+             overflows)",
+            cli.split_seconds, cli.output_rate
+        ))));
+    }
+
+    // Validate that the recording deadline (`start + total duration`) is representable before
+    // opening the stream, so an unsatisfiable duration (for example `--seconds` near u64::MAX)
+    // fails with a typed argument error before any device access or capture start. `Instant::now()
+    // .checked_add` is enough to prove representability. The later `checked_add` calls in run_wav /
+    // run_stdout_stream remain as defensive guards (they must not panic).
+    let total_duration = match &segments {
+        Some(segs) => SwitchScheduler::total_duration(segs),
+        None => Duration::from_secs(cli.seconds),
+    };
+    if Instant::now().checked_add(total_duration).is_none() {
+        return Err(describe_error(Error::InvalidArg(
+            "the recording duration is too large: its deadline overflows the clock".into(),
+        )));
+    }
+
     // Open the stream. `open` selects a `Box<dyn CaptureBackend>` internally based on config.kind.
     // Do not start it yet (two-stage flow). Read native_format from the opened Stream.
     let config = config_for_kind(cli, kind);
@@ -806,10 +843,10 @@ fn list_processes() -> std::result::Result<(), String> {
 /// - `[-] REMOVED <id>` — device removed (`id` is `node.name` only)
 /// - `[*] DEFAULT <source> -> <id>` — default device changed
 fn watch_devices_loop() -> std::result::Result<(), String> {
-    use flexaudio::core::DeviceEvent;
-
-    // Report the number of existing devices at startup (stderr). Enumeration failure is non-fatal.
-    let existing = flexaudio::devices().map(|d| d.len()).unwrap_or(0);
+    // Discovery failure must not masquerade as an empty authoritative inventory.
+    let existing = flexaudio::devices()
+        .map_err(|error| format!("Failed to enumerate devices: {error}"))?
+        .len();
     eprintln!(
         "Started device hot-plug monitoring ({existing} existing devices). Press Ctrl-C to stop."
     );
@@ -825,32 +862,15 @@ fn watch_devices_loop() -> std::result::Result<(), String> {
         .map_err(|e| format!("Failed to register Ctrl-C handler: {e}"))?;
     }
 
-    // Start monitoring. Degrade to Ok if PipeWire is unavailable (there will simply be no events).
+    // Linux monitoring startup failures propagate to the caller.
     let mut watcher = flexaudio::watch_devices()
         .map_err(|e| format!("Failed to start device monitoring: {e}"))?;
 
     while running.load(Ordering::SeqCst) {
         while let Some(ev) = watcher.poll_event() {
-            match ev {
-                DeviceEvent::Added(info) => {
-                    eprintln!(
-                        "[+] ADDED   {:<7} {} ({})",
-                        source_kind_label(info.source_kind),
-                        info.name,
-                        info.id,
-                    );
-                }
-                DeviceEvent::Removed { id } => {
-                    eprintln!("[-] REMOVED {id}");
-                }
-                DeviceEvent::DefaultChanged { kind, id } => {
-                    eprintln!("[*] DEFAULT {:<7} -> {}", source_kind_label(kind), id,);
-                }
-                // DeviceEvent is #[non_exhaustive]. Show unknown variants in debug form in case
-                // future variants are added (do not swallow them).
-                other => {
-                    eprintln!("[?] UNKNOWN  {other:?}");
-                }
+            if let Err(error) = device_events::report_device_event(ev, &mut flexaudio::devices) {
+                watcher.stop();
+                return Err(error);
             }
         }
         // Hot-plug events are infrequent. Sleep to avoid spinning; 100 ms is responsive enough.
@@ -858,6 +878,9 @@ fn watch_devices_loop() -> std::result::Result<(), String> {
     }
 
     watcher.stop();
+    while let Some(event) = watcher.poll_event() {
+        device_events::report_device_event(event, &mut flexaudio::devices)?;
+    }
     eprintln!();
     eprintln!("Stopped device hot-plug monitoring (Ctrl-C).");
     Ok(())
@@ -883,42 +906,6 @@ fn truncate(s: &str, max: usize) -> String {
         t.push('…');
         t
     }
-}
-
-/// Report advisory events and return confirmed denial to the caller.
-fn report_capture_event(event: flexaudio::Event) -> Result<(), Error> {
-    match event {
-        flexaudio::Event::TerminalError { error } => Err(error),
-        flexaudio::Event::PermissionDenied { permission, detail } => {
-            Err(Error::PermissionDenied { permission, detail })
-        }
-        flexaudio::Event::PermissionPending { detail, .. }
-        | flexaudio::Event::SilenceWhileSourceActive { detail } => {
-            eprintln!("Warning: {detail}");
-            Ok(())
-        }
-        other => {
-            eprintln!("  Event: {other:?}");
-            Ok(())
-        }
-    }
-}
-
-/// Both output paths share terminal-failure handling, including final shutdown.
-fn drain_capture_events(stream: &mut Stream) -> std::result::Result<(), String> {
-    let result = (|| {
-        while let Some(event) = stream.poll_event() {
-            report_capture_event(event)?;
-        }
-        match stream.terminal_error() {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    })();
-    result.map_err(|error| {
-        stream.stop();
-        describe_error(error)
-    })
 }
 
 /// WAV output path (legacy behavior). Collect N seconds (>0), write a 16-bit WAV, and print a
@@ -957,8 +944,14 @@ fn run_wav(
     let mut writer = RotatingWavWriter::new(&cli.out, output, cli.split_seconds);
     let mut chunk_count: u64 = 0;
 
-    // Poll chunks for the full recording duration and write them all.
-    let deadline = start + total;
+    // Poll chunks for the full recording duration and write them all. A duration that no clock can
+    // reach (for example `--seconds` near u64::MAX) is a typed argument error, not a panic.
+    let Some(deadline) = start.checked_add(total) else {
+        stream.stop();
+        return Err(describe_error(Error::InvalidArg(
+            "the recording duration is too large: its deadline overflows the clock".into(),
+        )));
+    };
     while Instant::now() < deadline {
         // Switch sources at segment boundaries, independently of output-file rotation.
         if let Some(sch) = scheduler.as_mut() {
@@ -1102,6 +1095,8 @@ fn run_stdout_stream(
 
     let start = Instant::now();
     // Finite recording deadline: sum of segment durations with `--sources`, otherwise `--seconds`.
+    // A duration that no clock can reach (for example `--seconds` near u64::MAX) is a typed argument
+    // error, not a panic.
     let deadline = if infinite {
         None
     } else {
@@ -1109,7 +1104,15 @@ fn run_stdout_stream(
             Some(segs) => SwitchScheduler::total_duration(segs),
             None => Duration::from_secs(cli.seconds),
         };
-        Some(start + dur)
+        match start.checked_add(dur) {
+            Some(deadline) => Some(deadline),
+            None => {
+                stream.stop();
+                return Err(describe_error(Error::InvalidArg(
+                    "the recording duration is too large: its deadline overflows the clock".into(),
+                )));
+            }
+        }
     };
     // Hot-swap scheduler (only with `--sources`; stdout remains one pipe).
     let mut scheduler = segments.map(|segs| SwitchScheduler::new(cli, segs, start));
@@ -1338,7 +1341,10 @@ impl RotatingWavWriter {
         Self {
             base: out.to_path_buf(),
             spec,
-            frames_per_file: split_seconds * output.sample_rate as u64,
+            // Saturating, never panicking: `run` rejects a `--split-seconds` whose product with the
+            // output rate overflows u64 before this is constructed, and a saturated threshold only
+            // means "no file ever reaches the boundary".
+            frames_per_file: split_seconds.saturating_mul(u64::from(output.sample_rate)),
             writer: None,
             frames_in_current: 0,
             files: Vec::new(),
@@ -1461,17 +1467,26 @@ fn fmt_dbfs(db: f64) -> String {
 ///
 /// Replace a missing-device (`DeviceNotFound`) error with guidance to run on real hardware.
 fn describe_error(err: Error) -> String {
-    match err {
+    let mut message = match &err {
         Error::DeviceNotFound => {
             "The specified device/endpoint was not found. Check the ID with `--list-devices`."
                 .into()
         }
-        error @ Error::PermissionDenied { .. } => error.to_string(),
+        error if error.permission().is_some() => err.to_string(),
         Error::DeviceLost => {
             "The input device was lost during capture (for example, disconnected).".into()
         }
-        other => format!("Failed to initialize stream: {other}"),
+        _ => format!("Failed to initialize stream: {err}"),
+    };
+    // The user's terminal explicitly opts into structured permission diagnostics.
+    // Display remains safe for other library consumers, including wrapped errors.
+    if let Error::PermissionDenied { detail, .. } = err.root() {
+        if !detail.is_empty() {
+            message.push_str("\nPermission detail: ");
+            message.push_str(detail);
+        }
     }
+    message
 }
 
 #[cfg(test)]
@@ -1766,7 +1781,8 @@ mod tests {
             .expect_err("confirmed denial must fail the capture loop");
             let message = describe_error(error);
             assert!(message.contains(&permission.to_string()));
-            assert!(message.contains("denied by user"));
+            assert!(message.contains("recording permission denied"));
+            assert!(message.contains("Permission detail: denied by user"));
             assert!(message.contains("Restart"));
         }
         report_capture_event(flexaudio::Event::SilenceWhileSourceActive {
@@ -1922,6 +1938,7 @@ mod tests {
     /// Create a test chunk with identical interleaved samples.
     fn chunk_of(frames: usize, channels: usize, value: f32) -> AudioChunk {
         AudioChunk {
+            frame_index: 0,
             data: vec![value; frames * channels],
             frames,
             pts_ns: 0,
@@ -1965,6 +1982,7 @@ mod tests {
             .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
             .collect();
         let chunk = AudioChunk {
+            frame_index: 0,
             data,
             frames: 320,
             pts_ns: 0,
@@ -2254,12 +2272,23 @@ mod tests {
         assert!(err.contains("cannot be combined"), "err: {err}");
     }
 
+    /// A recording deadline that no clock can reach (--seconds near u64::MAX) is rejected by `run`
+    /// with the overflow InvalidArg *before* the stream is opened/started: the returned message is
+    /// the preflight overflow error, not a device/open error, and no device is required here.
+    #[test]
+    fn run_rejects_duration_overflow_before_opening_stream() {
+        let cli = cli_from(&["--seconds", "18446744073709551615"]);
+        let err = run(&cli).expect_err("overflow must be rejected before open");
+        assert!(err.contains("deadline overflows the clock"), "err: {err}");
+    }
+
     /// s16 quantization in `write_chunk`: f32 -> i16. Uses the shared canonical `quantize_i16`
     /// (scale 32768, round, clamp, NaN->0). Negative full scale `-1.0` becomes `-32768`; values
     /// outside the range saturate.
     #[test]
     fn write_chunk_s16_quantizes_and_clamps() {
         let chunk = AudioChunk {
+            frame_index: 0,
             // 0.0 / 1.0 / -1.0 / out-of-range 2.0 (-> clamp 32767) / -2.0 (-> clamp -32768).
             data: vec![0.0, 1.0, -1.0, 2.0, -2.0],
             frames: 5,
@@ -2286,6 +2315,7 @@ mod tests {
     #[test]
     fn write_chunk_f32_roundtrips() {
         let chunk = AudioChunk {
+            frame_index: 0,
             data: vec![0.25, -0.5, 0.75],
             frames: 3,
             pts_ns: 0,
@@ -2311,5 +2341,294 @@ mod tests {
     fn fmt_dbfs_finite_and_infinite() {
         assert!(fmt_dbfs(-6.0).contains("dBFS"));
         assert!(fmt_dbfs(f64::NEG_INFINITY).contains("silence"));
+    }
+}
+
+#[cfg(test)]
+mod reproduction_tests {
+    use super::*;
+    fn cli_from(args: &[&str]) -> Cli {
+        let mut full = vec!["flexaudio-cli"];
+        full.extend_from_slice(args);
+        Cli::try_parse_from(full).unwrap()
+    }
+    fn test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("flexaudio-repro-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    // Offline audit reproductions. These exercise the existing CLI paths without devices.
+    struct ReproFinalEventBackend {
+        inner: flexaudio::MockBackend,
+        stopped: bool,
+        final_events: std::collections::VecDeque<flexaudio::Event>,
+        running_events: std::collections::VecDeque<flexaudio::Event>,
+        cleanup_error: Option<Error>,
+    }
+
+    impl flexaudio::core::CaptureBackend for ReproFinalEventBackend {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 1)
+        }
+        fn start(&mut self, sink: flexaudio::core::RawSink) -> flexaudio::core::Result<()> {
+            self.inner.start(sink)
+        }
+        fn stop(&mut self) {
+            self.inner.stop();
+            self.stopped = true;
+        }
+        fn stop_checked(&mut self) -> flexaudio::core::Result<()> {
+            self.stop();
+            self.cleanup_error.take().map_or(Ok(()), Err)
+        }
+        fn poll_event(&mut self) -> Option<flexaudio::Event> {
+            if self.stopped {
+                self.final_events.pop_front()
+            } else {
+                self.running_events.pop_front()
+            }
+        }
+    }
+
+    fn repro_wav_capture(final_event: Option<flexaudio::Event>) -> std::result::Result<(), String> {
+        repro_capture_events(Vec::new(), final_event.into_iter().collect(), None)
+    }
+
+    fn repro_capture_events(
+        running_events: Vec<flexaudio::Event>,
+        final_events: Vec<flexaudio::Event>,
+        cleanup_error: Option<Error>,
+    ) -> std::result::Result<(), String> {
+        static NEXT_CAPTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = test_dir(&format!(
+            "capture-{}",
+            NEXT_CAPTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut cli = cli_from(&["--seconds", "1"]);
+        cli.out = dir.join("rec.wav");
+        let config = StreamConfig::default();
+        let output = config.output;
+        let backend = ReproFinalEventBackend {
+            inner: flexaudio::MockBackend::new(48_000, 1, 440.0),
+            stopped: false,
+            final_events: final_events.into(),
+            running_events: running_events.into(),
+            cleanup_error,
+        };
+        let mut stream = Stream::open(config, Box::new(backend)).expect("mock open");
+        stream.start().expect("mock start");
+        let result = run_wav(&cli, &mut stream, output, None);
+        stream.stop();
+        assert!(
+            stream.poll_event().is_none(),
+            "all final diagnostics must be drained"
+        );
+        if result.is_ok() {
+            assert!(
+                hound::WavReader::open(&cli.out).unwrap().duration() > 0,
+                "successful warning-only recording must still deliver audio"
+            );
+        }
+        std::fs::remove_dir_all(dir).expect("remove test output");
+        result
+    }
+
+    #[test]
+    fn repro_p12_f48_legacy_fatal_final_event() {
+        let result = repro_wav_capture(Some(flexaudio::Event::Error(
+            "normalizer push failed: injected fatal DSP failure".into(),
+        )));
+        assert!(
+            result.is_err(),
+            "fatal final event was reported but recording returned success"
+        );
+    }
+
+    #[test]
+    fn repro_p12_f48_control_and_typed_terminal() {
+        assert!(repro_wav_capture(None).is_ok());
+        let result = repro_wav_capture(Some(flexaudio::Event::TerminalError {
+            error: Error::Backend("injected terminal failure".into()),
+        }));
+        assert!(result
+            .expect_err("typed final error must fail")
+            .contains("injected terminal failure"));
+    }
+
+    #[test]
+    fn repro_p12_reopen_warnings_continue_until_recovery() {
+        use flexaudio::core::{ErrorContext, Operation};
+        let warning = || flexaudio::Event::RecoverableError {
+            error: Error::Backend("normalizer push failed: recoverable reopen failure".into())
+                .with_context(ErrorContext::new(Operation::Reopen)),
+        };
+        repro_capture_events(
+            vec![warning(), warning(), flexaudio::Event::StreamRecovered],
+            vec![
+                warning(),
+                flexaudio::Event::Clipped,
+                flexaudio::Event::PermissionGranted,
+                flexaudio::Event::AudioLoss {
+                    loss: flexaudio::core::AudioLoss::raw_overflow(
+                        None,
+                        std::num::NonZeroU64::new(4),
+                        48_000,
+                        1,
+                    )
+                    .unwrap(),
+                },
+            ],
+            None,
+        )
+        .expect("typed reopen warnings must continue recording, even at final drain");
+    }
+
+    #[test]
+    fn repro_p12_poll_panic_warning_does_not_fail_recording() {
+        repro_capture_events(
+            vec![flexaudio::Event::RecoverableError {
+                error: Error::Backend("backend event polling panicked".into()),
+            }],
+            Vec::new(),
+            None,
+        )
+        .expect("typed poll panic warning must permit clean completion");
+    }
+
+    #[test]
+    fn repro_p12_shutdown_failure_drains_and_fails() {
+        let error = repro_capture_events(
+            Vec::new(),
+            vec![
+                flexaudio::Event::ShutdownError {
+                    error: Error::Backend("cleanup failed".into()),
+                },
+                flexaudio::Event::Clipped,
+                flexaudio::Event::PermissionGranted,
+            ],
+            Some(Error::Backend("producer shutdown failed".into())),
+        )
+        .expect_err("cleanup failure must fail even after a valid recording");
+        assert!(error.contains("producer shutdown failed"));
+    }
+
+    #[test]
+    fn typed_fatality_and_legacy_redaction_do_not_depend_on_text() {
+        for message in [
+            "reopen failed: secret-token",
+            "normalizer push failed: secret-token",
+        ] {
+            let error = report_capture_event(flexaudio::Event::Error(message.into())).unwrap_err();
+            let displayed = describe_error(error);
+            assert!(displayed.contains("legacy capture failure"));
+            assert!(!displayed.contains("secret-token"));
+            report_capture_event(flexaudio::Event::RecoverableError {
+                error: Error::Backend("normalizer push failed: recoverable warning".into()),
+            })
+            .expect("the event type determines fatality");
+        }
+    }
+
+    #[test]
+    fn wrapped_permission_detail_follows_safe_guidance() {
+        use flexaudio::core::{ErrorContext, ErrorGroup, Operation};
+        let error = Error::Multiple(ErrorGroup::new(
+            Error::PermissionDenied {
+                permission: flexaudio::Permission::SystemAudio,
+                detail: "target process access restricted".into(),
+            }
+            .with_context(ErrorContext::new(Operation::Start)),
+            Error::Backend("cleanup failed".into()),
+            Vec::new(),
+        ));
+        assert!(!error
+            .to_string()
+            .contains("target process access restricted"));
+        let message = describe_error(error);
+        assert!(
+            message.find("recording permission denied").unwrap()
+                < message
+                    .find("Permission detail: target process access restricted")
+                    .unwrap()
+        );
+        assert!(message.contains("related failure: backend error: cleanup failed"));
+    }
+
+    #[test]
+    fn config_error_keeps_library_message_and_default_chunk_duration() {
+        let cli = cli_from(&[]);
+        assert_eq!(config_for_kind(&cli, SourceKind::Mic).chunk_ms, 20);
+        let config = StreamConfig {
+            chunk_ms: 10,
+            ..StreamConfig::default()
+        };
+        let error = match Stream::open(
+            config,
+            Box::new(flexaudio::MockBackend::new(48_000, 1, 0.0)),
+        ) {
+            Ok(_) => panic!("non-20 chunk duration must fail before capture"),
+            Err(error) => error,
+        };
+        let safe_message = error.to_string();
+        assert!(describe_error(error).contains(&safe_message));
+        assert!(Cli::try_parse_from(["flexaudio-cli", "--chunk-ms", "10"]).is_err());
+    }
+
+    #[test]
+    fn repro_p12_f50_split_overflow() {
+        let cli = cli_from(&["--split-seconds", "18446744073709551615"]);
+        let result = std::panic::catch_unwind(|| {
+            RotatingWavWriter::new(
+                Path::new("unused.wav"),
+                cli.output_format(),
+                cli.split_seconds,
+            )
+        });
+        assert!(result.is_ok(), "accepted split duration must not panic");
+    }
+
+    #[test]
+    fn repro_p12_f50_deadline_overflow() {
+        let cli = cli_from(&["--seconds", "18446744073709551615"]);
+        let config = StreamConfig::default();
+        let output = config.output;
+        let mut stream = Stream::open(
+            config,
+            Box::new(flexaudio::MockBackend::new(48_000, 1, 0.0)),
+        )
+        .expect("mock open");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_wav(&cli, &mut stream, output, None)
+        }));
+        stream.stop();
+        assert!(result.is_ok(), "accepted recording duration must not panic");
+    }
+
+    #[test]
+    fn repro_p12_f50_control() {
+        let cli = cli_from(&["--split-seconds", "1"]);
+        let writer = RotatingWavWriter::new(
+            Path::new("unused.wav"),
+            cli.output_format(),
+            cli.split_seconds,
+        );
+        assert_eq!(writer.frames_per_file, u64::from(cli.output_rate));
+        assert!(Instant::now()
+            .checked_add(Duration::from_secs(cli.seconds))
+            .is_some());
+    }
+
+    #[test]
+    fn repro_p12_split_path_and_permission_controls() {
+        assert!(validate_output_path(Path::new(".")).is_err());
+        assert!(validate_output_path(Path::new("recording.wav")).is_ok());
+        let message = describe_error(Error::PermissionDenied {
+            permission: flexaudio::Permission::SystemAudio,
+            detail: "target process access restricted".into(),
+        });
+        assert!(message.contains("system audio"));
+        assert!(message.contains("target process access restricted"));
+        assert!(!message.contains("Microphone permission denied"));
     }
 }

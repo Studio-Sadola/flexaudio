@@ -6,9 +6,9 @@
 //!
 //! OS backend differences are hidden behind the private `DeviceWatchBackend` trait:
 //! - Linux: `PwDeviceWatcher` persistently monitors the PipeWire registry (`flexaudio-os-linux`).
-//! - Other OSes / degraded mode: `NoopWatcher` always returns `None`.
+//! - Other OSes: `NoopWatcher` always returns `None`.
 //!
-//! [`crate::watch_devices`] handles cfg and degraded-mode decisions, boxes the appropriate
+//! [`crate::watch_devices`] handles platform selection, boxes the appropriate
 //! implementation, and returns a [`DeviceWatcher`].
 
 use flexaudio_core::types::DeviceEvent;
@@ -48,7 +48,7 @@ impl DeviceWatcher {
         self.inner.poll_event()
     }
 
-    /// Stop monitoring; [`poll_event`](Self::poll_event) returns `None` afterward.
+    /// Stop producers and retain pending events for [`poll_event`](Self::poll_event) to drain.
     /// Safe to call twice or before any events have been delivered. Also called on drop.
     pub fn stop(&mut self) {
         self.inner.stop();
@@ -61,13 +61,11 @@ impl Drop for DeviceWatcher {
     }
 }
 
-/// No-op watcher used on non-Linux systems or in degraded mode (always returns `None`).
-///
-/// If `PwDeviceWatcher::start()` returns `Err` because PipeWire is unavailable,
-/// `watch_devices()` degrades to this watcher and returns `Ok`. Hotplug events will never arrive,
-/// consistent with `devices()` returning an empty list while the daemon is down.
+/// Intentional no-op on unsupported platforms.
+#[cfg(any(test, not(target_os = "linux")))]
 struct NoopWatcher;
 
+#[cfg(any(test, not(target_os = "linux")))]
 impl DeviceWatchBackend for NoopWatcher {
     fn poll_event(&mut self) -> Option<DeviceEvent> {
         None
@@ -89,29 +87,25 @@ impl DeviceWatchBackend for flexaudio_os_linux::PwDeviceWatcher {
     }
 }
 
-/// Start OS device-change monitoring and return a [`DeviceWatcher`].
-///
-/// - Linux: Try `PwDeviceWatcher::start()` for persistent PipeWire monitoring and wrap it on
-///   success. On failure (such as missing PipeWire), degrade to [`NoopWatcher`] and return
-///   `Ok`, as `devices()` does for an unavailable daemon.
-/// - Other OSes: Always use [`NoopWatcher`].
+/// Linux startup failures are errors; unsupported platforms intentionally use no-op.
 pub(crate) fn watch_devices() -> flexaudio_core::types::Result<DeviceWatcher> {
     #[cfg(target_os = "linux")]
     {
-        let inner: Box<dyn DeviceWatchBackend> = match flexaudio_os_linux::PwDeviceWatcher::start()
-        {
-            Ok(w) => Box::new(w),
-            // Missing PipeWire or connection failure degrades to no-op (no change events).
-            Err(_) => Box::new(NoopWatcher),
-        };
-        Ok(DeviceWatcher { inner })
+        watcher_from_start(
+            flexaudio_os_linux::PwDeviceWatcher::start()
+                .map(|watcher| Box::new(watcher) as Box<dyn DeviceWatchBackend>),
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        Ok(DeviceWatcher {
-            inner: Box::new(NoopWatcher),
-        })
+        watcher_from_start(Ok(Box::new(NoopWatcher)))
     }
+}
+
+fn watcher_from_start(
+    start: flexaudio_core::Result<Box<dyn DeviceWatchBackend>>,
+) -> flexaudio_core::Result<DeviceWatcher> {
+    start.map(|inner| DeviceWatcher { inner })
 }
 
 #[cfg(test)]
@@ -138,14 +132,64 @@ mod tests {
         assert!(w.poll_event().is_none());
     }
 
-    /// `watch_devices()` returns `Ok(DeviceWatcher)` without panicking when PipeWire is absent
-    /// (it simply degrades to Noop). The returned watcher is safe to poll immediately and can
-    /// be stopped normally.
+    /// Missing PipeWire is a startup error under the selected 0.5 contract.
     #[test]
-    fn watch_devices_is_graceful_without_pipewire() {
-        let mut w = watch_devices().expect("watch_devices always returns Ok in degraded mode");
-        // Returns None in degraded mode; with PipeWire, initial-scan events may also be suppressed.
-        let _ = w.poll_event();
-        w.stop();
+    fn watcher_start_failure_returns_error() {
+        let error = flexaudio_core::Error::Backend("unavailable watcher".into());
+        assert!(
+            matches!(watcher_from_start(Err(error.clone())), Err(observed) if observed == error)
+        );
+    }
+}
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn repro_p2_watcher_start_error() {
+        // Environment is restricted to a child process, so concurrently running
+        // tests and the user's PipeWire session are untouched. No daemon is started.
+        if std::env::var_os("FLEXAUDIO_REPRO_WATCHER_CHILD").is_none() {
+            let directory = std::env::temp_dir()
+                .join(format!("flexaudio-repro-watcher-{}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "device_watcher::repro_tests::repro_p2_watcher_start_error",
+                    "--exact",
+                    "--include-ignored",
+                    "--nocapture",
+                ])
+                .env("FLEXAUDIO_REPRO_WATCHER_CHILD", "1")
+                .env("XDG_RUNTIME_DIR", &directory)
+                .env("PIPEWIRE_RUNTIME_DIR", &directory)
+                .env("PIPEWIRE_REMOTE", "absent-repro-server")
+                .output()
+                .unwrap();
+            std::fs::remove_dir(directory).unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            return;
+        }
+        let original = flexaudio_os_linux::PwDeviceWatcher::start()
+            .err()
+            .expect("fixture must fail native watcher startup");
+        let result = watch_devices();
+        assert!(
+            result.is_err(),
+            "F26: native startup error={original}; facade returned Ok(NoopWatcher)"
+        );
+    }
+    #[test]
+    fn repro_p2_watcher_start_error_control() {
+        // Intentional no-op is benign on unsupported platforms, unlike failed
+        // Linux startup. Exercise the same facade wrapper and pull interface.
+        let mut watcher = DeviceWatcher {
+            inner: Box::new(NoopWatcher),
+        };
+        assert!(watcher.poll_event().is_none());
+        watcher.stop();
     }
 }

@@ -3,6 +3,7 @@
 use flexaudio_core::types::{Error, Permission, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub(crate) enum Access {
     Allowed,
     DeniedByUser,

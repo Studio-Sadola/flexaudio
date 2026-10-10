@@ -198,15 +198,34 @@ fn mock_default_output_regression_with_peak_rms() {
     }
 }
 
-/// Integrated `devices()` enumeration returns `Ok(Vec)` without panicking, and every
+/// Integrated `devices()` enumeration returns a complete inventory or a discovery error, and every
 /// DeviceInfo satisfies its invariants (nonempty id / loopback matches source_kind / positive
-/// rate and channel count). Headless/CI environments may have no devices and return an empty
-/// Vec; that is valid too (the key requirement is no panic).
+/// rate and channel count). A completed empty inventory is valid. Headless/CI environments
+/// without PipeWire return a backend error with Enumerate context, never partial success.
 #[test]
 fn devices_enumeration_never_panics_and_is_consistent() {
-    use flexaudio::core::types::SourceKind;
+    use flexaudio::{Error, ErrorKind, Operation, SourceKind};
 
-    let devices = flexaudio::devices().expect("devices() is designed not to return Err");
+    let devices = match flexaudio::devices() {
+        Ok(devices) => devices,
+        Err(error) => {
+            assert!(matches!(
+                error.root().kind(),
+                ErrorKind::Backend | ErrorKind::Unsupported | ErrorKind::PermissionDenied
+            ));
+            if error.kind() == ErrorKind::Backend {
+                let Error::Context { source, context } = &error else {
+                    panic!("discovery failure must retain Enumerate context");
+                };
+                assert_eq!(context.operation(), Operation::Enumerate);
+                assert!(
+                    matches!(source.as_ref(), Error::Backend(_)),
+                    "discovery context must be attached once"
+                );
+            }
+            return;
+        }
+    };
     for d in &devices {
         assert!(!d.id.is_empty(), "id (stable key) is nonempty");
         assert!(d.sample_rate > 0, "sample_rate is positive");

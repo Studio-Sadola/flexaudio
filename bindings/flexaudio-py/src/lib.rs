@@ -38,10 +38,14 @@ use fa::{ProcessMode, SourceKind};
 mod config;
 mod denoise;
 mod encode;
+mod errors;
 mod marshal;
 mod stream;
 mod vad;
 mod watcher;
+mod whisper_buffer;
+mod whisper_marshal;
+mod whisper_vad;
 
 use marshal::{device_info_to_py, process_info_to_py};
 
@@ -49,15 +53,7 @@ use marshal::{device_info_to_py, process_info_to_py};
 // Error conversion
 // ---------------------------------------------------------------------------
 
-/// Convert flexaudio::Error to a Python exception. Argument errors become `ValueError`; others become `RuntimeError`.
-/// Both preserve the message from Display.
-pub(crate) fn to_py_err(err: fa::Error) -> PyErr {
-    let msg = err.to_string();
-    match err {
-        fa::Error::InvalidArg(_) | fa::Error::UnsupportedFormat(_) => PyValueError::new_err(msg),
-        _ => PyRuntimeError::new_err(msg),
-    }
-}
+pub(crate) use errors::to_py_err;
 
 /// Convert VadError to a Python exception. Invalid configuration becomes `ValueError`; model loading and inference failures
 /// become `RuntimeError`.
@@ -143,7 +139,9 @@ pub(crate) fn bool_repr(b: bool) -> &'static str {
 // Module functions
 // ---------------------------------------------------------------------------
 
-/// List available devices. An empty list is valid in a headless environment.
+/// List the complete device inventory. An empty complete inventory is valid.
+/// Incomplete or failed discovery raises a typed exception, including when the
+/// PipeWire daemon is unreachable on Linux.
 #[pyfunction]
 fn devices() -> PyResult<Vec<marshal::PyDeviceInfo>> {
     let list = fa::devices().map_err(to_py_err)?;
@@ -171,6 +169,7 @@ fn processes(py: Python<'_>) -> PyResult<Vec<marshal::PyProcessInfo>> {
 /// Python module `flexaudio`.
 #[pymodule]
 fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    errors::register(m)?;
     // Functions.
     m.add_function(wrap_pyfunction!(devices, m)?)?;
     m.add_function(wrap_pyfunction!(processes, m)?)?;
@@ -187,6 +186,7 @@ fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<marshal::PyDeviceEvent>()?;
 
     // Standalone addons and monitoring.
+    whisper_vad::register(m)?;
     m.add_class::<vad::Vad>()?;
     m.add_class::<denoise::Denoiser>()?;
     m.add_class::<encode::FlacEncoder>()?;
@@ -253,6 +253,7 @@ mod tests {
 
     #[test]
     fn to_py_err_maps_variants_without_panic() {
+        Python::initialize();
         // Type selection needs no Python runtime (match only). The message comes from Display.
         let err = fa::Error::DeviceNotFound;
         assert!(err.to_string().contains("device not found"));
@@ -268,5 +269,90 @@ mod tests {
         let _ = vad_err_to_py(flexaudio_vad::VadError::ModelLoad("x".into()));
         let _ = denoise_err_to_py(flexaudio_denoise::DenoiseError::InvalidChannels(3));
         let _ = encode_err_to_py(flexaudio_encode::EncodeError::Unsupported("x".into()));
+    }
+}
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+    #[test]
+    fn repro_p10_f44_device_errors_keep_distinct_kinds() {
+        Python::initialize();
+        Python::attach(|py| {
+            let missing = to_py_err(fa::Error::DeviceNotFound);
+            let lost = to_py_err(fa::Error::DeviceLost);
+            assert!(
+                !missing.get_type(py).is(lost.get_type(py)),
+                "DeviceNotFound and DeviceLost both map to RuntimeError with no typed kind"
+            );
+        });
+    }
+    #[test]
+    fn repro_p10_control_invalid_arg_is_value_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            let error = to_py_err(fa::Error::InvalidArg("benign validation".into()));
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert!(error.to_string().contains("benign validation"));
+            let payload = error.value(py).getattr("audio_error").unwrap();
+            let payload = payload
+                .extract::<PyRef<'_, crate::errors::AudioError>>()
+                .unwrap();
+            assert!(
+                matches!(&payload.0, fa::Error::InvalidArg(detail) if detail == "benign validation")
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use pyo3::types::PyDict;
+
+    #[test]
+    fn non_twenty_chunk_duration_rejects_before_addons_or_device_access() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "flexaudio").unwrap();
+            flexaudio(&module).unwrap();
+            let locals = PyDict::new(py);
+            locals.set_item("flexaudio", module).unwrap();
+            py.run(
+                pyo3::ffi::c_str!(
+                    r#"
+failures = []
+for duration in (0, 10, 40, 4294967295):
+    try:
+        flexaudio.open('mic', chunk_ms=duration, denoise=True, output_rate=16000,
+                       vad={'threshold': 'invalid'})
+    except flexaudio.InvalidArgumentError as error:
+        assert error.audio_error.kind == 'invalidArg'
+        assert 'chunk_ms' in str(error)
+        failures.append(error.audio_error)
+    else:
+        raise AssertionError('unsupported chunk duration was accepted')
+"#
+                ),
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            for payload in locals
+                .get_item("failures")
+                .unwrap()
+                .unwrap()
+                .try_iter()
+                .unwrap()
+            {
+                let payload = payload.unwrap();
+                let payload = payload
+                    .extract::<PyRef<'_, crate::errors::AudioError>>()
+                    .unwrap();
+                assert!(
+                    matches!(&payload.0, fa::Error::InvalidArg(detail) if detail.contains("chunk_ms"))
+                );
+            }
+        });
     }
 }

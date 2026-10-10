@@ -65,6 +65,7 @@ struct RegistrySnapshot {
 
 /// Typed internal failures, rendered at the existing public `Error::Backend` boundary.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 enum SnapshotError {
     Query {
         operation: &'static str,
@@ -96,14 +97,16 @@ impl std::fmt::Display for SnapshotError {
             Self::Bind { node_id, cause } => {
                 write!(f, "pipewire bind output node {node_id} failed: {cause}")
             }
-            Self::Callback { callback, cause } => {
-                write!(f, "pipewire {callback} callback panicked: {cause}")
+            Self::Callback { callback, .. } => {
+                write!(f, "pipewire {callback} callback rejected")
             }
             Self::Core {
-                object_id,
-                code,
-                cause,
-            } => write!(f, "pipewire object {object_id} error {code}: {cause}"),
+                object_id, code, ..
+            } => write!(
+                f,
+                "pipewire object {object_id} error {code}: {}",
+                std::io::Error::from_raw_os_error(code.saturating_neg())
+            ),
             Self::Incomplete => write!(
                 f,
                 "pipewire registry sync did not complete within {} ms",
@@ -130,17 +133,14 @@ fn run_callback(
     callback: &'static str,
     body: impl FnOnce(),
 ) {
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(body)) {
-        let cause = payload
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| {
-                payload
-                    .downcast_ref::<&str>()
-                    .map(|message| (*message).to_string())
-            })
-            .unwrap_or_else(|| "non-string panic payload".into());
-        record_failure(failure, SnapshotError::Callback { callback, cause });
+    if catch_unwind(AssertUnwindSafe(body)).is_err() {
+        record_failure(
+            failure,
+            SnapshotError::Callback {
+                callback,
+                cause: "callback rejected".into(),
+            },
+        );
     }
 }
 
@@ -150,9 +150,16 @@ fn run_callback(
 /// mandatory output-node PIDs. Only a completed empty query returns `Ok([])`. Executable names
 /// and activity remain optional metadata.
 pub fn list_processes() -> Result<Vec<ProcessInfo>> {
-    let snapshot = collect_snapshot().map_err(|error| Error::Backend(error.to_string()))?;
-    build_process_list(&snapshot, read_executable)
-        .map_err(|error| Error::Backend(error.to_string()))
+    let snapshot = collect_snapshot().map_err(|error| {
+        Error::Backend(error.to_string()).with_context(flexaudio_core::ErrorContext::new(
+            flexaudio_core::Operation::Enumerate,
+        ))
+    })?;
+    build_process_list(&snapshot, read_executable).map_err(|error| {
+        Error::Backend(error.to_string()).with_context(flexaudio_core::ErrorContext::new(
+            flexaudio_core::Operation::Enumerate,
+        ))
+    })
 }
 
 /// Convert collection results to a raw list, rejecting unresolved mandatory PIDs.
@@ -785,7 +792,7 @@ mod tests {
             finish_snapshot(true, failure.take(), snap).unwrap_err(),
             SnapshotError::Callback {
                 callback: "registry global",
-                cause: "synthetic callback failure".into(),
+                cause: "callback rejected".into(),
             }
         );
     }
@@ -801,7 +808,30 @@ mod tests {
             finish_snapshot(true, Some(error), RegistrySnapshot::default())
                 .unwrap_err()
                 .to_string(),
-            "pipewire object 9 error -5: I/O failure"
+            format!(
+                "pipewire object 9 error -5: {}",
+                std::io::Error::from_raw_os_error(5)
+            )
         );
+    }
+
+    #[test]
+    fn error_display_omits_untrusted_core_and_panic_text() {
+        let private_metadata = "private application name and executable path";
+        for error in [
+            SnapshotError::Core {
+                object_id: 9,
+                code: -5,
+                cause: private_metadata.into(),
+            },
+            SnapshotError::Callback {
+                callback: "registry global",
+                cause: private_metadata.into(),
+            },
+        ] {
+            let message = error.to_string();
+            assert!(message.starts_with("pipewire"));
+            assert!(!message.contains(private_metadata));
+        }
     }
 }

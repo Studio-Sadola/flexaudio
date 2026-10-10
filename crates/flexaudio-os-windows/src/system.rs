@@ -29,7 +29,10 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use flexaudio_core::backend::{CaptureBackend, RawSink};
-use flexaudio_core::types::{DeviceInfo, Error, ProcessMode, Result, SourceKind};
+use flexaudio_core::types::{DeviceInfo, Error, Event, ProcessMode, Result, SourceKind};
+
+use crate::owner::{join_owner, OwnerShutdown};
+use flexaudio_core::{ErrorContext, Operation, ShutdownReport};
 
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::{
@@ -39,8 +42,8 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
 
 use crate::common::{
-    capture_loop, init_loopback_capture, map_hr, parse_mix_format, CaptureSetup, ComThread,
-    EventHandle,
+    capture_loop, init_loopback_capture, map_hr, map_hr_at, parse_mix_format, CaptureSetup,
+    ComThread, EventHandle,
 };
 use crate::format::{native_format_from_source, verify_format};
 use crate::keepalive::SilentRender;
@@ -87,9 +90,10 @@ pub struct WasapiSystemBackend {
     /// Running flag (guards duplicate starts, signals stop, and supports drop checks). `Send`.
     stop_flag: Arc<AtomicBool>,
     /// Handle for the thread that owns COM and capture (`Some` after start).
-    handle: Option<JoinHandle<Result<()>>>,
+    handle: Option<JoinHandle<ShutdownReport>>,
     /// Runtime failure reported once by the next start (watchdog reopen).
     pending_error: Option<Error>,
+    shutdown: OwnerShutdown,
     /// Last queried format, refreshed before constructing each classic-loopback sink.
     /// While running, retain the format with which that sink was configured.
     native: Cell<(u32, u16)>,
@@ -121,6 +125,7 @@ impl WasapiSystemBackend {
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
             pending_error: None,
+            shutdown: OwnerShutdown::default(),
             native: Cell::new(native),
         }
     }
@@ -272,8 +277,13 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
     let _com = ComThread::new();
     unsafe {
         let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                .map_err(|e| map_hr("CoCreateInstance(MMDeviceEnumerator)", e))?;
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| {
+                map_hr_at(
+                    Operation::Enumerate,
+                    "CoCreateInstance(MMDeviceEnumerator)",
+                    e,
+                )
+            })?;
 
         // Default render FriendlyName, used to set is_default. Continue if unavailable.
         let default_name = enumerator
@@ -283,10 +293,16 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
 
         let collection = enumerator
             .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
-            .map_err(|e| map_hr("IMMDeviceEnumerator::EnumAudioEndpoints", e))?;
+            .map_err(|e| {
+                map_hr_at(
+                    Operation::Enumerate,
+                    "IMMDeviceEnumerator::EnumAudioEndpoints",
+                    e,
+                )
+            })?;
         let count = collection
             .GetCount()
-            .map_err(|e| map_hr("IMMDeviceCollection::GetCount", e))?;
+            .map_err(|e| map_hr_at(Operation::Enumerate, "IMMDeviceCollection::GetCount", e))?;
 
         let mut out = Vec::with_capacity(count as usize);
         for i in 0..count {
@@ -352,6 +368,12 @@ impl CaptureBackend for WasapiSystemBackend {
         if let Some(error) = self.pending_error.take() {
             return Err(error);
         }
+        if exclude_root.is_some() {
+            verify_format(
+                PROCESS_LOOPBACK_FORMAT,
+                (sink.native_rate(), sink.native_channels()),
+            )?;
+        }
         // Reset the flag so start can run again after a previous stop.
         self.stop_flag.store(false, Ordering::SeqCst);
 
@@ -359,43 +381,61 @@ impl CaptureBackend for WasapiSystemBackend {
         let device_id = self.device_id.clone();
         // Channel for synchronously returning setup status (COM init through successful Start).
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        let (event_tx, event_rx) = mpsc::channel();
 
         let handle = thread::Builder::new()
             .name("flexaudio-wasapi-system".into())
-            .spawn(move || run_system_thread(exclude_root, device_id, sink, stop_flag, ready_tx))
-            .map_err(|e| Error::Backend(format!("spawn wasapi system thread: {e}")))?;
+            .spawn(move || {
+                run_system_thread(exclude_root, device_id, sink, stop_flag, ready_tx, event_tx)
+            })
+            .map_err(|_| {
+                self.stop_flag.store(true, Ordering::SeqCst);
+                Error::Backend("capture owner thread could not be started".into())
+                    .with_context(ErrorContext::new(Operation::Start))
+            })?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.handle = Some(handle);
+                self.shutdown.reset(event_rx);
                 Ok(())
             }
             Ok(Err(e)) => {
                 // Setup failed. Join because the thread exits just after sending ready.
-                self.stop_flag.store(false, Ordering::SeqCst);
-                let _ = handle.join();
-                Err(e)
+                self.stop_flag.store(true, Ordering::SeqCst);
+                ShutdownReport::new(Some(e), join_owner(handle).cleanup().to_vec()).result()
             }
             Err(_) => {
-                self.stop_flag.store(false, Ordering::SeqCst);
-                let _ = handle.join();
-                Err(Error::Backend(
-                    "wasapi system thread exited before reporting readiness".into(),
-                ))
+                self.stop_flag.store(true, Ordering::SeqCst);
+                ShutdownReport::new(
+                    Some(
+                        Error::Backend("capture owner exited before reporting readiness".into())
+                            .with_context(ErrorContext::new(Operation::Start)),
+                    ),
+                    join_owner(handle).cleanup().to_vec(),
+                )
+                .result()
             }
         }
     }
 
     fn stop(&mut self) {
-        // Safe for reentrant and duplicate stop calls.
+        let _ = self.stop_checked();
+    }
+
+    fn stop_checked(&mut self) -> Result<()> {
         self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
-            self.pending_error = match h.join() {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(error),
-                Err(_) => Some(Error::Backend("WASAPI system owner thread panicked".into())),
-            };
+        let handle = self.handle.take();
+        let joined_owner = handle.is_some();
+        let result = self.shutdown.finish(handle);
+        if joined_owner {
+            self.pending_error = result.as_ref().err().cloned();
         }
+        result
+    }
+
+    fn poll_event(&mut self) -> Option<Event> {
+        self.shutdown.poll_event()
     }
 }
 
@@ -425,7 +465,8 @@ fn run_system_thread(
     sink: RawSink,
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<()>>,
-) -> Result<()> {
+    event_tx: mpsc::Sender<Event>,
+) -> ShutdownReport {
     // Initialize COM on this thread (uninitialize on drop). Declared first, dropped last.
     let _com = ComThread::new();
 
@@ -444,11 +485,11 @@ fn run_system_thread(
         Ok(t) => t,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
-            return Ok(());
+            return ShutdownReport::new(None, Vec::new());
         }
     };
 
-    unsafe { capture_loop(setup, sink, &stop_flag, ready_tx) }
+    unsafe { capture_loop(setup, sink, &stop_flag, ready_tx, event_tx) }
 }
 
 /// Set up classic loopback on the render endpoint selected by `device_id` (`None`
@@ -482,8 +523,7 @@ unsafe fn setup_system_loopback(device_id: Option<&str>, sink: &RawSink) -> Resu
     let setup = (|| {
         let format = parse_mix_format(pwfx)?;
         verify_format(format, (sink.native_rate(), sink.native_channels()))?;
-        let keepalive = SilentRender::new(&device, pwfx)
-            .map_err(|e| keepalive_error("cannot create classic loopback silent keepalive", e))?;
+        let keepalive = SilentRender::new(&device, pwfx).map_err(keepalive_error)?;
         let (capture, event) = init_loopback_capture(&client, pwfx, 0)?;
         Ok(CaptureSetup {
             client,
@@ -501,6 +541,59 @@ unsafe fn setup_system_loopback(device_id: Option<&str>, sink: &RawSink) -> Resu
 mod tests {
     use super::*;
     use flexaudio_core::raw_ring;
+
+    #[test]
+    fn checked_stop_after_capture_failure_keeps_primary_and_cleanup() {
+        let mut backend = WasapiSystemBackend::new(true, None);
+        let primary = crate::common::map_hr(
+            "IAudioCaptureClient::ReleaseBuffer",
+            windows::core::Error::from(windows::core::HRESULT(0x80070005u32 as i32)),
+        );
+        let cleanup = Error::Backend("injected capture stop failure".into())
+            .with_context(ErrorContext::new(Operation::Stop));
+        let (event_tx, event_rx) = mpsc::channel();
+        backend.shutdown.reset(event_rx);
+        let capture_error = primary.clone();
+        let stop_error = cleanup.clone();
+        backend.handle = Some(thread::spawn(move || {
+            crate::owner::finish_capture(Err(capture_error), || Err(stop_error), &event_tx)
+        }));
+
+        let result = backend.stop_checked();
+        let Error::Multiple(group) = result.as_ref().unwrap_err() else {
+            panic!("capture and cleanup failures must both survive")
+        };
+        assert_eq!(group.primary(), &primary);
+        assert_eq!(group.secondary().next(), Some(&cleanup));
+        assert!(
+            matches!(backend.poll_event(), Some(Event::TerminalError { error }) if error == primary)
+        );
+        assert!(
+            matches!(backend.poll_event(), Some(Event::ShutdownError { error }) if error == cleanup)
+        );
+        assert!(backend.poll_event().is_none());
+        assert_eq!(backend.stop_checked(), result);
+    }
+
+    #[test]
+    fn checked_system_stop_retains_owner_failure_once() {
+        // Exclusion construction avoids any endpoint queries.
+        let mut backend = WasapiSystemBackend::new(true, None);
+        backend.handle = Some(thread::spawn(|| {
+            ShutdownReport::new(None, vec![Error::DeviceLost])
+        }));
+        let result = backend.stop_checked();
+        assert_eq!(
+            result.as_ref().unwrap_err().kind(),
+            flexaudio_core::ErrorKind::DeviceLost
+        );
+        assert_eq!(backend.stop_checked(), result);
+        assert!(matches!(
+            backend.poll_event(),
+            Some(Event::ShutdownError { .. })
+        ));
+        assert!(backend.poll_event().is_none());
+    }
 
     /// `new` and `native_format` do not panic, whether or not a render endpoint exists.
     #[test]
@@ -705,54 +798,50 @@ mod tests {
 
     #[test]
     fn keepalive_setup_context_preserves_classified_hresult_variants() {
+        use flexaudio_core::{ErrorKind, NativeStatus};
         use windows::core::HRESULT;
-
-        // E_ACCESSDENIED is a permission failure and keeps its typed variant.
-        let error = keepalive_error(
-            "cannot create classic loopback silent keepalive",
-            map_hr(
-                "Initialize",
-                windows::core::Error::from(HRESULT(0x80070005u32 as i32)),
-            ),
-        );
-        assert!(matches!(
-            error,
-            Error::PermissionDenied {
-                permission: flexaudio_core::types::Permission::SystemAudio,
-                detail,
-            } if !detail.is_empty()
-        ));
-        // Exclusive-mode conflicts are not permission problems: Backend, with context added.
-        for (code, cause) in [
-            (0x8889000Au32, "exclusive use"),
-            (0x8889000E, "exclusive audio mode is disallowed"),
+        for (code, kind) in [
+            (0x80070005u32, ErrorKind::PermissionDenied),
+            (0x8889000A, ErrorKind::Backend),
+            (0x8889000E, ErrorKind::Backend),
+            (0x88890004, ErrorKind::DeviceLost),
+            (0x80070490, ErrorKind::DeviceNotFound),
         ] {
-            let error = keepalive_error(
-                "cannot create classic loopback silent keepalive",
-                map_hr(
-                    "Initialize",
-                    windows::core::Error::from(HRESULT(code as i32)),
-                ),
+            let error = keepalive_error(map_hr(
+                "Initialize",
+                windows::core::Error::from(HRESULT(code as i32)),
+            ));
+            assert_eq!(error.kind(), kind);
+            match code {
+                0x80070005 => {
+                    assert_eq!(
+                        error.permission(),
+                        Some(flexaudio_core::Permission::SystemAudio)
+                    );
+                    assert!(
+                        matches!(error.root(), Error::PermissionDenied { detail, .. } if !detail.is_empty())
+                    );
+                }
+                0x8889000A => assert!(error.to_string().contains("exclusive use")),
+                0x8889000E => assert!(error
+                    .to_string()
+                    .contains("exclusive audio mode is disallowed")),
+                _ => {}
+            }
+            let Error::Context { source, context } = error else {
+                panic!("missing startup context")
+            };
+            assert_eq!(context.operation(), Operation::Start);
+            let Error::Context { context, .. } = *source else {
+                panic!("missing native context")
+            };
+            assert_eq!(
+                context.native_status(),
+                Some(NativeStatus::HResult {
+                    call: "Initialize",
+                    bits: code
+                })
             );
-            assert!(
-                matches!(
-                    &error,
-                    Error::Backend(message)
-                        if message.starts_with("cannot create classic loopback silent keepalive: ")
-                            && message.contains(cause)
-                ),
-                "{code:#x}: {error:?}"
-            );
-        }
-        for code in [0x88890004u32, 0x80070490] {
-            let error = keepalive_error(
-                "cannot create classic loopback silent keepalive",
-                map_hr(
-                    "Initialize",
-                    windows::core::Error::from(HRESULT(code as i32)),
-                ),
-            );
-            assert!(matches!(error, Error::DeviceNotFound));
         }
     }
 

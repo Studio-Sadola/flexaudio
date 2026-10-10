@@ -120,6 +120,7 @@ mod tests {
 
     fn chunk(seq: u64) -> SecondaryChunk {
         SecondaryChunk {
+            frame_index: seq * 960,
             samples: vec![0.0; 320],
             frames: 320,
             pts_ns: seq as i64 * 20_000_000,
