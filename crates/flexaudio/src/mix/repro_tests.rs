@@ -10,6 +10,7 @@ struct Burst {
     sink: Option<RawSink>,
     terminal: bool,
     panic_stop: bool,
+    stops: Arc<AtomicU64>,
 }
 impl Burst {
     fn new(samples: usize) -> Self {
@@ -21,6 +22,7 @@ impl Burst {
             sink: None,
             terminal: false,
             panic_stop: false,
+            stops: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -35,6 +37,7 @@ impl CaptureBackend for Burst {
         Ok(())
     }
     fn stop(&mut self) {
+        self.stops.fetch_add(1, Ordering::SeqCst);
         if let Some(mut sink) = self.sink.take() {
             sink.push(&vec![0.25; self.final_samples], 0);
         }
@@ -82,9 +85,15 @@ fn child_overflow(overflow: bool) {
     let dropped = lost.load(Ordering::SeqCst);
     assert!(!overflow || dropped > 0, "fixture must overflow child ring");
     assert!(dropped == 0 || event.is_some(), "F08: child_dropped_samples={dropped}, delivered_mixed_samples={delivered}, event={event:?}; loss disappeared at mixer boundary");
+    if overflow {
+        assert!(matches!(event, Some(Event::AudioLoss { loss })
+            if loss.path() == AudioPath::Capture { lane: Some(MixLane::Microphone) }
+            && loss.reason() == LossReason::RawOverflow
+            && loss.samples().unwrap().get() == dropped
+            && (loss.sample_rate(), loss.channels()) == (48_000, 2)));
+    }
 }
 #[test]
-#[ignore = "repro: F08"]
 fn repro_p3_child_overflow() {
     child_overflow(true);
 }
@@ -95,14 +104,14 @@ fn repro_p3_child_overflow_control() {
 
 fn fifo_overflow(overflow: bool) {
     let mut be: Box<dyn CaptureBackend> = Box::new(Burst::new(1920));
-    let mut lane = start_child(&mut be).unwrap();
+    let mut lane = start_child(&mut be, MixLane::Microphone, Arc::new(Notices::default())).unwrap();
     if overflow {
         lane.fifo = vec![0.1; FIFO_MAX_SAMPLES];
     }
     let before = lane.fifo.len();
     lane.ingest(&mut vec![0.0; RAW_RING_SAMPLES]).unwrap();
     let after = lane.fifo.len();
-    let event = be.poll_event();
+    let event = lane.notices.poll();
     be.stop();
     let lost = before + 1920 - after;
     assert!(
@@ -110,9 +119,16 @@ fn fifo_overflow(overflow: bool) {
         "F08/M3: fifo_discarded_samples={lost}, child_ring_overflow={}, event={event:?}",
         lane.consumer.overflow_count()
     );
+    if overflow {
+        assert!(matches!(event, Some(Event::AudioLoss { loss })
+            if loss.path() == AudioPath::MixFifo { lane: MixLane::Microphone }
+            && loss.reason() == LossReason::MixFifoOverflow
+            && loss.samples().unwrap().get() == u64::try_from(lost).unwrap()
+            && (loss.sample_rate(), loss.channels()) == (48_000, 2)));
+    }
+    assert!(lane.notices.poll().is_none());
 }
 #[test]
-#[ignore = "repro: F08 / D M3"]
 fn repro_p3_fifo_overflow() {
     fifo_overflow(true);
 }
@@ -141,7 +157,6 @@ fn final_tail(late: bool) {
     );
 }
 #[test]
-#[ignore = "repro: F13"]
 fn repro_p3_final_tail() {
     final_tail(true);
 }
@@ -163,9 +178,15 @@ fn shutdown(panic: bool) {
         !panic || event.is_some(),
         "F37: child stop panic swallowed: event={event:?}"
     );
+    if panic {
+        assert!(
+            matches!(event, Some(Event::ShutdownError { error: Error::Context { context, .. } })
+            if context.operation() == Operation::Stop && context.lane() == Some(MixLane::Microphone))
+        );
+    }
+    assert!(be.poll_event().is_none());
 }
 #[test]
-#[ignore = "repro: F37"]
 fn repro_p3_shutdown_panic() {
     shutdown(true);
 }
@@ -179,7 +200,10 @@ fn repro_p3_shutdown_panic_control() {
 fn repro_p3_terminal_lane_already_fixed() {
     let mut mic = Burst::new(0);
     mic.terminal = true;
-    let mut be = CompositeBackend::new(Box::new(mic), Box::new(Burst::new(1920)), 1.0, 1.0);
+    let mic_stops = mic.stops.clone();
+    let system = Burst::new(1920);
+    let system_stops = system.stops.clone();
+    let mut be = CompositeBackend::new(Box::new(mic), Box::new(system), 1.0, 1.0);
     let (producer, _consumer) = raw_ring(RAW_RING_SAMPLES);
     be.start(RawSink::new(producer, SAMPLE_RATE, CHANNELS))
         .unwrap();
@@ -189,6 +213,8 @@ fn repro_p3_terminal_lane_already_fixed() {
         matches!(event, Some(Event::TerminalError { .. })),
         "child failure must survive healthy system lane: {event:?}"
     );
+    assert_eq!(mic_stops.load(Ordering::SeqCst), 1);
+    assert_eq!(system_stops.load(Ordering::SeqCst), 1);
 }
 #[test]
 fn repro_p3_terminal_lane_control() {
@@ -242,9 +268,10 @@ fn clipping(clip: bool) {
         chunk.data[0],
         chunk.flags
     );
+    assert_eq!(event, clip.then_some(Event::Clipped));
+    assert!(stream.poll_event().is_none());
 }
 #[test]
-#[ignore = "repro: F16"]
 fn repro_p3_clipping_metadata() {
     clipping(true);
 }
@@ -262,6 +289,11 @@ fn valid_dsp(rate: u32) {
         normalizer: Normalizer::new(rate, 2, OutputFormat::default()).unwrap(),
         fifo: Vec::new(),
         last_supply: Instant::now(),
+        lane: MixLane::Microphone,
+        format: (rate, 2),
+        diagnostics: sink.diagnostics(),
+        overflow_seen: 0,
+        notices: Arc::new(Notices::default()),
     };
     let result = lane.ingest(&mut vec![0.0; RAW_RING_SAMPLES]);
     assert!(

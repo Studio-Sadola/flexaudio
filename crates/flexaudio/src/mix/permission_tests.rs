@@ -73,14 +73,21 @@ fn either_child_denial_stops_both_lanes_and_gates_stream() {
         while stream.terminal_error().is_none() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(
-            matches!(stream.terminal_error(), Some(Error::PermissionDenied { permission: p, .. }) if p == permission)
-        );
+        assert!(stream
+            .terminal_error()
+            .is_some_and(|error| error.permission() == Some(permission)));
         assert!(stream.poll_chunk().is_none());
         assert!(stream.poll_secondary().is_none());
         assert!(mic_stops.load(Ordering::SeqCst) > 0);
         assert!(system_stops.load(Ordering::SeqCst) > 0);
-        assert_eq!(stream.poll_event(), Some(denial(permission)));
+        assert!(
+            matches!(stream.poll_event(), Some(Event::TerminalError { error }) if error.permission() == Some(permission))
+        );
+        // The facade also reports the backend's checked capture failure as a
+        // shutdown result; both projections must retain the same permission.
+        assert!(
+            matches!(stream.poll_event(), Some(Event::ShutdownError { error }) if error.permission() == Some(permission))
+        );
         assert!(stream.poll_event().is_none());
         stream.stop();
     }
@@ -186,7 +193,9 @@ fn busy_child_cannot_starve_other_mailbox() {
         mix.poll_event(),
         Some(Event::RecoverableError { .. })
     ));
-    assert_eq!(mix.poll_event(), Some(denial(Permission::Microphone)));
+    assert!(
+        matches!(mix.poll_event(), Some(Event::TerminalError { error }) if error.permission() == Some(Permission::Microphone))
+    );
 }
 
 #[test]
@@ -250,10 +259,9 @@ fn terminal_error_waits_until_both_mix_children_have_stopped() {
     let (attempted_tx, attempted_rx) = mpsc::channel();
     // Resume must reject the recorded failure without reversing backend -> delivery
     // lock order or waiting for the child that only this test can release.
-    assert!(matches!(
-        stream.resume(),
-        Err(Error::PermissionDenied { .. })
-    ));
+    assert!(stream
+        .resume()
+        .is_err_and(|error| error.permission() == Some(Permission::Microphone)));
     let (observed_tx, observed_rx) = mpsc::channel();
     let observer = thread::spawn(move || {
         attempted_tx.send(()).unwrap();
@@ -271,10 +279,10 @@ fn terminal_error_waits_until_both_mix_children_have_stopped() {
         Err(mpsc::RecvTimeoutError::Timeout)
     );
     release_tx.send(()).unwrap();
-    assert!(matches!(
-        observed_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-        Some(Error::PermissionDenied { .. })
-    ));
+    assert!(observed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .is_some_and(|error| error.permission() == Some(Permission::Microphone)));
     let mut stream = observer.join().unwrap();
     stream.stop();
 }
