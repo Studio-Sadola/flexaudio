@@ -166,9 +166,26 @@ impl ShutdownReport {
     pub fn cleanup(&self) -> &[Error] {
         &self.cleanup
     }
-    /// Checked outcome preserving the primary and every cleanup failure.
+    /// Checked capture outcome. Isolated VAD cleanup causes remain in the report but do not
+    /// fail stop; a capture or other cleanup failure still retains all related causes.
     pub fn result(&self) -> Result<()> {
-        let mut causes = self.primary.iter().chain(self.cleanup.iter()).cloned();
+        let first = match self.primary.as_ref() {
+            Some(primary) => primary,
+            None => match self
+                .cleanup
+                .iter()
+                .find(|error| error.whisper_code().is_none())
+            {
+                Some(error) => error,
+                None => return Ok(()),
+            },
+        };
+        let mut causes = std::iter::once(first.clone()).chain(
+            self.cleanup
+                .iter()
+                .filter(|error| !std::ptr::eq(*error, first))
+                .cloned(),
+        );
         match (causes.next(), causes.next()) {
             (None, _) => Ok(()),
             (Some(error), None) => Err(error),
@@ -178,5 +195,105 @@ impl ShutdownReport {
                 causes.collect(),
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod whisper_tests {
+    use super::*;
+    use crate::WhisperCode;
+
+    #[test]
+    fn whisper_only_shutdown_succeeds_and_retains_the_typed_cause() {
+        let cause = Error::WhisperVad {
+            code: WhisperCode::Inference,
+        }
+        .with_context(ErrorContext::new(Operation::Flush));
+        let report = ShutdownReport::new(None, vec![cause.clone()]);
+        assert!(report.result().is_ok());
+        assert!(report.primary().is_none());
+        assert_eq!(report.cleanup(), &[cause]);
+        assert_eq!(
+            report.cleanup()[0].whisper_code(),
+            Some(WhisperCode::Inference)
+        );
+        assert!(report.cleanup()[0]
+            .to_string()
+            .contains("model inference or reset could not complete"));
+        assert!(ShutdownReport::new(None, Vec::new()).result().is_ok());
+    }
+
+    #[test]
+    fn capture_shutdown_message_excludes_isolated_whisper_related_causes() {
+        let capture = Error::DeviceLost
+            .with_context(ErrorContext::new(Operation::Stop))
+            .with_context(ErrorContext::new(Operation::Stop));
+        for operation in [Operation::Normalize, Operation::Flush] {
+            let whisper = Error::WhisperVad {
+                code: WhisperCode::Inference,
+            }
+            .with_context(ErrorContext::new(operation));
+            let report = ShutdownReport::new(Some(capture.clone()), vec![whisper.clone()]);
+            let error = report
+                .result()
+                .expect_err("capture loss must still fail stop");
+            assert_eq!(error.to_string(), "device lost during stop during stop");
+            assert_eq!(error.root(), &Error::DeviceLost);
+            assert_eq!(report.cleanup(), std::slice::from_ref(&whisper));
+            match error {
+                Error::Multiple(group) => {
+                    assert_eq!(group.secondary().collect::<Vec<_>>(), [&whisper]);
+                    assert_eq!(
+                        group.secondary().next().and_then(Error::whisper_code),
+                        Some(WhisperCode::Inference)
+                    );
+                }
+                _ => panic!("the rejecting error must retain typed related failures"),
+            }
+        }
+    }
+
+    #[test]
+    fn capture_shutdown_message_retains_non_whisper_related_causes() {
+        let capture = Error::DeviceLost.with_context(ErrorContext::new(Operation::Stop));
+        let cleanup = Error::Backend("the backend could not finish its shutdown".into())
+            .with_context(ErrorContext::new(Operation::Join));
+        let whisper = Error::WhisperVad {
+            code: WhisperCode::Inference,
+        }
+        .with_context(ErrorContext::new(Operation::Flush));
+        let report = ShutdownReport::new(Some(capture), vec![whisper, cleanup]);
+        let error = report
+            .result()
+            .expect_err("capture loss must still fail stop");
+        assert_eq!(error.to_string(), "device lost during stop; related failure: backend error: the backend could not finish its shutdown during join");
+        assert!(matches!(error, Error::Multiple(group) if group.secondary().count() == 2));
+    }
+
+    #[test]
+    fn real_shutdown_failures_remain_primary_and_retain_whisper_related_causes() {
+        let whisper = Error::WhisperVad {
+            code: WhisperCode::Conversion,
+        };
+        let capture = Error::DeviceLost;
+        let report = ShutdownReport::new(Some(capture.clone()), vec![whisper.clone()]);
+        let error = report
+            .result()
+            .expect_err("capture loss must still fail stop");
+        assert_eq!(error.root(), &capture);
+        assert!(
+            matches!(error, Error::Multiple(ref group) if group.secondary().next() == Some(&whisper))
+        );
+
+        // A real cleanup failure is the rejecting cause, even if VAD failed first.
+        let cleanup = Error::Backend("the backend could not finish its shutdown".into());
+        let report = ShutdownReport::new(None, vec![whisper.clone(), cleanup.clone()]);
+        let error = report
+            .result()
+            .expect_err("backend teardown failure must still fail stop");
+        assert_eq!(error.root(), &cleanup);
+        assert!(
+            matches!(error, Error::Multiple(ref group) if group.secondary().next() == Some(&whisper))
+        );
     }
 }

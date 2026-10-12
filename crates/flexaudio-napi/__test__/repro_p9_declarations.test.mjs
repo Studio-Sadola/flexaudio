@@ -30,7 +30,9 @@ test('repro_p9_stream_event_union', () => {
     permissionGranted: "; permission: 'microphone'",
     silenceWhileSourceActive: '; message: string', deviceLost: '', error: '; message: string',
     terminalError: '; error: AudioError', recoverableError: '; error: AudioError',
-    shutdownError: '; error: AudioError', audioLoss: '; loss: AudioLoss', clipped: '',
+    shutdownError: '; error: AudioError',
+    whisperVadFailed: '; error: AudioError; epoch: number',
+    audioLoss: '; loss: AudioLoss', clipped: '',
     unknown: '; message: string',
   });
 });
@@ -66,4 +68,15 @@ test('retained addon shutdown failures declare their typed Whisper code and audi
   assert.match(declarations, /export interface WhisperVadError extends Error \{[^}]*audioError\?: AudioError/);
   assert.match(body('ShutdownReport'), /primary: AudioError \| null/);
   assert.match(body('ShutdownReport'), /cleanupErrors: readonly AudioError\[\]/);
+});
+
+
+test('mock stream declares the actual positional event callback and test-only fault arguments', () => {
+  const signature = declarations.match(/export declare function __openMockStream\(([^\n]+)\): FlexStream/)?.[1];
+  assert.ok(signature, 'the mock stream must have a declaration');
+  assert.match(signature, /whisperVad\?: WhisperVadStreamOptions \| undefined \| null, onEvent\?: \(\(event: JsStreamEvent\) => void\) \| undefined \| null, whisperVadFailAtChunk\?: number \| undefined \| null, whisperVadResetFailures\?: number \| undefined \| null$/);
+  const docs = declarations.slice(declarations.lastIndexOf('/**', declarations.indexOf('export declare function __openMockStream')), declarations.indexOf('export declare function __openMockStream'));
+  assert.match(docs, /test-only/);
+  assert.match(docs, /not compiled into production/);
+  assert.match(alias('WhisperVadErrorCode'), /'TestFaultsUnavailable'/);
 });

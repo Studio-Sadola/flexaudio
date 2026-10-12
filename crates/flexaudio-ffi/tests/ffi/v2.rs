@@ -632,7 +632,7 @@ fn stream(
         whisper_events: Vec::new(),
         whisper_origin: (0, 0),
         whisper_error: None,
-        whisper_error_reported: false,
+        whisper_cleanup: Vec::new(),
         ready_chunks: VecDeque::new(),
         denoiser: denoise.then(|| flexaudio_denoise::Denoiser::new(1).unwrap()),
         vad: None,
@@ -713,8 +713,14 @@ fn v2_poll_invalid_output_keeps_event_and_initializes_valid_output() {
 fn v2_checked_stop_retains_cleanup_without_capture_primary_and_emits_once() {
     let cleanup = fa::Error::Unsupported.with_context(fa::ErrorContext::new(fa::Operation::Stop));
     let (mut stream, _, stops) = stream(Some(cleanup), false);
-    // A binding-local failure is added after the independently checked core teardown.
-    stream.whisper_error = Some(flexaudio_vad::WhisperVadTapError::Conversion);
+    // Record the isolated VAD cause through the same owner used by capture and flush.
+    stream.accept_whisper(
+        Err(flexaudio_vad::WhisperVadTapFailure {
+            error: flexaudio_vad::WhisperVadTapError::Conversion,
+            terminal_events: Vec::new(),
+        }),
+        fa::Operation::Normalize,
+    );
     unsafe {
         assert!(flexaudio_shutdown_report_v2(&stream).is_null());
         assert_eq!(crate::flexaudio_stop(&mut stream), -9);
@@ -731,7 +737,14 @@ fn v2_checked_stop_retains_cleanup_without_capture_primary_and_emits_once() {
         assert_eq!(kind(flexaudio_shutdown_cleanup_v2(report, 0)), -9);
         let binding = flexaudio_shutdown_cleanup_v2(report, 1);
         assert_eq!(kind(binding), -2);
-        assert_eq!(context(binding, 0).operation, 3);
+        let whisper_code = flexaudio_error_whisper_code_v2(binding);
+        assert!(!whisper_code.is_null());
+        assert_eq!(
+            CStr::from_ptr(whisper_code)
+                .to_str()
+                .expect("stable Whisper code must be valid UTF-8"),
+            "Conversion"
+        );
         let mut event = ptr::null_mut();
         let mut errors = Vec::new();
         while flexaudio_poll_event_v2(&mut stream, &mut event) == 1 {

@@ -10,6 +10,7 @@ struct Control {
     fail_at: Option<usize>,
     fail_reset: bool,
     resets: usize,
+    reset_attempts: usize,
 }
 
 struct Backend(Arc<Mutex<Control>>);
@@ -25,6 +26,7 @@ impl InferenceBackend for Backend {
     }
     fn reset(&mut self) -> Result<(), VadError> {
         let mut control = self.0.lock().unwrap();
+        control.reset_attempts += 1;
         if control.fail_reset {
             return Err(VadError::Reset("injected".into()));
         }
@@ -84,6 +86,36 @@ fn assert_order(events: &[Attached]) {
     }
     assert!(!open);
     assert!(ended);
+}
+
+/// Published capture origins as `(epoch, seq, capture_sample, pts_ns)`.
+fn origins(events: &[Attached]) -> Vec<(u32, u64, u64, i64)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Attached::EpochStart {
+                epoch,
+                seq,
+                capture_sample,
+                pts_ns,
+            } => Some((*epoch, *seq, *capture_sample, *pts_ns)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One epoch terminal per published epoch, in publication order.
+fn terminals(events: &[Attached]) -> Vec<EpochEndReason> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Attached::Vad(WhisperVadEvent {
+                kind: Kind::EpochEnd { reason },
+                ..
+            }) => Some(*reason),
+            _ => None,
+        })
+        .collect()
 }
 
 fn run(stereo: &[f32], chunk_frames: usize) -> Vec<Attached> {
@@ -212,6 +244,22 @@ fn tiny_tail_starts_epoch_at_drain_and_only_pads_one_model_frame() {
 }
 
 #[test]
+fn discontinuity_boundary_reports_the_flag_capture_gaps_and_pts_reanchors() {
+    let (mut tap, _) = tap();
+    // Before any accepted chunk only the explicit flag is a boundary.
+    assert!(tap.is_discontinuity_boundary(960, 960, 0, true));
+    assert!(!tap.is_discontinuity_boundary(960, 960, 0, false));
+    tap.process(&[0.2; 1920], 1000, 0, false).unwrap();
+    // 960 accepted frames from sample 1000: the next frame must be 1960.
+    assert!(!tap.is_discontinuity_boundary(1960, 960, 20_000_000, false));
+    assert!(tap.is_discontinuity_boundary(9999, 960, 20_000_000, false));
+    assert!(tap.is_discontinuity_boundary(1960, 960, 20_000_000, true));
+    assert!(tap.is_discontinuity_boundary(1960, 960, 30_000_000, false));
+    // An empty feed carries no frame and is never a boundary by index.
+    assert!(!tap.is_discontinuity_boundary(9999, 0, 30_000_000, false));
+}
+
+#[test]
 fn discontinuity_drains_old_epoch_before_new_origin_and_never_bridges_gap() {
     let (mut tap, control) = tap();
     let mut events = tap.process(&[0.2; 2000], 100, 0, false).unwrap();
@@ -267,96 +315,319 @@ fn pts_reanchors_use_same_drain_finish_reset_path() {
 }
 
 #[test]
-fn capture_index_gaps_fail_without_eof_finals_or_tail_inference() {
+fn capture_index_gap_finishes_the_prefix_and_reanchors_before_new_audio() {
     for discontinuity in [false, true] {
-        for next_sample in [100, 21100] {
-            let (mut tap, control) = tap();
-            let mut events = tap.process(&[0.2; 40000], 100, 0, false).unwrap();
-            let inferred = control.lock().unwrap().frames.len();
-            let failure = tap
-                .process(&[0.2; 1920], next_sample, 500_000_000, discontinuity)
-                .unwrap_err();
-            assert_eq!(failure.error, Error::Conversion);
-            events.extend(failure.terminal_events);
-            assert_order(&events);
-            assert!(events.iter().all(|event| !matches!(
-                event,
-                Attached::Vad(WhisperVadEvent {
-                    kind: Kind::Segment(_),
-                    ..
-                })
-            )));
-            assert!(events.iter().any(|event| matches!(
-                event,
-                Attached::Vad(WhisperVadEvent {
-                    kind: Kind::ProvisionalSpeechEnd {
-                        reason: PreviewCloseReason::Error,
-                        ..
-                    },
-                    ..
-                })
-            )));
-            assert!(matches!(
-                events.last().unwrap(),
-                Attached::Vad(WhisperVadEvent {
-                    kind: Kind::EpochEnd {
-                        reason: EpochEndReason::Error
-                    },
-                    ..
-                })
-            ));
-            assert_eq!(control.lock().unwrap().frames.len(), inferred);
-            assert_eq!(control.lock().unwrap().resets, 0);
-            assert_eq!(
-                tap.process(&[0.0; 2], 99999, 0, false).unwrap_err().error,
-                Error::FailedSession
-            );
-            assert!(tap.stop().unwrap_err().terminal_events.is_empty());
-            assert!(tap.flush().unwrap().is_empty());
-            assert!(tap.process(&[0.0; 2], 99999, 0, false).unwrap().is_empty());
-            let next = tap.stop().unwrap();
-            assert!(matches!(next[0], Attached::EpochStart { epoch: 1, .. }));
-            assert_order(&next);
-        }
+        let (mut tap, control) = tap();
+        let mut events = tap.process(&[0.2; 4000], 100, 0, false).unwrap();
+        assert!(matches!(
+            events[0],
+            Attached::EpochStart {
+                epoch: 0,
+                seq: 0,
+                capture_sample: 100,
+                pts_ns: 0,
+            }
+        ));
+        // The next accepted frame skips 19000 capture frames (a real drop), with and
+        // without an explicit discontinuity flag.
+        events.extend(
+            tap.process(&[0.2; 1920], 21100, 500_000_000, discontinuity)
+                .unwrap(),
+        );
+        // The old epoch closes as an intact prefix; missing audio never becomes padding.
+        assert_eq!(terminals(&events), [EpochEndReason::Finish]);
+        assert_eq!(
+            origins(&events),
+            [(0, 0, 100, 0), (1, 0, 21100, 500_000_000)]
+        );
+        assert_eq!(control.lock().unwrap().resets, 1);
+        events.extend(tap.stop().unwrap());
+        assert_order(&events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Attached::EpochStart { epoch: 1, .. }))
+                .count(),
+            1
+        );
     }
 }
 
 #[test]
-fn loss_before_first_poll_fails_without_accepting_a_later_origin() {
+fn discontinuity_before_the_first_origin_anchors_that_epoch_without_failing() {
     let (mut tap, control) = tap();
-    let failure = tap
-        .process(&[0.2; 1920], 960, 20_000_000, true)
-        .unwrap_err();
-    assert_eq!(failure.error, Error::Conversion);
-    assert!(failure.terminal_events.is_empty());
-    assert!(control.lock().unwrap().frames.is_empty());
-    assert!(tap.origin.is_none());
-    assert!(tap.stop().unwrap_err().terminal_events.is_empty());
-    assert!(tap.flush().unwrap().is_empty());
-    assert!(tap
-        .process(&[0.0; 2], 9600, 200_000_000, false)
-        .unwrap()
-        .is_empty());
-    let events = tap.stop().unwrap();
+    let mut events = tap.process(&[0.2; 1920], 960, 20_000_000, true).unwrap();
+    // Nothing precedes the first accepted feed, so there is nothing to close: the
+    // first input simply establishes its anchor.
     assert!(matches!(
         events[0],
         Attached::EpochStart {
+            epoch: 0,
+            seq: 0,
+            capture_sample: 960,
+            pts_ns: 20_000_000,
+        }
+    ));
+    events.extend(tap.stop().unwrap());
+    assert_order(&events);
+    assert!(matches!(
+        events.last().unwrap(),
+        Attached::Vad(WhisperVadEvent {
+            kind: Kind::EpochEnd {
+                reason: EpochEndReason::Finish
+            },
+            ..
+        })
+    ));
+    assert_eq!(control.lock().unwrap().resets, 0);
+}
+
+#[test]
+fn transport_gap_after_a_short_prefix_closes_it_at_drain_then_anchors_the_next_gap() {
+    let (mut tap, control) = tap();
+    assert!(tap.process(&[0.2; 120], 1000, 0, false).unwrap().is_empty());
+    let mut events = tap.process(&[0.2; 120], 2000, 100_000_000, false).unwrap();
+    // The 60-frame prefix retains no converter output until the split drains it, so
+    // sample zero is established then and closed with a real finish terminal. The gap
+    // itself is not a failure, and the post-gap frame re-anchors a fresh epoch, which
+    // publishes its origin when its own converter first retains output.
+    assert_eq!(origins(&events), [(0, 0, 1000, 0)]);
+    assert_eq!(terminals(&events), [EpochEndReason::Finish]);
+    assert_eq!(control.lock().unwrap().resets, 1);
+    events.extend(tap.stop().unwrap());
+    assert_order(&events);
+    assert_eq!(
+        origins(&events),
+        [(0, 0, 1000, 0), (1, 0, 2000, 100_000_000)]
+    );
+}
+
+#[test]
+fn failed_session_reinitializes_at_the_next_discontinuity() {
+    let (mut tap, control) = tap();
+    let mut events = tap.process(&[0.2; 4000], 0, 0, false).unwrap();
+    control.lock().unwrap().fail_at = Some(1);
+    let failure = tap
+        .process(&[0.2; 4000], 2000, project_pts(0, 2000).unwrap(), false)
+        .unwrap_err();
+    assert_eq!(failure.error, Error::Vad(crate::WhisperVadError::Inference));
+    events.extend(failure.terminal_events);
+    assert_order(&events);
+    // Contiguous audio carries no reinitialization point: intake stays failed.
+    assert_eq!(
+        tap.process(&[0.2; 2], 4000, project_pts(0, 4000).unwrap(), false)
+            .unwrap_err()
+            .error,
+        Error::FailedSession
+    );
+    control.lock().unwrap().fail_at = None;
+    let restart_pts = project_pts(0, 4000).unwrap();
+    events.extend(tap.process(&[0.2; 4000], 4000, restart_pts, true).unwrap());
+    // The discontinuity reinitializes converter and model, so the first post-gap
+    // frame starts a new anchored epoch instead of staying failed.
+    assert_eq!(origins(&events), [(0, 0, 0, 0), (1, 0, 4000, restart_pts)]);
+    assert_eq!(control.lock().unwrap().resets, 1);
+    events.extend(tap.stop().unwrap());
+    assert_order(&events);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Attached::EpochStart { epoch: 1, .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn failed_reinitialization_stays_failed_until_a_successful_reset() {
+    let (mut tap, control) = tap();
+    let mut events = tap.process(&[0.2; 4000], 0, 0, false).unwrap();
+    control.lock().unwrap().fail_at = Some(1);
+    let failure = tap
+        .process(&[0.2; 4000], 2000, project_pts(0, 2000).unwrap(), false)
+        .unwrap_err();
+    events.extend(failure.terminal_events);
+    assert_order(&events);
+    control.lock().unwrap().fail_at = None;
+    control.lock().unwrap().fail_reset = true;
+    let failure = tap
+        .process(&[0.2; 4000], 4000, project_pts(0, 4000).unwrap(), true)
+        .unwrap_err();
+    // The reset failed, so the new epoch is never published and the old closure is
+    // not repeated (no event storm).
+    assert_eq!(failure.error, Error::Vad(crate::WhisperVadError::Inference));
+    assert!(failure.terminal_events.is_empty());
+    assert_eq!(
+        tap.process(
+            &[0.2; 2],
+            6000,
+            project_pts(project_pts(0, 4000).unwrap(), 2000).unwrap(),
+            false,
+        )
+        .unwrap_err()
+        .error,
+        Error::FailedSession
+    );
+    assert_eq!(control.lock().unwrap().resets, 0);
+    control.lock().unwrap().fail_reset = false;
+    assert!(tap.flush().unwrap().is_empty());
+    assert!(tap
+        .process(&[0.0; 2], 8000, project_pts(0, 8000).unwrap(), false)
+        .unwrap()
+        .is_empty());
+    let next = tap.stop().unwrap();
+    assert!(matches!(
+        next[0],
+        Attached::EpochStart {
             epoch: 1,
-            capture_sample: 9600,
+            capture_sample: 8000,
             ..
         }
     ));
+    assert_order(&next);
+    assert_eq!(control.lock().unwrap().resets, 1);
+}
+
+#[test]
+fn failed_session_observes_skipped_capture_until_a_pts_reanchor() {
+    let (mut tap, control) = tap();
+    let mut events = tap.process(&[0.2; 4000], 0, 0, false).unwrap();
+    control.lock().unwrap().fail_at = Some(1);
+    let failure = tap
+        .process(&[0.2; 4000], 2000, project_pts(0, 2000).unwrap(), false)
+        .unwrap_err();
+    events.extend(failure.terminal_events);
+    control.lock().unwrap().fail_at = None;
+    for sample in [4000, 6000, 8000] {
+        assert_eq!(
+            tap.process(&[0.2; 4000], sample, project_pts(0, sample).unwrap(), false)
+                .unwrap_err()
+                .error,
+            Error::FailedSession,
+            "contiguous failed capture must not retry model reset"
+        );
+    }
+    assert_eq!(control.lock().unwrap().reset_attempts, 0);
+    // Capture indices still continue, but a changed PTS anchor is a recovery boundary.
+    let restart_pts = 1_000_000_000;
+    events.extend(
+        tap.process(&[0.2; 4000], 10000, restart_pts, false)
+            .unwrap(),
+    );
+    assert_eq!(origins(&events), [(0, 0, 0, 0), (1, 0, 10000, restart_pts)]);
+    assert_eq!(control.lock().unwrap().reset_attempts, 1);
+    events.extend(tap.stop().unwrap());
     assert_order(&events);
 }
 
 #[test]
-fn transport_gap_before_converter_publishes_never_fabricates_an_epoch() {
+fn failed_reset_observes_its_chunk_and_does_not_retry_on_contiguous_capture() {
     let (mut tap, control) = tap();
-    assert!(tap.process(&[0.2; 120], 1000, 0, false).unwrap().is_empty());
-    let failure = tap.process(&[0.2; 120], 2000, 0, false).unwrap_err();
-    assert_eq!(failure.error, Error::Conversion);
-    assert!(failure.terminal_events.is_empty());
-    assert!(control.lock().unwrap().frames.is_empty());
+    let mut events = tap.process(&[0.2; 4000], 0, 0, false).unwrap();
+    control.lock().unwrap().fail_at = Some(1);
+    events.extend(
+        tap.process(&[0.2; 4000], 2000, project_pts(0, 2000).unwrap(), false)
+            .unwrap_err()
+            .terminal_events,
+    );
+    {
+        let mut control = control.lock().unwrap();
+        control.fail_at = None;
+        control.fail_reset = true;
+    }
+    assert!(tap
+        .process(&[0.2; 4000], 4000, 1_000_000_000, true)
+        .unwrap_err()
+        .terminal_events
+        .is_empty());
+    // Allow reset again to prove it is not attempted just because failed audio was skipped.
+    control.lock().unwrap().fail_reset = false;
+    for offset in [2000, 4000, 6000] {
+        let failure = tap
+            .process(
+                &[0.2; 4000],
+                4000 + offset,
+                project_pts(1_000_000_000, offset).unwrap(),
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(failure.error, Error::FailedSession);
+        assert!(failure.terminal_events.is_empty());
+    }
+    assert_eq!(control.lock().unwrap().reset_attempts, 1);
+    assert_eq!(origins(&events).len(), 1);
+    assert_order(&events);
+}
+
+#[cfg(feature = "test-faults")]
+#[test]
+fn injected_failure_before_converter_feed_tracks_capture_and_failed_reset_once() {
+    let (mut tap, control) = tap();
+    let mut events = tap.process(&[0.2; 4000], 0, 0, false).unwrap();
+    tap.inject_failure();
+    events.extend(
+        tap.process(&[0.2; 4000], 2000, project_pts(0, 2000).unwrap(), false)
+            .unwrap_err()
+            .terminal_events,
+    );
+    assert_eq!(terminals(&events), [EpochEndReason::Error]);
+    for sample in [4000, 6000] {
+        assert_eq!(
+            tap.process(&[0.2; 4000], sample, project_pts(0, sample).unwrap(), false)
+                .unwrap_err()
+                .error,
+            Error::FailedSession
+        );
+    }
+    tap.inject_reset_failure();
+    assert!(tap
+        .process(&[0.2; 4000], 8000, 1_000_000_000, true)
+        .unwrap_err()
+        .terminal_events
+        .is_empty());
+    for offset in [2000, 4000, 6000] {
+        assert_eq!(
+            tap.process(
+                &[0.2; 4000],
+                8000 + offset,
+                project_pts(1_000_000_000, offset).unwrap(),
+                false,
+            )
+            .unwrap_err()
+            .error,
+            Error::FailedSession
+        );
+    }
+    assert_eq!(control.lock().unwrap().reset_attempts, 0);
+    events.extend(
+        tap.process(&[0.2; 4000], 16000, 2_000_000_000, true)
+            .unwrap(),
+    );
+    assert_eq!(
+        origins(&events),
+        [(0, 0, 0, 0), (1, 0, 16000, 2_000_000_000)]
+    );
+    events.extend(tap.stop().unwrap());
+    assert_order(&events);
+}
+
+#[cfg(feature = "test-faults")]
+#[test]
+fn injected_finish_failure_closes_the_published_epoch_on_flush_and_stop() {
+    for stopping in [false, true] {
+        let (mut tap, _) = tap();
+        let mut events = tap.process(&[0.2; 4000], 0, 0, false).unwrap();
+        tap.inject_failure();
+        let failure = if stopping { tap.stop() } else { tap.flush() }.unwrap_err();
+        assert_eq!(failure.error, Error::Vad(crate::WhisperVadError::Inference));
+        events.extend(failure.terminal_events);
+        assert_eq!(terminals(&events), [EpochEndReason::Error]);
+        assert_order(&events);
+        assert!(tap
+            .stop()
+            .expect("stop after a reported failure must succeed")
+            .is_empty());
+    }
 }
 
 #[test]
@@ -425,6 +696,60 @@ fn capture_validation_preserves_buffered_audio_and_origin_even_with_discontinuit
 }
 
 #[test]
+fn stop_after_inference_failure_succeeds_without_repeating_closure_or_reset() {
+    let (mut tap, control) = tap();
+    let mut events = tap
+        .process(&[0.2; 4000], 0, 0, false)
+        .expect("the first feed must establish an epoch");
+    control
+        .lock()
+        .expect("test backend lock must be available")
+        .fail_at = Some(1);
+    let failure = tap
+        .process(
+            &[0.2; 4000],
+            2000,
+            project_pts(0, 2000).expect("test PTS must be valid"),
+            false,
+        )
+        .expect_err("the second feed must fail model inference");
+    assert_eq!(failure.error, Error::Vad(crate::WhisperVadError::Inference));
+    events.extend(failure.terminal_events);
+    assert_eq!(terminals(&events), [EpochEndReason::Error]);
+    assert_order(&events);
+    assert!(tap
+        .stop()
+        .expect("an already reported VAD failure must not reject stop")
+        .is_empty());
+    assert!(tap.stop().expect("repeated stop must succeed").is_empty());
+    assert_eq!(
+        tap.flush()
+            .expect_err("stopped intake cannot recover")
+            .error,
+        Error::Stopped
+    );
+    assert_eq!(
+        tap.process(
+            &[0.2; 2],
+            4000,
+            project_pts(0, 4000).expect("test PTS must be valid"),
+            false
+        )
+        .expect_err("stopped intake cannot process")
+        .error,
+        Error::Stopped
+    );
+    assert_eq!(
+        control
+            .lock()
+            .expect("test backend lock must be available")
+            .reset_attempts,
+        0
+    );
+    assert_eq!(terminals(&events), [EpochEndReason::Error]);
+}
+
+#[test]
 fn inference_and_reset_failures_preserve_ordered_exactly_once_closure() {
     let (mut tap, control) = tap();
     let mut events = tap.process(&[0.2; 4000], 0, 0, false).unwrap();
@@ -444,7 +769,7 @@ fn inference_and_reset_failures_preserve_ordered_exactly_once_closure() {
             ..
         })
     ));
-    assert!(tap.stop().unwrap_err().terminal_events.is_empty());
+    assert_eq!(terminals(&events), [EpochEndReason::Error]);
     control.lock().unwrap().fail_at = None;
     assert!(tap.flush().unwrap().is_empty());
     let mut next = tap.process(&[0.2; 2], 9999, 999, false).unwrap();
@@ -464,6 +789,10 @@ fn inference_and_reset_failures_preserve_ordered_exactly_once_closure() {
     assert!(tap.flush().unwrap_err().terminal_events.is_empty());
     control.lock().unwrap().fail_reset = false;
     tap.flush().unwrap();
+    assert!(tap
+        .stop()
+        .expect("recovered session must stop cleanly")
+        .is_empty());
 }
 
 #[test]
@@ -481,10 +810,14 @@ fn first_feed_failure_carries_origin_before_terminal_and_suppresses_staged_onset
             ..
         }
     ));
+    // A re-anchored capture index is a discontinuity, so this call reinitializes the failed
+    // session instead of reporting the same failure again: the epoch is never closed twice.
+    assert!(tap.process(&[0.2; 2], 12, 34, false).unwrap().is_empty());
+    assert_eq!(terminals(&failure.terminal_events), [EpochEndReason::Error]);
+    // The reinitialized epoch continues from the re-anchored frame.
     assert!(tap
-        .process(&[0.2; 2], 12, 34, false)
-        .unwrap_err()
-        .terminal_events
+        .process(&[0.2; 2], 13, project_pts(34, 1).unwrap(), false)
+        .unwrap()
         .is_empty());
 }
 
@@ -547,7 +880,7 @@ fn conversion_failure_closes_published_epoch_once_and_flush_recovers() {
         } else {
             assert!(events.is_empty());
         }
-        assert!(tap.stop().unwrap_err().terminal_events.is_empty());
+        assert_eq!(terminals(&events).len(), usize::from(published));
         assert!(tap.flush().unwrap().is_empty());
         assert!(tap.process(&[0.0; 2], 9999, 0, false).unwrap().is_empty());
         let next = tap.stop().unwrap();

@@ -40,3 +40,6 @@ flexaudio-denoise = { path = "../../crates/flexaudio-denoise" }
 # - maturin alone enables extension-module through the crate feature above. This loads the module as a
 #   Python extension without linking libpython directly.
 pyo3 = { version = "0.29", features = ["abi3-py38"] }
+
+[dev-dependencies]
+flexaudio-vad = { path = "../../crates/flexaudio-vad", features = ["test-faults"] }

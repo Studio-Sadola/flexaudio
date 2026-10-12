@@ -230,7 +230,12 @@ impl PyAudioChunk {
         self.vad_events.extend(events);
     }
     pub(crate) fn has_audio_or_vad(&self) -> bool {
-        !self.samples.is_empty() || !self.vad_events.is_empty()
+        !self.samples.is_empty()
+            || !self.vad_events.is_empty()
+            || self
+                .whisper_events
+                .as_ref()
+                .is_some_and(|events| !events.is_empty())
     }
 
     /// Update metrics from the final delivered float PCM.
@@ -567,6 +572,37 @@ mod tests {
 
     use super::*;
     use fa::SourceKind;
+
+    #[test]
+    fn whisper_only_event_batches_remain_deliverable() {
+        let mut carrier = chunk_to_py(AudioChunk {
+            frame_index: 0,
+            data: Vec::new(),
+            frames: 0,
+            pts_ns: 0,
+            seq: 0,
+            flags: fa::ChunkFlags::empty(),
+            dropped_before: 0,
+            peak: 0.0,
+            rms: 0.0,
+        });
+        assert!(!carrier.has_audio_or_vad());
+        carrier.set_whisper_events(vec![flexaudio_vad::AttachedWhisperVadEvent::Vad(
+            flexaudio_vad::WhisperVadEvent {
+                epoch: 0,
+                seq: 1,
+                kind: flexaudio_vad::WhisperVadEventKind::EpochEnd {
+                    reason: flexaudio_vad::EpochEndReason::Error,
+                },
+            },
+        )]);
+        assert!(
+            carrier.has_audio_or_vad(),
+            "an event-only terminal must not be discarded"
+        );
+        carrier.set_whisper_events(Vec::new());
+        assert!(!carrier.has_audio_or_vad());
+    }
 
     #[test]
     fn terminal_backend_events_keep_error_kind_and_cause() {

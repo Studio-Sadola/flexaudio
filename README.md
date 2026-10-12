@@ -154,8 +154,12 @@ grid, optional provisional speech/cut events, and padded final-frame inference.
 Compatibility concerns the pinned postprocessing algorithm; different model
 versions need not produce identical probabilities. `WhisperVadTap` attaches to
 canonical capture with epoch clock anchors and flush/stop closure delivery.
-Transport gaps fail the affected epoch without inventing final segments.
-Legacy VAD and WhisperVad are mutually exclusive on a stream.
+A capture index gap, PTS reanchor or discontinuity closes the intact prefix and re-anchors the
+next accepted frame in a fresh epoch; missing audio never becomes padding. A VAD
+session failure latches the tap until the next discontinuity or a successful
+flush reinitializes it, and is a failure of that session only: capture and PCM
+delivery continue, and the affected epoch closes once with its typed error
+terminal. Legacy VAD and WhisperVad are mutually exclusive on a stream.
 
 ---
 

@@ -40,9 +40,10 @@ test('repro_p9_bridge_panic', red('C F37; D M11'), async () => {
   const stream = native.__reproP9Bridge('panic', () => {});
   await assert.rejects(stream.stop(), /bridge failure/);
 });
-test('repro_p9_stop_control', async () => {
+test('repro_p9_stop_control', async t => {
   const chunks = [];
   const stream = native.__openMockStream(48000, 1, 440, c => chunks.push(c));
+  t.after(async () => { await stream.stop(); });
   await new Promise(resolve => setTimeout(resolve, 100));
   await stream.stop();
   assert.ok(chunks.some(c => c.frames > 0));
@@ -70,7 +71,7 @@ test('repro_p9_throwing_callback_observation', () => {
     const stream = native.__openMockStream(48000, 1, 440, () => {
       if (!observed) throw new Error('repro callback exception');
     });
-    setTimeout(async () => { await stream.stop(); console.log('observed=' + observed); process.exit(observed ? 0 : 1); }, 100);
+    setTimeout(async () => { await stream.stop(); console.log('observed=' + observed); if (!observed) process.exitCode = 1; }, 100);
   `, addonPath], { encoding: 'utf8', timeout: 10000 });
   assert.equal(output.status, 0, output.stderr);
   assert.match(output.stdout, /observed=true/);
@@ -92,16 +93,17 @@ test('throwing callbacks preserve exception identity and allow checked shutdown'
         if (chunk.frames > 0) continued = true;
       });
       setTimeout(async () => {
-        assert.strictEqual(observed, thrown);
-        assert.equal(observed.code, 'CALLBACK_TEST');
-        await stream.stop();
-        assert.equal(continued, true);
-        assert.equal(stream.terminalError(), undefined);
-        const report = stream.shutdownReport();
-        assert.equal(report.primary, null);
-        assert.deepEqual(report.cleanupErrors, []);
-        console.log('exception retained; stop resolved');
-        process.exit(0);
+        try {
+          assert.strictEqual(observed, thrown);
+          assert.equal(observed.code, 'CALLBACK_TEST');
+          await stream.stop();
+          assert.equal(continued, true);
+          assert.equal(stream.terminalError(), undefined);
+          const report = stream.shutdownReport();
+          assert.equal(report.primary, null);
+          assert.deepEqual(report.cleanupErrors, []);
+          console.log('exception retained; stop resolved');
+        } finally { await stream.stop(); }
       }, 100);
     `, path], { encoding: 'utf8', timeout: 10000 });
     assert.equal(output.status, 0, `${path}: ${output.stderr}`);
@@ -109,8 +111,9 @@ test('throwing callbacks preserve exception identity and allow checked shutdown'
   }
 });
 
-test('optional lifecycle getters return undefined until a report is retained', async () => {
+test('optional lifecycle getters return undefined until a report is retained', async t => {
   const stream = native.__openMockStream(48000, 1, 440, () => {});
+  t.after(async () => { await stream.stop(); });
   assert.equal(stream.terminalError(), undefined);
   assert.equal(stream.shutdownReport(), undefined);
   await stream.stop();
@@ -124,7 +127,7 @@ test('repro_p9_reaper_failure_control', () => {
   const output = spawnSync(process.execPath, ['-e', `
     const native = require(process.argv[1]);
     const stream = native.__reproP9Bridge('reaper', () => {});
-    setTimeout(async () => { await stream.stop(); console.log('stop resolved despite reaper spawn failure'); process.exit(0); }, 100);
+    setTimeout(async () => { await stream.stop(); console.log('stop resolved despite reaper spawn failure'); }, 100);
   `, addonPath], { encoding: 'utf8', timeout: 10000 });
   assert.equal(output.status, 0, output.stderr);
   assert.match(output.stdout, /stop resolved despite reaper spawn failure/);
@@ -253,36 +256,55 @@ for (const processing of [true, false]) {
   for (const coreCleanup of [false, true]) {
     const scenario = `whisper-${processing ? 'process' : 'flush'}${coreCleanup ? '-cleanup' : ''}`;
     test(`${scenario}: stop and report retain addon and core causes across all waiters`, async () => {
-      const stream = native.__reproP9Bridge(scenario, () => {});
-      const whisperCode = processing ? 'InvalidPcm' : 'Conversion';
-      let retainedError;
-      const checkError = error => {
-        assert.equal(error.code, !processing && coreCleanup ? 'FLEX_DEVICE_LOST' : whisperCode);
+      const log = [];
+      const stream = native.__reproP9Bridge(scenario,
+        chunk => log.push({ kind: 'chunk', events: chunk.whisperVadEvents ?? [] }),
+        event => log.push({ kind: 'event', event }));
+      const whisperCode = 'Inference';
+      const checkReport = () => {
         const report = stream.shutdownReport();
         assert.ok(report);
-        if (processing) {
-          assert.equal(report.primary.whisperCode, whisperCode);
-          assert.equal(report.primary.contexts[0].operation, 'normalize');
-          assert.equal(report.cleanupErrors.length, coreCleanup ? 1 : 0);
-          if (coreCleanup) assert.equal(report.cleanupErrors[0].kind, 'deviceLost');
-        } else {
-          assert.equal(report.primary, null);
-          assert.equal(report.cleanupErrors.length, coreCleanup ? 2 : 1);
-          assert.equal(report.cleanupErrors.at(-1).whisperCode, whisperCode);
-          assert.equal(report.cleanupErrors.at(-1).contexts[0].operation, 'flush');
-          assert.equal(stream.terminalError(), undefined, 'flush-only failure is cleanup');
-        }
-        const causes = report.primary ? [report.primary, ...report.cleanupErrors] : report.cleanupErrors;
-        const [root, ...secondary] = causes;
+        assert.equal(report.primary, null, 'a whisper-only failure is never the capture primary');
+        const whisper = report.cleanupErrors.filter(cause => cause.whisperCode === whisperCode);
+        assert.equal(whisper.length, 1, 'the addon cause is retained exactly once');
+        assert.equal(whisper[0].contexts[0].operation, processing ? 'normalize' : 'flush');
+        assert.equal(report.cleanupErrors.length, coreCleanup ? 2 : 1);
+        if (coreCleanup) assert.equal(report.cleanupErrors[0].kind, 'deviceLost');
+        assert.equal(stream.terminalError(), undefined);
+        return report;
+      };
+      let retainedError;
+      const checkError = error => {
+        assert.equal(error.code, 'FLEX_DEVICE_LOST');
+        assert.equal(error.message, 'device lost during stop during stop',
+          'isolated Whisper cleanup must preserve the capture exception message');
+        const report = checkReport();
+        const [root, ...secondary] = report.cleanupErrors;
         assert.deepEqual(error.audioError, { ...root, secondary: [...root.secondary, ...secondary] });
         if (retainedError) assert.deepEqual(error.audioError, retainedError);
         retainedError = error.audioError;
         return true;
       };
-      // Concurrent stop waiters and a call made after completion share one outcome.
-      await Promise.all([assert.rejects(stream.stop(), checkError), assert.rejects(stream.stop(), checkError)]);
+      // Register all stop waiters before testing results, so assertion failures cannot leave intake live.
+      const first = stream.stop();
+      const second = stream.stop();
+      if (coreCleanup) {
+        await Promise.all([assert.rejects(first, checkError), assert.rejects(second, checkError)]);
+        await assert.rejects(stream.stop(), checkError);
+      } else {
+        await Promise.all([first, second]);
+        log.push({ kind: 'resolved' });
+        checkReport();
+        const carrier = log.findIndex(entry => entry.kind === 'chunk' && entry.events
+          .some(event => event.type === 'epochEnd' && event.reason === 'error'));
+        const failure = log.findIndex(entry => entry.kind === 'event' && entry.event.type === 'whisperVadFailed');
+        assert.ok(carrier >= 0 && carrier < failure, 'final failure closure must arrive before its notification');
+        assert.ok(failure < log.findIndex(entry => entry.kind === 'resolved'), 'whisperVadFailed must arrive before stop resolves');
+        assert.equal(log[failure].event.error.whisperCode, whisperCode);
+        assert.equal(log.filter(entry => entry.kind === 'event' && entry.event.type === 'whisperVadFailed').length, 1);
+        await stream.stop();
+      }
       const report = stream.shutdownReport();
-      await assert.rejects(stream.stop(), checkError);
       assert.deepEqual(stream.shutdownReport(), report);
     });
   }
@@ -296,9 +318,34 @@ test('core capture primary, core cleanup and final Whisper failure are all retai
       const report = stream.shutdownReport();
       assert.equal(report.primary.kind, 'unsupportedFormat');
       assert.deepEqual(report.cleanupErrors.map(cause => cause.kind), ['deviceLost', 'backend']);
-      assert.equal(report.cleanupErrors[1].whisperCode, 'Conversion');
+      assert.equal(report.cleanupErrors[1].whisperCode, 'Inference');
       assert.deepEqual(error.audioError.secondary, report.cleanupErrors);
       return true;
     });
   }
 });
+
+for (const scenario of ['whisper-secondary-orphan', 'whisper-pending-flush']) {
+  test(`${scenario}: pending closure precedes one notification and retains its cause`, async () => {
+    const log = [];
+    const stream = native.__reproP9Bridge(scenario,
+      chunk => log.push({ kind: 'chunk', chunk }),
+      event => log.push({ kind: 'event', event }));
+    await stream.stop();
+    log.push({ kind: 'resolved' });
+    const carrier = log.findIndex(entry => entry.kind === 'chunk'
+      && (entry.chunk.secondary?.whisperVadEvents ?? []).some(event => event.type === 'epochEnd' && event.reason === 'error'));
+    const failure = log.findIndex(entry => entry.kind === 'event' && entry.event.type === 'whisperVadFailed');
+    assert.ok(carrier >= 0 && carrier < failure, 'the selected-tap error closure must precede the notification');
+    assert.ok(failure < log.length - 1, 'the failure must arrive before stop resolves');
+    assert.equal(log.filter(entry => entry.kind === 'event' && entry.event.type === 'whisperVadFailed').length, 1);
+    if (scenario === 'whisper-secondary-orphan') {
+      assert.ok(log[carrier].chunk.frames > 0, 'an orphan secondary failure must ride real primary PCM');
+      assert.ok(log.filter(entry => entry.kind === 'chunk').every(entry => entry.chunk.frames > 0));
+    }
+    const report = stream.shutdownReport();
+    assert.equal(report.primary, null);
+    assert.equal(report.cleanupErrors.length, 1);
+    assert.equal(report.cleanupErrors[0].whisperCode, 'Inference');
+  });
+}

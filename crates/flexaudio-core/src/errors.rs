@@ -1,6 +1,7 @@
 //! Root failure kinds and safe default error messages.
 use crate::error_context::{ErrorContext, ErrorGroup};
 use crate::types::Permission;
+use crate::WhisperCode;
 use std::fmt;
 
 /// Stable root failure classification, preserved through context and related errors.
@@ -59,6 +60,11 @@ pub enum Error {
     DeviceLost,
     /// Backend failure with a safe explanation.
     Backend(String),
+    /// Optional VAD processor failure; capture remains usable.
+    WhisperVad {
+        /// Stable typed processor cause.
+        code: WhisperCode,
+    },
     /// Unsupported format with a safe validation explanation.
     UnsupportedFormat(String),
     /// Native format mismatch, retaining numeric pairs.
@@ -93,6 +99,7 @@ impl Error {
             Self::UnsupportedOsVersion => ErrorKind::UnsupportedOsVersion,
             Self::DeviceLost => ErrorKind::DeviceLost,
             Self::Backend(_) => ErrorKind::Backend,
+            Self::WhisperVad { .. } => ErrorKind::Backend,
             Self::UnsupportedFormat(_) => ErrorKind::UnsupportedFormat,
             Self::NativeFormatChanged { .. } => ErrorKind::NativeFormatChanged,
             Self::Unsupported => ErrorKind::Unsupported,
@@ -123,6 +130,13 @@ impl Error {
             _ => None,
         }
     }
+    /// Optional VAD cause retained through primary context wrappers.
+    pub fn whisper_code(&self) -> Option<WhisperCode> {
+        match self.root() {
+            Self::WhisperVad { code } => Some(*code),
+            _ => None,
+        }
+    }
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -134,6 +148,7 @@ impl fmt::Display for Error {
             Self::UnsupportedOsVersion => f.write_str("unsupported OS version"),
             Self::DeviceLost => f.write_str("device lost"),
             Self::Backend(message) => write!(f, "backend error: {message}"),
+            Self::WhisperVad { code } => write!(f, "whisper VAD failed ({}): {}", code.as_str(), code.explanation()),
             Self::UnsupportedFormat(message) => write!(f, "unsupported output format: {message}"),
             Self::NativeFormatChanged { advertised, actual } => write!(f, "native input format changed from {} Hz/{} channels to {} Hz/{} channels; recreate the stream", advertised.0, advertised.1, actual.0, actual.1),
             Self::Unsupported => f.write_str("unsupported"),
@@ -141,7 +156,9 @@ impl fmt::Display for Error {
             Self::Context { source, context } => write!(f, "{source} {context}"),
             Self::Multiple(group) => {
                 write!(f, "{}", group.primary())?;
-                for error in group.secondary() { write!(f, "; related failure: {error}")?; }
+                // Isolated VAD causes remain in the structured group and shutdown cleanup
+                // report. They do not change the capture primary's diagnostic message.
+                for error in group.secondary().filter(|error| error.whisper_code().is_none()) { write!(f, "; related failure: {error}")?; }
                 Ok(())
             }
         }

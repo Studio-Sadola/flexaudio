@@ -24,12 +24,18 @@ path = "src/lib.rs"
 crate-type = ["cdylib"]
 test = false
 
+[features]
+# Opt-in for device-free failure regressions; release workflows do not enable it.
+test-faults = ["flexaudio-vad/test-faults"]
+
 [dependencies]
 flexaudio = { path = "../flexaudio" }
 
 # Expose three addons to Node. All are pure Rust (the model is embedded), so neither model files nor
 # network access are needed at runtime. Versions follow the workspace crates via path dependencies.
 # vad's rustc 1.91 requirement is allowed by the rust-version above.
+# `test-faults` compiles the capture owner's failure injection used only by the test-only
+# `__openMockStream` fixture below.
 flexaudio-vad = { path = "../flexaudio-vad" }
 flexaudio-encode = { path = "../flexaudio-encode" }
 flexaudio-denoise = { path = "../flexaudio-denoise" }

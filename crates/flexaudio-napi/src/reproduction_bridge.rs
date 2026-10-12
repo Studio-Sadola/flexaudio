@@ -52,7 +52,9 @@ impl flexaudio::core::CaptureBackend for ShutdownFixtureBackend {
 // exports explicitly; expose the real FlexStream::stop through a plain JS object.
 #[napi::bindgen_prelude::ctor]
 fn register_test_exports() {
+    #[cfg(test)]
     napi::bindgen_prelude::register_module_export(None, "__reproP9Bridge\0", export_bridge);
+    #[cfg(test)]
     napi::bindgen_prelude::register_module_export(None, "__openMockStream\0", export_mock);
     napi::bindgen_prelude::register_module_export(None, "__reproP9VadEvents\0", export_vad_events);
     napi::bindgen_prelude::register_module_export(None, "__reproP9Error\0", export_error);
@@ -128,6 +130,35 @@ fn js_stream(env: &Env, stream: FlexStream) -> napi::Result<JsObject> {
         Ok(terminal_stream.terminal_error())
     })?;
     object.set_named_property("terminalError", terminal)?;
+    let pause_stream = stream.clone();
+    object.set_named_property(
+        "pause",
+        env.create_function_from_closure("pause", move |_| pause_stream.pause())?,
+    )?;
+    let resume_stream = stream.clone();
+    object.set_named_property(
+        "resume",
+        env.create_function_from_closure("resume", move |ctx| resume_stream.resume(*ctx.env))?,
+    )?;
+    let paused_stream = stream.clone();
+    object.set_named_property(
+        "isPaused",
+        env.create_function_from_closure("isPaused", move |_| paused_stream.is_paused())?,
+    )?;
+    let flush_stream = stream.clone();
+    object.set_named_property(
+        "flushWhisperVad",
+        env.create_function_from_closure("flushWhisperVad", move |ctx| {
+            flush_stream.flush_whisper_vad(*ctx.env)
+        })?,
+    )?;
+    let switch_stream = stream.clone();
+    object.set_named_property(
+        "switchSource",
+        env.create_function_from_closure("switchSource", move |ctx| {
+            switch_stream.switch_source(*ctx.env, ctx.get::<OpenOptions>(0)?)
+        })?,
+    )?;
     let report =
         env.create_function_from_closure("shutdownReport", move |_| Ok(stream.shutdown_report()))?;
     object.set_named_property("shutdownReport", report)?;
@@ -218,6 +249,7 @@ unsafe fn export_payloads(raw_env: sys::napi_env) -> napi::Result<sys::napi_valu
     Ok(function.raw())
 }
 
+#[cfg(test)]
 unsafe fn export_bridge(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
     let env = Env::from_raw(raw_env);
     let function = env.create_function_from_closure("__reproP9Bridge", |ctx| {
@@ -228,12 +260,22 @@ unsafe fn export_bridge(raw_env: sys::napi_env) -> napi::Result<sys::napi_value>
             .to_owned();
         let callback = ctx.get::<napi::JsFunction>(1)?;
         let callback = unsafe { Function::from_napi_value(ctx.env.raw(), callback.raw())? };
-        let stream = repro_p9_bridge(*ctx.env, scenario, callback)?;
+        let stream = repro_p9_bridge(
+            *ctx.env,
+            scenario,
+            callback,
+            if ctx.length <= 2 {
+                None
+            } else {
+                ctx.get::<Option<Function<JsStreamEvent, Unknown>>>(2)?
+            },
+        )?;
         js_stream(ctx.env, stream)
     })?;
     Ok(function.raw())
 }
 
+#[cfg(test)]
 unsafe fn export_mock(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
     let env = Env::from_raw(raw_env);
     let function = env.create_function_from_closure("__openMockStream", |ctx| {
@@ -244,7 +286,56 @@ unsafe fn export_mock(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
         let callback = ctx.get::<napi::JsFunction>(3)?;
         let callback = unsafe { Function::from_napi_value(ctx.env.raw(), callback.raw())? };
         let stream = open_mock_stream(
-            *ctx.env, rate, channels, frequency, callback, None, None, None, None, None, None,
+            *ctx.env,
+            rate,
+            channels,
+            frequency,
+            callback,
+            if ctx.length <= 4 {
+                None
+            } else {
+                ctx.get::<Option<u32>>(4)?
+            },
+            if ctx.length <= 5 {
+                None
+            } else {
+                ctx.get::<Option<u16>>(5)?
+            },
+            if ctx.length <= 6 {
+                None
+            } else {
+                ctx.get::<Option<String>>(6)?
+            },
+            if ctx.length <= 7 {
+                None
+            } else {
+                ctx.get::<Option<f64>>(7)?
+            },
+            if ctx.length <= 8 {
+                None
+            } else {
+                ctx.get::<Option<String>>(8)?
+            },
+            if ctx.length <= 9 {
+                None
+            } else {
+                ctx.get::<Option<napi::JsUnknown>>(9)?
+            },
+            if ctx.length <= 10 {
+                None
+            } else {
+                ctx.get::<Option<Function<JsStreamEvent, Unknown>>>(10)?
+            },
+            if ctx.length <= 11 {
+                None
+            } else {
+                ctx.get::<Option<f64>>(11)?
+            },
+            if ctx.length <= 12 {
+                None
+            } else {
+                ctx.get::<Option<f64>>(12)?
+            },
         )?;
         js_stream(ctx.env, stream)
     })?;
@@ -256,11 +347,13 @@ pub fn repro_p9_bridge(
     env: Env,
     scenario: String,
     on_chunk: Function<JsAudioChunk, Unknown>,
+    on_event: Option<Function<JsStreamEvent, Unknown>>,
 ) -> napi::Result<FlexStream> {
     let phase = Arc::new(Mutex::new(StopPhase::Running));
     let terminal: TerminalError = Arc::new(Mutex::new(None));
     let report: FinalReport = Arc::new(Mutex::new(None));
     let user = make_user_chunk_cb(&env, &on_chunk)?;
+    let (_, event_callback) = make_stream_event_callbacks(&env, on_event)?;
     let weak: ChunkTsfnWeakCell = Arc::new(OnceLock::new());
     let chunk = make_chunk_tsfn(
         &env,
@@ -269,8 +362,16 @@ pub fn repro_p9_bridge(
         weak.clone(),
         terminal.clone(),
         report.clone(),
+        event_callback.clone(),
     )?;
-    let settle = make_settle_tsfn(&env, phase.clone(), weak, user, report.clone())?;
+    let settle = make_settle_tsfn(
+        &env,
+        phase.clone(),
+        weak,
+        user,
+        report.clone(),
+        event_callback,
+    )?;
     let mut bridge = PairingBridge {
         whisper: None,
         on_chunk: chunk.as_ref().clone(),
@@ -295,6 +396,16 @@ pub fn repro_p9_bridge(
         last_primary_frame_index: 0,
         last_primary_dropped: 0,
     };
+    if scenario == "whisper-secondary-orphan" || scenario == "whisper-pending-flush" {
+        let mut whisper = whisper_integration::WhisperBridge::new(
+            flexaudio_vad::WhisperVadParams::default(),
+            flexaudio_vad::WhisperVadOptions::default(),
+            VadTap::Secondary,
+        )
+        .map_err(|error| whisper_integration::throw_error(&env, error))?;
+        whisper.inject_faults(Some(2), 0);
+        bridge.whisper = Some(whisper);
+    }
     if matches!(
         scenario.as_str(),
         "whisper-process"
@@ -327,7 +438,7 @@ pub fn repro_p9_bridge(
         stream
             .start()
             .map_err(|error| boundary::throw_error(&env, error))?;
-        return FlexStream::spawn(&env, stream, bridge, None, chunk, settle, terminal);
+        return FlexStream::spawn(&env, stream, bridge, None, chunk, settle, terminal, true);
     }
     #[cfg(target_os = "linux")]
     if scenario == "exhaust" || scenario == "reaper" {
@@ -359,12 +470,13 @@ pub fn repro_p9_bridge(
             stream
                 .start()
                 .map_err(|error| boundary::throw_error(&env, error))?;
-            let created = FlexStream::spawn(&env, stream, bridge, None, chunk, settle, terminal)?;
+            let created =
+                FlexStream::spawn(&env, stream, bridge, None, chunk, settle, terminal, true)?;
             restrict_threads();
             return Ok(created);
         }
         restrict_threads();
-        return FlexStream::spawn(&env, stream, bridge, None, chunk, settle, terminal);
+        return FlexStream::spawn(&env, stream, bridge, None, chunk, settle, terminal, true);
     }
     let handle = spawn_bridge_thread(
         chunk.clone(),
@@ -375,6 +487,57 @@ pub fn repro_p9_bridge(
         move || {
             if scenario == "panic" {
                 panic!("repro: C F37 bridge failure");
+            }
+            if scenario == "whisper-secondary-orphan" || scenario == "whisper-pending-flush" {
+                let mut whisper = bridge
+                    .whisper
+                    .take()
+                    .expect("the scenario owns its initialized VAD attachment");
+                for index in 0..2 {
+                    whisper.process(AudioChunk {
+                        data: vec![0.0; 1920],
+                        frames: 960,
+                        frame_index: index * 960,
+                        pts_ns: index as i64 * 20_000_000,
+                        seq: index,
+                        flags: ChunkFlags::empty(),
+                        dropped_before: 0,
+                        peak: 0.0,
+                        rms: 0.0,
+                    });
+                }
+                bridge.whisper = Some(whisper);
+                bridge.on_secondary(SecondaryChunk {
+                    samples: vec![0.0; 960],
+                    frames: 960,
+                    frame_index: 0,
+                    pts_ns: 0,
+                    seq: 0,
+                    flags: ChunkFlags::empty(),
+                    dropped_before: 0,
+                    peak: 0.0,
+                    rms: 0.0,
+                });
+                bridge.report_whisper_failure(); // No carrier yet: retain the notification.
+                if scenario == "whisper-secondary-orphan" {
+                    bridge.on_primary(AudioChunk {
+                        data: vec![0.0; 960],
+                        frames: 960,
+                        frame_index: 4800,
+                        pts_ns: 100_000_000,
+                        seq: 0,
+                        flags: ChunkFlags::empty(),
+                        dropped_before: 0,
+                        peak: 0.0,
+                        rms: 0.0,
+                    });
+                    bridge.drain_pairs();
+                } else {
+                    bridge.flush_whisper(false); // Successful recovery must not erase pending failure.
+                }
+                bridge.report_whisper_failure();
+                bridge.retain_shutdown_outcome(None);
+                return;
             }
             let primary_pts = if scenario == "orphan" { 100_000_000 } else { 0 };
             let secondary_pts = if scenario == "residual" {
@@ -425,5 +588,6 @@ pub fn repro_p9_bridge(
         settle_tsfn: settle,
         terminal,
         report,
+        mock_source: true,
     })
 }

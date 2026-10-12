@@ -27,3 +27,6 @@ flexaudio = { path = "../flexaudio" }
 flexaudio-vad = { path = "../flexaudio-vad" }
 flexaudio-encode = { path = "../flexaudio-encode" }
 flexaudio-denoise = { path = "../flexaudio-denoise" }
+
+[dev-dependencies]
+flexaudio-vad = { path = "../flexaudio-vad", features = ["test-faults"] }

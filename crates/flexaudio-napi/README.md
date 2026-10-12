@@ -283,10 +283,25 @@ output taps keep independent producer timelines across native restarts and gaps.
 `flushWhisperVad()` delivers an empty closing carrier before its promise resolves;
 `stop()` drains capture and closes its last epoch before settlement.
 
+An attached VAD failure is a failure of the **VAD session only**. It is reported once
+as `onEvent({ type: 'whisperVadFailed', error, epoch })`, after the carrier whose
+`whisperVadEvents` end with `epochEnd(error)`; `error.whisperCode` names the typed
+cause. Capture, PCM delivery, `pause`/`resume`, `switchSource` and `stop` keep
+working, and `terminalError()` stays undefined (it means capture primary only). The
+shutdown report keeps the cause in `cleanupErrors` with its `whisperCode` and leaves
+`primary` for real capture failures. The next discontinuity (the flag, a capture
+index gap, a PTS reanchor, or the first chunk after `resume`/`switchSource`) reinitializes converter
+and model, so the following frame starts a new anchored epoch; a failed
+reinitialization keeps the session failed without repeating the event, until
+`flushWhisperVad()` succeeds. Missing capture audio never becomes padding, and a
+capture index gap closes the intact prefix instead of failing it.
+
 Standalone tests do not open audio devices. After building/copying the addon as
 in `__test__/run-smoke.sh`, run
 `node __test__/whisper-vad.test.mjs` from this crate. The script uses `node:test`
-and reports each of its twelve cases.
+and reports each available case. Failure-isolation cases require a test addon built
+with `--features test-faults`; production builds reject injection with
+`TestFaultsUnavailable`. The release workflows do not enable this feature.
 
 ## Building the loader (`index.js` / `index.d.ts`)
 

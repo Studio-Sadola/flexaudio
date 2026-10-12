@@ -167,7 +167,7 @@ pub(super) fn audio_error(error: &Error) -> JsAudioError {
         Error::PermissionDenied { .. } => "permissionDenied",
         Error::UnsupportedOsVersion => "unsupportedOsVersion",
         Error::DeviceLost => "deviceLost",
-        Error::Backend(_) => "backend",
+        Error::Backend(_) | Error::WhisperVad { .. } => "backend",
         Error::UnsupportedFormat(_) => "unsupportedFormat",
         Error::NativeFormatChanged { .. } => "nativeFormatChanged",
         Error::Unsupported => "unsupported",
@@ -197,7 +197,7 @@ pub(super) fn audio_error(error: &Error) -> JsAudioError {
             .map(|permission| permission.as_str().into()),
         advertised,
         actual,
-        whisper_code: None,
+        whisper_code: error.whisper_code().map(|code| code.as_str().into()),
     }
 }
 
@@ -276,6 +276,7 @@ pub(super) fn event_to_js(event: Event) -> JsStreamEvent {
         message: None,
         error: None,
         loss: None,
+        epoch: None,
     };
     result.kind = match event {
         Event::ChunkDropped { count } => {
@@ -379,7 +380,7 @@ pub(super) fn device_event_to_js(event: DeviceEvent) -> JsDeviceEvent {
     result
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(flexaudio_repro_addon, feature = "test-faults")))]
 pub(super) fn fixture_error(kind: &str) -> Error {
     match kind {
         "invalidArg" => Error::InvalidArg("invalid rate".into()),

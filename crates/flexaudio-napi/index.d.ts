@@ -207,7 +207,7 @@ export interface FrameProbabilities {
 
 export type WhisperVadErrorCode = 'InvalidParameter' | 'InvalidPcm' | 'InvalidProbability'
   | 'Overflow' | 'SessionFinished' | 'Inference' | 'ModelLoad' | 'FailedSession'
-  | 'ConflictingVad' | 'UnsupportedTap' | 'UnsupportedConversionClock'
+  | 'ConflictingVad' | 'UnsupportedTap' | 'UnsupportedConversionClock' | 'TestFaultsUnavailable'
   | 'InvalidStereoLength' | 'CaptureSampleOverflow' | 'PtsOutOfRange' | 'Conversion' | 'Stopped'
 
 /** Drain terminalEvents through the normal consumer even when a call throws. */
@@ -291,9 +291,11 @@ export interface AudioLoss {
 }
 
 export interface ShutdownReport {
-  /** Capture failure, including attached Whisper processing; null on cleanup-only failure. */
+  /** Capture failure only; an attached whisper-compatible VAD failure is never the capture
+   * primary, so it stays null for a whisper-only failure (see whisperVadFailed). */
   primary: AudioError | null
-  /** Core teardown followed by addon final flush failures, retained in order. */
+  /** Core teardown, then the attached whisper VAD failure, then addon final flush failures,
+   * retained in order. A whisper failure keeps its typed whisperCode here. */
   cleanupErrors: readonly AudioError[]
 }
 
@@ -310,6 +312,13 @@ export type JsStreamEvent =
   | { type: 'terminalError'; error: AudioError }
   | { type: 'recoverableError'; error: AudioError }
   | { type: 'shutdownError'; error: AudioError }
+  /** The attached whisper-compatible VAD session failed; capture, PCM delivery, pause/resume,
+   * switchSource and stop keep working. `error.whisperCode` names the typed cause. Delivered
+   * after the carrier whose `whisperVadEvents` end with `epochEnd(error)`, and before stop
+   * resolves. Reported once per failure; the next discontinuity reinitializes the session
+   * and the following failure is
+   * reported again. `epoch` is the failed epoch (the one closed by that `epochEnd(error)`). */
+  | { type: 'whisperVadFailed'; error: AudioError; epoch: number }
   | { type: 'audioLoss'; loss: AudioLoss }
   /** Coalesced upstream clipping; no exact chunk, count, timestamp or lane attribution. */
   | { type: 'clipped' }
@@ -497,6 +506,9 @@ export declare function processes(): Promise<Array<JsProcessInfo>>
 export declare function openStream(options: OpenOptions, onChunk: (chunk: JsAudioChunk) => void, onEvent?: ((event: JsStreamEvent) => void) | undefined | null): FlexStream
 /** Watch device changes. Linux startup failure throws AudioException. RescanRequired invalidates incremental caches. */
 export declare function watchDevices(onEvent: (event: JsDeviceEvent) => void): DeviceWatcherHandle
+/** Test-only capability marker, present only when fault injection is compiled. */
+export declare const __whisperVadTestFaults: true | undefined
+
 /**
  * Test-only; outside the public API.
  *
@@ -513,10 +525,16 @@ export declare function watchDevices(onEvent: (event: JsDeviceEvent) => void): D
  * without real audio. Tests construct it with `minSpeechMs=0`, so threshold 0 lets `flushVad`
  * reliably finalize open utterances (verifies RT finalization even with synthetic waves lacking silence).
  *
+ * `onEvent` receives stream notifications, including `whisperVadFailed`.
+ * `whisperVadFailAtChunk` injects a model failure on the 1-based canonical capture chunk;
+ * `whisperVadResetFailures` fails that many subsequent reinitializations. Both are test-only
+ * and require an addon built with `test-faults`; other builds reject either argument with
+ * `TestFaultsUnavailable`, because fault injection is not compiled into production.
+ *
  * JS name is `__openMockStream`. Leading `__` marks it outside the public API. napi's default
  * conversion drops leading underscores, producing `openMockStream`, so `js_name` fixes the name.
  */
-export declare function __openMockStream(sampleRate: number, channels: number, freqHz: number, onChunk: (chunk: JsAudioChunk) => void, secondaryRate?: number | undefined | null, secondaryChannels?: number | undefined | null, secondaryEncoding?: string | undefined | null, vadThreshold?: number | undefined | null, vadTap?: string | undefined | null, whisperVad?: WhisperVadStreamOptions | undefined | null): FlexStream
+export declare function __openMockStream(sampleRate: number, channels: number, freqHz: number, onChunk: (chunk: JsAudioChunk) => void, secondaryRate?: number | undefined | null, secondaryChannels?: number | undefined | null, secondaryEncoding?: string | undefined | null, vadThreshold?: number | undefined | null, vadTap?: string | undefined | null, whisperVad?: WhisperVadStreamOptions | undefined | null, onEvent?: ((event: JsStreamEvent) => void) | undefined | null, whisperVadFailAtChunk?: number | undefined | null, whisperVadResetFailures?: number | undefined | null): FlexStream
 /**
  * Recording stream handle. Internally, the bridge thread owns and polls `flexaudio::Stream`
  * and sends chunks/events to JS through TSFN.
@@ -527,8 +545,9 @@ export declare class FlexStream {
    * stop (the last PCM and `frames:0` terminator) have been delivered to JS.
    * Repeated calls return the same retained success or failure after completion. Calling
    * inside `onChunk` does not freeze JS because joining happens off the JS thread.
-   * Rejects with AudioException or WhisperVadError on capture or cleanup failure; audioError
-   * retains all related causes. Capture failure suppresses
+   * A whisper-only failure resolves and remains in shutdownReport().cleanupErrors with its
+   * typed whisperCode. Rejects with AudioException on capture or other cleanup failure;
+   * audioError retains all related causes. Capture failure suppresses
    * further PCM and the normal terminator. Cleanup-only failure preserves valid graceful output.
    * The stopped stream is spent; call openStream to capture again.
    */

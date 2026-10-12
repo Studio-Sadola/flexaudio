@@ -47,12 +47,10 @@ impl Stream {
         }
         if let Some(whisper) = self.whisper.as_mut() {
             let result = whisper.stop();
-            if result.is_err() {
-                cleanup.push(flush_error("binding whisper VAD shutdown failed"));
-            }
-            self.accept_whisper(result);
+            self.accept_whisper(result, fa::Operation::Stop);
             self.whisper_carrier();
         }
+        cleanup.extend(self.whisper_cleanup.iter().cloned());
         self.local_events.extend(
             cleanup[before..]
                 .iter()
@@ -127,7 +125,7 @@ mod tests {
             whisper_events: Vec::new(),
             whisper_origin: (0, 0),
             whisper_error: None,
-            whisper_error_reported: false,
+            whisper_cleanup: Vec::new(),
             ready_chunks: Default::default(),
             denoiser: None,
             vad: None,

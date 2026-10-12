@@ -273,7 +273,7 @@ pub struct FlexStream {
     pub(crate) whisper_events: Vec<flexaudio_vad::AttachedWhisperVadEvent>,
     pub(crate) whisper_origin: (u64, i64),
     pub(crate) whisper_error: Option<flexaudio_vad::WhisperVadTapError>,
-    pub(crate) whisper_error_reported: bool,
+    pub(crate) whisper_cleanup: Vec<flexaudio::Error>,
     pub(crate) ready_chunks: std::collections::VecDeque<crate::whisper_integration::FlexChunkV2>,
     /// Noise suppressor when enabled (requires 48 kHz; constructed at open). `None` when disabled.
     pub(crate) denoiser: Option<Denoiser>,
