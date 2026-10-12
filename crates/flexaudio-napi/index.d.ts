@@ -3,7 +3,8 @@
 
 /* Public declarations maintained to match the strict 0.5 boundary contract. */
 
-/** JS DeviceInfo. `sourceKind` is a string ("mic"|"system"|"process"). */
+/** JS DeviceInfo. `sourceKind` is a string ("mic"|"system"|"process").
+ * Sample rate and channel count are mandatory; unknown formats are not fabricated. */
 export interface JsDeviceInfo {
   id: string
   name: string
@@ -231,8 +232,9 @@ export declare class WhisperVad {
 }
 /**
  * Stream notification. permissionDenied is terminal, with permission and
- * cause/remedy in message. permissionPending is advisory: consent remains undecided,
- * capture continues and may stay silent until granted. silenceWhileSourceActive
+ * cause/remedy in message. permissionPending and permissionGranted are retained for
+ * custom Rust backends and compatibility; built-in backends emit neither arm on
+ * any OS or capture source. A custom permissionPending is advisory. silenceWhileSourceActive
  * is advisory: the system-audio diagnosis is inconclusive and capture continues.
  * Missing permission and genuine digital silence remain possible in that case.
  */
@@ -282,8 +284,10 @@ export interface AudioException extends Error {
 
 export interface AudioLoss {
   path: AudioPath
+  /** generationEnded means a terminal capture discarded a held valid native startup
+   * prefix; its scalar sample count, rate and channels describe that native input. */
   reason: 'rawOverflow' | 'mixFifoOverflow' | 'corruptBuffer' | 'malformedBuffer'
-    | 'callbackRejected' | 'outputOverflow'
+    | 'callbackRejected' | 'outputOverflow' | 'generationEnded'
   /** Interval count of scalar interleaved samples at the discard point; null means unknown. */
   samples: bigint | null
   sampleRate: number
@@ -322,6 +326,8 @@ export type JsStreamEvent =
   | { type: 'audioLoss'; loss: AudioLoss }
   /** Coalesced upstream clipping; no exact chunk, count, timestamp or lane attribution. */
   | { type: 'clipped' }
+  /** Delivered before this generation's first onChunk and attached Whisper VAD epochStart. */
+  | { type: 'startupSamplesDropped'; frames: bigint; reason: 'outOfRange' }
   | { type: 'unknown'; message: string }
 
 export type JsDeviceEvent =
@@ -432,7 +438,14 @@ export interface OpenOptions {
    */
   secondaryOutput?: SecondaryOutputOptions
 }
-/** Enumerate the complete inventory. Discovery failure throws AudioException. */
+/** Enumerate the complete inventory. Discovery failure throws AudioException.
+ * On macOS, enumeration never prompts. With undecided microphone consent it
+ * throws a typed Backend error before any HAL/device/format query. Grant the
+ * responsible host access or use the bounded capture-open consent flow, then retry.
+ * Denied/restricted consent throws PermissionDenied. DeviceInfo formats are mandatory;
+ * incomplete discovery does not return a partial or unknown-format inventory.
+ * Windows enumeration does not preflight microphone permission; native enumeration
+ * proceeds. Microphone capture retains its separate existing permission preflight. */
 export declare function devices(): Array<JsDeviceInfo>
 /**
  * Enumerate processes with audio output sessions (streams) that can be targeted by per-process
@@ -461,14 +474,23 @@ export declare function processes(): Promise<Array<JsProcessInfo>>
 /**
  * Open and start a stream, returning a `FlexStream` that sends chunks/events to callbacks.
  * Confirmed microphone/system-audio denial throws actionable permission guidance.
- * Supply onEvent for runtime denial, permissionPending and silenceWhileSourceActive
+ * Supply onEvent for startupSamplesDropped, runtime denial and silenceWhileSourceActive
  * advisories. Without onEvent, terminalError() and stop() expose terminal failures
- * only; they do not expose advisories. macOS bundled microphone prompts wait up to
- * 30 s; an unanswered prompt proceeds with capture. Undecided consent emits
- * permissionPending after 5 s of capture. Authorization is checked every 500 ms
- * for the first 60 s, then every 2 s until resolved or stopped. Bare-host opens rely
- * on the responsible-app prompt. Windows checks Microphone privacy, including
- * Let desktop apps access your microphone.
+ * only; they do not expose advisories. macOS microphone authorization is checked
+ * before any HAL format query. Bundled prompts wait at most 30 s; an unanswered
+ * prompt throws a typed backend error without starting capture. Answer the prompt
+ * and retry. Undecided consent without a nonempty NSMicrophoneUsageDescription
+ * fails immediately; configure the bundle or grant the responsible host access
+ * before retrying. openStream is synchronous; use a worker thread for GUI hosts.
+ * The 30 s bound covers undecided consent, not authorized native queries.
+ * Built-in sources on every OS emit neither permissionPending nor permissionGranted;
+ * those arms remain for custom Rust backends and compatibility. macOS microphone
+ * capture requires decided consent before each start and does not continuously
+ * monitor authorization changes or revocation. With onEvent, startupSamplesDropped
+ * is delivered before the affected generation's first onChunk and attached epochStart.
+ * Recovered and other advisories use independent callbacks and may arrive
+ * before or after the startup notice; they have no ordering guarantee relative to it.
+ * Windows checks Microphone privacy, including Let desktop apps access your microphone.
  *
  * macOS system/process capture runs a once-per-generation self-probe after 5 s of
  * exact-zero samples with eligible external output active. It renders a roughly

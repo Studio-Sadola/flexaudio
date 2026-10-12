@@ -49,6 +49,7 @@ class DeclarationContracts(unittest.TestCase):
             "ShutdownErrorEventDict": ("shutdownError", "error"),
             "AudioLossEventDict": ("audioLoss", "loss"),
             "ClippedEventDict": ("clipped", None),
+            "StartupSamplesDroppedEventDict": ("startupSamplesDropped", "frames"),
             "UnknownEventDict": ("unknown", "message"),
         }
         self.assertEqual(self.members("StreamEventDict"), set(expected))
@@ -59,6 +60,10 @@ class DeclarationContracts(unittest.TestCase):
                 self.assertIn(payload, fields)
             self.assertFalse(any(field.startswith("Optional[") for field in fields.values()))
         self.assertEqual(self.fields("PermissionGrantedEventDict")["permission"], "Literal['microphone']")
+
+    def test_startup_drop_payload_is_typed(self):
+        self.assertEqual(self.fields("StartupSamplesDroppedEventDict")["frames"], "int")
+        self.assertEqual(self.fields("StartupSamplesDroppedEventDict")["reason"], "Literal['outOfRange']")
 
     def test_device_events_cannot_fabricate_default_id_or_source(self):
         self.assertEqual(self.members("DeviceEventDict"), {

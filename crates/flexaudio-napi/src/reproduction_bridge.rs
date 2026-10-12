@@ -3,6 +3,20 @@ use super::*;
 
 /// Sends deterministic PCM without devices or a producer thread; failures travel
 /// through the real facade stop/report and the production N-API bridge.
+struct StartupOrderFixtureBackend;
+impl flexaudio::core::CaptureBackend for StartupOrderFixtureBackend {
+    fn native_format(&self) -> (u32, u16) {
+        (48_000, 2)
+    }
+    fn start(&mut self, mut sink: flexaudio::core::RawSink) -> flexaudio::Result<()> {
+        let mut samples = vec![3.058; 960];
+        samples.extend([0.25; 3840]);
+        sink.push(&samples, 0);
+        Ok(())
+    }
+    fn stop(&mut self) {}
+}
+
 struct ShutdownFixtureBackend {
     sink: Option<flexaudio::core::RawSink>,
     cleanup_failure: bool,
@@ -101,7 +115,7 @@ unsafe fn export_chunk_ms(raw_env: sys::napi_env) -> napi::Result<sys::napi_valu
             if options.chunk_ms.is_some_and(|ms| ms != 20.0) {
                 boundary::throw_error(
                     ctx.env,
-                    flexaudio::Error::InvalidArg("chunkMs must be 20".into()),
+                    flexaudio::core::chunk_ms_error(flexaudio::core::ChunkMsOption::JavaScript),
                 )
             } else {
                 error
@@ -353,7 +367,7 @@ pub fn repro_p9_bridge(
     let terminal: TerminalError = Arc::new(Mutex::new(None));
     let report: FinalReport = Arc::new(Mutex::new(None));
     let user = make_user_chunk_cb(&env, &on_chunk)?;
-    let (_, event_callback) = make_stream_event_callbacks(&env, on_event)?;
+    let (mut event_tsfn, event_callback) = make_stream_event_callbacks(&env, on_event)?;
     let weak: ChunkTsfnWeakCell = Arc::new(OnceLock::new());
     let chunk = make_chunk_tsfn(
         &env,
@@ -370,8 +384,24 @@ pub fn repro_p9_bridge(
         weak,
         user,
         report.clone(),
-        event_callback,
+        event_callback.clone(),
     )?;
+    // Reverse queue creation order in this fixture: independent TSFNs cannot provide FIFO.
+    let startup_drain_fixture =
+        matches!(scenario.as_str(), "startup-flush" | "startup-stop-prologue");
+    let mut startup_stream = None;
+    if scenario == "startup-order" || startup_drain_fixture {
+        drop(event_tsfn.take());
+        if let Some(callback) = &event_callback {
+            let mut value = ptr::null_mut();
+            check_status!(unsafe {
+                sys::napi_get_reference_value(env.raw(), callback.refer(), &mut value)
+            })?;
+            let function =
+                unsafe { Function::<JsStreamEvent, Unknown>::from_napi_value(env.raw(), value)? };
+            event_tsfn = make_stream_event_callbacks(&env, Some(function))?.0;
+        }
+    }
     let mut bridge = PairingBridge {
         whisper: None,
         on_chunk: chunk.as_ref().clone(),
@@ -396,6 +426,41 @@ pub fn repro_p9_bridge(
         last_primary_frame_index: 0,
         last_primary_dropped: 0,
     };
+    if scenario == "startup-order" || startup_drain_fixture {
+        bridge.secondary = None;
+        bridge.output_channels = 2;
+        bridge.whisper = Some(
+            whisper_integration::WhisperBridge::new(
+                flexaudio_vad::WhisperVadParams::default(),
+                flexaudio_vad::WhisperVadOptions::default(),
+                VadTap::Primary,
+            )
+            .map_err(|error| whisper_integration::throw_error(&env, error))?,
+        );
+        let mut stream = flexaudio::Stream::open(
+            StreamConfig::default(),
+            Box::new(StartupOrderFixtureBackend),
+        )
+        .map_err(|error| boundary::throw_error(&env, error))?;
+        stream
+            .enable_capture_tap()
+            .map_err(|error| boundary::throw_error(&env, error))?;
+        start_bridge_stream(&env, &mut stream)?;
+        if startup_drain_fixture {
+            // Join intake without claiming events, making the accepted prefix deterministic.
+            // The fixture then invokes the same drain as the production flush/stop branch.
+            stream
+                .stop_checked()
+                .map_err(|error| boundary::throw_error(&env, error))?;
+            startup_stream = Some(stream);
+        } else {
+            // Queue both notice and PCM before the bridge starts, exposing cross-TSFN ordering.
+            std::thread::sleep(Duration::from_millis(30));
+            return FlexStream::spawn(
+                &env, stream, bridge, event_tsfn, chunk, settle, terminal, true,
+            );
+        }
+    }
     if scenario == "whisper-secondary-orphan" || scenario == "whisper-pending-flush" {
         let mut whisper = whisper_integration::WhisperBridge::new(
             flexaudio_vad::WhisperVadParams::default(),
@@ -435,9 +500,12 @@ pub fn repro_p9_bridge(
         stream
             .enable_capture_tap()
             .map_err(|error| boundary::throw_error(&env, error))?;
-        stream
-            .start()
-            .map_err(|error| boundary::throw_error(&env, error))?;
+        start_bridge_stream(&env, &mut stream)?;
+        if let Some(whisper) = bridge.whisper.as_mut() {
+            whisper
+                .prime_shutdown_fixture_capture(&mut stream)
+                .map_err(|error| boundary::throw_error(&env, error))?;
+        }
         return FlexStream::spawn(&env, stream, bridge, None, chunk, settle, terminal, true);
     }
     #[cfg(target_os = "linux")]
@@ -467,9 +535,7 @@ pub fn repro_p9_bridge(
             }
         };
         if scenario == "reaper" {
-            stream
-                .start()
-                .map_err(|error| boundary::throw_error(&env, error))?;
+            start_bridge_stream(&env, &mut stream)?;
             let created =
                 FlexStream::spawn(&env, stream, bridge, None, chunk, settle, terminal, true)?;
             restrict_threads();
@@ -478,6 +544,7 @@ pub fn repro_p9_bridge(
         restrict_threads();
         return FlexStream::spawn(&env, stream, bridge, None, chunk, settle, terminal, true);
     }
+    let fixture_terminal = terminal.clone();
     let handle = spawn_bridge_thread(
         chunk.clone(),
         settle.clone(),
@@ -485,6 +552,17 @@ pub fn repro_p9_bridge(
         report.clone(),
         terminal.clone(),
         move || {
+            if let Some(mut stream) = startup_stream.take() {
+                bridge.drain_stream(&mut stream, event_tsfn.as_ref(), &fixture_terminal);
+                if scenario == "startup-stop-prologue" && bridge.last_primary_frame_index == 0 {
+                    record_cleanup_failure(&bridge.report,
+                        flexaudio::Error::Backend("The synthetic stop prologue skipped accepted startup input; forward queued stream events before polling PCM.".into()));
+                }
+                bridge.flush_whisper(scenario == "startup-stop-prologue");
+                bridge.report_whisper_failure();
+                bridge.retain_shutdown_outcome(stream.shutdown_report());
+                return;
+            }
             if scenario == "panic" {
                 panic!("repro: C F37 bridge failure");
             }

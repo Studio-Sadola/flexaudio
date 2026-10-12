@@ -100,7 +100,8 @@
 
 #define FLEX_DEVICE_EVENT_KIND_UNKNOWN 3
 
-// Late microphone consent; permission getter returns 1.
+// Late microphone consent for custom backends/compatibility; permission getter returns 1.
+// Built-in backends emit neither pending nor granted notices on any OS/source.
 #define FLEX_EVENT_KIND_PERMISSION_GRANTED 9
 
 // Validated interval sample loss.
@@ -123,6 +124,14 @@
 
 // Incremental inventory is invalid; obtain a complete inventory again.
 #define FLEX_DEVICE_EVENT_KIND_RESCAN_REQUIRED 5
+
+// Leading invalid microphone frames suppressed; v2 accessor gives frames/reason.
+// Enqueued chronologically before publishing the generation's first chunk.
+// Event-first callers can observe it before PCM; PCM polling does not wait for event polling.
+#define FLEX_EVENT_KIND_STARTUP_SAMPLES_DROPPED 15
+
+// Startup validation saw non-finite or out-of-range microphone samples.
+#define FLEX_STARTUP_DROP_OUT_OF_RANGE 0
 
 #define FLEX_STREAM_VERSION_2 2
 
@@ -328,7 +337,9 @@ typedef struct FlexChunk {
 //
 // For Error, PermissionDenied, SilenceWhileSourceActive, and PermissionPending,
 // the message is stored in flexaudio_last_error. PermissionDenied retains kind 3;
-// PermissionPending has kind 8 and does not stop capture.
+// PermissionPending has kind 8 and does not stop capture. This arm remains for
+// custom Rust backends and compatibility; built-in sources on every OS emit
+// neither pending nor granted notices.
 typedef struct FlexEvent {
     // Event kind.
     int32_t kind;
@@ -382,7 +393,8 @@ typedef struct FlexAudioLossV2 {
     uint32_t lane;
     // 0 primary, 1 secondary; used only for output path.
     uint32_t tap;
-    // 0 raw overflow, 1 FIFO overflow, 2 corrupt, 3 malformed, 4 callback rejected, 5 output overflow.
+    // 0 raw overflow, 1 FIFO overflow, 2 corrupt, 3 malformed, 4 callback rejected,
+    // 5 output overflow, 6 generation ended: terminal capture discarded a held valid native startup prefix.
     uint32_t reason;
     // 0 unknown, 1 known positive scalar interleaved sample count.
     uint32_t count_known;
@@ -550,6 +562,13 @@ typedef struct FlexWhisperVadEvent {
 
 // Open a stream from the configuration (without starting it). On failure, return NULL and
 // set last_error.
+// For macOS microphone/Mix, consent is checked before any HAL/device-format query.
+// An undecided bundled prompt waits at most 30 seconds; an unanswered prompt returns
+// NULL with a typed Backend error without querying HAL or starting capture. Answer
+// the prompt and retry. Undecided consent without microphone usage metadata fails
+// immediately; configure the bundle or grant the responsible host access first.
+// The bound covers the undecided consent wait, not authorized native queries.
+// Opening is synchronous; GUI hosts should use a worker thread.
 //
 // If `config.denoise` / `config.has_vad` is enabled, build the corresponding add-ons (noise
 // suppression / VAD) here and attach them to the stream (`poll_chunk` applies denoise → VAD).
@@ -669,6 +688,9 @@ uint64_t flexaudio_dropped_chunks(const struct FlexStream *s);
 // with actionable guidance in flexaudio_last_error, including after stop.
 // `out.data` is owned by flexaudio; free it with
 // `flexaudio_chunk_free` when done.
+// PCM polling does not wait for event polling, including after stop. Startup notices
+// enter the ordinary FIFO event queue before the generation's first chunk is published;
+// event-first callers can observe them before polling that PCM.
 //
 // If add-ons are enabled, the chunk passes through denoise → VAD before it is returned. When
 // VAD is enabled, confirmed events are stored in `out.vad_events` (with count
@@ -698,6 +720,8 @@ void flexaudio_chunk_free(struct FlexChunk *chunk);
 // Error, PermissionDenied (kind 3), SilenceWhileSourceActive (kind 7), and
 // PermissionPending (kind 8, advisory only: capture continues)
 // store safe explanations in last_error. Typed failures project to Error (5):
+// Pending/granted arms remain for custom Rust backends and compatibility;
+// built-in sources on every OS emit neither notice.
 // v1 cannot distinguish terminal/recoverable/cleanup; inspect terminal_error or use v2.
 // Counts above INT64_MAX saturate with a range-loss diagnostic. PermissionDenied is terminal, including
 // a confirmed macOS self-probe failure. SilenceWhileSourceActive means the
@@ -760,6 +784,13 @@ int32_t flexaudio_terminal_error(const struct FlexStream *s);
 // unreachable PipeWire daemon on Linux) returns a typed error code and sets
 // `flexaudio_last_error` / `flexaudio_last_error_info_v2`; it is not an empty success.
 // Free the allocated array with `flexaudio_devices_free`.
+// On macOS, enumeration never prompts. With undecided microphone consent it returns
+// a typed Backend error before any HAL/device/format query. Grant the responsible
+// host access or use the bounded capture-open consent flow, then retry enumeration.
+// Denied/restricted consent returns a permission error. DeviceInfo formats are mandatory;
+// discovery does not return a partial or unknown-format inventory.
+// Windows enumeration does not preflight microphone permission; native enumeration
+// proceeds. Microphone capture retains its separate existing permission preflight.
 //
 // # Safety
 // `out_array` / `out_count` must be valid output pointers (NULL is InvalidArg).
@@ -1084,6 +1115,16 @@ const struct FlexErrorInfoV2 *flexaudio_shutdown_primary_v2(const struct FlexShu
 const struct FlexErrorInfoV2 *flexaudio_shutdown_cleanup_v2(const struct FlexShutdownReportV2 *value,
                                                             size_t index);
 
+// Suppressed microphone native frames; 0 for other event arms, output untouched.
+// # Safety
+// value must be a live event; out must be writable and aligned.
+int32_t flexaudio_event_startup_frames_v2(const struct FlexEventV2 *value, uint64_t *out);
+
+// Startup-drop reason; currently FLEX_STARTUP_DROP_OUT_OF_RANGE (includes non-finite samples).
+// # Safety
+// value must be a live event; out must be writable and aligned.
+int32_t flexaudio_event_startup_reason_v2(const struct FlexEventV2 *value, int32_t *out);
+
 // Create a VAD from a config. A NULL `config` uses the defaults (Silero-compatible).
 //
 // Returns NULL and sets last_error on failure (model load failure, invalid sample_rate, etc.).
@@ -1177,6 +1218,9 @@ void flexaudio_watcher_free(struct FlexWatcher *w);
 int32_t flexaudio_open_v2(const struct FlexStreamConfigV2 *config, struct FlexStream **out);
 
 // Poll a versioned chunk: 1 available, 0 absent, negative result on error.
+// PCM polling does not wait for event polling, including after stop.
+// Startup notices are enqueued before publishing their generation's first chunk;
+// event-first callers can drain the ordinary FIFO event queue before PCM.
 // # Safety
 // Stream must be exclusively owned; out must be writable, with any prior chunk already freed.
 int32_t flexaudio_poll_chunk_v2(struct FlexStream *s, struct FlexChunkV2 *out);

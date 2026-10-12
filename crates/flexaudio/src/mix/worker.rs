@@ -1,5 +1,42 @@
 //! Non-realtime normalization, mixing and graceful final drain.
 use super::*;
+
+/// Align both lanes to the first confirmed mic frame before any publication.
+fn prepare_startup(mic: &mut ChildLane, system: &mut ChildLane, sink: &mut RawSink) -> bool {
+    if mic.startup_abandoned {
+        return false;
+    }
+    let Some(guard) = mic.startup.as_ref() else {
+        return true;
+    };
+    if mic.startup_reported && !guard.is_pending() {
+        return true;
+    }
+    let frames = guard.dropped_frames();
+    // Convert the cumulative prefix once, matching the facade's canonical clock.
+    let target = frames.saturating_mul(u64::from(SAMPLE_RATE)) / u64::from(mic.format.0)
+        * u64::from(CHANNELS);
+    let remaining = target.saturating_sub(
+        mic.startup_system_skipped
+            .saturating_add(system.fifo_evicted),
+    );
+    let skip = usize::try_from(remaining)
+        .unwrap_or(usize::MAX)
+        .min(system.fifo.len());
+    system.fifo.drain(..skip);
+    mic.startup_system_skipped = mic
+        .startup_system_skipped
+        .saturating_add(u64::try_from(skip).unwrap_or(u64::MAX));
+    if guard.is_pending() || remaining > u64::try_from(skip).unwrap_or(u64::MAX) {
+        return false;
+    }
+    if frames > 0 {
+        sink.diagnostics().record_startup_drop(frames, mic.format.0);
+    }
+    mic.startup_reported = true;
+    true
+}
+
 pub(super) fn mix_and_push(
     mic: &mut ChildLane,
     system: &mut ChildLane,
@@ -9,6 +46,9 @@ pub(super) fn mix_and_push(
     sink: &mut RawSink,
     mixed: &mut Vec<f32>,
 ) -> bool {
+    if !prepare_startup(mic, system, sink) {
+        return false;
+    }
     let ch = CHANNELS as usize;
     let ratio = drift.controller.ratio;
     let steady_frames =
@@ -125,7 +165,7 @@ pub(super) fn run_mixer(
                 notices.fail(error);
             }
         }
-        if !notices.failed() {
+        if !notices.failed() && prepare_startup(&mut mic, &mut system, &mut sink) {
             // Producer clocks are finished: pair all remaining samples at unity
             // ratio and pad only the shorter lane. No starvation delay on stop.
             mixed.clear();
@@ -153,5 +193,12 @@ pub(super) fn run_mixer(
         if let Err(error) = lane.losses() {
             notices.cleanup(error);
         }
+    }
+    if notices.failed() {
+        if let Err(error) = mic.reject_startup() {
+            notices.cleanup(lane_error(error, Operation::Stop, MixLane::Microphone));
+        }
+    } else {
+        mic.retain_startup_drop();
     }
 }

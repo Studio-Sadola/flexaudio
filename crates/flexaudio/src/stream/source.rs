@@ -101,7 +101,7 @@ impl Stream {
     /// tests in another crate (`tests/integration.rs`) to call this with a MockBackend.
     #[doc(hidden)]
     pub fn switch_backend(&mut self, new_backend: Box<dyn CaptureBackend>) -> Result<()> {
-        self.switch_backend_inner(new_backend, None)
+        self.switch_backend_inner(new_backend, None, None)
     }
 
     /// Publish a backend and its denoise setting as one capture generation.
@@ -111,13 +111,14 @@ impl Stream {
         new_backend: Box<dyn CaptureBackend>,
         denoise: bool,
     ) -> Result<()> {
-        self.switch_backend_inner(new_backend, Some(denoise))
+        self.switch_backend_inner(new_backend, Some(denoise), None)
     }
 
     fn switch_backend_inner(
         &mut self,
         new_backend: Box<dyn CaptureBackend>,
         denoise: Option<bool>,
+        microphone: Option<bool>,
     ) -> Result<()> {
         if let Some(error) = self.terminal_error() {
             return Err(error);
@@ -181,6 +182,9 @@ impl Stream {
                     self.shared.backend_stopped.store(false, Ordering::SeqCst);
                     if let Some(enabled) = denoise {
                         self.shared.denoise_enabled.store(enabled, Ordering::SeqCst);
+                    }
+                    if let Some(microphone) = microphone {
+                        self.shared.microphone.store(microphone, Ordering::SeqCst);
                     }
                     self.shared.publish_raw(
                         &mut rc,
@@ -312,7 +316,11 @@ impl Stream {
             }
         };
         // Swap it in (switch_backend guarantees continuity).
-        self.switch_backend_inner(backend, denoise)?;
+        self.switch_backend_inner(
+            backend,
+            denoise,
+            Some(new_config.kind == flexaudio_core::SourceKind::Mic),
+        )?;
         // Update mutable config fields only on success (keep output and other fields unchanged).
         self.config = StreamConfig {
             kind: new_config.kind,

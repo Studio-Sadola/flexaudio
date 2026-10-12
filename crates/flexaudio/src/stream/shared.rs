@@ -9,6 +9,16 @@ impl SharedState {
             None => (0, 0),
         };
         RawSnapshot {
+            microphone: self.microphone.load(Ordering::SeqCst),
+            startup_drop: if scratch.is_empty() {
+                None
+            } else {
+                self.raw_diagnostics
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(CaptureDiagnostics::take_startup_drop)
+            },
             losses: if scratch.is_empty() {
                 Ok(Vec::new())
             } else {
@@ -35,6 +45,7 @@ impl SharedState {
         native_format: (u32, u16),
         change: GenerationChange,
     ) {
+        self.drain_pending_startup_drop();
         let old_format = *self.native_format.lock().unwrap_or_else(|e| e.into_inner());
         self.publish_capture_losses(self.capture_losses_locked(consumer.as_ref(), old_format));
         *self.native_format.lock().unwrap_or_else(|e| e.into_inner()) = native_format;
@@ -97,9 +108,65 @@ impl SharedState {
 
     /// Shared loss drain for final shutdown, including failures before acquiring intake.
     pub(super) fn drain_capture_losses(&self) {
+        self.drain_pending_startup_drop();
         let consumer = self.raw_consumer.lock().unwrap_or_else(|e| e.into_inner());
         let format = *self.native_format.lock().unwrap_or_else(|e| e.into_inner());
         self.publish_capture_losses(self.capture_losses_locked(consumer.as_ref(), format));
+    }
+
+    /// Capture replacement/final shutdown must not erase an undelivered Mix report.
+    fn drain_pending_startup_drop(&self) {
+        let pending = self
+            .raw_diagnostics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(CaptureDiagnostics::take_startup_drop);
+        if let Some((frames, rate)) = pending {
+            if let Err(error) = self.advance_startup_gap(frames, rate) {
+                self.record_cleanup(error);
+            }
+            if rate > 0 {
+                let duration = i64::try_from(u128::from(frames) * 1_000_000_000 / u128::from(rate))
+                    .unwrap_or(i64::MAX);
+                let origin = monotonic_now_ns().saturating_sub(duration);
+                self.recording_epoch_ns
+                    .compare_exchange(i64::MIN, origin, Ordering::SeqCst, Ordering::SeqCst)
+                    .ok();
+            }
+            self.push_event(Event::StartupSamplesDropped {
+                frames,
+                reason: flexaudio_core::StartupDropReason::OutOfRange,
+            });
+        }
+    }
+    /// Each counter stores frames at its tap rate; returned indices are canonical.
+    pub(super) fn advance_startup_gap(&self, frames: u64, native_rate: u32) -> Result<()> {
+        if native_rate == 0 {
+            return Err(Error::InvalidState(
+                "startup gap has no native sample rate; recreate the capture stream".into(),
+            ));
+        }
+        let taps = [
+            (&self.primary_frame_index, self.output_format.sample_rate),
+            (
+                &self.secondary_frame_index,
+                self.secondary_format
+                    .map_or(48_000, |format| format.sample_rate),
+            ),
+            (&self.capture_frame_index, 48_000),
+        ];
+        for (counter, tap_rate) in taps {
+            let skipped =
+                u64::try_from(u128::from(frames) * u128::from(tap_rate) / u128::from(native_rate))
+                    .map_err(|_| {
+                        Error::InvalidState(
+                            "startup frame timeline exhausted; reopen the stream".into(),
+                        )
+                    })?;
+            advance_frame_index(counter, skipped, tap_rate)?;
+        }
+        Ok(())
     }
 
     /// Stop and recovery publication share the raw lock; delivery cannot announce after this.
@@ -171,9 +238,26 @@ impl SharedState {
         }
     }
 
+    /// Retire a FIFO event while holding its queue lock, whether delivered or discarded.
+    pub(super) fn retire_event(&self, event: &Event) {
+        if matches!(event, Event::StartupSamplesDropped { .. }) {
+            self.startup_order
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .claim();
+        }
+    }
+
     pub(super) fn push_event(&self, ev: Event) {
-        // Recover the VecDeque and continue even if poisoned; events are not torn.
+        // One FIFO owns every event. Register the push-only boundary before publishing
+        // the notice and before intake can publish the generation's first chunk.
         let mut q = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(ev, Event::StartupSamplesDropped { .. }) {
+            self.startup_order
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .register(self);
+        }
         q.push_back(ev);
     }
 

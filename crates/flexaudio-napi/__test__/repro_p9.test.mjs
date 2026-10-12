@@ -219,6 +219,9 @@ test('chunkMs defaults to 20 and rejects non-20 values before acquisition', () =
     assert.throws(() => native.__reproP9ChunkMs({ kind: 'mic', chunkMs }), error => {
       assert.equal(error.code, 'FLEX_INVALID_ARG');
       assert.equal(error.audioError.kind, 'invalidArg');
+      assert.match(error.message, /canonical 20 ms frame contract/);
+      assert.match(error.message, /set chunkMs to 20/);
+      assert.ok(!error.message.includes('chunk_ms'));
       return true;
     });
   }
@@ -347,5 +350,53 @@ for (const scenario of ['whisper-secondary-orphan', 'whisper-pending-flush']) {
     assert.equal(report.primary, null);
     assert.equal(report.cleanupErrors.length, 1);
     assert.equal(report.cleanupErrors[0].whisperCode, 'Inference');
+  });
+}
+
+
+test('startup drop precedes the first chunk and Whisper epoch on the callback queue', async () => {
+  const order = [];
+  const stream = native.__reproP9Bridge('startup-order', chunk => {
+    if (chunk.frames > 0) order.push('chunk');
+    for (const event of chunk.whisperVadEvents ?? []) {
+      if (event.type === 'epochStart') order.push('epochStart');
+    }
+  }, event => {
+    if (event.type === 'startupSamplesDropped') order.push('startupSamplesDropped');
+  });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  await stream.stop();
+  const drop = order.indexOf('startupSamplesDropped');
+  const chunk = order.indexOf('chunk');
+  const epoch = order.indexOf('epochStart');
+  assert.ok(drop >= 0 && chunk >= 0 && epoch >= 0, `missing startup fixture output: ${order}`);
+  assert.ok(drop < chunk && drop < epoch, `startup notice arrived after generation data: ${order}`);
+});
+
+for (const scenario of ['startup-flush', 'startup-stop-prologue']) {
+  test(`${scenario} drains the accepted prefix before finalizing Whisper`, async () => {
+    const order = [];
+    const chunks = [];
+    const stream = native.__reproP9Bridge(scenario, chunk => {
+      chunks.push(chunk);
+      if (chunk.frames > 0) order.push('chunk');
+      for (const event of chunk.whisperVadEvents ?? []) order.push(event.type);
+    }, event => {
+      if (event.type === 'startupSamplesDropped') order.push(event.type);
+    });
+    await stream.stop();
+    assert.equal(chunks.reduce((sum, chunk) => sum + chunk.data.length, 0), 3840,
+      'all accepted startup PCM must be delivered before completion');
+    const events = chunks.flatMap(chunk => chunk.whisperVadEvents ?? []);
+    assert.equal(events.filter(event => event.type === 'epochStart').length, 1,
+      'the pending accepted prefix must start its epoch before finalization');
+    const ends = events.filter(event => event.type === 'epochEnd');
+    assert.equal(ends.length, 1, 'the accepted epoch closes exactly once');
+    assert.equal(ends[0].reason, 'finish');
+    const notice = order.indexOf('startupSamplesDropped');
+    assert.ok(notice >= 0 && notice < order.indexOf('chunk') && notice < order.indexOf('epochStart'),
+      `startup notice must precede PCM and epoch events: ${order}`);
+    assert.equal(stream.shutdownReport().primary, null);
+    assert.deepEqual(stream.shutdownReport().cleanupErrors, []);
   });
 }

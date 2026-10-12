@@ -254,6 +254,7 @@ fn loss_to_js(loss: AudioLoss) -> Option<JsAudioLoss> {
         LossReason::MalformedBuffer => "malformedBuffer",
         LossReason::CallbackRejected => "callbackRejected",
         LossReason::OutputOverflow => "outputOverflow",
+        LossReason::GenerationEnded => "generationEnded",
         _ => return None,
     };
     Some(JsAudioLoss {
@@ -271,6 +272,8 @@ fn loss_to_js(loss: AudioLoss) -> Option<JsAudioLoss> {
 pub(super) fn event_to_js(event: Event) -> JsStreamEvent {
     let mut result = JsStreamEvent {
         kind: String::new(),
+        frames: None,
+        reason: None,
         permission: None,
         count: None,
         message: None,
@@ -330,6 +333,11 @@ pub(super) fn event_to_js(event: Event) -> JsStreamEvent {
                 "unknown"
             }
         },
+        Event::StartupSamplesDropped { frames, reason } => {
+            result.frames = Some(BigInt::from(frames));
+            result.reason = Some(reason.as_str().into());
+            "startupSamplesDropped"
+        }
         Event::Clipped => "clipped",
         _ => {
             result.message = Some("unknown stream event diagnostic".into());
@@ -591,5 +599,25 @@ mod tests {
                 _ => panic!("known count lost"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    #[test]
+    fn startup_event_frames_remain_unsigned_bigint() {
+        let event = event_to_js(Event::StartupSamplesDropped {
+            frames: u64::MAX,
+            reason: flexaudio::StartupDropReason::OutOfRange,
+        });
+        assert_eq!(event.kind, "startupSamplesDropped");
+        assert_eq!(
+            event.frames.expect("startup frames").get_u64(),
+            (false, u64::MAX, true)
+        );
+        assert_eq!(event.reason.as_deref(), Some("outOfRange"));
+        assert!(event.error.is_none());
+        assert!(event.count.is_none());
     }
 }

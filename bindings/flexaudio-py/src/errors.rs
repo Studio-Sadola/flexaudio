@@ -260,6 +260,7 @@ impl AudioLoss {
             fa::LossReason::MalformedBuffer => "malformedBuffer",
             fa::LossReason::CallbackRejected => "callbackRejected",
             fa::LossReason::OutputOverflow => "outputOverflow",
+            fa::LossReason::GenerationEnded => "generationEnded",
             _ => {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
                     "unsupported loss reason",

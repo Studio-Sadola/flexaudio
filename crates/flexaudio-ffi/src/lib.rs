@@ -126,6 +126,13 @@ fn fail(err: flexaudio::Error) -> i32 {
 
 /// Open a stream from the configuration (without starting it). On failure, return NULL and
 /// set last_error.
+/// For macOS microphone/Mix, consent is checked before any HAL/device-format query.
+/// An undecided bundled prompt waits at most 30 seconds; an unanswered prompt returns
+/// NULL with a typed Backend error without querying HAL or starting capture. Answer
+/// the prompt and retry. Undecided consent without microphone usage metadata fails
+/// immediately; configure the bundle or grant the responsible host access first.
+/// The bound covers the undecided consent wait, not authorized native queries.
+/// Opening is synchronous; GUI hosts should use a worker thread.
 ///
 /// If `config.denoise` / `config.has_vad` is enabled, build the corresponding add-ons (noise
 /// suppression / VAD) here and attach them to the stream (`poll_chunk` applies denoise → VAD).
@@ -486,6 +493,9 @@ pub unsafe extern "C" fn flexaudio_dropped_chunks(s: *const FlexStream) -> u64 {
 /// with actionable guidance in flexaudio_last_error, including after stop.
 /// `out.data` is owned by flexaudio; free it with
 /// `flexaudio_chunk_free` when done.
+/// PCM polling does not wait for event polling, including after stop. Startup notices
+/// enter the ordinary FIFO event queue before the generation's first chunk is published;
+/// event-first callers can observe them before polling that PCM.
 ///
 /// If add-ons are enabled, the chunk passes through denoise → VAD before it is returned. When
 /// VAD is enabled, confirmed events are stored in `out.vad_events` (with count
@@ -514,6 +524,14 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
             return code::FLEX_INVALID_ARG;
         }
         if let Some(error) = stream.inner.terminal_error() {
+            // A committed VAD closure survives a later capture failure; queued PCM does not.
+            while let Some(mut chunk) = stream.ready_chunks.pop_front() {
+                if chunk.chunk.frames == 0 {
+                    out.write(chunk.chunk);
+                    return 1;
+                }
+                whisper_integration::flexaudio_chunk_free_v2(&mut chunk);
+            }
             fail(error);
             return code::FLEX_FAILURE;
         }
@@ -585,6 +603,8 @@ pub unsafe extern "C" fn flexaudio_chunk_free(chunk: *mut FlexChunk) {
 /// Error, PermissionDenied (kind 3), SilenceWhileSourceActive (kind 7), and
 /// PermissionPending (kind 8, advisory only: capture continues)
 /// store safe explanations in last_error. Typed failures project to Error (5):
+/// Pending/granted arms remain for custom Rust backends and compatibility;
+/// built-in sources on every OS emit neither notice.
 /// v1 cannot distinguish terminal/recoverable/cleanup; inspect terminal_error or use v2.
 /// Counts above INT64_MAX saturate with a range-loss diagnostic. PermissionDenied is terminal, including
 /// a confirmed macOS self-probe failure. SilenceWhileSourceActive means the
@@ -758,6 +778,13 @@ pub unsafe extern "C" fn flexaudio_terminal_error(s: *const FlexStream) -> i32 {
 /// unreachable PipeWire daemon on Linux) returns a typed error code and sets
 /// `flexaudio_last_error` / `flexaudio_last_error_info_v2`; it is not an empty success.
 /// Free the allocated array with `flexaudio_devices_free`.
+/// On macOS, enumeration never prompts. With undecided microphone consent it returns
+/// a typed Backend error before any HAL/device/format query. Grant the responsible
+/// host access or use the bounded capture-open consent flow, then retry enumeration.
+/// Denied/restricted consent returns a permission error. DeviceInfo formats are mandatory;
+/// discovery does not return a partial or unknown-format inventory.
+/// Windows enumeration does not preflight microphone permission; native enumeration
+/// proceeds. Microphone capture retains its separate existing permission preflight.
 ///
 /// # Safety
 /// `out_array` / `out_count` must be valid output pointers (NULL is InvalidArg).

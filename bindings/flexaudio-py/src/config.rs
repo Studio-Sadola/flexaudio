@@ -87,11 +87,7 @@ pub(crate) fn build_config(
     mic_gain: f32,
     system_gain: f32,
 ) -> PyResult<StreamConfig> {
-    if chunk_ms != 20 {
-        return Err(crate::to_py_err(::flexaudio::Error::InvalidArg(
-            "chunk_ms must be 20".into(),
-        )));
-    }
+    ::flexaudio::core::validate_chunk_ms(chunk_ms).map_err(crate::to_py_err)?;
     let kind = parse_source_kind(kind)?;
     let mode = parse_process_mode(mode)?;
     let output = OutputFormat {

@@ -15,6 +15,14 @@ pip install "flexaudio>=0.5,<0.6"
 ```python
 import flexaudio
 import numpy as np
+import time
+
+def drain_events(stream):
+    while True:
+        event = stream.poll_event()
+        if event is None:
+            return
+        print(event.type)
 
 # List a complete device inventory (incomplete or failed discovery raises typed exceptions).
 for d in flexaudio.devices():
@@ -22,20 +30,32 @@ for d in flexaudio.devices():
 
 # Open a microphone stream. open() starts capture before returning.
 with flexaudio.open("mic") as stream:
-    chunk = stream.poll_chunk()      # None if nothing is ready yet
-    if chunk is not None:
+    for _ in range(100):
+        drain_events(stream)         # Event-first callers observe startup notices before PCM.
+        chunk = stream.poll_chunk()  # None if nothing is ready yet
+        if chunk is None:
+            time.sleep(0.005)
+            continue
         # data is interleaved little-endian f32 bytes.
         samples = np.frombuffer(chunk.data, dtype=np.float32)
         print(chunk.frames, chunk.peak, chunk.rms, samples.shape)
 
-    event = stream.poll_event()      # None if no event is pending
-    if event is not None:
-        print(event.type, event.count, event.message)
-# leaving the `with` block stops the stream
+    stream.stop()
+    while True:
+        drain_events(stream)         # Drain notices before final PCM too.
+        chunk = stream.poll_chunk()
+        if chunk is None:
+            break
+        print("final frames", chunk.frames)
+# leaving the `with` block reuses the completed stop outcome
 ```
 
 Incomplete or failed device discovery raises a typed exception, including when
 Linux has no reachable PipeWire daemon. Watcher startup failure also raises.
+PCM polling does not wait for event polling, including after stop. Startup notices
+are enqueued chronologically before publishing their generation's first chunk.
+Event-first callers can drain the ordinary FIFO event queue before PCM to observe
+the notice first; PCM-only callers can omit event polling.
 
 ### Sources
 
@@ -118,6 +138,7 @@ Capture terminal failure suppresses remaining PCM and audio tails.
 
 ```python
 with flexaudio.open("mic", denoise=True, vad={"threshold": 0.5}) as stream:
+    drain_events(stream)  # Use the helper from Usage before every PCM poll.
     chunk = stream.poll_chunk()
     if chunk is not None:
         samples = np.frombuffer(chunk.data, dtype=np.float32)  # denoised audio
@@ -209,9 +230,11 @@ path, reason, optional positive scalar-interleaved sample count, rate, and chann
 exact chunk attribution; flags 8 (`PADDED`) and 16 (`CLIPPED`) instead describe
 that delivered chunk. Padding alone does not imply a gap.
 
-`permissionGranted` reports microphone consent once after `permissionPending`
-in the same live capture generation. It remains advisory and does not guarantee
-nonzero PCM. `error` and `terminalError` are terminal; `recoverableError` continues
+Built-in backends emit neither `permissionPending` nor `permissionGranted` for
+any capture source on any OS. Those event arms remain for custom Rust backends
+and compatibility. From 0.5.3, macOS microphone capture requires decided consent
+before each start and does not continuously monitor authorization or revocation.
+`error` and `terminalError` are terminal; `recoverableError` continues
 capture. `terminal_error()` retains the typed capture primary. `shutdown_report()`
 returns the final typed primary and ordered `cleanup_errors`, or `None` before
 shutdown. Checked `stop()` raises any capture or cleanup failure, including on

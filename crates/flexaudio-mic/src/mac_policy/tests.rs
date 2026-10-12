@@ -3,67 +3,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
-#[test]
-fn consent_pending_then_granted_once() {
-    let fake = Fake::new(Status::NotDetermined, false, None);
-    let mut poll = ConsentPoll::new();
-    assert!(matches!(
-        poll.poll(PENDING_GRACE, &fake),
-        Ok(Some(Event::PermissionPending { .. }))
-    ));
-    *fake.status.lock().unwrap() = Ok(Status::Authorized);
-    assert_eq!(
-        poll.poll(PENDING_GRACE + POLL_INTERVAL, &fake),
-        Ok(Some(Event::PermissionGranted))
-    );
-    assert!(!poll.active());
-    *fake.status.lock().unwrap() = Err(Error::Backend("finished poll must not query".into()));
-    for elapsed in [Duration::from_secs(10), Duration::from_secs(70)] {
-        assert_eq!(poll.poll(elapsed, &fake), Ok(None));
-    }
-}
-
-#[test]
-fn consent_authorized_without_pending_no_grant() {
-    for status in [Status::Authorized, Status::NotDetermined] {
-        let fake = Fake::new(status, false, None);
-        let mut poll = ConsentPoll::new();
-        assert_eq!(poll.poll(POLL_INTERVAL, &fake), Ok(None));
-        *fake.status.lock().unwrap() = Ok(Status::Authorized);
-        assert_eq!(poll.poll(POLL_INTERVAL * 2, &fake), Ok(None));
-        assert_eq!(poll.poll(PENDING_GRACE, &fake), Ok(None));
-    }
-    let fake = Fake::new(Status::NotDetermined, true, Some(true));
-    assert_eq!(check(&fake), Ok(false));
-    assert_eq!(ConsentPoll::new().poll(PENDING_GRACE, &fake), Ok(None));
-}
-
-#[test]
-fn consent_denied_or_query_error_no_grant() {
-    for status in [
-        Ok(Status::Denied),
-        Ok(Status::Restricted),
-        Err(Error::Backend("injected query failure".into())),
-    ] {
-        let fake = Fake::new(Status::NotDetermined, false, None);
-        let mut poll = ConsentPoll::new();
-        assert!(matches!(
-            poll.poll(PENDING_GRACE, &fake),
-            Ok(Some(Event::PermissionPending { .. }))
-        ));
-        *fake.status.lock().unwrap() = status.clone();
-        let result = poll.poll(PENDING_GRACE + POLL_INTERVAL, &fake);
-        if let Err(error) = status {
-            assert_eq!(result, Err(error));
-        } else {
-            assert!(matches!(result, Ok(Some(Event::PermissionDenied { .. }))));
-        }
-        *fake.status.lock().unwrap() = Ok(Status::Authorized);
-        assert_eq!(poll.poll(Duration::from_secs(70), &fake), Ok(None));
-        assert!(!poll.active());
-    }
-}
-
 type Completion = Box<dyn Fn(bool) + Send + Sync>;
 
 struct Fake {
@@ -71,6 +10,7 @@ struct Fake {
     usage: Result<bool>,
     answer: Option<bool>,
     request_error: bool,
+    metadata_queries: AtomicUsize,
     requests: AtomicUsize,
     completion: Mutex<Option<Completion>>,
 }
@@ -82,6 +22,7 @@ impl Fake {
             usage: Ok(usage),
             answer,
             request_error: false,
+            metadata_queries: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
             completion: Mutex::new(None),
         }
@@ -102,6 +43,7 @@ impl Provider for Fake {
         self.status.lock().unwrap().clone()
     }
     fn has_usage_description(&self) -> Result<bool> {
+        self.metadata_queries.fetch_add(1, Ordering::SeqCst);
         self.usage.clone()
     }
     fn request_access(&self, completion: Completion) -> Result<()> {
@@ -117,8 +59,9 @@ impl Provider for Fake {
     }
 }
 
-fn check(fake: &Fake) -> Result<bool> {
+fn check(fake: &Fake) -> Result<()> {
     preflight(
+        crate::permission::Purpose::Capture,
         fake,
         &PromptCoordinator::default(),
         Duration::from_millis(1),
@@ -143,26 +86,118 @@ fn denied_and_restricted_fail_before_any_prompt() {
 #[test]
 fn authorized_proceeds_without_metadata_or_prompt() {
     let fake = Fake::new(Status::Authorized, false, None);
-    assert_eq!(check(&fake), Ok(false));
+    assert_eq!(check(&fake), Ok(()));
     assert_eq!(fake.requests.load(Ordering::SeqCst), 0);
 }
 
 #[test]
-fn pending_without_usage_description_proceeds_with_owner_polling() {
+fn unanswered_prompt_returns_bounded_error_without_entering_blocking_hal_query() {
+    let fake = Fake::new(Status::NotDetermined, true, None);
+    let queries = AtomicUsize::new(0);
+    let (_release, blocked) = std::sync::mpsc::channel::<()>();
+    let started = Instant::now();
+    let result = crate::permission::format_after_preflight(
+        || {
+            preflight(
+                crate::permission::Purpose::Capture,
+                &fake,
+                &PromptCoordinator::default(),
+                Duration::from_millis(5),
+            )
+        },
+        || {
+            queries.fetch_add(1, Ordering::SeqCst);
+            // Simulate a native query that waits for undecided consent. The test
+            // has its own bound so a regression cannot hang CI.
+            let _ = blocked.recv_timeout(Duration::from_millis(100));
+            None
+        },
+    );
+    assert_eq!(
+        queries.load(Ordering::SeqCst),
+        0,
+        "undecided consent must not enter HAL"
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let error = result.expect_err("an unanswered prompt must fail closed");
+    assert_eq!(error.kind(), flexaudio_core::ErrorKind::Backend);
+    assert_eq!(
+        error.permission(),
+        None,
+        "an unanswered prompt is not a denial"
+    );
+    for guidance in ["unanswered", "retry", "Microphone"] {
+        assert!(error.to_string().contains(guidance));
+    }
+    assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn authorized_format_query_control_reads_native_format_once() {
+    let fake = Fake::new(Status::Authorized, false, None);
+    let queries = AtomicUsize::new(0);
+    let result = crate::permission::format_after_preflight(
+        || check(&fake),
+        || {
+            queries.fetch_add(1, Ordering::SeqCst);
+            Some((44_100, 2))
+        },
+    );
+    assert_eq!(result, Ok((44_100, 2)));
+    assert_eq!(queries.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.requests.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn revoked_consent_is_rechecked_before_another_native_query() {
+    let fake = Fake::new(Status::Authorized, false, None);
+    assert!(check(&fake).is_ok());
+    *fake.status.lock().expect("test status lock") = Ok(Status::Denied);
+    let result = crate::permission::format_after_preflight(
+        || check(&fake),
+        || panic!("revoked consent must not enter the native query"),
+    );
+    assert!(matches!(
+        result,
+        Err(Error::PermissionDenied {
+            permission: Permission::Microphone,
+            ..
+        })
+    ));
+    assert_eq!(fake.requests.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn missing_usage_description_fails_without_entering_hal_or_requesting_access() {
     let fake = Fake::new(Status::NotDetermined, false, None);
-    assert_eq!(check(&fake), Ok(true));
+    let result = crate::permission::format_after_preflight(
+        || check(&fake),
+        || panic!("undecided consent without usage metadata must not query HAL"),
+    );
+    let error = result.expect_err("missing prompt metadata must fail closed");
+    assert_eq!(error.kind(), flexaudio_core::ErrorKind::Backend);
+    for guidance in ["NSMicrophoneUsageDescription", "retry", "responsible"] {
+        assert!(error.to_string().contains(guidance));
+    }
+    assert_eq!(fake.requests.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn pending_without_usage_description_fails_closed() {
+    let fake = Fake::new(Status::NotDetermined, false, None);
+    assert!(matches!(check(&fake), Err(Error::Backend(_))));
     assert_eq!(fake.requests.load(Ordering::SeqCst), 0);
 }
 
 #[test]
 fn pending_with_usage_description_grant_proceeds() {
     let fake = Fake::new(Status::NotDetermined, true, Some(true));
-    assert_eq!(check(&fake), Ok(false));
+    assert_eq!(check(&fake), Ok(()));
     assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn prompt_refusal_is_a_permission_error_and_timeout_remains_pending() {
+fn prompt_refusal_is_a_permission_error_and_timeout_is_a_backend_error() {
     let fake = Fake::new(Status::NotDetermined, true, Some(false));
     assert!(matches!(
         check(&fake),
@@ -173,7 +208,7 @@ fn prompt_refusal_is_a_permission_error_and_timeout_remains_pending() {
     ));
     assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
     let fake = Fake::new(Status::NotDetermined, true, None);
-    assert_eq!(check(&fake), Ok(true));
+    assert!(matches!(check(&fake), Err(Error::Backend(_))));
     assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
 }
 
@@ -198,7 +233,14 @@ fn concurrent_opens_share_one_prompt() {
         .map(|_| {
             let fake = fake.clone();
             let coordinator = coordinator.clone();
-            thread::spawn(move || preflight(&*fake, &coordinator, Duration::from_secs(2)))
+            thread::spawn(move || {
+                preflight(
+                    crate::permission::Purpose::Capture,
+                    &*fake,
+                    &coordinator,
+                    Duration::from_secs(2),
+                )
+            })
         })
         .collect();
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -220,7 +262,7 @@ fn concurrent_opens_share_one_prompt() {
     }
     fake.complete(true);
     for handle in handles {
-        assert_eq!(handle.join().unwrap(), Ok(false));
+        assert_eq!(handle.join().unwrap(), Ok(()));
     }
     assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
 }
@@ -230,20 +272,41 @@ fn timeout_keeps_native_prompt_shared_and_accepts_late_completion() {
     let fake = Fake::new(Status::NotDetermined, true, None);
     let coordinator = PromptCoordinator::default();
     for _ in 0..2 {
-        assert_eq!(preflight(&fake, &coordinator, Duration::ZERO), Ok(true));
+        assert!(matches!(
+            preflight(
+                crate::permission::Purpose::Capture,
+                &fake,
+                &coordinator,
+                Duration::ZERO
+            ),
+            Err(Error::Backend(_))
+        ));
     }
     assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
     fake.complete(true);
-    assert_eq!(preflight(&fake, &coordinator, Duration::ZERO), Ok(false));
+    assert_eq!(
+        preflight(
+            crate::permission::Purpose::Capture,
+            &fake,
+            &coordinator,
+            Duration::ZERO
+        ),
+        Ok(())
+    );
     *fake.status.lock().unwrap() = Ok(Status::Denied);
     assert!(matches!(
-        preflight(&fake, &coordinator, Duration::ZERO),
+        preflight(
+            crate::permission::Purpose::Capture,
+            &fake,
+            &coordinator,
+            Duration::ZERO
+        ),
         Err(Error::PermissionDenied { .. })
     ));
 }
 
 #[test]
-fn completion_still_polls_until_authorization_is_authoritative() {
+fn completion_without_authoritative_authorization_fails_closed() {
     struct Inconsistent;
     impl Provider for Inconsistent {
         fn status(&self) -> Result<Status> {
@@ -257,10 +320,15 @@ fn completion_still_polls_until_authorization_is_authoritative() {
             Ok(())
         }
     }
-    assert_eq!(
-        preflight(&Inconsistent, &PromptCoordinator::default(), Duration::ZERO),
-        Ok(true)
-    );
+    assert!(matches!(
+        preflight(
+            crate::permission::Purpose::Capture,
+            &Inconsistent,
+            &PromptCoordinator::default(),
+            Duration::ZERO
+        ),
+        Err(Error::Backend(_))
+    ));
 }
 
 #[test]
@@ -294,13 +362,26 @@ fn post_prompt_denial_and_restriction_fail_closed_and_consent_is_not_cached() {
             status,
         };
         assert!(matches!(
-            preflight(&fake, &PromptCoordinator::default(), Duration::ZERO),
+            preflight(
+                crate::permission::Purpose::Capture,
+                &fake,
+                &PromptCoordinator::default(),
+                Duration::ZERO
+            ),
             Err(Error::PermissionDenied { .. })
         ));
     }
     let fake = Fake::new(Status::NotDetermined, true, Some(true));
     let coordinator = PromptCoordinator::default();
-    assert_eq!(preflight(&fake, &coordinator, Duration::ZERO), Ok(false));
+    assert_eq!(
+        preflight(
+            crate::permission::Purpose::Capture,
+            &fake,
+            &coordinator,
+            Duration::ZERO
+        ),
+        Ok(())
+    );
     // A caller that raced the completed grant must not initiate a second prompt.
     assert_eq!(
         coordinator.request(&fake, Duration::ZERO),
@@ -314,151 +395,133 @@ fn post_prompt_denial_and_restriction_fail_closed_and_consent_is_not_cached() {
     );
     // Resetting consent creates a new request, rather than caching the old grant.
     *fake.status.lock().unwrap() = Ok(Status::NotDetermined);
-    assert_eq!(preflight(&fake, &coordinator, Duration::ZERO), Ok(false));
+    assert_eq!(
+        preflight(
+            crate::permission::Purpose::Capture,
+            &fake,
+            &coordinator,
+            Duration::ZERO
+        ),
+        Ok(())
+    );
     assert_eq!(fake.requests.load(Ordering::SeqCst), 2);
 }
 
 #[test]
-fn late_denial_is_emitted_once_and_authorization_ends_polling() {
-    for status in [Status::Denied, Status::Restricted] {
-        let fake = Fake::new(Status::NotDetermined, false, None);
-        let mut poll = ConsentPoll::new();
-        assert!(poll.active());
-        assert_eq!(poll.poll(Duration::from_millis(499), &fake), Ok(None));
-        assert_eq!(poll.poll(POLL_INTERVAL, &fake), Ok(None));
-        *fake.status.lock().unwrap() = Ok(status);
-        assert!(matches!(
-            poll.poll(Duration::from_secs(1), &fake),
-            Ok(Some(Event::PermissionDenied {
-                permission: Permission::Microphone,
-                ..
-            }))
-        ));
-        assert!(!poll.active());
-        assert_eq!(poll.poll(Duration::from_secs(2), &fake), Ok(None));
-    }
-    let fake = Fake::new(Status::Authorized, false, None);
-    let mut poll = ConsentPoll::new();
-    assert_eq!(poll.poll(POLL_INTERVAL, &fake), Ok(None));
-    assert!(!poll.active());
-}
-
-#[test]
-fn query_failure_is_not_a_permission_denial() {
-    let fake = Fake::new(Status::NotDetermined, false, None);
-    *fake.status.lock().unwrap() = Err(Error::Backend("injected failure".into()));
-    assert!(matches!(
-        ConsentPoll::new().poll(POLL_INTERVAL, &fake),
-        Err(Error::Backend(_))
-    ));
-}
-
-#[test]
-fn default_intervals_and_grace_match_contract() {
-    assert_eq!(PROMPT_TIMEOUT, Duration::from_secs(30));
-    assert_eq!(POLL_INTERVAL, Duration::from_millis(500));
-    assert_eq!(POLL_SLOW_AFTER, Duration::from_secs(60));
-    assert_eq!(POLL_SLOW_INTERVAL, Duration::from_secs(2));
-    assert_eq!(PENDING_GRACE, Duration::from_secs(5));
-}
-
-#[test]
-fn undecided_permission_emits_one_advisory_after_five_seconds_per_generation() {
-    let fake = Fake::new(Status::NotDetermined, false, None);
-    for _ in 0..2 {
-        let mut poll = ConsentPoll::new();
-        for half_second in 1..10 {
-            assert_eq!(
-                poll.poll(Duration::from_millis(half_second * 500), &fake),
-                Ok(None)
-            );
-        }
-        assert_eq!(
-            poll.poll(PENDING_GRACE, &fake),
-            Ok(Some(Event::PermissionPending {
-                permission: Permission::Microphone,
-                detail: PENDING_DETAIL.into(),
-            }))
-        );
-        assert!(poll.active());
-        for seconds in [6, 60, 70, 3600] {
-            assert_eq!(poll.poll(Duration::from_secs(seconds), &fake), Ok(None));
-            assert!(poll.active());
-        }
-    }
-    for guidance in [
-        "not been decided",
-        "silence",
-        "ssh",
-        "launchd",
-        "Terminal",
-        "NSMicrophoneUsageDescription",
-        "Privacy & Security > Microphone",
-    ] {
-        assert!(PENDING_DETAIL.contains(guidance));
-    }
-}
-
-#[test]
-fn denial_or_restriction_after_seventy_seconds_is_still_terminal() {
-    for status in [Status::Denied, Status::Restricted] {
-        let fake = Fake::new(Status::NotDetermined, false, None);
-        let mut poll = ConsentPoll::new();
-        assert!(matches!(
-            poll.poll(PENDING_GRACE, &fake),
-            Ok(Some(Event::PermissionPending { .. }))
-        ));
-        assert_eq!(poll.poll(POLL_SLOW_AFTER, &fake), Ok(None));
-        assert_eq!(poll.wait_duration(POLL_SLOW_AFTER), POLL_SLOW_INTERVAL);
-        *fake.status.lock().unwrap() = Ok(status);
-        assert!(matches!(
-            poll.poll(Duration::from_secs(70), &fake),
-            Ok(Some(Event::PermissionDenied {
-                permission: Permission::Microphone,
-                ..
-            }))
-        ));
-        assert!(!poll.active());
-        assert_eq!(poll.poll(Duration::from_secs(90), &fake), Ok(None));
-    }
-}
-
-#[test]
-fn authorization_before_grace_emits_no_advisory_and_late_grant_ends_polling() {
-    let fake = Fake::new(Status::NotDetermined, false, None);
-    let mut poll = ConsentPoll::new();
-    assert_eq!(poll.poll(POLL_INTERVAL, &fake), Ok(None));
-    *fake.status.lock().unwrap() = Ok(Status::Authorized);
-    assert_eq!(poll.poll(PENDING_GRACE, &fake), Ok(None));
-    assert!(!poll.active());
-    *fake.status.lock().unwrap() = Err(Error::Backend("must not query again".into()));
-    assert_eq!(poll.poll(Duration::from_secs(70), &fake), Ok(None));
-
-    let fake = Fake::new(Status::NotDetermined, false, None);
-    let mut poll = ConsentPoll::new();
-    assert!(matches!(
-        poll.poll(PENDING_GRACE, &fake),
-        Ok(Some(Event::PermissionPending { .. }))
-    ));
-    *fake.status.lock().unwrap() = Ok(Status::Authorized);
-    assert_eq!(
-        poll.poll(Duration::from_secs(70), &fake),
-        Ok(Some(Event::PermissionGranted))
-    );
-    assert!(!poll.active());
-}
-
-#[test]
-fn expired_wait_is_shared_and_owner_startup_does_not_wait_again() {
+fn expired_wait_is_shared_without_prompting_or_waiting_again() {
     let fake = Fake::new(Status::NotDetermined, true, None);
     let coordinator = PromptCoordinator::default();
-    assert_eq!(preflight(&fake, &coordinator, Duration::ZERO), Ok(true));
+    assert!(matches!(
+        preflight(
+            crate::permission::Purpose::Capture,
+            &fake,
+            &coordinator,
+            Duration::ZERO
+        ),
+        Err(Error::Backend(_))
+    ));
     // A real wait would take 30 seconds; an already expired prompt must return now.
-    assert_eq!(preflight(&fake, &coordinator, PROMPT_TIMEOUT), Ok(true));
+    assert!(matches!(
+        preflight(
+            crate::permission::Purpose::Capture,
+            &fake,
+            &coordinator,
+            PROMPT_TIMEOUT
+        ),
+        Err(Error::Backend(_))
+    ));
     assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
     fake.complete(false);
     assert!(matches!(
-        preflight(&fake, &coordinator, Duration::ZERO),
+        preflight(
+            crate::permission::Purpose::Capture,
+            &fake,
+            &coordinator,
+            Duration::ZERO
+        ),
         Err(Error::PermissionDenied { .. })
     ));
+}
+
+#[test]
+fn prompt_timeout_matches_documented_contract() {
+    assert_eq!(PROMPT_TIMEOUT, Duration::from_secs(30));
+}
+
+#[test]
+fn enumeration_undecided_never_prompts_or_enters_hal() {
+    let fake = Fake::new(Status::NotDetermined, true, Some(true));
+    let queries = AtomicUsize::new(0);
+    let result = crate::permission::query_after_preflight(
+        || {
+            preflight(
+                Purpose::Enumeration,
+                &fake,
+                &PromptCoordinator::default(),
+                Duration::from_millis(5),
+            )
+        },
+        || {
+            queries.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    );
+    assert_eq!(
+        fake.requests.load(Ordering::SeqCst),
+        0,
+        "enumeration must not request microphone access"
+    );
+    assert_eq!(
+        fake.metadata_queries.load(Ordering::SeqCst),
+        0,
+        "enumeration must not inspect prompting metadata"
+    );
+    assert_eq!(
+        queries.load(Ordering::SeqCst),
+        0,
+        "undecided enumeration must not enter HAL"
+    );
+    let error =
+        result.expect_err("mandatory device format cannot be queried with undecided consent");
+    assert_eq!(error.kind(), flexaudio_core::ErrorKind::Backend);
+    for guidance in ["undecided", "enumerat", "Microphone", "retry"] {
+        assert!(error.to_string().contains(guidance));
+    }
+}
+
+#[test]
+fn enumeration_authorized_and_denied_controls_never_prompt() {
+    for status in [Status::Authorized, Status::Denied, Status::Restricted] {
+        let fake = Fake::new(status, false, None);
+        let queries = AtomicUsize::new(0);
+        let result = crate::permission::query_after_preflight(
+            || {
+                preflight(
+                    Purpose::Enumeration,
+                    &fake,
+                    &PromptCoordinator::default(),
+                    Duration::ZERO,
+                )
+            },
+            || {
+                queries.fetch_add(1, Ordering::SeqCst);
+                Ok((44_100, 2))
+            },
+        );
+        if status == Status::Authorized {
+            assert_eq!(result, Ok((44_100, 2)));
+            assert_eq!(queries.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(matches!(
+                result,
+                Err(Error::PermissionDenied {
+                    permission: Permission::Microphone,
+                    ..
+                })
+            ));
+            assert_eq!(queries.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(fake.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.metadata_queries.load(Ordering::SeqCst), 0);
+    }
 }

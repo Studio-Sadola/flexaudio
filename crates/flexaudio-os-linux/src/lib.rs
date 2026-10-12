@@ -41,9 +41,11 @@ use flexaudio_core::{ErrorContext, Event, Operation};
 mod discovery;
 use discovery::EnumerationFailure;
 mod owner;
+mod readiness;
 use owner::{
     finish_worker, poll_backend_event, push_backend_event, rollback_worker, BackendEvents,
 };
+use readiness::{negotiation_timeout_message, Readiness, NEGOTIATION_DEADLINE};
 mod watcher_queue;
 use watcher_queue::{lock_events, transition_default, WatchEventQueue, WatchEvents};
 
@@ -68,46 +70,6 @@ const MAX_WATCH_EVENTS: usize = 1024;
 /// quickly, but this prevents `while !done { run() }` from looping or hanging forever if it does
 /// not. On timeout, return an error without publishing an incomplete inventory.
 const ENUMERATE_DEADLINE_MS: u128 = 2_000;
-
-/// Deadline (milliseconds) for [`run_pw_loop`]'s capture stream to negotiate its format.
-///
-/// Readiness is reported only once `param_changed` stores a negotiated format. A stream that
-/// never negotiates (for example the sink disappeared mid-setup) must not block `start()`
-/// forever, so a one-shot timer reports failure and quits the loop at this deadline.
-const NEGOTIATE_DEADLINE_MS: u128 = 2_000;
-
-/// Single-shot readiness report from the capture loop thread back to `start()`.
-///
-/// The loop thread reports success only after the stream has negotiated its format (see
-/// [`add_capture_listener`]'s `param_changed`), or failure from the negotiation deadline timer.
-/// `sent` makes the report single-shot, so a late deadline cannot overwrite a successful report.
-struct Readiness {
-    /// Channel back to `start()`.
-    tx: mpsc::Sender<std::result::Result<(), String>>,
-    /// Whether a report (success or failure) has already been sent.
-    sent: std::cell::Cell<bool>,
-}
-
-impl Readiness {
-    /// Report that the stream is set up and its format negotiated. No-op if already reported.
-    fn report_ready(&self) {
-        if !self.sent.replace(true) {
-            let _ = self.tx.send(Ok(()));
-        }
-    }
-
-    /// Report a setup failure. No-op if a report has already been sent.
-    fn report_failure(&self, msg: String) {
-        if !self.sent.replace(true) {
-            let _ = self.tx.send(Err(msg));
-        }
-    }
-
-    /// Whether a report has already been sent (success or failure).
-    fn is_reported(&self) -> bool {
-        self.sent.get()
-    }
-}
 
 /// Call [`pipewire::init`] once per process.
 ///
@@ -527,9 +489,9 @@ impl CaptureBackend for PwProcessBackend {
         // Stop channel for the loop thread (the receiver is attached to the loop).
         let (stop_tx, stop_rx) = pw::channel::channel::<Terminate>();
         // Channel to synchronously return setup status to start(). Success means PipeWire
-        // connection, registry retrieval, stream creation, and registry listener registration.
-        // A fan-out link to the target PID is not required for success (the target may not have
-        // appeared yet; the registry callback links it when it does).
+        // connection and negotiated format when an eligible target exists. A complete
+        // registry snapshot without an eligible target also succeeds, and keeps watching
+        // for its later arrival. Both paths share the two-second startup deadline.
         let (ready_tx, ready_rx) = mpsc::channel::<std::result::Result<(), String>>();
 
         let running = self.running.clone();
@@ -551,9 +513,8 @@ impl CaptureBackend for PwProcessBackend {
         // Wait for setup. Treat thread exit without sending ready as failure.
         match ready_rx.recv() {
             Ok(Ok(())) => {
-                // Setup succeeded (connection through registry listener registration). The
-                // thread now waits for the target PID and creates a link-factory link once its
-                // output ports and our input ports are available.
+                // Format negotiation succeeded, or a complete snapshot confirmed no target.
+                // Registry callbacks continue linking eligible targets as they appear.
                 self.events = generation_events;
                 self.shutdown = None;
                 self.stop_tx = Some(stop_tx);
@@ -626,7 +587,9 @@ fn run_pw_process_loop(
 ) {
     // Setup (connection, stream creation, and registry listener registration) is in a separate function.
     // Keep its return values alive for the whole run (dropping them stops watching and linking).
-    let (main_loop, _keep) = match setup_pw_process(select, sink, events.clone()) {
+    let readiness = std::rc::Rc::new(Readiness::new(ready_tx.clone(), true));
+    let (main_loop, _keep) = match setup_pw_process(select, sink, events.clone(), readiness.clone())
+    {
         Ok(t) => t,
         Err(msg) => {
             // Report setup failure and exit (without panicking).
@@ -642,11 +605,9 @@ fn run_pw_process_loop(
         main_loop_for_quit.quit();
     });
 
-    // Report setup success. run() now blocks and waits for the target PID to appear.
-    if ready_tx.send(Ok(())).is_err() {
-        // The caller is gone (e.g. start was dropped). Do not run.
+    let Ok(_timer) = arm_negotiation_deadline(&main_loop, readiness, events) else {
         return;
-    }
+    };
 
     // Run until Terminate or process exit. Wait here while the target PID is absent; the registry
     // callback creates the link when it appears.
@@ -681,6 +642,7 @@ struct ProcessKeep {
     _registry: pw::registry::RegistryRc,
     _registry_listener: pw::registry::Listener,
     _links: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, Vec<pw::link::Link>>>>,
+    _core_listener: pw::core::Listener,
     _core: pw::core::CoreRc,
     _bound_nodes: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, BoundNode>>>,
 }
@@ -1017,6 +979,7 @@ fn setup_pw_process(
     select: PidSelect,
     sink: RawSink,
     events: BackendEvents,
+    readiness: std::rc::Rc<Readiness>,
 ) -> std::result::Result<(pw::main_loop::MainLoopRc, ProcessKeep), String> {
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
@@ -1060,9 +1023,8 @@ fn setup_pw_process(
         sink,
         scratch: Default::default(),
         events: events.clone(),
-        // The fan-out path reports readiness at connect time (see run_pw_process_loop) and does
-        // not wait for negotiation on this listener.
-        readiness: None,
+        // The same negotiated-format callback reports readiness for monitor and fan-in.
+        readiness: readiness.clone(),
     };
     // Register callbacks (shared helper; same param_changed/process behavior as system capture).
     let listener = add_capture_listener(&stream, user_data, &main_loop)?;
@@ -1132,7 +1094,16 @@ fn setup_pw_process(
         linked: &RefCell<HashMap<u32, Vec<pw::link::Link>>>,
         events: &BackendEvents,
         main_loop: &pw::main_loop::MainLoopRc,
+        readiness: &Readiness,
     ) -> Result<()> {
+        // Eligibility is independent of port arrival: an eligible node with no complete
+        // link plan must still fail startup if negotiation never finishes.
+        readiness.set_target_present(
+            nodes
+                .borrow()
+                .values()
+                .any(|entry| select.selects_node(entry, &client_pid.borrow())),
+        );
         let result = (|| -> Result<()> {
             {
                 let nodes = nodes.borrow();
@@ -1285,6 +1256,7 @@ fn setup_pw_process(
                     error: error.clone(),
                 },
             );
+            readiness.report_failure(error.to_string());
             main_loop.quit();
         }
         result
@@ -1295,6 +1267,8 @@ fn setup_pw_process(
     // then reevaluates links with try_link each time.
     // `PidSelect` is no longer `Copy` (Exclude owns a HashSet), so every closure
     // that used to capture it by copy gets its own clone.
+    let readiness_for_global = readiness.clone();
+    let readiness_for_remove = readiness.clone();
     let select_for_global = select.clone();
     let select_for_remove = select.clone();
     let events_for_global = events.clone();
@@ -1387,6 +1361,7 @@ fn setup_pw_process(
                             let self_node_for_info = self_node_for_global.clone();
                             let core_for_info = core_for_global.clone();
                             let stream_for_info = stream_for_global.clone();
+                            let readiness_for_info = readiness_for_global.clone();
                             let select_for_info = select.clone(); // `select` is no longer Copy
                             let listener = node
                                 .add_listener_local()
@@ -1455,6 +1430,7 @@ fn setup_pw_process(
                                             &linked_for_info,
                                             &events_for_info,
                                             &loop_for_info,
+                                            &readiness_for_info,
                                         );
                                     }));
                                 })
@@ -1508,6 +1484,7 @@ fn setup_pw_process(
                     &linked_for_global,
                     &events_for_global,
                     &loop_for_global,
+                    &readiness_for_global,
                 );
             }));
         })
@@ -1601,7 +1578,7 @@ fn setup_pw_process(
                 bound_for_remove.borrow_mut().remove(&id);
 
                 // Once waiting again, immediately retry links if another target is already ready.
-                if relink_needed {
+                if relink_needed || !readiness_for_remove.is_reported() {
                     let _ = try_link(
                         &core_for_remove,
                         &stream_for_remove,
@@ -1613,9 +1590,57 @@ fn setup_pw_process(
                         &linked_for_remove,
                         &events_for_remove,
                         &loop_for_remove,
+                        &readiness_for_remove,
                     );
                 }
             }));
+        })
+        .register();
+
+    // A completed registry snapshot, including bound Node info, is required before
+    // treating an absent target as success. A second sync covers binds requested while
+    // processing the first registry snapshot; it is bounded by the shared startup timer.
+    let pending = Rc::new(Cell::new(core.sync(0).map_err(|_| {
+        "PipeWire could not synchronize capture targets; restart the audio session and retry capture."
+            .to_string()
+    })?.seq()));
+    let second_sync = Rc::new(Cell::new(false));
+    let core_weak = core.downgrade();
+    let readiness_for_sync = readiness.clone();
+    let events_for_sync = events.clone();
+    let loop_for_sync = main_loop.clone();
+    let loop_for_error = main_loop.clone();
+    let readiness_for_error = readiness.clone();
+    let events_for_error = events.clone();
+    let _core_listener = core.add_listener_local()
+        .done(move |id, seq| {
+            if id != pw::core::PW_ID_CORE || seq.seq() != pending.get() {
+                return;
+            }
+            if second_sync.replace(true) {
+                readiness_for_sync.registry_synchronized();
+                return;
+            }
+            let next = core_weak.upgrade().and_then(|core| core.sync(0).ok());
+            match next {
+                Some(next) => pending.set(next.seq()),
+                None => {
+                    report_capture_startup_failure(
+                        &readiness_for_sync,
+                        &events_for_sync,
+                        "PipeWire could not complete the capture target snapshot; restart the audio session and retry capture.",
+                    );
+                    loop_for_sync.quit();
+                }
+            }
+        })
+        .error(move |_id, _seq, _res, _message| {
+            report_capture_startup_failure(
+                &readiness_for_error,
+                &events_for_error,
+                "PipeWire rejected capture setup; check audio-session access, restart the audio session and retry capture.",
+            );
+            loop_for_error.quit();
         })
         .register();
 
@@ -1627,6 +1652,7 @@ fn setup_pw_process(
             _registry: registry,
             _registry_listener,
             _links: linked,
+            _core_listener,
             _core: core,
             _bound_nodes: bound_nodes,
         },
@@ -1643,10 +1669,9 @@ struct UserData {
     sink: RawSink,
     scratch: std::rc::Rc<std::cell::RefCell<Vec<f32>>>,
     events: BackendEvents,
-    /// Readiness report for the system-monitor path: `param_changed` reports success once a
-    /// format is negotiated. `None` for the process fan-out path, which reports readiness at
-    /// connect time and does not wait for negotiation on this listener.
-    readiness: Option<std::rc::Rc<Readiness>>,
+    /// Shared readiness report: `param_changed` reports success once a format is negotiated.
+    /// Process fan-in may also succeed when the completed registry snapshot has no target.
+    readiness: std::rc::Rc<Readiness>,
 }
 
 /// Register `param_changed` / `process` callbacks on a capture stream.
@@ -1696,9 +1721,9 @@ fn add_capture_listener(
                             .with_context(ErrorContext::new(Operation::Start)),
                         },
                     );
-                    if let Some(readiness) = &user_data.readiness {
-                        readiness.report_failure("unsupported pipewire channel count".into());
-                    }
+                    user_data
+                        .readiness
+                        .report_failure("unsupported pipewire channel count".into());
                     loop_for_format.quit();
                     return;
                 }
@@ -1712,18 +1737,16 @@ fn add_capture_listener(
                     && format.channels() == u32::from(user_data.sink.native_channels())
                     && format.rate() != 0;
                 if !accepted {
-                    if let Some(readiness) = &user_data.readiness {
-                        if !readiness.is_reported() {
-                            readiness.report_failure("unacceptable pipewire capture format".into());
-                            loop_for_format.quit();
-                        }
+                    if !user_data.readiness.is_reported() {
+                        user_data
+                            .readiness
+                            .report_failure("unacceptable pipewire capture format".into());
+                        loop_for_format.quit();
                     }
                     return;
                 }
                 user_data.format = format;
-                if let Some(readiness) = &user_data.readiness {
-                    readiness.report_ready();
-                }
+                user_data.readiness.report_ready();
             }));
         })
         .process(move |stream, user_data| {
@@ -1880,21 +1903,18 @@ fn run_pw_loop(
 ) {
     // Single-shot readiness report. It is filled by `param_changed` (success) or by the
     // negotiation deadline timer below (failure).
-    let readiness = std::rc::Rc::new(Readiness {
-        tx: ready_tx.clone(),
-        sent: std::cell::Cell::new(false),
-    });
+    let readiness = std::rc::Rc::new(Readiness::new(ready_tx.clone(), false));
 
     // Setup is in a separate function. Keep its return values alive for the whole run (dropping them stops it).
-    let (main_loop, _stream, _listener) = match setup_pw(device_id, sink, readiness.clone(), events)
-    {
-        Ok(t) => t,
-        Err(msg) => {
-            // Report setup failure and exit (without panicking).
-            let _ = ready_tx.send(Err(msg));
-            return;
-        }
-    };
+    let (main_loop, _stream, _listener) =
+        match setup_pw(device_id, sink, readiness.clone(), events.clone()) {
+            Ok(t) => t,
+            Err(msg) => {
+                // Report setup failure and exit (without panicking).
+                let _ = ready_tx.send(Err(msg));
+                return;
+            }
+        };
 
     // Attach the stop channel receiver to the loop. On Terminate, call quit(). attach only
     // borrows this local `main_loop`, so AttachedReceiver is scoped to this stack frame (no
@@ -1905,36 +1925,65 @@ fn run_pw_loop(
         main_loop_for_quit.quit();
     });
 
-    // Readiness is reported only once the format is negotiated (see `param_changed`), never at
-    // connect time: reporting at connect time told the caller capture was running even if the
-    // stream never negotiated. A one-shot timer bounds the wait, so a stream that never
-    // negotiates cannot block `start()` forever; if a report was already sent, it is a no-op.
-    let readiness_for_timer = readiness.clone();
-    let main_loop_for_timeout = main_loop.clone();
-    let _timer = main_loop.loop_().add_timer(move |_expirations| {
-        if !readiness_for_timer.is_reported() {
-            readiness_for_timer.report_failure("pipewire format negotiation timed out".into());
-            main_loop_for_timeout.quit();
-        }
-    });
-    if let Err(e) = _timer
-        .update_timer(
-            Some(std::time::Duration::from_millis(
-                NEGOTIATE_DEADLINE_MS as u64,
-            )),
-            None,
-        )
-        .into_result()
-    {
-        readiness.report_failure(format!("arm pipewire negotiation deadline failed: {e}"));
-        main_loop.quit();
+    let Ok(_timer) = arm_negotiation_deadline(&main_loop, readiness, events) else {
         return;
-    }
+    };
 
     // Run until Terminate, the negotiation deadline, or process exit.
     main_loop.run();
     // On exit, drop _timer → _attached → _listener → _stream → main_loop in reverse declaration
     // order, destroying the PipeWire resources on this thread.
+}
+
+/// Retain the typed failure before waking start(), so rollback observes the same cause.
+fn report_capture_startup_failure(readiness: &Readiness, events: &BackendEvents, message: &str) {
+    let error = Error::Backend(message.into()).with_context(ErrorContext::new(Operation::Start));
+    push_backend_event(events, Event::TerminalError { error });
+    readiness.report_failure(message.into());
+}
+
+/// One deadline mechanism for monitor capture and application-stream fan-in.
+fn arm_negotiation_deadline<'a>(
+    main_loop: &'a pw::main_loop::MainLoopRc,
+    readiness: std::rc::Rc<Readiness>,
+    events: BackendEvents,
+) -> Result<pw::loop_::TimerSource<'a>> {
+    let readiness_for_timer = readiness.clone();
+    let events_for_timer = events.clone();
+    let loop_for_timeout = main_loop.clone();
+    let timer = main_loop.loop_().add_timer(move |_expirations| {
+        if readiness_for_timer.is_reported() {
+            return;
+        }
+        // Store the typed error before the policy sends its channel failure. An absent
+        // target succeeds only after a complete registry snapshot and keeps watching.
+        if readiness_for_timer.requires_negotiation() {
+            push_backend_event(
+                &events_for_timer,
+                Event::TerminalError {
+                    error: Error::Backend(negotiation_timeout_message())
+                        .with_context(ErrorContext::new(Operation::Start)),
+                },
+            );
+        }
+        if readiness_for_timer.deadline_expired() {
+            loop_for_timeout.quit();
+        }
+    });
+    if timer
+        .update_timer(Some(NEGOTIATION_DEADLINE), None)
+        .into_result()
+        .is_err()
+    {
+        let message = "PipeWire could not arm the capture startup deadline; restart the audio session and retry capture.";
+        // Timer setup has failed before the worker enters the loop.
+        report_capture_startup_failure(&readiness, &events, message);
+        main_loop.quit();
+        return Err(
+            Error::Backend(message.into()).with_context(ErrorContext::new(Operation::Start))
+        );
+    }
+    Ok(timer)
 }
 
 /// PipeWire setup. Returns `Err(String)` on failure (does not panic).
@@ -2010,7 +2059,7 @@ fn setup_pw(
         scratch: Default::default(),
         events: events.clone(),
         // `param_changed` reports readiness through this handle once the format is negotiated.
-        readiness: Some(readiness),
+        readiness,
     };
 
     // Register callbacks. Store the negotiated format in `param_changed` and send buffers

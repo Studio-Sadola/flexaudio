@@ -130,6 +130,13 @@ The facade crate `flexaudio` re-exports everything you need:
   Linux microphone IDs are CPAL IDs; PipeWire Audio/Source nodes are not advertised
   as microphones. Incomplete or failed discovery returns an error, including
   when the PipeWire daemon is unreachable on Linux.
+  On macOS, enumeration never prompts: undecided microphone consent returns a
+  typed `Backend` error before any HAL/device/format query. Grant the responsible
+  host access or use the bounded capture-open consent flow, then retry discovery.
+  Denied/restricted consent returns `PermissionDenied`. DeviceInfo sample rate
+  and channel count are mandatory; no partial or unknown-format inventory is returned.
+  Windows enumeration does not preflight microphone permission; native enumeration
+  proceeds. Microphone capture retains its separate existing permission preflight.
 - `flexaudio::processes() -> Result<Vec<ProcessInfo>>` — list audio output
   session/stream owners on Linux/Windows and Core Audio processes on macOS,
   including input-only processes (see
@@ -175,7 +182,7 @@ parsing messages. `Display` keeps library-authored explanations while redacting
 device names, permission detail and internal call labels; structured access
 provides opt-in diagnostics. Third-party legacy backend strings are replaced by
 a safe explanation. Handle `AudioLoss`, `Clipped`, `RecoverableError`,
-`ShutdownError` and `PermissionGranted` events, plus device `DefaultCleared` /
+`ShutdownError` events, plus device `DefaultCleared` /
 `RescanRequired`. `DefaultChanged.kind` is now `DefaultDeviceKind`. Loss marks
 subsequent output `DISCONTINUITY`; `PADDED=8` and `CLIPPED=16` describe output
 integrity. Peak/RMS reflect delivered samples after denoise/gain in every binding.
@@ -224,6 +231,42 @@ stream.start()?;
 stream.stop();
 # Ok::<(), flexaudio::Error>(())
 ```
+
+---
+
+## Microphone startup samples
+
+At each open, recovery reopen, and source switch, microphone capture (including
+its Mix lane) suppresses a leading invalid prefix: non-finite samples or samples
+outside [-1, 1]. All channels must remain valid for 10 ms of native
+frames; delivery includes the start of that confirmation window. Valid input
+from the first frame, including zeros, is buffered for confirmation and replayed
+unchanged; an entirely valid shorter input is also delivered when stopped or when its
+generation is replaced during confirmation. Once
+startup is confirmed, samples are untouched; system/process loopback is not filtered.
+
+The first delivered chunk after a drop carries `DISCONTINUITY`. Discarded frames
+advance the capture clock and frame indices rather than compacting recording
+time. `StartupSamplesDropped { frames, reason: OutOfRange }` reports once per
+affected microphone generation (native frame count), including in Mix. Node.js
+uses `startupSamplesDropped` with bigint `frames` and `reason: 'outOfRange'`;
+Python uses the same tag and integer count. C v2 exposes event kind 15 and typed
+frame/reason accessors; the CLI prints a safe warning. The startup notice precedes
+that generation's first Node.js `onChunk` callback and attached Whisper VAD
+`epochStart`. Provide `onEvent` to receive the Node.js notice. Recovered and other
+advisories use independent callbacks and may arrive before or after the startup
+notice; this ordering guarantee covers only startup notice versus affected PCM.
+For Rust, Python and C pull APIs, the notice is enqueued chronologically before
+the generation's first chunk is published. Event-first callers drain the ordinary
+FIFO event queue before PCM to observe that notice first. PCM polling does not
+wait for event polling; PCM-only callers continue to receive chunks, including
+after stop. C v1 projects the advisory as `Unknown` with count zero.
+
+If capture fails terminally while holding a valid native startup prefix, `AudioLoss`
+with reason `generationEnded` reports the discarded scalar interleaved samples
+at their native sample rate and channel count. After invalid samples, if valid input is not
+confirmed within two seconds, capture terminates with an actionable typed
+backend error. No fixed period of valid audio is discarded.
 
 ---
 
@@ -276,6 +319,9 @@ sources ignore valid exclusions. The same controls are available in each binding
   Pulse-proxied streams are not captured during exclusion until their PID is
   known. The requested system device is not used while exclusion is active:
   application-stream fan-in is not device-scoped.
+  Eligible process/exclusion capture targets must negotiate format within two
+  seconds or opening fails with a typed, actionable backend error. A completed
+  target snapshot with no eligible source opens successfully and keeps watching.
 
 The device rules also apply to `mix_system_device_id`; microphone selection
 is unaffected.
@@ -360,11 +406,11 @@ for Mix), and suppresses further audio and automatic reopening. Create a new
 stream after correcting permission; `start`, `resume`, and `switch_source` on a
 terminally failed stream return its stored error.
 
-If the macOS consent monitor cannot query authorization, capture fails
-closed with `Event::TerminalError { error }` and retains the original backend
-error; it does not invent a permission denial. N-API/Python report this as a
-`terminalError` event; C v1 projects it as legacy Error kind 5 and v2 retains
-typed terminality. The same terminal failure remains queryable. A microphone configuration that
+Built-in backends currently emit neither `PermissionPending` nor
+`PermissionGranted`, for any capture source on any OS. Their event arms remain
+available for custom Rust backends and compatibility. A macOS authorization-query
+failure returns a typed backend error before capture starts; it does not invent
+a permission denial. A microphone configuration that
 differs from its advertised native format is rejected before capture builds with
 `Error::NativeFormatChanged { advertised, actual }`; recreate the stream using the
 current device format instead of delivering incorrectly interpreted samples.
@@ -373,8 +419,9 @@ Rust exposes `Stream::terminal_error()`. N-API exposes `terminalError()` and
 rejects `stop()` on capture or cleanup failure; provide `onEvent` for immediate
 notifications and inspect `shutdownReport()`. Python `poll_chunk()` raises a typed
 `RuntimeError` subclass on terminal failure; `terminal_error()` returns the
-stored `AudioError` without consuming events. C `flexaudio_poll_chunk()` and
-`flexaudio_terminal_error()` return the primary root result code (for example,
+stored `AudioError` without consuming events. C v1 `flexaudio_poll_chunk()` returns
+`FLEX_FAILURE` (-2) for a terminal capture error. C v2 `flexaudio_poll_chunk_v2()`
+and `flexaudio_terminal_error()` return the primary root result code (for example,
 `FLEX_PERMISSION_DENIED` (-7) or `FLEX_FAILURE` (-2) for a backend failure), with
 the safe explanation in `flexaudio_last_error()`. Permission event kind remains 3 in C. N-API/Python
 permission events keep type `permissionDenied` and add `permission`
@@ -382,34 +429,26 @@ permission events keep type `permissionDenied` and add `permission`
 
 ### macOS
 
-- **Microphone** (including the mic lane of Mix): flexaudio checks the public
-  AVFoundation authorization status. Denied or restricted access fails before
-  capture. If authorization is not determined and the main app bundle declares
-  a non-empty `NSMicrophoneUsageDescription`, flexaudio requests consent and
-  waits up to 30 seconds. Refusal is a permission error; an unanswered request
-  proceeds with capture and continued authorization monitoring. Open on a worker
-  thread when hosting a GUI so waiting does not block its event loop.
-- A bare CLI running inside Terminal may have no main-bundle microphone usage
-  description. flexaudio does not request consent directly in that case; it
-  proceeds with opening capture so macOS can prompt for the responsible app.
-  While consent remains undecided, the backend checks authorization throughout
-  capture: every 500 ms for the first 60 seconds, then every 2 seconds. A late
-  denied/restricted status produces a terminal permission event; authorization
-  stops polling. If a pending advisory was published, late authorization emits
-  `PermissionGranted` once for that capture generation (microphone only),
-  exposed as `permissionGranted` in N-API/Python and v2 event kind 9 in C.
-  An unanswered prompt is not proof of denial.
-- If microphone consent is still undecided five seconds after capture starts,
-  flexaudio emits `Event::PermissionPending { permission, detail }` once per
-  capture generation, including the mic lane of Mix. This is an advisory:
-  capture continues and may remain silent until permission is granted. Check
-  **System Settings > Privacy & Security > Microphone**. SSH, launchd, or other
-  background contexts may not show a prompt; run from Terminal or use an app
-  bundle with a non-empty `NSMicrophoneUsageDescription`. N-API/Python expose
-  type `permissionPending` with `permission` and `message`; C uses event kind 8
-  with guidance in `flexaudio_last_error()`. The CLI prints a warning and
-  continues. Provide N-API `onEvent`, or poll Rust/Python/C events, to receive
-  advisories; terminal-error accessors report terminal failures only.
+- **Microphone** (including the mic lane of Mix): flexaudio checks AVFoundation
+  authorization before any HAL/device-format query. Denied or restricted access
+  fails with a permission error. With undecided authorization and a nonempty
+  `NSMicrophoneUsageDescription`, flexaudio requests consent and waits at most
+  30 seconds. An unanswered prompt returns a typed `Backend` error without
+  starting capture; answer the prompt and retry. Opening is synchronous, so GUI
+  hosts should call it on a worker thread. The bound covers the undecided consent
+  wait, not arbitrary native queries after authorization.
+- Undecided authorization without a main-bundle microphone usage description
+  fails immediately, avoiding an unbounded responsible-host HAL prompt and an
+  unsafe direct AVFoundation request. Use a configured application bundle, or
+  grant the responsible host microphone access before retrying. An unanswered
+  prompt is not a permission denial. From 0.5.3, each microphone capture start
+  requires decided consent. Microphone capture does not continuously monitor
+  authorization changes or permission revocation after capture starts. In 0.5.2,
+  `ConsentPoll` was wired for pending `NotDetermined` consent when preflight
+  returned `Ok(true)`, but an earlier `query_native_format` could block before
+  reaching the capture owner and its monitor. Initially `Authorized` capture
+  had no continuous revocation monitor. Native capture failures follow the
+  backend's normal error path.
 - **System and per-process audio** use Core Audio process taps (macOS 14.4+).
   Add a usage description to your app's `Info.plist`:
   ```xml

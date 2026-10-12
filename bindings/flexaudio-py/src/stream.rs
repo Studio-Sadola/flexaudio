@@ -85,25 +85,39 @@ impl Stream {
             &mut CoreVad,
         ) -> Result<Vec<flexaudio_vad::VadEvent>, flexaudio_vad::VadError>,
     ) -> PyResult<Option<PyAudioChunk>> {
+        self.poll_chunk_with_steps(flush, CoreVad::process_pcm)
+    }
+
+    fn poll_chunk_with_steps(
+        &mut self,
+        flush: impl FnOnce(
+            &mut CoreVad,
+        ) -> Result<Vec<flexaudio_vad::VadEvent>, flexaudio_vad::VadError>,
+        process: impl FnOnce(
+            &mut CoreVad,
+            &[f32],
+            u32,
+            u16,
+        ) -> Result<Vec<flexaudio_vad::VadEvent>, flexaudio_vad::VadError>,
+    ) -> PyResult<Option<PyAudioChunk>> {
         self.drain_capture();
         if let Some(error) = self.inner.terminal_error() {
             return Err(to_py_err(error));
         }
-        let Some(chunk) = self.inner.poll_chunk() else {
+        let chunk = self.inner.poll_chunk();
+        let Some(chunk) = chunk else {
             return match self.inner.terminal_error() {
                 Some(error) => Err(to_py_err(error)),
                 None => Ok(None),
             };
         };
-        // The core marks the first chunk after a pause/resume, a source switch, or dropped audio with
-        // DISCONTINUITY: it is not contiguous with what came before, so clear the add-on history and
-        // start a fresh timeline at this chunk. Otherwise the denoise delay line replays pre-gap
-        // audio and VAD keeps its sample clock and resampler across the gap.
-        //
-        // Flush VAD before clearing it. A bare reset discards an unreported open segment: both
-        // SpeechStart and SpeechEnd are emitted only when that segment is finalized. Flush returns
-        // that pair on the old sample clock and resets before processing post-gap audio.
         let discontinuity = chunk.flags.contains(fa::ChunkFlags::DISCONTINUITY);
+        let carrier_origin = (
+            chunk.seq,
+            chunk.frame_index,
+            chunk.pts_ns,
+            chunk.dropped_before,
+        );
         self.output_end = Some((
             chunk
                 .frame_index
@@ -116,50 +130,58 @@ impl Stream {
         ));
         self.whisper_origin.1 = self.whisper_origin.1.max(chunk.pts_ns);
         let mut py_chunk = chunk_to_py(chunk);
-        let mut vad_events: Vec<(bool, u64)> = Vec::new();
         if discontinuity {
-            let mut flush_error = None;
-            if let Some(vad) = self.vad.as_mut() {
-                match flush(vad) {
-                    Ok(events) => vad_events = vad_event_pairs(events),
-                    Err(error) => {
-                        // A latched failure makes flush return before resetting. Attempt recovery
-                        // anyway; if reset also fails, VAD retains that failure for later polls.
-                        let _ = vad.reset();
-                        flush_error = Some(error);
-                    }
-                }
-            }
             if let Some(dn) = self.denoiser.as_mut() {
                 dn.reset();
             }
-            // Report the original flush error once, after both reset attempts. This poll consumes
-            // the discontinuity chunk; the next poll starts with fresh state if reset succeeded.
-            if let Some(error) = flush_error {
-                return Err(vad_err_to_py(error));
-            }
         }
-
-        // Denoise before measuring or detecting speech in delivered PCM.
-        if let Some(dn) = self.denoiser.as_mut() {
+        let denoiser = self.denoiser.as_mut();
+        if let Some(vad) = self.vad.as_mut() {
+            let outcome = flexaudio_vad::process_capture_chunk(vad, discontinuity, flush, |vad| {
+                if let Some(dn) = denoiser {
+                    dn.process(py_chunk.samples_mut()).map_err(|_| {
+                        flexaudio_vad::VadError::Inference(
+                            "Noise suppression failed while preparing VAD input; reopen the stream and retry.".into(),
+                        )
+                    })?;
+                }
+                process(
+                    vad,
+                    py_chunk.samples(),
+                    self.output_rate,
+                    self.output_channels,
+                )
+            });
+            let mut events = outcome.flushed;
+            match outcome.processed {
+                Ok(processed) => events.extend(processed),
+                Err(error) => {
+                    // Preserve finalized events on an independent carrier before raising the
+                    // original error. It remains pollable with no later PCM and after stop.
+                    if !events.is_empty() {
+                        let mut carrier = chunk_to_py(fa::AudioChunk {
+                            data: Vec::new(),
+                            frames: 0,
+                            seq: carrier_origin.0,
+                            frame_index: carrier_origin.1,
+                            pts_ns: carrier_origin.2,
+                            dropped_before: carrier_origin.3,
+                            flags: fa::ChunkFlags::empty(),
+                            peak: 0.0,
+                            rms: 0.0,
+                        });
+                        carrier.set_vad_events(vad_event_pairs(events));
+                        self.ready_chunks.push_back(carrier);
+                    }
+                    return Err(vad_err_to_py(error));
+                }
+            }
+            py_chunk.set_vad_events(vad_event_pairs(events));
+        } else if let Some(dn) = denoiser {
             dn.process(py_chunk.samples_mut())
                 .map_err(denoise_err_to_py)?;
         }
-
         py_chunk.update_metrics();
-
-        // 2) VAD: detect speech boundaries from processed audio and attach them. process_pcm converts
-        //    to mono and resamples to the VAD rate internally, so pass the output format as is. New
-        //    events follow any events the discontinuity flush above already produced.
-        if let Some(vad) = self.vad.as_mut() {
-            let events = vad
-                .process_pcm(py_chunk.samples(), self.output_rate, self.output_channels)
-                .map_err(vad_err_to_py)?;
-            vad_events.extend(vad_event_pairs(events));
-        }
-        if self.vad.is_some() {
-            py_chunk.set_vad_events(vad_events);
-        }
 
         if self.whisper.is_some() {
             py_chunk.set_whisper_events(std::mem::take(&mut self.whisper_events));
@@ -239,6 +261,8 @@ impl Stream {
     /// timeline. Events on later chunks use the new VAD sample clock, restarted at zero.
     /// Both boundaries are delivered together when a segment finalizes. If flushing fails,
     /// reset VAD and denoise before raising the flush error; the consumed chunk is not returned.
+    /// If post-gap processing fails, raise that error and retain successfully flushed events on
+    /// a zero-frame carrier returned by the next poll, even after stop.
     fn poll_chunk(&mut self) -> PyResult<Option<PyAudioChunk>> {
         if let Some(error) = self.inner.terminal_error() {
             // Closing event carriers remain deliverable; captured PCM does not.
@@ -248,16 +272,14 @@ impl Stream {
                 None => Err(to_py_err(error)),
             };
         }
-        if let Some(chunk) = self.ready_chunks.pop_front() {
-            return Ok(Some(chunk));
+        if !self.ready_chunks.is_empty() {
+            return Ok(self.ready_chunks.pop_front());
         }
         let result = match self.poll_chunk_with_flush(CoreVad::flush) {
             Ok(chunk) => chunk,
             Err(error) => {
                 self.whisper_carrier();
-                if let Some(chunk) = self.ready_chunks.pop_front() {
-                    return Ok(Some(chunk));
-                }
+                // Report this failure now; finalized event carriers remain queued for the next poll.
                 return Err(error);
             }
         };
@@ -265,10 +287,7 @@ impl Stream {
             return Ok(result);
         }
         self.whisper_carrier();
-        if let Some(chunk) = self.ready_chunks.pop_front() {
-            return Ok(Some(chunk));
-        }
-        Ok(None)
+        Ok(self.ready_chunks.pop_front())
     }
 
     /// Retained typed capture primary, including after stop; does not consume events.
@@ -1163,6 +1182,61 @@ mod repro_tests {
                     assert!(delivered_events(bound).is_empty());
                 }
             }
+        });
+    }
+
+    #[test]
+    fn post_gap_process_failure_retains_closing_events_once() {
+        Python::initialize();
+        let (mut stream, sink) = vad_fixture(0.0);
+        send(&mut stream, &sink);
+        send(&mut stream, &sink);
+        stream.pause();
+        stream.resume().expect("mock resume");
+        sink.lock()
+            .expect("sink lock")
+            .as_mut()
+            .expect("active sink")
+            .push(&[0.0; 960], 0);
+        let error =
+            flexaudio_vad::VadError::Inference("injected one-shot processing failure".into());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match stream.poll_chunk_with_steps(CoreVad::flush, |_, _, _, _| Err(error.clone())) {
+                Err(actual) => {
+                    Python::attach(|py| {
+                        assert!(actual.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+                        assert_eq!(actual.value(py).to_string(), error.to_string());
+                    });
+                    break;
+                }
+                Ok(None) => {
+                    assert!(std::time::Instant::now() < deadline, "mock chunk timed out");
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Ok(Some(_)) => panic!("processing failure must be reported"),
+            }
+        }
+        let carrier = stream
+            .poll_chunk()
+            .expect("retained carrier poll")
+            .expect("a destructive flush must retain its events after processing fails");
+        assert!(
+            carrier.samples().is_empty(),
+            "failed PCM must not be delivered"
+        );
+        assert!(
+            stream.poll_chunk().expect("empty poll").is_none(),
+            "deliver closing events once"
+        );
+        let _ = stream.stop();
+        Python::attach(|py| {
+            let object = Py::new(py, carrier).expect("event carrier object");
+            assert_eq!(
+                delivered_events(object.bind(py)),
+                [("speech_start".into(), 0), ("speech_end".into(), 512)],
+                "original pre-gap sample positions"
+            );
         });
     }
 

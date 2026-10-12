@@ -33,6 +33,7 @@ test('repro_p9_stream_event_union', () => {
     shutdownError: '; error: AudioError',
     whisperVadFailed: '; error: AudioError; epoch: number',
     audioLoss: '; loss: AudioLoss', clipped: '',
+    startupSamplesDropped: "; frames: bigint; reason: 'outOfRange'",
     unknown: '; message: string',
   });
 });

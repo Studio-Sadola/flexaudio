@@ -294,6 +294,13 @@ fn valid_dsp(rate: u32) {
         diagnostics: sink.diagnostics(),
         overflow_seen: 0,
         notices: Arc::new(Notices::default()),
+        startup: Some(flexaudio_core::startup::StartupSamples::new(rate, 2)),
+        startup_started: Instant::now(),
+        startup_reported: false,
+        startup_abandoned: false,
+        startup_system_skipped: 0,
+        fifo_evicted: 0,
+        pending_frame: Vec::new(),
     };
     let result = lane.ingest(&mut vec![0.0; RAW_RING_SAMPLES]);
     assert!(

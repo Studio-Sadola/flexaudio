@@ -135,6 +135,35 @@ impl WhisperBridge {
         whisper_vad::marshal(std::mem::take(&mut self.events))
     }
 
+    #[cfg(any(test, flexaudio_repro_addon))]
+    /// Establish the real active prefix required by synthetic shutdown faults.
+    /// The valid-first-frame fixture emits no startup notice. Accept its existing
+    /// canonical capture before a stop can publish a primary that closes delivery.
+    pub(super) fn prime_shutdown_fixture_capture(
+        &mut self,
+        stream: &mut flexaudio::Stream,
+    ) -> flexaudio::Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(error) = stream.terminal_error() {
+                return Err(error);
+            }
+            if let Some(chunk) = stream.poll_capture_ordered() {
+                self.process(chunk);
+                return match self.error.as_ref() {
+                    Some(error) => Err(error.audio_error()),
+                    None => Ok(()),
+                };
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(flexaudio::Error::Backend(
+                    "The shutdown fixture did not publish accepted canonical capture within 5 seconds; repair the synthetic producer before testing finalization.".into(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[cfg(all(flexaudio_repro_addon, feature = "test-faults"))]
     pub(super) fn inject_shutdown_failure(&mut self, processing: bool) {
         self.fail_at_chunk = processing.then_some(2);
@@ -145,7 +174,7 @@ impl WhisperBridge {
 impl PairingBridge {
     pub(super) fn drain_capture(&mut self, stream: &mut flexaudio::Stream) {
         if let Some(whisper) = self.whisper.as_mut() {
-            while let Some(chunk) = stream.poll_capture() {
+            while let Some(chunk) = stream.poll_capture_ordered() {
                 whisper.process(chunk);
             }
         }
@@ -311,6 +340,8 @@ pub(super) fn failure_event(
     epoch: u32,
 ) -> super::JsStreamEvent {
     super::JsStreamEvent {
+        frames: None,
+        reason: None,
         permission: None,
         kind: "whisperVadFailed".to_string(),
         count: None,
@@ -367,6 +398,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shutdown_fixture_accepts_capture_before_terminal_stop() -> flexaudio::Result<()> {
+        struct TerminalOnStop {
+            stopped: bool,
+            reported: bool,
+        }
+        impl flexaudio::CaptureBackend for TerminalOnStop {
+            fn native_format(&self) -> (u32, u16) {
+                (48_000, 2)
+            }
+            fn start(&mut self, mut sink: flexaudio::core::RawSink) -> flexaudio::Result<()> {
+                sink.push(&[0.0; 1920], 0);
+                Ok(())
+            }
+            fn stop(&mut self) {
+                self.stopped = true;
+            }
+            fn stop_checked(&mut self) -> flexaudio::Result<()> {
+                self.stop();
+                Err(flexaudio::Error::DeviceLost)
+            }
+            fn poll_event(&mut self) -> Option<Event> {
+                if self.stopped && !std::mem::replace(&mut self.reported, true) {
+                    Some(Event::TerminalError {
+                        error: flexaudio::Error::UnsupportedFormat(
+                            "The synthetic capture ended; reopen the fixture to continue.".into(),
+                        ),
+                    })
+                } else {
+                    None
+                }
+            }
+        }
+        let mut whisper =
+            WhisperBridge::new(Default::default(), Default::default(), VadTap::Primary)
+                .expect("offline shared capture owner");
+        let mut stream = flexaudio::Stream::open(
+            Default::default(),
+            Box::new(TerminalOnStop {
+                stopped: false,
+                reported: false,
+            }),
+        )?;
+        stream.enable_ordered_delivery()?;
+        stream.enable_capture_tap()?;
+        stream.start()?;
+        whisper.prime_shutdown_fixture_capture(&mut stream)?;
+        assert_eq!(whisper.last_frame_index, 960,
+            "the shutdown fixture must accept its actual canonical prefix before terminal capture closes delivery");
+        stream
+            .stop_checked()
+            .expect_err("capture primary and cleanup failure");
+        // The real shared owner's fault applies to finishing accepted PCM, never
+        // fabricated output after the capture primary has closed delivery.
+        #[cfg(feature = "test-faults")]
+        whisper.owner.inject_failure();
+        let finalization = whisper.owner.stop();
+        whisper.accept(finalization, shutdown::WhisperFailureStage::StopFlush);
+        let report = shutdown::ShutdownReport {
+            core: stream.shutdown_report(),
+            whisper: whisper.failures.clone(),
+            binding_cleanup: Vec::new(),
+        }
+        .to_js();
+        let Either::A(primary) = &report.primary else {
+            panic!("the actual capture failure must remain the primary")
+        };
+        assert_eq!(primary.kind, "unsupportedFormat");
+        #[cfg(feature = "test-faults")]
+        assert_eq!(
+            report
+                .cleanup_errors
+                .iter()
+                .map(|error| error.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["deviceLost", "backend"],
+            "an active fixture must retain the real final Whisper failure after core cleanup"
+        );
+        #[cfg(feature = "test-faults")]
+        assert_eq!(
+            report.cleanup_errors[1].whisper_code.as_deref(),
+            Some("Inference")
+        );
+        #[cfg(not(feature = "test-faults"))]
+        assert_eq!(
+            report
+                .cleanup_errors
+                .iter()
+                .map(|error| error.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["deviceLost"],
+            "successful attachment closure preserves the core cleanup cause"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_whisper_failure_event_names_its_cause_and_epoch() {
         let event = failure_event(
             &WhisperVadTapError::Vad(flexaudio_vad::WhisperVadError::Inference),
@@ -417,7 +544,7 @@ mod tests {
             let mut frames = 0;
             while frames < 1920 {
                 assert!(std::time::Instant::now() < deadline);
-                if let Some(chunk) = stream.poll_capture() {
+                if let Some(chunk) = stream.poll_capture_ordered() {
                     frames += chunk.frames;
                     bridge.process(chunk);
                 } else {
@@ -434,7 +561,7 @@ mod tests {
                 }
             ));
             stream.stop();
-            while let Some(chunk) = stream.poll_capture() {
+            while let Some(chunk) = stream.poll_capture_ordered() {
                 bridge.process(chunk);
             }
             let result = bridge.owner.stop();

@@ -3,14 +3,10 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use flexaudio_core::types::{Error, Event, Permission, Result};
+use crate::permission::Purpose;
+use flexaudio_core::types::{Error, Permission, Result};
 
 pub(crate) const PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
-pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
-pub(crate) const POLL_SLOW_AFTER: Duration = Duration::from_secs(60);
-pub(crate) const POLL_SLOW_INTERVAL: Duration = Duration::from_secs(2);
-pub(crate) const PENDING_GRACE: Duration = Duration::from_secs(5);
-pub(crate) const PENDING_DETAIL: &str = "Microphone permission has not been decided. macOS delivers silence until microphone permission is granted. If the process was started from ssh, launchd, or another context that cannot show the consent prompt, run it from Terminal or an app bundle with a nonempty NSMicrophoneUsageDescription. Grant access to the responsible app in System Settings > Privacy & Security > Microphone, then retry from that host if necessary.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -32,6 +28,18 @@ fn denied(detail: &str) -> Error {
         permission: Permission::Microphone,
         detail: detail.into(),
     }
+}
+
+fn unanswered_prompt() -> Error {
+    Error::Backend("The microphone consent prompt is unanswered, so capture cannot safely query the input format. Answer the responsible app's prompt or grant access in System Settings > Privacy & Security > Microphone, then retry opening the stream. Consent waits at most 30 seconds.".into())
+}
+
+fn missing_usage_description() -> Error {
+    Error::Backend("Microphone consent is undecided and the main app bundle has no nonempty NSMicrophoneUsageDescription, so capture cannot safely request consent or query the input format. Launch from an app bundle with that usage description, or grant Microphone access to the responsible host app in System Settings > Privacy & Security > Microphone, then retry opening the stream.".into())
+}
+
+fn undecided_enumeration() -> Error {
+    Error::Backend("Microphone consent is undecided, so device enumeration cannot safely query the mandatory native input format. Enumeration does not request access. Open a microphone stream from a configured app bundle to answer its consent prompt, or grant the responsible host access in System Settings > Privacy & Security > Microphone, then retry device enumeration.".into())
 }
 
 #[derive(Default)]
@@ -147,101 +155,34 @@ impl PromptCoordinator {
     }
 }
 
-/// True means consent is undecided and the capture owner must keep polling.
+/// Require decided consent before querying HAL; unanswered requests fail closed.
 pub(crate) fn preflight(
+    purpose: Purpose,
     provider: &dyn Provider,
     coordinator: &PromptCoordinator,
     timeout: Duration,
-) -> Result<bool> {
+) -> Result<()> {
     match provider.status()? {
-        Status::Authorized => Ok(false),
+        Status::Authorized => Ok(()),
         Status::Denied => Err(denied("macOS denied microphone access")),
         Status::Restricted => Err(denied("macOS restricted microphone access")),
         Status::NotDetermined => {
+            if purpose == Purpose::Enumeration {
+                return Err(undecided_enumeration());
+            }
             if !provider.has_usage_description()? {
-                return Ok(true);
+                return Err(missing_usage_description());
             }
             if coordinator.request(provider, timeout)? == Decision::Refused {
                 return Err(denied("The microphone consent prompt was refused"));
             }
             match provider.status()? {
-                Status::Authorized => Ok(false),
+                Status::Authorized => Ok(()),
                 Status::Denied => Err(denied("macOS denied microphone access after the prompt")),
                 Status::Restricted => Err(denied(
                     "macOS restricted microphone access after the prompt",
                 )),
-                Status::NotDetermined => Ok(true),
-            }
-        }
-    }
-}
-
-/// Owner-thread polling state. Elapsed time is injected; no clock or OS calls occur here.
-pub(crate) struct ConsentPoll {
-    next: Duration,
-    finished: bool,
-    pending_emitted: bool,
-}
-
-impl ConsentPoll {
-    pub(crate) fn new() -> Self {
-        Self {
-            next: POLL_INTERVAL,
-            finished: false,
-            pending_emitted: false,
-        }
-    }
-
-    pub(crate) fn active(&self) -> bool {
-        !self.finished
-    }
-
-    pub(crate) fn wait_duration(&self, elapsed: Duration) -> Duration {
-        self.next.saturating_sub(elapsed)
-    }
-
-    pub(crate) fn poll(
-        &mut self,
-        elapsed: Duration,
-        provider: &dyn Provider,
-    ) -> Result<Option<Event>> {
-        if self.finished || elapsed < self.next {
-            return Ok(None);
-        }
-        self.next = elapsed.saturating_add(if elapsed < POLL_SLOW_AFTER {
-            POLL_INTERVAL
-        } else {
-            POLL_SLOW_INTERVAL
-        });
-        let status = match provider.status() {
-            Ok(status) => status,
-            Err(error) => {
-                self.finished = true;
-                return Err(error);
-            }
-        };
-        match status {
-            Status::Authorized => {
-                self.finished = true;
-                Ok(self.pending_emitted.then_some(Event::PermissionGranted))
-            }
-            Status::NotDetermined => {
-                if elapsed >= PENDING_GRACE && !self.pending_emitted {
-                    self.pending_emitted = true;
-                    return Ok(Some(Event::PermissionPending {
-                        permission: Permission::Microphone,
-                        detail: PENDING_DETAIL.into(),
-                    }));
-                }
-                Ok(None)
-            }
-            Status::Denied | Status::Restricted => {
-                self.finished = true;
-                Ok(Some(Event::PermissionDenied {
-                    permission: Permission::Microphone,
-                    detail: "macOS denied or restricted microphone access after capture startup"
-                        .into(),
-                }))
+                Status::NotDetermined => Err(unanswered_prompt()),
             }
         }
     }

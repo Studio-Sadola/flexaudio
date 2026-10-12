@@ -43,10 +43,12 @@ use std::num::NonZeroU64;
 mod control;
 mod delivery;
 mod intake;
+mod intake_generation;
 mod lifecycle;
 mod processor;
 mod shared;
 mod source;
+mod startup_order;
 mod tap_drain;
 #[cfg(test)]
 use control::{drain_backend_events, MailboxDrain};
@@ -62,6 +64,8 @@ mod contract_tests;
 mod permission_tests;
 #[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+mod startup_tests;
 
 /// RawRing capacity in f32 samples. Keep it independent of native SR×ch and large enough to avoid
 /// drops on the RT path (about 0.5 seconds of 48k stereo headroom). The mix source's composite
@@ -97,6 +101,9 @@ pub struct Stream {
 
     /// Consumer end of the chunk ring, read by the caller.
     chunk_consumer: ChunkConsumer,
+    pending_primary: Option<AudioChunk>,
+    pending_secondary: Option<SecondaryChunk>,
+    pending_capture: Option<AudioChunk>,
     capture_consumer: Option<ChunkConsumer>,
 
     /// Secondary tap consumer (only when `config.secondary_output` is `Some`).
@@ -117,6 +124,10 @@ pub struct Stream {
 
 /// State shared by the intake thread, watchdog thread, and main thread.
 struct SharedState {
+    startup_order: Mutex<startup_order::StartupOrder>,
+    output_format: OutputFormat,
+    secondary_format: Option<OutputFormat>,
+    microphone: AtomicBool,
     cleanup: Mutex<Vec<Error>>,
     backend_stopped: AtomicBool,
     raw_diagnostics: Mutex<Option<CaptureDiagnostics>>,
@@ -209,6 +220,8 @@ struct SharedState {
 
 /// Metadata and samples observed together under the raw-consumer lock.
 struct RawSnapshot {
+    microphone: bool,
+    startup_drop: Option<(u64, u32)>,
     generation: u64,
     denoise_enabled: bool,
     native_format: (u32, u16),
@@ -295,6 +308,10 @@ impl Stream {
         let events = Arc::new(Mutex::new(VecDeque::new()));
 
         let shared = Arc::new(SharedState {
+            startup_order: Mutex::new(startup_order::StartupOrder::default()),
+            output_format: config.output,
+            secondary_format: config.secondary_output,
+            microphone: AtomicBool::new(config.kind == flexaudio_core::SourceKind::Mic),
             cleanup: Mutex::new(Vec::new()),
             backend_stopped: AtomicBool::new(false),
             raw_diagnostics: Mutex::new(None),
@@ -329,6 +346,9 @@ impl Stream {
             config,
             shared,
             chunk_consumer,
+            pending_primary: None,
+            pending_secondary: None,
+            pending_capture: None,
             capture_consumer: None,
             secondary_consumer,
             events,
@@ -366,15 +386,21 @@ impl Stream {
     /// Queue overflow emits capture AudioLoss in 48 kHz stereo scalar samples and marks
     /// the next delivered capture chunk DISCONTINUITY, including before the first poll.
     pub fn poll_capture(&mut self) -> Option<AudioChunk> {
-        let _delivery = self
-            .shared
-            .delivery
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if self.shared.terminal.is_failed() {
-            return None;
-        }
-        self.capture_consumer.as_mut()?.try_pop()
+        self.poll_capture_inner(false)
+    }
+    /// N-API push adapter capture poll. Drain events before retrying a pending startup notice.
+    pub fn poll_capture_ordered(&mut self) -> Option<AudioChunk> {
+        self.poll_capture_inner(true)
+    }
+    fn poll_capture_inner(&mut self, ordered: bool) -> Option<AudioChunk> {
+        startup_order::poll(
+            &mut self.pending_capture,
+            || self.capture_consumer.as_mut()?.try_pop(),
+            |c| c.frame_index,
+            &self.shared,
+            startup_order::Tap::Capture,
+            ordered,
+        )
     }
 }
 
@@ -490,11 +516,7 @@ mod repro_tests;
 mod frame_tests;
 
 pub(crate) fn validate_chunk_ms(chunk_ms: u32) -> Result<()> {
-    if chunk_ms == 20 {
-        Ok(())
-    } else {
-        Err(Error::InvalidArg("chunk_ms must be 20".into()))
-    }
+    flexaudio_core::validate_chunk_ms(chunk_ms)
 }
 fn with_cleanup(primary: Error, cleanup: Option<Error>) -> Error {
     match cleanup {

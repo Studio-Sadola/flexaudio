@@ -241,6 +241,9 @@ pub unsafe extern "C" fn flexaudio_open_v2(
 }
 
 /// Poll a versioned chunk: 1 available, 0 absent, negative result on error.
+/// PCM polling does not wait for event polling, including after stop.
+/// Startup notices are enqueued before publishing their generation's first chunk;
+/// event-first callers can drain the ordinary FIFO event queue before PCM.
 /// # Safety
 /// Stream must be exclusively owned; out must be writable, with any prior chunk already freed.
 #[no_mangle]

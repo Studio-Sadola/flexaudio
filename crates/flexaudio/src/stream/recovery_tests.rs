@@ -245,8 +245,10 @@ fn latched_generation(recovery: bool) {
             GenerationChange::Switch
         },
     );
-    wait(|| !stream.chunk_consumer.is_empty());
-    wait(|| !stream.secondary_consumer.as_ref().unwrap().is_empty());
+    // Replacement now preserves the old valid startup prefix as one tail. Wait
+    // for new-generation output too before stop can suppress its recovery flag.
+    wait(|| stream.chunk_consumer.len() >= 2);
+    wait(|| stream.secondary_consumer.as_ref().unwrap().len() >= 2);
     stream.stop();
     assert_eq!(recovery_count(&mut stream), usize::from(recovery));
     assert_chunk_flags(&mut stream, usize::from(recovery));

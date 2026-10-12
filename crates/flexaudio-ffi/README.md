@@ -49,6 +49,14 @@ C's `free`.
 #include "flexaudio.h"
 #include <stdio.h>
 
+static int drain_events(FlexStream *s) {
+    FlexEvent event;
+    int result;
+    while ((result = flexaudio_poll_event(s, &event)) == 1)
+        printf("event=%d\n", event.kind);
+    return result;
+}
+
 int main(void) {
     FlexConfig cfg = {0};              // All zeros = defaults (mic / 48k / stereo / 20ms)
     cfg.kind = FLEX_SOURCE_KIND_MIC;
@@ -66,6 +74,7 @@ int main(void) {
 
     FlexChunk chunk;
     for (int i = 0; i < 100; i++) {
+        if (drain_events(s) < 0) break;
         int r = flexaudio_poll_chunk(s, &chunk);
         if (r < 0) break;              // Error (flexaudio_last_error)
         if (r == 0) continue;          // Nothing available yet (wait briefly and retry)
@@ -74,6 +83,15 @@ int main(void) {
         flexaudio_chunk_free(&chunk);  // Free data
     }
 
+    if (flexaudio_stop(s) < 0)
+        fprintf(stderr, "stop failed: %s\n", flexaudio_last_error());
+    for (;;) {
+        if (drain_events(s) < 0) break;
+        int r = flexaudio_poll_chunk(s, &chunk);
+        if (r <= 0) break;
+        printf("final frames=%u\n", chunk.frames);
+        flexaudio_chunk_free(&chunk);
+    }
     flexaudio_free(s);
     return 0;
 }
@@ -86,6 +104,11 @@ cc -std=c11 -Wall -Wextra -Werror -fsyntax-only -I crates/flexaudio-ffi/include 
 ```
 
 The capture example is also compiled against the generated header by the Rust test suite.
+PCM polling does not wait for event polling, including after stop. Startup notices
+are enqueued chronologically before publishing their generation's first chunk.
+Event-first callers can drain the ordinary FIFO event queue before PCM to observe
+the notice first; PCM-only callers can omit event polling. C v1 projects
+the notice as `Unknown`, while C v2 retains its native frame count and reason.
 
 ## Exclude Playback by PID
 
@@ -102,7 +125,7 @@ if (!s) {
     fprintf(stderr, "open failed: %s\n", flexaudio_last_error());
 } else {
     if (flexaudio_start(s) == FLEX_OK) {
-        /* ... poll audio; later replace the source and its exclusion list ... */
+        /* ... drain_events(s) before each PCM poll; later replace the source ... */
         if (flexaudio_switch_source_with_exclude_pids(s, &cfg, excluded, count) < 0)
             fprintf(stderr, "switch failed: %s\n", flexaudio_last_error());
     }
@@ -164,7 +187,8 @@ cfg.has_vad = true;      // All-zero cfg.vad uses Silero defaults (threshold 0.5
 
 FlexStream *s = flexaudio_open(&cfg);
 /* ... start / poll ... */
-if (flexaudio_poll_chunk(s, &chunk) == 1) {
+/* Use the drain_events helper from Basic Capture before every PCM poll. */
+if (drain_events(s) == 0 && flexaudio_poll_chunk(s, &chunk) == 1) {
     for (size_t i = 0; i < chunk.vad_events_len; i++) {
         FlexVadEvent ev = chunk.vad_events[i];   // kind: 0=start / 1=end
         printf("%s @ %lld\n", ev.kind == 0 ? "speech-start" : "speech-end",
@@ -324,6 +348,10 @@ legacy-VAD conflicts and secondary taps with explicit codes. Primary attachment
 uses producer-assigned canonical capture indices and valid tail lengths; attached
 events use a separate versioned union, including EPOCH_START=6 and its u64
 capture/i64 PTS origin. `flexaudio_flush_whisper_vad` is a no-op when disabled.
+Both flush and stop finish processing internally and retain versioned chunks.
+PCM polling remains independent of event polling after flush or stop. Event-first
+callers can drain stream events before retained chunks to observe startup notices
+already enqueued before their generation's first chunk was published.
 
 An attached Whisper VAD failure closes its epoch once while capture and polling
 continue. `flexaudio_stop` returns `FLEX_OK` for a VAD-only failure, and the

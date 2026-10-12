@@ -73,7 +73,9 @@ impl FlexStream {
     ///
     /// - A chunk flagged DISCONTINUITY first flushes and clears the add-on state (no audio continuity
     ///   across it): VAD is flushed so an open speech segment is finalized and its events are delivered
-    ///   with this chunk, then the denoiser is reset.
+    ///   with this chunk. The denoiser's history is also reset before processing new audio.
+    ///   A later processing failure is reported immediately; successfully flushed events remain
+    ///   queued on a zero-frame carrier for the next poll, including after stop.
     /// - denoise: process interleaved data in place (48 kHz is guaranteed by open).
     /// - VAD: pass data in the output format (after denoise) to `process_pcm` and append finalized
     ///   events to `FlexChunk::vad_events` (after any events flushed for the discontinuity).
@@ -87,72 +89,82 @@ impl FlexStream {
         &mut self,
         flush: impl FnOnce(&mut Vad) -> Result<Vec<flexaudio_vad::VadEvent>, flexaudio_vad::VadError>,
     ) -> Result<Option<FlexChunk>, flexaudio_vad::VadError> {
+        self.poll_processed_with_steps(flush, Vad::process_pcm)
+    }
+
+    fn poll_processed_with_steps(
+        &mut self,
+        flush: impl FnOnce(&mut Vad) -> Result<Vec<flexaudio_vad::VadEvent>, flexaudio_vad::VadError>,
+        process: impl FnOnce(
+            &mut Vad,
+            &[f32],
+            u32,
+            u16,
+        ) -> Result<Vec<flexaudio_vad::VadEvent>, flexaudio_vad::VadError>,
+    ) -> Result<Option<FlexChunk>, flexaudio_vad::VadError> {
         if self.whisper.is_none() {
             if let Some(chunk) = self.ready_chunks.pop_front() {
                 return Ok(Some(chunk.chunk));
             }
         }
-        let Some(mut chunk) = self.inner.poll_chunk() else {
+        let chunk = self.inner.poll_chunk();
+        let Some(mut chunk) = chunk else {
             return Ok(None);
         };
 
         self.whisper_origin.1 = self.whisper_origin.1.max(chunk.pts_ns);
 
-        // A DISCONTINUITY chunk (resume after pause, source switch, or dropped audio) is not
-        // contiguous with what came before, so clear the add-ons' history: otherwise the denoise
-        // delay line replays pre-gap audio into the first samples and VAD keeps counting across a
-        // timeline that restarted. The core marks the first chunk after such a gap with this flag,
-        // which is the existing signal for "reset your state" (the N-API binding resets its VAD the
-        // same way).
-        //
-        // Flush VAD before clearing it. A bare reset discards an unreported open segment: both
-        // SpeechStart and SpeechEnd are emitted only when that segment is finalized. Flush returns
-        // that pair on the old sample clock and resets before processing post-gap audio.
-        let mut vad_events = Vec::new();
-        if chunk.flags.contains(ChunkFlags::DISCONTINUITY) {
-            let mut flush_error = None;
-            if let Some(vad) = self.vad.as_mut() {
-                match flush(vad) {
-                    Ok(events) => vad_events = events,
-                    Err(error) => {
-                        // A latched failure makes flush return before resetting. Attempt recovery
-                        // anyway; if reset also fails, VAD retains that failure for later polls.
-                        let _ = vad.reset();
-                        flush_error = Some(error);
-                    }
-                }
-            }
+        let discontinuity = chunk.flags.contains(ChunkFlags::DISCONTINUITY);
+        let output = self.inner.config().output;
+        if discontinuity {
             if let Some(dn) = self.denoiser.as_mut() {
                 dn.reset();
             }
-            // Report the original flush error once, after both reset attempts. This poll consumes
-            // the discontinuity chunk; the next poll starts with fresh state if reset succeeded.
-            if let Some(error) = flush_error {
-                return Err(error);
-            }
         }
-
-        // 1) denoise (in place). Length is frames×channels, hence divisible by channel count,
-        //    so this should not fail; if it does, pass through the original data.
-        if let Some(dn) = self.denoiser.as_mut() {
+        let denoiser = self.denoiser.as_mut();
+        let mut vad_events = Vec::new();
+        if let Some(vad) = self.vad.as_mut() {
+            let outcome = flexaudio_vad::process_capture_chunk(vad, discontinuity, flush, |vad| {
+                if let Some(dn) = denoiser {
+                    dn.process(&mut chunk.data).map_err(|_| {
+                        flexaudio_vad::VadError::Inference(
+                            "Noise suppression failed while preparing VAD input; reopen the stream and retry.".into(),
+                        )
+                    })?;
+                }
+                process(vad, &chunk.data, output.sample_rate, output.channels)
+            });
+            vad_events = outcome.flushed;
+            match outcome.processed {
+                Ok(events) => vad_events.extend(events),
+                Err(error) => {
+                    // Keep finalized events even if there is no later PCM. Poll/stop drains this
+                    // zero-frame carrier exactly once; failed input is never delivered.
+                    if !vad_events.is_empty() {
+                        chunk.data.clear();
+                        chunk.frames = 0;
+                        chunk.peak = 0.0;
+                        chunk.rms = 0.0;
+                        let mut carrier = convert::chunk_to_c(chunk);
+                        let (pointer, len) = vad_events_to_c(vad_events);
+                        carrier.vad_events = pointer;
+                        carrier.vad_events_len = len;
+                        let carrier = self.versioned_chunk(carrier);
+                        self.ready_chunks.push_back(carrier);
+                    }
+                    return Err(error);
+                }
+            }
+        } else if let Some(dn) = denoiser {
             dn.process(&mut chunk.data).map_err(|_| {
-                flexaudio_vad::VadError::Inference("denoise processing failed".into())
+                flexaudio_vad::VadError::Inference(
+                    "Noise suppression failed; reopen the stream and retry.".into(),
+                )
             })?;
         }
-        // Denoise rewrote the samples, so the core's peak / RMS describe pre-denoise audio while the
-        // C API documents them as metrics of the delivered PCM. Recompute them from the final data
-        // (same one-pass formula the core uses; VAD below only reads the samples).
         let (peak, rms) = peak_rms(&chunk.data);
         chunk.peak = peak;
         chunk.rms = rms;
-
-        // 2) VAD. Pass the unchanged output format (guaranteed after open) to process_pcm.
-        //    output is Copy, so save it before borrowing mutably. New events follow any events the
-        //    discontinuity flush above already produced (pre-gap segment first, then this chunk).
-        let output = self.inner.config().output;
-        if let Some(vad) = self.vad.as_mut() {
-            vad_events.extend(vad.process_pcm(&chunk.data, output.sample_rate, output.channels)?);
-        }
 
         self.last_output = Some((
             chunk
@@ -191,6 +203,10 @@ pub(crate) fn peak_rms(data: &[f32]) -> (f32, f32) {
     let rms = (sum_sq / data.len() as f64).sqrt() as f32;
     (peak, rms)
 }
+
+#[cfg(test)]
+#[path = "../tests/ffi/startup_order.rs"]
+mod startup_order_tests;
 
 #[cfg(test)]
 mod tests {
@@ -405,6 +421,55 @@ mod tests {
             }
             free(chunk);
         }
+        stream.inner.stop();
+    }
+
+    #[test]
+    fn post_gap_process_failure_retains_closing_events_once() {
+        let (mut stream, sink) = vad_stream(0.0);
+        free(push_and_poll(&mut stream, &sink));
+        free(push_and_poll(&mut stream, &sink));
+        stream.inner.pause();
+        stream.inner.resume().expect("mock resume");
+        sink.lock()
+            .expect("sink lock")
+            .as_mut()
+            .expect("active sink")
+            .push(&[0.0; 960], 0);
+        let error =
+            flexaudio_vad::VadError::Inference("injected one-shot processing failure".into());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match stream.poll_processed_with_steps(Vad::flush, |_, _, _, _| Err(error.clone())) {
+                Err(actual) => {
+                    assert_eq!(actual, error);
+                    break;
+                }
+                Ok(None) => {
+                    assert!(Instant::now() < deadline, "mock chunk timed out");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok(Some(chunk)) => {
+                    free(chunk);
+                    panic!("processing failure must be reported");
+                }
+            }
+        }
+        let carrier = stream
+            .poll_processed()
+            .expect("retained carrier poll")
+            .expect("a destructive flush must retain its events after processing fails");
+        assert_eq!(carrier.frames, 0, "failed PCM must not be delivered");
+        assert_eq!(
+            events(&carrier),
+            [(0, 0), (1, 512)],
+            "original pre-gap sample positions"
+        );
+        free(carrier);
+        assert!(
+            stream.poll_processed().expect("empty poll").is_none(),
+            "deliver closing events once"
+        );
         stream.inner.stop();
     }
 

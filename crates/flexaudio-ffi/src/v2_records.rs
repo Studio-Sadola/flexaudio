@@ -8,7 +8,8 @@ pub struct FlexAudioLossV2 {
     pub lane: u32,
     /// 0 primary, 1 secondary; used only for output path.
     pub tap: u32,
-    /// 0 raw overflow, 1 FIFO overflow, 2 corrupt, 3 malformed, 4 callback rejected, 5 output overflow.
+    /// 0 raw overflow, 1 FIFO overflow, 2 corrupt, 3 malformed, 4 callback rejected,
+    /// 5 output overflow, 6 generation ended: terminal capture discarded a held valid native startup prefix.
     pub reason: u32,
     /// 0 unknown, 1 known positive scalar interleaved sample count.
     pub count_known: u32,
@@ -42,7 +43,8 @@ pub struct FlexErrorContextV2 {
     pub native_call: *const std::os::raw::c_char,
 }
 
-/// Late microphone consent; permission getter returns 1.
+/// Late microphone consent for custom backends/compatibility; permission getter returns 1.
+/// Built-in backends emit neither pending nor granted notices on any OS/source.
 pub const FLEX_EVENT_KIND_PERMISSION_GRANTED: i32 = 9;
 /// Validated interval sample loss.
 pub const FLEX_EVENT_KIND_AUDIO_LOSS: i32 = 10;
@@ -58,3 +60,10 @@ pub const FLEX_EVENT_KIND_CLIPPED: i32 = 14;
 pub const FLEX_DEVICE_EVENT_KIND_DEFAULT_CLEARED: i32 = 4;
 /// Incremental inventory is invalid; obtain a complete inventory again.
 pub const FLEX_DEVICE_EVENT_KIND_RESCAN_REQUIRED: i32 = 5;
+
+/// Leading invalid microphone frames suppressed; v2 accessor gives frames/reason.
+/// Enqueued chronologically before publishing the generation's first chunk.
+/// Event-first callers can observe it before PCM; PCM polling does not wait for event polling.
+pub const FLEX_EVENT_KIND_STARTUP_SAMPLES_DROPPED: i32 = 15;
+/// Startup validation saw non-finite or out-of-range microphone samples.
+pub const FLEX_STARTUP_DROP_OUT_OF_RANGE: i32 = 0;

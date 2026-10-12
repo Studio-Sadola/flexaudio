@@ -633,6 +633,14 @@ fn sim_lane() -> ChildLane {
         diagnostics: CaptureDiagnostics::new(SAMPLE_RATE, CHANNELS),
         overflow_seen: 0,
         notices: Arc::new(Notices::default()),
+        // Drift fixtures inject already accepted canonical samples directly.
+        startup: None,
+        startup_started: Instant::now(),
+        startup_reported: false,
+        startup_abandoned: false,
+        startup_system_skipped: 0,
+        fifo_evicted: 0,
+        pending_frame: Vec::new(),
     }
 }
 

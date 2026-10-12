@@ -2,6 +2,72 @@ use super::*;
 use flexaudio_core::raw_ring;
 
 #[test]
+fn legacy_constructor_keeps_windows_capture_check_before_its_single_format_query() {
+    let source = include_str!("lib.rs");
+    let constructor = source
+        .split("pub fn new(device_id:")
+        .nth(1)
+        .expect("legacy microphone constructor")
+        .split("pub fn try_new")
+        .next()
+        .expect("legacy constructor body");
+    assert!(
+        constructor.contains("#[cfg(target_os = \"windows\")]"),
+        "legacy Windows constructor must preserve its existing capability check"
+    );
+    assert!(constructor.contains("let purpose = permission::Purpose::Capture;"));
+    assert!(constructor.contains("let purpose = permission::Purpose::Enumeration;"));
+    assert_eq!(
+        constructor.matches("query_native_format(").count(),
+        1,
+        "legacy construction must keep one native query implementation"
+    );
+}
+
+#[test]
+fn every_native_host_query_requires_an_explicit_consent_purpose() {
+    let source = include_str!("lib.rs");
+    let host = source
+        .split("fn cpal_default_host(")
+        .nth(1)
+        .expect("CPAL host acquisition function")
+        .split("pub struct CpalMicBackend")
+        .next()
+        .expect("host function body");
+    let gate = host
+        .find("permission::query_after_preflight")
+        .expect("native host acquisition must check consent before any HAL query");
+    let query = host
+        .find("cpal::default_host()")
+        .expect("native host acquisition must be centralized");
+    assert!(gate < query, "consent must precede native host acquisition");
+    let enumeration = source
+        .split("pub fn list_devices()")
+        .nth(1)
+        .expect("microphone enumeration function")
+        .split("impl CaptureBackend")
+        .next()
+        .expect("enumeration body");
+    assert!(
+        enumeration.contains("cpal_default_host(permission::Purpose::Enumeration)"),
+        "device enumeration must never enter the prompting capture gate"
+    );
+    let capture = source
+        .split("fn build_stream(")
+        .nth(1)
+        .expect("capture owner stream builder");
+    assert!(
+        capture.contains("cpal_default_host(permission::Purpose::Capture)"),
+        "each capture generation must check consent before native device resolution"
+    );
+    assert_eq!(
+        source.matches("cpal::default_host()").count(),
+        2,
+        "only the host helper and its documentation may reference native host acquisition"
+    );
+}
+
+#[test]
 fn unavailable_runtime_device_uses_typed_device_lost_without_text_classification() {
     let mut backend = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
     backend

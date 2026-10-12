@@ -136,7 +136,9 @@ pub(crate) fn validate_config(config: &FlexConfig) -> Result<(), ()> {
         }
     }
     if config.chunk_ms != 0 && config.chunk_ms != DEFAULT_CHUNK_MS {
-        return invalid_config("chunk_ms must be 20 (or 0 for the default)");
+        return ::flexaudio::core::validate_chunk_ms(config.chunk_ms).map_err(|error| {
+            crate::error::set_audio_error(error);
+        });
     }
     Ok(())
 }
@@ -450,7 +452,10 @@ pub fn event_to_c(ev: Event) -> FlexEvent {
                 count: 0,
             }
         }
-        Event::AudioLoss { .. } | Event::Clipped | Event::PermissionGranted => {
+        Event::StartupSamplesDropped { .. }
+        | Event::AudioLoss { .. }
+        | Event::Clipped
+        | Event::PermissionGranted => {
             // New advisory events have no representable v1 payload.
             FlexEvent {
                 kind: FlexEventKind::Unknown as i32,
@@ -578,6 +583,19 @@ pub unsafe fn free_process_array(arr: *mut FlexProcessInfo, count: usize) {
 mod tests {
     use super::*;
     use flexaudio::ChunkFlags;
+
+    #[test]
+    fn v1_startup_advisory_is_unknown_without_a_legacy_count() {
+        crate::error::clear_last_error();
+        let projected = event_to_c(Event::StartupSamplesDropped {
+            frames: 480,
+            reason: flexaudio::core::StartupDropReason::OutOfRange,
+        });
+        assert_eq!(projected.kind, FlexEventKind::Unknown as i32);
+        assert_eq!(projected.count, 0);
+        assert!(crate::error::last_error_ptr().is_null());
+        assert!(crate::error::last_audio_error().is_none());
+    }
 
     #[test]
     fn terminal_backend_events_keep_error_code_and_cause() {

@@ -30,6 +30,7 @@ pub use flexaudio_core::types::{
     Operation, OutputFormat, OutputTap, Permission, ProcessInfo, ProcessMode, Result,
     SecondaryChunk, ShutdownReport, SourceKind, StreamConfig, WhisperCode,
 };
+pub use flexaudio_core::StartupDropReason;
 
 /// Return audio devices for all sources in one list.
 ///
@@ -48,6 +49,13 @@ pub use flexaudio_core::types::{
 /// Success means a complete authoritative inventory across every provider.
 /// A confirmed empty inventory is valid; query failure returns Err, even if another
 /// provider returned devices. A partial inventory must never be treated as complete.
+/// On macOS, enumeration never prompts. With undecided microphone consent it returns
+/// a typed [`Error::Backend`] before any HAL/device/format query. Grant the responsible
+/// host access or use the bounded capture-open consent flow, then retry enumeration.
+/// Denied/restricted consent returns [`Error::PermissionDenied`]. DeviceInfo formats
+/// are mandatory; discovery does not return a partial or unknown-format inventory.
+/// Windows enumeration does not preflight microphone permission; native enumeration
+/// proceeds. Microphone capture retains its separate existing permission preflight.
 pub fn devices() -> Result<Vec<DeviceInfo>> {
     // Microphone input (cpal) is common to all OSes. Linux extends this with PipeWire devices,
     // so mut is needed there; other OSes do not extend it. The allow handles this difference.
@@ -157,6 +165,15 @@ pub fn watch_devices() -> Result<DeviceWatcher> {
 /// stream.stop();
 /// # Ok::<(), flexaudio::Error>(())
 /// ```
+/// For macOS microphone/Mix, consent is checked before any HAL/device-format query.
+/// An undecided bundled prompt waits at most 30 seconds; an unanswered prompt returns
+/// a typed [`Error::Backend`] without querying HAL or starting capture. Answer the
+/// prompt and retry. Undecided consent without a nonempty microphone usage description
+/// fails immediately; configure the bundle or grant the responsible host access first.
+/// This bound covers the undecided consent wait, not arbitrary native queries after
+/// authorization. Opening is synchronous; GUI hosts should use a worker thread.
+/// Pull PCM does not require an event poll. Startup notices enter the ordinary FIFO
+/// event queue before the affected generation's first chunk is published.
 pub fn open(config: StreamConfig) -> Result<Stream> {
     stream::validate_chunk_ms(config.chunk_ms)?;
     // Validate the output format early. Stream::open also checks it, but errors should be

@@ -114,6 +114,8 @@ impl FlexErrorInfoV2 {
 }
 /// Owned event with immutable payloads. Free with flexaudio_event_free_v2.
 pub struct FlexEventV2 {
+    pub(crate) startup_frames: Option<u64>,
+    pub(crate) startup_reason: Option<i32>,
     pub(crate) kind: i32,
     pub(crate) count: Option<u64>,
     pub(crate) permission: Option<i32>,
@@ -124,6 +126,8 @@ pub struct FlexEventV2 {
 impl FlexEventV2 {
     pub(crate) fn new(event: Event) -> Self {
         let mut out = Self {
+            startup_frames: None,
+            startup_reason: None,
             kind: 6,
             count: None,
             permission: None,
@@ -185,6 +189,13 @@ impl FlexEventV2 {
                 out.kind = FLEX_EVENT_KIND_RECOVERABLE_ERROR;
                 out.error = Some(FlexErrorInfoV2::new(error));
             }
+            Event::StartupSamplesDropped { frames, reason } => {
+                out.kind = FLEX_EVENT_KIND_STARTUP_SAMPLES_DROPPED;
+                out.startup_frames = Some(frames);
+                out.startup_reason = Some(match reason {
+                    flexaudio::StartupDropReason::OutOfRange => FLEX_STARTUP_DROP_OUT_OF_RANGE,
+                });
+            }
             Event::Clipped => out.kind = FLEX_EVENT_KIND_CLIPPED,
             _ => out.message = Some(cstring("unknown stream event")),
         }
@@ -223,6 +234,7 @@ fn loss_record(loss: AudioLoss) -> FlexAudioLossV2 {
         LossReason::MalformedBuffer => 3,
         LossReason::CallbackRejected => 4,
         LossReason::OutputOverflow => 5,
+        LossReason::GenerationEnded => 6,
         _ => u32::MAX,
     };
     if let Some(samples) = loss.samples() {
