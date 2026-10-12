@@ -183,7 +183,9 @@ pub enum FlexEventKind {
     /// Missing permission and genuine digital silence remain possible.
     /// Retrieve the explanation with flexaudio_last_error; capture continues.
     SilenceWhileSourceActive = 7,
-    /// Recording consent remains undecided; advisory only, capture continues.
+    /// Custom-backend/compatibility notice: recording consent remains undecided.
+    /// Built-in sources on every OS emit neither pending nor granted notices.
+    /// Advisory only; capture continues.
     /// Retrieve guidance with flexaudio_last_error; capture may stay silent until granted.
     PermissionPending = 8,
 }
@@ -192,7 +194,9 @@ pub enum FlexEventKind {
 ///
 /// For Error, PermissionDenied, SilenceWhileSourceActive, and PermissionPending,
 /// the message is stored in flexaudio_last_error. PermissionDenied retains kind 3;
-/// PermissionPending has kind 8 and does not stop capture.
+/// PermissionPending has kind 8 and does not stop capture. This arm remains for
+/// custom Rust backends and compatibility; built-in sources on every OS emit
+/// neither pending nor granted notices.
 #[repr(C)]
 pub struct FlexEvent {
     /// Event kind.

@@ -297,6 +297,10 @@ pub(crate) fn chunk_to_py(chunk: AudioChunk) -> PyAudioChunk {
 #[pyclass(module = "flexaudio", name = "StreamEvent", frozen)]
 pub struct PyStreamEvent {
     #[pyo3(get)]
+    frames: Option<u64>,
+    #[pyo3(get)]
+    reason: Option<String>,
+    #[pyo3(get)]
     permission: Option<String>,
     #[pyo3(get, name = "type")]
     kind: String,
@@ -320,6 +324,12 @@ impl PyStreamEvent {
         if let Some(permission) = &self.permission {
             d.set_item("permission", permission)?;
         }
+        if let Some(frames) = self.frames {
+            d.set_item("frames", frames)?;
+        }
+        if let Some(reason) = &self.reason {
+            d.set_item("reason", reason)?;
+        }
         if let Some(count) = self.count {
             d.set_item("count", count)?;
         }
@@ -337,6 +347,8 @@ impl PyStreamEvent {
 }
 pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
     let mut result = PyStreamEvent {
+        frames: None,
+        reason: None,
         kind: String::new(),
         permission: None,
         count: None,
@@ -360,6 +372,11 @@ pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
         Event::AudioLoss { loss } => {
             result.loss = Some(crate::errors::AudioLoss(loss));
             "audioLoss"
+        }
+        Event::StartupSamplesDropped { frames, reason } => {
+            result.frames = Some(frames);
+            result.reason = Some(reason.as_str().into());
+            "startupSamplesDropped"
         }
         Event::Clipped => "clipped",
         Event::PermissionGranted => {
@@ -891,6 +908,41 @@ mod parity_tests {
                 u64::MAX
             );
             assert_eq!(d.len(), 2);
+        });
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    #[test]
+    fn startup_drop_serialization_has_exact_native_frames_and_reason() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let mapped = event_to_py(Event::StartupSamplesDropped {
+                frames: u64::MAX,
+                reason: fa::StartupDropReason::OutOfRange,
+            });
+            let record = mapped.to_dict(py).expect("typed startup record");
+            assert_eq!(record.len(), 3);
+            assert_eq!(
+                record
+                    .get_item("frames")
+                    .expect("frames field")
+                    .expect("native frame value")
+                    .extract::<u64>()
+                    .expect("u64 count"),
+                u64::MAX
+            );
+            assert_eq!(
+                record
+                    .get_item("reason")
+                    .expect("reason field")
+                    .expect("reason value")
+                    .extract::<String>()
+                    .expect("typed reason"),
+                "outOfRange"
+            );
         });
     }
 }

@@ -532,6 +532,13 @@ impl std::fmt::Display for Permission {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
+    /// Leading invalid microphone frames suppressed once per capture generation.
+    StartupSamplesDropped {
+        /// Suppressed frames at the microphone's native rate.
+        frames: u64,
+        /// Typed validation cause, including non-finite samples.
+        reason: crate::startup::StartupDropReason,
+    },
     /// `count` chunks were dropped because the chunk ring was full.
     ChunkDropped {
         /// Cumulative primary-tap chunk drops; excludes capture and secondary losses.

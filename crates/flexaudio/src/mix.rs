@@ -14,9 +14,11 @@ use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::clock::monotonic_now_ns;
 use flexaudio_core::normalizer::Normalizer;
 use flexaudio_core::raw_ring::{raw_ring, RawConsumer};
+#[cfg(test)]
+use flexaudio_core::types::LossReason;
 use flexaudio_core::types::{
-    AudioLoss, AudioPath, Error, ErrorContext, ErrorKind, Event, LossReason, MixLane, Operation,
-    OutputFormat, Result, ShutdownReport, CHANNELS, SAMPLE_RATE,
+    AudioLoss, AudioPath, Error, ErrorContext, ErrorKind, Event, MixLane, Operation, OutputFormat,
+    Result, ShutdownReport, CHANNELS, SAMPLE_RATE,
 };
 use flexaudio_core::CaptureDiagnostics;
 

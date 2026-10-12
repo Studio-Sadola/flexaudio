@@ -126,7 +126,8 @@ impl Stream {
             self.events
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .drain(..old_event_count);
+                .drain(..old_event_count)
+                .for_each(|event| self.shared.retire_event(&event));
         }
         self.started = true;
         self.shutdown = None;

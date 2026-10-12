@@ -22,7 +22,7 @@ exception; FlacEncoder propagates finalization errors only on normal exit.
 from os import PathLike
 from typing import List, Literal, Optional, Sequence, Tuple, TypedDict, Union
 
-StreamEventType = Literal[
+StreamEventType = Literal["startupSamplesDropped",
     "chunkDropped", "stalled", "recovered", "permissionDenied", "permissionPending",
     "silenceWhileSourceActive", "deviceLost", "error", "terminalError",
     "recoverableError", "shutdownError", "audioLoss", "clipped", "permissionGranted", "unknown"
@@ -157,7 +157,7 @@ class OutputPathDict(TypedDict):
     type: Literal["output"]
     tap: Literal["primary", "secondary"]
 AudioPath = Union[CapturePathDict, MixFifoPathDict, OutputPathDict]
-LossReason = Literal["rawOverflow", "mixFifoOverflow", "corruptBuffer", "malformedBuffer", "callbackRejected", "outputOverflow"]
+LossReason = Literal["rawOverflow", "mixFifoOverflow", "corruptBuffer", "malformedBuffer", "callbackRejected", "outputOverflow", "generationEnded"]
 class AudioLossDict(TypedDict):
     path: AudioPath
     reason: LossReason
@@ -165,6 +165,11 @@ class AudioLossDict(TypedDict):
     sample_rate: int
     channels: int
 class AudioLoss:
+    """Discarded audio with a count at the reported rate and channel count.
+
+    generationEnded reports a held valid native startup prefix discarded when
+    capture fails terminally. samples counts scalar interleaved native samples.
+    """
     @property
     def path(self) -> AudioPath: ...
     @property
@@ -229,7 +234,12 @@ class ClippedEventDict(TypedDict):
 class UnknownEventDict(TypedDict):
     type: Literal["unknown"]
     message: str
-StreamEventDict = Union[ChunkDroppedEventDict, StalledEventDict, RecoveredEventDict, PermissionDeniedEventDict, PermissionPendingEventDict, PermissionGrantedEventDict, SilenceWhileSourceActiveEventDict, DeviceLostEventDict, LegacyErrorEventDict, TerminalErrorEventDict, RecoverableErrorEventDict, ShutdownErrorEventDict, AudioLossEventDict, ClippedEventDict, UnknownEventDict]
+class StartupSamplesDroppedEventDict(TypedDict):
+    type: Literal["startupSamplesDropped"]
+    frames: int
+    reason: Literal["outOfRange"]
+
+StreamEventDict = Union[StartupSamplesDroppedEventDict, ChunkDroppedEventDict, StalledEventDict, RecoveredEventDict, PermissionDeniedEventDict, PermissionPendingEventDict, PermissionGrantedEventDict, SilenceWhileSourceActiveEventDict, DeviceLostEventDict, LegacyErrorEventDict, TerminalErrorEventDict, RecoverableErrorEventDict, ShutdownErrorEventDict, AudioLossEventDict, ClippedEventDict, UnknownEventDict]
 
 class DeviceInfoDict(TypedDict):
     id: str
@@ -267,6 +277,7 @@ class VadSettings(TypedDict, total=False):
     sample_rate: int
 
 class DeviceInfo:
+    """Advertised sample rate and channel count are mandatory, never fabricated."""
     def __repr__(self) -> str: ...
     @property
     def id(self) -> str: ...
@@ -329,16 +340,22 @@ class AudioChunk:
     def rms(self) -> float: ...
 
 class StreamEvent:
-    """Stream notification; permissionPending and silenceWhileSourceActive are advisories.
+    """Stream notification; silenceWhileSourceActive is advisory.
 
-    permissionPending carries permission and an actionable message; capture
-    continues and may remain silent until granted. permissionDenied is terminal
+    Built-in backends emit neither permissionPending nor permissionGranted on any
+    OS or capture source. Their event arms remain for custom Rust backends and
+    compatibility. A custom permissionPending is advisory; a custom
+    permissionGranted can report late microphone consent. permissionDenied is terminal
     and carries permission and a cause/remedy message. silenceWhileSourceActive
     means the system-audio diagnosis is inconclusive; capture continues because
     missing permission and genuine digital silence remain possible. error carries
     a safe message and is terminal. terminalError preserves the typed capture failure;
     recoverableError is advisory, while shutdownError reports cleanup failure.
-    permissionGranted reports late microphone consent following Pending.
+    startupSamplesDropped is enqueued chronologically before publishing the
+    generation's first chunk. Event-first callers drain the ordinary FIFO event
+    queue before PCM to observe the notice first. PCM polling does not wait for event polling.
+    macOS microphone capture requires decided consent before each start; it does
+    not continuously monitor authorization changes or permission revocation.
 
     On macOS, system/process capture can confirm SystemAudio denial with an active
     self-probe after sustained exact zeros and eligible external output activity.
@@ -353,6 +370,10 @@ class StreamEvent:
     def permission(self) -> Optional[RecordingPermission]: ...
     @property
     def count(self) -> Optional[int]: ...
+    @property
+    def frames(self) -> Optional[int]: ...
+    @property
+    def reason(self) -> Optional[Literal["outOfRange"]]: ...
     @property
     def message(self) -> Optional[str]: ...
     @property
@@ -393,6 +414,10 @@ class Stream:
     def poll_chunk(self) -> Optional[AudioChunk]:
         """Poll PCM and finalized VAD boundary pairs (start and end together).
 
+        PCM polling does not wait for event polling. Event-first callers can
+        drain poll_event before PCM to observe startup notices already enqueued
+        before the affected generation's first chunk was published.
+
         On DISCONTINUITY (flags & 1), flushed pre-gap events come first and
         retain the old at_sample clock. Fixed 20 ms chunks cannot complete a
         fresh 32 ms VAD frame: every event on that chunk is pre-gap, and events
@@ -402,7 +427,13 @@ class Stream:
         After a successful reset, later polls do not repeat the flush error.
         """
         ...
-    def poll_event(self) -> Optional[StreamEvent]: ...
+    def poll_event(self) -> Optional[StreamEvent]:
+        """Poll the ordinary FIFO event queue; PCM polling remains independent.
+
+        A startup notice is enqueued before the generation's first chunk is
+        published, so event-first callers can observe it before polling PCM.
+        """
+        ...
     def terminal_error(self) -> Optional[AudioError]:
         """Retained terminal failure, including after stop; does not consume events.
 
@@ -600,7 +631,16 @@ class DeviceWatcher:
     def __exit__(self, _exc_type: Optional[object], _exc_value: Optional[object], _traceback: Optional[object]) -> bool: ...
 
 def devices() -> List[DeviceInfo]:
-    """Complete inventory; incomplete or failed discovery raises a typed exception."""
+    """Complete inventory; incomplete or failed discovery raises a typed exception.
+
+    On macOS, enumeration never prompts. With undecided microphone consent it
+    raises a typed Backend error before any HAL/device/format query. Grant the
+    responsible host access or use the bounded capture-open consent flow, then retry.
+    Denied/restricted consent raises PermissionDenied. DeviceInfo formats are mandatory;
+    discovery never returns a partial or unknown-format inventory.
+    Windows enumeration does not preflight microphone permission; native enumeration
+    proceeds. Microphone capture retains its separate existing permission preflight.
+    """
     ...
 def processes() -> List[ProcessInfo]: ...
 def watch_devices() -> DeviceWatcher:
@@ -616,4 +656,14 @@ def open(
     mic_gain: float = 1.0, system_gain: float = 1.0,
     vad: Optional[VadSettings] = None, denoise: bool = False,
     whisper_vad: Optional[WhisperVadStreamOptions] = None
-) -> Stream: ...
+) -> Stream:
+    """Open capture synchronously; macOS microphone consent must be decided.
+
+    Bundled prompts wait at most 30 seconds; an unanswered prompt raises a typed
+    backend error without starting capture. Answer the prompt and retry. Built-in
+    backends emit neither permissionPending nor permissionGranted on any OS/source.
+    The 30-second bound covers undecided consent, not authorized native queries.
+    PCM polling does not wait for event polling. To observe startup notices
+    first, drain the ordinary FIFO event queue before polling PCM.
+    """
+    ...

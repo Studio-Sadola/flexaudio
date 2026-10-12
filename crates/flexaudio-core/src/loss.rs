@@ -56,6 +56,8 @@ pub enum LossReason {
     CallbackRejected,
     /// Finished output ring capacity exceeded.
     OutputOverflow,
+    /// Valid buffered capture could not be delivered after terminal generation closure.
+    GenerationEnded,
 }
 
 /// Rejections that can occur at the native capture boundary.
@@ -90,9 +92,9 @@ impl AudioLoss {
             reason,
             samples,
             sample_rate: NonZeroU32::new(rate)
-                .ok_or_else(|| Error::InvalidArg("loss rate must be positive".into()))?,
+                .ok_or_else(|| Error::InvalidArg("loss sample rate is zero, so discarded audio cannot be timed; report the positive sample rate of the discarded buffer".into()))?,
             channels: NonZeroU16::new(channels)
-                .ok_or_else(|| Error::InvalidArg("loss channels must be positive".into()))?,
+                .ok_or_else(|| Error::InvalidArg("loss channel count is zero, so discarded audio cannot be counted in frames; report the positive channel count of the discarded buffer".into()))?,
         })
     }
     /// Capture PCM ring overflow with the discard-point format and exact scalar count,
@@ -106,6 +108,17 @@ impl AudioLoss {
         Self::new(
             AudioPath::Capture { lane },
             LossReason::RawOverflow,
+            samples,
+            rate,
+            channels,
+        )
+    }
+    /// Valid buffered capture discarded because terminal failure closed delivery.
+    /// Counts use the buffered native format, before normalization.
+    pub fn generation_ended(samples: Option<NonZeroU64>, rate: u32, channels: u16) -> Result<Self> {
+        Self::new(
+            AudioPath::Capture { lane: None },
+            LossReason::GenerationEnded,
             samples,
             rate,
             channels,
@@ -177,6 +190,12 @@ impl AudioLoss {
     /// Scalar interleaved samples; None means unknown.
     pub fn samples(&self) -> Option<NonZeroU64> {
         self.samples
+    }
+    /// Replace a coalesced count while retaining the validated path and format.
+    /// None represents an unknown count, including arithmetic overflow.
+    pub fn with_sample_count(mut self, samples: Option<NonZeroU64>) -> Self {
+        self.samples = samples;
+        self
     }
     /// Sample rate at discard point.
     pub fn sample_rate(&self) -> u32 {

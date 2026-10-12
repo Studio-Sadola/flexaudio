@@ -30,6 +30,7 @@
 
 #![warn(missing_docs)]
 
+mod capture;
 mod config;
 mod infer;
 mod resample;
@@ -50,6 +51,7 @@ pub use whisper_tap::WhisperVadTap;
 pub use whisper_tap_types::*;
 pub use whisper_types::*;
 
+pub use capture::{process_capture_chunk, VadCaptureEngine, VadCaptureOutcome};
 pub use config::VadConfig;
 pub use resample::PcmFormat;
 pub use segmenter::Segment;

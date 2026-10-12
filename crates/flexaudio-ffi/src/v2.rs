@@ -557,3 +557,90 @@ pub unsafe extern "C" fn flexaudio_shutdown_cleanup_v2(
             .unwrap_or(ptr::null())
     })
 }
+
+/// Suppressed microphone native frames; 0 for other event arms, output untouched.
+/// # Safety
+/// value must be a live event; out must be writable and aligned.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_event_startup_frames_v2(
+    value: *const FlexEventV2,
+    out: *mut u64,
+) -> i32 {
+    scalar(value, out, |event| Ok(event.startup_frames))
+}
+/// Startup-drop reason; currently FLEX_STARTUP_DROP_OUT_OF_RANGE (includes non-finite samples).
+/// # Safety
+/// value must be a live event; out must be writable and aligned.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_event_startup_reason_v2(
+    value: *const FlexEventV2,
+    out: *mut i32,
+) -> i32 {
+    scalar(value, out, |event| Ok(event.startup_reason))
+}
+
+#[cfg(test)]
+mod startup_tests {
+    #[test]
+    fn startup_mapping_exhaustively_matches_the_typed_reason() {
+        // The enum has one variant today, so a semantic assertion cannot detect
+        // a hardcoded reason. Keep the boundary exhaustive when the contract grows.
+        let source = include_str!("v2_storage.rs");
+        let arm = source
+            .split_once("Event::StartupSamplesDropped")
+            .expect("startup event mapping")
+            .1
+            .split_once("Event::Clipped")
+            .expect("end of startup event mapping")
+            .0;
+        assert!(
+            arm.contains("{ frames, reason }"),
+            "startup mapping must retain its typed reason"
+        );
+        let arms = arm
+            .split_once("match reason {")
+            .expect("startup reason must be mapped exhaustively")
+            .1
+            .split_once("});")
+            .expect("end of reason mapping")
+            .0;
+        let mut count = 0;
+        for line in arms.lines().filter(|line| line.contains("=>")) {
+            let pattern = line.split_once("=>").expect("match arm").0.trim();
+            assert!(
+                pattern.starts_with("flexaudio::StartupDropReason::"),
+                "startup reasons must use typed variant arms, without a wildcard"
+            );
+            assert!(
+                pattern.split('|').all(|variant| variant.trim() != "_"),
+                "startup reason alternatives must not contain a wildcard"
+            );
+            count += 1;
+        }
+        assert!(count > 0, "typed startup mapping must contain a reason arm");
+    }
+
+    use super::*;
+    #[test]
+    fn startup_accessors_preserve_unsigned_frames_and_reject_wrong_arms() {
+        let event = FlexEventV2::new(flexaudio::Event::StartupSamplesDropped {
+            frames: u64::MAX,
+            reason: flexaudio::StartupDropReason::OutOfRange,
+        });
+        let control = FlexEventV2::new(flexaudio::Event::Clipped);
+        let mut frames = 7;
+        let mut reason = -1;
+        unsafe {
+            assert_eq!(flexaudio_event_startup_frames_v2(&event, &mut frames), 1);
+            assert_eq!(frames, u64::MAX);
+            assert_eq!(flexaudio_event_startup_reason_v2(&event, &mut reason), 1);
+            assert_eq!(reason, FLEX_STARTUP_DROP_OUT_OF_RANGE);
+            assert_eq!(flexaudio_event_startup_frames_v2(&control, &mut frames), 0);
+            assert_eq!(frames, u64::MAX);
+            assert_eq!(
+                flexaudio_event_startup_reason_v2(&event, ptr::null_mut()),
+                code::FLEX_INVALID_ARG
+            );
+        }
+    }
+}

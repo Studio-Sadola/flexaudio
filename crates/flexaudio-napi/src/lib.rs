@@ -16,6 +16,8 @@
 //! No network communication occurs at runtime (napi is only the N-API bridge).
 
 mod boundary;
+mod bridge_drain;
+use bridge_drain::start_bridge_stream;
 mod flac_encoder;
 mod shutdown;
 use boundary::{device_event_to_js, event_to_js, to_napi_err, JsAudioError, JsAudioLoss};
@@ -98,6 +100,7 @@ type DeviceTsfn = ThreadsafeFunction<JsDeviceEvent, ErrorStrategy::Fatal>;
 /// Values queued on the onChunk TSFN. Chunks go to the user's `onChunk`; `StopFlushed` is
 /// an end signal in the same queue (not exposed to JS onChunk).
 enum ChunkEmit {
+    StartupDropped(Box<JsStreamEvent>),
     Chunk(Box<JsAudioChunk>),
     WhisperFlushed(SendDeferred, Option<flexaudio_vad::WhisperVadTapError>),
     /// A whisper-only failure: the closing carrier is already queued on this same TSFN,
@@ -233,8 +236,10 @@ fn terminal_event(error: flexaudio::Error) -> JsStreamEvent {
 fn forward_stream_events(
     stream: &mut flexaudio::Stream,
     callback: Option<&EventTsfn>,
+    chunk_queue: &ChunkTsfn,
     terminal: &Mutex<Option<StreamTerminal>>,
-) {
+) -> bool {
+    let mut released_startup = false;
     if let Some(error) = stream.terminal_error() {
         *terminal.lock().unwrap_or_else(lock_poisoned) = Some(StreamTerminal(error));
     }
@@ -249,10 +254,21 @@ fn forward_stream_events(
         if let Event::TerminalError { error } = &event {
             *terminal.lock().unwrap_or_else(lock_poisoned) = Some(StreamTerminal(error.clone()));
         }
-        if let Some(callback) = callback {
+        if matches!(event, Event::StartupSamplesDropped { .. }) {
+            released_startup = true;
+            // poll_event claims the notice before this nonblocking enqueue. The
+            // unbounded queue is owned by this bridge thread, so its notice is
+            // queued before PCM on the same TSFN. If the queue is Closing,
+            // subsequent PCM enqueues fail too; no callback can overtake it.
+            chunk_queue.call(
+                ChunkEmit::StartupDropped(Box::new(event_to_js(event))),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+        } else if let Some(callback) = callback {
             callback.call(event_to_js(event), ThreadsafeFunctionCallMode::NonBlocking);
         }
     }
+    released_startup
 }
 
 fn take_stop_waiters(phase: &Mutex<StopPhase>) -> Vec<SendDeferred> {
@@ -398,6 +414,27 @@ fn make_stream_event_callbacks(
     Ok((Some(tsfn), Some(retained)))
 }
 
+/// Invoke the retained callback on the chunk queue for events with PCM ordering guarantees.
+fn call_ordered_event(
+    env: &Env,
+    callback: Option<&Arc<UserCallback>>,
+    event: JsStreamEvent,
+) -> napi::Result<()> {
+    let Some(callback) = callback else {
+        return Ok(());
+    };
+    let refer = callback.refer();
+    if refer.is_null() {
+        return Ok(());
+    }
+    let mut value = ptr::null_mut();
+    check_status!(unsafe { sys::napi_get_reference_value(env.raw(), refer, &mut value) })?;
+    let function: Function<JsStreamEvent, Unknown> =
+        unsafe { Function::from_napi_value(env.raw(), value)? };
+    function.call(event)?;
+    Ok(())
+}
+
 /// TSFN that calls the user's `onChunk`. Chunks go to the user; `StopFlushed` resolves the
 /// deferred in the same queue (without calling the user's onChunk). The pump function is a no-op.
 /// After resolving, unref the chunk TSFN and release onChunk's `napi_ref`.
@@ -417,6 +454,10 @@ fn make_chunk_tsfn(
             let user = user;
             let chunk_weak = chunk_weak.clone();
             move |ctx: ThreadSafeCallContext<ChunkEmit>| match ctx.value {
+                ChunkEmit::StartupDropped(event) => {
+                    call_ordered_event(&ctx.env, on_event.as_ref(), *event)?;
+                    Ok(Vec::<Unknown>::new())
+                }
                 ChunkEmit::Chunk(chunk) => {
                     let denied = matches!(
                         *terminal.lock().unwrap_or_else(lock_poisoned),
@@ -459,19 +500,11 @@ fn make_chunk_tsfn(
                     // The failure's terminal carrier was queued on this same TSFN before
                     // this value, so its onChunk call ran first. A whisper-only failure is
                     // reported to onEvent; it must never become an uncaught exception.
-                    if let Some(on_event) = &on_event {
-                        let refer = on_event.refer();
-                        if !refer.is_null() {
-                            let mut value = ptr::null_mut();
-                            check_status!(unsafe {
-                                sys::napi_get_reference_value(ctx.env.raw(), refer, &mut value)
-                            })?;
-                            let callback: Function<JsStreamEvent, Unknown> =
-                                unsafe { Function::from_napi_value(ctx.env.raw(), value)? };
-                            callback
-                                .call(whisper_integration::failure_event(&error, stage, epoch))?;
-                        }
-                    }
+                    call_ordered_event(
+                        &ctx.env,
+                        on_event.as_ref(),
+                        whisper_integration::failure_event(&error, stage, epoch),
+                    )?;
                     Ok(Vec::<Unknown>::new())
                 }
                 ChunkEmit::VadError(message) => {
@@ -764,8 +797,10 @@ pub struct VadOptions {
 }
 
 /// Stream notification. permissionDenied is terminal, with permission and
-/// cause/remedy in message. permissionPending is advisory: consent remains undecided,
-/// capture continues and may stay silent until granted. silenceWhileSourceActive
+/// cause/remedy in message. permissionPending and permissionGranted remain for custom
+/// Rust backends and compatibility; built-in sources on every OS emit neither arm.
+/// A custom permissionPending is advisory: consent remains undecided and capture continues.
+/// silenceWhileSourceActive
 /// is advisory: the system-audio diagnosis is inconclusive and capture continues.
 /// Missing permission and genuine digital silence remain possible in that case.
 /// whisperVadFailed is advisory for capture: the attached whisper VAD session failed,
@@ -773,6 +808,11 @@ pub struct VadOptions {
 /// stop keep working. It is delivered after that failure's `epochEnd(error)` carrier.
 #[napi(object)]
 pub struct JsStreamEvent {
+    /// Present on startupSamplesDropped: suppressed native microphone frames.
+    pub frames: Option<BigInt>,
+    /// Present on startupSamplesDropped: outOfRange (includes non-finite input).
+    #[napi(ts_type = "'outOfRange'")]
+    pub reason: Option<String>,
     /// Present on permissionDenied and permissionPending: microphone | systemAudio.
     #[napi(ts_type = "'microphone' | 'systemAudio'")]
     pub permission: Option<String>,
@@ -1110,8 +1150,8 @@ fn build_config(options: &OpenOptions) -> napi::Result<StreamConfig> {
     };
     if let Some(ms) = options.chunk_ms {
         if ms != 20.0 {
-            return Err(to_napi_err(flexaudio::Error::InvalidArg(
-                "chunkMs must be 20".into(),
+            return Err(to_napi_err(flexaudio::core::chunk_ms_error(
+                flexaudio::core::ChunkMsOption::JavaScript,
             )));
         }
         config.chunk_ms = 20;
@@ -1248,8 +1288,9 @@ impl PairingBridge {
                 Some(events)
             }
             Err(error) => {
+                let events = vad.take_pending_events();
                 self.report_vad_error(error.to_string());
-                None
+                Some(events)
             }
         }
     }
@@ -1298,7 +1339,9 @@ impl PairingBridge {
                     ),
                 );
                 self.report_vad_error(error.to_string());
-                Vec::new()
+                self.vad
+                    .as_mut()
+                    .map_or_else(Vec::new, |vad| vad.take_pending_events())
             }
         };
         // Prepend any runtime pending events (chronological order).
@@ -1624,14 +1667,11 @@ impl FlexStream {
                             // VAD tap chunk (pending).
                             BridgeCmd::FlushVad => bridge.flush_vad(),
                             BridgeCmd::FlushWhisperVad(deferred) => {
-                                bridge.drain_capture(&mut stream);
-                                while let Some(chunk) = stream.poll_chunk() {
-                                    bridge.on_primary(chunk);
-                                }
-                                while let Some(chunk) = stream.poll_secondary() {
-                                    bridge.on_secondary(chunk);
-                                }
-                                bridge.drain_pairs();
+                                bridge.drain_stream(
+                                    &mut stream,
+                                    on_event.as_ref(),
+                                    &thread_terminal,
+                                );
                                 bridge.flush_whisper(false);
                                 // flushWhisperVad reinitializes on success, so a previous
                                 // whisper-only failure no longer applies to this stream.
@@ -1652,38 +1692,16 @@ impl FlexStream {
                     if thread_stop.load(Ordering::SeqCst) {
                         break;
                     }
-                    if let Some(error) = stream.terminal_error() {
-                        *thread_terminal.lock().unwrap_or_else(lock_poisoned) =
-                            Some(StreamTerminal(error));
-                        bridge.primary_fifo.clear();
-                        bridge.secondary_fifo.clear();
-                        bridge.pending_flush_events.clear();
-                    }
                     // Drain all arriving primary/secondary chunks into the bridge. Run VAD/quantization, pair within
                     // the pts window, and deliver to onChunk.
-                    bridge.drain_capture(&mut stream);
-                    while let Some(chunk) = stream.poll_chunk() {
-                        bridge.on_primary(chunk);
-                    }
-                    while let Some(chunk) = stream.poll_secondary() {
-                        bridge.on_secondary(chunk);
-                    }
-                    bridge.drain_pairs();
+                    bridge.drain_stream(&mut stream, on_event.as_ref(), &thread_terminal);
                     // A whisper-only failure never becomes the capture terminal: it is
                     // reported once through whisperVadFailed and retained as cleanup.
                     bridge.report_whisper_failure();
-                    forward_stream_events(&mut stream, on_event.as_ref(), &thread_terminal);
                     thread::sleep(POLL_INTERVAL);
                 }
                 // Drain chunks remaining in the rings before stopping, then deliver pairs.
-                bridge.drain_capture(&mut stream);
-                while let Some(chunk) = stream.poll_chunk() {
-                    bridge.on_primary(chunk);
-                }
-                while let Some(chunk) = stream.poll_secondary() {
-                    bridge.on_secondary(chunk);
-                }
-                bridge.drain_pairs();
+                bridge.drain_stream(&mut stream, on_event.as_ref(), &thread_terminal);
                 // stop() ordering (addendum 2-2):
                 //   1. Audio stop-flush: core flush queues the trailing tail (denoise delay line + resampler
                 //      remainder) into the rings.
@@ -1693,31 +1711,9 @@ impl FlexStream {
                 // This delivers both trailing recorded audio (2) and final speechEnd (3). Audio stop-flush and
                 // flushVad are separate (audio samples versus VAD events).
                 let _ = stream.stop_checked();
-                // Stop can discover a pending backend denial. Preserve its event and
-                // terminal state before queuing any tail audio or settlement.
-                forward_stream_events(&mut stream, on_event.as_ref(), &thread_terminal);
-                if let Some(error) = stream.terminal_error() {
-                    *thread_terminal.lock().unwrap_or_else(lock_poisoned) =
-                        Some(StreamTerminal(error));
-                    bridge.primary_fifo.clear();
-                    bridge.secondary_fifo.clear();
-                    bridge.pending_flush_events.clear();
-                }
-                bridge.drain_capture(&mut stream);
-                while let Some(chunk) = stream.poll_chunk() {
-                    bridge.on_primary(chunk); // 2 (primary tap VAD also consumes the tail here)
-                }
-                while let Some(chunk) = stream.poll_secondary() {
-                    bridge.on_secondary(chunk); // 2 (secondary tap VAD also consumes the tail here)
-                }
-                bridge.drain_pairs(); // 2 Deliver trailing audio
-                if let Some(error) = stream.terminal_error() {
-                    *thread_terminal.lock().unwrap_or_else(lock_poisoned) =
-                        Some(StreamTerminal(error));
-                    bridge.primary_fifo.clear();
-                    bridge.secondary_fifo.clear();
-                    bridge.pending_flush_events.clear();
-                }
+                // Stop can discover a pending backend denial. The shared drain
+                // forwards it and suppresses failed PCM before accepting the tail.
+                bridge.drain_stream(&mut stream, on_event.as_ref(), &thread_terminal);
                 if stream.terminal_error().is_none() {
                     while let Some(secondary) = bridge.secondary_fifo.pop_front() {
                         bridge.emit_secondary_envelope(secondary);
@@ -1963,7 +1959,7 @@ impl FlexStream {
             if options.chunk_ms.is_some_and(|ms| ms != 20.0) {
                 boundary::throw_error(
                     &env,
-                    flexaudio::Error::InvalidArg("chunkMs must be 20".into()),
+                    flexaudio::core::chunk_ms_error(flexaudio::core::ChunkMsOption::JavaScript),
                 )
             } else {
                 error
@@ -2227,6 +2223,13 @@ impl Drop for DeviceWatcherHandle {
 // ---------------------------------------------------------------------------
 
 /// Enumerate the complete inventory. Discovery failure throws a typed audio exception.
+/// On macOS, enumeration never prompts. With undecided microphone consent it throws
+/// a typed Backend error before any HAL/device/format query. Grant the responsible
+/// host access or use the bounded capture-open consent flow, then retry enumeration.
+/// Denied/restricted consent throws PermissionDenied. DeviceInfo formats are mandatory;
+/// discovery does not return a partial or unknown-format inventory.
+/// Windows enumeration does not preflight microphone permission; native enumeration
+/// proceeds. Microphone capture retains its separate existing permission preflight.
 #[napi]
 pub fn devices(env: Env) -> napi::Result<Vec<JsDeviceInfo>> {
     let list = flexaudio::devices().map_err(|error| boundary::throw_error(&env, error))?;
@@ -2261,13 +2264,22 @@ pub fn processes() -> AsyncTask<ProcessesTask> {
 
 /// Open and start a stream, returning a `FlexStream` that sends chunks/events to callbacks.
 /// Confirmed microphone/system-audio denial throws actionable permission guidance.
-/// Supply onEvent for runtime denial, permissionPending and silenceWhileSourceActive
+/// Supply onEvent for startupSamplesDropped, runtime denial and silenceWhileSourceActive
 /// advisories. Without onEvent, terminalError() and stop() expose terminal failures
-/// only; they do not expose advisories. macOS bundled microphone prompts wait up to
-/// 30 s; an unanswered prompt proceeds with capture. Undecided consent emits
-/// permissionPending after 5 s of capture. Authorization is checked every 500 ms
-/// for the first 60 s, then every 2 s until resolved or stopped. Bare-host opens rely
-/// on the responsible-app prompt. Windows checks Microphone privacy, including
+/// only; they do not expose advisories. macOS microphone consent is checked
+/// before any HAL query. Bundled prompts wait at most 30 s; an unanswered prompt
+/// throws a typed Backend error without starting capture. Answer the prompt and retry.
+/// Undecided consent without a nonempty NSMicrophoneUsageDescription fails immediately;
+/// configure the bundle or grant the responsible host access before retrying.
+/// Opening is synchronous; use a worker thread for GUI hosts.
+/// The 30 s bound covers undecided consent, not authorized native queries.
+/// Built-in sources on every OS emit neither permissionPending nor permissionGranted; those arms
+/// remain for custom Rust backends and compatibility. Each microphone start requires
+/// decided consent; authorization changes and revocation are not continuously monitored.
+/// With onEvent, startupSamplesDropped precedes the affected generation's first
+/// onChunk and attached Whisper epochStart. Recovered and other advisories use
+/// independent callbacks and may arrive before or after the startup notice.
+/// Windows checks Microphone privacy, including
 /// Let desktop apps access your microphone.
 ///
 /// macOS system/process capture runs a once-per-generation self-probe after 5 s of
@@ -2337,7 +2349,7 @@ pub fn open_stream(
         if options.chunk_ms.is_some_and(|ms| ms != 20.0) {
             boundary::throw_error(
                 &env,
-                flexaudio::Error::InvalidArg("chunkMs must be 20".into()),
+                flexaudio::core::chunk_ms_error(flexaudio::core::ChunkMsOption::JavaScript),
             )
         } else {
             error
@@ -2389,9 +2401,7 @@ pub fn open_stream(
             .enable_capture_tap()
             .map_err(|error| boundary::throw_error(&env, error))?;
     }
-    stream
-        .start()
-        .map_err(|error| boundary::throw_error(&env, error))?;
+    start_bridge_stream(&env, &mut stream)?;
 
     let stop_phase = Arc::new(Mutex::new(StopPhase::Running));
     let terminal: TerminalError = Arc::new(Mutex::new(None));
@@ -2629,9 +2639,7 @@ pub fn open_mock_stream(
             .enable_capture_tap()
             .map_err(|error| boundary::throw_error(&env, error))?;
     }
-    stream
-        .start()
-        .map_err(|error| boundary::throw_error(&env, error))?;
+    start_bridge_stream(&env, &mut stream)?;
     // The mock path bypasses integrated denoise. VAD runs only when `vadThreshold` is specified (for
     // verification of flushVad, vadEvents, and pairing paths).
     let stop_phase = Arc::new(Mutex::new(StopPhase::Running));

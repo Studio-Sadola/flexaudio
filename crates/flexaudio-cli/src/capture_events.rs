@@ -28,6 +28,13 @@ impl CaptureEventReporter {
                 self.add_loss(loss);
                 Ok(())
             }
+            Event::StartupSamplesDropped { frames, reason } => {
+                eprintln!(
+                    "Warning: suppressed {frames} leading microphone frames ({})",
+                    reason.as_str()
+                );
+                Ok(())
+            }
             Event::Clipped => {
                 eprintln!("Warning: upstream audio was clipped; exact output chunk attribution is unavailable");
                 Ok(())
@@ -118,6 +125,7 @@ impl LossSummary {
             LossReason::MalformedBuffer => "malformed buffer",
             LossReason::CallbackRejected => "callback rejected",
             LossReason::OutputOverflow => "output overflow",
+            LossReason::GenerationEnded => "terminal generation closure",
             _ => "unknown loss reason",
         };
         let count = self.samples.map_or_else(

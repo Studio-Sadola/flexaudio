@@ -74,7 +74,13 @@ mod tests {
     #[test]
     fn granted_prompt_cannot_feed_real_stereo_config_into_fallback_mono_sink() {
         let provider = PromptingProvider(AtomicBool::new(false));
-        preflight(&provider, &PromptCoordinator::default(), Duration::ZERO).unwrap();
+        preflight(
+            crate::permission::Purpose::Capture,
+            &provider,
+            &PromptCoordinator::default(),
+            Duration::ZERO,
+        )
+        .unwrap();
         let discover = || {
             assert_eq!(provider.status()?, Status::Authorized);
             Ok((44_100, 2))

@@ -38,29 +38,17 @@ fn run_intake_inner(
     output: OutputFormat,
     secondary_output: Option<OutputFormat>,
 ) {
-    // Startup arguments can become stale before this thread is scheduled.
+    let formats = (output, secondary_output);
     let initial = shared.snapshot_raw(&mut []);
-    let (rate, channels) = initial.native_format;
-    // If Normalizer construction fails (for example, rubato setup), latch TerminalError and exit rather
-    // than dying silently.
-    let mut normalizer = match build_normalizer(
-        &shared,
-        rate,
-        channels,
-        output,
-        secondary_output,
-        initial.denoise_enabled,
-    ) {
-        Ok(n) => n,
-        Err(e) => {
-            shared.fail_terminal(e.with_context(ErrorContext::new(Operation::Normalize)));
+    let mut input = match intake_generation::IntakeGeneration::new(&shared, &initial, formats, 0) {
+        Ok(input) => input,
+        Err(error) => {
+            shared.fail_terminal(error.with_context(ErrorContext::new(Operation::Normalize)));
             return;
         }
     };
-    let mut clock = ClockNormalizer::new();
     let mut primary_state = tap_drain::TapState::default();
     let mut secondary_state = tap_drain::TapState::default();
-    let mut current_generation = initial.generation;
     let mut capture_state = tap_drain::TapState {
         discontinuity: shared.primary_frame_index.load(Ordering::SeqCst) != 0,
         ..Default::default()
@@ -70,61 +58,71 @@ fn run_intake_inner(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
-    // Each tap retains flags and resume state until its own first delivery.
-    let mut overflow_baseline: u64 = 0;
-
-    // Pop scratch buffer (sized to the RawRing capacity so the whole ring can be drained in one call).
     let mut scratch = vec![0.0f32; RAW_RING_SAMPLES];
-
     'intake: loop {
         if shared.terminal.is_failed() {
             break;
         }
         let stopping = shared.stopping.load(Ordering::SeqCst);
-
-        // Detect a generation change (reopen/source switch) and reset for the new source. Since
-        // native_format may change, reread shared state and rebuild the native-dependent Stage 1
-        // Normalizer. Do not reset the recording epoch here; timestamps stay continuous from zero
-        // across generations.
         let snapshot = shared.snapshot_raw(&mut scratch);
-        let gen = snapshot.generation;
-        if gen != current_generation {
-            if let Err(error) = advance_frame_index(
-                &shared.capture_frame_index,
-                normalizer.buffered_capture_frames() as u64,
-                48_000,
-            ) {
-                shared.fail_terminal(error.with_context(ErrorContext::new(Operation::Normalize)));
-                break 'intake;
-            }
-            current_generation = gen;
-            capture_state.discontinuity = true;
-            // Pending delivery flags belong to the discarded normalizer, never its replacement.
+        if snapshot.generation != input.number {
+            // Close the OLD guard, format and DSP before adopting the replacement.
+            let old_recovered = (primary_state.recovered, secondary_state.recovered);
             primary_state.recovered = false;
             secondary_state.recovered = false;
-            let (rate, channels) = snapshot.native_format;
-            normalizer = match build_normalizer(
-                &shared,
-                rate,
-                channels,
-                output,
-                secondary_output,
-                snapshot.denoise_enabled,
-            ) {
-                Ok(n) => n,
-                Err(e) => {
-                    shared.fail_terminal(e.with_context(ErrorContext::new(Operation::Normalize)));
-                    return;
+            let closed = match input.finish(&shared, intake_generation::GenerationEnd::Replaced) {
+                Ok(progress) => progress,
+                Err(error) => {
+                    shared
+                        .fail_terminal(error.with_context(ErrorContext::new(Operation::Normalize)));
+                    break 'intake;
                 }
             };
-            clock = ClockNormalizer::new();
-            // The new RawConsumer counts overflows from 0 (avoid a falsely huge delta).
-            overflow_baseline = 0;
+            if closed.discontinuity {
+                capture_state.discontinuity = true;
+                primary_state.discontinuity = true;
+                secondary_state.discontinuity = true;
+            }
+            if closed.pushed {
+                primary_state.discontinuity |= old_recovered.0;
+                secondary_state.discontinuity |= old_recovered.1;
+                if let Err(error) = drain_outputs(
+                    &shared,
+                    &mut input.normalizer,
+                    OutputRings {
+                        capture: capture_producer.as_mut(),
+                        primary: &mut chunk_producer,
+                        secondary: secondary_producer.as_mut(),
+                    },
+                    OutputStates {
+                        capture: &mut capture_state,
+                        primary: &mut primary_state,
+                        secondary: &mut secondary_state,
+                    },
+                    formats,
+                    f32::from_bits(shared.gain_bits.load(Ordering::Relaxed)),
+                    true,
+                ) {
+                    shared
+                        .fail_terminal(error.with_context(ErrorContext::new(Operation::Normalize)));
+                    break 'intake;
+                }
+            }
+            input = match intake_generation::IntakeGeneration::new(
+                &shared,
+                &snapshot,
+                formats,
+                input.minimum_pts,
+            ) {
+                Ok(input) => input,
+                Err(error) => {
+                    shared
+                        .fail_terminal(error.with_context(ErrorContext::new(Operation::Normalize)));
+                    break 'intake;
+                }
+            };
+            capture_state.discontinuity = true;
         }
-
-        // Fan out shared pending flags to each tap's local state. The watchdog is stopped by
-        // switching during a source switch, so both flags should not be set together; if they are,
-        // they are combined with OR.
         if snapshot.recovered || snapshot.discontinuity {
             capture_state.discontinuity = true;
         }
@@ -136,11 +134,7 @@ fn run_intake_inner(
             primary_state.discontinuity = true;
             secondary_state.discontinuity = true;
         }
-
-        // Drain RawRing into the Normalizer and observe overflows (capture-side data loss).
-        let mut produced_any = false;
-        let mut push_err: Option<Error> = None;
-        let overflow_now = snapshot.overflows;
+        let overflowed = snapshot.overflows > input.overflows;
         let losses = match snapshot.losses {
             Ok(losses) => losses,
             Err(error) => {
@@ -150,88 +144,75 @@ fn run_intake_inner(
         };
         let observed_loss = !losses.is_empty();
         if observed_loss {
-            capture_state.discontinuity = true;
-            primary_state.discontinuity = true;
-            secondary_state.discontinuity = true;
             for loss in losses {
                 shared.push_event(Event::AudioLoss { loss });
             }
         }
-        if shared.capture_enabled.load(Ordering::SeqCst)
-            && (overflow_now > overflow_baseline || observed_loss)
-        {
-            if let Err(error) = advance_frame_index(
-                &shared.capture_frame_index,
-                normalizer.buffered_capture_frames() as u64,
-                48_000,
-            ) {
+        if overflowed || observed_loss || snapshot.startup_drop.is_some() {
+            capture_state.discontinuity = true;
+            primary_state.discontinuity = true;
+            secondary_state.discontinuity = true;
+        }
+        if shared.capture_enabled.load(Ordering::SeqCst) && (overflowed || observed_loss) {
+            if let Err(error) = input.rebuild_after_loss(&shared, snapshot.denoise_enabled, formats)
+            {
                 shared.fail_terminal(error.with_context(ErrorContext::new(Operation::Normalize)));
                 break 'intake;
             }
-            // No DSP history or partial chunk may bridge capture-side loss. Rebuild
-            // the normalized representation and reanchor its PTS, keeping stream counters.
-            let (rate, channels) = snapshot.native_format;
-            normalizer = match build_normalizer(
+        }
+        if let Some((frames, rate)) = snapshot.startup_drop {
+            if let Err(error) = input.external_drop(&shared, frames, rate) {
+                shared.fail_terminal(error);
+                break 'intake;
+            }
+        }
+        if let Err(error) = input.check_deadline(&shared) {
+            shared.fail_terminal(error.with_context(ErrorContext::new(Operation::Normalize)));
+            break 'intake;
+        }
+        let mut produced_any = false;
+        if snapshot.samples > 0 {
+            // Suppressed raw input still establishes producer health for the watchdog.
+            shared
+                .last_sample_ns
+                .store(monotonic_now_ns(), Ordering::SeqCst);
+            match input.accept(
                 &shared,
-                rate,
-                channels,
-                output,
-                secondary_output,
-                snapshot.denoise_enabled,
+                &scratch[..snapshot.samples],
+                overflowed || observed_loss,
             ) {
-                Ok(normalizer) => normalizer,
+                Ok(progress) => {
+                    produced_any = progress.pushed;
+                    if progress.discontinuity {
+                        capture_state.discontinuity = true;
+                        primary_state.discontinuity = true;
+                        secondary_state.discontinuity = true;
+                    }
+                }
                 Err(error) => {
                     shared
                         .fail_terminal(error.with_context(ErrorContext::new(Operation::Normalize)));
                     break 'intake;
                 }
-            };
-            clock = ClockNormalizer::new();
-        }
-        if snapshot.samples > 0 {
-            let samples = &scratch[..snapshot.samples];
-            // Device PTS: monotonic approximation based on the native sample rate (arrival time).
-            let device_pts = monotonic_now_ns();
-            let norm_pts = clock.normalize(device_pts);
-            if let Err(e) = normalizer.push(samples, norm_pts) {
-                push_err = Some(e);
-            } else {
-                shared
-                    .last_sample_ns
-                    .store(monotonic_now_ns(), Ordering::SeqCst);
-                produced_any = true;
             }
         }
-
-        // If push failed, latch TerminalError and exit intake (do not die silently).
-        if let Some(e) = push_err {
-            shared.fail_terminal(e.with_context(ErrorContext::new(Operation::Normalize)));
-            return;
-        }
-
-        // On RawRing overflow (RT outran intake and discarded samples), set DISCONTINUITY on the
-        // next primary and secondary chunks (loss before normalization affects both taps equally).
-        // The PTS already reflects the gap through wall-clock re-anchoring.
-        if overflow_now > overflow_baseline {
-            capture_state.discontinuity = true;
-            primary_state.discontinuity = true;
-            secondary_state.discontinuity = true;
-        }
-        overflow_baseline = overflow_now;
-
-        // On stop, flush and emit the tail (denoise delay line + resampler remainder).
+        input.overflows = snapshot.overflows;
         if stopping {
-            if let Err(error) = normalizer.flush() {
-                shared.record_cleanup(error);
+            match input.finish(&shared, intake_generation::GenerationEnd::Stopped) {
+                Ok(progress) if progress.discontinuity => {
+                    capture_state.discontinuity = true;
+                    primary_state.discontinuity = true;
+                    secondary_state.discontinuity = true;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    shared.record_cleanup(error.with_context(ErrorContext::new(Operation::Flush)))
+                }
             }
         }
-
-        // Output gain stays after conversion. The capture copy gets the same snapshot
-        // independently, before WhisperVadTap's mono/16 kHz conversion.
-        let gain = f32::from_bits(shared.gain_bits.load(Ordering::Relaxed));
-        let drained = drain_outputs(
+        let emitted = match drain_outputs(
             &shared,
-            &mut normalizer,
+            &mut input.normalizer,
             OutputRings {
                 capture: capture_producer.as_mut(),
                 primary: &mut chunk_producer,
@@ -242,27 +223,25 @@ fn run_intake_inner(
                 primary: &mut primary_state,
                 secondary: &mut secondary_state,
             },
-            (output, secondary_output),
-            gain,
+            formats,
+            f32::from_bits(shared.gain_bits.load(Ordering::Relaxed)),
             stopping,
-        );
-        let emitted_any = match drained {
+        ) {
             Ok(emitted) => emitted,
             Err(error) => {
                 shared.fail_terminal(error.with_context(ErrorContext::new(Operation::Normalize)));
                 break 'intake;
             }
         };
-
-        // If stop was requested, the tail has been flushed; exit.
         if stopping {
             break;
         }
-
-        // Sleep briefly when there is no data to avoid busy-spinning the CPU.
-        if !produced_any && !emitted_any {
+        if !produced_any && !emitted {
             thread::sleep(Duration::from_millis(2));
         }
+    }
+    if let Err(error) = input.reject_pending(&shared) {
+        shared.record_cleanup(error);
     }
     *shared
         .capture_producer

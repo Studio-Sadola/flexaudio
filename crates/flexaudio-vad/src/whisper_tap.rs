@@ -87,6 +87,12 @@ impl WhisperVadTap {
         }
     }
 
+    /// Whether the shared capture session is latched after a processing or reset failure.
+    /// Contiguous input keeps it failed; successful flush or boundary reinitialization clears it.
+    pub fn is_failed(&self) -> bool {
+        self.state == State::Failed
+    }
+
     /// Test-only fault injection for the bindings' failure-path self-tests.
     ///
     /// The next nonempty process or active-epoch finish (flush/stop) fails exactly like a

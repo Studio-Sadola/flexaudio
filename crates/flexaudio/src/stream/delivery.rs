@@ -82,6 +82,24 @@ impl Stream {
         f32::from_bits(self.shared.gain_bits.load(Ordering::Relaxed))
     }
 
+    /// Enable startup notice barriers for a push adapter before capture starts.
+    /// The adapter must drain events before polling the ordered primary, secondary,
+    /// and capture taps, then emit notices and PCM on one ordered callback queue.
+    /// Pull consumers leave this disabled; their event FIFO remains independent of PCM.
+    pub fn enable_ordered_delivery(&mut self) -> Result<()> {
+        if self.started || self.shutdown.is_some() {
+            return Err(Error::InvalidState(
+                "ordered delivery must be enabled before capture starts; enable it on a newly opened stream before calling start".into(),
+            ));
+        }
+        self.shared
+            .startup_order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enable();
+        Ok(())
+    }
+
     /// Retrieve one completed chunk (non-blocking). Returns `None` if none is available.
     ///
     /// Returned chunks contain interleaved `f32` in the output format (`config.output`). Chunks are
@@ -89,15 +107,21 @@ impl Stream {
     /// `frames == 960` (`data.len() == 1920`). `peak`/`rms` are computed from final data. `seq`
     /// increases monotonically.
     pub fn poll_chunk(&mut self) -> Option<AudioChunk> {
-        let _delivery = self
-            .shared
-            .delivery
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if self.shared.terminal.is_failed() {
-            return None;
-        }
-        self.chunk_consumer.try_pop()
+        self.poll_chunk_inner(false)
+    }
+    /// N-API push adapter poll. Drain events before retrying a pending startup notice.
+    pub fn poll_chunk_ordered(&mut self) -> Option<AudioChunk> {
+        self.poll_chunk_inner(true)
+    }
+    fn poll_chunk_inner(&mut self, ordered: bool) -> Option<AudioChunk> {
+        startup_order::poll(
+            &mut self.pending_primary,
+            || self.chunk_consumer.try_pop(),
+            |c| c.frame_index,
+            &self.shared,
+            startup_order::Tap::Primary,
+            ordered,
+        )
     }
 
     /// Retrieve one completed secondary tap chunk (non-blocking). Returns `None` if none is available.
@@ -108,15 +132,21 @@ impl Stream {
     /// in the secondary Stage2 resampler. Match primary and secondary by `pts_ns` (time), since each
     /// tap has its own `seq` counter.
     pub fn poll_secondary(&mut self) -> Option<SecondaryChunk> {
-        let _delivery = self
-            .shared
-            .delivery
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if self.shared.terminal.is_failed() {
-            return None;
-        }
-        self.secondary_consumer.as_mut().and_then(|c| c.try_pop())
+        self.poll_secondary_inner(false)
+    }
+    /// N-API push adapter poll. Drain events before retrying a pending startup notice.
+    pub fn poll_secondary_ordered(&mut self) -> Option<SecondaryChunk> {
+        self.poll_secondary_inner(true)
+    }
+    fn poll_secondary_inner(&mut self, ordered: bool) -> Option<SecondaryChunk> {
+        startup_order::poll(
+            &mut self.pending_secondary,
+            || self.secondary_consumer.as_mut()?.try_pop(),
+            |c| c.frame_index,
+            &self.shared,
+            startup_order::Tap::Secondary,
+            ordered,
+        )
     }
 
     /// Terminal capture failure, retained after stop. Confirmed permission denial
@@ -158,12 +188,15 @@ impl Stream {
         self.shared.denoise_enabled.store(enabled, Ordering::SeqCst);
     }
 
-    /// Retrieve one undelivered event (non-blocking). Returns `None` if none is available.
+    /// Retrieve the oldest undelivered event (non-blocking).
+    /// Startup notices enter this FIFO before their generation's first chunk is published.
+    /// PCM polling never requires event polling; the ordered push adapter claims its
+    /// boundary only when this chronological FIFO delivers the corresponding notice.
     pub fn poll_event(&mut self) -> Option<Event> {
-        self.events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop_front()
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let event = events.pop_front()?;
+        self.shared.retire_event(&event);
+        Some(event)
     }
 
     /// Total chunks discarded by the chunk ring through DROP_OLDEST.

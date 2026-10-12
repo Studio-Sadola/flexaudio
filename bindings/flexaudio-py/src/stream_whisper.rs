@@ -36,7 +36,14 @@ impl Stream {
     ) {
         match result {
             Ok(events) => {
-                if matches!(operation, fa::Operation::Normalize | fa::Operation::Flush) {
+                // Empty output is not proof of recovery. The shared owner's lifecycle
+                // is authoritative, including while normalization produces no event.
+                if matches!(operation, fa::Operation::Normalize | fa::Operation::Flush)
+                    && self
+                        .whisper
+                        .as_ref()
+                        .is_some_and(|owner| !owner.is_failed())
+                {
                     self.whisper_error = None;
                 }
                 self.whisper_events.extend(events);
@@ -93,7 +100,7 @@ impl Stream {
     }
 
     pub(super) fn drain_output(&mut self) -> PyResult<()> {
-        while let Some(chunk) = self.poll_chunk_with_flush(CoreVad::flush)? {
+        while let Some(chunk) = self.poll_chunk_with_steps(CoreVad::flush, CoreVad::process_pcm)? {
             self.ready_chunks.push_back(chunk);
         }
         Ok(())
@@ -117,6 +124,40 @@ mod tests {
         }
         fn stop(&mut self) {
             self.0.lock().unwrap().take();
+        }
+    }
+
+    /// Keep the manual producer's generation stable without holding a lock that
+    /// capture delivery also needs while the watchdog reconciles a backend stop.
+    struct ContiguousBackend {
+        sink: Arc<Mutex<Option<fa::core::backend::RawSink>>>,
+        fenced: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl fa::CaptureBackend for ContiguousBackend {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 2)
+        }
+        fn start(&mut self, sink: fa::core::backend::RawSink) -> fa::Result<()> {
+            let mut current = self.sink.lock().expect("fake producer ownership lock");
+            if self.fenced.load(std::sync::atomic::Ordering::SeqCst) && current.is_some() {
+                return Err(fa::Error::Backend(
+                    "The contiguous test generation is leased; release the fixture lease before reopening.".into(),
+                ));
+            }
+            *current = Some(sink);
+            Ok(())
+        }
+        fn stop(&mut self) {
+            let mut current = self.sink.lock().expect("fake producer ownership lock");
+            if !self.fenced.load(std::sync::atomic::Ordering::SeqCst) {
+                current.take();
+            }
+        }
+    }
+    struct GenerationLease(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for GenerationLease {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -290,10 +331,16 @@ mod tests {
         });
     }
 
-    fn capture_stream(sink: &Arc<Mutex<Option<fa::core::backend::RawSink>>>) -> Stream {
+    fn capture_stream(
+        sink: &Arc<Mutex<Option<fa::core::backend::RawSink>>>,
+        fenced: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Stream {
         let mut inner = fa::Stream::open(
             fa::StreamConfig::default(),
-            Box::new(PushBackend(sink.clone())),
+            Box::new(ContiguousBackend {
+                sink: sink.clone(),
+                fenced: fenced.clone(),
+            }),
         )
         .unwrap();
         inner.enable_capture_tap().unwrap();
@@ -322,7 +369,36 @@ mod tests {
         py: Python<'_>,
         stream: &mut Stream,
         sink: &Arc<Mutex<Option<fa::core::backend::RawSink>>>,
+        fenced: &Arc<std::sync::atomic::AtomicBool>,
     ) {
+        fail_attachment_with_delay(py, stream, sink, fenced, Duration::ZERO);
+    }
+
+    fn fail_attachment_with_delay(
+        py: Python<'_>,
+        stream: &mut Stream,
+        sink: &Arc<Mutex<Option<fa::core::backend::RawSink>>>,
+        fenced: &Arc<std::sync::atomic::AtomicBool>,
+        idle: Duration,
+    ) {
+        // Model one contiguous generation regardless of processor startup or gate load.
+        // Drop the lease before the caller intentionally pauses, switches, or stops.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let _lease = loop {
+            let current = sink.lock().expect("fake producer ownership lock");
+            if current.is_some() {
+                // Lease acquisition and backend stop check share the ownership lock.
+                // Release it before polling so delivery can reconcile watchdog attempts.
+                fenced.store(true, std::sync::atomic::Ordering::SeqCst);
+                break GenerationLease(fenced.clone());
+            }
+            drop(current);
+            assert!(
+                Instant::now() < deadline,
+                "fake producer must become available for the contiguous generation lease"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
         sink.lock().unwrap().as_mut().unwrap().push(&[0.2; 1920], 0);
         wait_for_epoch_start(py, stream);
         stream.whisper.as_mut().unwrap().inject_failure();
@@ -379,6 +455,7 @@ mod tests {
         );
         // This empty poll used to raise the retained Whisper error and end capture loops.
         assert!(stream.poll_chunk().unwrap().is_none());
+        std::thread::sleep(idle);
         sink.lock()
             .unwrap()
             .as_mut()
@@ -393,6 +470,24 @@ mod tests {
                 .extract::<u64>()
                 .unwrap(),
             1920
+        );
+        let flags: u32 = chunk
+            .bind(py)
+            .getattr("flags")
+            .expect("capture flags")
+            .extract()
+            .expect("integer flags");
+        let pts_ns: i64 = chunk
+            .bind(py)
+            .getattr("pts_ns")
+            .expect("capture PTS")
+            .extract()
+            .expect("integer PTS");
+        assert_eq!(flags & (fa::ChunkFlags::DISCONTINUITY | fa::ChunkFlags::RECOVERED).bits(), 0,
+            "the contiguous fixture must not recover while its producer is idle; flags={flags:#x}, pts_ns={pts_ns}, retained_failure={}", stream.whisper_error.is_some());
+        assert_eq!(
+            pts_ns, 40_000_000,
+            "third contiguous capture must stay on the source clock; flags={flags:#x}"
         );
         assert!(stream.whisper_error.is_some());
     }
@@ -425,12 +520,73 @@ mod tests {
     }
 
     #[test]
+    fn empty_success_does_not_clear_a_latched_shared_owner_failure() {
+        Python::initialize();
+        Python::attach(|_| {
+            let sink = Arc::new(Mutex::new(None));
+            let fenced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut stream = capture_stream(&sink, &fenced);
+            let owner = stream.whisper.as_mut().expect("enabled shared owner");
+            owner.inject_failure();
+            let failure = owner.process(&[0.2; 1920], 0, 0, false);
+            assert!(
+                failure.is_err(),
+                "fault injection must latch the real owner"
+            );
+            stream.accept_whisper(failure, fa::Operation::Normalize);
+            assert!(stream.whisper_error.is_some());
+            // An empty callback result is not proof that the authoritative session recovered.
+            // Inject it at the existing result seam while the shared owner remains failed.
+            stream.accept_whisper(Ok(Vec::new()), fa::Operation::Normalize);
+            assert!(
+                stream.whisper_error.is_some(),
+                "an empty success must not erase a latched shared-owner failure"
+            );
+            assert_eq!(
+                stream.whisper_cleanup.len(),
+                1,
+                "retain the original typed cause once"
+            );
+            assert_eq!(
+                stream.whisper_cleanup[0].whisper_code(),
+                Some(fa::WhisperCode::Inference)
+            );
+            // Explicit successful recovery can clear the active failure while retaining cleanup.
+            stream
+                .flush_whisper_vad()
+                .expect("shared-owner recovery flush");
+            assert!(stream.whisper_error.is_none());
+            assert_eq!(stream.whisper_cleanup.len(), 1);
+            let _ = stream.stop();
+        });
+    }
+
+    #[test]
+    fn contiguous_failed_attachment_survives_fixture_idle_above_recovery_timeout() {
+        Python::initialize();
+        Python::attach(|py| {
+            let sink = Arc::new(Mutex::new(None));
+            let fenced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut stream = capture_stream(&sink, &fenced);
+            fail_attachment_with_delay(
+                py,
+                &mut stream,
+                &sink,
+                &fenced,
+                Duration::from_millis(2_750),
+            );
+            assert_whisper_shutdown(py, &mut stream);
+        });
+    }
+
+    #[test]
     fn whisper_failure_preserves_python_polling_and_stop_with_typed_cleanup() {
         Python::initialize();
         Python::attach(|py| {
             let sink = Arc::new(Mutex::new(None));
-            let mut stream = capture_stream(&sink);
-            fail_attachment(py, &mut stream, &sink);
+            let fenced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut stream = capture_stream(&sink, &fenced);
+            fail_attachment(py, &mut stream, &sink, &fenced);
             assert_whisper_shutdown(py, &mut stream);
         });
     }
@@ -440,8 +596,9 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             let sink = Arc::new(Mutex::new(None));
-            let mut stream = capture_stream(&sink);
-            fail_attachment(py, &mut stream, &sink);
+            let fenced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut stream = capture_stream(&sink, &fenced);
+            fail_attachment(py, &mut stream, &sink, &fenced);
             stream.flush_whisper_vad()?;
             assert!(
                 stream.whisper_error.is_none(),
@@ -464,8 +621,9 @@ mod tests {
         Python::attach(|py| {
             for switch in [false, true] {
                 let sink = Arc::new(Mutex::new(None));
-                let mut stream = capture_stream(&sink);
-                fail_attachment(py, &mut stream, &sink);
+                let fenced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mut stream = capture_stream(&sink, &fenced);
+                fail_attachment(py, &mut stream, &sink, &fenced);
                 if switch {
                     stream
                         .inner

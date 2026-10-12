@@ -12,6 +12,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-10-12
+
+### Fixed
+
+- Microphone startup suppresses non-finite or out-of-range leading frames at each
+  capture generation, including the mic lane of Mix. After a drop, 10 ms of valid
+  native frames confirms startup and is delivered in full. Valid zeros pass
+  unchanged, capture timestamps and frame indices preserve suppressed time, and
+  the first delivered chunk carries `DISCONTINUITY`. Persistent invalid startup
+  fails capture with safe driver/settings/reopen guidance after two seconds.
+  Valid startup audio shorter than the confirmation window survives immediate
+  source switches and recovery replacement. Mid-stream and system/process-loopback
+  samples are unchanged.
+- macOS microphone and Mix check consent before HAL/cpal format queries.
+  Unanswered bundled prompts return an actionable typed backend error within
+  30 seconds; undecided consent without usage metadata fails immediately.
+  Answer the prompt or configure the host and retry instead of blocking indefinitely.
+  Every microphone capture start requires decided consent. Built-in backends
+  emit neither `PermissionPending` nor `PermissionGranted` for any source on any
+  OS; those event arms remain for custom Rust backends and compatibility.
+  In 0.5.2, `ConsentPoll` was wired for `NotDetermined` consent after preflight
+  returned `Ok(true)`, but the earlier `query_native_format` could block before
+  reaching the capture owner and its pending-consent monitor. Initially
+  `Authorized` capture had no continuous revocation monitor. The old pending
+  route is removed in 0.5.3; authorization-query failures retain their typed cause.
+  macOS device enumeration never prompts: undecided consent fails with a typed
+  backend error before any HAL/device/format query. DeviceInfo formats remain
+  mandatory, so discovery does not fabricate partial or unknown-format records.
+  Windows enumeration does not preflight microphone permission; native discovery
+  proceeds. Microphone capture retains its separate existing permission preflight.
+- Legacy VAD closing events from a successful discontinuity flush survive a later
+  reset or processing failure across Node.js, Python and C. The shared operation
+  preserves the original timestamps and reports the original failure; Python/C
+  retain closing events for one delivery on a zero-frame carrier in the next poll.
+  Node.js keeps one timestamp anchor per legacy VAD epoch, so rounded later chunk
+  times cannot move a delayed speech boundary before recording zero.
+- Linux process/exclusion fan-in waits for eligible targets to negotiate capture
+  format using the same two-second readiness deadline and explained error as
+  monitor capture. A completed snapshot with no eligible target remains a
+  successful open and continues watching for playback. Offline regression checks
+  cover readiness policy and static callback/timer wiring; they do not exercise
+  a live PipeWire format-negotiation callback.
+- Noncanonical chunk durations now explain the canonical 20 ms frame contract
+  and how to set the duration, using one shared validation message.
+
+### Added
+
+- Typed `StartupSamplesDropped` events report the suppressed native microphone
+  frame count once per generation with reason `OutOfRange`. Node.js and Python
+  expose `startupSamplesDropped` and `outOfRange`; C v2 adds event kind 15 with
+  native-frame and reason accessors, and the CLI prints safe startup diagnostics.
+  Node.js notice delivery precedes the generation's first PCM callback and attached
+  Whisper VAD `epochStart`; other advisories use independent callbacks. Pull APIs
+  enqueue the notice chronologically before publishing the generation's first
+  chunk, preserving ordinary FIFO event order. PCM polling never waits for an event
+  poll; event-first callers can observe the notice before PCM. C v1 projects the
+  advisory as `Unknown` with count zero.
+- `AudioLoss` reason `generationEnded` reports valid native startup samples
+  discarded by a terminal capture failure before their delivery, with native-rate
+  scalar interleaved sample counts. C v2 uses loss reason code 6.
+
+[0.5.3]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.2...v0.5.3
+
 ## [0.5.2] - 2026-10-11
 
 ### Fixed

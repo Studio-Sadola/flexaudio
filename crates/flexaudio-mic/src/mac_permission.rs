@@ -61,14 +61,11 @@ impl Provider for Native {
     }
 }
 
-pub(crate) fn preflight() -> Result<bool> {
+pub(crate) fn preflight(purpose: crate::permission::Purpose) -> Result<()> {
     mac_policy::preflight(
+        purpose,
         &Native,
         PROMPTS.get_or_init(PromptCoordinator::default),
         mac_policy::PROMPT_TIMEOUT,
     )
-}
-
-pub(crate) fn can_query_format() -> bool {
-    matches!(Native.status(), Ok(Status::Authorized))
 }

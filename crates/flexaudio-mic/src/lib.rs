@@ -46,7 +46,6 @@ use flexaudio_core::{ErrorContext, ErrorGroup, Operation};
 mod capture_owner;
 
 mod callback_mailbox;
-mod generation;
 mod input_config;
 #[cfg(target_os = "macos")]
 mod mac_permission;
@@ -72,11 +71,15 @@ const FALLBACK_FORMAT: (u32, u16) = (48_000, 1);
 /// STA thread that first creates it. Initialize the enumerator through a keeper before
 /// returning the host, preventing a short-lived caller thread from becoming the first
 /// creator. Other OSes skip the keeper and return `cpal::default_host()` as before.
-fn cpal_default_host() -> Result<cpal::Host> {
-    #[cfg(windows)]
-    windows_keeper::ensure()?;
-
-    Ok(cpal::default_host())
+fn cpal_default_host(purpose: permission::Purpose) -> Result<cpal::Host> {
+    permission::query_after_preflight(
+        || permission::preflight(purpose),
+        || {
+            #[cfg(windows)]
+            windows_keeper::ensure()?;
+            Ok(cpal::default_host())
+        },
+    )
 }
 
 /// Microphone input capture backend using cpal.
@@ -96,14 +99,13 @@ pub struct CpalMicBackend {
     native: (u32, u16),
     /// ID (device name) of the selected input device. `None` uses the default input device.
     device_id: Option<String>,
-    /// Notifications from the capture owner; callbacks never query consent.
+    /// Control-thread teardown notifications; callbacks never query consent.
     events: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
-    /// A confirmed runtime denial cannot be restarted on this backend instance.
+    /// A retained terminal failure prevents restarting this backend instance.
     terminal_error: Option<Error>,
     /// Runtime failures are materialized on the control thread, never the callback.
     callback_errors: Arc<callback_mailbox::CallbackMailbox>,
-    generation: Arc<generation::Generation>,
     shutdown_result: Option<Result<()>>,
     pending_events: VecDeque<Event>,
 }
@@ -122,28 +124,35 @@ impl CpalMicBackend {
     /// [`start`](Self::start) returns [`Error::DeviceNotFound`]. If consent or a device
     /// change reveals a different format, `start` returns [`Error::NativeFormatChanged`]
     /// before building capture, and refreshes [`native_format`](Self::native_format).
+    /// This infallible constructor never requests consent. On macOS, undecided or
+    /// denied access skips native queries and selects the fallback. Capture start rechecks consent.
     /// Prefer [`try_new`](Self::try_new) to discover the format after consent.
     pub fn new(device_id: Option<String>) -> Self {
-        let native = if permission::can_query_format() {
-            query_native_format(device_id.as_deref()).unwrap_or(FALLBACK_FORMAT)
-        } else {
-            FALLBACK_FORMAT
-        };
+        // Preserve the existing nonprompting Windows capability check and fallback.
+        #[cfg(target_os = "windows")]
+        let purpose = permission::Purpose::Capture;
+        #[cfg(not(target_os = "windows"))]
+        let purpose = permission::Purpose::Enumeration;
+        let native = query_native_format(device_id.as_deref(), purpose)
+            .ok()
+            .flatten()
+            .unwrap_or(FALLBACK_FORMAT);
         Self::with_format(device_id, native)
     }
 
     /// Check OS microphone permission before discovering the device format.
     ///
     /// macOS prompts only when the main bundle declares a nonempty microphone
-    /// usage description. Otherwise the responsible application may prompt during
-    /// startup, and the capture owner watches for a later denial. Windows checks
+    /// usage description. Undecided consent without that metadata fails before
+    /// querying the input format; grant access to the responsible host app or
+    /// launch from an app bundle with that usage description, then retry. Windows checks
     /// the public microphone capability; unsupported queries defer to capture.
     /// A refused explicit prompt returns [`Error::PermissionDenied`]. An unanswered
-    /// prompt proceeds after 30 seconds; capture emits [`Event::PermissionPending`]
-    /// after five seconds of undecided consent and continues checking until a decision.
+    /// prompt returns an actionable [`Error::Backend`] after at most 30 seconds,
+    /// without querying HAL or treating the unanswered prompt as a denial.
     pub fn try_new(device_id: Option<String>) -> Result<Self> {
-        permission::preflight()?;
-        let native = query_native_format(device_id.as_deref()).unwrap_or(FALLBACK_FORMAT);
+        let native = query_native_format(device_id.as_deref(), permission::Purpose::Capture)?
+            .unwrap_or(FALLBACK_FORMAT);
         Ok(Self::with_format(device_id, native))
     }
 
@@ -151,10 +160,6 @@ impl CpalMicBackend {
         let (event_tx, events) = mpsc::channel();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let callback_errors = Arc::new(callback_mailbox::CallbackMailbox::new(stop_flag.clone()));
-        let generation = Arc::new(generation::Generation::new(
-            stop_flag.clone(),
-            event_tx.clone(),
-        ));
         Self {
             stop_flag,
             handle: None,
@@ -164,7 +169,6 @@ impl CpalMicBackend {
             event_tx,
             terminal_error: None,
             callback_errors,
-            generation,
             shutdown_result: None,
             pending_events: VecDeque::new(),
         }
@@ -174,7 +178,7 @@ impl CpalMicBackend {
         if let Some(result) = &self.shutdown_result {
             return result.clone();
         }
-        self.generation.cancel();
+        self.stop_flag.store(true, Ordering::SeqCst);
         let result = match self.handle.take() {
             Some(handle) => {
                 handle.thread().unpark();
@@ -268,11 +272,17 @@ fn resolve_input_device(host: &cpal::Host, device_id: Option<&str>) -> Result<De
 /// Get the native `(sample_rate, channels)` format for the input device selected by
 /// `device_id`. Return `None` if resolving the device or reading its configuration fails
 /// (the caller falls back to [`FALLBACK_FORMAT`]).
-fn query_native_format(device_id: Option<&str>) -> Option<(u32, u16)> {
-    let host = cpal_default_host().ok()?;
-    let device = resolve_input_device(&host, device_id).ok()?;
-    let config = device.default_input_config().ok()?;
-    Some((config.sample_rate().0, config.channels()))
+/// Consent or host acquisition failure remains a typed error, before device queries.
+fn query_native_format(
+    device_id: Option<&str>,
+    purpose: permission::Purpose,
+) -> Result<Option<(u32, u16)>> {
+    let host = cpal_default_host(purpose)?;
+    let format = resolve_input_device(&host, device_id)
+        .ok()
+        .and_then(|device| device.default_input_config().ok())
+        .map(|config| (config.sample_rate().0, config.channels()));
+    Ok(format)
 }
 
 /// Enumerate input (microphone) devices, for the microphone portion of `devices()`.
@@ -288,8 +298,12 @@ fn query_native_format(device_id: Option<&str>) -> Option<(u32, u16)> {
 /// Return an empty `Vec` only after a successful query found no devices.
 /// IDs may collide when multiple devices share a name, but cpal provides no more stable key,
 /// so this is accepted.
+/// macOS enumeration never prompts: undecided consent returns an actionable Backend
+/// error before CPAL/HAL queries; denied/restricted access returns PermissionDenied.
+/// Windows enumeration does not consult microphone capture capability; discovery
+/// keeps its native query behavior independently of capture consent.
 pub fn list_devices() -> Result<Vec<DeviceInfo>> {
-    let host = cpal_default_host()?;
+    let host = cpal_default_host(permission::Purpose::Enumeration)?;
 
     let default_name = host
         .default_input_device()
@@ -342,21 +356,16 @@ impl CaptureBackend for CpalMicBackend {
         if self.handle.is_some() {
             return Ok(());
         }
-        // Each owner receives fresh state; an old generation can never publish
-        // grants or close PCM on a later generation.
+        // Each owner receives a fresh stop flag and callback mailbox, so old
+        // callback failures cannot close PCM on a later generation.
         self.stop_flag = Arc::new(AtomicBool::new(false));
         self.callback_errors = Arc::new(callback_mailbox::CallbackMailbox::new(
             self.stop_flag.clone(),
-        ));
-        self.generation = Arc::new(generation::Generation::new(
-            self.stop_flag.clone(),
-            self.event_tx.clone(),
         ));
 
         let stop_flag = self.stop_flag.clone();
         // cpal::Device is !Send, so pass only the device_id string and resolve it on the thread.
         let device_id = self.device_id.clone();
-        let generation = self.generation.clone();
         let callback_errors = self.callback_errors.clone();
         // Ready channel reports build/play success or failure from the owner thread to start().
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
@@ -364,17 +373,10 @@ impl CaptureBackend for CpalMicBackend {
         let handle = thread::Builder::new()
             .name("flexaudio-mic-cpal".into())
             .spawn(move || {
-                capture_owner::run(
-                    sink,
-                    device_id,
-                    stop_flag,
-                    ready_tx,
-                    generation,
-                    callback_errors,
-                );
+                capture_owner::run(sink, device_id, stop_flag, ready_tx, callback_errors);
             })
             .map_err(|e| {
-                self.generation.cancel();
+                self.stop_flag.store(true, Ordering::SeqCst);
                 Error::Backend(format!("spawn cpal mic thread: {e}"))
                     .with_context(ErrorContext::new(Operation::Start))
             })?;
@@ -467,7 +469,7 @@ fn build_stream(
     stop_flag: Arc<AtomicBool>,
     callback_errors: Arc<callback_mailbox::CallbackMailbox>,
 ) -> Result<cpal::Stream> {
-    let host = cpal_default_host()?;
+    let host = cpal_default_host(permission::Purpose::Capture)?;
     // None selects default; Some must uniquely match an advertised CPAL name.
     let device = resolve_input_device(&host, device_id)?;
 

@@ -4,7 +4,7 @@ use crate::{AudioLoss, Result};
 use std::num::NonZeroU64;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 #[cfg(not(target_has_atomic = "64"))]
@@ -16,6 +16,7 @@ pub struct CaptureDiagnostics {
     inner: Arc<Pending>,
 }
 struct Pending {
+    startup_drop: Mutex<Option<(u64, u32)>>,
     summaries: [AtomicU64; 3],
     rate: u32,
     channels: u16,
@@ -25,11 +26,29 @@ impl CaptureDiagnostics {
     pub fn new(rate: u32, channels: u16) -> Self {
         Self {
             inner: Arc::new(Pending {
+                startup_drop: Mutex::new(None),
                 summaries: std::array::from_fn(|_| AtomicU64::new(0)),
                 rate,
                 channels,
             }),
         }
+    }
+    /// Publish a microphone startup gap before the first composite Mix samples.
+    /// Called only by the non-realtime mixer, once per generation.
+    pub fn record_startup_drop(&self, frames: u64, native_rate: u32) {
+        *self
+            .inner
+            .startup_drop
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((frames, native_rate));
+    }
+    /// Drain the composite microphone gap once, off callback and before PCM.
+    pub fn take_startup_drop(&self) -> Option<(u64, u32)> {
+        self.inner
+            .startup_drop
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
     }
     fn record(&self, index: usize, samples: Option<NonZeroU64>) {
         let summary = &self.inner.summaries[index];
@@ -131,5 +150,18 @@ mod tests {
         let loss = diagnostics.drain().unwrap()[0];
         assert!(loss.samples().is_none_or(|samples| samples.get() == 4_000));
         assert!(diagnostics.drain().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    #[test]
+    fn composite_startup_gap_is_drained_once_with_native_rate() {
+        let diagnostics = CaptureDiagnostics::new(48_000, 2);
+        assert_eq!(diagnostics.take_startup_drop(), None);
+        diagnostics.record_startup_drop(441, 44_100);
+        assert_eq!(diagnostics.clone().take_startup_drop(), Some((441, 44_100)));
+        assert_eq!(diagnostics.take_startup_drop(), None);
     }
 }

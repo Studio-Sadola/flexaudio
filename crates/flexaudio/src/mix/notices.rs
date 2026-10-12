@@ -13,7 +13,7 @@ struct State {
     terminal_pending: bool,
     cleanup: Vec<Error>,
     events: VecDeque<Event>,
-    // At most ten fixed lane/reason combinations from child capture and FIFOs.
+    // At most twelve fixed lane/reason combinations from child capture and FIFOs.
     losses: Vec<AudioLoss>,
     clipped: bool,
 }
@@ -79,7 +79,7 @@ impl Notices {
                 .zip(loss.samples())
                 .and_then(|(a, b)| a.get().checked_add(b.get()))
                 .and_then(NonZeroU64::new);
-            *previous = combine_loss(loss, samples);
+            *previous = loss.with_sample_count(samples);
         } else {
             state.losses.push(loss);
         }
@@ -111,34 +111,5 @@ impl Notices {
         if state.primary.is_none() {
             sink.push(mixed, monotonic_now_ns());
         }
-    }
-}
-
-fn combine_loss(loss: AudioLoss, samples: Option<NonZeroU64>) -> AudioLoss {
-    match (loss.path(), loss.reason()) {
-        (AudioPath::MixFifo { lane }, LossReason::MixFifoOverflow) => {
-            AudioLoss::mix_fifo_overflow(lane, samples)
-        }
-        (AudioPath::Capture { lane }, LossReason::RawOverflow) => {
-            AudioLoss::raw_overflow(lane, samples, loss.sample_rate(), loss.channels())
-                .expect("validated native format")
-        }
-        (AudioPath::Capture { lane }, reason) => {
-            let diagnostics = CaptureDiagnostics::new(loss.sample_rate(), loss.channels());
-            match reason {
-                LossReason::CorruptBuffer => diagnostics.record_corrupt_buffer(samples),
-                LossReason::MalformedBuffer => diagnostics.record_malformed_buffer(samples),
-                LossReason::CallbackRejected => diagnostics.record_callback_rejected(samples),
-                _ => unreachable!("only capture rejection reports reach the Mix mailbox"),
-            }
-            let combined = diagnostics.drain().expect("validated native format")[0];
-            match lane {
-                Some(lane) => combined
-                    .with_capture_lane(lane)
-                    .expect("unattributed capture report"),
-                None => combined,
-            }
-        }
-        _ => unreachable!("only child capture and FIFO reports reach the Mix mailbox"),
     }
 }
