@@ -109,11 +109,22 @@ impl IntakeGeneration {
         samples: &[f32],
         reanchor: bool,
     ) -> Result<InputProgress> {
-        let norm_pts = self
-            .clock
-            .normalize(monotonic_now_ns())
-            .max(self.minimum_pts);
+        self.accept_at(shared, samples, reanchor, monotonic_now_ns())
+    }
+
+    fn accept_at(
+        &mut self,
+        shared: &SharedState,
+        samples: &[f32],
+        reanchor: bool,
+        arrival_ns: i64,
+    ) -> Result<InputProgress> {
+        let norm_pts = self.clock.normalize(arrival_ns).max(self.minimum_pts);
         let mut origin = *self.origin.get_or_insert(norm_pts);
+        let confirming = self
+            .startup
+            .as_ref()
+            .is_some_and(StartupSamples::is_pending);
         let accepted = match self.startup.as_mut() {
             Some(guard) => match guard.push(samples, self.started.elapsed()) {
                 Ok(accepted) => accepted,
@@ -138,7 +149,17 @@ impl IntakeGeneration {
             self.external_gap_ns = 0;
         }
         let pts = if self.startup.is_some() && !accepted.samples.is_empty() {
-            origin.saturating_add(native_frames_ns(accepted.first_frame, self.native.0))
+            let replay_pts =
+                origin.saturating_add(native_frames_ns(accepted.first_frame, self.native.0));
+            if confirming {
+                // Held confirmation PCM retains its original position, including suppressed time.
+                replay_pts
+            } else {
+                // Established capture follows arrival time, so pauses and slow callbacks are
+                // never compacted into sample-count time. The startup floor keeps a subsequent
+                // short push from moving still-buffered confirmation PCM backwards.
+                norm_pts.max(replay_pts)
+            }
         } else {
             norm_pts
         };
@@ -262,4 +283,50 @@ impl IntakeGeneration {
 fn native_frames_ns(frames: u64, rate: u32) -> i64 {
     let nanos = u128::from(frames) * 1_000_000_000 / u128::from(rate.max(1));
     i64::try_from(nanos).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mock::MockBackend;
+
+    #[test]
+    fn confirmed_microphone_preserves_sparse_arrival_clock_across_pause() -> Result<()> {
+        let stream = Stream::open(
+            StreamConfig::default(),
+            Box::new(MockBackend::new(48_000, 2, 440.0)),
+        )?;
+        let shared = &stream.shared;
+        let snapshot = shared.snapshot_raw(&mut []);
+        let mut input = IntakeGeneration::new(shared, &snapshot, (stream.config.output, None), 0)?;
+        let samples = [0.25; 1920];
+        input.accept_at(shared, &samples, false, 1_000_000_000)?;
+        let before = input
+            .normalizer
+            .pop_chunk_with_metadata()
+            .expect("initial full chunk");
+        shared.paused.store(true, Ordering::SeqCst);
+        // A slow producer emits only 200 ms of audio during 600 ms of elapsed capture time.
+        // Discard normalized output exactly as paused delivery does, without scheduler sleeps.
+        for index in 1..=9 {
+            input.accept_at(shared, &samples, false, 1_000_000_000 + index * 60_000_000)?;
+            assert!(input.normalizer.pop_chunk_with_metadata().is_some());
+        }
+        shared.paused.store(false, Ordering::SeqCst);
+        input.accept_at(shared, &samples, false, 1_600_000_000)?;
+        let after = input
+            .normalizer
+            .pop_chunk_with_metadata()
+            .expect("resumed full chunk");
+        let delta = after.pts_ns - before.pts_ns;
+        assert!(
+            delta >= 480_000_000,
+            "600 ms of capture time must retain the pause test's 480 ms lower bound: delta={delta} ns"
+        );
+        assert_eq!(
+            delta, 600_000_000,
+            "established input must preserve arrival-clock deltas"
+        );
+        Ok(())
+    }
 }

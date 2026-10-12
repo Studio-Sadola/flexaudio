@@ -399,8 +399,10 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(2));
         };
+        let first_push_ns = fa::core::clock::monotonic_now_ns();
         sink.lock().unwrap().as_mut().unwrap().push(&[0.2; 1920], 0);
         wait_for_epoch_start(py, stream);
+        let first_delivery_ns = fa::core::clock::monotonic_now_ns();
         stream.whisper.as_mut().unwrap().inject_failure();
         sink.lock()
             .unwrap()
@@ -456,12 +458,14 @@ mod tests {
         // This empty poll used to raise the retained Whisper error and end capture loops.
         assert!(stream.poll_chunk().unwrap().is_none());
         std::thread::sleep(idle);
+        let third_push_ns = fa::core::clock::monotonic_now_ns();
         sink.lock()
             .unwrap()
             .as_mut()
             .unwrap()
             .push(&[0.2; 1920], 40_000_000);
         let chunk = next_audio_chunk(py, stream);
+        let third_delivery_ns = fa::core::clock::monotonic_now_ns();
         assert_eq!(
             chunk
                 .bind(py)
@@ -485,9 +489,15 @@ mod tests {
             .expect("integer PTS");
         assert_eq!(flags & (fa::ChunkFlags::DISCONTINUITY | fa::ChunkFlags::RECOVERED).bits(), 0,
             "the contiguous fixture must not recover while its producer is idle; flags={flags:#x}, pts_ns={pts_ns}, retained_failure={}", stream.whisper_error.is_some());
-        assert_eq!(
-            pts_ns, 40_000_000,
-            "third contiguous capture must stay on the source clock; flags={flags:#x}"
+        // Public PCM PTS follows capture arrival time after startup confirmation. The lease
+        // keeps frame indices and Whisper's canonical epoch contiguous, but it does not
+        // compact elapsed idle time. Bound the two intake arrivals by their real push/delivery
+        // observations, retaining the 40 ms startup sample-position floor for rapid pushes.
+        let earliest_pts = (third_push_ns - first_delivery_ns).max(40_000_000);
+        let latest_pts = (third_delivery_ns - first_push_ns).max(40_000_000);
+        assert!(
+            (earliest_pts..=latest_pts).contains(&pts_ns),
+            "third PCM PTS must preserve arrival time within observed publication bounds {earliest_pts}..={latest_pts} ns: pts_ns={pts_ns}, flags={flags:#x}"
         );
         assert!(stream.whisper_error.is_some());
     }
