@@ -22,11 +22,16 @@ class DeclarationContracts(unittest.TestCase):
         return {node.id for node in value.slice.elts}
 
     def fields(self, name):
-        return {
+        fields = {}
+        for base in self.classes[name].bases:
+            if isinstance(base, ast.Name) and base.id in self.classes:
+                fields.update(self.fields(base.id))
+        fields.update({
             node.target.id: ast.unparse(node.annotation)
             for node in self.classes[name].body
             if isinstance(node, ast.AnnAssign)
-        }
+        })
+        return fields
 
     def test_stream_events_are_closed_and_complete(self):
         expected = {
@@ -80,6 +85,25 @@ class DeclarationContracts(unittest.TestCase):
         self.assertEqual(set(self.fields("ErrorContextDict")), {"operation", "lane", "native_status"})
         self.assertEqual(set(self.fields("AudioLossDict")), {"path", "reason", "samples", "sample_rate", "channels"})
         self.assertEqual(set(self.fields("ShutdownReportDict")), {"primary", "cleanup_errors"})
+
+    def test_backend_whisper_code_is_optional_and_exclusive(self):
+        # Execute only the declarations, so this test needs no native extension.
+        end = next(
+            index for index, node in enumerate(self.tree.body)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "AudioErrorDict"
+        )
+        declarations = ast.Module(body=self.tree.body[:end + 1], type_ignores=[])
+        namespace = {}
+        exec(compile(declarations, "flexaudio.pyi", "exec"), namespace)
+        for name in self.members("AudioErrorDict"):
+            fields = self.fields(name)
+            self.assertEqual("whisper_code" in fields, name == "BackendErrorDict")
+        backend = namespace["BackendErrorDict"]
+        self.assertEqual(self.fields("BackendErrorDict")["whisper_code"], "WhisperCode")
+        self.assertEqual(backend.__optional_keys__, {"whisper_code"})
+        self.assertEqual(backend.__required_keys__, {"kind", "message", "contexts", "secondary"})
 
 
 if __name__ == "__main__":

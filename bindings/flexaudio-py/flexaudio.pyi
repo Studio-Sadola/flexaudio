@@ -65,9 +65,9 @@ class UnsupportedOsVersionErrorDict(_AudioErrorFields):
     kind: Literal["unsupportedOsVersion"]
 class DeviceLostErrorDict(_AudioErrorFields):
     kind: Literal["deviceLost"]
-class BackendErrorDict(_AudioErrorFields):
+class _BackendErrorRequiredFields(_AudioErrorFields):
     kind: Literal["backend"]
-class WhisperVadAudioErrorDict(BackendErrorDict):
+class BackendErrorDict(_BackendErrorRequiredFields, total=False):
     whisper_code: WhisperCode
 class UnsupportedFormatErrorDict(_AudioErrorFields):
     kind: Literal["unsupportedFormat"]
@@ -79,7 +79,7 @@ class UnsupportedErrorDict(_AudioErrorFields):
     kind: Literal["unsupported"]
 class AmbiguousDeviceNameErrorDict(_AudioErrorFields):
     kind: Literal["ambiguousDeviceName"]
-AudioErrorDict = Union[InvalidArgumentErrorDict, InvalidStateErrorDict, DeviceNotFoundErrorDict, RecordingPermissionErrorDict, UnsupportedOsVersionErrorDict, DeviceLostErrorDict, BackendErrorDict, WhisperVadAudioErrorDict, UnsupportedFormatErrorDict, NativeFormatChangedErrorDict, UnsupportedErrorDict, AmbiguousDeviceNameErrorDict]
+AudioErrorDict = Union[InvalidArgumentErrorDict, InvalidStateErrorDict, DeviceNotFoundErrorDict, RecordingPermissionErrorDict, UnsupportedOsVersionErrorDict, DeviceLostErrorDict, BackendErrorDict, UnsupportedFormatErrorDict, NativeFormatChangedErrorDict, UnsupportedErrorDict, AmbiguousDeviceNameErrorDict]
 
 class NativeFormat:
     @property
