@@ -184,6 +184,7 @@ fn confirmation_window_clock_survives_the_next_partial_push() -> Result<()> {
     stream.start()?;
     let mut input = vec![3.058; 960];
     input.extend([0.25; 960]);
+    let first_publication_ns = monotonic_now_ns();
     sink.lock()
         .unwrap_or_else(|error| error.into_inner())
         .as_mut()
@@ -204,18 +205,30 @@ fn confirmation_window_clock_survives_the_next_partial_push() -> Result<()> {
         stream.poll_chunk().is_none(),
         "ten milliseconds is shorter than a primary chunk"
     );
+    let epoch = stream.shared.recording_epoch_ns.load(Ordering::SeqCst);
+    // Established input follows arrival time even when confirmation PCM is still buffered.
+    thread::sleep(Duration::from_millis(60));
+    let second_publication_ns = monotonic_now_ns();
     sink.lock()
         .unwrap_or_else(|error| error.into_inner())
         .as_mut()
         .expect("synthetic sink")
         .push(&[0.25; 960], 0);
     let first = first_chunk(&mut stream)?;
+    let delivered_ns = monotonic_now_ns();
     stream.stop_checked()?;
     assert_eq!(first.frame_index, 480);
+    // Primary extrapolation retains its legacy integer nanoseconds per frame. Its new
+    // arrival anchor sits 480 frames after the start of the buffered confirmation PCM.
+    let buffered_primary_ns = 480 * (1_000_000_000 / 48_000);
+    let earliest_pts = second_publication_ns - epoch - buffered_primary_ns;
+    // ClockNormalizer's first arrival is between publication and its normalized epoch;
+    // use that measured interval to bound its fixed offset without a scheduling guess.
+    let latest_pts = delivered_ns - first_publication_ns - buffered_primary_ns;
     assert!(
-        (10_000_000..10_001_000).contains(&first.pts_ns),
-        "confirmation clock reanchored: {}",
-        first.pts_ns
+        (earliest_pts..=latest_pts).contains(&first.pts_ns),
+        "primary confirmation PTS {} must follow delayed arrival within {earliest_pts}..={latest_pts}",
+        first.pts_ns,
     );
     assert_eq!(
         stream

@@ -108,7 +108,15 @@ mod tests {
 
     #[test]
     fn windows_native_adapter_uses_the_injected_purpose_policy() {
-        let source = include_str!("permission.rs");
+        let lf = include_str!("permission.rs").replace("\r\n", "\n");
+        for source in [lf.clone(), lf.replace('\n', "\r\n")] {
+            assert_windows_adapter_wiring(&source);
+        }
+    }
+
+    fn assert_windows_adapter_wiring(source: &str) {
+        // Windows checkouts may use CRLF; verify the same code on either checkout.
+        let source = source.replace("\r\n", "\n");
         let windows = source
             .split("#[cfg(target_os = \"windows\")]\n    {")
             .nth(1)
@@ -119,5 +127,20 @@ mod tests {
         assert!(
             windows.contains("windows_preflight(purpose, crate::windows_permission::preflight)")
         );
+    }
+
+    #[test]
+    fn windows_adapter_wiring_rejects_a_capture_policy_bypass() {
+        let lf = include_str!("permission.rs").replace("\r\n", "\n");
+        let bypassed = lf.replace(
+            "windows_preflight(purpose, crate::windows_permission::preflight)",
+            "windows_preflight(purpose, || Ok(()))",
+        );
+        for source in [bypassed.clone(), bypassed.replace('\n', "\r\n")] {
+            assert!(
+                std::panic::catch_unwind(|| assert_windows_adapter_wiring(&source)).is_err(),
+                "the structural check must reject bypassed capture consent on either checkout"
+            );
+        }
     }
 }
