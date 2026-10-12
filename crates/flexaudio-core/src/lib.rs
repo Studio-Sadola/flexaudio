@@ -39,6 +39,7 @@ pub mod quant;
 pub mod raw_ring;
 pub mod secondary_ring;
 pub mod types;
+mod whisper_error;
 
 // Re-export the main types at the crate root.
 pub use backend::{CaptureBackend, RawSink};
@@ -56,3 +57,4 @@ pub use types::{
 };
 
 pub use diagnostics::CaptureDiagnostics;
+pub use whisper_error::WhisperCode;

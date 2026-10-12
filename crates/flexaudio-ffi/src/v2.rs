@@ -464,6 +464,26 @@ pub unsafe extern "C" fn flexaudio_error_message_v2(
         v.message.as_ptr()
     })
 }
+/// Borrow the stable Whisper VAD cause code until the error owner is freed.
+/// NULL means this error has no Whisper VAD cause; invalid pointers set last_error.
+/// # Safety
+/// value must be a live readable error owner. Do not free the borrowed string.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_error_whisper_code_v2(
+    value: *const FlexErrorInfoV2,
+) -> *const c_char {
+    guard_const_ptr(|| {
+        error::clear_last_error();
+        if !valid(value) {
+            invalid();
+            return ptr::null();
+        }
+        (*value)
+            .whisper_code
+            .as_ref()
+            .map_or(ptr::null(), |code| code.as_ptr())
+    })
+}
 /// Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
 /// Invalid pointer/index sets last_error. Do not free the borrowed view separately.
 /// # Safety

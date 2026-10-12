@@ -57,21 +57,53 @@ pub enum WhisperVadTapError {
     PtsOutOfRange,
     /// The locked converter could not establish its exact sample-aligned clock.
     UnsupportedConversionClock,
-    /// Capture transport or conversion failed; the epoch is incomplete and cannot produce
-    /// successful EOF finals. Includes missing/reordered canonical capture frames.
+    /// Capture conversion failed; the epoch is incomplete and cannot produce successful EOF
+    /// finals, because lost transport cannot be recovered from a fresh converter.
     Conversion,
     /// Capture intake has already stopped.
     Stopped,
-    /// A fatal failure requires successful reinitialization through flush.
+    /// A fatal failure requires reinitialization through flush or the next discontinuity.
     FailedSession,
 }
 
 impl std::fmt::Display for WhisperVadTapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "whisper VAD tap error: {self:?}")
+        self.audio_error().fmt(f)
     }
 }
 impl std::error::Error for WhisperVadTapError {}
+
+impl WhisperVadTapError {
+    /// One shared projection into a retained processor cleanup cause; capture stays independent.
+    pub fn code(&self) -> flexaudio_core::WhisperCode {
+        use flexaudio_core::WhisperCode;
+        match self {
+            Self::Vad(error) => match error {
+                WhisperVadError::InvalidParameter { .. } => WhisperCode::InvalidParameter,
+                WhisperVadError::InvalidProbability { .. } => WhisperCode::InvalidProbability,
+                WhisperVadError::InvalidPcm { .. } => WhisperCode::InvalidPcm,
+                WhisperVadError::Overflow { .. } => WhisperCode::Overflow,
+                WhisperVadError::SessionFinished => WhisperCode::SessionFinished,
+                WhisperVadError::Inference => WhisperCode::Inference,
+                WhisperVadError::ModelLoad => WhisperCode::ModelLoad,
+                WhisperVadError::FailedSession => WhisperCode::FailedSession,
+            },
+            Self::InvalidStereoLength => WhisperCode::InvalidStereoLength,
+            Self::InvalidPcm { .. } => WhisperCode::InvalidPcm,
+            Self::CaptureSampleOverflow => WhisperCode::CaptureSampleOverflow,
+            Self::PtsOutOfRange => WhisperCode::PtsOutOfRange,
+            Self::UnsupportedConversionClock => WhisperCode::UnsupportedConversionClock,
+            Self::Conversion => WhisperCode::Conversion,
+            Self::Stopped => WhisperCode::Stopped,
+            Self::FailedSession => WhisperCode::FailedSession,
+        }
+    }
+
+    /// Retain the typed processor failure independently of capture's outcome.
+    pub fn audio_error(&self) -> flexaudio_core::Error {
+        flexaudio_core::Error::WhisperVad { code: self.code() }
+    }
+}
 
 /// Drain the ordered event batch even on failure, before reporting the typed cause.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1058,6 +1058,12 @@ const char *flexaudio_device_event_id_v2(const struct FlexDeviceEventV2 *value);
 // value must be a live readable owner.
 const char *flexaudio_error_message_v2(const struct FlexErrorInfoV2 *value);
 
+// Borrow the stable Whisper VAD cause code until the error owner is freed.
+// NULL means this error has no Whisper VAD cause; invalid pointers set last_error.
+// # Safety
+// value must be a live readable error owner. Do not free the borrowed string.
+const char *flexaudio_error_whisper_code_v2(const struct FlexErrorInfoV2 *value);
+
 // Borrow a view until the owning tree is freed. NULL means absent/wrong arm.
 // Invalid pointer/index sets last_error. Do not free the borrowed view separately.
 // # Safety

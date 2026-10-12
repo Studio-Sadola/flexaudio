@@ -12,6 +12,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-11
+
+### Fixed
+
+- A whisper-compatible VAD failure no longer fails the recording. The N-API
+  addon threw the failure from its chunk thread, which surfaced as an
+  `uncaughtException` and killed the consumer mid-recording. It is now reported
+  once as `onEvent({ type: 'whisperVadFailed', error, epoch })`, delivered after
+  the carrier whose `whisperVadEvents` end with `epochEnd(error)`;
+  `error.whisperCode` names the typed cause. Capture, PCM delivery,
+  `pause`/`resume`, `switchSource` and `stop` keep working, and `terminalError()`
+  still means capture primary only.
+- `shutdownReport()` keeps an attached VAD failure in `cleanupErrors` with its
+  typed `whisperCode`, including a processing-time failure, and never promotes it
+  to `primary`. A real capture failure keeps its precedence.
+- A failed VAD session reinitializes at the next discontinuity: the
+  discontinuity flag, a capture index gap, a PTS reanchor, or the first chunk after
+  `resume`/`switchSource`. A successful reset starts a new anchored epoch
+  (`epochStart` with `seq` 0) at that first post-gap frame; a failed reset keeps
+  the session failed and reports once instead of repeating the event.
+  `flushWhisperVad()` remains an explicit reinitialization. Python and C follow
+  the same path through the shared capture owner.
+- A capture index gap closes the intact prefix with its `epochEnd(finish)` and
+  re-anchors the next accepted frame, instead of failing the epoch
+  (`flexaudio-vad`). Dropped audio is never replaced by padding, and a
+  discontinuity before the first accepted feed simply anchors that epoch.
+
 ## [0.5.1] - 2026-10-11
 
 ### Fixed
@@ -565,7 +592,8 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
   publication and interactive approval of new packages in scopes
   requiring 2FA. (1840fbb)
 
-[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.3.1...v0.4.0

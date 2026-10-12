@@ -28,6 +28,7 @@ StreamEventType = Literal[
     "recoverableError", "shutdownError", "audioLoss", "clipped", "permissionGranted", "unknown"
 ]
 RecordingPermission = Literal["microphone", "systemAudio"]
+WhisperCode = Literal["InvalidParameter", "InvalidProbability", "InvalidPcm", "Overflow", "SessionFinished", "Inference", "ModelLoad", "FailedSession", "InvalidStereoLength", "CaptureSampleOverflow", "PtsOutOfRange", "UnsupportedConversionClock", "Conversion", "Stopped"]
 
 MixLane = Literal["microphone", "systemAudio"]
 
@@ -66,6 +67,8 @@ class DeviceLostErrorDict(_AudioErrorFields):
     kind: Literal["deviceLost"]
 class BackendErrorDict(_AudioErrorFields):
     kind: Literal["backend"]
+class WhisperVadAudioErrorDict(BackendErrorDict):
+    whisper_code: WhisperCode
 class UnsupportedFormatErrorDict(_AudioErrorFields):
     kind: Literal["unsupportedFormat"]
 class NativeFormatChangedErrorDict(_AudioErrorFields):
@@ -76,7 +79,7 @@ class UnsupportedErrorDict(_AudioErrorFields):
     kind: Literal["unsupported"]
 class AmbiguousDeviceNameErrorDict(_AudioErrorFields):
     kind: Literal["ambiguousDeviceName"]
-AudioErrorDict = Union[InvalidArgumentErrorDict, InvalidStateErrorDict, DeviceNotFoundErrorDict, RecordingPermissionErrorDict, UnsupportedOsVersionErrorDict, DeviceLostErrorDict, BackendErrorDict, UnsupportedFormatErrorDict, NativeFormatChangedErrorDict, UnsupportedErrorDict, AmbiguousDeviceNameErrorDict]
+AudioErrorDict = Union[InvalidArgumentErrorDict, InvalidStateErrorDict, DeviceNotFoundErrorDict, RecordingPermissionErrorDict, UnsupportedOsVersionErrorDict, DeviceLostErrorDict, BackendErrorDict, WhisperVadAudioErrorDict, UnsupportedFormatErrorDict, NativeFormatChangedErrorDict, UnsupportedErrorDict, AmbiguousDeviceNameErrorDict]
 
 class NativeFormat:
     @property
@@ -103,6 +106,8 @@ class AudioError:
     def secondary(self) -> List[AudioError]: ...
     @property
     def permission(self) -> Optional[RecordingPermission]: ...
+    @property
+    def whisper_code(self) -> Optional[WhisperCode]: ...
     @property
     def advertised(self) -> Optional[NativeFormat]: ...
     @property

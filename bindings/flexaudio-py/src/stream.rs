@@ -44,7 +44,7 @@ pub struct Stream {
     whisper_events: Vec<flexaudio_vad::AttachedWhisperVadEvent>,
     whisper_origin: (u64, i64),
     whisper_error: Option<flexaudio_vad::WhisperVadTapError>,
-    whisper_error_reported: bool,
+    whisper_cleanup: Vec<fa::Error>,
     ready_chunks: std::collections::VecDeque<PyAudioChunk>,
     // Integrated denoise (requires 48kHz). None when disabled.
     denoiser: Option<CoreDenoiser>,
@@ -251,12 +251,6 @@ impl Stream {
         if let Some(chunk) = self.ready_chunks.pop_front() {
             return Ok(Some(chunk));
         }
-        if !self.whisper_error_reported && self.whisper_events.is_empty() {
-            if let Some(error) = self.whisper_error.clone() {
-                self.whisper_error_reported = true;
-                return Err(crate::whisper_vad::tap_error(error));
-            }
-        }
         let result = match self.poll_chunk_with_flush(CoreVad::flush) {
             Ok(chunk) => chunk,
             Err(error) => {
@@ -273,12 +267,6 @@ impl Stream {
         self.whisper_carrier();
         if let Some(chunk) = self.ready_chunks.pop_front() {
             return Ok(Some(chunk));
-        }
-        if !self.whisper_error_reported {
-            if let Some(error) = self.whisper_error.clone() {
-                self.whisper_error_reported = true;
-                return Err(crate::whisper_vad::tap_error(error));
-            }
         }
         Ok(None)
     }
@@ -550,7 +538,7 @@ pub fn open(
         whisper_events: Vec::new(),
         whisper_origin: (0, 0),
         whisper_error: None,
-        whisper_error_reported: false,
+        whisper_cleanup: Vec::new(),
         ready_chunks: std::collections::VecDeque::new(),
         inner: stream,
         shutdown: None,
@@ -617,7 +605,7 @@ mod tests {
                 whisper_events: Vec::new(),
                 whisper_origin: (0, 0),
                 whisper_error: None,
-                whisper_error_reported: false,
+                whisper_cleanup: Vec::new(),
                 ready_chunks: std::collections::VecDeque::new(),
                 inner: denied_stream(),
                 shutdown: None,
@@ -691,7 +679,7 @@ else:
                     whisper_events: Vec::new(),
                     whisper_origin: (0, 0),
                     whisper_error: None,
-                    whisper_error_reported: false,
+                    whisper_cleanup: Vec::new(),
                     ready_chunks: std::collections::VecDeque::new(),
                     inner,
                     shutdown: None,
@@ -794,7 +782,7 @@ mod repro_tests {
                 whisper_events: Vec::new(),
                 whisper_origin: (0, 0),
                 whisper_error: None,
-                whisper_error_reported: false,
+                whisper_cleanup: Vec::new(),
                 ready_chunks: std::collections::VecDeque::new(),
                 inner,
                 shutdown: None,
@@ -1010,7 +998,7 @@ mod repro_tests {
                 whisper_events: Vec::new(),
                 whisper_origin: (0, 0),
                 whisper_error: None,
-                whisper_error_reported: false,
+                whisper_cleanup: Vec::new(),
                 ready_chunks: std::collections::VecDeque::new(),
                 inner,
                 shutdown: None,

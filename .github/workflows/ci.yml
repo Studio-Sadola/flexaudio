@@ -58,8 +58,13 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Select Python for PyO3 tests
+        run: echo "PYO3_PYTHON=$(command -v python)" >> "$GITHUB_ENV"
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
+        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev python3-dev
       - name: Rustfmt (check formatting)
         run: cargo fmt --all --check
       - name: Clippy (deny warnings)
@@ -88,6 +93,11 @@ jobs:
           -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
           -p flexaudio-encode -p flexaudio-denoise
           -p flexaudio-ffi
+      - name: Test Whisper fault isolation (device-free)
+        run: cargo test -p flexaudio-vad --features test-faults
+      # Do not enable extension-module: Rust test executables need to link libpython.
+      - name: Test Python binding Rust isolation (device-free)
+        run: cargo test -p flexaudio-py
       - name: Python binding (maturin build + import)
         run: |
           python3 -m venv /tmp/pyenv
@@ -237,6 +247,24 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
       - name: N-API smoke / dual / async-api (mock only)
         run: bash crates/flexaudio-napi/__test__/run-smoke.sh
+      - name: Build plain debug addon (without fault injection)
+        timeout-minutes: 15
+        run: |
+          cargo build -p flexaudio-napi
+          cp target/debug/libflexaudio_napi.so crates/flexaudio-napi/__test__/plain-debug.node
+      - name: Build fault-injection reproduction addon
+        timeout-minutes: 15
+        run: |
+          cargo rustc -p flexaudio-napi --example capture_test_addon --features test-faults --crate-type cdylib -- --cfg test --cfg flexaudio_repro_addon
+          cp target/debug/examples/libcapture_test_addon.so crates/flexaudio-napi/__test__/repro.node
+      - name: Test N-API failure isolation (device-free)
+        timeout-minutes: 5
+        working-directory: crates/flexaudio-napi
+        env:
+          FLEXAUDIO_RUN_REPRO: '1'
+          FLEXAUDIO_REPRO_ADDON: ${{ github.workspace }}/crates/flexaudio-napi/__test__/repro.node
+          FLEXAUDIO_TEST_ADDON: ${{ github.workspace }}/crates/flexaudio-napi/__test__/plain-debug.node
+        run: node --test __test__/repro_p9.test.mjs __test__/repro_p9_declarations.test.mjs __test__/whisper-vad.test.mjs
 
   smoke-linux-pipewire:
     name: Self-exclusion smoke (Linux / real PipeWire)

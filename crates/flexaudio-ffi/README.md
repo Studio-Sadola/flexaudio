@@ -320,10 +320,14 @@ There are no audio-copying or timestamp-map APIs.
 config/chunk layouts. Initialize the versioned config's size to `sizeof` and
 version to `FLEX_STREAM_VERSION_2`; its config pointer references the unchanged
 v1 struct. A NULL `whisper_vad` selects ordinary capture. New-mode options reject
-legacy-VAD conflicts and secondary taps with explicit codes. **Primary attachment
-currently returns `FLEX_WHISPER_UNSUPPORTED_CONVERSION_CLOCK` before opening a
-device** because the producer has not exposed authoritative canonical capture
-indices/valid tail lengths. Polled-frame counts are never treated as exact
-capture origins. `flexaudio_flush_whisper_vad` is a no-op when disabled. Once
-producer provenance is supplied, attached events have their own versioned union,
-including EPOCH_START=6 and the u64 capture/i64 PTS origin.
+legacy-VAD conflicts and secondary taps with explicit codes. Primary attachment
+uses producer-assigned canonical capture indices and valid tail lengths; attached
+events use a separate versioned union, including EPOCH_START=6 and its u64
+capture/i64 PTS origin. `flexaudio_flush_whisper_vad` is a no-op when disabled.
+
+An attached Whisper VAD failure closes its epoch once while capture and polling
+continue. `flexaudio_stop` returns `FLEX_OK` for a VAD-only failure, and the
+shutdown report retains it among cleanup causes while its capture primary stays
+absent. Borrow its stable typed code with `flexaudio_error_whisper_code_v2` on
+the cleanup error. The next discontinuity or a successful explicit flush
+reinitializes the shared session before a new origin is published.

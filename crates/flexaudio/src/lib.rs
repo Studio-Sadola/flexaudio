@@ -28,7 +28,7 @@ pub use flexaudio_core::types::{
     AudioChunk, AudioLoss, AudioPath, ChunkFlags, DefaultDeviceKind, DeviceEvent, DeviceInfo,
     Error, ErrorContext, ErrorGroup, ErrorKind, Event, LossReason, MixLane, NativeStatus,
     Operation, OutputFormat, OutputTap, Permission, ProcessInfo, ProcessMode, Result,
-    SecondaryChunk, ShutdownReport, SourceKind, StreamConfig,
+    SecondaryChunk, ShutdownReport, SourceKind, StreamConfig, WhisperCode,
 };
 
 /// Return audio devices for all sources in one list.

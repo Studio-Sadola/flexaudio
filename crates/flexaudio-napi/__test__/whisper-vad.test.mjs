@@ -5,8 +5,20 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { test } from 'node:test';
 
-const native = createRequire(import.meta.url)(process.env.FLEXAUDIO_TEST_ADDON || './flexaudio.node');
-const { WhisperVad } = native;
+const require = createRequire(import.meta.url);
+const plainNative = require(process.env.FLEXAUDIO_TEST_ADDON || './flexaudio.node');
+const native = process.env.FLEXAUDIO_REPRO_ADDON ? require(process.env.FLEXAUDIO_REPRO_ADDON) : plainNative;
+const { WhisperVad } = plainNative;
+const faultTests = { skip: typeof native.__reproP9Bridge !== 'function' && !native.__whisperVadTestFaults && 'production addon excludes test fault injection' };
+if (process.env.FLEXAUDIO_RUN_REPRO === '1') {
+  assert.equal(faultTests.skip, false, 'required reproduction addon must support attached fault injection');
+  assert.equal(typeof WhisperVad, 'function', 'required plain addon must export standalone WhisperVad');
+  assert.equal(typeof plainNative.__openMockStream, 'function', 'required plain addon must export mock capture');
+  assert.equal(Boolean(plainNative.__whisperVadTestFaults || plainNative.__reproP9Bridge), false,
+    'plain addon must exclude fault injection so production rejection is exercised');
+}
+const standaloneTest = typeof WhisperVad === 'function' ? test
+  : (name, fn) => test(name, { skip: 'reproduction addon has no standalone WhisperVad export; attached tests still run' }, fn);
 const speaking = { threshold: 0, minSpeechDurationMs: 0, speechPadMs: 0, provisional: true };
 
 function collect(pcm, sizes, params = speaking) {
@@ -34,7 +46,7 @@ function rejectsCode(fn, code) {
   });
 }
 
-test('standalone exports the exact discriminated event fields without capture origins', () => {
+standaloneTest('standalone exports the exact discriminated event fields without capture origins', () => {
   const { events } = collect(new Float32Array(513), [513]);
   assert.deepEqual(events, [
     { type: 'provisionalSpeechStart', epoch: 0, seq: 0, atMs: 0 },
@@ -45,13 +57,13 @@ test('standalone exports the exact discriminated event fields without capture or
   ]);
 });
 
-test('default silence yields only an epoch terminal and preview is opt-in', () => {
+standaloneTest('default silence yields only an epoch terminal and preview is opt-in', () => {
   const vad = new WhisperVad();
   assert.deepEqual(vad.process(new Float32Array(2048)), []);
   assert.deepEqual(vad.finish(), [{ type: 'epochEnd', epoch: 0, seq: 0, reason: 'finish' }]);
 });
 
-test('synthetic PCM events and probabilities are independent of feed partition', () => {
+standaloneTest('synthetic PCM events and probabilities are independent of feed partition', () => {
   const pcm = Float32Array.from({ length: 4097 }, (_, i) => 0.2 * Math.sin(i * 0.17));
   const whole = collect(pcm, [pcm.length]);
   for (const sizes of [[1], [320], [512], [3, 517, 17, 1600]]) {
@@ -63,7 +75,7 @@ test('synthetic PCM events and probabilities are independent of feed partition',
     whole.events.filter(e => e.type === 'segment').map(({ startMs, endMs }) => ({ startMs, endMs })));
 });
 
-test('EOF infers exactly one partial tail; preview uses physical integer milliseconds', () => {
+standaloneTest('EOF infers exactly one partial tail; preview uses physical integer milliseconds', () => {
   for (const length of [0, 1, 15, 16, 511, 512, 513]) {
     const result = collect(new Float32Array(length), [17]);
     assert.equal(result.probabilities.length, Math.ceil(length / 512));
@@ -77,7 +89,7 @@ test('EOF infers exactly one partial tail; preview uses physical integer millise
   }
 });
 
-test('latest probabilities own their data and identify the latest frame batch', () => {
+standaloneTest('latest probabilities own their data and identify the latest frame batch', () => {
   const vad = new WhisperVad(speaking);
   vad.process(new Float32Array(512));
   const first = vad.lastFrameProbabilities();
@@ -97,7 +109,7 @@ test('latest probabilities own their data and identify the latest frame batch', 
   assert.equal(first.values[0], 99);
 });
 
-test('finish is idempotent and reset starts a new epoch without duplicate closure', () => {
+standaloneTest('finish is idempotent and reset starts a new epoch without duplicate closure', () => {
   const vad = new WhisperVad(speaking);
   vad.process(new Float32Array(513));
   vad.finish();
@@ -109,7 +121,7 @@ test('finish is idempotent and reset starts a new epoch without duplicate closur
   ]);
 });
 
-test('running reset closes published hints and abandons pending final segments', () => {
+standaloneTest('running reset closes published hints and abandons pending final segments', () => {
   const vad = new WhisperVad(speaking);
   vad.process(new Float32Array(513));
   assert.deepEqual(vad.reset(), [
@@ -121,7 +133,7 @@ test('running reset closes published hints and abandons pending final segments',
   assert.equal(vad.lastFrameProbabilities().firstFrameIndex, 0);
 });
 
-test('provisional cuts use the fixed 30000 ms deadline including a partial EOF frame', () => {
+standaloneTest('provisional cuts use the fixed 30000 ms deadline including a partial EOF frame', () => {
   const { events } = collect(new Float32Array(16 * 30001), [1703]);
   const cuts = events.filter(e => e.type === 'provisionalCut');
   assert.deepEqual(cuts.map(({ startMs, endMs, reason }) => ({ startMs, endMs, reason })), [
@@ -134,7 +146,7 @@ test('provisional cuts use the fixed 30000 ms deadline including a partial EOF f
   assert.equal(events.at(-1).type, 'epochEnd');
 });
 
-test('invalid PCM throws a typed code and leaves the complete feed unconsumed', () => {
+standaloneTest('invalid PCM throws a typed code and leaves the complete feed unconsumed', () => {
   const vad = new WhisperVad(speaking);
   const control = new WhisperVad(speaking);
   const prefix = new Float32Array(319);
@@ -152,7 +164,7 @@ test('invalid PCM throws a typed code and leaves the complete feed unconsumed', 
   assert.deepEqual(vad.finish(), control.finish());
 });
 
-test('parameters reject unknown fields, nonboolean preview and unsafe numeric conversions', () => {
+standaloneTest('parameters reject unknown fields, nonboolean preview and unsafe numeric conversions', () => {
   const invalid = [
     { threshold: 1.0000000001 }, { threshold: NaN }, { threshold: Infinity }, { threshold: -0.1 },
     { maxSpeechDurationS: Infinity }, { maxSpeechDurationS: -1 }, { maxSpeechDurationS: 3.5e38 },
@@ -170,8 +182,8 @@ test('parameters reject unknown fields, nonboolean preview and unsafe numeric co
 });
 
 test('stream options reject conflicts and unsupported taps before opening any device',
-  { skip: typeof native.openStream !== 'function' && 'standalone boundary addon has no capture API' }, () => {
-  const open = options => native.openStream({ kind: 'mic', ...options }, () => {});
+  { skip: typeof plainNative.openStream !== 'function' && 'standalone boundary addon has no capture API' }, () => {
+  const open = options => plainNative.openStream({ kind: 'mic', ...options }, () => {});
   rejectsCode(() => open({ vad: {}, whisperVad: { tap: 'primary' } }), 'ConflictingVad');
   rejectsCode(() => open({ vadTap: 'secondary', secondaryOutput: { rate: 16000, channels: 1 },
     whisperVad: { tap: 'primary' } }), 'ConflictingVad');
@@ -184,8 +196,189 @@ test('stream options reject conflicts and unsupported taps before opening any de
   }
 });
 
+function waitFor(predicate, message, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  return (async () => {
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, message);
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  })();
+}
+
+function openWhisperMock(t, log, failAtChunk = 3, resetFailures = undefined) {
+  const stream = native.__openMockStream(48000, 2, 0,
+    chunk => log.push({ kind: 'chunk', frames: chunk.frames, events: chunk.whisperVadEvents ?? [] }),
+    undefined, undefined, undefined, undefined, undefined,
+    { params: { threshold: 0, minSpeechDurationMs: 0, speechPadMs: 0 }, provisional: true, tap: 'primary' },
+    event => log.push({ kind: 'event', event }), failAtChunk, resetFailures);
+  // Register before assertions: a failed assertion must never strand the capture worker/TSFN.
+  t.after(async () => { await stream.stop(); });
+  return stream;
+}
+
+function failureIndex(log) {
+  return log.findIndex(entry => entry.kind === 'event' && entry.event.type === 'whisperVadFailed');
+}
+
+function assertFailureOrder(log, before = log.length) {
+  const failure = failureIndex(log);
+  assert.ok(failure >= 0 && failure < before, 'whisperVadFailed must arrive before settlement');
+  const event = log[failure].event;
+  const carrier = log.findIndex(entry => entry.kind === 'chunk'
+    && entry.events.some(item => item.type === 'epochEnd' && item.reason === 'error' && item.epoch === event.epoch));
+  assert.ok(carrier >= 0 && carrier < failure, 'epochEnd(error) carrier must precede whisperVadFailed');
+  assert.equal(log[carrier].events.at(-1).type, 'epochEnd');
+  assert.equal(event.error.kind, 'backend');
+  assert.equal(event.error.whisperCode, 'Inference');
+  assert.match(event.error.message, /whisper/i);
+  assert.equal(event.error.secondary.length, 0);
+  return event;
+}
+
+function assertWhisperReport(stream, code = 'Inference') {
+  const report = stream.shutdownReport();
+  assert.equal(report.primary, null, 'a whisper-only failure is never the capture primary');
+  const whisper = report.cleanupErrors.filter(error => typeof error.whisperCode === 'string');
+  assert.equal(whisper.length, 1, 'the failure is retained once as a cleanup cause');
+  assert.equal(whisper[0].whisperCode, code);
+  assert.equal(stream.terminalError(), undefined, 'terminalError means capture primary only');
+}
+
+test('production mock capture rejects test faults because injection is not compiled into the addon',
+  { skip: Boolean(plainNative.__whisperVadTestFaults || plainNative.__reproP9Bridge)
+    || typeof plainNative.__openMockStream !== 'function' }, async () => {
+  for (const [failAt, resetFailures] of [[3, undefined], [undefined, 1]]) {
+    let unexpected;
+    try {
+      assert.throws(() => {
+        unexpected = plainNative.__openMockStream(48000, 2, 0, () => {},
+          undefined, undefined, undefined, undefined, undefined,
+          { tap: 'primary' }, undefined, failAt, resetFailures);
+      }, error => {
+        assert.equal(error.code, 'TestFaultsUnavailable');
+        assert.deepEqual(error.terminalEvents, []);
+        assert.match(error.message, /injection.*not compiled|not compiled.*injection/i);
+        return true;
+      });
+    } finally {
+      // If a faulty addon accepts injection, the assertion is red and it still gets stopped.
+      if (unexpected) await unexpected.stop();
+    }
+  }
+});
+
+test('mock failure counts reject fractional, negative and overflowing values before capture starts', faultTests, async () => {
+  for (const [failure, resets] of [[0, undefined], [-1, undefined], [1.5, undefined], [2 ** 32 + 3, undefined],
+    [undefined, -1], [undefined, 0.5], [undefined, Infinity]]) {
+    let unexpected;
+    try {
+      rejectsCode(() => { unexpected = native.__openMockStream(48000, 2, 0, () => {},
+        undefined, undefined, undefined, undefined, undefined, { tap: 'primary' }, undefined,
+        failure, resets); }, 'InvalidParameter');
+    } finally {
+      if (unexpected) await unexpected.stop();
+    }
+  }
+});
+
+test('a whisper-only failure never fails capture or emits a stop terminator before stop', faultTests, async t => {
+  const log = [];
+  let uncaught;
+  const onUncaught = error => { uncaught = error; };
+  process.once('uncaughtException', onUncaught);
+  t.after(() => process.removeListener('uncaughtException', onUncaught));
+  const stream = openWhisperMock(t, log);
+  await waitFor(() => failureIndex(log) >= 0, 'a whisper-only failure must be reported as whisperVadFailed');
+  assert.equal(uncaught, undefined, 'a whisper-only failure must not become an uncaughtException');
+  const event = assertFailureOrder(log);
+  const failure = failureIndex(log);
+  await waitFor(() => log.slice(failure).filter(entry => entry.kind === 'chunk' && entry.frames > 0).length > 3,
+    'PCM delivery must continue after a whisper-only failure');
+  assert.equal(log.some(entry => entry.kind === 'chunk' && entry.frames === 0), false,
+    'a mid-stream failure carrier must use real PCM, because frames:0 means stop');
+  assert.doesNotThrow(() => stream.resume(), 'resume must succeed after a whisper-only failure');
+  await stream.stop();
+  log.push({ kind: 'resolved' });
+  assertFailureOrder(log, log.length - 1);
+  assertWhisperReport(stream, event.error.whisperCode);
+  assert.equal(log.filter(entry => entry.kind === 'chunk').at(-1).frames, 0, 'stop delivers a terminator');
+});
+
+test('an immediate stop from the error carrier observes epochEnd then failure event then stop resolution', faultTests, async t => {
+  const log = [];
+  let stopping;
+  let stream;
+  stream = native.__openMockStream(48000, 2, 0, chunk => {
+    const events = chunk.whisperVadEvents ?? [];
+    log.push({ kind: 'chunk', frames: chunk.frames, events });
+    if (events.some(event => event.type === 'epochEnd' && event.reason === 'error')) {
+      stopping ??= stream.stop().then(() => { log.push({ kind: 'resolved' }); });
+    }
+  }, undefined, undefined, undefined, undefined, undefined,
+  { params: { threshold: 0, minSpeechDurationMs: 0, speechPadMs: 0 }, provisional: true, tap: 'primary' },
+  event => log.push({ kind: 'event', event }), 3);
+  t.after(async () => { await stream.stop(); });
+  await waitFor(() => stopping !== undefined, 'the real failure must deliver epochEnd(error)');
+  await stopping;
+  assertFailureOrder(log, log.findIndex(entry => entry.kind === 'resolved'));
+  assertWhisperReport(stream);
+});
+
+for (const boundary of ['resume', 'switchSource']) {
+  test(`the discontinuity after ${boundary} reinitializes the failed session with a new origin`, faultTests, async t => {
+    const log = [];
+    const stream = openWhisperMock(t, log);
+    await waitFor(() => failureIndex(log) >= 0, 'a whisper-only failure must be reported');
+    const failedEpoch = log[failureIndex(log)].event.epoch;
+    const boundaryIndex = log.length;
+    if (boundary === 'resume') {
+      stream.pause();
+      assert.equal(stream.isPaused(), true);
+      assert.doesNotThrow(() => stream.resume());
+    } else {
+      assert.doesNotThrow(() => stream.switchSource({ kind: 'mock' }), 'switchSource must succeed after a whisper-only failure');
+    }
+    const origins = () => log.slice(boundaryIndex).flatMap(entry => entry.kind === 'chunk' ? entry.events : [])
+      .filter(event => event.type === 'epochStart' && event.epoch > failedEpoch);
+    await waitFor(() => origins().length > 0, `the discontinuity after ${boundary} must start a new epoch`);
+    const origin = origins()[0];
+    assert.equal(origin.seq, 0);
+    assert.equal(typeof origin.captureSample, 'bigint');
+    assert.ok(origin.captureSample > 0n, 'the new epoch anchors on the first post-gap frame');
+    assert.equal(typeof origin.ptsNs, 'number');
+    assert.equal(log.filter(entry => entry.kind === 'event' && entry.event.type === 'whisperVadFailed').length, 1);
+    await stream.stop();
+    assertWhisperReport(stream);
+  });
+}
+
+test('one failed reset at a real boundary stays failed until explicit flush succeeds', faultTests, async t => {
+  const log = [];
+  const stream = openWhisperMock(t, log, 3, 1);
+  await waitFor(() => failureIndex(log) >= 0, 'a real injected model failure must be reported');
+  const failedEpoch = log[failureIndex(log)].event.epoch;
+  const delivered = () => log.filter(entry => entry.kind === 'chunk' && entry.frames > 0).length;
+  const before = delivered();
+  await waitFor(() => delivered() >= before + 3, 'PCM must continue after the model failure');
+  stream.pause();
+  stream.resume();
+  const afterBoundary = delivered();
+  await waitFor(() => delivered() >= afterBoundary + 8, 'PCM must continue after the one failed reset');
+  const newOrigins = () => log.flatMap(entry => entry.kind === 'chunk' ? entry.events : [])
+    .filter(event => event.type === 'epochStart' && event.epoch > failedEpoch);
+  assert.equal(newOrigins().length, 0, 'a failed reset must not publish a new origin on later contiguous chunks');
+  assert.equal(log.filter(entry => entry.kind === 'event' && entry.event.type === 'whisperVadFailed').length, 1,
+    'a failed reinitialization must not repeat the failure event');
+  await stream.flushWhisperVad();
+  await waitFor(() => newOrigins().length > 0, 'successful explicit flush must permit the next epochStart');
+  assert.equal(newOrigins()[0].seq, 0);
+  await stream.stop();
+  assertWhisperReport(stream);
+});
+
 test('attached primary and secondary close epochs before flush and stop settle',
-  { skip: typeof native.__openMockStream !== 'function' && 'addon has no fake capture API' }, async () => {
+  { skip: typeof native.__openMockStream !== 'function' && 'addon has no fake capture API' }, async t => {
   for (const tap of ['primary', 'secondary']) {
     const chunks = [];
     const events = [];
@@ -195,6 +388,7 @@ test('attached primary and secondary close epochs before flush and stop settle',
       if (carrier) events.push(...(carrier.whisperVadEvents ?? []));
     }, tap === 'secondary' ? 16000 : undefined, 1, 's16', undefined, undefined,
     { params: { threshold: 0, minSpeechDurationMs: 0, speechPadMs: 0 }, provisional: true, tap });
+    t.after(async () => { await stream.stop(); });
     const deadline = Date.now() + 5000;
     while (!events.some(event => event.type === 'provisionalSpeechStart')) {
       assert.ok(Date.now() < deadline, 'fake capture timed out');

@@ -10,6 +10,20 @@ pub(super) struct WhisperFailure {
     pub stage: WhisperFailureStage,
 }
 
+impl WhisperFailure {
+    /// Typed audio-error projection: a backend failure carrying the operation context and the
+    /// stable whisper code that names the addon cause. Diagnostics name the cause only, never
+    /// PCM, a device name or a secret.
+    pub(super) fn audio_error(&self) -> boundary::JsAudioError {
+        boundary::audio_error(
+            &self
+                .error
+                .audio_error()
+                .with_context(ErrorContext::new(self.stage.operation())),
+        )
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum WhisperFailureStage {
     Process,
@@ -24,16 +38,12 @@ impl WhisperFailureStage {
             Self::RuntimeFlush | Self::StopFlush => Operation::Flush,
         }
     }
-
-    pub fn is_primary(self) -> bool {
-        matches!(self, Self::Process | Self::RuntimeFlush)
-    }
 }
 
 #[derive(Default)]
 pub(super) struct ShutdownReport {
     pub core: Option<flexaudio::core::ShutdownReport>,
-    pub whisper: Option<WhisperFailure>,
+    pub whisper: Vec<WhisperFailure>,
     pub binding_cleanup: Vec<flexaudio::Error>,
 }
 
@@ -41,102 +51,147 @@ impl ShutdownReport {
     pub fn from_core(core: Option<flexaudio::core::ShutdownReport>) -> Self {
         Self {
             core,
-            whisper: None,
+            whisper: Vec::new(),
             binding_cleanup: Vec::new(),
         }
     }
 
-    fn whisper_error(&self) -> Option<boundary::JsAudioError> {
-        self.whisper.as_ref().map(|failure| {
-            let error = flexaudio::Error::Backend("attached whisper VAD failure".into())
-                .with_context(ErrorContext::new(failure.stage.operation()));
-            let mut mapped = boundary::audio_error(&error);
-            mapped.message = failure.error.to_string();
-            mapped.whisper_code = Some(whisper_integration::error_code(&failure.error).into());
-            mapped
-        })
-    }
-
-    pub fn to_js(&self) -> boundary::JsShutdownReport {
-        let mut primary = self
+    /// One shared outcome contract decides both retained diagnostics and checked stop.
+    fn outcome(&self) -> flexaudio::core::ShutdownReport {
+        let primary = self
             .core
             .as_ref()
             .and_then(|report| report.primary())
-            .map(boundary::audio_error);
-        let mut cleanup_errors = self
+            .cloned();
+        let mut cleanup = self
             .core
             .as_ref()
-            .map(|report| {
-                report
-                    .cleanup()
-                    .iter()
-                    .map(boundary::audio_error)
-                    .collect::<Vec<_>>()
-            })
+            .map(|report| report.cleanup().to_vec())
             .unwrap_or_default();
-        if let Some(error) = self.whisper_error() {
-            if self
-                .whisper
-                .as_ref()
-                .is_some_and(|failure| failure.stage.is_primary())
-            {
-                // Processing failed during capture. Keep any core primary and retain the
-                // addon as a related primary; teardown errors remain in cleanupErrors.
-                if let Some(primary) = primary.as_mut() {
-                    primary.secondary.push(error);
-                } else {
-                    primary = Some(error);
-                }
-            } else {
-                // A final addon flush is cleanup, even when core capture was clean.
-                cleanup_errors.push(error);
-            }
-        }
-        cleanup_errors.extend(self.binding_cleanup.iter().map(boundary::audio_error));
+        cleanup.extend(self.whisper.iter().map(|failure| {
+            failure
+                .error
+                .audio_error()
+                .with_context(ErrorContext::new(failure.stage.operation()))
+        }));
+        cleanup.extend(self.binding_cleanup.iter().cloned());
+        flexaudio::core::ShutdownReport::new(primary, cleanup)
+    }
+
+    pub fn to_js(&self) -> boundary::JsShutdownReport {
+        let report = self.outcome();
         boundary::JsShutdownReport {
-            primary: primary.map(Either::A).unwrap_or(Either::B(Null)),
-            cleanup_errors,
+            primary: report
+                .primary()
+                .map(boundary::audio_error)
+                .map(Either::A)
+                .unwrap_or(Either::B(Null)),
+            cleanup_errors: report.cleanup().iter().map(boundary::audio_error).collect(),
         }
     }
 
     pub fn exception(&self, env: &Env) -> napi::Result<Option<JsObject>> {
-        let core_primary = self.core.as_ref().and_then(|report| report.primary());
-        let whisper_primary = self
-            .whisper
-            .as_ref()
-            .filter(|failure| failure.stage.is_primary());
-        let core_cleanup = self
-            .core
-            .as_ref()
-            .and_then(|report| report.cleanup().first());
-        // Match the report's primary/cleanup order, keeping the existing Whisper code
-        // when the addon is the root cause. Every cause is also in audioError.
-        let mut exception = if let Some(error) = core_primary {
-            boundary::js_error(env, error)?
-        } else if let Some(failure) = whisper_primary {
-            whisper_integration::js_error(env, &failure.error)?
-        } else if let Some(error) = core_cleanup {
-            boundary::js_error(env, error)?
-        } else if let Some(failure) = self.whisper.as_ref() {
-            whisper_integration::js_error(env, &failure.error)?
-        } else if let Some(error) = self.binding_cleanup.first() {
-            boundary::js_error(env, error)?
-        } else {
-            return Ok(None);
-        };
-        let report = self.to_js();
-        let mut causes = match report.primary {
-            Either::A(primary) => std::iter::once(primary)
-                .chain(report.cleanup_errors)
-                .collect::<Vec<_>>(),
-            Either::B(_) => report.cleanup_errors,
+        match self.outcome().result() {
+            Ok(()) => Ok(None),
+            Err(error) => boundary::js_error(env, &error).map(Some),
         }
-        .into_iter();
-        let mut root = causes
-            .next()
-            .expect("exception requires a retained failure");
-        root.secondary.extend(causes);
-        exception.set_named_property("audioError", root)?;
-        Ok(Some(exception))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn whisper_failure() -> WhisperFailure {
+        WhisperFailure {
+            error: WhisperVadTapError::Vad(flexaudio_vad::WhisperVadError::Inference),
+            stage: WhisperFailureStage::Process,
+        }
+    }
+
+    #[test]
+    fn attached_vad_failure_is_cleanup_only_and_keeps_its_typed_code() {
+        let report = ShutdownReport {
+            core: None,
+            whisper: vec![whisper_failure()],
+            binding_cleanup: Vec::new(),
+        };
+        let js = report.to_js();
+        assert!(
+            matches!(js.primary, Either::B(Null)),
+            "a whisper-only failure must not be the capture primary"
+        );
+        assert_eq!(js.cleanup_errors.len(), 1);
+        assert_eq!(js.cleanup_errors[0].kind, "backend");
+        assert_eq!(
+            js.cleanup_errors[0].whisper_code.as_deref(),
+            Some("Inference")
+        );
+        assert_eq!(js.cleanup_errors[0].contexts[0].operation, "normalize");
+    }
+
+    #[test]
+    fn capture_primary_keeps_precedence_over_an_attached_vad_failure() {
+        let report = ShutdownReport {
+            core: Some(flexaudio::core::ShutdownReport::new(
+                Some(flexaudio::Error::DeviceLost),
+                Vec::new(),
+            )),
+            whisper: vec![whisper_failure()],
+            binding_cleanup: Vec::new(),
+        };
+        let js = report.to_js();
+        let Either::A(primary) = js.primary else {
+            panic!("a real capture failure remains the primary")
+        };
+        assert_eq!(primary.kind, "deviceLost");
+        assert_eq!(js.cleanup_errors.len(), 1);
+        assert_eq!(
+            js.cleanup_errors[0].whisper_code.as_deref(),
+            Some("Inference")
+        );
+    }
+
+    #[test]
+    fn a_stop_flush_vad_failure_is_cleanup_and_keeps_the_flush_context() {
+        let report = ShutdownReport {
+            core: None,
+            whisper: vec![WhisperFailure {
+                error: WhisperVadTapError::Conversion,
+                stage: WhisperFailureStage::StopFlush,
+            }],
+            binding_cleanup: Vec::new(),
+        };
+        let js = report.to_js();
+        assert!(matches!(js.primary, Either::B(Null)));
+        assert_eq!(js.cleanup_errors.len(), 1);
+        assert_eq!(
+            js.cleanup_errors[0].whisper_code.as_deref(),
+            Some("Conversion")
+        );
+        assert_eq!(js.cleanup_errors[0].contexts[0].operation, "flush");
+    }
+    #[test]
+    fn whisper_only_stop_succeeds_and_binding_cleanup_keeps_the_rejecting_root() {
+        let mut report = ShutdownReport {
+            core: None,
+            whisper: vec![whisper_failure()],
+            binding_cleanup: Vec::new(),
+        };
+        assert!(report.outcome().result().is_ok());
+        report.binding_cleanup.push(flexaudio::Error::Backend(
+            "the bridge could not join because its worker failed".into(),
+        ));
+        let error = report
+            .outcome()
+            .result()
+            .expect_err("a bridge failure must still reject stop");
+        let mapped = boundary::audio_error(&error);
+        assert!(mapped.whisper_code.is_none());
+        assert_eq!(mapped.secondary.len(), 1);
+        assert_eq!(
+            mapped.secondary[0].whisper_code.as_deref(),
+            Some("Inference")
+        );
     }
 }

@@ -16,6 +16,12 @@ struct Origin {
     pts_ns: i64,
 }
 
+#[derive(Clone, Copy)]
+struct Intake {
+    origin: Origin,
+    frames: u64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
     Running,
@@ -46,8 +52,15 @@ pub struct WhisperVadTap {
     vad: WhisperVad,
     converter: CaptureConverter,
     origin: Option<Origin>,
+    // Continuity belongs to capture intake, including valid chunks skipped while failed.
+    // Converter counters describe only accepted DSP input and cannot detect later gaps.
+    intake: Option<Intake>,
     started: bool,
     state: State,
+    #[cfg(feature = "test-faults")]
+    injected_failure: bool,
+    #[cfg(feature = "test-faults")]
+    injected_reset_failure: bool,
 }
 
 impl WhisperVadTap {
@@ -64,9 +77,34 @@ impl WhisperVadTap {
             vad,
             converter,
             origin: None,
+            intake: None,
             started: false,
             state: State::Running,
+            #[cfg(feature = "test-faults")]
+            injected_failure: false,
+            #[cfg(feature = "test-faults")]
+            injected_reset_failure: false,
         }
+    }
+
+    /// Test-only fault injection for the bindings' failure-path self-tests.
+    ///
+    /// The next nonempty process or active-epoch finish (flush/stop) fails exactly like a
+    /// model fault: published hints close once with their typed error terminal and the
+    /// session latches until a successful flush or discontinuity-driven reinitialization.
+    /// Production callers never use it; it is compiled only with the `test-faults` feature.
+    #[cfg(feature = "test-faults")]
+    #[doc(hidden)]
+    pub fn inject_failure(&mut self) {
+        self.injected_failure = true;
+    }
+
+    /// Test-only: make the next reinitialization fail, so the session stays failed.
+    /// Compiled only with the `test-faults` feature.
+    #[cfg(feature = "test-faults")]
+    #[doc(hidden)]
+    pub fn inject_reset_failure(&mut self) {
+        self.injected_reset_failure = true;
     }
 
     /// Consume one canonical chunk and return its ordered attached events.
@@ -74,10 +112,11 @@ impl WhisperVadTap {
     /// `capture_sample`/`pts_ns` locate the first frame, independently of event delivery.
     /// PTS uses the chunk's signed safe-integer domain. Within an epoch, project PTS with
     /// floor(delta_frames*1e9/48000), rather than multiplying by truncated ns per frame.
-    /// An explicit discontinuity or PTS reanchor closes an intact prefix before resetting.
-    /// Missing/reordered capture frames, or a discontinuity before the first accepted feed,
-    /// fail the epoch without successful EOF finals. A successful flush is required to
-    /// recover. Invalid complete feeds leave state unchanged.
+    /// A discontinuity flag, a PTS reanchor or missing/reordered capture frames closes the
+    /// intact prefix and re-anchors the next accepted frame in a fresh epoch; dropped audio
+    /// is never replaced by padding. After a fatal failure the same triggers reinitialize
+    /// converter and model, while contiguous input keeps the session failed until then.
+    /// Invalid complete feeds leave state unchanged.
     pub fn process(
         &mut self,
         stereo_48k: &[f32],
@@ -85,7 +124,9 @@ impl WhisperVadTap {
         pts_ns: i64,
         discontinuity: bool,
     ) -> Result<Vec<Attached>, Failure> {
-        self.require_running()?;
+        if self.state == State::Stopped {
+            return Err(Error::Stopped.into());
+        }
         if !stereo_48k.len().is_multiple_of(2) {
             return Err(Error::InvalidStereoLength.into());
         }
@@ -102,22 +143,9 @@ impl WhisperVadTap {
         project_pts(pts_ns, 0)?;
         project_pts(pts_ns, frames)?;
         let input_frames = self.converter.input_frames();
-        let transport_gap = frames != 0
-            && self.origin.is_some_and(|origin| {
-                origin.capture_sample.checked_add(input_frames) != Some(capture_sample)
-            });
-        if transport_gap || (frames != 0 && discontinuity && self.origin.is_none()) {
-            // Do not infer a tail or call finish on an incomplete capture timeline.
-            // Reuse the fatal conversion/intake path to close published hints once.
-            return Err(self.conversion_failure(Vec::new()));
-        }
-        let clock_break = if frames != 0 {
-            self.origin
-                .is_some_and(|origin| project_pts(origin.pts_ns, input_frames).ok() != Some(pts_ns))
-        } else {
-            false
-        };
-        let split = discontinuity || clock_break;
+        // Missing capture frames are a discontinuity, not a failure: the gap never
+        // becomes padding and the prefix closes as an intact epoch.
+        let split = self.is_discontinuity_boundary(capture_sample, frames, pts_ns, discontinuity);
         let total = if split { 0 } else { input_frames }
             .checked_add(frames)
             .ok_or(Error::CaptureSampleOverflow)?;
@@ -133,14 +161,47 @@ impl WhisperVadTap {
                 project_pts(origin.pts_ns, total)?;
             }
         }
+        // Reserve and observe the complete valid feed before any reset/conversion/model
+        // failure. Even a failed reset consumes this capture boundary for continuity; the
+        // following contiguous chunk must not retry simply because DSP never accepted it.
+        let intake = if split { None } else { self.intake };
+        let observed_frames = intake
+            .map_or(0, |intake| intake.frames)
+            .checked_add(frames)
+            .ok_or(Error::CaptureSampleOverflow)?;
+        if let Some(intake) = intake {
+            project_pts(intake.origin.pts_ns, observed_frames)?;
+        }
+        self.intake = if frames == 0 {
+            intake
+        } else {
+            Some(Intake {
+                origin: intake.map_or(
+                    Origin {
+                        capture_sample,
+                        pts_ns,
+                    },
+                    |intake| intake.origin,
+                ),
+                frames: observed_frames,
+            })
+        };
         let mut events = Vec::new();
-        if split && self.origin.is_some() {
+        if self.state == State::Failed {
+            if !split {
+                // Contiguous audio carries no reinitialization point.
+                return Err(Error::FailedSession.into());
+            }
+            self.reinitialize(&mut events)?;
+        } else if split && self.origin.is_some() {
             self.finish_epoch(&mut events)?;
             self.reinitialize(&mut events)?;
         }
         if frames == 0 {
             return Ok(events);
         }
+        #[cfg(feature = "test-faults")]
+        self.fail_if_injected(&mut events)?;
         self.origin.get_or_insert(Origin {
             capture_sample,
             pts_ns,
@@ -151,6 +212,27 @@ impl WhisperVadTap {
         };
         self.feed_mono(&mono, &mut events)?;
         Ok(events)
+    }
+
+    /// Whether this capture chunk is a discontinuity boundary: an explicit flag, capture
+    /// index gap or PTS reanchor on the observed capture timeline.
+    ///
+    /// Bindings feed every chunk to [`Self::process`], including while failed. This one
+    /// predicate decides recovery; converter input counts do not advance for failed audio.
+    /// Empty feeds have no implicit capture/clock boundary.
+    pub fn is_discontinuity_boundary(
+        &self,
+        capture_sample: u64,
+        frames: u64,
+        pts_ns: i64,
+        discontinuity: bool,
+    ) -> bool {
+        discontinuity
+            || (frames != 0
+                && self.intake.is_some_and(|intake| {
+                    intake.origin.capture_sample.checked_add(intake.frames) != Some(capture_sample)
+                        || project_pts(intake.origin.pts_ns, intake.frames).ok() != Some(pts_ns)
+                }))
     }
 
     /// Drain/finish the prefix, reset both DSP and model, and await a new capture origin.
@@ -167,17 +249,22 @@ impl WhisperVadTap {
             self.finish_epoch(&mut events)?;
             self.reinitialize(&mut events)?;
         }
+        self.intake = None;
         Ok(events)
     }
 
     /// Drain valid PCM and finish exactly once, without starting another epoch.
     /// The caller stops intake/drains queued canonical chunks first and delivers this batch
     /// before disposing the worker. Stop before any valid PCM returns no epoch events.
+    /// An already failed epoch has reported its closure; stop seals intake successfully
+    /// without another drain, reset or terminal event.
     pub fn stop(&mut self) -> Result<Vec<Attached>, Failure> {
-        if self.state == State::Stopped {
+        if self.state != State::Running {
+            // A failed epoch already carried its error closure. Its converter/model state
+            // cannot produce a valid drain, so stop only seals intake without another error.
+            self.state = State::Stopped;
             return Ok(Vec::new());
         }
-        self.require_running()?;
         let mut events = Vec::new();
         self.finish_epoch(&mut events)?;
         self.state = State::Stopped;
@@ -188,6 +275,8 @@ impl WhisperVadTap {
         if self.origin.is_none() {
             return Ok(());
         }
+        #[cfg(feature = "test-faults")]
+        self.fail_if_injected(events)?;
         let mono = match self.converter.drain() {
             Ok(mono) => mono,
             Err(()) => return Err(self.conversion_failure(std::mem::take(events))),
@@ -202,6 +291,21 @@ impl WhisperVadTap {
         self.origin = None;
         self.started = false;
         Ok(())
+    }
+
+    #[cfg(feature = "test-faults")]
+    fn fail_if_injected(&mut self, events: &mut Vec<Attached>) -> Result<(), Failure> {
+        if !std::mem::take(&mut self.injected_failure) {
+            return Ok(());
+        }
+        let failure = match self.vad.abort() {
+            Ok(failure) => failure,
+            Err(error) => WhisperVadFailure {
+                error,
+                terminal_events: Vec::new(),
+            },
+        };
+        Err(self.vad_failure(failure, std::mem::take(events)))
     }
 
     fn feed_mono(&mut self, mono: &[f32], events: &mut Vec<Attached>) -> Result<(), Failure> {
@@ -233,6 +337,15 @@ impl WhisperVadTap {
     }
 
     fn reinitialize(&mut self, events: &mut Vec<Attached>) -> Result<(), Failure> {
+        #[cfg(feature = "test-faults")]
+        if std::mem::take(&mut self.injected_reset_failure) {
+            // Test-only: a failed reset stays failed and reports no second closure.
+            self.state = State::Failed;
+            return Err(Failure {
+                error: Error::Vad(crate::WhisperVadError::Inference),
+                terminal_events: std::mem::take(events),
+            });
+        }
         let converter = match CaptureConverter::new() {
             Ok(converter) => converter,
             Err(()) => {
@@ -300,14 +413,6 @@ impl WhisperVadTap {
         Failure {
             error,
             terminal_events: events,
-        }
-    }
-
-    fn require_running(&self) -> Result<(), Error> {
-        match self.state {
-            State::Running => Ok(()),
-            State::Failed => Err(Error::FailedSession),
-            State::Stopped => Err(Error::Stopped),
         }
     }
 }

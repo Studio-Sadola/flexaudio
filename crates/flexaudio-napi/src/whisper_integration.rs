@@ -10,13 +10,21 @@ pub(super) struct WhisperBridge {
     pub tap: VadTap,
     events: Vec<AttachedWhisperVadEvent>,
     pub error: Option<WhisperVadTapError>,
-    error_stage: shutdown::WhisperFailureStage,
-    reported_error: bool,
+    failures: Vec<shutdown::WhisperFailure>,
+    notifications: VecDeque<(shutdown::WhisperFailure, u32)>,
+    /// Latest epoch published on the selected tap, for the failure notification.
+    pub last_epoch: u32,
     last_frame_index: u64,
     last_pts: i64,
-    #[cfg(all(test, flexaudio_repro_addon))]
-    inject_invalid_pcm: bool,
-    #[cfg(all(test, flexaudio_repro_addon))]
+    /// Test-only (`__openMockStream`): fail the VAD session on this 1-based capture chunk.
+    #[cfg(feature = "test-faults")]
+    fail_at_chunk: Option<u32>,
+    /// Test-only (`__openMockStream`): make the next reinitializations fail.
+    #[cfg(feature = "test-faults")]
+    reset_failures: u32,
+    #[cfg(feature = "test-faults")]
+    capture_chunks: u32,
+    #[cfg(all(flexaudio_repro_addon, feature = "test-faults"))]
     inject_stop_failure: bool,
 }
 
@@ -31,15 +39,28 @@ impl WhisperBridge {
             tap,
             events: Vec::new(),
             error: None,
-            error_stage: shutdown::WhisperFailureStage::Process,
-            reported_error: false,
+            failures: Vec::new(),
+            notifications: VecDeque::new(),
+            last_epoch: 0,
             last_frame_index: 0,
             last_pts: 0,
-            #[cfg(all(test, flexaudio_repro_addon))]
-            inject_invalid_pcm: false,
-            #[cfg(all(test, flexaudio_repro_addon))]
+            #[cfg(feature = "test-faults")]
+            fail_at_chunk: None,
+            #[cfg(feature = "test-faults")]
+            reset_failures: 0,
+            #[cfg(feature = "test-faults")]
+            capture_chunks: 0,
+            #[cfg(all(flexaudio_repro_addon, feature = "test-faults"))]
             inject_stop_failure: false,
         })
+    }
+
+    /// Test-only (`__openMockStream`): fail the VAD session on the given 1-based chunk and
+    /// the given number of following reinitializations.
+    #[cfg(feature = "test-faults")]
+    pub(super) fn inject_faults(&mut self, fail_at_chunk: Option<u32>, reset_failures: u32) {
+        self.fail_at_chunk = fail_at_chunk;
+        self.reset_failures = reset_failures;
     }
 
     fn accept(
@@ -48,35 +69,61 @@ impl WhisperBridge {
         stage: shutdown::WhisperFailureStage,
     ) {
         match result {
-            Ok(events) => self.events.extend(events),
+            Ok(events) => {
+                if matches!(
+                    stage,
+                    shutdown::WhisperFailureStage::Process
+                        | shutdown::WhisperFailureStage::RuntimeFlush
+                ) {
+                    self.error = None;
+                }
+                for event in &events {
+                    self.last_epoch = event.epoch();
+                }
+                self.events.extend(events);
+            }
             Err(failure) => {
+                for event in &failure.terminal_events {
+                    self.last_epoch = event.epoch();
+                }
                 self.events.extend(failure.terminal_events);
                 if self.error.is_none() {
+                    let retained = shutdown::WhisperFailure {
+                        error: failure.error.clone(),
+                        stage,
+                    };
+                    self.notifications
+                        .push_back((retained.clone(), self.last_epoch));
+                    self.failures.push(retained);
                     self.error = Some(failure.error);
-                    self.error_stage = stage;
                 }
             }
         }
     }
 
-    fn process(&mut self, chunk: AudioChunk) {
-        if self.error.is_some() {
-            return;
-        }
-        #[cfg(all(test, flexaudio_repro_addon))]
-        let chunk = {
-            let mut chunk = chunk;
-            if std::mem::take(&mut self.inject_invalid_pcm) {
-                chunk.data[0] = f32::NAN;
+    pub(super) fn process(&mut self, chunk: AudioChunk) {
+        let discontinuity = chunk.flags.contains(ChunkFlags::DISCONTINUITY);
+        #[cfg(feature = "test-faults")]
+        {
+            self.capture_chunks = self.capture_chunks.saturating_add(1);
+            let boundary = self.owner.is_discontinuity_boundary(
+                chunk.frame_index,
+                chunk.frames as u64,
+                chunk.pts_ns,
+                discontinuity,
+            );
+            if self.reset_failures > 0 && boundary {
+                self.reset_failures -= 1;
+                self.owner.inject_reset_failure();
             }
-            chunk
-        };
-        let result = self.owner.process(
-            &chunk.data,
-            chunk.frame_index,
-            chunk.pts_ns,
-            chunk.flags.contains(ChunkFlags::DISCONTINUITY),
-        );
+            if self.fail_at_chunk == Some(self.capture_chunks) {
+                self.fail_at_chunk = None;
+                self.owner.inject_failure();
+            }
+        }
+        let result =
+            self.owner
+                .process(&chunk.data, chunk.frame_index, chunk.pts_ns, discontinuity);
         if result.is_ok() {
             self.last_frame_index = chunk.frame_index + chunk.frames as u64;
             self.last_pts = chunk.pts_ns + (chunk.frames as i64 * 1_000_000_000 / 48_000);
@@ -88,20 +135,10 @@ impl WhisperBridge {
         whisper_vad::marshal(std::mem::take(&mut self.events))
     }
 
-    pub(super) fn processing_error(&self) -> Option<WhisperVadTapError> {
-        self.error_stage
-            .is_primary()
-            .then(|| self.error.clone())
-            .flatten()
-    }
-
-    #[cfg(all(test, flexaudio_repro_addon))]
+    #[cfg(all(flexaudio_repro_addon, feature = "test-faults"))]
     pub(super) fn inject_shutdown_failure(&mut self, processing: bool) {
-        self.inject_invalid_pcm = processing;
+        self.fail_at_chunk = processing.then_some(2);
         self.inject_stop_failure = !processing;
-        // The fixture inspects retained stop/report diagnostics instead of throwing
-        // an additional asynchronous exception into the node:test runner.
-        self.reported_error = true;
     }
 }
 
@@ -118,21 +155,15 @@ impl PairingBridge {
         let Some(whisper) = self.whisper.as_mut() else {
             return;
         };
+        #[cfg(all(flexaudio_repro_addon, feature = "test-faults"))]
+        if stopping && std::mem::take(&mut whisper.inject_stop_failure) {
+            whisper.owner.inject_failure();
+        }
         let result = if stopping {
             whisper.owner.stop()
         } else {
             whisper.owner.flush()
         };
-        #[cfg(all(test, flexaudio_repro_addon))]
-        let result = if stopping && whisper.inject_stop_failure {
-            Err(WhisperVadTapError::Conversion.into())
-        } else {
-            result
-        };
-        if !stopping {
-            whisper.error = None;
-            whisper.reported_error = false;
-        }
         whisper.accept(
             result,
             if stopping {
@@ -145,38 +176,39 @@ impl PairingBridge {
     }
 
     pub(super) fn retain_shutdown_outcome(&self, core: Option<flexaudio::core::ShutdownReport>) {
-        let failure = self.whisper.as_ref().and_then(|owner| {
-            owner.error.clone().map(|error| shutdown::WhisperFailure {
-                error,
-                stage: owner.error_stage,
-            })
-        });
+        let failures = self
+            .whisper
+            .as_ref()
+            .map(|owner| owner.failures.clone())
+            .unwrap_or_default();
         let mut retained = self.report.lock().unwrap_or_else(lock_poisoned);
         let mut report = shutdown::ShutdownReport::from_core(core);
         // Legacy VAD's finalization also uses the shared cleanup recorder.
         if let Some(previous) = retained.take() {
             report.binding_cleanup = previous.binding_cleanup;
         }
-        report.whisper = failure;
+        report.whisper = failures;
         *retained = Some(report);
     }
 
     pub(super) fn report_whisper_failure(&mut self) {
-        let error = self
-            .whisper
-            .as_ref()
-            .filter(|owner| !owner.reported_error)
-            .and_then(|owner| owner.error.clone());
-        if let Some(error) = error {
-            self.emit_whisper_carrier();
+        let Some(owner) = self.whisper.as_mut() else {
+            return;
+        };
+        // A process failure waits for its terminal batch to ride a real PCM carrier.
+        // Flush/stop explicitly emit their closing carrier before calling this method.
+        if !owner.events.is_empty() {
+            return;
+        }
+        while let Some((failure, epoch)) = owner.notifications.pop_front() {
             self.on_chunk.call(
-                ChunkEmit::WhisperError(error),
+                ChunkEmit::WhisperFailed {
+                    error: failure.error,
+                    stage: failure.stage,
+                    epoch,
+                },
                 ThreadsafeFunctionCallMode::NonBlocking,
             );
-            self.whisper
-                .as_mut()
-                .expect("enabled attachment")
-                .reported_error = true;
         }
     }
 
@@ -229,6 +261,72 @@ impl PairingBridge {
     }
 }
 
+/// Validate the mock-only injection contract before acquiring any resources.
+pub(super) fn validate_fault_options(
+    attached: bool,
+    fail_at_chunk: Option<f64>,
+    reset_failures: Option<f64>,
+) -> Result<(Option<u32>, u32), whisper_vad::BoundaryError> {
+    if fail_at_chunk.is_none() && reset_failures.is_none() {
+        return Ok((None, 0));
+    }
+    #[cfg(not(feature = "test-faults"))]
+    {
+        let _ = attached;
+        Err(whisper_vad::BoundaryError::TestFaultsUnavailable)
+    }
+    #[cfg(feature = "test-faults")]
+    {
+        if !attached {
+            return Err(whisper_vad::BoundaryError::InvalidParameter);
+        }
+        fn count(value: f64, minimum: f64) -> Result<u32, whisper_vad::BoundaryError> {
+            if !value.is_finite()
+                || value.fract() != 0.0
+                || !(minimum..=f64::from(u32::MAX)).contains(&value)
+            {
+                return Err(whisper_vad::BoundaryError::InvalidParameter);
+            }
+            // The validated integer is representable without truncation or wrap.
+            Ok(value as u32)
+        }
+        Ok((
+            fail_at_chunk.map(|value| count(value, 1.0)).transpose()?,
+            reset_failures
+                .map(|value| count(value, 0.0))
+                .transpose()?
+                .unwrap_or(0),
+        ))
+    }
+}
+
+/// One `whisperVadFailed` notification for a failure of the attached VAD session only.
+///
+/// The typed cause is projected exactly like the retained shutdown cause (same message,
+/// operation context and stable whisper code), so the event and `shutdownReport()` agree.
+/// It contains no PCM, device name or transcript.
+pub(super) fn failure_event(
+    error: &WhisperVadTapError,
+    stage: shutdown::WhisperFailureStage,
+    epoch: u32,
+) -> super::JsStreamEvent {
+    super::JsStreamEvent {
+        permission: None,
+        kind: "whisperVadFailed".to_string(),
+        count: None,
+        error: Some(
+            shutdown::WhisperFailure {
+                error: error.clone(),
+                stage,
+            }
+            .audio_error(),
+        ),
+        loss: None,
+        message: None,
+        epoch: Some(epoch),
+    }
+}
+
 pub(super) fn throw_error(env: &Env, error: WhisperVadTapError) -> NapiError {
     match js_error(env, &error).and_then(|exception| env.throw(exception)) {
         Ok(()) => NapiError::new(Status::PendingException, error.to_string()),
@@ -244,17 +342,7 @@ pub(super) fn js_error(env: &Env, error: &WhisperVadTapError) -> napi::Result<Js
 }
 
 pub(super) fn error_code(error: &WhisperVadTapError) -> &'static str {
-    match error {
-        WhisperVadTapError::Vad(error) => whisper_vad::core_code(error).0,
-        WhisperVadTapError::InvalidStereoLength => "InvalidStereoLength",
-        WhisperVadTapError::InvalidPcm { .. } => "InvalidPcm",
-        WhisperVadTapError::CaptureSampleOverflow => "CaptureSampleOverflow",
-        WhisperVadTapError::PtsOutOfRange => "PtsOutOfRange",
-        WhisperVadTapError::UnsupportedConversionClock => "UnsupportedConversionClock",
-        WhisperVadTapError::Conversion => "Conversion",
-        WhisperVadTapError::Stopped => "Stopped",
-        WhisperVadTapError::FailedSession => "FailedSession",
-    }
+    error.code().as_str()
 }
 
 pub(super) fn settle_flush(
@@ -277,6 +365,27 @@ pub(super) fn settle_flush(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_whisper_failure_event_names_its_cause_and_epoch() {
+        let event = failure_event(
+            &WhisperVadTapError::Vad(flexaudio_vad::WhisperVadError::Inference),
+            shutdown::WhisperFailureStage::Process,
+            4,
+        );
+        assert_eq!(event.kind, "whisperVadFailed");
+        assert_eq!(event.epoch, Some(4));
+        assert!(event.permission.is_none() && event.count.is_none() && event.loss.is_none());
+        let error = event.error.expect("typed cause");
+        assert_eq!(error.kind, "backend");
+        assert_eq!(error.whisper_code.as_deref(), Some("Inference"));
+        assert_eq!(error.contexts[0].operation, "normalize");
+        assert!(
+            error.message.contains("Inference"),
+            "message: {}",
+            error.message
+        );
+    }
 
     #[test]
     fn attached_primary_and_secondary_use_canonical_origins_and_close_once() {

@@ -105,12 +105,7 @@ impl FlexStream {
             }
             self.stop_whisper();
         }
-        if self.whisper_error.is_some() {
-            cleanup.push(
-                Error::Backend("whisper VAD shutdown failed".into())
-                    .with_context(ErrorContext::new(Operation::Flush)),
-            );
-        }
+        cleanup.extend(self.whisper_cleanup.iter().cloned());
         let report = ShutdownReport::new(core.primary().cloned(), cleanup);
         let result = report.result();
         self.shutdown = Some(report);

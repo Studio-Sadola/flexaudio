@@ -71,6 +71,7 @@ impl Context {
 pub struct FlexErrorInfoV2 {
     pub(crate) root: Error,
     pub(crate) message: CString,
+    pub(crate) whisper_code: Option<CString>,
     contexts: Vec<Context>,
     pub(crate) secondary: Vec<FlexErrorInfoV2>,
 }
@@ -99,6 +100,7 @@ impl FlexErrorInfoV2 {
         Self {
             root: error.root().clone(),
             message: cstring(error.to_string()),
+            whisper_code: error.whisper_code().map(|code| cstring(code.as_str())),
             contexts,
             secondary,
         }

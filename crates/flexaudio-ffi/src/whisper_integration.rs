@@ -284,24 +284,12 @@ pub unsafe extern "C" fn flexaudio_poll_chunk_v2(s: *mut FlexStream, out: *mut F
             out.write(chunk);
             return 1;
         }
-        if !stream.whisper_error_reported && stream.whisper_events.is_empty() {
-            if let Some(error) = stream.whisper_error.clone() {
-                stream.whisper_error_reported = true;
-                return reject(tap_status(&error), &error.to_string());
-            }
-        }
         match stream.next_whisper_chunk() {
             Ok(Some(chunk)) => {
                 out.write(chunk);
                 1
             }
             Ok(None) => {
-                if !stream.whisper_error_reported {
-                    if let Some(error) = stream.whisper_error.clone() {
-                        stream.whisper_error_reported = true;
-                        return reject(tap_status(&error), &error.to_string());
-                    }
-                }
                 if let Some(error) = stream.inner.terminal_error() {
                     crate::error::set_audio_error(error);
                     return code::FLEX_FAILURE;
@@ -383,18 +371,11 @@ impl FlexStream {
         if let Err(error) = self.queue_whisper_input() {
             return crate::vad::vad_failure(error);
         }
-        // Report intake failures before a successful flush can recover the tap.
-        let intake_error = (!self.whisper_error_reported)
-            .then(|| self.whisper_error.clone())
-            .flatten();
         let result = flush(self.whisper.as_mut().expect("enabled attachment"));
-        self.whisper_error = None;
-        self.whisper_error_reported = false;
-        self.accept_whisper(result);
+        let flush_error = result.as_ref().err().map(|failure| failure.error.clone());
+        self.accept_whisper(result, flexaudio::Operation::Flush);
         self.queue_whisper_carrier();
-        if let Some(error) = intake_error.or_else(|| self.whisper_error.clone()) {
-            self.whisper_error.get_or_insert(error.clone());
-            self.whisper_error_reported = true;
+        if let Some(error) = flush_error {
             return reject(tap_status(&error), &error.to_string());
         }
         code::FLEX_OK
@@ -406,12 +387,22 @@ impl FlexStream {
             Vec<flexaudio_vad::AttachedWhisperVadEvent>,
             flexaudio_vad::WhisperVadTapFailure,
         >,
+        operation: flexaudio::Operation,
     ) {
         match result {
-            Ok(events) => self.whisper_events.extend(events),
+            Ok(events) => {
+                if matches!(
+                    operation,
+                    flexaudio::Operation::Normalize | flexaudio::Operation::Flush
+                ) {
+                    self.whisper_error = None;
+                }
+                self.whisper_events.extend(events);
+            }
             Err(failure) => {
                 self.whisper_events.extend(failure.terminal_events);
                 if self.whisper_error.is_none() {
+                    self.whisper_cleanup.push(failure.error.audio_error());
                     self.whisper_error = Some(failure.error);
                 }
             }
@@ -422,14 +413,12 @@ impl FlexStream {
             return;
         }
         while let Some(chunk) = self.inner.poll_capture() {
-            if self.whisper_error.is_some() {
-                continue;
-            }
+            let discontinuity = chunk.flags.contains(flexaudio::ChunkFlags::DISCONTINUITY);
             let result = self.whisper.as_mut().expect("enabled attachment").process(
                 &chunk.data,
                 chunk.frame_index,
                 chunk.pts_ns,
-                chunk.flags.contains(flexaudio::ChunkFlags::DISCONTINUITY),
+                discontinuity,
             );
             if result.is_ok() {
                 self.whisper_origin = (
@@ -437,7 +426,7 @@ impl FlexStream {
                     chunk.pts_ns + (chunk.frames as i64 * 1_000_000_000 / 48_000),
                 );
             }
-            self.accept_whisper(result);
+            self.accept_whisper(result, flexaudio::Operation::Normalize);
         }
     }
     pub(crate) fn versioned_chunk(&mut self, chunk: FlexChunk) -> FlexChunkV2 {
@@ -497,7 +486,7 @@ impl FlexStream {
             .expect("whisper attachment excludes legacy VAD");
         if let Some(tap) = self.whisper.as_mut() {
             let result = tap.stop();
-            self.accept_whisper(result);
+            self.accept_whisper(result, flexaudio::Operation::Stop);
             self.queue_whisper_carrier();
         }
     }
@@ -565,7 +554,7 @@ mod tests {
             whisper_events: Vec::new(),
             whisper_origin: (0, 0),
             whisper_error: None,
-            whisper_error_reported: false,
+            whisper_cleanup: Vec::new(),
             ready_chunks: Default::default(),
             denoiser: None,
             vad: None,
@@ -644,7 +633,7 @@ mod tests {
                 whisper_events: Vec::new(),
                 whisper_origin: (0, 0),
                 whisper_error: None,
-                whisper_error_reported: false,
+                whisper_cleanup: Vec::new(),
                 ready_chunks: Default::default(),
                 vad: None,
                 denoiser: None,

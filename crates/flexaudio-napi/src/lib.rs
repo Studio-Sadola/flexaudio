@@ -92,6 +92,7 @@ const DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 type ChunkTsfn = ThreadsafeFunction<ChunkEmit, ErrorStrategy::Fatal>;
 type SettleTsfn = ThreadsafeFunction<(), ErrorStrategy::Fatal>;
 type EventTsfn = ThreadsafeFunction<JsStreamEvent, ErrorStrategy::Fatal>;
+type EventCallbacks = (Option<EventTsfn>, Option<Arc<UserCallback>>);
 type DeviceTsfn = ThreadsafeFunction<JsDeviceEvent, ErrorStrategy::Fatal>;
 
 /// Values queued on the onChunk TSFN. Chunks go to the user's `onChunk`; `StopFlushed` is
@@ -99,7 +100,13 @@ type DeviceTsfn = ThreadsafeFunction<JsDeviceEvent, ErrorStrategy::Fatal>;
 enum ChunkEmit {
     Chunk(Box<JsAudioChunk>),
     WhisperFlushed(SendDeferred, Option<flexaudio_vad::WhisperVadTapError>),
-    WhisperError(flexaudio_vad::WhisperVadTapError),
+    /// A whisper-only failure: the closing carrier is already queued on this same TSFN,
+    /// and the notification is handed to onEvent only after it (never an uncaught throw).
+    WhisperFailed {
+        error: flexaudio_vad::WhisperVadTapError,
+        stage: shutdown::WhisperFailureStage,
+        epoch: u32,
+    },
     StopFlushed,
     VadError(String),
 }
@@ -128,15 +135,15 @@ struct StreamInner {
 /// `napi_delete_reference` is restricted to the JS thread. Explicitly release it in StopFlushed /
 /// the settlement callback (both TSFN callbacks on the JS thread); Drop during TSFN finalization
 /// is then a no-op. This releases the onChunk closure after `stop()` even if the TSFN remains alive.
-struct UserChunkCb {
+struct UserCallback {
     env: sys::napi_env,
     refer: AtomicPtr<c_void>,
 }
 
-unsafe impl Send for UserChunkCb {}
-unsafe impl Sync for UserChunkCb {}
+unsafe impl Send for UserCallback {}
+unsafe impl Sync for UserCallback {}
 
-impl UserChunkCb {
+impl UserCallback {
     fn new(env: sys::napi_env, refer: sys::napi_ref) -> Arc<Self> {
         Arc::new(Self {
             env,
@@ -157,7 +164,7 @@ impl UserChunkCb {
     }
 }
 
-impl Drop for UserChunkCb {
+impl Drop for UserCallback {
     fn drop(&mut self) {
         self.release();
     }
@@ -229,20 +236,18 @@ fn forward_stream_events(
     terminal: &Mutex<Option<StreamTerminal>>,
 ) {
     if let Some(error) = stream.terminal_error() {
-        *terminal.lock().unwrap_or_else(lock_poisoned) = Some(StreamTerminal::Capture(error));
+        *terminal.lock().unwrap_or_else(lock_poisoned) = Some(StreamTerminal(error));
     }
     while let Some(event) = stream.poll_event() {
         if let Event::PermissionDenied { permission, detail } = &event {
-            *terminal.lock().unwrap_or_else(lock_poisoned) = Some(StreamTerminal::Capture(
-                flexaudio::Error::PermissionDenied {
+            *terminal.lock().unwrap_or_else(lock_poisoned) =
+                Some(StreamTerminal(flexaudio::Error::PermissionDenied {
                     permission: *permission,
                     detail: detail.clone(),
-                },
-            ));
+                }));
         }
         if let Event::TerminalError { error } = &event {
-            *terminal.lock().unwrap_or_else(lock_poisoned) =
-                Some(StreamTerminal::Capture(error.clone()));
+            *terminal.lock().unwrap_or_else(lock_poisoned) = Some(StreamTerminal(error.clone()));
         }
         if let Some(callback) = callback {
             callback.call(event_to_js(event), ThreadsafeFunctionCallMode::NonBlocking);
@@ -260,26 +265,14 @@ fn take_stop_waiters(phase: &Mutex<StopPhase>) -> Vec<SendDeferred> {
 }
 
 /// Durable copy of the core's terminal failure, retained after the bridge exits.
+///
+/// A whisper-compatible VAD failure is not a capture failure: it is reported once through
+/// `whisperVadFailed` and retained in the shutdown report's cleanup causes.
 #[derive(Clone)]
-enum StreamTerminal {
-    Capture(flexaudio::Error),
-    Whisper(flexaudio_vad::WhisperVadTapError),
-}
+struct StreamTerminal(flexaudio::Error);
 impl std::fmt::Display for StreamTerminal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Capture(error) => error.fmt(formatter),
-            Self::Whisper(error) => error.fmt(formatter),
-        }
-    }
-}
-fn retain_whisper_failure(
-    terminal: &Mutex<Option<StreamTerminal>>,
-    error: flexaudio_vad::WhisperVadTapError,
-) {
-    let mut terminal = terminal.lock().unwrap_or_else(lock_poisoned);
-    if !matches!(*terminal, Some(StreamTerminal::Capture(_))) {
-        *terminal = Some(StreamTerminal::Whisper(error));
+        self.0.fmt(formatter)
     }
 }
 
@@ -300,20 +293,11 @@ fn record_bridge_failure(report: &FinalReport, terminal: &Mutex<Option<StreamTer
         let mut report = report.lock().unwrap_or_else(lock_poisoned);
         if report.is_none() {
             let mut retained = shutdown::ShutdownReport::default();
-            match terminal {
-                Some(StreamTerminal::Capture(error)) => {
-                    retained.core = Some(flexaudio::core::ShutdownReport::new(
-                        Some(error),
-                        Vec::new(),
-                    ));
-                }
-                Some(StreamTerminal::Whisper(error)) => {
-                    retained.whisper = Some(shutdown::WhisperFailure {
-                        error,
-                        stage: shutdown::WhisperFailureStage::Process,
-                    });
-                }
-                None => {}
+            if let Some(StreamTerminal(error)) = terminal {
+                retained.core = Some(flexaudio::core::ShutdownReport::new(
+                    Some(error),
+                    Vec::new(),
+                ));
             }
             *report = Some(retained);
         }
@@ -386,10 +370,32 @@ fn unref_chunk_weak(cell: &OnceLock<Weak<ChunkTsfn>>, env: &Env) {
 fn make_user_chunk_cb(
     env: &Env,
     on_chunk: &Function<JsAudioChunk, Unknown>,
-) -> napi::Result<Arc<UserChunkCb>> {
+) -> napi::Result<Arc<UserCallback>> {
     let mut refer = ptr::null_mut();
     check_status!(unsafe { sys::napi_create_reference(env.raw(), on_chunk.raw(), 1, &mut refer) })?;
-    Ok(UserChunkCb::new(env.raw(), refer))
+    Ok(UserCallback::new(env.raw(), refer))
+}
+
+/// Retain the original event callback for ordered Whisper delivery. Core notifications
+/// use an unreferenced TSFN; the chunk queue owns the event-loop lifetime through stop.
+fn make_stream_event_callbacks(
+    env: &Env,
+    callback: Option<Function<JsStreamEvent, Unknown>>,
+) -> napi::Result<EventCallbacks> {
+    let Some(callback) = callback else {
+        return Ok((None, None));
+    };
+    let mut refer = ptr::null_mut();
+    check_status!(unsafe { sys::napi_create_reference(env.raw(), callback.raw(), 1, &mut refer) })?;
+    let retained = UserCallback::new(env.raw(), refer);
+    let function = unsafe { napi::JsFunction::from_napi_value(env.raw(), callback.raw())? };
+    let mut tsfn = function
+        .create_threadsafe_function::<JsStreamEvent, JsStreamEvent, _, ErrorStrategy::Fatal>(
+            0,
+            |ctx| Ok(vec![ctx.value]),
+        )?;
+    tsfn.unref(env)?;
+    Ok((Some(tsfn), Some(retained)))
 }
 
 /// TSFN that calls the user's `onChunk`. Chunks go to the user; `StopFlushed` resolves the
@@ -398,10 +404,11 @@ fn make_user_chunk_cb(
 fn make_chunk_tsfn(
     env: &Env,
     stop_phase: Arc<Mutex<StopPhase>>,
-    user: Arc<UserChunkCb>,
+    user: Arc<UserCallback>,
     chunk_weak: ChunkTsfnWeakCell,
     terminal: TerminalError,
     report: FinalReport,
+    on_event: Option<Arc<UserCallback>>,
 ) -> napi::Result<Arc<ChunkTsfn>> {
     let pump =
         env.create_function_from_closure("flexaudioChunkPump", |ctx| ctx.env.get_undefined())?;
@@ -413,7 +420,7 @@ fn make_chunk_tsfn(
                 ChunkEmit::Chunk(chunk) => {
                     let denied = matches!(
                         *terminal.lock().unwrap_or_else(lock_poisoned),
-                        Some(StreamTerminal::Capture(_))
+                        Some(StreamTerminal(_))
                     );
                     if denied
                         && !(chunk.frames == 0
@@ -444,9 +451,27 @@ fn make_chunk_tsfn(
                     whisper_integration::settle_flush(&ctx.env, deferred, error)?;
                     Ok(Vec::<Unknown>::new())
                 }
-                ChunkEmit::WhisperError(error) => {
-                    let error = whisper_integration::js_error(&ctx.env, &error)?;
-                    ctx.env.throw(error)?;
+                ChunkEmit::WhisperFailed {
+                    error,
+                    stage,
+                    epoch,
+                } => {
+                    // The failure's terminal carrier was queued on this same TSFN before
+                    // this value, so its onChunk call ran first. A whisper-only failure is
+                    // reported to onEvent; it must never become an uncaught exception.
+                    if let Some(on_event) = &on_event {
+                        let refer = on_event.refer();
+                        if !refer.is_null() {
+                            let mut value = ptr::null_mut();
+                            check_status!(unsafe {
+                                sys::napi_get_reference_value(ctx.env.raw(), refer, &mut value)
+                            })?;
+                            let callback: Function<JsStreamEvent, Unknown> =
+                                unsafe { Function::from_napi_value(ctx.env.raw(), value)? };
+                            callback
+                                .call(whisper_integration::failure_event(&error, stage, epoch))?;
+                        }
+                    }
                     Ok(Vec::<Unknown>::new())
                 }
                 ChunkEmit::VadError(message) => {
@@ -460,6 +485,9 @@ fn make_chunk_tsfn(
                     // Release the event-loop reference after termination and resolution (ordering contract).
                     unref_chunk_weak(&chunk_weak, &ctx.env);
                     user.release();
+                    if let Some(callback) = &on_event {
+                        callback.release();
+                    }
                     Ok(Vec::<Unknown>::new())
                 }
             }
@@ -479,8 +507,9 @@ fn make_settle_tsfn(
     env: &Env,
     stop_phase: Arc<Mutex<StopPhase>>,
     chunk_weak: ChunkTsfnWeakCell,
-    user: Arc<UserChunkCb>,
+    user: Arc<UserCallback>,
     report: FinalReport,
+    on_event: Option<Arc<UserCallback>>,
 ) -> napi::Result<SettleTsfn> {
     let pump =
         env.create_function_from_closure("flexaudioStopSettle", |ctx| ctx.env.get_undefined())?;
@@ -491,6 +520,9 @@ fn make_settle_tsfn(
             }
             unref_chunk_weak(&chunk_weak, &ctx.env);
             user.release();
+            if let Some(callback) = &on_event {
+                callback.release();
+            }
             Ok(Vec::<Unknown>::new())
         }
     })?;
@@ -736,6 +768,9 @@ pub struct VadOptions {
 /// capture continues and may stay silent until granted. silenceWhileSourceActive
 /// is advisory: the system-audio diagnosis is inconclusive and capture continues.
 /// Missing permission and genuine digital silence remain possible in that case.
+/// whisperVadFailed is advisory for capture: the attached whisper VAD session failed,
+/// carrying its typed code, and capture, PCM delivery, pause/resume, switchSource and
+/// stop keep working. It is delivered after that failure's `epochEnd(error)` carrier.
 #[napi(object)]
 pub struct JsStreamEvent {
     /// Present on permissionDenied and permissionPending: microphone | systemAudio.
@@ -747,6 +782,8 @@ pub struct JsStreamEvent {
     pub error: Option<JsAudioError>,
     pub loss: Option<JsAudioLoss>,
     pub message: Option<String>,
+    /// Present on whisperVadFailed: the epoch whose VAD session failed.
+    pub epoch: Option<u32>,
 }
 
 /// JS device event. `type` identifies the kind; device/id/sourceKind are optional.
@@ -1093,6 +1130,7 @@ fn build_config(options: &OpenOptions) -> napi::Result<StreamConfig> {
 /// result through `result_tx` (JS expects a synchronous return).
 struct SwitchCmd {
     config: StreamConfig,
+    mock_source: bool,
     result_tx: mpsc::Sender<flexaudio::core::Result<()>>,
 }
 
@@ -1456,6 +1494,12 @@ impl PairingBridge {
                     Some(s) => {
                         if s.pts_ns < p_pts - PAIR_WINDOW_NS / 2 {
                             // Secondary too old (e.g. primary dropped): discard the orphan and inspect the next secondary.
+                            if self.whisper.is_some() {
+                                // Preserve this secondary PCM on a real primary carrier.
+                                // Empty midstream envelopes look like stop to consumers;
+                                // the secondary retains its own original clock metadata.
+                                break self.secondary_fifo.pop_front();
+                            }
                             let orphan = self.secondary_fifo.pop_front().unwrap();
                             self.emit_secondary_envelope(orphan);
                             continue;
@@ -1501,12 +1545,14 @@ pub struct FlexStream {
     settle_tsfn: SettleTsfn,
     terminal: TerminalError,
     report: FinalReport,
+    mock_source: bool,
 }
 
 impl FlexStream {
     /// Accept an already `start()`ed Stream and the emitting [`PairingBridge`], then spawn a bridge
     /// thread. Stream is Send, so move it to the thread (poll_* takes
     /// &mut self, requiring thread ownership). The bridge holds integrated VAD / secondary tap settings.
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         env: &Env,
         stream: flexaudio::Stream,
@@ -1515,6 +1561,7 @@ impl FlexStream {
         chunk_tsfn: Arc<ChunkTsfn>,
         settle_tsfn: SettleTsfn,
         terminal: TerminalError,
+        mock_source: bool,
     ) -> napi::Result<Self> {
         let report = bridge.report.clone();
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1542,7 +1589,13 @@ impl FlexStream {
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
                             BridgeCmd::Switch(sw) => {
-                                let r = stream.switch_source(sw.config);
+                                let r = if sw.mock_source {
+                                    stream.switch_backend(Box::new(flexaudio::MockBackend::new(
+                                        48_000, 2, 0.0,
+                                    )))
+                                } else {
+                                    stream.switch_source(sw.config)
+                                };
                                 // Ignore a dropped receiver (switch_source caller).
                                 let _ = sw.result_tx.send(r);
                             }
@@ -1580,17 +1633,13 @@ impl FlexStream {
                                 }
                                 bridge.drain_pairs();
                                 bridge.flush_whisper(false);
+                                // flushWhisperVad reinitializes on success, so a previous
+                                // whisper-only failure no longer applies to this stream.
+                                bridge.report_whisper_failure();
                                 let error = bridge
                                     .whisper
                                     .as_ref()
                                     .and_then(|owner| owner.error.clone());
-                                if matches!(
-                                    *thread_terminal.lock().unwrap_or_else(lock_poisoned),
-                                    Some(StreamTerminal::Whisper(_))
-                                ) {
-                                    *thread_terminal.lock().unwrap_or_else(lock_poisoned) =
-                                        error.clone().map(StreamTerminal::Whisper);
-                                }
                                 bridge.on_chunk.call(
                                     ChunkEmit::WhisperFlushed(deferred, error),
                                     ThreadsafeFunctionCallMode::NonBlocking,
@@ -1605,7 +1654,7 @@ impl FlexStream {
                     }
                     if let Some(error) = stream.terminal_error() {
                         *thread_terminal.lock().unwrap_or_else(lock_poisoned) =
-                            Some(StreamTerminal::Capture(error));
+                            Some(StreamTerminal(error));
                         bridge.primary_fifo.clear();
                         bridge.secondary_fifo.clear();
                         bridge.pending_flush_events.clear();
@@ -1620,14 +1669,9 @@ impl FlexStream {
                         bridge.on_secondary(chunk);
                     }
                     bridge.drain_pairs();
+                    // A whisper-only failure never becomes the capture terminal: it is
+                    // reported once through whisperVadFailed and retained as cleanup.
                     bridge.report_whisper_failure();
-                    if let Some(error) = bridge
-                        .whisper
-                        .as_ref()
-                        .and_then(|owner| owner.error.clone())
-                    {
-                        retain_whisper_failure(&thread_terminal, error);
-                    }
                     forward_stream_events(&mut stream, on_event.as_ref(), &thread_terminal);
                     thread::sleep(POLL_INTERVAL);
                 }
@@ -1654,7 +1698,7 @@ impl FlexStream {
                 forward_stream_events(&mut stream, on_event.as_ref(), &thread_terminal);
                 if let Some(error) = stream.terminal_error() {
                     *thread_terminal.lock().unwrap_or_else(lock_poisoned) =
-                        Some(StreamTerminal::Capture(error));
+                        Some(StreamTerminal(error));
                     bridge.primary_fifo.clear();
                     bridge.secondary_fifo.clear();
                     bridge.pending_flush_events.clear();
@@ -1669,7 +1713,7 @@ impl FlexStream {
                 bridge.drain_pairs(); // 2 Deliver trailing audio
                 if let Some(error) = stream.terminal_error() {
                     *thread_terminal.lock().unwrap_or_else(lock_poisoned) =
-                        Some(StreamTerminal::Capture(error));
+                        Some(StreamTerminal(error));
                     bridge.primary_fifo.clear();
                     bridge.secondary_fifo.clear();
                     bridge.pending_flush_events.clear();
@@ -1681,13 +1725,9 @@ impl FlexStream {
                 }
                 if bridge.whisper.is_some() {
                     bridge.flush_whisper(true);
-                    if let Some(error) = bridge
-                        .whisper
-                        .as_ref()
-                        .and_then(|owner| owner.processing_error())
-                    {
-                        retain_whisper_failure(&thread_terminal, error);
-                    }
+                    // Deliver the one whisperVadFailed notification (if not already sent)
+                    // before stop() settles; the retained report carries it afterwards.
+                    bridge.report_whisper_failure();
                 } else if stream.terminal_error().is_none() {
                     bridge.flush_vad_final();
                 }
@@ -1727,6 +1767,7 @@ impl FlexStream {
             settle_tsfn,
             terminal,
             report,
+            mock_source,
         })
     }
 
@@ -1861,7 +1902,10 @@ impl FlexStream {
         Ok(promise)
     }
 
-    /// Stored terminal failure, or undefined when capture has not terminally failed.
+    /// Stored **capture** terminal failure, or undefined when capture has not terminally
+    /// failed. An attached whisper-compatible VAD failure is not a capture failure: it is
+    /// reported once as a `whisperVadFailed` event and retained in `shutdownReport()`'s
+    /// cleanup causes, so this remains undefined after a whisper-only failure.
     /// Remains available after stop and does not consume onEvent notifications.
     #[napi]
     pub fn terminal_error(&self) -> Either<JsStreamEvent, Undefined> {
@@ -1869,12 +1913,7 @@ impl FlexStream {
             .lock()
             .unwrap_or_else(lock_poisoned)
             .clone()
-            .map(|error| {
-                Either::A(match error {
-                    StreamTerminal::Capture(error) => terminal_event(error),
-                    StreamTerminal::Whisper(error) => event_to_js(Event::Error(error.to_string())),
-                })
-            })
+            .map(|StreamTerminal(error)| Either::A(terminal_event(error)))
             .unwrap_or(Either::B(()))
     }
 
@@ -1898,16 +1937,28 @@ impl FlexStream {
     /// `seq` stays continuous across switches; the first chunk afterward has the DISCONTINUITY flag.
     /// `options.gain` is ignored (gain is stream state; use `setGain` to change it).
     ///
+    /// A whisper-compatible VAD failure does not block a source switch: the switch closes
+    /// the old epoch and the next capture frame reinitializes the VAD session.
+    ///
     /// Throws if `stop()` has already completed (the bridge thread has stopped).
     #[napi]
     pub fn switch_source(&self, env: Env, options: OpenOptions) -> napi::Result<()> {
-        if let Some(error) = self.terminal.lock().unwrap_or_else(lock_poisoned).clone() {
-            return Err(match error {
-                StreamTerminal::Capture(error) => boundary::throw_error(&env, error),
-                StreamTerminal::Whisper(error) => whisper_integration::throw_error(&env, error),
-            });
+        if let Some(StreamTerminal(error)) =
+            self.terminal.lock().unwrap_or_else(lock_poisoned).clone()
+        {
+            return Err(boundary::throw_error(&env, error));
         }
         // As in openStream, build_config converts options → StreamConfig.
+        let mock_source = options.kind == "mock";
+        if mock_source && !self.mock_source {
+            return Err(boundary::throw_error(&env, flexaudio::Error::InvalidArg(
+                "mock source switches require a mock stream because real streams must select a capture backend".into(),
+            )));
+        }
+        let mut options = options;
+        if mock_source {
+            options.kind = "mic".into();
+        }
         let config = build_config(&options).map_err(|error| {
             if options.chunk_ms.is_some_and(|ms| ms != 20.0) {
                 boundary::throw_error(
@@ -1928,7 +1979,11 @@ impl FlexStream {
         };
         let (result_tx, result_rx) = mpsc::channel();
         cmd_tx
-            .send(BridgeCmd::Switch(SwitchCmd { config, result_tx }))
+            .send(BridgeCmd::Switch(SwitchCmd {
+                config,
+                mock_source,
+                result_tx,
+            }))
             .map_err(|_| {
                 NapiError::new(
                     Status::GenericFailure,
@@ -1965,14 +2020,15 @@ impl FlexStream {
         Ok(())
     }
 
-    /// Unpause and resume delivery. Throws if `stop()` has already completed.
+    /// Unpause and resume delivery. The first chunk afterward is a discontinuity, which also
+    /// reinitializes a failed whisper-compatible VAD session; it never throws for that failure.
+    /// Throws if `stop()` has already completed.
     #[napi]
     pub fn resume(&self, env: Env) -> napi::Result<()> {
-        if let Some(error) = self.terminal.lock().unwrap_or_else(lock_poisoned).clone() {
-            return Err(match error {
-                StreamTerminal::Capture(error) => boundary::throw_error(&env, error),
-                StreamTerminal::Whisper(error) => whisper_integration::throw_error(&env, error),
-            });
+        if let Some(StreamTerminal(error)) =
+            self.terminal.lock().unwrap_or_else(lock_poisoned).clone()
+        {
+            return Err(boundary::throw_error(&env, error));
         }
         let cmd_tx = {
             let g = self.inner.lock().unwrap_or_else(lock_poisoned);
@@ -2255,7 +2311,7 @@ pub fn open_stream(
         Unknown,
     >,
     #[napi(ts_arg_type = "((event: JsStreamEvent) => void) | undefined | null")] on_event: Option<
-        EventTsfn,
+        Function<JsStreamEvent, Unknown>,
     >,
 ) -> napi::Result<FlexStream> {
     let whisper_options = options
@@ -2341,6 +2397,7 @@ pub fn open_stream(
     let terminal: TerminalError = Arc::new(Mutex::new(None));
     let report: FinalReport = Arc::new(Mutex::new(None));
     let user = make_user_chunk_cb(&env, &on_chunk)?;
+    let (on_event, event_callback) = make_stream_event_callbacks(&env, on_event)?;
     let chunk_weak: ChunkTsfnWeakCell = Arc::new(OnceLock::new());
     let on_chunk = make_chunk_tsfn(
         &env,
@@ -2349,8 +2406,16 @@ pub fn open_stream(
         chunk_weak.clone(),
         terminal.clone(),
         report.clone(),
+        event_callback.clone(),
     )?;
-    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user, report.clone())?;
+    let settle_tsfn = make_settle_tsfn(
+        &env,
+        stop_phase.clone(),
+        chunk_weak,
+        user,
+        report.clone(),
+        event_callback,
+    )?;
     let bridge = PairingBridge {
         whisper,
         on_chunk: on_chunk.as_ref().clone(),
@@ -2378,6 +2443,7 @@ pub fn open_stream(
         on_chunk,
         settle_tsfn,
         terminal,
+        false,
     )
 }
 
@@ -2422,6 +2488,12 @@ pub fn watch_devices(
     })
 }
 
+/// Test-only capability marker; absent from builds without fault injection.
+#[cfg(feature = "test-faults")]
+#[napi]
+#[allow(non_upper_case_globals)]
+pub const __whisperVadTestFaults: bool = true;
+
 /// Test-only; outside the public API.
 ///
 /// Create a stream by passing `MockBackend` to low-level `Stream::open`, then run it through the
@@ -2436,6 +2508,11 @@ pub fn watch_devices(
 /// 'primary'), allowing `flushVad`, `vadEvents` `atNs`, and automatic `stop()` flush to be verified
 /// without real audio. Tests construct it with `minSpeechMs=0`, so threshold 0 lets `flushVad`
 /// reliably finalize open utterances (verifies RT finalization even with synthetic waves lacking silence).
+///
+/// `whisperVad` attaches the canonical VAD owner; `onEvent` receives stream notifications
+/// (including `whisperVadFailed`). `whisperVadFailAtChunk` fails the VAD session on that 1-based
+/// capture chunk and `whisperVadResetFailures` fails the next reinitializations, so a
+/// whisper-only failure and its recovery path can be exercised without a model fault or device.
 ///
 /// JS name is `__openMockStream`. Leading `__` marks it outside the public API. napi's default
 /// conversion drops leading underscores, producing `openMockStream`, so `js_name` fixes the name.
@@ -2456,7 +2533,20 @@ pub fn open_mock_stream(
     vad_threshold: Option<f64>,
     vad_tap: Option<String>,
     whisper_vad: Option<napi::JsUnknown>,
+    #[napi(ts_arg_type = "((event: JsStreamEvent) => void) | undefined | null")] on_event: Option<
+        Function<JsStreamEvent, Unknown>,
+    >,
+    whisper_vad_fail_at_chunk: Option<f64>,
+    whisper_vad_reset_failures: Option<f64>,
 ) -> napi::Result<FlexStream> {
+    let (fault_chunk, reset_faults) = whisper_integration::validate_fault_options(
+        whisper_vad.is_some(),
+        whisper_vad_fail_at_chunk,
+        whisper_vad_reset_failures,
+    )
+    .map_err(|error| whisper_vad::throw_boundary(&env, error))?;
+    #[cfg(not(feature = "test-faults"))]
+    let _ = (fault_chunk, reset_faults);
     let whisper_options = whisper_vad
         .map(|value| {
             whisper_vad::stream_options(
@@ -2472,6 +2562,12 @@ pub fn open_mock_stream(
         .map(|(params, options, tap)| whisper_integration::WhisperBridge::new(params, options, tap))
         .transpose()
         .map_err(|error| whisper_integration::throw_error(&env, error))?;
+    #[cfg(feature = "test-faults")]
+    let mut whisper = whisper;
+    #[cfg(feature = "test-faults")]
+    if let Some(bridge) = whisper.as_mut() {
+        bridge.inject_faults(fault_chunk, reset_faults);
+    }
     // Secondary tap (only when configured). Validate encoding and build marshaling settings.
     let secondary_cfg = match secondary_rate {
         Some(rate) => {
@@ -2542,6 +2638,7 @@ pub fn open_mock_stream(
     let terminal: TerminalError = Arc::new(Mutex::new(None));
     let report: FinalReport = Arc::new(Mutex::new(None));
     let user = make_user_chunk_cb(&env, &on_chunk)?;
+    let (on_event, event_callback) = make_stream_event_callbacks(&env, on_event)?;
     let chunk_weak: ChunkTsfnWeakCell = Arc::new(OnceLock::new());
     let on_chunk = make_chunk_tsfn(
         &env,
@@ -2550,8 +2647,16 @@ pub fn open_mock_stream(
         chunk_weak.clone(),
         terminal.clone(),
         report.clone(),
+        event_callback.clone(),
     )?;
-    let settle_tsfn = make_settle_tsfn(&env, stop_phase.clone(), chunk_weak, user, report.clone())?;
+    let settle_tsfn = make_settle_tsfn(
+        &env,
+        stop_phase.clone(),
+        chunk_weak,
+        user,
+        report.clone(),
+        event_callback,
+    )?;
     let bridge = PairingBridge {
         whisper,
         on_chunk: on_chunk.as_ref().clone(),
@@ -2571,7 +2676,16 @@ pub fn open_mock_stream(
         last_primary_frame_index: 0,
         last_primary_dropped: 0,
     };
-    FlexStream::spawn(&env, stream, bridge, None, on_chunk, settle_tsfn, terminal)
+    FlexStream::spawn(
+        &env,
+        stream,
+        bridge,
+        on_event,
+        on_chunk,
+        settle_tsfn,
+        terminal,
+        true,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3456,6 +3570,7 @@ mod reproduction_tests {
             "audioLoss",
             "clipped",
             "unknown",
+            "whisperVadFailed",
         ] {
             assert!(stream.contains(&format!("type: '{tag}'")), "missing {tag}");
         }
@@ -3464,6 +3579,10 @@ mod reproduction_tests {
             assert!(stream.contains(&format!("type: '{tag}'; error: AudioError")));
         }
         assert!(stream.contains("type: 'audioLoss'; loss: AudioLoss"));
+        assert!(
+            stream.contains("type: 'whisperVadFailed'; error: AudioError; epoch: number"),
+            "a whisper failure must carry its typed error and failed epoch"
+        );
     }
 
     #[test]
@@ -3510,5 +3629,5 @@ mod reproduction_tests {
 }
 
 // Build the test addon with cargo rustc --lib -- --cfg test --cfg flexaudio_repro_addon.
-#[cfg(all(test, flexaudio_repro_addon))]
+#[cfg(all(flexaudio_repro_addon, feature = "test-faults"))]
 mod reproduction_bridge;

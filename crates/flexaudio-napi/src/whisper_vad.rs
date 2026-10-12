@@ -26,11 +26,15 @@ pub(crate) enum BoundaryError {
     ConflictingVad,
     UnsupportedTap,
     UnsupportedConversionClock,
+    #[cfg(not(feature = "test-faults"))]
+    TestFaultsUnavailable,
 }
 
 impl BoundaryError {
     fn code(&self) -> &'static str {
         match self {
+            #[cfg(not(feature = "test-faults"))]
+            Self::TestFaultsUnavailable => "TestFaultsUnavailable",
             Self::InvalidParameter => "InvalidParameter",
             Self::ConflictingVad => "ConflictingVad",
             Self::UnsupportedTap => "UnsupportedTap",
@@ -40,7 +44,9 @@ impl BoundaryError {
 
     fn message(&self) -> &'static str {
         match self {
-            Self::InvalidParameter => "invalid whisper VAD options",
+            #[cfg(not(feature = "test-faults"))]
+            Self::TestFaultsUnavailable => "Whisper VAD failure injection is unavailable because injection is not compiled into this build",
+            Self::InvalidParameter => "invalid whisper VAD options because a field, type or value violates the supported contract",
             Self::ConflictingVad => "whisperVad cannot be combined with vad or vadTap",
             Self::UnsupportedTap => "whisperVad tap must be primary or an enabled secondary output",
             Self::UnsupportedConversionClock => {

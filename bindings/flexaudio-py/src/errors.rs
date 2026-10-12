@@ -164,6 +164,10 @@ impl AudioError {
         self.0.permission().map(fa::Permission::as_str)
     }
     #[getter]
+    fn whisper_code(&self) -> Option<&'static str> {
+        self.0.whisper_code().map(fa::WhisperCode::as_str)
+    }
+    #[getter]
     fn advertised(&self) -> Option<NativeFormat> {
         match self.0.root() {
             fa::Error::NativeFormatChanged { advertised, .. } => Some((*advertised).into()),
@@ -195,6 +199,9 @@ impl AudioError {
         d.set_item("secondary", secondary)?;
         if let Some(permission) = self.permission() {
             d.set_item("permission", permission)?;
+        }
+        if let Some(code) = self.whisper_code() {
+            d.set_item("whisper_code", code)?;
         }
         if let (Some(advertised), Some(actual)) = (self.advertised(), self.actual()) {
             d.set_item("advertised", advertised.to_dict(py)?)?;

@@ -13,6 +13,7 @@
 pub use crate::error_context::{ErrorContext, ErrorGroup, NativeStatus, Operation, ShutdownReport};
 pub use crate::errors::{Error, ErrorKind};
 pub use crate::loss::{AudioLoss, AudioPath, LossReason, MixLane, OutputTap};
+pub use crate::WhisperCode;
 use bitflags::bitflags;
 
 /// Sample rate (Hz) of the internal canonical form. All streams are normalized to this rate first.

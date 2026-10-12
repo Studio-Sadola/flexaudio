@@ -16,23 +16,13 @@ impl Stream {
         }
         self.drain_capture();
         let drained = self.drain_output();
-        let intake_error = (!self.whisper_error_reported)
-            .then(|| self.whisper_error.clone())
-            .flatten();
         let result = flush(self.whisper.as_mut().expect("enabled attachment"));
-        self.whisper_error = None;
-        self.whisper_error_reported = false;
-        self.accept_whisper(result);
+        let flushed = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|failure| crate::whisper_vad::tap_error(failure.error.clone()));
+        self.accept_whisper(result, fa::Operation::Flush);
         self.whisper_carrier();
-        let tap_error = intake_error.or_else(|| self.whisper_error.clone());
-        let flushed = match tap_error {
-            Some(error) => {
-                self.whisper_error.get_or_insert(error.clone());
-                self.whisper_error_reported = true;
-                Err(crate::whisper_vad::tap_error(error))
-            }
-            None => Ok(()),
-        };
         drained.and(flushed)
     }
 
@@ -42,12 +32,19 @@ impl Stream {
             Vec<flexaudio_vad::AttachedWhisperVadEvent>,
             flexaudio_vad::WhisperVadTapFailure,
         >,
+        operation: fa::Operation,
     ) {
         match result {
-            Ok(events) => self.whisper_events.extend(events),
+            Ok(events) => {
+                if matches!(operation, fa::Operation::Normalize | fa::Operation::Flush) {
+                    self.whisper_error = None;
+                }
+                self.whisper_events.extend(events);
+            }
             Err(failure) => {
                 self.whisper_events.extend(failure.terminal_events);
                 if self.whisper_error.is_none() {
+                    self.whisper_cleanup.push(failure.error.audio_error());
                     self.whisper_error = Some(failure.error);
                 }
             }
@@ -59,14 +56,12 @@ impl Stream {
             return;
         }
         while let Some(chunk) = self.inner.poll_capture() {
-            if self.whisper_error.is_some() {
-                continue;
-            }
+            let discontinuity = chunk.flags.contains(fa::ChunkFlags::DISCONTINUITY);
             let result = self.whisper.as_mut().expect("enabled attachment").process(
                 &chunk.data,
                 chunk.frame_index,
                 chunk.pts_ns,
-                chunk.flags.contains(fa::ChunkFlags::DISCONTINUITY),
+                discontinuity,
             );
             if result.is_ok() {
                 self.whisper_origin = (
@@ -74,7 +69,7 @@ impl Stream {
                     chunk.pts_ns + (chunk.frames as i64 * 1_000_000_000 / 48_000),
                 );
             }
-            self.accept_whisper(result);
+            self.accept_whisper(result, fa::Operation::Normalize);
         }
     }
 
@@ -125,6 +120,24 @@ mod tests {
         }
     }
 
+    /// Whether one attached carrier publishes an epoch origin.
+    fn has_epoch_start(events: &pyo3::Bound<'_, pyo3::PyAny>) -> bool {
+        if events.is_none() {
+            return false;
+        }
+        events
+            .try_iter()
+            .map(|iter| {
+                iter.flatten().any(|event| {
+                    event
+                        .getattr("type")
+                        .and_then(|kind| kind.extract::<String>())
+                        .is_ok_and(|kind| kind == "epoch_start")
+                })
+            })
+            .unwrap_or(false)
+    }
+
     fn next_chunk(stream: &mut Stream) -> PyAudioChunk {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -133,6 +146,47 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "fake capture timed out");
             std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Poll until a real PCM chunk is delivered (attached carriers carry `frames` 0).
+    fn next_audio_chunk(py: Python<'_>, stream: &mut Stream) -> Py<PyAudioChunk> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(chunk) = stream.poll_chunk().unwrap() {
+                let wrapped = Py::new(py, chunk).unwrap();
+                let frames = wrapped
+                    .bind(py)
+                    .getattr("frames")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap();
+                if frames > 0 {
+                    return wrapped;
+                }
+            }
+            assert!(Instant::now() < deadline, "fake capture timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Poll until one attached carrier publishes an epoch origin.
+    fn wait_for_epoch_start(py: Python<'_>, stream: &mut Stream) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the discontinuity boundary must start a new epoch"
+            );
+            match stream.poll_chunk().unwrap() {
+                Some(chunk) => {
+                    let chunk = Py::new(py, chunk).unwrap();
+                    if has_epoch_start(&chunk.bind(py).getattr("whisper_vad_events").unwrap()) {
+                        return;
+                    }
+                }
+                None => std::thread::sleep(Duration::from_millis(2)),
+            }
         }
     }
 
@@ -160,7 +214,7 @@ mod tests {
                 whisper_events: Vec::new(),
                 whisper_origin: (0, 0),
                 whisper_error: None,
-                whisper_error_reported: false,
+                whisper_cleanup: Vec::new(),
                 ready_chunks: Default::default(),
                 vad: None,
                 denoiser: None,
@@ -231,17 +285,208 @@ mod tests {
                 assert!(stream.poll_chunk().unwrap().is_none());
                 stream.flush_whisper_with(|_| Ok(Vec::new())).unwrap();
             }
-            stream.whisper_error = Some(WhisperVadTapError::Conversion);
-            let error = stream.flush_whisper_with(|_| Ok(Vec::new())).unwrap_err();
-            assert_eq!(
-                error
-                    .value(py)
-                    .getattr("code")
-                    .unwrap()
-                    .extract::<String>()
-                    .unwrap(),
-                "Conversion"
+            stream.stop().unwrap();
+            while stream.poll_chunk().unwrap().is_some() {}
+        });
+    }
+
+    fn capture_stream(sink: &Arc<Mutex<Option<fa::core::backend::RawSink>>>) -> Stream {
+        let mut inner = fa::Stream::open(
+            fa::StreamConfig::default(),
+            Box::new(PushBackend(sink.clone())),
+        )
+        .unwrap();
+        inner.enable_capture_tap().unwrap();
+        inner.start().unwrap();
+        Stream {
+            inner,
+            shutdown: None,
+            local_events: Default::default(),
+            output_end: None,
+            whisper: Some(
+                flexaudio_vad::WhisperVadTap::new(Default::default(), Default::default()).unwrap(),
+            ),
+            whisper_events: Vec::new(),
+            whisper_origin: (0, 0),
+            whisper_error: None,
+            whisper_cleanup: Vec::new(),
+            ready_chunks: Default::default(),
+            vad: None,
+            denoiser: None,
+            output_rate: 48_000,
+            output_channels: 2,
+        }
+    }
+
+    fn fail_attachment(
+        py: Python<'_>,
+        stream: &mut Stream,
+        sink: &Arc<Mutex<Option<fa::core::backend::RawSink>>>,
+    ) {
+        sink.lock().unwrap().as_mut().unwrap().push(&[0.2; 1920], 0);
+        wait_for_epoch_start(py, stream);
+        stream.whisper.as_mut().unwrap().inject_failure();
+        sink.lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .push(&[0.2; 1920], 20_000_000);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut ended = false;
+        while !ended {
+            assert!(
+                Instant::now() < deadline,
+                "injected failure must deliver its terminal batch"
             );
+            if let Some(chunk) = stream.poll_chunk().unwrap() {
+                let chunk = Py::new(py, chunk).unwrap();
+                let events = chunk.bind(py).getattr("whisper_vad_events").unwrap();
+                if !events.is_none() {
+                    for event in events.try_iter().unwrap() {
+                        let event = event.unwrap();
+                        if event.getattr("type").unwrap().extract::<String>().unwrap()
+                            == "epoch_end"
+                        {
+                            assert_eq!(
+                                event
+                                    .getattr("reason")
+                                    .unwrap()
+                                    .extract::<String>()
+                                    .unwrap(),
+                                "error"
+                            );
+                            ended = true;
+                        }
+                    }
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert_eq!(
+            stream
+                .whisper_error
+                .as_ref()
+                .unwrap()
+                .audio_error()
+                .whisper_code(),
+            Some(fa::WhisperCode::Inference)
+        );
+        assert_eq!(
+            stream.whisper_cleanup.len(),
+            1,
+            "one real processor failure must retain exactly one cleanup cause"
+        );
+        // This empty poll used to raise the retained Whisper error and end capture loops.
+        assert!(stream.poll_chunk().unwrap().is_none());
+        sink.lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .push(&[0.2; 1920], 40_000_000);
+        let chunk = next_audio_chunk(py, stream);
+        assert_eq!(
+            chunk
+                .bind(py)
+                .getattr("frame_index")
+                .unwrap()
+                .extract::<u64>()
+                .unwrap(),
+            1920
+        );
+        assert!(stream.whisper_error.is_some());
+    }
+
+    fn assert_whisper_shutdown(py: Python<'_>, stream: &mut Stream) {
+        stream.stop().unwrap();
+        stream.stop().unwrap();
+        assert!(stream.terminal_error().is_none());
+        let report = Py::new(py, stream.shutdown_report().unwrap()).unwrap();
+        let report = report.bind(py).call_method0("to_dict").unwrap();
+        assert!(report.get_item("primary").unwrap().is_none());
+        let cleanup = report.get_item("cleanup_errors").unwrap();
+        assert_eq!(
+            cleanup.len().unwrap(),
+            1,
+            "a processor failure must survive recovery exactly once"
+        );
+        assert_eq!(
+            cleanup
+                .get_item(0)
+                .unwrap()
+                .get_item("whisper_code")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "Inference"
+        );
+        // Consume every closing batch instead of dropping unread terminal events.
+        while stream.poll_chunk().unwrap().is_some() {}
+    }
+
+    #[test]
+    fn whisper_failure_preserves_python_polling_and_stop_with_typed_cleanup() {
+        Python::initialize();
+        Python::attach(|py| {
+            let sink = Arc::new(Mutex::new(None));
+            let mut stream = capture_stream(&sink);
+            fail_attachment(py, &mut stream, &sink);
+            assert_whisper_shutdown(py, &mut stream);
+        });
+    }
+
+    #[test]
+    fn successful_flush_reinitializes_shared_owner_after_process_failure() -> PyResult<()> {
+        Python::initialize();
+        Python::attach(|py| {
+            let sink = Arc::new(Mutex::new(None));
+            let mut stream = capture_stream(&sink);
+            fail_attachment(py, &mut stream, &sink);
+            stream.flush_whisper_vad()?;
+            assert!(
+                stream.whisper_error.is_none(),
+                "successful shared flush must clear the active failure"
+            );
+            sink.lock()
+                .expect("fake capture sink mutex must remain usable")
+                .as_mut()
+                .expect("fake capture backend must retain its sink until stop")
+                .push(&[0.2; 1920], 60_000_000);
+            wait_for_epoch_start(py, &mut stream);
+            assert_whisper_shutdown(py, &mut stream);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_failed_attachment_reinitializes_at_the_next_discontinuity() {
+        Python::initialize();
+        Python::attach(|py| {
+            for switch in [false, true] {
+                let sink = Arc::new(Mutex::new(None));
+                let mut stream = capture_stream(&sink);
+                fail_attachment(py, &mut stream, &sink);
+                if switch {
+                    stream
+                        .inner
+                        .switch_backend(Box::new(PushBackend(sink.clone())))
+                        .unwrap();
+                } else {
+                    stream.pause();
+                    stream.resume().unwrap();
+                }
+                sink.lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .push(&[0.2; 1920], 60_000_000);
+                wait_for_epoch_start(py, &mut stream);
+                assert!(
+                    stream.whisper_error.is_none(),
+                    "the shared owner must recover only at a discontinuity"
+                );
+                assert_whisper_shutdown(py, &mut stream);
+            }
         });
     }
 
@@ -277,7 +522,7 @@ mod tests {
                 whisper_events: Vec::new(),
                 whisper_origin: (0, 0),
                 whisper_error: None,
-                whisper_error_reported: false,
+                whisper_cleanup: Vec::new(),
                 ready_chunks: Default::default(),
                 vad: None,
                 denoiser: None,

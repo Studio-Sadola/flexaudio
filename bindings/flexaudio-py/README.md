@@ -289,5 +289,11 @@ and authoritative frame indices before output conversion. Attached chunks carry
 origin. `AudioChunk.frame_index` is a producer-owned 48 kHz timeline position.
 `flush_whisper_vad()` and `stop()` queue ordered closing carriers even without new
 PCM. Poll until the terminal carrier is consumed before releasing the stream.
+An attached VAD failure is a failure of that session only: capture and PCM
+delivery continue, and polling delivers its closing events without raising the
+processor failure. `stop()` succeeds for a VAD-only failure; its shutdown report
+retains the cause in `cleanup_errors` with `whisper_code`, and `primary` remains
+capture-only. The next discontinuity (or a successful `flush_whisper_vad()`)
+reinitializes the session so its next frame starts a new anchored epoch.
 Disabled attachment has `AudioChunk.whisper_vad_events=None` and flush is a no-op.
 Legacy `Vad` and its integration keep their existing behavior.

@@ -36,7 +36,7 @@ fn stream(denoise: bool) -> (FlexStream, Arc<Mutex<Option<fa::core::backend::Raw
             whisper_events: Vec::new(),
             whisper_origin: (0, 0),
             whisper_error: None,
-            whisper_error_reported: false,
+            whisper_cleanup: Vec::new(),
             ready_chunks: std::collections::VecDeque::new(),
             inner,
             denoiser: denoise.then(|| Denoiser::new(1).unwrap()),
