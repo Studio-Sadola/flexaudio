@@ -19,14 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Discovery keeps devices with unreadable mandatory formats as unavailable (0/0),
   and keeps unreadable optional process metadata unknown instead of rejecting neighbors.
   Collection/count failures still fail the whole call. Entries without a readable
-  selectable identity may be omitted. Linux PipeWire output discovery and watcher
+  selectable identity may be omitted; macOS also omits unreadable output direction.
+  Windows/macOS keep unknown device names with selectable native-ID fallbacks.
+  Optional default queries leave no default instead of failing discovery; selected
+  and default device-scoped opens check format availability (Linux exclusion fan-in
+  is not device-scoped). Linux PipeWire output discovery and watcher
   notifications retain independent 48000 Hz / 2-channel compatibility defaults.
 - Primary/secondary PTS steps use rational arithmetic while retaining per-callback
   arrival re-anchoring. At 48 kHz primary, frame_index and capture_sample identify
   the same sample across replacement, recovery, loss rebuild and startup release.
 - Windows waits distinguish timeout from native failure; COM initialization accepts
   only successful initialization or the documented already-initialized cases.
-- Linux PipeWire bind failures, malformed/missing buffers, rejected renegotiation,
+- Linux PipeWire capture bind failures, malformed/missing buffers, rejected renegotiation,
   callback panics and watcher daemon errors become readiness, loss or terminal
   diagnostics. Routing changes mark the next chunk discontinuous; watcher stop
   retains join failures and terminal notifications.
@@ -57,6 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Public `flexaudio_core::inventory` helpers share entry omission, optional metadata,
+  collection error propagation and checked device-format policy across OS adapters.
 - Rust/Python `DeviceInfo.format_available`, Node.js `JsDeviceInfo.formatAvailable`,
   and C `flexaudio_device_format_available_v2` expose unreadable mandatory formats.
   False uses sample rate 0 and channels 0; checked open retains typed cause/remedy.

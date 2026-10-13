@@ -211,7 +211,9 @@ pub struct FlexEvent {
 /// Information for one enumerated device (corresponds to [`flexaudio::DeviceInfo`]).
 ///
 /// `id` / `name` are flexaudio-owned, NUL-terminated UTF-8 strings. Release the entire array with
-/// `flexaudio_devices_free` (do not use C `free`).
+/// `flexaudio_devices_free` (do not use C `free`). Unknown names are empty strings;
+/// Windows/macOS use selectable native IDs when names are unreadable. macOS omits
+/// unreadable output direction; unreadable default queries leave is_default=false.
 #[repr(C)]
 pub struct FlexDeviceInfo {
     /// Stable ID (released by `flexaudio_devices_free`).

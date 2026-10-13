@@ -148,7 +148,8 @@ The facade crate `flexaudio` re-exports everything you need:
   `pid` as `target_pid` for per-process capture.
 - `flexaudio::watch_devices() -> Result<DeviceWatcher>` — pull-style device
   notifications. Linux startup failure returns an error; later daemon, callback,
-  or shutdown failures produce `DeviceEvent::TerminalError { error }` once.
+  or shutdown failures produce `DeviceEvent::TerminalError { error }`. A later
+  stop/join failure can emit another notification with accumulated causes.
   Node.js/Python expose `terminalError` with a typed `error`; C v2 exposes device
   event kind 6 and `flexaudio_device_event_error_v2`. C v1 polling returns the
   root negative error code and sets last_error. Windows/macOS currently
@@ -182,7 +183,14 @@ terminal. Legacy VAD and WhisperVad are mutually exclusive on a stream.
 Collection/enumeration or count failures fail the whole call with a typed error.
 Unreadable per-entry optional metadata stays unknown; process names use the existing
 `pid N` fallback and absent executable/bundle ID. Entries with no readable selectable
-identity may be omitted. An unreadable mandatory device format keeps the device with
+identity may be omitted. Windows/macOS retain existing name-based IDs when the name
+is readable; an unreadable name uses the native endpoint ID/UID with `name=""`
+(explicit unknown), which remains selectable. macOS devices with unreadable output
+direction are omitted because they cannot be classified. An unreadable default
+query leaves `is_default=false` and does not fail discovery. Device-scoped default
+opens validate the resolved default format. Linux exclusion fan-in is not device-scoped
+and uses its negotiated canonical format, so it is exempt from this device-format gate.
+An unreadable mandatory device format keeps the device with
 `format_available: false` (JS `formatAvailable`) and **sample rate = 0, channels = 0**.
 Opening performs a fresh checked query and fails with a typed cause and retry remedy
 if the format remains unreadable. C keeps the v1 struct layout and exposes
@@ -208,15 +216,18 @@ authoritative position; gaps report loss. VAD's exact sample-clock mapping uses
 timeline, independent of primary/secondary formats and `tap`. It equals primary
 `frameIndex` for the same sample when primary is 48 kHz, including generation
 replacement, recovery, loss rebuild and startup PCM release. At other primary rates
-the axes share units but not an exact origin: resampler group delay is not compensated.
+the axes share units but not an exact origin: resampler group delay is not compensated,
+and unreconciled startup-release padding can grow the offset by up to one primary
+chunk per boundary.
 Neither index is an offset into concatenated delivered PCM: pause and queue drops
 advance indices without delivering samples.
 
 An arrival gap without reopen emits no event or `DISCONTINUITY`: `frameIndex`
 remains contiguous, only primary `ptsNs` jumps, and attached WhisperVad keeps its
 epoch open. A stall (at least 2 s without consumed samples, checked every 250 ms)
-emits `stalled`, reopens with `recoverableError` and 250 ms..5 s backoff, then emits
-`recovered`. The first new-generation primary data chunk has
+emits `stalled` and attempts to reopen. Each failed reopen attempt emits
+`recoverableError` and backs off from 250 ms to 5 s. After a successful reopen,
+`recovered` is emitted when new PCM arrives. The first new-generation primary data chunk has
 `RECOVERED|DISCONTINUITY`; WhisperVad closes with `epochEnd(finish)` and starts a
 new epoch when new PCM arrives. Downtime does not become frames. These three
 advisories are unordered relative to `onChunk` and epoch events.

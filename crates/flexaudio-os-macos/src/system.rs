@@ -134,8 +134,8 @@ pub struct MacSystemBackend {
     /// effective exclusion set is `exclude_pids ∪ {self if exclude_self}`; a
     /// non-empty set takes the exclusion path.
     exclude_pids: Vec<u32>,
-    /// Target output device name (= [`DeviceInfo::id`](flexaudio_core::types::DeviceInfo)).
-    /// `None` uses a global tap for the default output; `Some(name)` targets that output device.
+    /// Target inventory ID (name or native UID fallback; [`DeviceInfo::id`](flexaudio_core::types::DeviceInfo)).
+    /// `None` validates the default output before a global tap; `Some(id)` targets that device.
     /// Process exclusions also apply to the selected device.
     device_id: Option<String>,
     /// Running flag (guards repeated start, signals stop, and tracks drop state). `Send`.
@@ -271,23 +271,14 @@ impl CaptureBackend for MacSystemBackend {
                         }
                     }
                 }
-                let device_uid = if let Some(name) = device_id {
-                    // Resolve the selected output device even when exclusions are active.
-                    // Return DeviceNotFound if no device matches.
-                    match crate::devices::uid_for_device_name(&name) {
-                        Ok(Some(uid)) => Some(uid),
-                        Ok(None) => {
-                            let _ = ready_tx.send(Err(Error::DeviceNotFound));
+                let device_uid =
+                    match crate::devices::resolve_output_device_uid(device_id.as_deref()) {
+                        Ok(uid) => uid,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error));
                             return Ok(());
                         }
-                        Err(e) => {
-                            let _ = ready_tx.send(Err(e));
-                            return Ok(());
-                        }
-                    }
-                } else {
-                    None
-                };
+                    };
                 let kind = system_tap_kind(ids, device_uid);
                 run_tap_thread(
                     kind,

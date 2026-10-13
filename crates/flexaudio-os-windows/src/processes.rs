@@ -13,13 +13,13 @@
 //! This is read-only and does not open audio (it does not initialize `IAudioClient`), so it does not
 //! trigger permission prompts such as microphone privacy prompts. Read process names with
 //! `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` and `QueryFullProcessImageNameW`. Return no name
-//! only when a process disappeared; failed metadata queries reject the snapshot.
+//! when optional metadata is unreadable; vanished processes may be omitted.
 
 use flexaudio_core::process_list::executable_basename;
 use flexaudio_core::types::{Error, ProcessInfo, Result};
 
 use windows::core::{Interface, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, S_FALSE, S_OK};
+use windows::Win32::Foundation::{CloseHandle, S_OK};
 use windows::Win32::Media::Audio::{
     eRender, AudioSessionStateActive, AudioSessionStateExpired, AudioSessionStateInactive,
     IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -40,7 +40,7 @@ const IMAGE_PATH_CAPACITY: usize = 32_768;
 /// Raw values read from one session.
 struct SessionRecord {
     pid: u32,
-    /// A successfully queried session state; discovery rejects unreadable states.
+    /// A successfully queried session state; unreadable activity stays unknown.
     active: Option<bool>,
 }
 
@@ -105,9 +105,9 @@ unsafe fn collect_sessions() -> Result<Vec<SessionRecord>> {
         .map_err(|e| map_hr_at(Operation::Enumerate, "IMMDeviceCollection::GetCount", e))?;
 
     let by_endpoint = crate::inventory::collect_complete(0..endpoint_count, |index| {
-        let device = collection
-            .Item(index)
-            .map_err(|error| map_hr_at(Operation::Enumerate, "IMMDeviceCollection::Item", error))?;
+        let Ok(device) = collection.Item(index) else {
+            return Ok(None);
+        };
         let manager: IAudioSessionManager2 =
             device.Activate(CLSCTX_ALL, None).map_err(|error| {
                 map_hr_at(
@@ -138,7 +138,8 @@ unsafe fn collect_sessions() -> Result<Vec<SessionRecord>> {
     Ok(by_endpoint.into_iter().flatten().collect())
 }
 
-/// Read one session. Skip only known system sounds, expired sessions, or PID 0.
+/// Read one session. Omit vanished/unidentifiable sessions, system sounds and expired sessions.
+/// An unreadable activity state stays unknown once the PID is readable.
 ///
 /// # Safety
 /// COM must be initialized on the calling thread. `session_list` must be valid.
@@ -146,66 +147,36 @@ unsafe fn read_session(
     session_list: &windows::Win32::Media::Audio::IAudioSessionEnumerator,
     session_index: i32,
 ) -> Result<Option<SessionRecord>> {
-    let control = session_list.GetSession(session_index).map_err(|error| {
-        map_hr_at(
-            Operation::Enumerate,
-            "IAudioSessionEnumerator::GetSession",
-            error,
-        )
-    })?;
-    let control2: IAudioSessionControl2 = control.cast().map_err(|error| {
-        map_hr_at(
-            Operation::Enumerate,
-            "IAudioSessionControl::QueryInterface",
-            error,
-        )
-    })?;
+    let Ok(control) = session_list.GetSession(session_index) else {
+        return Ok(None);
+    };
+    let Ok(control2) = control.cast::<IAudioSessionControl2>() else {
+        return Ok(None);
+    };
     let system_sounds = control2.IsSystemSoundsSession();
     if system_sounds == S_OK {
         return Ok(None);
     }
-    if system_sounds != S_FALSE {
-        return Err(map_hr_at(
-            Operation::Enumerate,
-            "IAudioSessionControl2::IsSystemSoundsSession",
-            windows::core::Error::from(system_sounds),
-        ));
-    }
-    let pid = control2.GetProcessId().map_err(|error| {
-        map_hr_at(
-            Operation::Enumerate,
-            "IAudioSessionControl2::GetProcessId",
-            error,
-        )
-    })?;
+    let Ok(pid) = control2.GetProcessId() else {
+        return Ok(None);
+    };
     if pid == 0 {
         return Ok(None);
     }
-    let state = control2.GetState().map_err(|error| {
-        map_hr_at(
-            Operation::Enumerate,
-            "IAudioSessionControl::GetState",
-            error,
-        )
-    })?;
-    if state == AudioSessionStateExpired {
+    let state = control2.GetState().ok();
+    if state == Some(AudioSessionStateExpired) {
         return Ok(None);
     }
-    let active = if state == AudioSessionStateActive {
-        true
-    } else if state == AudioSessionStateInactive {
-        false
-    } else {
-        return Err(Error::Backend(format!(
-            "native audio session state is invalid (value {}); retry discovery",
-            state.0
-        ))
-        .with_context(flexaudio_core::ErrorContext::new(Operation::Enumerate)));
-    };
-    Ok(Some(SessionRecord {
-        pid,
-        active: Some(active),
-    }))
+    let active = state.and_then(|state| {
+        if state == AudioSessionStateActive {
+            Some(true)
+        } else if state == AudioSessionStateInactive {
+            Some(false)
+        } else {
+            None
+        }
+    });
+    Ok(Some(SessionRecord { pid, active }))
 }
 
 /// Retain a metadata failure without misclassifying process access as recording consent.

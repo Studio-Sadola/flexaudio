@@ -4,7 +4,7 @@
 //! with `AUDCLNT_STREAMFLAGS_LOOPBACK` (classic loopback), equivalent to Linux's
 //! [`PwSystemBackend`](../flexaudio_os_linux). Select an output endpoint with
 //! `device_id`: `None` uses the default render endpoint; `Some(id)` selects the
-//! eRender endpoint whose FriendlyName matches. `id` is the FriendlyName returned
+//! eRender endpoint whose inventory ID matches. `id` is normally the FriendlyName returned
 //! by [`list_output_devices`].
 //!
 //! `exclude_self == true`: Capture all system audio except this process and
@@ -84,7 +84,7 @@ pub struct WasapiSystemBackend {
     /// equal the root validated by [`exclude_root`](WasapiSystemBackend::exclude_root).
     exclude_pids: Vec<u32>,
     /// Output endpoint selection. `None` uses the default render endpoint;
-    /// `Some(id)` selects the eRender endpoint whose FriendlyName matches `id`.
+    /// `Some(id)` selects the eRender endpoint whose name or native endpoint ID matches `id`.
     /// Unused when `exclude_self == true`.
     device_id: Option<String>,
     /// Running flag (guards duplicate starts, signals stop, and supports drop checks). `Send`.
@@ -218,7 +218,7 @@ fn query_native_format(device_id: Option<&str>) -> Result<(u32, u16)> {
 /// Resolve `device_id` to a render endpoint.
 ///
 /// For `None`, call `GetDefaultAudioEndpoint(eRender, eConsole)`. For `Some(id)`,
-/// enumerate ACTIVE eRender endpoints and return the first whose FriendlyName
+/// enumerate ACTIVE eRender endpoints and return the first whose name or native ID
 /// matches `id`. Returns [`Error::DeviceNotFound`] if none match.
 ///
 /// # Safety
@@ -241,17 +241,21 @@ unsafe fn resolve_render_endpoint(
         .map_err(|e| map_hr("IMMDeviceCollection::GetCount", e))?;
 
     for i in 0..count {
-        let device = collection
-            .Item(i)
-            .map_err(|error| map_hr("IMMDeviceCollection::Item", error))?;
-        if endpoint_friendly_name(&device)? == id {
+        let Ok(device) = collection.Item(i) else {
+            continue;
+        };
+        if flexaudio_core::inventory::device_identity_matches(
+            id,
+            endpoint_friendly_name(&device),
+            || endpoint_native_id(&device),
+        ) {
             return Ok(device);
         }
     }
     Err(Error::DeviceNotFound)
 }
 
-/// Read the required endpoint name, preserving property-store query failures.
+/// Read the optional endpoint display name, preserving property-store query failures.
 ///
 /// # Safety
 /// COM must be initialized on the calling thread, and `device` must be a valid `IMMDevice`.
@@ -276,13 +280,36 @@ unsafe fn endpoint_friendly_name(device: &IMMDevice) -> Result<String> {
     Ok(name)
 }
 
+/// Read a fallback selectable endpoint ID; always release the COM allocation.
+unsafe fn endpoint_native_id(device: &IMMDevice) -> Result<String> {
+    let value = device
+        .GetId()
+        .map_err(|error| map_hr_at(Operation::Enumerate, "IMMDevice::GetId", error))?;
+    if value.is_null() {
+        return Err(Error::DeviceNotFound);
+    }
+    let id = value
+        .to_string()
+        .map_err(|error| map_hr_at(Operation::Enumerate, "IMMDevice::GetId(string)", error));
+    CoTaskMemFree(Some(value.0.cast()));
+    id
+}
+
+/// Share inventory and open identity selection, including unreadable display names.
+unsafe fn endpoint_identity(device: &IMMDevice) -> Option<(String, String)> {
+    flexaudio_core::inventory::device_identity(endpoint_friendly_name(device), || {
+        endpoint_native_id(device)
+    })
+}
+
 /// Enumerate active render (output) endpoints and return them as [`DeviceInfo`] entries.
 ///
-/// Each `DeviceInfo` uses the endpoint's FriendlyName for `id` and `name`, gets
+/// Each `DeviceInfo` normally uses FriendlyName for `id` and `name`, gets
 /// `sample_rate` and `channels` from MixFormat, and has
 /// [`SourceKind::SystemLoopback`] as `source_kind` and `true` for `is_loopback`.
-/// `is_default` is set on the entry whose FriendlyName matches the default render
-/// endpoint. Reject the snapshot if an endpoint FriendlyName cannot be read.
+/// `is_default` is set on the entry whose inventory ID matches the default render
+/// endpoint. An unreadable FriendlyName uses the native endpoint ID and an empty
+/// name (unknown); omit an entry only when neither identity is readable.
 pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
     let _com = ComThread::new()?;
     // SAFETY: this scope owns COM initialization and uses interfaces on one thread.
@@ -295,18 +322,18 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
                     error,
                 )
             })?;
-        let default_name = match enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
-            Ok(device) => endpoint_friendly_name(&device).ok(),
-            // E_NOTFOUND is a successfully absent default, not a failed inventory.
-            Err(error) if error.code().0 as u32 == 0x8007_0490 => None,
-            Err(error) => {
-                return Err(map_hr_at(
-                    Operation::Enumerate,
-                    "IMMDeviceEnumerator::GetDefaultAudioEndpoint",
-                    error,
-                ))
-            }
-        };
+        let default_id = flexaudio_core::inventory::optional(
+            enumerator
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .map(|device| endpoint_identity(&device).map(|(id, _)| id))
+                .map_err(|error| {
+                    map_hr_at(
+                        Operation::Enumerate,
+                        "IMMDeviceEnumerator::GetDefaultAudioEndpoint",
+                        error,
+                    )
+                }),
+        );
         let collection = enumerator
             .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
             .map_err(|error| {
@@ -320,15 +347,17 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
             map_hr_at(Operation::Enumerate, "IMMDeviceCollection::GetCount", error)
         })?;
         crate::inventory::collect_complete(0..count, |index| {
-            let device = collection.Item(index).map_err(|error| {
-                map_hr_at(Operation::Enumerate, "IMMDeviceCollection::Item", error)
-            })?;
-            let name = endpoint_friendly_name(&device)?;
+            let Ok(device) = collection.Item(index) else {
+                return Ok(None);
+            };
+            let Some((id, name)) = endpoint_identity(&device) else {
+                return Ok(None);
+            };
             let (sample_rate, channels, format_available) =
                 flexaudio_core::inventory::device_format(endpoint_mix_format(&device));
-            let is_default = default_name.as_deref() == Some(name.as_str());
+            let is_default = default_id.as_deref() == Some(id.as_str());
             Ok(Some(DeviceInfo {
-                id: name.clone(),
+                id,
                 name,
                 source_kind: SourceKind::SystemLoopback,
                 sample_rate,

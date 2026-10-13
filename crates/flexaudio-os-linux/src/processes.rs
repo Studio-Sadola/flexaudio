@@ -6,7 +6,7 @@
 //!
 //! PID resolution shares [`resolve_node_pid`](crate::resolve_node_pid) with
 //! process capture. Pulse nodes require a valid app PID from bound node info;
-//! unresolved output nodes fail the query instead of being listed under the proxy's PID.
+//! unresolved output nodes are omitted instead of being listed under the proxy's PID.
 //!
 //! Get executable names from the kernel's `/proc/<pid>/exe`, not PipeWire's self-reported value
 //! (fall back to `/proc/<pid>/comm` if unreadable).
@@ -71,10 +71,6 @@ enum SnapshotError {
         operation: &'static str,
         cause: String,
     },
-    Bind {
-        node_id: u32,
-        cause: String,
-    },
     Callback {
         callback: &'static str,
         cause: String,
@@ -85,18 +81,12 @@ enum SnapshotError {
         cause: String,
     },
     Incomplete,
-    MissingPid {
-        node_id: u32,
-    },
 }
 
 impl std::fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Query { operation, cause } => write!(f, "pipewire {operation} failed: {cause}"),
-            Self::Bind { node_id, cause } => {
-                write!(f, "pipewire bind output node {node_id} failed: {cause}")
-            }
             Self::Callback { callback, .. } => {
                 write!(f, "pipewire {callback} callback rejected")
             }
@@ -111,10 +101,6 @@ impl std::fmt::Display for SnapshotError {
                 f,
                 "pipewire registry sync did not complete within {} ms",
                 LIST_DEADLINE.as_millis()
-            ),
-            Self::MissingPid { node_id } => write!(
-                f,
-                "pipewire output node {node_id} has no resolvable mandatory process ID"
             ),
         }
     }
@@ -161,15 +147,15 @@ fn run_callback(
 
 /// List processes with an audio output stream (`Stream/Output/Audio`) as a raw list.
 ///
-/// Returns [`Error::Backend`] for connection, sync, bind or callback failures and unresolved
-/// mandatory output-node PIDs. Only a completed empty query returns `Ok([])`. Executable names
+/// Returns [`Error::Backend`] for connection, sync or callback failures.
+/// Entries without a resolvable PID are omitted; executable names
 /// and activity remain optional metadata.
 pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     let snapshot = collect_snapshot().map_err(|error| error.into_core())?;
     build_process_list(&snapshot, read_executable).map_err(|error| error.into_core())
 }
 
-/// Convert collection results to a raw list, rejecting unresolved mandatory PIDs.
+/// Convert collection results to a raw list, omitting unidentifiable output nodes.
 ///
 /// Display name preference: node `application.name`, then Client `application.name` (empty if neither
 /// exists; the facade fills in an executable name, etc.). Sort deterministically by node ID.
@@ -183,8 +169,9 @@ fn build_process_list(
     let mut out = Vec::with_capacity(node_ids.len());
     for node_id in node_ids {
         let node = &snapshot.nodes[&node_id];
-        let pid = resolve_node_pid(&node.entry, &snapshot.client_pid)
-            .ok_or(SnapshotError::MissingPid { node_id })?;
+        let Some(pid) = resolve_node_pid(&node.entry, &snapshot.client_pid) else {
+            continue;
+        };
         let client_name = node
             .entry
             .owning_client_id
@@ -323,16 +310,9 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, SnapshotError> {
                         // Bind for state and mandatory application PID information.
                         let node: pw::node::Node = match registry_for_global.bind(global) {
                             Ok(node) => node,
-                            Err(error) => {
-                                record_failure(
-                                    &failure_for_global,
-                                    SnapshotError::Bind {
-                                        node_id: global.id,
-                                        cause: error.to_string(),
-                                    },
-                                );
-                                return;
-                            }
+                            // Node binding is entry-level: retain readable PID/name properties,
+                            // or let PID resolution omit the node if bound info was required.
+                            Err(_) => return,
                         };
                         let failure_for_info = failure_for_global.clone();
                         let snapshot_for_info = snapshot_for_global.clone();
@@ -600,11 +580,7 @@ mod tests {
                 };
                 let actual =
                     result.map(|list| list.iter().map(|process| process.pid).collect::<Vec<_>>());
-                let expected = if expected.is_empty() {
-                    Err(SnapshotError::MissingPid { node_id: 1 })
-                } else {
-                    Ok(expected.clone())
-                };
+                let expected = Ok(expected.clone());
                 assert_eq!(
                     actual, expected,
                     "node API={node_api:?}, client API={client_api:?}, app PID={app_pid:?}"
@@ -634,11 +610,7 @@ mod tests {
                 let result = build_process_list(&snap, |_| None);
                 let actual =
                     result.map(|list| list.iter().map(|process| process.pid).collect::<Vec<_>>());
-                let expected = if expected.is_empty() {
-                    Err(SnapshotError::MissingPid { node_id: 1 })
-                } else {
-                    Ok(expected.clone())
-                };
+                let expected = Ok(expected.clone());
                 assert_eq!(
                     actual, expected,
                     "node API={node_api:?}, client API={client_api:?}, props={props:?}"
@@ -671,10 +643,7 @@ mod tests {
                 40,
                 ClientEntry::from_props(None, Some("7"), Some("pipewire-pulse")),
             );
-            assert_eq!(
-                build_process_list(&snap, |_| None).unwrap_err(),
-                SnapshotError::MissingPid { node_id: 1 }
-            );
+            assert!(build_process_list(&snap, |_| None).unwrap().is_empty());
         }
     }
 
@@ -740,13 +709,17 @@ mod tests {
     }
 
     #[test]
-    fn missing_mandatory_pid_rejects_entire_populated_snapshot() {
+    fn missing_mandatory_pid_omits_entry_and_keeps_neighbors() {
         let mut snap = RegistrySnapshot::default();
         snap.nodes.insert(1, node(None, Some(42), None));
         snap.nodes.insert(2, node(Some(77), None, Some("orphan")));
         assert_eq!(
-            build_process_list(&snap, |_| None).unwrap_err(),
-            SnapshotError::MissingPid { node_id: 2 }
+            build_process_list(&snap, |_| None)
+                .unwrap()
+                .iter()
+                .map(|entry| entry.pid)
+                .collect::<Vec<_>>(),
+            vec![42]
         );
     }
 
@@ -768,20 +741,20 @@ mod tests {
     }
 
     #[test]
-    fn bind_failure_preserves_node_and_cause() {
+    fn collection_failure_preserves_first_cause() {
         let failure = RefCell::new(None);
         record_failure(
             &failure,
-            SnapshotError::Bind {
-                node_id: 7,
+            SnapshotError::Query {
+                operation: "registry sync",
                 cause: "permission denied".into(),
             },
         );
         run_callback(&failure, "node info", || panic!("later failure"));
         assert_eq!(
             finish_snapshot(true, failure.take(), RegistrySnapshot::default()).unwrap_err(),
-            SnapshotError::Bind {
-                node_id: 7,
+            SnapshotError::Query {
+                operation: "registry sync",
                 cause: "permission denied".into()
             }
         );

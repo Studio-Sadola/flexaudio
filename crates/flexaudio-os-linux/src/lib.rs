@@ -224,20 +224,12 @@ impl CaptureBackend for PwSystemBackend {
         let excluded =
             effective_exclusion(self.exclude_self, &self.exclude_pids, std::process::id());
         let fan_in = !excluded.is_empty();
-        let device_id = self.device_id.clone();
+        let mut device_id = self.device_id.clone();
         if !fan_in {
-            if let Some(id) = device_id.as_deref() {
-                let devs = list_devices()?;
-                let device = devs
-                    .iter()
-                    .find(|device| device.is_loopback && device.id == id)
-                    .ok_or(Error::DeviceNotFound)?;
-                if !device.format_available {
-                    flexaudio_core::inventory::require_device_format(Err(
-                        EnumerationFailure::Format.error(),
-                    ))?;
-                }
-            }
+            let devices = list_devices()?;
+            let device =
+                flexaudio_core::inventory::selected_output_device(&devices, device_id.as_deref())?;
+            device_id = Some(device.id.clone());
         }
 
         // Stop channel for the loop thread (the receiver is attached to the loop).
@@ -2135,7 +2127,7 @@ const PROC_SCRATCH_CAP: usize = (NATIVE_RATE as usize) * (NATIVE_CHANNELS as usi
 struct NodeRecord {
     /// `node.name` used as a stable, persistent ID.
     node_name: String,
-    /// Display name: prefer `node.description`, otherwise use `node.name`.
+    /// Display name: `node.description`, or empty for unknown.
     description: String,
     /// `media.class` (`"Audio/Sink"` / `"Audio/Source"`, etc.).
     media_class: String,
@@ -2156,17 +2148,17 @@ struct EnumState {
     default_source: Option<String>,
 }
 
-/// Only nodes can represent entries in the audio inventory. A props-less node
-/// cannot be classified safely; unrelated globals do not require device identity.
+/// Only nodes and metadata participate in inventory; missing properties give no selectable entry.
 fn enumeration_properties<'a>(
     object_type: &pw::types::ObjectType,
     props: Option<&'a spa::utils::dict::DictRef>,
-) -> std::result::Result<Option<&'a spa::utils::dict::DictRef>, EnumerationFailure> {
-    if props.is_none() && *object_type == pw::types::ObjectType::Node {
-        Err(EnumerationFailure::Identity)
-    } else {
-        Ok(props)
-    }
+) -> Option<&'a spa::utils::dict::DictRef> {
+    props.filter(|_| {
+        matches!(
+            object_type,
+            pw::types::ObjectType::Node | pw::types::ObjectType::Metadata
+        )
+    })
 }
 
 /// Enumerate audio devices (microphones and system output sinks) through PipeWire.
@@ -2180,7 +2172,7 @@ fn enumeration_properties<'a>(
 ///   facade omits these entries and obtains its openable microphone IDs from cpal.
 ///
 /// Map these to [`DeviceInfo`]. `id` is the persistent `node.name`; `name` is `node.description`
-/// (or `node.name` if absent). `sample_rate` / `channels` use `audio.rate` / `audio.channels` if
+/// (empty/unknown if absent). `sample_rate` / `channels` use `audio.rate` / `audio.channels` if
 /// available. Absent optional properties retain `48000 / 2` defaults; explicitly
 /// invalid properties use format_available=false and 0/0. Set `is_default = true` for the device whose
 /// `node.name` matches the `default` metadata (`default.audio.sink` / `default.audio.source`).
@@ -2234,34 +2226,22 @@ fn enumerate_pw() -> Result<Vec<DeviceInfo>> {
         .global(move |global| {
             // A panic crossing FFI is UB, so wrap the callback body in catch_unwind.
             let result = catch_unwind(AssertUnwindSafe(|| {
-                let props = match enumeration_properties(&global.type_, global.props) {
-                    Ok(Some(props)) => props,
-                    Ok(None) => return,
-                    Err(failure) => {
-                        failure_for_global
-                            .borrow_mut()
-                            .get_or_insert_with(|| failure.error());
-                        return;
-                    }
+                let Some(props) = enumeration_properties(&global.type_, global.props) else {
+                    return;
                 };
                 match global.type_ {
                     pw::types::ObjectType::Node => {
                         // Collect only nodes whose media.class is Audio/Sink or Audio/Source.
                         let media_class = props.get(*pw::keys::MEDIA_CLASS).unwrap_or("");
-                        if media_class != "Audio/Sink" && media_class != "Audio/Source" {
+                        let Some(node_name) =
+                            discovery::node_identity(media_class, props.get(*pw::keys::NODE_NAME))
+                        else {
                             return;
-                        }
-                        let node_name = props.get(*pw::keys::NODE_NAME).unwrap_or("");
-                        if node_name.is_empty() {
-                            failure_for_global
-                                .borrow_mut()
-                                .get_or_insert_with(|| EnumerationFailure::Identity.error());
-                            return;
-                        }
+                        };
                         let description = props
                             .get(*pw::keys::NODE_DESCRIPTION)
                             .filter(|s| !s.is_empty())
-                            .unwrap_or(node_name);
+                            .unwrap_or("");
                         let (rate, channels, _) = discovery::device_format(
                             props.get("audio.rate"),
                             props.get(*pw::keys::AUDIO_CHANNELS),
@@ -2281,16 +2261,14 @@ fn enumerate_pw() -> Result<Vec<DeviceInfo>> {
                         if meta_name != "default" {
                             return;
                         }
-                        let metadata: pw::metadata::Metadata =
-                            match registry_for_global.bind(global) {
-                                Ok(m) => m,
-                                Err(_) => {
-                                    failure_for_global.borrow_mut().get_or_insert_with(|| {
-                                        EnumerationFailure::Metadata.error()
-                                    });
-                                    return;
-                                }
-                            };
+                        let Some(metadata) = flexaudio_core::inventory::optional(
+                            registry_for_global
+                                .bind::<pw::metadata::Metadata, _>(global)
+                                .map(Some)
+                                .map_err(|_| EnumerationFailure::Metadata.error()),
+                        ) else {
+                            return;
+                        };
                         let failure_for_meta = failure_for_global.clone();
                         let state_for_meta = state_for_global.clone();
                         let listener = metadata
@@ -2778,7 +2756,6 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
         .map_err(|e| format!("get pipewire registry failed: {e}"))?;
 
     // Local watcher-thread state (!Send), shared with each closure through Rc.
-    let query_failure = Rc::new(Cell::new(None::<EnumerationFailure>));
     let state = Rc::new(RefCell::new(WatchState::default()));
     // Clone and move the event queue (events: Arc<Mutex<VecDeque>>) into each closure.
 
@@ -2787,7 +2764,6 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
     let meta_keep: MetaKeepStore = Rc::new(RefCell::new(Vec::new()));
 
     // Registry global / global_remove listeners.
-    let failure_for_global = query_failure.clone();
     let loop_for_global = main_loop.clone();
     let loop_for_remove = main_loop.clone();
     let state_for_global = state.clone();
@@ -2804,7 +2780,7 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                 &events_for_global,
                 || loop_for_global.quit(),
                 || {
-                    let Some(props) = global.props else {
+                    let Some(props) = enumeration_properties(&global.type_, global.props) else {
                         return;
                     };
                     match global.type_ {
@@ -2812,23 +2788,16 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                             // Same extraction logic as enumerate_pw.
                             // Collect only nodes whose media.class is Audio/Sink or Audio/Source.
                             let media_class = props.get(*pw::keys::MEDIA_CLASS).unwrap_or("");
-                            if media_class != "Audio/Sink" && media_class != "Audio/Source" {
+                            let Some(node_name) = discovery::node_identity(
+                                media_class,
+                                props.get(*pw::keys::NODE_NAME),
+                            ) else {
                                 return;
-                            }
-                            let node_name = props.get(*pw::keys::NODE_NAME).unwrap_or("");
-                            if node_name.is_empty() {
-                                failure_for_global.set(Some(EnumerationFailure::Identity));
-                                fail_watcher(
-                                    &events_for_global,
-                                    EnumerationFailure::Identity.error(),
-                                );
-                                loop_for_global.quit();
-                                return;
-                            }
+                            };
                             let description = props
                                 .get(*pw::keys::NODE_DESCRIPTION)
                                 .filter(|s| !s.is_empty())
-                                .unwrap_or(node_name);
+                                .unwrap_or("");
                             let (sample_rate, channels, format_available) =
                                 discovery::device_format(
                                     props.get("audio.rate"),
@@ -2876,19 +2845,14 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                             if meta_name != "default" {
                                 return;
                             }
-                            let metadata: pw::metadata::Metadata =
-                                match registry_for_global.bind(global) {
-                                    Ok(m) => m,
-                                    Err(_) => {
-                                        failure_for_global.set(Some(EnumerationFailure::Metadata));
-                                        fail_watcher(
-                                            &events_for_global,
-                                            EnumerationFailure::Metadata.error(),
-                                        );
-                                        loop_for_global.quit();
-                                        return;
-                                    }
-                                };
+                            let Some(metadata) = flexaudio_core::inventory::optional(
+                                registry_for_global
+                                    .bind::<pw::metadata::Metadata, _>(global)
+                                    .map(Some)
+                                    .map_err(|_| EnumerationFailure::Metadata.error()),
+                            ) else {
+                                return;
+                            };
                             let state_for_meta = state_for_global.clone();
                             let loop_for_meta = loop_for_global.clone();
                             let events_for_meta = events_for_global.clone();
@@ -3067,9 +3031,6 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
     if aborted.get() {
         return Err("pipewire watch initial scan aborted".into());
     }
-    if let Some(failure) = query_failure.get() {
-        return Err(failure.message().into());
-    }
 
     Ok((
         main_loop,
@@ -3094,7 +3055,7 @@ mod tests {
     use flexaudio_core::raw_ring::raw_ring;
 
     #[test]
-    fn enumeration_missing_properties_only_fail_for_nodes() {
+    fn enumeration_missing_properties_omit_unidentifiable_entries() {
         use pw::types::ObjectType;
 
         for object_type in [
@@ -3106,31 +3067,20 @@ mod tests {
             ObjectType::Port,
             ObjectType::Other("unrelated interface".into()),
         ] {
-            assert!(matches!(
-                enumeration_properties(&object_type, None),
-                Ok(None)
-            ));
+            assert!(enumeration_properties(&object_type, None).is_none());
         }
-        assert!(matches!(
-            enumeration_properties(&ObjectType::Node, None),
-            Err(EnumerationFailure::Identity)
-        ));
+        assert!(enumeration_properties(&ObjectType::Node, None).is_none());
 
         // A dictionary (including an empty one) remains available to the normal
         // media.class/node.name checks in the registry callback.
         let properties = properties! { "node.name" => "fixture.audio" };
         let props: &spa::utils::dict::DictRef = properties.as_ref();
         assert!(std::ptr::eq(
-            enumeration_properties(&ObjectType::Node, Some(props))
-                .unwrap()
-                .unwrap(),
+            enumeration_properties(&ObjectType::Node, Some(props)).unwrap(),
             props,
         ));
         let empty = pw::properties::PropertiesBox::new();
-        assert!(matches!(
-            enumeration_properties(&ObjectType::Node, Some(empty.as_ref())),
-            Ok(Some(_))
-        ));
+        assert!(enumeration_properties(&ObjectType::Node, Some(empty.as_ref())).is_some());
     }
 
     /// Verify `PwSystemBackend: Send` as required by the [`CaptureBackend`] contract (proves

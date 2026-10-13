@@ -6,7 +6,6 @@ pub(crate) enum EnumerationFailure {
     CoreGone,
     Iterate,
     Deadline,
-    Identity,
     Format,
     Metadata,
     Callback,
@@ -18,7 +17,6 @@ impl EnumerationFailure {
             Self::CoreGone => "pipewire core disappeared during registry enumeration",
             Self::Iterate => "pipewire registry loop iteration failed",
             Self::Deadline => "pipewire registry enumeration timed out",
-            Self::Identity => "pipewire device has no mandatory stable identity",
             Self::Format => "pipewire device advertised an invalid native format",
             Self::Metadata => "pipewire default metadata query failed",
             Self::Callback => "pipewire registry query callback rejected",
@@ -91,7 +89,7 @@ mod round3_tests {
                 (None, None),
                 (Some("48000"), Some("0")),
             ]),
-            |(rate, channels)| Some(device_format(rate, channels)),
+            |(rate, channels)| Ok(Some(device_format(rate, channels))),
         )
         .unwrap();
         assert_eq!(
@@ -103,5 +101,30 @@ mod round3_tests {
                 (0, 0, false)
             ]
         );
+    }
+}
+
+/// Classify selectable audio nodes consistently for inventory and watcher callbacks.
+pub(crate) fn node_identity<'a>(media_class: &str, name: Option<&'a str>) -> Option<&'a str> {
+    if !matches!(media_class, "Audio/Sink" | "Audio/Source") {
+        return None;
+    }
+    name.filter(|name| !name.is_empty())
+}
+
+#[cfg(test)]
+mod round4_tests {
+    use super::*;
+    #[test]
+    fn missing_audio_node_identity_keeps_inventory_and_watcher_neighbors() {
+        for media_class in ["Audio/Sink", "Audio/Source"] {
+            let entries = flexaudio_core::inventory::collect(
+                Ok([Some("before"), Some(""), None, Some("after")]),
+                |name| Ok(node_identity(media_class, name)),
+            )
+            .unwrap();
+            assert_eq!(entries, ["before", "after"]);
+        }
+        assert_eq!(node_identity("Stream/Output/Audio", None), None);
     }
 }
