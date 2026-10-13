@@ -212,11 +212,14 @@ pub struct FlexEvent {
 ///
 /// `id` / `name` are flexaudio-owned, NUL-terminated UTF-8 strings. Release the entire array with
 /// `flexaudio_devices_free` (do not use C `free`). Unknown names are empty strings;
-/// Windows/macOS use selectable native IDs when names are unreadable. macOS omits
-/// unreadable output direction; unreadable default queries leave is_default=false.
+/// Windows/macOS use selectable native IDs when names are unreadable. IDs may change
+/// between queries: a native fallback may become the recovered name. A name-based ID
+/// cannot be opened while its name is unreadable; the native ID stays openable in both
+/// name states. macOS omits unreadable output direction from discovery; open retains
+/// its typed cause. Unreadable default queries leave is_default=false.
 #[repr(C)]
 pub struct FlexDeviceInfo {
-    /// Stable ID (released by `flexaudio_devices_free`).
+    /// Selectable ID (released by `flexaudio_devices_free`).
     pub id: *mut c_char,
     /// Human-readable display name (released by `flexaudio_devices_free`).
     pub name: *mut c_char,

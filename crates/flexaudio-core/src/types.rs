@@ -129,13 +129,14 @@ pub struct SecondaryChunk {
 /// cpal (microphones on all OSes) has no persistent ID, so use the device name as id. PipeWire
 /// (Linux) uses `node.name` as id (`node.description` is used for the display name `name`).
 ///
-/// Enumerating again on the same machine with the same configuration returns the same `id`. Uniqueness across
-/// different machines or operating systems is not guaranteed. Windows/macOS normally
-/// use the display name as ID, with a selectable native endpoint ID/UID when the name
-/// is unreadable. A later discovery may replace that fallback with a readable name.
+/// IDs are not guaranteed to remain the same across discovery calls, machines or OSes.
+/// Windows/macOS normally use the display name as ID, falling back to the native
+/// endpoint ID/UID when the name is unreadable. Later discovery may replace that
+/// native fallback with the recovered name. A name-based ID cannot be opened while
+/// its name is unreadable; the native ID remains openable in either name state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
-    /// Stable ID. Key accepted by [`StreamConfig::device_id`] (cpal = device name /
+    /// Selectable ID. Key accepted by [`StreamConfig::device_id`] (cpal = device name /
     /// PipeWire = `node.name`).
     pub id: String,
     /// Human-readable display name; empty means unknown when a selectable ID exists.
@@ -148,7 +149,8 @@ pub struct DeviceInfo {
     /// Native channel count, or 0 when `format_available` is false.
     pub channels: u16,
     /// Whether the capture format was available. False means rate/channels are both 0;
-    /// opening requires a fresh successful query, otherwise a typed cause/remedy error.
+    /// Windows/macOS and microphones re-query at open; explicit Linux outputs use a
+    /// fresh inventory gate. Linux default output negotiates through PipeWire without a pre-check.
     pub format_available: bool,
     /// `true` for loopback (system-output monitor), `false` for a recording device (microphone).
     pub is_loopback: bool,

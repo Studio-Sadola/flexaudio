@@ -21,10 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Collection/count failures still fail the whole call. Entries without a readable
   selectable identity may be omitted; macOS also omits unreadable output direction.
   Windows/macOS keep unknown device names with selectable native-ID fallbacks.
-  Optional default queries leave no default instead of failing discovery; selected
-  and default device-scoped opens check format availability (Linux exclusion fan-in
-  is not device-scoped). Linux PipeWire output discovery and watcher
+  Optional default queries leave no default instead of failing discovery. Windows/macOS
+  output and microphone opens re-query format; explicit Linux output IDs use a fresh
+  inventory/format gate. Linux default opens leave `target.object` unset and let PipeWire
+  resolve the default sink and negotiate format without an inventory pre-check;
+  exclusion fan-in also uses negotiation. Linux PipeWire output discovery and watcher
   notifications retain independent 48000 Hz / 2-channel compatibility defaults.
+- Linux process node-bind failures reject the collection with the first cause unless
+  a registry removal confirms the node vanished. Windows process discovery omits
+  invalidated/vanished endpoints but retains access-denied and other typed query errors.
+  macOS selected-output opens retain unreadable direction-query causes.
 - Primary/secondary PTS steps use rational arithmetic while retaining per-callback
   arrival re-anchoring. At 48 kHz primary, frame_index and capture_sample identify
   the same sample across replacement, recovery, loss rebuild and startup release.
@@ -65,10 +71,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collection error propagation and checked device-format policy across OS adapters.
 - Rust/Python `DeviceInfo.format_available`, Node.js `JsDeviceInfo.formatAvailable`,
   and C `flexaudio_device_format_available_v2` expose unreadable mandatory formats.
-  False uses sample rate 0 and channels 0; checked open retains typed cause/remedy.
+  False uses sample rate 0 and channels 0; checked open retains typed cause/remedy
+  (Linux default output relies on PipeWire negotiation without a pre-check).
   ProcessInfo retains the existing `pid N` fallback and absent optional fields.
   C v1 device structure layout is unchanged. Rust DeviceInfo struct literals must
   supply the new field.
+- Clarify device IDs can change between discovery calls: recovered names replace native
+  fallbacks; name-based IDs cannot open while names are unreadable, while native IDs
+  remain openable in both states. The public ID scheme is unchanged.
 - Document arrival PTS limits, canonical capture origins, stall/recovery ordering,
   increasing attached WhisperVad epochs and synchronous source-switch boundaries.
 - `DeviceEvent::TerminalError { error }`: terminal watcher failure, exposed as

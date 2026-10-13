@@ -123,3 +123,94 @@ mod tests {
         ));
     }
 }
+
+// All endpoint acquisition/count stages share this per-endpoint policy.
+pub(crate) fn endpoint_query<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if endpoint_vanished(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn endpoint_vanished(error: &Error) -> bool {
+    match error {
+        Error::Context { source, context } => match context.native_status() {
+            Some(NativeStatus::HResult { bits, .. }) => matches!(
+                bits,
+                0x8889_0004 // AUDCLNT_E_DEVICE_INVALIDATED
+                | 0x8007_0057 // E_INVALIDARG
+                | 0x8007_0490 // HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
+                | 0x8007_0002 // HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+            ),
+            _ => endpoint_vanished(source),
+        },
+        Error::Diagnostic { source, .. } => endpoint_vanished(source),
+        Error::Multiple(group) => endpoint_vanished(group.primary()),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    fn fault(bits: u32) -> Error {
+        let cause = if bits == 0x8007_0005 {
+            Error::PermissionDenied {
+                permission: flexaudio_core::Permission::SystemAudio,
+                detail: "endpoint access denied; retry discovery".into(),
+            }
+        } else {
+            Error::Backend("endpoint query failed; retry discovery".into())
+        };
+        cause.with_context(ErrorContext::new(Operation::Enumerate).with_native_status(
+            NativeStatus::HResult {
+                call: "endpoint fixture",
+                bits,
+            },
+        ))
+    }
+
+    // WASAPI endpoint invalidation cannot be triggered on Linux. Inject retained
+    // HRESULTs into the helper used by Item/Activate/session enumeration/count.
+    #[test]
+    fn invalidated_endpoint_keeps_healthy_sessions() {
+        let sessions = flexaudio_core::inventory::collect(Ok([0, 1]), |id| {
+            endpoint_query(if id == 0 {
+                Err(fault(0x8889_0004))
+            } else {
+                Ok(vec![42])
+            })
+        })
+        .unwrap();
+        assert_eq!(sessions, [vec![42]]);
+    }
+
+    #[test]
+    fn one_endpoint_access_denied_retains_typed_cause() {
+        let error = fault(0x8007_0005);
+        let result = flexaudio_core::inventory::collect(Ok([0, 1]), |id| {
+            endpoint_query(if id == 1 {
+                Err(error.clone())
+            } else {
+                Ok(vec![42])
+            })
+        });
+        assert_eq!(result, Err(error));
+        assert_eq!(
+            result.unwrap_err().kind(),
+            flexaudio_core::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn only_invalidated_or_vanished_endpoint_errors_are_omitted() {
+        for bits in [0x8889_0004, 0x8007_0057, 0x8007_0490, 0x8007_0002] {
+            assert_eq!(endpoint_query::<u32>(Err(fault(bits))), Ok(None));
+        }
+        for bits in [0x8007_0005, 0x8000_4005, 0x8889_000a] {
+            assert_eq!(endpoint_query::<u32>(Err(fault(bits))), Err(fault(bits)));
+        }
+    }
+}

@@ -219,18 +219,13 @@ impl CaptureBackend for PwSystemBackend {
             return Ok(());
         }
 
-        // Resolve requested sinks only against a complete inventory. The fan-in exclusion
-        // path is not device-scoped, so only the ordinary monitor path performs this lookup.
+        // Explicit monitor targets require a checked inventory. Default monitor opens
+        // leave target.object unset so PipeWire resolves and negotiates without enumeration.
+        // The fan-in exclusion path is not device-scoped and also skips the inventory.
         let excluded =
             effective_exclusion(self.exclude_self, &self.exclude_pids, std::process::id());
         let fan_in = !excluded.is_empty();
-        let mut device_id = self.device_id.clone();
-        if !fan_in {
-            let devices = list_devices()?;
-            let device =
-                flexaudio_core::inventory::selected_output_device(&devices, device_id.as_deref())?;
-            device_id = Some(device.id.clone());
-        }
+        let device_id = discovery::capture_target(fan_in, self.device_id.clone(), list_devices)?;
 
         // Stop channel for the loop thread (the receiver is attached to the loop).
         let (stop_tx, stop_rx) = pw::channel::channel::<Terminate>();

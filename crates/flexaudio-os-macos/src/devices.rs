@@ -261,7 +261,7 @@ fn device_uid(device: AudioObjectID) -> Result<String> {
 /// with unreadable direction (cannot classify) or no selectable identity.
 pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
     let default_id = default_output_device().unwrap_or(0);
-    crate::inventory::collect_complete(all_device_ids(read_system_object_list)?, |id| {
+    flexaudio_core::inventory::collect(all_device_ids(read_system_object_list), |id| {
         let Some((identity, name)) = output_device_identity(id) else {
             return Ok(None);
         };
@@ -284,7 +284,7 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
 
 /// One identity/classification path for both discovery and selected-device open.
 fn output_device_identity(id: AudioObjectID) -> Option<(String, String)> {
-    if !is_output_device(id).unwrap_or(false) {
+    if !crate::inventory::output_device_matches(is_output_device(id), || true).ok()? {
         return None;
     }
     flexaudio_core::inventory::device_identity(device_name(id), || device_uid(id))
@@ -310,13 +310,13 @@ pub(crate) fn resolve_output_device_uid(requested_id: Option<&str>) -> Result<Op
         return Ok(None);
     };
     for id in all_device_ids(read_system_object_list)? {
-        if is_output_device(id).unwrap_or(false)
-            && flexaudio_core::inventory::device_identity_matches(
+        if crate::inventory::output_device_matches(is_output_device(id), || {
+            flexaudio_core::inventory::device_identity_matches(
                 requested_id,
                 device_name(id),
                 || device_uid(id),
             )
-        {
+        })? {
             require_output_format(id)?;
             return device_uid(id).map(Some);
         }
@@ -339,7 +339,6 @@ mod tests {
             assert_eq!(d.source_kind, SourceKind::SystemLoopback);
             assert!(d.is_loopback);
             assert!(!d.id.is_empty());
-            assert_eq!(d.id, d.name);
             if d.format_available {
                 assert!(d.sample_rate > 0);
                 assert!(d.channels > 0);

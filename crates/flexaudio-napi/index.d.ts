@@ -6,8 +6,11 @@
 /** JS DeviceInfo. `sourceKind` is a string ("mic"|"system"|"process").
  * Unreadable mandatory formats use sampleRate=0, channels=0 and formatAvailable=false.
  * Unknown device display names are empty strings. Windows/macOS use a selectable
- * native endpoint ID/UID when the name-based ID is unreadable; unreadable direction
- * on macOS is omitted. An unreadable default query leaves isDefault=false. */
+ * native endpoint ID/UID when the name is unreadable. IDs may change between queries:
+ * a native fallback may become the recovered name. A name-based ID cannot be opened
+ * while its name is unreadable; the native ID stays openable in both name states.
+ * Unreadable direction on macOS is omitted from discovery; open retains its typed cause.
+ * An unreadable default query leaves isDefault=false. */
 export interface JsDeviceInfo {
   id: string
   name: string
