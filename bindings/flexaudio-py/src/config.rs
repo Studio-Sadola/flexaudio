@@ -44,22 +44,30 @@ pub(crate) fn parse_exclude_pids(value: Option<&Bound<'_, PyAny>>) -> PyResult<V
     let mut pids = Vec::with_capacity(len);
     for index in 0..len {
         let item = sequence.get_item(index)?;
-        let message = || {
-            format!(
-                "exclude_pids[{index}] must be a positive integer in 1..=4294967295, got {}",
-                match item.repr() {
-                    Ok(repr) => repr.to_string_lossy().into_owned(),
-                    // Python may refuse decimal formatting of extremely large integers.
-                    Err(_) => "<unrepresentable value>".to_string(),
+        let message = || -> PyResult<String> {
+            let repr = match item.repr() {
+                Ok(repr) => repr.to_string_lossy().into_owned(),
+                Err(error) if item.is_instance_of::<PyInt>() => {
+                    // Python limits decimal integer formatting; hexadecimal remains exact.
+                    let _ = error;
+                    item.py()
+                        .import("builtins")?
+                        .getattr("hex")?
+                        .call1((&item,))?
+                        .extract::<String>()?
                 }
-            )
+                Err(error) => return Err(error),
+            };
+            Ok(format!(
+                "exclude_pids[{index}] must be a positive integer in 1..=4294967295, got {repr}"
+            ))
         };
         if item.is_instance_of::<PyBool>() || !item.is_instance_of::<PyInt>() {
-            return Err(PyTypeError::new_err(message()));
+            return Err(PyTypeError::new_err(message()?));
         }
         let pid = match item.extract::<u32>() {
             Ok(pid) if pid != 0 => pid,
-            _ => return Err(PyValueError::new_err(message())),
+            _ => return Err(PyValueError::new_err(message()?)),
         };
         pids.push(pid);
     }
@@ -238,6 +246,20 @@ mod tests {
             assert!(parse_exclude_pids(None).expect("default").is_empty());
             let value = py.None().into_bound(py);
             assert!(parse_exclude_pids(Some(&value)).expect("None").is_empty());
+        });
+    }
+
+    #[test]
+    fn silent_failure_rejected_huge_pid_reports_the_value_instead_of_a_placeholder() {
+        Python::initialize();
+        Python::attach(|py| {
+            let value = py
+                .eval(pyo3::ffi::c_str!("[10 ** 5000]"), None, None)
+                .unwrap();
+            let error = parse_exclude_pids(Some(&value)).unwrap_err();
+            let message = error.to_string();
+            assert!(!message.contains("<unrepresentable value>"));
+            assert!(message.contains("0x") || message.contains(&"0".repeat(5000)));
         });
     }
 

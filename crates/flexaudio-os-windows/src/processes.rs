@@ -13,16 +13,17 @@
 //! This is read-only and does not open audio (it does not initialize `IAudioClient`), so it does not
 //! trigger permission prompts such as microphone privacy prompts. Read process names with
 //! `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` and `QueryFullProcessImageNameW`. Return no name
-//! for processes that cannot be opened (such as protected processes); the facade supplies `pid <N>`.
+//! only when a process disappeared; failed metadata queries reject the snapshot.
 
 use flexaudio_core::process_list::executable_basename;
 use flexaudio_core::types::{Error, ProcessInfo, Result};
 
 use windows::core::{Interface, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, S_OK};
+use windows::Win32::Foundation::{CloseHandle, S_FALSE, S_OK};
 use windows::Win32::Media::Audio::{
-    eRender, AudioSessionStateActive, AudioSessionStateExpired, IAudioSessionControl2,
-    IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    eRender, AudioSessionStateActive, AudioSessionStateExpired, AudioSessionStateInactive,
+    IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator,
+    DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::System::Threading::{
@@ -39,7 +40,7 @@ const IMAGE_PATH_CAPACITY: usize = 32_768;
 /// Raw values read from one session.
 struct SessionRecord {
     pid: u32,
-    /// `Some(true)`=Active / `Some(false)`=Inactive / `None`=state could not be read.
+    /// A successfully queried session state; discovery rejects unreadable states.
     active: Option<bool>,
 }
 
@@ -47,11 +48,11 @@ struct SessionRecord {
 ///
 /// Check first that the OS supports process loopback (build 20348 or later); otherwise return
 /// [`Error::UnsupportedOsVersion`] using the same function as capture. Return `Ok(empty)` if there
-/// are no render endpoints. If endpoints exist but none provide a session manager, return the last
-/// failure as a typed [`Error`] (for example, access denied becomes [`Error::PermissionDenied`]).
+/// are no render endpoints. Any endpoint/session/metadata query failure rejects the complete
+/// snapshot with its typed cause; no successfully read subset is returned.
 pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     crate::version::ensure_process_loopback_supported()?;
-    let _com = ComThread::new();
+    let _com = ComThread::new()?;
     // SAFETY: COM is initialized in this function (ComThread). COM interfaces are used only here,
     // on the same thread, and never cross a thread boundary.
     let sessions = unsafe { collect_sessions()? };
@@ -59,7 +60,7 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     let mut image_buffer = vec![0u16; IMAGE_PATH_CAPACITY];
     let mut out = Vec::with_capacity(sessions.len());
     for session in sessions {
-        let executable = process_image_path(session.pid, &mut image_buffer)
+        let executable = process_image_path(session.pid, &mut image_buffer)?
             .and_then(|path| executable_basename(&path));
         out.push(ProcessInfo {
             pid: session.pid,
@@ -98,112 +99,156 @@ unsafe fn collect_sessions() -> Result<Vec<SessionRecord>> {
         .GetCount()
         .map_err(|e| map_hr_at(Operation::Enumerate, "IMMDeviceCollection::GetCount", e))?;
 
-    let mut sessions = Vec::new();
-    let mut any_endpoint_read = false;
-    let mut last_error: Option<Error> = None;
-    for index in 0..endpoint_count {
-        let device = match collection.Item(index) {
-            Ok(d) => d,
-            Err(e) => {
-                last_error = Some(map_hr_at(
-                    Operation::Enumerate,
-                    "IMMDeviceCollection::Item",
-                    e,
-                ));
-                continue;
-            }
-        };
-        let manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
-            Ok(m) => m,
-            Err(e) => {
-                last_error = Some(map_hr_at(
+    let by_endpoint = crate::inventory::collect_complete(0..endpoint_count, |index| {
+        let device = collection
+            .Item(index)
+            .map_err(|error| map_hr_at(Operation::Enumerate, "IMMDeviceCollection::Item", error))?;
+        let manager: IAudioSessionManager2 =
+            device.Activate(CLSCTX_ALL, None).map_err(|error| {
+                map_hr_at(
                     Operation::Enumerate,
                     "IMMDevice::Activate(IAudioSessionManager2)",
-                    e,
-                ));
-                continue;
-            }
-        };
-        let session_list = match manager.GetSessionEnumerator() {
-            Ok(list) => list,
-            Err(e) => {
-                last_error = Some(map_hr_at(
-                    Operation::Enumerate,
-                    "IAudioSessionManager2::GetSessionEnumerator",
-                    e,
-                ));
-                continue;
-            }
-        };
-        any_endpoint_read = true;
-        let session_count = session_list.GetCount().unwrap_or(0);
-        for session_index in 0..session_count {
-            if let Some(record) = read_session(&session_list, session_index) {
-                sessions.push(record);
-            }
-        }
-    }
-
-    if endpoint_count > 0 && !any_endpoint_read {
-        if let Some(e) = last_error {
-            return Err(e);
-        }
-    }
-    Ok(sessions)
+                    error,
+                )
+            })?;
+        let session_list = manager.GetSessionEnumerator().map_err(|error| {
+            map_hr_at(
+                Operation::Enumerate,
+                "IAudioSessionManager2::GetSessionEnumerator",
+                error,
+            )
+        })?;
+        let session_count = session_list.GetCount().map_err(|error| {
+            map_hr_at(
+                Operation::Enumerate,
+                "IAudioSessionEnumerator::GetCount",
+                error,
+            )
+        })?;
+        let sessions = crate::inventory::collect_complete(0..session_count, |session_index| {
+            read_session(&session_list, session_index)
+        })?;
+        Ok(Some(sessions))
+    })?;
+    Ok(by_endpoint.into_iter().flatten().collect())
 }
 
-/// Read one session. Return `None` for system sounds, expired sessions, PID 0, or unreadable sessions.
+/// Read one session. Skip only known system sounds, expired sessions, or PID 0.
 ///
 /// # Safety
 /// COM must be initialized on the calling thread. `session_list` must be valid.
 unsafe fn read_session(
     session_list: &windows::Win32::Media::Audio::IAudioSessionEnumerator,
     session_index: i32,
-) -> Option<SessionRecord> {
-    let control = session_list.GetSession(session_index).ok()?;
-    let control2: IAudioSessionControl2 = control.cast().ok()?;
-    // In windows 0.54, `IsSystemSoundsSession` returns `HRESULT` (not `Result<()>`).
-    // S_OK means a system sound session (such as a notification), not a specific app; S_FALSE (1) is normal.
-    // S_FALSE is also considered success (HRESULT >= 0), so wrapping it in `Result<()>` loses the distinction.
-    if control2.IsSystemSoundsSession() == S_OK {
-        return None;
+) -> Result<Option<SessionRecord>> {
+    let control = session_list.GetSession(session_index).map_err(|error| {
+        map_hr_at(
+            Operation::Enumerate,
+            "IAudioSessionEnumerator::GetSession",
+            error,
+        )
+    })?;
+    let control2: IAudioSessionControl2 = control.cast().map_err(|error| {
+        map_hr_at(
+            Operation::Enumerate,
+            "IAudioSessionControl::QueryInterface",
+            error,
+        )
+    })?;
+    let system_sounds = control2.IsSystemSoundsSession();
+    if system_sounds == S_OK {
+        return Ok(None);
     }
-    let pid = control2.GetProcessId().ok()?;
+    if system_sounds != S_FALSE {
+        return Err(map_hr_at(
+            Operation::Enumerate,
+            "IAudioSessionControl2::IsSystemSoundsSession",
+            windows::core::Error::from(system_sounds),
+        ));
+    }
+    let pid = control2.GetProcessId().map_err(|error| {
+        map_hr_at(
+            Operation::Enumerate,
+            "IAudioSessionControl2::GetProcessId",
+            error,
+        )
+    })?;
     if pid == 0 {
-        return None;
+        return Ok(None);
     }
-    let state = control2.GetState().ok();
-    if state == Some(AudioSessionStateExpired) {
-        return None;
+    let state = control2.GetState().map_err(|error| {
+        map_hr_at(
+            Operation::Enumerate,
+            "IAudioSessionControl::GetState",
+            error,
+        )
+    })?;
+    if state == AudioSessionStateExpired {
+        return Ok(None);
     }
-    Some(SessionRecord {
+    let active = if state == AudioSessionStateActive {
+        true
+    } else if state == AudioSessionStateInactive {
+        false
+    } else {
+        return Err(Error::Backend(format!(
+            "native audio session state is invalid (value {}); retry discovery",
+            state.0
+        ))
+        .with_context(flexaudio_core::ErrorContext::new(Operation::Enumerate)));
+    };
+    Ok(Some(SessionRecord {
         pid,
-        active: state.map(|s| s == AudioSessionStateActive),
-    })
+        active: Some(active),
+    }))
 }
 
-/// Get the PID's image path in Win32 format. Return `None` if it cannot be opened or read.
-fn process_image_path(pid: u32, buffer: &mut [u16]) -> Option<String> {
-    // SAFETY: Always close the handle returned by OpenProcess. The caller owns `buffer`, which is
-    // writable; `size` is its length in UTF-16 units and is updated with the actual length on return.
+/// Retain a metadata failure without misclassifying process access as recording consent.
+fn metadata_error(call: &'static str, error: windows::core::Error) -> Error {
+    let bits = error.code().0 as u32;
+    Error::Backend(format!("process metadata query failed (HRESULT 0x{bits:08X}); check process access and retry discovery"))
+        .with_context(flexaudio_core::ErrorContext::new(Operation::Enumerate)
+            .with_native_status(flexaudio_core::NativeStatus::HResult { call, bits }))
+}
+
+/// Get the PID's image path. Only a disappeared process or empty successful query is absent.
+fn process_image_path(pid: u32, buffer: &mut [u16]) -> Result<Option<String>> {
+    // SAFETY: close the owned handle; buffer is writable for the supplied UTF-16 capacity.
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(handle) => handle,
+            // ERROR_INVALID_PARAMETER indicates the process no longer exists.
+            Err(error) if error.code().0 as u32 == 0x8007_0057 => return Ok(None),
+            Err(error) => return Err(metadata_error("OpenProcess", error)),
+        };
         let mut size = buffer.len() as u32;
         let queried = QueryFullProcessImageNameW(
             handle,
             PROCESS_NAME_WIN32,
             PWSTR(buffer.as_mut_ptr()),
             &mut size,
-        );
-        let _ = CloseHandle(handle);
-        queried.ok()?;
-        let len = (size as usize).min(buffer.len());
-        let path = String::from_utf16_lossy(&buffer[..len]);
-        if path.is_empty() {
-            None
-        } else {
-            Some(path)
+        )
+        .map_err(|error| metadata_error("QueryFullProcessImageNameW", error));
+        let closed = CloseHandle(handle).map_err(|error| metadata_error("CloseHandle", error));
+        match (queried, closed) {
+            (Err(primary), Err(secondary)) => {
+                return Err(Error::Multiple(flexaudio_core::ErrorGroup::new(
+                    primary,
+                    secondary,
+                    Vec::new(),
+                )))
+            }
+            (Err(error), _) | (_, Err(error)) => return Err(error),
+            (Ok(()), Ok(())) => {}
         }
+        let path = buffer
+            .get(..size as usize)
+            .and_then(|units| String::from_utf16(units).ok())
+            .ok_or_else(|| {
+                Error::Backend("process image query returned invalid text; retry discovery".into())
+                    .with_context(flexaudio_core::ErrorContext::new(Operation::Enumerate))
+            })?;
+        Ok((!path.is_empty()).then_some(path))
     }
 }
 
@@ -244,7 +289,8 @@ mod tests {
     fn own_image_path_is_readable() {
         let mut buffer = vec![0u16; IMAGE_PATH_CAPACITY];
         let path = process_image_path(std::process::id(), &mut buffer)
-            .expect("the current process image path should be readable");
+            .expect("the current process image query should succeed")
+            .expect("the current process image path should exist");
         assert!(path.to_ascii_lowercase().ends_with(".exe"), "{path}");
     }
 }

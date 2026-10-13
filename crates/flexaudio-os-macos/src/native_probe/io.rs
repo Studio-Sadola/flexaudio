@@ -19,7 +19,7 @@ use objc2_core_audio_types::{
     AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp,
 };
 
-use crate::probe::{ProbeControl, ProbeOutcome};
+use crate::probe::{ProbeCleanup, ProbeControl, ProbeOutcome};
 
 pub(super) type DeviceBlock = RcBlock<
     dyn Fn(
@@ -48,9 +48,19 @@ pub(super) fn check(control: &ProbeControl) -> Result<(), ProbeOutcome> {
     Ok(())
 }
 
-pub(super) fn failed(context: &str, status: i32) -> ProbeOutcome {
+pub(super) fn failed(context: &'static str, status: i32) -> ProbeOutcome {
+    let mut error_context = flexaudio_core::ErrorContext::new(flexaudio_core::Operation::Start);
+    if status != 0 {
+        error_context = error_context.with_native_status(flexaudio_core::NativeStatus::OsStatus {
+            call: context,
+            value: status,
+        });
+    }
     ProbeOutcome::Failed {
-        detail: format!("self-probe {context} failed (OSStatus {status})"),
+        error: flexaudio_core::Error::Backend(format!(
+            "self-probe {context} failed; retry capture"
+        ))
+        .with_context(error_context),
     }
 }
 
@@ -165,6 +175,7 @@ pub(super) fn float_rate(format: &AudioStreamBasicDescription) -> Result<u32, Pr
 /// retries teardown. An OS refusing destruction can retain native resources; Rust cannot
 /// force their release or preempt a synchronous native hang.
 pub(super) struct IoRegistration {
+    cleanup: Arc<ProbeCleanup>,
     device: AudioObjectID,
     id: AudioDeviceIOProcID,
     gate: Arc<AtomicBool>,
@@ -180,6 +191,7 @@ impl IoRegistration {
     ) -> Result<Self, ProbeOutcome> {
         check(control)?;
         let mut owner = Self {
+            cleanup: control.cleanup_diagnostics(),
             device,
             id: None,
             gate,
@@ -216,6 +228,8 @@ impl IoRegistration {
         let stop = unsafe { AudioDeviceStop(self.device, Some(id)) };
         // SAFETY: this is this owner's registered IOProc, not shared with another capture.
         let destroy = unsafe { AudioDeviceDestroyIOProcID(self.device, Some(id)) };
+        self.cleanup.record_native("IOProc stop", stop);
+        self.cleanup.record_native("IOProc destruction", destroy);
         if destroy == 0 {
             self.id = None;
         }

@@ -46,6 +46,7 @@ impl PcmFormat {
 /// matches the target, only mono conversion is performed and no resampler is used.
 pub(crate) struct PcmConverter {
     format: PcmFormat,
+    input_seen: bool,
     channels: usize,
     /// Sample-rate converter for the target rate. `None` if the input rate matches (mono
     /// conversion only).
@@ -123,6 +124,7 @@ impl PcmConverter {
         };
         Ok(PcmConverter {
             format,
+            input_seen: false,
             channels,
             resampler,
             remainder: Vec::new(),
@@ -142,6 +144,13 @@ impl PcmConverter {
         self.format == format
     }
 
+    /// A resampler retains filter history even when its block accumulator is empty.
+    /// Replacing it would lose the delayed output of that input; only a checked
+    /// flush/reset boundary may abandon this history under the legacy EOF contract.
+    pub(crate) fn has_pending_input(&self) -> bool {
+        !self.remainder.is_empty() || (self.resampler.is_some() && self.input_seen)
+    }
+
     /// Downmix interleaved input to mono, resample if needed, and append target-rate mono samples
     /// to `out`.
     ///
@@ -156,6 +165,7 @@ impl PcmConverter {
         if self.fail_conversion {
             return Err("injected conversion failure".into());
         }
+        self.input_seen |= !interleaved.is_empty();
         // Append this input to the previous remainder and downmix only complete frames.
         self.remainder.extend_from_slice(interleaved);
         let frames = self.remainder.len() / self.channels;

@@ -72,6 +72,9 @@ pub struct FlexErrorInfoV2 {
     pub(crate) root: Error,
     pub(crate) message: CString,
     pub(crate) whisper_code: Option<CString>,
+    pub(crate) addon_kind: Option<CString>,
+    pub(crate) addon_message: Option<CString>,
+    pub(crate) diagnostic_details: Vec<CString>,
     contexts: Vec<Context>,
     pub(crate) secondary: Vec<FlexErrorInfoV2>,
 }
@@ -85,6 +88,7 @@ impl FlexErrorInfoV2 {
             secondary: &mut Vec<FlexErrorInfoV2>,
         ) {
             match error {
+                Error::Diagnostic { source, .. } => collect(source, contexts, secondary),
                 Error::Context { source, context } => {
                     contexts.push(Context::new(*context));
                     collect(source, contexts, secondary);
@@ -98,6 +102,16 @@ impl FlexErrorInfoV2 {
         }
         collect(&error, &mut contexts, &mut secondary);
         Self {
+            addon_kind: error.addon_kind().map(|kind| cstring(kind.as_str())),
+            addon_message: match error.root() {
+                Error::Addon { message, .. } => Some(cstring(message.clone())),
+                _ => None,
+            },
+            diagnostic_details: error
+                .diagnostic_details()
+                .into_iter()
+                .map(cstring)
+                .collect(),
             root: error.root().clone(),
             message: cstring(error.to_string()),
             whisper_code: error.whisper_code().map(|code| cstring(code.as_str())),
@@ -250,6 +264,7 @@ pub struct FlexDeviceEventV2 {
     pub(crate) dropped_events: Option<u64>,
     pub(crate) device: Option<FlexDeviceInfo>,
     pub(crate) id: Option<CString>,
+    pub(crate) error: Option<FlexErrorInfoV2>,
 }
 impl FlexDeviceEventV2 {
     pub(crate) fn new(event: flexaudio::DeviceEvent) -> Self {
@@ -260,6 +275,7 @@ impl FlexDeviceEventV2 {
             dropped_events: None,
             device: None,
             id: None,
+            error: None,
         };
         let default = |k| match k {
             DefaultDeviceKind::Microphone => 0,
@@ -267,6 +283,10 @@ impl FlexDeviceEventV2 {
             _ => -1,
         };
         match event {
+            DeviceEvent::TerminalError { error } => {
+                out.kind = FLEX_DEVICE_EVENT_KIND_TERMINAL_ERROR;
+                out.error = Some(FlexErrorInfoV2::new(error));
+            }
             DeviceEvent::Added(info) => {
                 out.kind = 0;
                 out.id = Some(cstring(info.id.clone()));

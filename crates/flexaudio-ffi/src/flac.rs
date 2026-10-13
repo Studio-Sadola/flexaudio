@@ -14,7 +14,7 @@ use std::slice;
 
 use flexaudio_encode::{EncodeError, FlacWriter};
 
-use crate::error::{clear_last_error, code, set_last_error};
+use crate::error::{clear_last_error, code, set_audio_error, set_last_error};
 use crate::{guard_i32, guard_ptr};
 
 /// Maximum sample rate supported by the FLAC writer (Hz). Match the limit imposed by
@@ -216,13 +216,9 @@ pub struct FlexFlac {
 
 /// Map EncodeError to an error code (argument errors become InvalidArg; all others become Failure).
 fn flac_err(e: EncodeError) -> i32 {
-    let is_arg = matches!(e, EncodeError::Unsupported(_));
-    set_last_error(e.to_string());
-    if is_arg {
-        code::FLEX_INVALID_ARG
-    } else {
-        code::FLEX_FAILURE
-    }
+    let error = e.audio_error();
+    let message = format!("{error}: {e}");
+    crate::error::set_audio_error_with_message(error, message)
 }
 
 /// Open FLAC output at `path`. `split_seconds = 0` creates one file; values of 1 or more rotate to
@@ -244,31 +240,35 @@ pub unsafe extern "C" fn flexaudio_flac_create(
     guard_ptr(|| {
         clear_last_error();
         if path.is_null() {
-            set_last_error("flexaudio_flac_create: path pointer is null");
+            set_audio_error(flexaudio::Error::InvalidArg(
+                "flexaudio_flac_create: path pointer is null".into(),
+            ));
             return std::ptr::null_mut();
         }
         let path = match CStr::from_ptr(path).to_str() {
             Ok(s) => PathBuf::from(s),
             Err(_) => {
-                set_last_error("flexaudio_flac_create: path is not valid UTF-8");
+                set_audio_error(flexaudio::Error::InvalidArg(
+                    "flexaudio_flac_create: path is not valid UTF-8".into(),
+                ));
                 return std::ptr::null_mut();
             }
         };
         // Reject invalid values early, matching FlacWriter::create; no file is created.
         if !(1..=2).contains(&ch) {
-            set_last_error(format!(
+            flac_err(EncodeError::Unsupported(format!(
                 "flexaudio_flac_create: channels must be 1 or 2, got {ch}"
-            ));
+            )));
             return std::ptr::null_mut();
         }
         if !(1..=MAX_SAMPLE_RATE).contains(&sr) {
-            set_last_error(format!(
+            flac_err(EncodeError::Unsupported(format!(
                 "flexaudio_flac_create: sample rate must be 1..={MAX_SAMPLE_RATE} Hz, got {sr}"
-            ));
+            )));
             return std::ptr::null_mut();
         }
         if let Err(error) = validate_destination(&path) {
-            set_last_error(error.to_string());
+            flac_err(error);
             return std::ptr::null_mut();
         }
         let inner = RotatingFlac::new(path, sr, ch, split_seconds);
@@ -297,8 +297,10 @@ pub unsafe extern "C" fn flexaudio_flac_write(
             return code::FLEX_INVALID_ARG;
         };
         if matches!(flac.inner.state, EncoderState::Finalized) {
-            set_last_error("flexaudio_flac_write: writer is already finalized");
-            return code::FLEX_INVALID_STATE;
+            return set_audio_error(flexaudio::Error::InvalidState(
+                "FLAC writer is already finalized; create a new writer before appending audio"
+                    .into(),
+            ));
         }
         if let EncoderState::Failed(error) = &flac.inner.state {
             return flac_err(error.error());
@@ -532,5 +534,96 @@ mod tests {
             code::FLEX_INVALID_ARG
         );
         unsafe { flexaudio_flac_free(std::ptr::null_mut()) };
+    }
+}
+
+#[cfg(test)]
+mod addon_cause_tests {
+    use super::*;
+    #[test]
+    fn finalized_writer_retains_invalid_state_in_typed_error_accessors() {
+        // The finalized lazy writer never opens its destination: no I/O is needed.
+        let mut handle = FlexFlac {
+            inner: RotatingFlac::new(PathBuf::new(), 16_000, 1, 0),
+        };
+        handle.inner.state = EncoderState::Finalized;
+        let status = unsafe { flexaudio_flac_write(&mut handle, std::ptr::null(), 0) };
+        assert_eq!(status, code::FLEX_INVALID_STATE);
+        assert_eq!(
+            crate::error::last_audio_error().unwrap().kind(),
+            flexaudio::ErrorKind::InvalidState
+        );
+    }
+
+    #[test]
+    fn encoder_failure_does_not_become_an_invalid_argument() {
+        assert_eq!(
+            flac_err(EncodeError::Encoder("injected encoder failure".into())),
+            code::FLEX_FAILURE
+        );
+        let error = crate::error::last_audio_error().unwrap();
+        assert_eq!(error.kind(), flexaudio::ErrorKind::Backend);
+        assert_eq!(
+            error.addon_kind(),
+            Some(flexaudio::core::AddonErrorKind::FlacEncoder)
+        );
+        assert!(format!("{error:?}").contains("injected encoder failure"));
+    }
+}
+
+#[cfg(test)]
+mod round2_tests {
+    use super::*;
+    #[test]
+    fn round2_flac_create_preserves_argument_and_addon_causes() {
+        for (path, rate, channels, addon) in [
+            (std::ptr::null(), 16_000, 1, None),
+            (
+                c"unused.flac".as_ptr(),
+                0,
+                1,
+                Some(flexaudio::AddonErrorKind::FlacUnsupported),
+            ),
+            (
+                c"unused.flac".as_ptr(),
+                16_000,
+                3,
+                Some(flexaudio::AddonErrorKind::FlacUnsupported),
+            ),
+            (
+                c"".as_ptr(),
+                16_000,
+                1,
+                Some(flexaudio::AddonErrorKind::FlacUnsupported),
+            ),
+        ] {
+            assert!(unsafe { flexaudio_flac_create(path, rate, channels, 0) }.is_null());
+            let error = crate::error::last_audio_error().unwrap();
+            assert_eq!(error.kind(), flexaudio::ErrorKind::InvalidArg);
+            assert_eq!(error.addon_kind(), addon);
+            if addon.is_some() {
+                assert!(
+                    matches!(error.root(), flexaudio::Error::Addon { message, .. } if !message.is_empty())
+                );
+            }
+        }
+    }
+    #[test]
+    fn round2_flac_v1_message_keeps_os_cause_and_v2_typed_cause() {
+        let cause = EncodeError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let expected = cause.to_string();
+        assert_eq!(flac_err(cause), code::FLEX_FAILURE);
+        let error = crate::error::last_audio_error().unwrap();
+        assert_eq!(error.addon_kind(), Some(flexaudio::AddonErrorKind::FlacIo));
+        assert!(
+            matches!(error.root(), flexaudio::Error::Addon { message, .. } if message == &expected)
+        );
+        let message = unsafe { CStr::from_ptr(crate::error::last_error_ptr()) }
+            .to_str()
+            .unwrap();
+        assert!(
+            message.contains(&expected),
+            "v1 caller lost the OS cause: {message}"
+        );
     }
 }

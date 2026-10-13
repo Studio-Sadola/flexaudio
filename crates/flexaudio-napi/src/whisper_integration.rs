@@ -263,24 +263,15 @@ impl PairingBridge {
         match whisper.tap {
             VadTap::Primary => carrier.whisper_vad_events = Some(events),
             VadTap::Secondary => {
-                let (data, encoding) = match self.secondary.map(|config| config.encoding) {
-                    Some(SecEncoding::S16) => (Either::A(Int16Array::new(Vec::new())), "s16"),
-                    _ => (Either::B(Float32Array::new(Vec::new())), "f32"),
-                };
-                carrier.secondary = Some(JsSecondaryChunk {
-                    data,
-                    encoding: encoding.into(),
-                    frames: 0,
-                    frame_index: BigInt::from(whisper.last_frame_index),
-                    pts_ns: carrier.pts_ns,
-                    seq: BigInt::from(0u64),
-                    flags: 0,
-                    dropped_before: 0,
-                    peak: 0.0,
-                    rms: 0.0,
-                    vad_events: None,
-                    whisper_vad_events: Some(events),
-                });
+                let mut secondary = secondary_event_carrier(
+                    self.secondary.map(|config| config.encoding),
+                    carrier.pts_ns,
+                    Vec::new(),
+                    self.last_secondary,
+                );
+                secondary.vad_events = None;
+                secondary.whisper_vad_events = Some(events);
+                carrier.secondary = Some(secondary);
             }
         }
         self.on_chunk.call(
@@ -368,6 +359,10 @@ pub(super) fn throw_error(env: &Env, error: WhisperVadTapError) -> NapiError {
 pub(super) fn js_error(env: &Env, error: &WhisperVadTapError) -> napi::Result<JsObject> {
     let mut object = env.create_error(NapiError::new(Status::GenericFailure, error.to_string()))?;
     object.set_named_property("code", error_code(error))?;
+    object.set_named_property(
+        "audioError",
+        super::boundary::audio_error(&error.audio_error()),
+    )?;
     object.set_named_property("terminalEvents", env.create_array(0)?)?;
     Ok(object)
 }

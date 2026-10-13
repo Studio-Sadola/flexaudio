@@ -67,7 +67,10 @@ impl WhisperVadTap {
     /// Snapshot shared parameters/options and construct DSP/model off the capture thread.
     pub fn new(params: WhisperVadParams, options: WhisperVadOptions) -> Result<Self, Error> {
         params.validate().map_err(Error::Vad)?;
-        let converter = CaptureConverter::new().map_err(|_| Error::UnsupportedConversionClock)?;
+        let converter = CaptureConverter::new().map_err(|source| Error::Cause {
+            primary: Box::new(Error::UnsupportedConversionClock),
+            source,
+        })?;
         let vad = WhisperVad::new(params, options).map_err(Error::Vad)?;
         Ok(Self::with_vad(vad, converter))
     }
@@ -214,7 +217,7 @@ impl WhisperVadTap {
         });
         let mono = match self.converter.push(stereo_48k) {
             Ok(mono) => mono,
-            Err(()) => return Err(self.conversion_failure(events)),
+            Err(source) => return Err(self.conversion_failure(events, source)),
         };
         self.feed_mono(&mono, &mut events)?;
         Ok(events)
@@ -285,7 +288,7 @@ impl WhisperVadTap {
         self.fail_if_injected(events)?;
         let mono = match self.converter.drain() {
             Ok(mono) => mono,
-            Err(()) => return Err(self.conversion_failure(std::mem::take(events))),
+            Err(source) => return Err(self.conversion_failure(std::mem::take(events), source)),
         };
         self.feed_mono(&mono, events)?;
         if self.started {
@@ -323,7 +326,7 @@ impl WhisperVadTap {
             .iter()
             .any(|sample| !sample.is_finite() || !(-1.0..=1.0).contains(sample))
         {
-            return Err(self.conversion_failure(std::mem::take(events)));
+            return Err(self.conversion_failure(std::mem::take(events), crate::VadError::Resample("capture conversion produced non-finite or out-of-range PCM; reset the VAD session and retry".into())));
         }
         if !self.started {
             let origin = self.origin.expect("valid mono requires capture input");
@@ -354,10 +357,13 @@ impl WhisperVadTap {
         }
         let converter = match CaptureConverter::new() {
             Ok(converter) => converter,
-            Err(()) => {
+            Err(source) => {
                 self.state = State::Failed;
                 return Err(Failure {
-                    error: Error::UnsupportedConversionClock,
+                    error: Error::Cause {
+                        primary: Box::new(Error::UnsupportedConversionClock),
+                        source,
+                    },
                     terminal_events: std::mem::take(events),
                 });
             }
@@ -405,7 +411,11 @@ impl WhisperVadTap {
         }
     }
 
-    fn conversion_failure(&mut self, mut events: Vec<Attached>) -> Failure {
+    fn conversion_failure(
+        &mut self,
+        mut events: Vec<Attached>,
+        source: crate::VadError,
+    ) -> Failure {
         let error = match self.vad.abort() {
             Ok(failure) => {
                 if self.started {
@@ -417,7 +427,10 @@ impl WhisperVadTap {
         };
         self.state = State::Failed;
         Failure {
-            error,
+            error: Error::Cause {
+                primary: Box::new(error),
+                source,
+            },
             terminal_events: events,
         }
     }

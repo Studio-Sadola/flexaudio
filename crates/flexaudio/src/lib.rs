@@ -30,7 +30,7 @@ pub use flexaudio_core::types::{
     Operation, OutputFormat, OutputTap, Permission, ProcessInfo, ProcessMode, Result,
     SecondaryChunk, ShutdownReport, SourceKind, StreamConfig, WhisperCode,
 };
-pub use flexaudio_core::StartupDropReason;
+pub use flexaudio_core::{AddonErrorKind, StartupDropReason};
 
 /// Return audio devices for all sources in one list.
 ///
@@ -187,6 +187,21 @@ pub fn open(config: StreamConfig) -> Result<Stream> {
     Stream::open(config, backend)
 }
 
+/// Shared preflight used by the Mix branch of open's backend construction.
+fn validate_mix_gains(config: &StreamConfig) -> Result<()> {
+    for (name, gain) in [
+        ("mix_mic_gain", config.mix_mic_gain),
+        ("mix_system_gain", config.mix_system_gain),
+    ] {
+        if !gain.is_finite() || gain < 0.0 {
+            return Err(Error::InvalidArg(format!(
+                "{name} must be finite and >= 0.0, got {gain}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validate exclusion PIDs only for sources that use system capture.
 pub(crate) fn validate_exclude_pids(config: &StreamConfig) -> Result<()> {
     if matches!(config.kind, SourceKind::SystemLoopback | SourceKind::Mix)
@@ -282,16 +297,7 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
         // per-side gains using the same rules as global gain (checked by Stream::open).
         // Ignore device_id; select each side with mix_mic_device_id / mix_system_device_id.
         SourceKind::Mix => {
-            for (name, gain) in [
-                ("mix_mic_gain", config.mix_mic_gain),
-                ("mix_system_gain", config.mix_system_gain),
-            ] {
-                if !gain.is_finite() || gain < 0.0 {
-                    return Err(Error::InvalidArg(format!(
-                        "{name} must be finite and >= 0.0, got {gain}"
-                    )));
-                }
-            }
+            validate_mix_gains(config)?;
             let mic = Box::new(flexaudio_mic::CpalMicBackend::try_new(
                 config.mix_mic_device_id.clone(),
             )?);
@@ -428,8 +434,7 @@ mod tests {
         }
     }
 
-    /// A valid Mix config passes backend construction (open), including permission
-    /// checks and native microphone format discovery on the host.
+    /// Valid Mix gains pass the same preflight as the public open path.
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     #[test]
     fn mix_config_with_valid_gains_opens() {
@@ -439,20 +444,16 @@ mod tests {
             mix_system_gain: 2.0,
             ..Default::default()
         };
-        let stream = match open(config) {
-            Ok(stream) => stream,
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            Err(
-                error @ Error::PermissionDenied {
-                    permission: Permission::Microphone,
-                    ..
-                },
-            ) => {
-                eprintln!("Skipping mix_config_with_valid_gains_opens: host microphone permission is denied: {error}");
-                return;
-            }
-            Err(error) => panic!("valid Mix config should open successfully: {error:?}"),
-        };
+        // Public open also queries real microphone/system devices. Exercise its
+        // shared gain validator here so this test stays hardware-free.
+        validate_mix_gains(&config).expect("public open Mix gain validation");
+        let backend = mix::CompositeBackend::new(
+            Box::new(MockBackend::new(48_000, 2, 0.0)),
+            Box::new(MockBackend::new(48_000, 2, 0.0)),
+            config.mix_mic_gain,
+            config.mix_system_gain,
+        );
+        let stream = Stream::open(config, Box::new(backend)).expect("valid Mix configuration");
         // The composite backend reports its internal canonical format (Stream's first stage is pass-through).
         assert_eq!(stream.native_format(), (48_000, 2));
     }

@@ -849,3 +849,28 @@ fn mix_drift_sim_minus_300ppm_no_steady_zero_fill() {
         corrected.final_ratio
     );
 }
+
+#[test]
+fn routing_discontinuity_survives_a_mix_lane_until_actual_output() {
+    let mut lane = sim_lane();
+    lane.diagnostics.mark_discontinuity();
+    lane.losses().unwrap();
+    let (producer, _consumer) = raw_ring(16);
+    let mut sink = RawSink::new(producer, 48_000, 2);
+    let diagnostic = sink.diagnostics();
+    lane.notices.publish(&mut sink, &[]);
+    assert!(
+        !diagnostic.take_discontinuity(),
+        "empty publication must retain the routing marker"
+    );
+    lane.notices.publish(&mut sink, &[0.0; 4]);
+    assert!(
+        diagnostic.take_discontinuity(),
+        "lane routing changes must reach composite output"
+    );
+    lane.notices.publish(&mut sink, &[0.0; 4]);
+    assert!(
+        !diagnostic.take_discontinuity(),
+        "one routing change produces one marker"
+    );
+}

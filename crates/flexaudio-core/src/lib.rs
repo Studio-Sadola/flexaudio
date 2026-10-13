@@ -26,12 +26,17 @@
 
 #![warn(missing_docs)]
 
+mod addon_error;
+pub use addon_error::AddonErrorKind;
+
 pub mod backend;
 pub mod chunk_ring;
 pub mod clock;
 pub mod diagnostics;
 pub mod error_context;
 mod errors;
+mod spawn_error;
+pub use spawn_error::spawn_error;
 mod loss;
 pub mod normalizer;
 pub mod process_list;

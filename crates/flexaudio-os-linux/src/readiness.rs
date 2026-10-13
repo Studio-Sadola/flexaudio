@@ -1,4 +1,5 @@
 // Capture startup policy, kept independent of PipeWire for injected callback tests.
+use flexaudio_core::{Error, ErrorContext, Operation, Result};
 use std::cell::Cell;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -13,18 +14,19 @@ pub(crate) fn negotiation_timeout_message() -> String {
     )
 }
 
+pub(crate) fn negotiation_timeout_error() -> Error {
+    Error::Backend(negotiation_timeout_message()).with_context(ErrorContext::new(Operation::Start))
+}
+
 pub(crate) struct Readiness {
-    tx: mpsc::Sender<std::result::Result<(), String>>,
+    tx: mpsc::Sender<Result<()>>,
     sent: Cell<bool>,
     target_present: Cell<bool>,
     registry_complete: Cell<bool>,
 }
 
 impl Readiness {
-    pub(crate) fn new(
-        tx: mpsc::Sender<std::result::Result<(), String>>,
-        process_capture: bool,
-    ) -> Self {
+    pub(crate) fn new(tx: mpsc::Sender<Result<()>>, process_capture: bool) -> Self {
         Self {
             tx,
             sent: Cell::new(false),
@@ -50,9 +52,9 @@ impl Readiness {
         }
     }
 
-    pub(crate) fn report_failure(&self, message: String) {
+    pub(crate) fn report_failure(&self, error: Error) {
         if !self.sent.replace(true) {
-            let _ = self.tx.send(Err(message));
+            let _ = self.tx.send(Err(error));
         }
     }
 
@@ -70,7 +72,7 @@ impl Readiness {
             return false;
         }
         if self.requires_negotiation() {
-            self.report_failure(negotiation_timeout_message());
+            self.report_failure(negotiation_timeout_error());
             true
         } else {
             self.report_ready();
@@ -130,6 +132,21 @@ mod tests {
     }
 
     #[test]
+    fn readiness_preserves_typed_source_context_and_private_diagnostic() {
+        let (tx, rx) = mpsc::channel();
+        let readiness = Readiness::new(tx, true);
+        let error = Error::UnsupportedFormat("synthetic layout; retry".into())
+            .with_context(ErrorContext::new(Operation::Link))
+            .with_diagnostic_detail("synthetic daemon detail".into());
+        readiness.report_failure(error.clone());
+        assert_eq!(rx.recv().unwrap(), Err(error.clone()));
+        readiness.report_failure(Error::DeviceLost);
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert_eq!(error.kind(), flexaudio_core::ErrorKind::UnsupportedFormat);
+        assert_eq!(error.diagnostic_details(), ["synthetic daemon detail"]);
+    }
+
+    #[test]
     fn eligible_process_target_waits_for_negotiation_and_times_out() {
         let (tx, rx) = mpsc::channel();
         let readiness = Readiness::new(tx, true);
@@ -141,8 +158,8 @@ mod tests {
             .recv()
             .expect("deadline must report failure")
             .expect_err("eligible target did not negotiate");
-        assert!(message.contains("2 seconds"));
-        assert!(message.contains("retry"));
+        assert!(message.to_string().contains("2 seconds"));
+        assert!(message.to_string().contains("retry"));
     }
 
     #[test]
@@ -171,7 +188,7 @@ mod tests {
             assert!(readiness.deadline_expired());
             let result = rx.recv().expect("deadline must report");
             assert!(result.is_err());
-            assert_eq!(result, Err(negotiation_timeout_message()));
+            assert_eq!(result, Err(negotiation_timeout_error()));
             assert!(negotiation_timeout_message().contains("2 seconds"));
         }
     }

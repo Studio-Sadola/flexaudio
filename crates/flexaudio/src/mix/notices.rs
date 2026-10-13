@@ -16,22 +16,52 @@ struct State {
     // At most twelve fixed lane/reason combinations from child capture and FIFOs.
     losses: Vec<AudioLoss>,
     clipped: bool,
+    discontinuity: bool,
 }
+impl State {
+    // Reconciliation can observe the same child error at startup and shutdown.
+    // Retain each distinct cause once in observation order through one path.
+    fn retain_terminal(&mut self, error: Error) -> bool {
+        let Some(previous) = self.primary.take() else {
+            self.primary = Some(error);
+            return true;
+        };
+        if previous == error {
+            self.primary = Some(previous);
+            return false;
+        }
+        let (primary, mut related) = match previous {
+            Error::Multiple(group) => (
+                group.primary().clone(),
+                group.secondary().cloned().collect::<Vec<_>>(),
+            ),
+            primary => (primary, Vec::new()),
+        };
+        if error != primary && !related.contains(&error) {
+            related.push(error);
+        }
+        self.primary = Some(if related.is_empty() {
+            primary
+        } else {
+            let first = related.remove(0);
+            Error::Multiple(flexaudio_core::ErrorGroup::new(primary, first, related))
+        });
+        false
+    }
+}
+
 impl Notices {
     pub(super) fn failed(&self) -> bool {
         self.failed.load(Ordering::SeqCst)
     }
     pub(super) fn retain_primary(&self, error: Error) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.primary.is_none() {
-            state.primary = Some(error);
-        }
+        state.retain_terminal(error);
         self.failed.store(true, Ordering::SeqCst);
     }
     pub(super) fn fail(&self, error: Error) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.primary.is_none() {
-            state.primary = Some(error);
+        if state.retain_terminal(error) {
             state.terminal_pending = true;
         }
         self.failed.store(true, Ordering::SeqCst);
@@ -106,10 +136,43 @@ impl Notices {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         ShutdownReport::new(state.primary.clone(), state.cleanup.clone())
     }
+    pub(super) fn discontinuity(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .discontinuity = true;
+    }
     pub(super) fn publish(&self, sink: &mut RawSink, mixed: &[f32]) {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.primary.is_none() {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.primary.is_none() && !mixed.is_empty() {
+            if std::mem::take(&mut state.discontinuity) {
+                sink.diagnostics().mark_discontinuity();
+            }
             sink.push(mixed, monotonic_now_ns());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn later_terminal_causes_are_retained_in_the_error_group() {
+        let notices = Notices::default();
+        notices.fail(Error::DeviceLost);
+        notices.fail(Error::Backend("second lane failed".into()));
+        notices.retain_primary(Error::InvalidState("third lane failed".into()));
+        notices.retain_primary(Error::DeviceLost);
+        let report = notices.report();
+        match report.primary().unwrap() {
+            Error::Multiple(group) => {
+                assert_eq!(group.primary().root(), &Error::DeviceLost);
+                assert_eq!(group.secondary().count(), 2);
+            }
+            _ => panic!("later terminal causes must be retained"),
+        }
+        assert!(report.result().is_err());
+        assert!(notices.take_terminal().is_some());
+        assert!(notices.take_terminal().is_none());
     }
 }

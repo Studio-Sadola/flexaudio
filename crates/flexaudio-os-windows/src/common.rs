@@ -17,7 +17,7 @@ use flexaudio_core::clock::monotonic_now_ns;
 use flexaudio_core::types::{Error, Permission};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::{
     IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX,
@@ -120,14 +120,12 @@ pub(crate) struct ComThread {
 
 impl ComThread {
     /// Initialize COM on this thread. Does not panic.
-    pub(crate) fn new() -> Self {
-        // In version 0.54, CoInitializeEx returns HRESULT, not Result.
-        // S_OK / S_FALSE indicate success; RPC_E_CHANGED_MODE means another mode is already initialized.
+    pub(crate) fn new() -> Result<Self, Error> {
+        // Every successful call, including S_FALSE, requires a matching uninitialize.
+        // RPC_E_CHANGED_MODE borrows another component's initialization only.
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        // On success (S_OK=0 / S_FALSE=1), this call initialized COM, so uninitialize on drop.
-        // For RPC_E_CHANGED_MODE and similar cases, another component initialized it; do not uninitialize.
-        let uninit_on_drop = hr.is_ok();
-        Self { uninit_on_drop }
+        let uninit_on_drop = crate::native_outcomes::com_initialization(hr.0)?;
+        Ok(Self { uninit_on_drop })
     }
 }
 
@@ -427,11 +425,13 @@ pub(crate) unsafe fn init_loopback_capture(
     Ok((capture, event))
 }
 
-/// Check whether `WaitForSingleObject` returned the signaled value (`WAIT_OBJECT_0`).
-/// Used by the process backend while waiting for activation to complete.
-pub(crate) fn wait_event_signaled(handle: HANDLE, timeout_ms: u32) -> bool {
-    let r = unsafe { WaitForSingleObject(handle, timeout_ms) };
-    r == WAIT_OBJECT_0
+/// Interpret native activation completion without confusing failure with timeout.
+pub(crate) fn wait_event(handle: HANDLE, timeout_ms: u32) -> crate::native_outcomes::WaitOutcome {
+    let status = unsafe { WaitForSingleObject(handle, timeout_ms) }.0;
+    // GetLastError is meaningful only for WAIT_FAILED and must be read immediately.
+    let os_error =
+        (status == u32::MAX).then(|| unsafe { windows::Win32::Foundation::GetLastError().0 });
+    crate::native_outcomes::wait_outcome(status, os_error)
 }
 
 #[cfg(test)]

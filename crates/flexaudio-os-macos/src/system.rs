@@ -299,16 +299,9 @@ impl CaptureBackend for MacSystemBackend {
                     event_tx,
                 )
             })
-            .map_err(|_| {
-                ShutdownReport::new(
-                    Some(
-                        Error::Backend("capture owner thread could not be started".into())
-                            .with_context(ErrorContext::new(Operation::Start)),
-                    ),
-                    stop_owner(&self.publication, &self.stop_flag, None),
-                )
-                .result()
-                .expect_err("owner spawn failed")
+            .map_err(|error| {
+                self.stop_flag.store(true, Ordering::SeqCst);
+                flexaudio_core::spawn_error("Core Audio capture owner", error)
             })?;
 
         match ready_rx.recv() {
@@ -450,7 +443,10 @@ pub(crate) fn run_tap_thread(
                                 detail,
                             }
                         }
-                        ProbeDecision::Advisory { detail } => {
+                        ProbeDecision::Advisory { detail, error } => {
+                            if let Some(error) = error {
+                                let _ = event_tx.send(Event::RecoverableError { error });
+                            }
                             Event::SilenceWhileSourceActive { detail }
                         }
                     };

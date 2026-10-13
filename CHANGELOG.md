@@ -12,6 +12,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-10-13
+
+### Fixed
+
+- Device and process discovery rejects incomplete mandatory snapshots on Windows,
+  macOS and microphones instead of skipping unreadable entries or fabricating formats.
+  Linux PipeWire output discovery and watcher notifications retain independent
+  48000 Hz / 2-channel compatibility defaults for missing or unparseable format properties.
+  Optional process metadata remains absent only when confirmed absent or its
+  process disappeared; other native query failures reject the snapshot.
+- Windows waits distinguish timeout from native failure; COM initialization accepts
+  only successful initialization or the documented already-initialized cases.
+- Linux PipeWire bind failures, malformed/missing buffers, rejected renegotiation,
+  callback panics and watcher daemon errors become readiness, loss or terminal
+  diagnostics. Routing changes mark the next chunk discontinuous; watcher stop
+  retains join failures and terminal notifications.
+- Later Mix terminal causes and concurrent VAD flush/reset failures remain ordered
+  related causes. VAD rejects format changes while input is pending and retains
+  completed speech events when reset fails. Standalone flush errors retain pending
+  events in Node.js/Python and populated C output; attached Python source switches
+  use the shared gap lifecycle before replacing addons.
+- Shared typed addon projection retains VAD/FLAC kind and message in bindings and
+  shutdown reports. Whisper model, inference, reset and converter errors preserve
+  their causes. Worker creation preserves I/O kind and OS code; Linux query errors
+  preserve opt-in daemon details, and inconclusive macOS self-probes retain their
+  native cause in an existing recoverable-error event alongside the silence advisory.
+- FFI boolean guards set typed last errors on panic. Failed Node.js stop-error
+  creation still settles the Promise; the loader retains all attempted failures.
+  Secondary event carriers retain sequence, frame index and dropped counters.
+  Python invalid PID errors include the value's representation.
+- Clock translation documents saturating arithmetic; CLI errors name the failed
+  operation and check started WAV finalization, retaining runtime and finalization errors.
+  Failure before the first chunk never creates or truncates the WAV destination.
+- Microphone discovery validates native rates/channels through the capture configuration
+  helper. Data callback panics close PCM and publish a typed terminal failure through
+  the lock-free callback mailbox.
+- C error storage retains the real typed causes for FLAC creation, processed polling
+  and VAD construction; message-only legacy errors no longer invent InvalidArg causes.
+  C v1 FLAC messages include the addon cause; C v2 retains its structured fields.
+  Python exceptions from `EncodeError` use the shared addon projection and expose kind/message.
+
+### Added
+
+- `DeviceEvent::TerminalError { error }`: terminal watcher failure, exposed as
+  `terminalError` in Node.js/Python and C v2 device event kind 6 with its error accessor.
+  C v1 watcher polling returns the negative typed error code and sets last_error.
+- `Error::Diagnostic { source, detail }` and binding diagnostic-detail accessors keep
+  native details opt-in and excluded from safe display.
+- `Error::Addon { kind, message }` and `AddonErrorKind` distinguish `VadModelLoad`,
+  `VadInference`, `VadInvalidConfig`, `VadInvalidFormat`, `VadResample`, `VadReset`,
+  `FlacIo`, `FlacUnsupported` and `FlacEncoder`; bindings expose kind/message fields
+  and C v2 accessors. Existing `ErrorKind` variants are reused; FLAC I/O/encoder
+  failures now receive their correct root classifications.
+- `VadError::Multiple`, `WhisperVadError::Cause` and `WhisperVadTapError::Cause`
+  retain related typed addon failures; `Vad::take_pending_events()` drains completed
+  speech events after a failed reset.
+
+[0.5.4]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.3...v0.5.4
+
 ## [0.5.3] - 2026-10-12
 
 ### Fixed

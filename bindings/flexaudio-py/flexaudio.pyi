@@ -20,7 +20,7 @@ exception; FlacEncoder propagates finalization errors only on normal exit.
 """
 
 from os import PathLike
-from typing import List, Literal, Optional, Sequence, Tuple, TypedDict, Union
+from typing import List, Literal, Optional, Protocol, Sequence, Tuple, TypedDict, Union
 
 StreamEventType = Literal["startupSamplesDropped",
     "chunkDropped", "stalled", "recovered", "permissionDenied", "permissionPending",
@@ -48,10 +48,14 @@ class ErrorContextDict(TypedDict):
     operation: Literal["enumerate", "start", "normalize", "flush", "reopen", "rollback", "stop", "join", "link"]
     lane: Optional[MixLane]
     native_status: Optional[NativeStatus]
+AddonErrorKind = Literal["vadModelLoad", "vadInference", "vadInvalidConfig", "vadInvalidFormat", "vadResample", "vadReset", "flacIo", "flacUnsupported", "flacEncoder"]
 class _AudioErrorFields(TypedDict):
     message: str
     contexts: List[ErrorContextDict]
     secondary: List["AudioErrorDict"]
+    diagnostic_details: List[str]
+    addon_kind: Optional[AddonErrorKind]
+    addon_message: Optional[str]
 class InvalidArgumentErrorDict(_AudioErrorFields):
     kind: Literal["invalidArg"]
 class InvalidStateErrorDict(_AudioErrorFields):
@@ -112,6 +116,12 @@ class AudioError:
     def advertised(self) -> Optional[NativeFormat]: ...
     @property
     def actual(self) -> Optional[NativeFormat]: ...
+    @property
+    def diagnostic_details(self) -> List[str]: ...
+    @property
+    def addon_kind(self) -> Optional[AddonErrorKind]: ...
+    @property
+    def addon_message(self) -> Optional[str]: ...
     def to_dict(self) -> AudioErrorDict: ...
 class InvalidArgumentError(ValueError):
     @property
@@ -265,7 +275,16 @@ class DefaultClearedEventDict(TypedDict):
 class RescanRequiredEventDict(TypedDict):
     type: Literal["rescanRequired"]
     dropped_events: int
-DeviceEventDict = Union[DeviceAddedEventDict, DeviceRemovedEventDict, DefaultChangedEventDict, DefaultClearedEventDict, RescanRequiredEventDict, UnknownEventDict]
+class DeviceTerminalErrorDict(TypedDict):
+    type: Literal["terminalError"]
+    error: AudioErrorDict
+DeviceEventDict = Union[DeviceTerminalErrorDict, DeviceAddedEventDict, DeviceRemovedEventDict, DefaultChangedEventDict, DefaultClearedEventDict, RescanRequiredEventDict, UnknownEventDict]
+
+# Structural fields on a typed exception raised specifically by standalone Vad.flush.
+# This typing helper does not represent an instantiable native class.
+class _VadFlushErrorFields(Protocol):
+    audio_error: AudioError
+    pending_events: List["VadEvent"]
 
 class VadSettings(TypedDict, total=False):
     threshold: float
@@ -396,6 +415,8 @@ class DeviceEvent:
     def dropped_events(self) -> Optional[int]: ...
     @property
     def message(self) -> Optional[str]: ...
+    @property
+    def error(self) -> Optional[AudioError]: ...
     def to_dict(self) -> DeviceEventDict: ...
 
 class Stream:
@@ -569,10 +590,12 @@ WhisperVadEvent = Union[SegmentEvent, ProvisionalSpeechStartEvent,
 AttachedWhisperVadEvent = Union[WhisperVadEvent, EpochStartEvent]
 
 class WhisperVadValidationError(ValueError):
+    audio_error: AudioError
     code: str
     terminal_events: List[WhisperVadEvent]
 
 class WhisperVadRuntimeError(RuntimeError):
+    audio_error: AudioError
     code: str
     terminal_events: List[WhisperVadEvent]
 

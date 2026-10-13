@@ -2,6 +2,16 @@
 
 use flexaudio_core::types::{Error, Result};
 
+pub(crate) fn discover<C>(
+    query: impl FnOnce() -> Result<C>,
+    native_format: impl FnOnce(&C) -> (u32, u16),
+) -> Result<(u32, u16)> {
+    let config = query()?;
+    let actual = native_format(&config);
+    validate(actual)?;
+    Ok(actual)
+}
+
 pub(crate) fn checked<C>(
     discover: impl FnOnce() -> Result<C>,
     native_format: impl FnOnce(&C) -> (u32, u16),
@@ -9,6 +19,14 @@ pub(crate) fn checked<C>(
 ) -> Result<C> {
     let config = discover()?;
     let actual = native_format(&config);
+    validate(actual)?;
+    if actual != advertised {
+        return Err(Error::NativeFormatChanged { advertised, actual });
+    }
+    Ok(config)
+}
+
+fn validate(actual: (u32, u16)) -> Result<()> {
     if actual.0 == 0 || actual.1 == 0 {
         return Err(Error::InvalidArg(
             "native microphone rate and channels must be positive".into(),
@@ -19,10 +37,7 @@ pub(crate) fn checked<C>(
             "native microphone channels must be one or two".into(),
         ));
     }
-    if actual != advertised {
-        return Err(Error::NativeFormatChanged { advertised, actual });
-    }
-    Ok(config)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -113,5 +128,75 @@ mod tests {
             ),
             Err(Error::DeviceNotFound)
         );
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_retains_resolution_and_configuration_errors() {
+        // Device/CPAL failures require a native adapter. Inject its query result
+        // into the helper shared by discovery and checked capture configuration.
+        for cause in [
+            Error::DeviceNotFound,
+            Error::Backend("configuration unavailable; reconnect the device and retry".into()),
+        ] {
+            assert_eq!(
+                discover(|| Err::<(u32, u16), _>(cause.clone()), |format| *format),
+                Err(cause)
+            );
+        }
+        assert_eq!(
+            discover(|| Ok((44_100, 2)), |format| *format),
+            Ok((44_100, 2))
+        );
+    }
+}
+
+/// Materialize a query failure outside callbacks; shared by native discovery callers.
+pub(crate) fn query_failure(action: &'static str, error: impl std::fmt::Display) -> Error {
+    Error::Backend(format!("{action} failed; reconnect the device and retry"))
+        .with_diagnostic_detail(error.to_string())
+        .with_context(flexaudio_core::ErrorContext::new(
+            flexaudio_core::Operation::Enumerate,
+        ))
+}
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn native_query_detail_is_retained_without_entering_default_display() {
+        // Real CPAL query failures cannot be injected portably; use their shared mapper.
+        let error = query_failure(
+            "query microphone input configuration",
+            "synthetic private native detail",
+        );
+        assert!(!error.to_string().contains("synthetic private"));
+        assert_eq!(
+            error.diagnostic_details(),
+            ["synthetic private native detail"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod round2_tests {
+    use super::*;
+    #[test]
+    fn round2_inventory_formats_share_capture_validation() {
+        for (format, kind) in [
+            ((0, 1), flexaudio_core::ErrorKind::InvalidArg),
+            ((48_000, 0), flexaudio_core::ErrorKind::InvalidArg),
+            ((48_000, 3), flexaudio_core::ErrorKind::UnsupportedFormat),
+        ] {
+            assert_eq!(discover(|| Ok(format), |f| *f).unwrap_err().kind(), kind);
+            assert_eq!(
+                checked(|| Ok(format), |f| *f, format).unwrap_err().kind(),
+                kind
+            );
+        }
+        assert_eq!(discover(|| Ok((44_100, 2)), |f| *f), Ok((44_100, 2)));
     }
 }

@@ -68,11 +68,14 @@ class DeclarationContracts(unittest.TestCase):
     def test_device_events_cannot_fabricate_default_id_or_source(self):
         self.assertEqual(self.members("DeviceEventDict"), {
             "DeviceAddedEventDict", "DeviceRemovedEventDict", "DefaultChangedEventDict",
-            "DefaultClearedEventDict", "RescanRequiredEventDict", "UnknownEventDict",
+            "DefaultClearedEventDict", "RescanRequiredEventDict", "DeviceTerminalErrorDict", "UnknownEventDict",
         })
         self.assertEqual(set(self.fields("DefaultClearedEventDict")), {"type", "source_kind"})
         self.assertEqual(self.fields("DefaultClearedEventDict")["source_kind"], "Literal['mic', 'system']")
         self.assertEqual(set(self.fields("RescanRequiredEventDict")), {"type", "dropped_events"})
+        self.assertEqual(self.fields("DeviceTerminalErrorDict"), {
+            "type": "Literal['terminalError']", "error": "AudioErrorDict",
+        })
 
     def test_error_union_has_one_arm_per_root_and_specific_payloads(self):
         expected = {
@@ -83,7 +86,15 @@ class DeclarationContracts(unittest.TestCase):
         self.assertEqual(self.members("AudioErrorDict"), {name + "ErrorDict" for name in expected})
         for name in expected:
             fields = self.fields(name + "ErrorDict")
-            self.assertIn("kind", fields)
+            common = {"kind", "message", "contexts", "secondary", "diagnostic_details", "addon_kind", "addon_message"}
+            specific = {
+                "RecordingPermission": {"permission"}, "NativeFormatChanged": {"advertised", "actual"},
+                "Backend": {"whisper_code"},
+            }.get(name, set())
+            self.assertEqual(set(fields), common | specific)
+            self.assertEqual(fields["diagnostic_details"], "List[str]")
+            self.assertEqual(fields["addon_kind"], "Optional[AddonErrorKind]")
+            self.assertEqual(fields["addon_message"], "Optional[str]")
             self.assertEqual("permission" in fields, name == "RecordingPermission")
             self.assertEqual("advertised" in fields, name == "NativeFormatChanged")
             self.assertEqual("actual" in fields, name == "NativeFormatChanged")
@@ -108,7 +119,7 @@ class DeclarationContracts(unittest.TestCase):
         backend = namespace["BackendErrorDict"]
         self.assertEqual(self.fields("BackendErrorDict")["whisper_code"], "WhisperCode")
         self.assertEqual(backend.__optional_keys__, {"whisper_code"})
-        self.assertEqual(backend.__required_keys__, {"kind", "message", "contexts", "secondary"})
+        self.assertEqual(backend.__required_keys__, {"kind", "message", "contexts", "secondary", "diagnostic_details", "addon_kind", "addon_message"})
 
 
 if __name__ == "__main__":

@@ -116,3 +116,11 @@ fn aligned_ramp_and_stereo_average_are_partition_invariant() {
         .collect();
     assert!(convert(&inverted, 480).iter().all(|&value| value == 0.0));
 }
+
+#[test]
+fn conversion_failure_preserves_the_converter_cause() {
+    let mut converter = CaptureConverter::new().unwrap();
+    converter.fail_conversion();
+    let error = converter.push(&[0.0; 1920]).unwrap_err();
+    assert!(format!("{error:?}").contains("injected conversion failure"));
+}

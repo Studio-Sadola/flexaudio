@@ -425,6 +425,7 @@ pub fn repro_p9_bridge(
         last_primary_seq: 0,
         last_primary_frame_index: 0,
         last_primary_dropped: 0,
+        last_secondary: SecondaryCarrierMetadata::default(),
     };
     if scenario == "startup-order" || startup_drain_fixture {
         bridge.secondary = None;
@@ -461,7 +462,10 @@ pub fn repro_p9_bridge(
             );
         }
     }
-    if scenario == "whisper-secondary-orphan" || scenario == "whisper-pending-flush" {
+    if matches!(
+        scenario.as_str(),
+        "whisper-secondary-orphan" | "whisper-pending-flush" | "whisper-pending-stop"
+    ) {
         let mut whisper = whisper_integration::WhisperBridge::new(
             flexaudio_vad::WhisperVadParams::default(),
             flexaudio_vad::WhisperVadOptions::default(),
@@ -566,7 +570,7 @@ pub fn repro_p9_bridge(
             if scenario == "panic" {
                 panic!("repro: C F37 bridge failure");
             }
-            if scenario == "whisper-secondary-orphan" || scenario == "whisper-pending-flush" {
+            if matches!(scenario.as_str(), "whisper-secondary-orphan" | "whisper-pending-flush" | "whisper-pending-stop") {
                 let mut whisper = bridge
                     .whisper
                     .take()
@@ -590,9 +594,9 @@ pub fn repro_p9_bridge(
                     frames: 960,
                     frame_index: 0,
                     pts_ns: 0,
-                    seq: 0,
+                    seq: 17,
                     flags: ChunkFlags::empty(),
-                    dropped_before: 0,
+                    dropped_before: 5,
                     peak: 0.0,
                     rms: 0.0,
                 });
@@ -611,7 +615,7 @@ pub fn repro_p9_bridge(
                     });
                     bridge.drain_pairs();
                 } else {
-                    bridge.flush_whisper(false); // Successful recovery must not erase pending failure.
+                    bridge.flush_whisper(scenario == "whisper-pending-stop"); // Recovery/stop must not erase pending failure.
                 }
                 bridge.report_whisper_failure();
                 bridge.retain_shutdown_outcome(None);

@@ -197,7 +197,7 @@ fn validate_tap(tap: &str, secondary: bool) -> Result<crate::VadTap, BoundaryErr
 }
 
 pub(crate) fn core_code(error: &WhisperVadError) -> (&'static str, Status) {
-    match error {
+    match error.root() {
         WhisperVadError::InvalidParameter { .. } => ("InvalidParameter", Status::InvalidArg),
         WhisperVadError::InvalidPcm { .. } => ("InvalidPcm", Status::InvalidArg),
         WhisperVadError::InvalidProbability { .. } => ("InvalidProbability", Status::InvalidArg),
@@ -206,6 +206,7 @@ pub(crate) fn core_code(error: &WhisperVadError) -> (&'static str, Status) {
         WhisperVadError::Inference => ("Inference", Status::GenericFailure),
         WhisperVadError::ModelLoad => ("ModelLoad", Status::GenericFailure),
         WhisperVadError::FailedSession => ("FailedSession", Status::GenericFailure),
+        WhisperVadError::Cause { primary, .. } => core_code(primary),
     }
 }
 
@@ -356,6 +357,7 @@ pub(crate) fn throw_boundary(env: &Env, error: BoundaryError) -> Error {
             Status::InvalidArg
         },
         Vec::new(),
+        None,
     )
 }
 
@@ -365,11 +367,15 @@ fn throw_error(
     message: &str,
     status: Status,
     events: Vec<JsWhisperVadEvent>,
+    audio_error: Option<super::boundary::JsAudioError>,
 ) -> Error {
     let result = (|| {
         let mut exception = env.create_error(Error::new(status, message))?;
         exception.set_named_property("code", code)?;
         exception.set_named_property("terminalEvents", events)?;
+        if let Some(error) = audio_error {
+            exception.set_named_property("audioError", error)?;
+        }
         env.throw(exception)
     })();
     match result {
@@ -386,6 +392,7 @@ fn failure(env: &Env, error: WhisperVadFailure) -> Error {
         &error.error.to_string(),
         status,
         standalone(error.terminal_events),
+        Some(super::boundary::audio_error(&error.error.audio_error())),
     )
 }
 
@@ -441,6 +448,7 @@ impl WhisperVad {
                     "expected Float32Array mono16k PCM",
                     Status::InvalidArg,
                     Vec::new(),
+                    None,
                 )
             })?;
         self.inner

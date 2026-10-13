@@ -135,6 +135,8 @@ The facade crate `flexaudio` re-exports everything you need:
   host access or use the bounded capture-open consent flow, then retry discovery.
   Denied/restricted consent returns `PermissionDenied`. DeviceInfo sample rate
   and channel count are mandatory; no partial or unknown-format inventory is returned.
+  Linux PipeWire output formats retain the compatibility defaults described in
+  [Failure reporting](#failure-reporting-in-054).
   Windows enumeration does not preflight microphone permission; native enumeration
   proceeds. Microphone capture retains its separate existing permission preflight.
 - `flexaudio::processes() -> Result<Vec<ProcessInfo>>` — list audio output
@@ -144,12 +146,16 @@ The facade crate `flexaudio` re-exports everything you need:
   processes are included; use `is_output_active` to check current playback and
   `pid` as `target_pid` for per-process capture.
 - `flexaudio::watch_devices() -> Result<DeviceWatcher>` — pull-style device
-  notifications. Linux startup failure returns an error; Windows/macOS currently
+  notifications. Linux startup failure returns an error; later daemon, callback,
+  or shutdown failures produce `DeviceEvent::TerminalError { error }` once.
+  Node.js/Python expose `terminalError` with a typed `error`; C v2 exposes device
+  event kind 6 and `flexaudio_device_event_error_v2`. C v1 polling returns the
+  root negative error code and sets last_error. Windows/macOS currently
   provide an intentional no-op watcher.
 - Re-exported types: `StreamConfig`, `SourceKind`, `ProcessMode`, `OutputFormat`,
   `AudioChunk`, `SecondaryChunk`, `ChunkFlags`, `DeviceInfo`, `ProcessInfo`,
   `DeviceEvent`, `DefaultDeviceKind`, `Event`, `Permission`, `Error`, `ErrorKind`,
-  `ErrorContext`, `AudioLoss`, `ShutdownReport`, `Result`.
+  `ErrorContext`, `AddonErrorKind`, `AudioLoss`, `ShutdownReport`, `Result`.
 
 Voice activity detection (`flexaudio-vad`): `Vad::new` / `Vad::process` for
 streaming `SpeechStart` / `SpeechEnd` events, and `get_speech_timestamps` for
@@ -169,6 +175,59 @@ delivery continue, and the affected epoch closes once with its typed error
 terminal. Legacy VAD and WhisperVad are mutually exclusive on a stream.
 
 ---
+
+## Failure reporting in 0.5.4
+
+Discovery fails the whole snapshot when a mandatory device name, classification,
+format, process PID or session query fails. Unreadable mandatory entries are not
+silently skipped. Linux PipeWire output discovery and device watcher notifications
+are an exception for formats: missing or unparseable `audio.rate` / `audio.channels`
+properties still default independently to 48000 Hz / 2 channels. These values are
+compatibility defaults, not measured formats; `DeviceInfo` does not distinguish them.
+Optional process metadata is absent only when confirmed absent or when its
+process disappeared; other native metadata query failures reject the snapshot.
+Windows native waits distinguish
+an actual timeout from a failed wait, and COM initialization reports unexpected
+HRESULT failures.
+
+Linux routing changes mark the next delivered chunk `DISCONTINUITY`. Failed binds,
+malformed/missing buffers, rejected renegotiation and callback panics surface through
+the existing readiness, loss and terminal paths. A failed watcher ends monitoring;
+`RescanRequired` remains an inventory invalidation, independent of watcher failure.
+Stop retains worker join failures and queued terminal notifications.
+
+`Error::Diagnostic { source, detail }` preserves opt-in native detail while safe
+`Display` shows only its typed source. Node.js `diagnosticDetails`, Python
+`diagnostic_details` and C v2 diagnostic count/detail accessors expose that detail;
+it may contain private host data and should not be logged automatically.
+`Error::Addon { kind, message }` preserves `AddonErrorKind` for VAD model load,
+inference, invalid configuration/format, resampling/reset and FLAC I/O,
+unsupported input or encoder failure. Bindings expose `addonKind`/`addonMessage`
+(Python: `addon_kind`/`addon_message`; C v2: addon kind/message accessors).
+Later terminal failures, combined flush/reset failures, VAD tails and Whisper VAD
+model/conversion causes remain ordered related errors rather than replacing the
+primary. Additive Rust `VadError::Multiple`, `WhisperVadError::Cause` and
+`WhisperVadTapError::Cause` arms retain those typed causes.
+
+Legacy VAD rejects format changes while converted input is pending; drain or reset
+explicitly before changing the format. Completed speech events survive a failed reset
+and are drained once with `Vad::take_pending_events()`. Python standalone flush
+exceptions carry `pending_events`, Node.js flush exceptions carry `pendingEvents`,
+and C flush can return a negative error with populated event output that must still
+be freed. Attached source switches close the old speech epoch through the shared gap
+lifecycle before replacing addons. Event-only secondary Node.js carriers preserve
+observed sequence, frame index and drop counters.
+
+An inconclusive macOS self-probe preserves its native reason and emits an existing
+`RecoverableError` alongside the silence advisory; capture remains usable.
+Worker creation errors retain their I/O kind and OS code with retry guidance.
+The Node.js native loader retains every attempted candidate and its original failure
+in `attempts`/`errors`; failed stop error creation still rejects the Promise.
+FFI boolean panic guards set a typed last error. Python invalid PID diagnostics
+include the offending representation, using hexadecimal for integers too large for
+decimal formatting. Clock translation saturates at the `i64` boundary; the CLI
+names the failed operation and checks WAV finalization even after capture failure,
+retaining both failures.
 
 ## Migrating to 0.5
 

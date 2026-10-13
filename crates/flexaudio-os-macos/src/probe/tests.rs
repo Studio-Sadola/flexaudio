@@ -44,6 +44,7 @@ fn control() -> (ProbeControl, Arc<FakeClock>) {
             deadline: now + PROBE_TIMEOUT,
             cancellation: Arc::new(AtomicBool::new(false)),
             clock: clock.clone(),
+            cleanup: Arc::new(ProbeCleanup::default()),
         },
         clock,
     )
@@ -78,20 +79,26 @@ fn denial_preserves_typed_cause_once() {
 }
 
 #[test]
-fn failure_and_timeout_keep_old_advisory_once() {
-    for outcome in [
-        ProbeOutcome::Failed {
-            detail: "unsupported output format".into(),
-        },
-        ProbeOutcome::TimedOut,
+fn failure_and_timeout_keep_explained_advisory_once() {
+    for (outcome, expected) in [
+        (
+            ProbeOutcome::Failed {
+                error: Error::Backend("unsupported output format".into()),
+            },
+            "unsupported output format",
+        ),
+        (ProbeOutcome::TimedOut, "two-second deadline"),
     ] {
         let (control, _) = control();
         let mut probe = fake(outcome);
         let mut generation = GenerationProbe::default();
-        assert_eq!(
-            generation.on_silence(&mut probe, &control),
-            Some(advisory())
-        );
+        let Some(ProbeDecision::Advisory { detail, .. }) =
+            generation.on_silence(&mut probe, &control)
+        else {
+            panic!("inconclusive probe must produce an advisory");
+        };
+        assert!(detail.contains(ADVISORY_DETAIL));
+        assert!(detail.contains(expected));
         assert_eq!(generation.on_silence(&mut probe, &control), None);
         assert_eq!(probe.calls, 1);
     }
@@ -130,7 +137,7 @@ fn stop_after_probe_evidence_wins_over_every_outcome() {
             detail: "denied".into(),
         },
         ProbeOutcome::Failed {
-            detail: "failure".into(),
+            error: Error::Backend("failure".into()),
         },
         ProbeOutcome::TimedOut,
     ] {
@@ -152,7 +159,7 @@ fn expired_deadline_never_starts_probe_or_accepts_late_evidence() {
     let mut probe = fake(ProbeOutcome::Present);
     assert_eq!(
         GenerationProbe::default().on_silence(&mut probe, &control),
-        Some(advisory())
+        Some(advisory_failures(vec![timeout_error()]))
     );
     assert_eq!(probe.calls, 0);
     for outcome in [
@@ -166,7 +173,7 @@ fn expired_deadline_never_starts_probe_or_accepts_late_evidence() {
         probe.advance = Some(clock);
         assert_eq!(
             GenerationProbe::default().on_silence(&mut probe, &control),
-            Some(advisory())
+            Some(advisory_failures(vec![timeout_error()]))
         );
         assert_eq!(probe.calls, 1);
     }
@@ -336,4 +343,103 @@ fn uncancelled_poison_can_publish_terminal_failure_in_order() {
         Err(PublicationError::Poisoned)
     );
     assert!(control.cancelled());
+}
+
+#[test]
+fn failed_probe_preserves_its_safe_reason_in_the_advisory() {
+    let (control, _) = control();
+    let mut probe = fake(ProbeOutcome::Failed {
+        error: Error::Backend("self-probe IOProc stop failed (OSStatus -50)".into()),
+    });
+    let decision = GenerationProbe::default()
+        .on_silence(&mut probe, &control)
+        .unwrap();
+    let ProbeDecision::Advisory { detail, .. } = decision else {
+        panic!("failed self-probe must remain an advisory");
+    };
+    assert!(detail.contains("self-probe IOProc stop failed (OSStatus -50)"));
+}
+
+#[test]
+fn native_probe_teardown_retains_all_failed_statuses_after_drop() {
+    // Native stop/destroy failures need Core Audio. The real native owners share
+    // this cleanup mailbox, including their Drop path; exercise it without audio.
+    let (control, _) = control();
+    let cleanup = control.cleanup_diagnostics();
+    cleanup.record_native("IOProc stop", -50);
+    cleanup.record_native("IOProc destruction", -51);
+    cleanup.record_native("aggregate destruction", 0);
+    let mut probe = fake(ProbeOutcome::Present);
+    let Some(ProbeDecision::Advisory { detail, .. }) =
+        GenerationProbe::default().on_silence(&mut probe, &control)
+    else {
+        panic!("failed teardown must invalidate successful evidence");
+    };
+    assert!(detail.contains("IOProc stop failed"));
+    assert!(detail.contains("OSStatus -50"));
+    assert!(detail.contains("IOProc destruction failed"));
+    assert!(detail.contains("OSStatus -51"));
+    assert!(!detail.contains("aggregate destruction"));
+    assert!(cleanup.take().is_empty());
+}
+
+#[test]
+fn advisory_keeps_native_context_and_cleanup_as_typed_related_causes() {
+    let (control, _) = control();
+    let cause = Error::Backend("self-probe setup failed; retry capture".into()).with_context(
+        ErrorContext::new(Operation::Start).with_native_status(NativeStatus::OsStatus {
+            call: "fixture_start",
+            value: -50,
+        }),
+    );
+    control.cleanup.record_native("IOProc destruction", -51);
+    let mut probe = fake(ProbeOutcome::Failed {
+        error: cause.clone(),
+    });
+    let Some(ProbeDecision::Advisory {
+        error: Some(Error::Multiple(group)),
+        ..
+    }) = GenerationProbe::default().on_silence(&mut probe, &control)
+    else {
+        panic!("probe cause and cleanup must be retained together");
+    };
+    assert_eq!(group.primary(), &cause);
+    let Error::Context { context, .. } = group.secondary().next().unwrap() else {
+        panic!("missing cleanup context");
+    };
+    assert_eq!(context.operation(), Operation::Stop);
+    assert_eq!(
+        context.native_status(),
+        Some(NativeStatus::OsStatus {
+            call: "IOProc destruction",
+            value: -51
+        })
+    );
+}
+
+#[test]
+fn late_native_failure_survives_the_timeout_advisory() {
+    // Native synchronous calls cannot be forced to fail at a deadline on Linux.
+    // Check the adapter preserves its result, then inject both into shared policy.
+    assert!(!include_str!("../native_probe.rs").contains("Err(_) if control.timed_out()"));
+    let (control, clock) = control();
+    let cause = Error::Backend("native probe setup failed; retry capture".into()).with_context(
+        ErrorContext::new(Operation::Start).with_native_status(NativeStatus::OsStatus {
+            call: "fixture_setup",
+            value: -50,
+        }),
+    );
+    let mut probe = fake(ProbeOutcome::Failed {
+        error: cause.clone(),
+    });
+    probe.advance = Some(clock);
+    let Some(ProbeDecision::Advisory {
+        error: Some(Error::Multiple(group)),
+        ..
+    }) = GenerationProbe::default().on_silence(&mut probe, &control)
+    else {
+        panic!("late failed setup must retain both native and timeout causes");
+    };
+    assert_eq!(group.primary(), &cause);
+    assert_eq!(group.secondary().collect::<Vec<_>>(), [&timeout_error()]);
 }

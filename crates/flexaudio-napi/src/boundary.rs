@@ -85,6 +85,9 @@ pub struct JsAudioError {
     pub actual: Option<JsNativeFormat>,
     /// Typed attached-addon cause, projected as a backend error in the shared report.
     pub whisper_code: Option<String>,
+    pub addon_kind: Option<String>,
+    pub addon_message: Option<String>,
+    pub diagnostic_details: Vec<String>,
 }
 
 #[napi(object)]
@@ -147,6 +150,9 @@ pub(super) fn audio_error(error: &Error) -> JsAudioError {
     let mut root = error;
     loop {
         match root {
+            Error::Diagnostic { source, .. } => {
+                root = source;
+            }
             Error::Context { source, context } => {
                 contexts.push(context_to_js(*context));
                 root = source;
@@ -168,6 +174,11 @@ pub(super) fn audio_error(error: &Error) -> JsAudioError {
         Error::UnsupportedOsVersion => "unsupportedOsVersion",
         Error::DeviceLost => "deviceLost",
         Error::Backend(_) | Error::WhisperVad { .. } => "backend",
+        Error::Addon { .. } => match error.kind() {
+            ErrorKind::InvalidArg => "invalidArg",
+            ErrorKind::UnsupportedFormat => "unsupportedFormat",
+            _ => "backend",
+        },
         Error::UnsupportedFormat(_) => "unsupportedFormat",
         Error::NativeFormatChanged { .. } => "nativeFormatChanged",
         Error::Unsupported => "unsupported",
@@ -198,6 +209,16 @@ pub(super) fn audio_error(error: &Error) -> JsAudioError {
         advertised,
         actual,
         whisper_code: error.whisper_code().map(|code| code.as_str().into()),
+        addon_kind: error.addon_kind().map(|kind| kind.as_str().into()),
+        addon_message: match error.root() {
+            Error::Addon { message, .. } => Some(message.clone()),
+            _ => None,
+        },
+        diagnostic_details: error
+            .diagnostic_details()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
     }
 }
 
@@ -355,9 +376,14 @@ pub(super) fn device_event_to_js(event: DeviceEvent) -> JsDeviceEvent {
         id: None,
         source_kind: None,
         dropped_events: None,
+        error: None,
         message: None,
     };
     result.kind = match event {
+        DeviceEvent::TerminalError { error } => {
+            result.error = Some(audio_error(&error));
+            "terminalError"
+        }
         DeviceEvent::Added(info) => {
             result.device = Some(device_info_to_js(info));
             "added"
@@ -619,5 +645,32 @@ mod startup_tests {
         assert_eq!(event.reason.as_deref(), Some("outOfRange"));
         assert!(event.error.is_none());
         assert!(event.count.is_none());
+    }
+}
+
+#[cfg(test)]
+mod retained_cause_tests {
+    use super::*;
+    #[test]
+    fn addon_and_native_detail_survive_wrappers_without_entering_safe_message() {
+        let error = Error::Addon {
+            kind: flexaudio::core::AddonErrorKind::VadReset,
+            message: "synthetic reset cause".into(),
+        }
+        .with_context(ErrorContext::new(Operation::Flush))
+        .with_diagnostic_detail("synthetic native detail".into());
+        let projected = audio_error(&error);
+        assert_eq!(projected.kind, "backend");
+        assert_eq!(projected.addon_kind.as_deref(), Some("vadReset"));
+        assert_eq!(
+            projected.addon_message.as_deref(),
+            Some("synthetic reset cause")
+        );
+        assert_eq!(projected.diagnostic_details, ["synthetic native detail"]);
+        assert_eq!(projected.contexts[0].operation, "flush");
+        assert!(!projected.message.contains("synthetic"));
+        let event = device_event_to_js(DeviceEvent::TerminalError { error });
+        assert_eq!(event.kind, "terminalError");
+        assert_eq!(event.error.unwrap().addon_kind.as_deref(), Some("vadReset"));
     }
 }

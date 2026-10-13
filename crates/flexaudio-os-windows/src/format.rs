@@ -20,6 +20,24 @@ pub(crate) fn native_format_from_source(
     cached.get()
 }
 
+/// Legacy format getters cannot return errors. Keep the query cause until a
+/// later successful query or checked start, rather than silently using the cache.
+pub(crate) fn retain_format_query(
+    failure: &std::cell::RefCell<Option<Error>>,
+    queried: Result<(u32, u16)>,
+) -> Option<(u32, u16)> {
+    match queried {
+        Ok(format) => {
+            failure.replace(None);
+            Some(format)
+        }
+        Err(error) => {
+            failure.replace(Some(error));
+            None
+        }
+    }
+}
+
 /// The sink and negotiated endpoint format must describe the same frames.
 pub(crate) fn verify_format(actual: (u32, u16), expected: (u32, u16)) -> Result<()> {
     if actual != expected || actual.0 == 0 || actual.1 == 0 {
@@ -135,5 +153,23 @@ mod tests {
                 Err(Error::UnsupportedFormat(_))
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    #[test]
+    fn native_format_query_failure_is_retained_until_success() {
+        let failure = std::cell::RefCell::new(None);
+        let cause = Error::Backend("native query unavailable; retry capture".into());
+        assert_eq!(retain_format_query(&failure, Err(cause.clone())), None);
+        assert_eq!(*failure.borrow(), Some(cause));
+        assert_eq!(
+            retain_format_query(&failure, Ok((44_100, 2))),
+            Some((44_100, 2))
+        );
+        assert!(failure.borrow().is_none());
     }
 }

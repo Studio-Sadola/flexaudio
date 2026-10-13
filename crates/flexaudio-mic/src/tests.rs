@@ -100,8 +100,11 @@ fn runtime_mailbox_has_one_writer_and_one_delivery_per_generation() {
         }
     });
     assert!(stop.load(Ordering::SeqCst));
+    let Some(callback_mailbox::CallbackFailure::Native(error)) = mailbox.take() else {
+        panic!("native CPAL cause must remain typed");
+    };
     assert_eq!(
-        mailbox.take().unwrap().to_string(),
+        error.to_string(),
         "A backend-specific error has occurred: injected CPAL failure"
     );
     assert!(mailbox.take().is_none());
@@ -332,4 +335,50 @@ fn end_to_end_captures_real_audio() {
     assert!(got > 0, "expected captured samples, got none");
     // Samples stay within [-1, 1] (conversion is valid).
     assert!(buf[..got].iter().all(|&s| (-1.5..=1.5).contains(&s)));
+}
+
+#[test]
+fn infallible_constructor_retains_query_failure_before_start() {
+    // Native permission/device failures are not portable to CI; inject the same
+    // query result consumed by new rather than access hardware or request consent.
+    let cause = Error::Backend("input configuration query failed; reconnect the device and retry".into())
+        .with_context(ErrorContext::new(Operation::Enumerate));
+    let mut backend = CpalMicBackend::from_query_result(None, Err(cause.clone()));
+    assert_eq!(backend.terminal_error, Some(cause.clone()));
+    assert_eq!(backend.poll_event(), Some(Event::TerminalError { error: cause }));
+    assert_eq!(backend.poll_event(), None);
+}
+
+#[test]
+fn microphone_native_query_uses_the_checked_discovery_helper() {
+    // CPAL Device is concrete and cannot inject native query failures without hardware.
+    // No portable behavioral wiring test is possible; input_config discovery tests
+    // inject query failures through the shared helper, and this guards adapter wiring.
+    let source = include_str!("lib.rs");
+    let query = source.split("fn query_native_format(").nth(1).unwrap().split("pub fn list_devices()").next().unwrap();
+    assert!(query.contains("input_config::discover"));
+    assert!(!query.contains(".ok()"));
+    assert!(!query.contains("unwrap_or"));
+}
+
+#[test]
+fn round2_callback_panic_closes_pcm_and_publishes_one_typed_terminal() {
+    let mut backend = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
+    backend.callback_errors.guard(|| panic!("injected callback panic"));
+    assert!(backend.stop_flag.load(Ordering::SeqCst));
+    let event = backend.poll_event().expect("callback panic must be observable");
+    assert!(matches!(event, Event::TerminalError { error: Error::Backend(ref message) } if message.contains("panicked")));
+    assert!(backend.terminal_error.is_some());
+    assert!(backend.poll_event().is_none());
+    backend.callback_errors.guard(|| panic!("later callback panic"));
+    assert!(backend.poll_event().is_none());
+}
+
+#[test]
+fn round2_microphone_inventory_uses_validated_native_formats() {
+    // CPAL's concrete Device cannot inject formats without native hardware.
+    // input_config discovery tests exercise the validation; this checks adapter wiring.
+    let source = include_str!("lib.rs");
+    let inventory = source.split("pub fn list_devices()").nth(1).unwrap().split("impl CaptureBackend").next().unwrap();
+    assert!(inventory.contains("input_config::discover("));
 }

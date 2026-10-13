@@ -112,7 +112,7 @@ pub(crate) fn guard_value<T>(fallback: T, f: impl FnOnce() -> T) -> T {
 
 /// Wrap a bool-returning function in a panic guard. On panic, return false.
 fn guard_bool(f: impl FnOnce() -> bool) -> bool {
-    catch_unwind(AssertUnwindSafe(f)).unwrap_or(false)
+    guard_value(false, f)
 }
 
 /// Small helper that records a `flexaudio::Error` in last_error and returns FAILURE.
@@ -548,10 +548,7 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
                 }
                 None => 0,
             },
-            Err(error) => {
-                set_last_error(error.to_string());
-                code::FLEX_FAILURE
-            }
+            Err(error) => crate::vad::vad_failure(error),
         }
     })
 }
@@ -1046,3 +1043,19 @@ mod header_tests;
 #[cfg(test)]
 #[path = "../tests/ffi/v2.rs"]
 mod v2_tests;
+
+#[cfg(test)]
+mod bool_guard_tests {
+    use super::*;
+    #[test]
+    fn silent_failure_bool_guard_panic_sets_typed_last_error() {
+        error::set_audio_error(flexaudio::Error::InvalidArg("stale error".into()));
+        assert!(!guard_bool(|| panic!("private panic payload")));
+        // SAFETY: the thread-local error string is live until the next setter.
+        let text = unsafe { std::ffi::CStr::from_ptr(flexaudio_last_error()) }
+            .to_str()
+            .unwrap();
+        assert!(text.contains("panic caught at FFI boundary"), "{text}");
+        assert!(!text.contains("private panic payload"));
+    }
+}

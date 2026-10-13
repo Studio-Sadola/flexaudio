@@ -380,7 +380,7 @@ fn error_rolls_back_staged_onsets_cuts_and_finals_and_closes_published_watermark
     let mut e = vad.process(&[0.0; 512]).unwrap();
     c.lock().unwrap().fail_at = Some(3);
     let failure = vad.process(&[0.0; 4 * 512]).unwrap_err();
-    assert_eq!(failure.error, WhisperVadError::Inference);
+    assert_eq!(failure.error.root(), &WhisperVadError::Inference);
     e.extend(failure.terminal_events);
     assert_invariants(&e);
     assert_eq!(cuts(&e), [(0, 32, crate::PreviewCutReason::Error)]);
@@ -449,7 +449,7 @@ fn invalid_model_probability_is_fatal_not_a_validation_rejection() {
     for p in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
         let (mut vad, _) = session(Default::default(), true, vec![p]);
         let f = vad.process(&[0.0; 512]).unwrap_err();
-        assert_eq!(f.error, WhisperVadError::Inference);
+        assert_eq!(f.error.root(), &WhisperVadError::Inference);
         assert_eq!(
             kinds(&f.terminal_events),
             [Kind::EpochEnd {
@@ -606,5 +606,40 @@ fn failed_call_limit_cut_is_discarded_and_reset_after_limit_has_positive_residua
             (0, 30000, crate::PreviewCutReason::Limit),
             (30000, 30016, crate::PreviewCutReason::Reset)
         ]
+    );
+}
+
+#[test]
+fn inference_and_reset_preserve_original_typed_causes() {
+    let (mut vad, control) = session(WhisperVadParams::default(), false, vec![]);
+    control.lock().unwrap().fail_at = Some(0);
+    let failure = vad.process(&[0.0; 512]).unwrap_err();
+    assert!(format!("{:?}", failure.error).contains("injected"));
+    assert_eq!(
+        failure.error.cause(),
+        Some(&VadError::Inference("injected".into()))
+    );
+    control.lock().unwrap().fail_reset = true;
+    let failure = vad.reset().unwrap_err();
+    assert!(format!("{:?}", failure.error).contains("injected"));
+    assert_eq!(
+        failure.error.cause(),
+        Some(&VadError::Reset("injected".into()))
+    );
+}
+
+#[test]
+fn model_load_error_uses_the_shared_typed_cause_envelope() {
+    // The embedded model is known-good, so a real optimizer/model-load failure
+    // cannot be triggered reliably. Exercise the helper used by construction;
+    // inference/reset failures above additionally exercise injectable runtime work.
+    let source = VadError::ModelLoad("injected model optimizer cause".into());
+    let error = WhisperVadError::ModelLoad.with_cause(source.clone());
+    assert_eq!(error.root(), &WhisperVadError::ModelLoad);
+    assert_eq!(error.cause(), Some(&source));
+    assert!(!error.to_string().contains("injected model optimizer cause"));
+    assert_eq!(
+        error.audio_error().whisper_code(),
+        Some(flexaudio_core::WhisperCode::ModelLoad)
     );
 }

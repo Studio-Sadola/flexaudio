@@ -53,6 +53,8 @@ for data in [array.array('d', [0.0]), array.array('h', [0]),
         assert False
     except fa.WhisperVadValidationError as error:
         assert error.code == 'InvalidPcm' and error.terminal_events == []
+        assert error.audio_error.kind == 'invalidArg'
+        assert 'contiguous one-dimensional native float32' in error.audio_error.message
         assert 'contiguous one-dimensional native float32' in str(error)
 assert vad.last_frame_probabilities().first_frame_index == 0
 "#

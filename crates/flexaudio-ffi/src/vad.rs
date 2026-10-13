@@ -108,7 +108,8 @@ pub unsafe extern "C" fn flexaudio_vad_process(
 
 /// Finalize pending speech at EOF and return a library-owned VAD event array.
 ///
-/// Valid destinations initialize to NULL/0, also on error. A repeated successful
+/// Valid destinations initialize to NULL/0. Completed events remain available even
+/// when a subsequent reset fails; free any returned event array also on error. A repeated successful
 /// flush returns NULL/0 unless new input arrived. Free with `flexaudio_vad_events_free`.
 ///
 /// # Safety
@@ -133,7 +134,12 @@ pub unsafe extern "C" fn flexaudio_vad_flush(
         }
         let events = match (*v).inner.flush() {
             Ok(events) => events,
-            Err(error) => return vad_failure(error),
+            Err(error) => {
+                let (events, len) = vad_events_to_c((*v).inner.take_pending_events());
+                out.write(events);
+                out_len.write(len);
+                return vad_failure(error);
+            }
         };
         let (events, len) = vad_events_to_c(events);
         out.write(events);
@@ -144,17 +150,7 @@ pub unsafe extern "C" fn flexaudio_vad_flush(
 
 /// Map addon failures by their typed variant; raw inference diagnostics stay private.
 pub(crate) fn vad_failure(error: flexaudio_vad::VadError) -> i32 {
-    use flexaudio_vad::VadError;
-    let error = match error {
-        VadError::InvalidFormat(message) | VadError::InvalidConfig(message) => {
-            flexaudio::Error::InvalidArg(message)
-        }
-        VadError::ModelLoad(_) => flexaudio::Error::Backend("VAD model load failed".into()),
-        VadError::Inference(_) => flexaudio::Error::Backend("VAD inference failed".into()),
-        VadError::Resample(_) => flexaudio::Error::Backend("VAD resampling failed".into()),
-        VadError::Reset(_) => flexaudio::Error::Backend("VAD reset failed".into()),
-    };
-    set_audio_error(error)
+    set_audio_error(error.audio_error())
 }
 
 /// Free an event array allocated by `flexaudio_vad_process` or `flexaudio_vad_flush`. NULL / 0 is safe.
@@ -252,6 +248,43 @@ mod tests {
     }
 
     #[test]
+    fn standalone_flush_returns_completed_events_also_on_reset_failure() {
+        // The embedded engine reset is infallible; the test-only fault simulates
+        // an external inference backend's reset failure without audio hardware.
+        let mut handle = FlexVad {
+            inner: Vad::new(flexaudio_vad::VadConfig {
+                threshold: 0.0,
+                neg_threshold: Some(0.0),
+                min_speech_ms: 0,
+                speech_pad_ms: 0,
+                ..Default::default()
+            })
+            .unwrap(),
+        };
+        handle.inner.process(&[0.1; 1024]).unwrap();
+        handle.inner.inject_reset_failure();
+        let mut events = std::ptr::null_mut();
+        let mut len = 0;
+        let status = unsafe { flexaudio_vad_flush(&mut handle, &mut events, &mut len) };
+        assert_eq!(status, code::FLEX_FAILURE);
+        assert_eq!(len, 2);
+        let completed = unsafe { std::slice::from_raw_parts(events, len) };
+        assert_eq!(completed[0].kind, 0);
+        assert_eq!(completed[1].kind, 1);
+        assert_eq!(
+            crate::error::last_audio_error().unwrap().addon_kind(),
+            Some(flexaudio::core::AddonErrorKind::VadReset)
+        );
+        unsafe { flexaudio_vad_events_free(events, len) };
+        assert_eq!(
+            unsafe { flexaudio_vad_flush(&mut handle, &mut events, &mut len) },
+            code::FLEX_FAILURE
+        );
+        assert!(events.is_null());
+        assert_eq!(len, 0, "failed-reset speech must only be delivered once");
+    }
+
+    #[test]
     fn vad_invalid_format_returns_failure_detail() {
         let v = unsafe { flexaudio_vad_new(std::ptr::null()) };
         assert!(!v.is_null());
@@ -268,11 +301,24 @@ mod tests {
                 .to_str()
                 .unwrap();
             let error = crate::error::last_audio_error().expect("typed format error retained");
-            let flexaudio::Error::InvalidArg(detail) = &error else {
-                panic!("invalid format must preserve its InvalidArg root");
+            assert_eq!(error.kind(), flexaudio::ErrorKind::InvalidArg);
+            let flexaudio::Error::Addon {
+                kind: flexaudio::core::AddonErrorKind::VadInvalidFormat,
+                message: detail,
+            } = &error
+            else {
+                panic!("invalid format must preserve its typed addon cause");
             };
             assert!(detail.contains(reason));
-            assert_eq!(message, error.to_string());
+            let expected = flexaudio_vad::Vad::new(flexaudio_vad::VadConfig::default())
+                .unwrap()
+                .process_pcm(&[], rate, channels)
+                .unwrap_err()
+                .audio_error();
+            assert_eq!(
+                error, expected,
+                "FFI must retain the entire typed addon cause"
+            );
             assert!(message.contains(reason));
         }
         unsafe { flexaudio_vad_free(v) };

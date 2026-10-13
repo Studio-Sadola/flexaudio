@@ -61,7 +61,8 @@ impl WhisperVad {
         options: WhisperVadOptions,
     ) -> Result<Self, WhisperVadError> {
         params.validate()?;
-        let engine = SileroEngine::load().map_err(|_| WhisperVadError::ModelLoad)?;
+        let engine =
+            SileroEngine::load().map_err(|source| WhisperVadError::ModelLoad.with_cause(source))?;
         Self::with_backend(params, options, Box::new(CheckedSilero(engine)))
     }
 
@@ -233,8 +234,8 @@ impl WhisperVad {
             .checked_add(1)
             .ok_or_else(|| overflow(Operation::Epoch))?;
         let mut batch = self.reserve_batch(0)?;
-        if self.engine.reset().is_err() {
-            return Err(self.fail(WhisperVadError::Inference, &mut batch));
+        if let Err(source) = self.engine.reset() {
+            return Err(self.fail(WhisperVadError::Inference.with_cause(source), &mut batch));
         }
         if self.state == Lifecycle::Running {
             self.close_epoch(PreviewCloseReason::Reset, EpochEndReason::Reset, &mut batch);
@@ -278,7 +279,7 @@ impl WhisperVad {
         let p = self
             .engine
             .infer(frame)
-            .map_err(|_| WhisperVadError::Inference)?;
+            .map_err(|source| WhisperVadError::Inference.with_cause(source))?;
         if !p.is_finite() || !(0.0..=1.0).contains(&p) {
             return Err(WhisperVadError::Inference);
         }

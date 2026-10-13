@@ -72,3 +72,6 @@ pub use process::MacProcessBackend;
 pub use processes::list_processes;
 #[cfg(target_os = "macos")]
 pub use system::MacSystemBackend;
+
+#[cfg(any(target_os = "macos", test))]
+mod inventory;

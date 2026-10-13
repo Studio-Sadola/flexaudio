@@ -130,7 +130,8 @@ stream.stop();
   問い合わせる前に型付き `Backend` エラーを返します。責任を持つホストのアクセスを許可するか、
   待機時間に上限のあるキャプチャのオープンで同意を確定し、再度列挙してください。
   拒否／制限は `PermissionDenied` になります。DeviceInfo のサンプルレートとチャンネル数は必須で、
-  一部だけの一覧や不明な形式を補ったレコードは返しません。
+  一部だけの一覧や不明な形式を補ったレコードは返しません。Linux の PipeWire 出力形式には、
+  [失敗通知](#054-の失敗通知)に記載した互換性のための既定値があります。
   Windows の列挙では AppCapability によるマイクの権限の事前確認を行わず、
   ネイティブの一覧取得を進めます。キャプチャには従来の別の権限事前確認を適用します。
 - `flexaudio::processes() -> Result<Vec<ProcessInfo>>` — Linux/Windows では音声出力のセッション／ストリームを持つプロセスを、
@@ -140,11 +141,16 @@ stream.stop();
   プロセス単位のキャプチャには `pid` を `target_pid` として渡してください。
 - `flexaudio::watch_devices() -> Result<DeviceWatcher>` — デバイスの接続・取り外しに関する通知
   （追加／削除／デフォルトの変更）をポーリングで受け取れます。
-  Linux で開始に失敗するとエラーを返します。Windows/macOS では、現在は何も行わないウォッチャーを返します。
+  Linux で開始に失敗するとエラーを返します。その後のデーモン、コールバック、停止処理の
+  失敗は `DeviceEvent::TerminalError { error }` を一度だけ通知します。
+  Node.js/Python では型付き `error` を持つ `terminalError`、C v2 ではデバイスイベントの
+  種別 6 と `flexaudio_device_event_error_v2` で参照できます。C v1 のポーリングは根本原因の
+  負のエラーコードを返し、last_error を設定します。Windows/macOS では、意図的に
+  何も行わないウォッチャーを返します。
 - 再エクスポートされる型: `StreamConfig`, `SourceKind`, `ProcessMode`, `OutputFormat`,
   `AudioChunk`, `SecondaryChunk`, `ChunkFlags`, `DeviceInfo`, `ProcessInfo`,
   `DeviceEvent`, `DefaultDeviceKind`, `Event`, `Permission`, `Error`, `ErrorKind`,
-  `ErrorContext`, `AudioLoss`, `ShutdownReport`, `Result`。
+  `ErrorContext`, `AddonErrorKind`, `AudioLoss`, `ShutdownReport`, `Result`。
 
 音声区間検出（`flexaudio-vad`）では、`Vad::new` / `Vad::process` でストリーミングの
 `SpeechStart` / `SpeechEnd` イベントを取得し、`get_speech_timestamps` でバッチ処理による区間分割を行います。
@@ -166,6 +172,57 @@ Silero VAD モデルはバイナリに埋め込まれているため、実行時
 次のポーリング用にゼロフレームのチャンクへ保持します。
 
 ---
+
+## 0.5.4 の失敗通知
+
+デバイスの必須の名前・分類・形式、プロセス PID、セッションの問い合わせに失敗すると、
+検出は一覧全体をエラーとして返します。読めない必須項目を黙って省略しません。
+形式については Linux の PipeWire 出力検出とデバイス監視通知に例外があります。
+`audio.rate` / `audio.channels` のプロパティが欠落しているか解析できない場合は、
+それぞれ独立に 48000 Hz / 2 チャンネルへフォールバックします。これは互換性のための
+既定値で、測定済みの形式ではありません。`DeviceInfo` では両者を区別できません。
+任意のプロセスメタデータは不存在の確認済み、またはプロセスが終了した場合だけ欠落し、
+それ以外のネイティブ問い合わせの失敗は一覧全体をエラーにします。Windows の待機は
+タイムアウトと待機自体の失敗を区別し、COM 初期化は想定外の HRESULT を報告します。
+
+Linux のルーティング変更は次に配信するチャンクに `DISCONTINUITY` を付けます。
+bind の失敗、不正・欠落バッファ、拒否した形式再交渉、コールバックの panic は、
+既存の準備完了・損失・終端通知の経路で報告します。監視の失敗は監視を終了し、
+`DeviceEvent::TerminalError { error }` を一度通知します。Node.js/Python は型付きの
+`error` を持つ `terminalError`、C v2 はデバイスイベント種別 6 と
+`flexaudio_device_event_error_v2` を公開します。C v1 の poll は負の原因コードを返し、
+last_error を設定します。`RescanRequired` は一覧の無効化を表し、監視失敗とは区別します。
+停止後もワーカーの join 失敗と未配信の終端通知を保持します。
+
+`Error::Diagnostic { source, detail }` はネイティブ詳細を保持し、安全な `Display` には
+型付きの原因だけを表示します。Node.js の `diagnosticDetails`、Python の
+`diagnostic_details`、C v2 の詳細件数・詳細アクセサーで明示的に取得できます。
+詳細には非公開のホスト情報が含まれる場合があるため、自動でログに出さないでください。
+`Error::Addon { kind, message }` と `AddonErrorKind` は VAD のモデル読み込み・推論・
+設定/形式・再サンプリング・reset、および FLAC の I/O・未対応入力・エンコーダー失敗を
+区別します。バインディングは `addonKind`/`addonMessage`（Python は
+`addon_kind`/`addon_message`、C v2 は種別・メッセージアクセサー）を公開します。
+後から発生した終端エラー、flush と reset の同時失敗、VAD の末尾処理、Whisper VAD の
+モデル・変換原因は、主原因を置き換えず順序付きの関連エラーとして残します。
+Rust に追加した `VadError::Multiple`、`WhisperVadError::Cause`、
+`WhisperVadTapError::Cause` が型付きの原因を保持します。
+
+従来の VAD は変換済み入力が残っている間の形式変更を拒否します。変更前に明示的に
+排出または reset してください。reset が失敗しても完成した発話イベントは残り、
+`Vad::take_pending_events()` で一度だけ取り出せます。Python の単独 flush 例外は
+`pending_events`、Node.js は `pendingEvents` を保持します。C の flush は負の結果と
+イベント出力を同時に返す場合があり、その出力も解放が必要です。ソース切り替えは
+共有のギャップ処理で古い発話区間を閉じてからアドオンを交換します。Node.js の
+イベント専用 secondary チャンクは最後の seq・frame index・drop カウンターを保持します。
+
+macOS の自己プローブが判定不能になった場合、ネイティブの原因を保持し、無音の注意通知と
+既存の `RecoverableError` を配信します。キャプチャは継続できます。
+ワーカー生成の失敗は I/O の種別・OS コードと再試行の案内を保持します。Node.js の
+ローダーは試した全候補と元の失敗を `attempts`/`errors` に残し、停止エラーの生成に
+失敗しても Promise を reject します。FFI の bool panic ガードは型付き last_error を
+設定します。Python の不正 PID は値の表現を含み、十進表記できない巨大整数には
+十六進表記を使います。時計の変換は `i64` の境界で飽和し、CLI は失敗した操作を示し、
+実行中の失敗後も WAV の終了処理を検査して両方の失敗を保持します。
 
 ## 0.5 への移行
 

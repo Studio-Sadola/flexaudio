@@ -32,7 +32,13 @@ impl SharedState {
             // Empty generations must leave recovery pending until captured samples arrive.
             recovered: samples > 0 && self.recovered_pending.swap(false, Ordering::SeqCst),
             discontinuity: !scratch.is_empty()
-                && self.discontinuity_pending.swap(false, Ordering::SeqCst),
+                && (self.discontinuity_pending.swap(false, Ordering::SeqCst)
+                    | self
+                        .raw_diagnostics
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .is_some_and(CaptureDiagnostics::take_discontinuity)),
         }
     }
 

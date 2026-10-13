@@ -1,6 +1,6 @@
 //! Thin standalone C adapters over the shared whisper-compatible session.
 
-use crate::error::{clear_last_error, code, set_last_error};
+use crate::error::{clear_last_error, code, set_audio_error, set_last_error};
 use crate::whisper_types::*;
 use crate::{guard_i32, guard_ptr};
 use flexaudio_vad::{
@@ -35,7 +35,7 @@ pub(crate) fn params_from_c(p: &FlexWhisperVadParams) -> Result<WhisperVadParams
 }
 
 pub(crate) fn error_code(e: &WhisperVadError) -> i32 {
-    match e {
+    match e.root() {
         WhisperVadError::InvalidParameter { .. }
         | WhisperVadError::InvalidProbability { .. }
         | WhisperVadError::InvalidPcm { .. }
@@ -44,6 +44,7 @@ pub(crate) fn error_code(e: &WhisperVadError) -> i32 {
             code::FLEX_INVALID_STATE
         }
         WhisperVadError::Inference | WhisperVadError::ModelLoad => code::FLEX_FAILURE,
+        WhisperVadError::Cause { primary, .. } => error_code(primary),
     }
 }
 
@@ -199,7 +200,7 @@ pub unsafe extern "C" fn flexaudio_whisper_vad_new(
         match WhisperVad::new(params, WhisperVadOptions { provisional }) {
             Ok(inner) => Box::into_raw(Box::new(FlexWhisperVad { inner })),
             Err(e) => {
-                set_last_error(e.to_string());
+                set_audio_error(e.audio_error());
                 ptr::null_mut()
             }
         }
@@ -215,7 +216,7 @@ unsafe fn stream_result(
         Ok(events) => (events, code::FLEX_OK),
         Err(failure) => {
             let status = error_code(&failure.error);
-            set_last_error(failure.error.to_string());
+            set_audio_error(failure.error.audio_error());
             (failure.terminal_events, status)
         }
     };
@@ -352,7 +353,7 @@ pub unsafe extern "C" fn flexaudio_whisper_postprocessor_new(
         match WhisperVadPostProcessor::new(p) {
             Ok(inner) => Box::into_raw(Box::new(FlexWhisperVadPostProcessor { inner })),
             Err(e) => {
-                set_last_error(e.to_string());
+                set_audio_error(e.audio_error());
                 ptr::null_mut()
             }
         }
@@ -379,7 +380,7 @@ unsafe fn segment_result(
             code::FLEX_OK
         }
         Err(e) => {
-            set_last_error(e.to_string());
+            set_audio_error(e.audio_error());
             error_code(&e)
         }
     }

@@ -410,7 +410,7 @@ fn failed_session_reinitializes_at_the_next_discontinuity() {
     let failure = tap
         .process(&[0.2; 4000], 2000, project_pts(0, 2000).unwrap(), false)
         .unwrap_err();
-    assert_eq!(failure.error, Error::Vad(crate::WhisperVadError::Inference));
+    assert_eq!(failure.error.code(), flexaudio_core::WhisperCode::Inference);
     events.extend(failure.terminal_events);
     assert_order(&events);
     // Contiguous audio carries no reinitialization point: intake stays failed.
@@ -455,7 +455,7 @@ fn failed_reinitialization_stays_failed_until_a_successful_reset() {
         .unwrap_err();
     // The reset failed, so the new epoch is never published and the old closure is
     // not repeated (no event storm).
-    assert_eq!(failure.error, Error::Vad(crate::WhisperVadError::Inference));
+    assert_eq!(failure.error.code(), flexaudio_core::WhisperCode::Inference);
     assert!(failure.terminal_events.is_empty());
     assert_eq!(
         tap.process(
@@ -619,7 +619,7 @@ fn injected_finish_failure_closes_the_published_epoch_on_flush_and_stop() {
         let mut events = tap.process(&[0.2; 4000], 0, 0, false).unwrap();
         tap.inject_failure();
         let failure = if stopping { tap.stop() } else { tap.flush() }.unwrap_err();
-        assert_eq!(failure.error, Error::Vad(crate::WhisperVadError::Inference));
+        assert_eq!(failure.error.code(), flexaudio_core::WhisperCode::Inference);
         events.extend(failure.terminal_events);
         assert_eq!(terminals(&events), [EpochEndReason::Error]);
         assert_order(&events);
@@ -713,7 +713,7 @@ fn stop_after_inference_failure_succeeds_without_repeating_closure_or_reset() {
             false,
         )
         .expect_err("the second feed must fail model inference");
-    assert_eq!(failure.error, Error::Vad(crate::WhisperVadError::Inference));
+    assert_eq!(failure.error.code(), flexaudio_core::WhisperCode::Inference);
     events.extend(failure.terminal_events);
     assert_eq!(terminals(&events), [EpochEndReason::Error]);
     assert_order(&events);
@@ -757,7 +757,7 @@ fn inference_and_reset_failures_preserve_ordered_exactly_once_closure() {
     let failure = tap
         .process(&[0.2; 4000], 2000, project_pts(0, 2000).unwrap(), false)
         .unwrap_err();
-    assert_eq!(failure.error, Error::Vad(crate::WhisperVadError::Inference));
+    assert_eq!(failure.error.code(), flexaudio_core::WhisperCode::Inference);
     events.extend(failure.terminal_events);
     assert_order(&events);
     assert!(matches!(
@@ -864,7 +864,10 @@ fn conversion_failure_closes_published_epoch_once_and_flush_recovers() {
                 false,
             )
             .unwrap_err();
-        assert_eq!(failure.error, Error::Conversion);
+        assert_eq!(
+            failure.error.code(),
+            flexaudio_core::WhisperCode::Conversion
+        );
         events.extend(failure.terminal_events);
         if published {
             assert_order(&events);

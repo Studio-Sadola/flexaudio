@@ -120,6 +120,21 @@ impl std::fmt::Display for SnapshotError {
     }
 }
 
+impl SnapshotError {
+    fn into_core(self) -> Error {
+        match self {
+            Self::Core {
+                object_id,
+                code,
+                cause,
+            } => crate::discovery::core_error(object_id, code, &cause),
+            error => Error::Backend(error.to_string()).with_context(
+                flexaudio_core::ErrorContext::new(flexaudio_core::Operation::Enumerate),
+            ),
+        }
+    }
+}
+
 impl std::error::Error for SnapshotError {}
 
 /// Preserve the first cause even if later events or the deadline also fail.
@@ -150,16 +165,8 @@ fn run_callback(
 /// mandatory output-node PIDs. Only a completed empty query returns `Ok([])`. Executable names
 /// and activity remain optional metadata.
 pub fn list_processes() -> Result<Vec<ProcessInfo>> {
-    let snapshot = collect_snapshot().map_err(|error| {
-        Error::Backend(error.to_string()).with_context(flexaudio_core::ErrorContext::new(
-            flexaudio_core::Operation::Enumerate,
-        ))
-    })?;
-    build_process_list(&snapshot, read_executable).map_err(|error| {
-        Error::Backend(error.to_string()).with_context(flexaudio_core::ErrorContext::new(
-            flexaudio_core::Operation::Enumerate,
-        ))
-    })
+    let snapshot = collect_snapshot().map_err(|error| error.into_core())?;
+    build_process_list(&snapshot, read_executable).map_err(|error| error.into_core())
 }
 
 /// Convert collection results to a raw list, rejecting unresolved mandatory PIDs.
@@ -833,5 +840,23 @@ mod tests {
             assert!(message.starts_with("pipewire"));
             assert!(!message.contains(private_metadata));
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn process_query_retains_daemon_cause_through_core_projection() {
+        let error = SnapshotError::Core {
+            object_id: 9,
+            code: -5,
+            cause: "synthetic daemon detail".into(),
+        }
+        .into_core();
+        assert_eq!(error.diagnostic_details(), ["synthetic daemon detail"]);
+        assert!(!error.to_string().contains("synthetic daemon detail"));
+        assert!(error.to_string().contains("-5"));
+        assert_eq!(error.kind(), flexaudio_core::ErrorKind::Backend);
     }
 }

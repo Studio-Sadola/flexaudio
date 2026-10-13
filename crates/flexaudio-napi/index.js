@@ -11,7 +11,13 @@ const { platform, arch } = process
 
 let nativeBinding = null
 let localFileExisted = false
-let loadError = null
+const loadErrors = []
+function loadNative(candidate) {
+  try { return require(candidate) } catch (error) {
+    loadErrors.push({ candidate, error })
+    throw error
+  }
+}
 
 function isMusl() {
   // For Node 10
@@ -35,24 +41,24 @@ switch (platform) {
         localFileExisted = existsSync(join(__dirname, 'index.android-arm64.node'))
         try {
           if (localFileExisted) {
-            nativeBinding = require('./index.android-arm64.node')
+            nativeBinding = loadNative('./index.android-arm64.node')
           } else {
-            nativeBinding = require('@studio-sadola/flexaudio-android-arm64')
+            nativeBinding = loadNative('@studio-sadola/flexaudio-android-arm64')
           }
         } catch (e) {
-          loadError = e
+          // loadNative retains this attempted candidate.
         }
         break
       case 'arm':
         localFileExisted = existsSync(join(__dirname, 'index.android-arm-eabi.node'))
         try {
           if (localFileExisted) {
-            nativeBinding = require('./index.android-arm-eabi.node')
+            nativeBinding = loadNative('./index.android-arm-eabi.node')
           } else {
-            nativeBinding = require('@studio-sadola/flexaudio-android-arm-eabi')
+            nativeBinding = loadNative('@studio-sadola/flexaudio-android-arm-eabi')
           }
         } catch (e) {
-          loadError = e
+          // loadNative retains this attempted candidate.
         }
         break
       default:
@@ -67,12 +73,12 @@ switch (platform) {
         )
         try {
           if (localFileExisted) {
-            nativeBinding = require('./index.win32-x64-msvc.node')
+            nativeBinding = loadNative('./index.win32-x64-msvc.node')
           } else {
-            nativeBinding = require('@studio-sadola/flexaudio-win32-x64-msvc')
+            nativeBinding = loadNative('@studio-sadola/flexaudio-win32-x64-msvc')
           }
         } catch (e) {
-          loadError = e
+          // loadNative retains this attempted candidate.
         }
         break
       case 'ia32':
@@ -81,12 +87,12 @@ switch (platform) {
         )
         try {
           if (localFileExisted) {
-            nativeBinding = require('./index.win32-ia32-msvc.node')
+            nativeBinding = loadNative('./index.win32-ia32-msvc.node')
           } else {
-            nativeBinding = require('@studio-sadola/flexaudio-win32-ia32-msvc')
+            nativeBinding = loadNative('@studio-sadola/flexaudio-win32-ia32-msvc')
           }
         } catch (e) {
-          loadError = e
+          // loadNative retains this attempted candidate.
         }
         break
       case 'arm64':
@@ -95,12 +101,12 @@ switch (platform) {
         )
         try {
           if (localFileExisted) {
-            nativeBinding = require('./index.win32-arm64-msvc.node')
+            nativeBinding = loadNative('./index.win32-arm64-msvc.node')
           } else {
-            nativeBinding = require('@studio-sadola/flexaudio-win32-arm64-msvc')
+            nativeBinding = loadNative('@studio-sadola/flexaudio-win32-arm64-msvc')
           }
         } catch (e) {
-          loadError = e
+          // loadNative retains this attempted candidate.
         }
         break
       default:
@@ -111,23 +117,23 @@ switch (platform) {
     localFileExisted = existsSync(join(__dirname, 'index.darwin-universal.node'))
     try {
       if (localFileExisted) {
-        nativeBinding = require('./index.darwin-universal.node')
+        nativeBinding = loadNative('./index.darwin-universal.node')
       } else {
-        nativeBinding = require('@studio-sadola/flexaudio-darwin-universal')
+        nativeBinding = loadNative('@studio-sadola/flexaudio-darwin-universal')
       }
       break
-    } catch {}
+    } catch (error) { /* loadNative retained the universal candidate failure. */ }
     switch (arch) {
       case 'x64':
         localFileExisted = existsSync(join(__dirname, 'index.darwin-x64.node'))
         try {
           if (localFileExisted) {
-            nativeBinding = require('./index.darwin-x64.node')
+            nativeBinding = loadNative('./index.darwin-x64.node')
           } else {
-            nativeBinding = require('@studio-sadola/flexaudio-darwin-x64')
+            nativeBinding = loadNative('@studio-sadola/flexaudio-darwin-x64')
           }
         } catch (e) {
-          loadError = e
+          // loadNative retains this attempted candidate.
         }
         break
       case 'arm64':
@@ -136,12 +142,12 @@ switch (platform) {
         )
         try {
           if (localFileExisted) {
-            nativeBinding = require('./index.darwin-arm64.node')
+            nativeBinding = loadNative('./index.darwin-arm64.node')
           } else {
-            nativeBinding = require('@studio-sadola/flexaudio-darwin-arm64')
+            nativeBinding = loadNative('@studio-sadola/flexaudio-darwin-arm64')
           }
         } catch (e) {
-          loadError = e
+          // loadNative retains this attempted candidate.
         }
         break
       default:
@@ -155,12 +161,12 @@ switch (platform) {
     localFileExisted = existsSync(join(__dirname, 'index.freebsd-x64.node'))
     try {
       if (localFileExisted) {
-        nativeBinding = require('./index.freebsd-x64.node')
+        nativeBinding = loadNative('./index.freebsd-x64.node')
       } else {
-        nativeBinding = require('@studio-sadola/flexaudio-freebsd-x64')
+        nativeBinding = loadNative('@studio-sadola/flexaudio-freebsd-x64')
       }
     } catch (e) {
-      loadError = e
+      // loadNative retains this attempted candidate.
     }
     break
   case 'linux':
@@ -172,12 +178,12 @@ switch (platform) {
           )
           try {
             if (localFileExisted) {
-              nativeBinding = require('./index.linux-x64-musl.node')
+              nativeBinding = loadNative('./index.linux-x64-musl.node')
             } else {
-              nativeBinding = require('@studio-sadola/flexaudio-linux-x64-musl')
+              nativeBinding = loadNative('@studio-sadola/flexaudio-linux-x64-musl')
             }
           } catch (e) {
-            loadError = e
+            // loadNative retains this attempted candidate.
           }
         } else {
           localFileExisted = existsSync(
@@ -185,12 +191,12 @@ switch (platform) {
           )
           try {
             if (localFileExisted) {
-              nativeBinding = require('./index.linux-x64-gnu.node')
+              nativeBinding = loadNative('./index.linux-x64-gnu.node')
             } else {
-              nativeBinding = require('@studio-sadola/flexaudio-linux-x64-gnu')
+              nativeBinding = loadNative('@studio-sadola/flexaudio-linux-x64-gnu')
             }
           } catch (e) {
-            loadError = e
+            // loadNative retains this attempted candidate.
           }
         }
         break
@@ -201,12 +207,12 @@ switch (platform) {
           )
           try {
             if (localFileExisted) {
-              nativeBinding = require('./index.linux-arm64-musl.node')
+              nativeBinding = loadNative('./index.linux-arm64-musl.node')
             } else {
-              nativeBinding = require('@studio-sadola/flexaudio-linux-arm64-musl')
+              nativeBinding = loadNative('@studio-sadola/flexaudio-linux-arm64-musl')
             }
           } catch (e) {
-            loadError = e
+            // loadNative retains this attempted candidate.
           }
         } else {
           localFileExisted = existsSync(
@@ -214,12 +220,12 @@ switch (platform) {
           )
           try {
             if (localFileExisted) {
-              nativeBinding = require('./index.linux-arm64-gnu.node')
+              nativeBinding = loadNative('./index.linux-arm64-gnu.node')
             } else {
-              nativeBinding = require('@studio-sadola/flexaudio-linux-arm64-gnu')
+              nativeBinding = loadNative('@studio-sadola/flexaudio-linux-arm64-gnu')
             }
           } catch (e) {
-            loadError = e
+            // loadNative retains this attempted candidate.
           }
         }
         break
@@ -230,12 +236,12 @@ switch (platform) {
           )
           try {
             if (localFileExisted) {
-              nativeBinding = require('./index.linux-arm-musleabihf.node')
+              nativeBinding = loadNative('./index.linux-arm-musleabihf.node')
             } else {
-              nativeBinding = require('@studio-sadola/flexaudio-linux-arm-musleabihf')
+              nativeBinding = loadNative('@studio-sadola/flexaudio-linux-arm-musleabihf')
             }
           } catch (e) {
-            loadError = e
+            // loadNative retains this attempted candidate.
           }
         } else {
           localFileExisted = existsSync(
@@ -243,12 +249,12 @@ switch (platform) {
           )
           try {
             if (localFileExisted) {
-              nativeBinding = require('./index.linux-arm-gnueabihf.node')
+              nativeBinding = loadNative('./index.linux-arm-gnueabihf.node')
             } else {
-              nativeBinding = require('@studio-sadola/flexaudio-linux-arm-gnueabihf')
+              nativeBinding = loadNative('@studio-sadola/flexaudio-linux-arm-gnueabihf')
             }
           } catch (e) {
-            loadError = e
+            // loadNative retains this attempted candidate.
           }
         }
         break
@@ -259,12 +265,12 @@ switch (platform) {
           )
           try {
             if (localFileExisted) {
-              nativeBinding = require('./index.linux-riscv64-musl.node')
+              nativeBinding = loadNative('./index.linux-riscv64-musl.node')
             } else {
-              nativeBinding = require('@studio-sadola/flexaudio-linux-riscv64-musl')
+              nativeBinding = loadNative('@studio-sadola/flexaudio-linux-riscv64-musl')
             }
           } catch (e) {
-            loadError = e
+            // loadNative retains this attempted candidate.
           }
         } else {
           localFileExisted = existsSync(
@@ -272,12 +278,12 @@ switch (platform) {
           )
           try {
             if (localFileExisted) {
-              nativeBinding = require('./index.linux-riscv64-gnu.node')
+              nativeBinding = loadNative('./index.linux-riscv64-gnu.node')
             } else {
-              nativeBinding = require('@studio-sadola/flexaudio-linux-riscv64-gnu')
+              nativeBinding = loadNative('@studio-sadola/flexaudio-linux-riscv64-gnu')
             }
           } catch (e) {
-            loadError = e
+            // loadNative retains this attempted candidate.
           }
         }
         break
@@ -287,12 +293,12 @@ switch (platform) {
         )
         try {
           if (localFileExisted) {
-            nativeBinding = require('./index.linux-s390x-gnu.node')
+            nativeBinding = loadNative('./index.linux-s390x-gnu.node')
           } else {
-            nativeBinding = require('@studio-sadola/flexaudio-linux-s390x-gnu')
+            nativeBinding = loadNative('@studio-sadola/flexaudio-linux-s390x-gnu')
           }
         } catch (e) {
-          loadError = e
+          // loadNative retains this attempted candidate.
         }
         break
       default:
@@ -304,10 +310,10 @@ switch (platform) {
 }
 
 if (!nativeBinding) {
-  if (loadError) {
-    throw loadError
-  }
-  throw new Error(`Failed to load native binding`)
+  const error = new Error('Failed to load native binding; every attempted candidate failed')
+  error.attempts = loadErrors
+  error.errors = loadErrors.map(attempt => attempt.error)
+  throw error
 }
 
 const { FlexStream, DeviceWatcherHandle, devices, processes, openStream, watchDevices, __openMockStream, Vad, FlacEncoder, Denoiser } = nativeBinding

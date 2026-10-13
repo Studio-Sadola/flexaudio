@@ -255,10 +255,17 @@ export interface ErrorContext {
 }
 
 /** Library-authored message, outer-to-inner contexts, ordered related failures. */
+export type AddonErrorKind = 'vadModelLoad' | 'vadInference' | 'vadInvalidConfig' | 'vadInvalidFormat'
+  | 'vadResample' | 'vadReset' | 'flacIo' | 'flacUnsupported' | 'flacEncoder'
+
 export type AudioError = {
   message: string
   contexts: readonly ErrorContext[]
   secondary: readonly AudioError[]
+  /** Opt-in native details may contain private host data; excluded from message. */
+  diagnosticDetails: readonly string[]
+  addonKind?: AddonErrorKind
+  addonMessage?: string
 } & (
   | { kind: 'invalidArg' }
   | { kind: 'invalidState' }
@@ -273,6 +280,9 @@ export type AudioError = {
   | { kind: 'ambiguousDeviceName' }
   | { kind: 'unknown' }
 )
+
+/** Legacy standalone Vad.flush rejection; completed speech survives a reset failure. */
+export interface VadFlushException extends AudioException { pendingEvents: JsVadEvent[] }
 
 export interface AudioException extends Error {
   code: 'FLEX_INVALID_ARG' | 'FLEX_INVALID_STATE' | 'FLEX_DEVICE_NOT_FOUND'
@@ -336,6 +346,7 @@ export type JsDeviceEvent =
   | { type: 'defaultChanged'; sourceKind: 'mic' | 'system'; id: string }
   | { type: 'defaultCleared'; sourceKind: 'mic' | 'system' }
   | { type: 'rescanRequired'; droppedEvents: bigint }
+  | { type: 'terminalError'; error: AudioError }
   | { type: 'unknown'; message: string }
 
 /**

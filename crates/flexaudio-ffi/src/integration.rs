@@ -49,14 +49,7 @@ pub(crate) fn build_addons(config: &FlexConfig) -> Result<(Option<Denoiser>, Opt
         match Vad::new(vad_config) {
             Ok(v) => Some(v),
             Err(e) => {
-                let kind = match e {
-                    flexaudio_vad::VadError::InvalidConfig(_)
-                    | flexaudio_vad::VadError::InvalidFormat(_) => {
-                        flexaudio::Error::InvalidArg("invalid VAD configuration".into())
-                    }
-                    _ => flexaudio::Error::Backend("VAD construction failed".into()),
-                };
-                crate::error::set_audio_error(kind);
+                crate::error::set_audio_error(e.audio_error());
                 return Err(());
             }
         }
@@ -230,6 +223,75 @@ mod tests {
         fn stop(&mut self) {
             self.0.lock().unwrap().take();
         }
+    }
+
+    #[test]
+    fn round2_processed_poll_v1_retains_addon_cause() {
+        assert_processed_poll_retains_addon_cause(false);
+    }
+    #[test]
+    fn round2_processed_poll_v2_retains_addon_cause() {
+        assert_processed_poll_retains_addon_cause(true);
+    }
+    fn assert_processed_poll_retains_addon_cause(version2: bool) {
+        let (mut stream, sink) = vad_stream(0.5);
+        stream
+            .vad
+            .as_mut()
+            .unwrap()
+            .inject_failure(flexaudio_vad::VadError::Inference(
+                "injected poll cause".into(),
+            ));
+        sink.lock().unwrap().as_mut().unwrap().push(&[0.0; 960], 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = if version2 {
+                let mut out = std::mem::MaybeUninit::uninit();
+                unsafe {
+                    crate::whisper_integration::flexaudio_poll_chunk_v2(
+                        &mut stream,
+                        out.as_mut_ptr(),
+                    )
+                }
+            } else {
+                let mut out = std::mem::MaybeUninit::uninit();
+                unsafe { crate::flexaudio_poll_chunk(&mut stream, out.as_mut_ptr()) }
+            };
+            if status != 0 {
+                assert_eq!(status, crate::error::code::FLEX_FAILURE);
+                let error = crate::error::last_audio_error().expect("typed poll cause retained");
+                assert_eq!(
+                    error.addon_kind(),
+                    Some(flexaudio::AddonErrorKind::VadInference)
+                );
+                assert!(
+                    matches!(error.root(), flexaudio::Error::Addon { message, .. } if message == "injected poll cause")
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "injected PCM did not arrive");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        stream.inner.stop();
+    }
+
+    #[test]
+    fn legacy_vad_shutdown_keeps_typed_addon_cause() {
+        let (mut stream, _) = vad_stream(0.5);
+        stream
+            .vad
+            .as_mut()
+            .unwrap()
+            .inject_failure(flexaudio_vad::VadError::Resample(
+                "injected tail cause".into(),
+            ));
+        assert!(stream.stop_binding().is_err());
+        let report = stream.shutdown.as_ref().unwrap();
+        assert_eq!(
+            report.cleanup()[0].addon_kind(),
+            Some(flexaudio::core::AddonErrorKind::VadResample)
+        );
+        assert!(format!("{:?}", report.cleanup()[0]).contains("injected tail cause"));
     }
 
     /// Build a 48 kHz mono stream with integrated VAD using `threshold` for both the speech and
@@ -618,5 +680,26 @@ mod tests {
         cdef.denoise = 1;
         let (dn2, _) = build_addons(&cdef).expect("Default 48k should succeed");
         assert!(dn2.is_some());
+    }
+}
+
+#[cfg(test)]
+mod round2_tests {
+    use super::*;
+    #[test]
+    fn round2_vad_construction_retains_typed_addon_cause() {
+        // All fields are numeric or nullable pointers; zero selects documented defaults.
+        let mut config: FlexConfig = unsafe { std::mem::zeroed() };
+        config.has_vad = 1;
+        config.vad.threshold = 2.0;
+        assert!(build_addons(&config).is_err());
+        let error = crate::error::last_audio_error().unwrap();
+        assert_eq!(
+            error.addon_kind(),
+            Some(flexaudio::AddonErrorKind::VadInvalidConfig)
+        );
+        assert!(
+            matches!(error.root(), flexaudio::Error::Addon { message, .. } if message.contains("threshold"))
+        );
     }
 }

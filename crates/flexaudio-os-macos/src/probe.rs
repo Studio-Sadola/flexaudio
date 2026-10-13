@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::capture_health::ADVISORY_DETAIL;
+use flexaudio_core::{Error, ErrorContext, ErrorGroup, NativeStatus, Operation};
 
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -13,7 +14,7 @@ pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) enum ProbeOutcome {
     Present,
     Denied { detail: String },
-    Failed { detail: String },
+    Failed { error: Error },
     TimedOut,
     Cancelled,
 }
@@ -36,10 +37,55 @@ impl Clock for SystemClock {
     }
 }
 
+/// Control-thread teardown diagnostics. Native callbacks never touch this mailbox.
+#[derive(Default)]
+pub(crate) struct ProbeCleanup(Mutex<Vec<Error>>);
+
+impl ProbeCleanup {
+    pub(crate) fn record_native(&self, call: &'static str, status: i32) {
+        if status == 0 {
+            return;
+        }
+        let mut failures = match self.0.lock() {
+            Ok(failures) => failures,
+            Err(poisoned) => {
+                let mut failures = poisoned.into_inner();
+                failures.push(Error::Backend(
+                    "self-probe cleanup diagnostics were poisoned; retry capture".into(),
+                ));
+                failures
+            }
+        };
+        failures.push(
+            Error::Backend(format!("self-probe {call} failed; retry capture")).with_context(
+                ErrorContext::new(Operation::Stop).with_native_status(NativeStatus::OsStatus {
+                    call,
+                    value: status,
+                }),
+            ),
+        );
+    }
+
+    fn take(&self) -> Vec<Error> {
+        let mut failures = match self.0.lock() {
+            Ok(failures) => failures,
+            Err(poisoned) => {
+                let mut failures = poisoned.into_inner();
+                failures.push(Error::Backend(
+                    "self-probe cleanup diagnostics were poisoned; retry capture".into(),
+                ));
+                failures
+            }
+        };
+        std::mem::take(&mut *failures)
+    }
+}
+
 pub(crate) struct ProbeControl {
     deadline: Instant,
     cancellation: Arc<AtomicBool>,
     clock: Arc<dyn Clock>,
+    cleanup: Arc<ProbeCleanup>,
 }
 
 impl ProbeControl {
@@ -48,7 +94,12 @@ impl ProbeControl {
             deadline,
             cancellation,
             clock: Arc::new(SystemClock),
+            cleanup: Arc::new(ProbeCleanup::default()),
         }
+    }
+
+    pub(crate) fn cleanup_diagnostics(&self) -> Arc<ProbeCleanup> {
+        self.cleanup.clone()
     }
 
     pub(crate) fn deadline(&self) -> Instant {
@@ -134,8 +185,13 @@ impl PublicationGate {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ProbeDecision {
-    Denied { detail: String },
-    Advisory { detail: String },
+    Denied {
+        detail: String,
+    },
+    Advisory {
+        detail: String,
+        error: Option<Error>,
+    },
 }
 
 /// The silence trigger is latched before probing, including cancellation or failure.
@@ -171,8 +227,17 @@ impl GenerationProbe {
         if matches!(outcome, ProbeOutcome::Cancelled) {
             return None;
         }
-        if control.timed_out() {
-            return Some(advisory());
+        let mut errors = control.cleanup.take();
+        if let ProbeOutcome::Failed { error } = &outcome {
+            errors.insert(0, error.clone());
+        }
+        if control.timed_out() || matches!(outcome, ProbeOutcome::TimedOut) {
+            errors.push(timeout_error());
+        }
+        // Cleanup failure invalidates permission evidence, even if the adapter
+        // recognized a signal or reported denial before resources were released.
+        if !errors.is_empty() {
+            return Some(advisory_failures(errors));
         }
         match outcome {
             ProbeOutcome::Present | ProbeOutcome::Cancelled => None,
@@ -185,7 +250,37 @@ impl GenerationProbe {
 fn advisory() -> ProbeDecision {
     ProbeDecision::Advisory {
         detail: ADVISORY_DETAIL.into(),
+        error: None,
     }
+}
+
+fn timeout_error() -> Error {
+    Error::Backend(
+        "self-probe did not complete before its two-second deadline; retry capture".into(),
+    )
+    .with_context(ErrorContext::new(Operation::Start))
+}
+
+fn advisory_failures(errors: Vec<Error>) -> ProbeDecision {
+    let detail = format!(
+        "{ADVISORY_DETAIL} Self-probe detail: {}",
+        errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let mut errors = errors.into_iter();
+    let error = match (errors.next(), errors.next()) {
+        (Some(primary), Some(secondary)) => Some(Error::Multiple(ErrorGroup::new(
+            primary,
+            secondary,
+            errors.collect(),
+        ))),
+        (Some(error), None) => Some(error),
+        _ => None,
+    };
+    ProbeDecision::Advisory { detail, error }
 }
 
 #[cfg(test)]

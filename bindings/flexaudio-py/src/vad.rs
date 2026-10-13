@@ -85,13 +85,23 @@ impl Vad {
 
     /// Close the active speech segment (if any) and return its remaining events; resets state for reuse.
     fn flush(&mut self) -> PyResult<Vec<PyVadEvent>> {
-        Ok(self
-            .inner
-            .flush()
-            .map_err(vad_err_to_py)?
-            .into_iter()
-            .map(vad_event_to_py)
-            .collect())
+        let events = match self.inner.flush() {
+            Ok(events) => events,
+            Err(error) => {
+                let pending: Vec<_> = self
+                    .inner
+                    .take_pending_events()
+                    .into_iter()
+                    .map(vad_event_to_py)
+                    .collect();
+                return Python::attach(|py| {
+                    let error = vad_err_to_py(error);
+                    error.value(py).setattr("pending_events", pending)?;
+                    Err(error)
+                });
+            }
+        };
+        Ok(events.into_iter().map(vad_event_to_py).collect())
     }
 
     /// Reset all state, the remainder buffer, and the resampler (so another stream can be processed).
@@ -103,6 +113,45 @@ impl Vad {
 #[cfg(test)]
 mod repro_tests {
     use super::*;
+    #[test]
+    fn standalone_flush_exception_retains_completed_events_once() {
+        // The embedded engine reset is infallible; simulate the external backend
+        // failure through the test-only hook, without real audio hardware.
+        Python::initialize();
+        Python::attach(|py| {
+            let mut vad = Vad::new(0.0, 0, 0, 0, 0, 16_000, Some(0.0)).unwrap();
+            vad.process(vec![0.1; 1024], 16_000, 1).unwrap();
+            vad.inner.inject_reset_failure();
+            let error = match vad.flush() {
+                Err(error) => error,
+                Ok(_) => panic!("reset fault must fail flush"),
+            };
+            let events = error.value(py).getattr("pending_events").unwrap();
+            let types: Vec<String> = events
+                .try_iter()
+                .unwrap()
+                .map(|event| event.unwrap().getattr("type").unwrap().extract().unwrap())
+                .collect();
+            assert_eq!(types, ["speech_start", "speech_end"]);
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("audio_error")
+                    .unwrap()
+                    .getattr("addon_kind")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "vadReset"
+            );
+            vad.reset().unwrap();
+            assert!(
+                vad.flush().unwrap().is_empty(),
+                "completed events must only be delivered once"
+            );
+        });
+    }
+
     #[test]
     fn repro_p10_f42_standalone_vad_has_flush() {
         Python::initialize();

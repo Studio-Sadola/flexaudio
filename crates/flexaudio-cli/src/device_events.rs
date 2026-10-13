@@ -6,6 +6,9 @@ pub(super) fn report_device_event(
     relist: &mut impl FnMut() -> Result<Vec<DeviceInfo>, Error>,
 ) -> Result<(), String> {
     match event {
+        DeviceEvent::TerminalError { error } => {
+            return Err(format!("Device monitoring failed: {error}"))
+        }
         DeviceEvent::Added(info) => {
             eprintln!(
                 "[+] ADDED   {:<7} {} ({})",

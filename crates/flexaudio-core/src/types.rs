@@ -136,9 +136,13 @@ pub struct DeviceInfo {
     pub name: String,
     /// Source kind used to capture this device.
     pub source_kind: SourceKind,
-    /// Native (default) device sample rate (Hz), or a reasonable default if unknown.
+    /// Native (default) device sample rate (Hz). Linux PipeWire discovery and
+    /// watcher notifications use 48000 when `audio.rate` is missing or unparseable;
+    /// this compatibility default cannot be distinguished from a measured value.
     pub sample_rate: u32,
-    /// Native (default) device channel count, or a reasonable default if unknown.
+    /// Native (default) device channel count. Linux PipeWire discovery and watcher
+    /// notifications use 2 when `audio.channels` is missing or unparseable;
+    /// this compatibility default cannot be distinguished from a measured value.
     pub channels: u16,
     /// `true` for loopback (system-output monitor), `false` for a recording device (microphone).
     pub is_loopback: bool,
@@ -210,6 +214,11 @@ pub enum DeviceEvent {
     DefaultCleared {
         /// Default endpoint domain.
         kind: DefaultDeviceKind,
+    },
+    /// Device monitoring ended with a retained typed failure.
+    TerminalError {
+        /// Failure of the watcher, independent of capture.
+        error: Error,
     },
     /// Incremental inventory is invalid; obtain a complete inventory again.
     RescanRequired {

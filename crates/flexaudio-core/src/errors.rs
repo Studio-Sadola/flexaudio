@@ -60,6 +60,13 @@ pub enum Error {
     DeviceLost,
     /// Backend failure with a safe explanation.
     Backend(String),
+    /// Addon failure with its stable identity and opt-in diagnostic message.
+    Addon {
+        /// Stable addon cause.
+        kind: crate::AddonErrorKind,
+        /// Original diagnostic, available through structured access only.
+        message: String,
+    },
     /// Optional VAD processor failure; capture remains usable.
     WhisperVad {
         /// Stable typed processor cause.
@@ -78,6 +85,13 @@ pub enum Error {
     Unsupported,
     /// Selection matched multiple devices.
     AmbiguousDeviceName,
+    /// Opt-in native diagnostic detail, excluded from safe display.
+    Diagnostic {
+        /// Typed underlying failure.
+        source: Box<Error>,
+        /// Native diagnostic text, available only through structured access.
+        detail: String,
+    },
     /// Context preserving the source kind.
     Context {
         /// Underlying failure.
@@ -99,12 +113,13 @@ impl Error {
             Self::UnsupportedOsVersion => ErrorKind::UnsupportedOsVersion,
             Self::DeviceLost => ErrorKind::DeviceLost,
             Self::Backend(_) => ErrorKind::Backend,
+            Self::Addon { kind, .. } => kind.error_kind(),
             Self::WhisperVad { .. } => ErrorKind::Backend,
             Self::UnsupportedFormat(_) => ErrorKind::UnsupportedFormat,
             Self::NativeFormatChanged { .. } => ErrorKind::NativeFormatChanged,
             Self::Unsupported => ErrorKind::Unsupported,
             Self::AmbiguousDeviceName => ErrorKind::AmbiguousDeviceName,
-            Self::Context { source, .. } => source.kind(),
+            Self::Context { source, .. } | Self::Diagnostic { source, .. } => source.kind(),
             Self::Multiple(group) => group.primary().kind(),
         }
     }
@@ -115,10 +130,30 @@ impl Error {
             context,
         }
     }
+    /// Retain opt-in native text without exposing it in the default message.
+    pub fn with_diagnostic_detail(self, detail: String) -> Self {
+        Self::Diagnostic {
+            source: Box::new(self),
+            detail,
+        }
+    }
+    /// Native diagnostic text along the primary cause chain, outermost first.
+    pub fn diagnostic_details(&self) -> Vec<&str> {
+        match self {
+            Self::Diagnostic { source, detail } => {
+                let mut details = vec![detail.as_str()];
+                details.extend(source.diagnostic_details());
+                details
+            }
+            Self::Context { source, .. } => source.diagnostic_details(),
+            Self::Multiple(group) => group.primary().diagnostic_details(),
+            _ => Vec::new(),
+        }
+    }
     /// Primary root for explicit structured projections and permission checks.
     pub fn root(&self) -> &Self {
         match self {
-            Self::Context { source, .. } => source.root(),
+            Self::Context { source, .. } | Self::Diagnostic { source, .. } => source.root(),
             Self::Multiple(group) => group.primary().root(),
             error => error,
         }
@@ -127,6 +162,13 @@ impl Error {
     pub fn permission(&self) -> Option<Permission> {
         match self.root() {
             Self::PermissionDenied { permission, .. } => Some(*permission),
+            _ => None,
+        }
+    }
+    /// Addon cause retained through primary context wrappers.
+    pub fn addon_kind(&self) -> Option<crate::AddonErrorKind> {
+        match self.root() {
+            Self::Addon { kind, .. } => Some(*kind),
             _ => None,
         }
     }
@@ -148,11 +190,13 @@ impl fmt::Display for Error {
             Self::UnsupportedOsVersion => f.write_str("unsupported OS version"),
             Self::DeviceLost => f.write_str("device lost"),
             Self::Backend(message) => write!(f, "backend error: {message}"),
+            Self::Addon { kind, .. } => f.write_str(kind.explanation()),
             Self::WhisperVad { code } => write!(f, "whisper VAD failed ({}): {}", code.as_str(), code.explanation()),
             Self::UnsupportedFormat(message) => write!(f, "unsupported output format: {message}"),
             Self::NativeFormatChanged { advertised, actual } => write!(f, "native input format changed from {} Hz/{} channels to {} Hz/{} channels; recreate the stream", advertised.0, advertised.1, actual.0, actual.1),
             Self::Unsupported => f.write_str("unsupported"),
             Self::AmbiguousDeviceName => f.write_str("device selection is ambiguous; select a unique device"),
+            Self::Diagnostic { source, .. } => source.fmt(f),
             Self::Context { source, context } => write!(f, "{source} {context}"),
             Self::Multiple(group) => {
                 write!(f, "{}", group.primary())?;
@@ -167,7 +211,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Context { source, .. } => Some(source.as_ref()),
+            Self::Context { source, .. } | Self::Diagnostic { source, .. } => Some(source.as_ref()),
             Self::Multiple(group) => Some(group.primary()),
             _ => None,
         }

@@ -45,7 +45,7 @@ use windows::Win32::Media::Multimedia::WAVE_FORMAT_IEEE_FLOAT;
 use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 
 use crate::common::{
-    capture_loop, init_loopback_capture, map_hr, wait_event_signaled, CaptureSetup, ComThread,
+    capture_loop, init_loopback_capture, map_hr, wait_event, CaptureSetup, ComThread,
 };
 use windows::core::PCWSTR;
 
@@ -243,10 +243,9 @@ impl CaptureBackend for WasapiProcessBackend {
             .spawn(move || {
                 run_process_thread(target_pid, mode, sink, stop_flag, ready_tx, event_tx)
             })
-            .map_err(|_| {
+            .map_err(|error| {
                 self.stop_flag.store(true, Ordering::SeqCst);
-                Error::Backend("capture owner thread could not be started".into())
-                    .with_context(ErrorContext::new(Operation::Start))
+                flexaudio_core::spawn_error("WASAPI process capture owner", error)
             })?;
 
         match ready_rx.recv() {
@@ -324,7 +323,13 @@ fn run_process_thread(
     ready_tx: mpsc::Sender<Result<()>>,
     event_tx: mpsc::Sender<Event>,
 ) -> ShutdownReport {
-    let _com = ComThread::new();
+    let _com = match ComThread::new() {
+        Ok(com) => com,
+        Err(error) => {
+            let _ = ready_tx.send(Err(error));
+            return ShutdownReport::new(None, Vec::new());
+        }
+    };
 
     let setup = unsafe { setup_process_loopback(target_pid, mode) };
     let setup = match setup {
@@ -404,15 +409,10 @@ pub(crate) unsafe fn setup_process_loopback(
         }
     };
 
-    // Wait up to 5 seconds. Map a timeout to a Backend error.
-    if !wait_event_signaled(done_event, 5000) {
-        let _ = CloseHandle(done_event);
-        return Err(Error::Backend(
-            "process loopback activation timed out".into(),
-        ));
-    }
-    // The completion event is no longer needed. Keep params/prop/handler alive until this function ends.
+    // Close the native event after retaining its exact wait outcome and OS error.
+    let waited = wait_event(done_event, 5000);
     let _ = CloseHandle(done_event);
+    crate::native_outcomes::activation_wait(waited)?;
 
     // Retrieve the activation result on the initiating thread (keep COM objects on one thread).
     let mut hr = HRESULT(0);

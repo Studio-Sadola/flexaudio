@@ -72,11 +72,7 @@ impl NativeProbe {
             match translate_pid_to_object(own_pid) {
                 Ok(0) => thread::sleep(Duration::from_millis(5)),
                 Ok(object) => break object,
-                Err(error) => {
-                    return Err(ProbeOutcome::Failed {
-                        detail: format!("self-probe host process lookup: {error}"),
-                    })
-                }
+                Err(error) => return Err(ProbeOutcome::Failed { error }),
             }
         };
         let mut capture = Capture::new(
@@ -162,7 +158,7 @@ impl NativeProbe {
         Ok(match identified {
             SignalEvidence::Matched => ProbeOutcome::Present,
             SignalEvidence::ExactZeros => ProbeOutcome::Denied { detail: "The private self-probe captured continuous exact-zero samples covering at least 95% of the verified default-output diagnostic signal and its complete 500 ms capture-latency window; System Audio Recording access was not granted".into() },
-            SignalEvidence::Inconclusive => ProbeOutcome::Failed { detail: "The private self-probe did not obtain an unambiguous matching signal or continuous overlapping zero capture with verified rendering".into() },
+            SignalEvidence::Inconclusive => ProbeOutcome::Failed { error: flexaudio_core::Error::Backend("The private self-probe did not obtain an unambiguous matching signal or continuous overlapping zero capture with verified rendering; retry capture".into()) },
         })
     }
 }
@@ -174,7 +170,6 @@ impl Probe for NativeProbe {
         objc2::rc::autoreleasepool(|_| match Self::execute(control) {
             Ok(outcome) => outcome,
             Err(_) if control.cancelled() => ProbeOutcome::Cancelled,
-            Err(_) if control.timed_out() => ProbeOutcome::TimedOut,
             Err(outcome) => outcome,
         })
     }
