@@ -190,7 +190,9 @@ be replaced by the recovered name. A name-based ID cannot be opened while its na
 is unreadable; the native ID remains openable in both name states. macOS devices
 with unreadable output direction are omitted from discovery; the typed direction
 cause is returned for the requested device. Explicit-output scans skip vanished or
-unrelated unreadable devices. An unreadable default query leaves
+unrelated unreadable devices. If the requested macOS device's direction query fails
+and neither its name nor UID is readable, it cannot be matched and open returns
+`DeviceNotFound`. An unreadable default query leaves
 `is_default=false` and does not fail discovery. Windows/macOS default opens validate
 the resolved default format. On Linux, `device_id=None` leaves `target.object` unset:
 PipeWire resolves the default sink and negotiates the format at open, without an
@@ -210,6 +212,7 @@ ERROR_ACCESS_DENIED (5 / 0x80070005) and other image/name failures mean unknown 
 Windows process discovery omits invalidated or vanished render endpoints
 (AUDCLNT_E_DEVICE_INVALIDATED, E_INVALIDARG, ERROR_NOT_FOUND, ERROR_FILE_NOT_FOUND);
 access denied and other endpoint query failures terminate the call with a typed cause.
+Windows device discovery applies the same omission/terminal-error rule to `Item()` failures.
 Linux process discovery omits a failed node bind only when a registry removal confirms
 the node vanished; other bind failures reject the collection with the first cause.
 macOS kAudioHardwareBadObjectError (`!obj`, 0x216f626a), ESRCH (3), and ENOENT (2)

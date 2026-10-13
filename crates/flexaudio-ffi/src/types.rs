@@ -215,8 +215,11 @@ pub struct FlexEvent {
 /// Windows/macOS use selectable native IDs when names are unreadable. IDs may change
 /// between queries: a native fallback may become the recovered name. A name-based ID
 /// cannot be opened while its name is unreadable; the native ID stays openable in both
-/// name states. macOS omits unreadable output direction from discovery; open retains
-/// its typed cause. Unreadable default queries leave is_default=false.
+/// name states. macOS omits unreadable output direction from discovery; the typed
+/// direction cause is returned for the requested device. Explicit-output scans skip
+/// vanished or unrelated unreadable devices. If the requested device's direction query
+/// fails and neither its name nor UID is readable, open returns DeviceNotFound because
+/// it cannot be matched. Unreadable default queries leave is_default=false.
 #[repr(C)]
 pub struct FlexDeviceInfo {
     /// Selectable ID (released by `flexaudio_devices_free`).

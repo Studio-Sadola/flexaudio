@@ -372,7 +372,8 @@ impl Default for OutputFormat {
 pub struct StreamConfig {
     /// Device to select. Applies to both mic (input device) and system (output endpoint).
     /// `None` selects the default (mic = default input / system = default output); `Some(id)` selects the device returned by `devices()`
-    /// with the matching stable ID. If no device matches, `start` returns
+    /// with the matching selectable ID. IDs can change between discovery calls.
+    /// If no device matches, `start` returns
     /// [`Error::DeviceNotFound`]. Ignored for [`SourceKind::ProcessLoopback`]
     /// (the target is selected by `target_pid`). Also ignored for [`SourceKind::Mix`]
     /// (select each side with `mix_mic_device_id` / `mix_system_device_id` instead).

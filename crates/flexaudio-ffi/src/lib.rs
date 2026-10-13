@@ -1062,8 +1062,12 @@ mod bool_guard_tests {
 
 /// Whether this device's capture format is available. Additive v2 accessor; the
 /// v1 FlexDeviceInfo layout is unchanged. False means sample_rate=0 and channels=0.
-/// Opening requires a fresh successful format query or fails with a typed
-/// cause/remedy error. Linux PipeWire's documented compatibility defaults remain available.
+/// Windows/macOS output and microphone opens perform a fresh checked format query.
+/// Explicit Linux output IDs use a fresh checked inventory and format-availability gate.
+/// These checks fail with a typed cause/remedy error if the format remains unreadable.
+/// Linux output opens without a device ID rely on PipeWire to resolve the default sink
+/// and negotiate the format, without an inventory/format pre-check. Linux PipeWire's
+/// documented compatibility defaults remain available.
 /// NULL/misaligned pointers return false and set a typed InvalidArg last error.
 ///
 /// # Safety

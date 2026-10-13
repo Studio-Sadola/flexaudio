@@ -478,7 +478,7 @@ pub(crate) fn vad_event_to_py(ev: flexaudio_vad::VadEvent) -> PyVadEvent {
 ///
 /// `type` is "added" | "removed" | "defaultChanged". Fields depend on the event:
 /// - added: `device` ([`DeviceInfo`](PyDeviceInfo)).
-/// - removed: `id` (stable ID of the removed device).
+/// - removed: `id` (selectable ID of the removed device; IDs can change between discovery calls).
 /// - defaultChanged: `id` (ID of the new default device) and `source_kind` ("mic"|"system").
 #[pyclass(module = "flexaudio", name = "DeviceEvent", frozen)]
 pub struct PyDeviceEvent {
