@@ -16,7 +16,7 @@ use flexaudio_core::backend::RawSink;
 use flexaudio_core::clock::monotonic_now_ns;
 use flexaudio_core::types::{Error, Permission};
 
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::{
     IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
@@ -98,6 +98,28 @@ pub(crate) fn map_hr_at(
                 bits: code.0 as u32,
             }),
         )
+}
+
+/// Decode a borrowed native string, leaving allocation cleanup to its owner.
+///
+/// # Safety
+/// `value` must point to a valid NUL-terminated UTF-16 allocation.
+pub(crate) unsafe fn pwstr_to_string(
+    value: PWSTR,
+    operation: Operation,
+    call: &'static str,
+) -> Result<String, Error> {
+    value.to_string().map_err(|error| {
+        // windows-rs maps invalid UTF-16 to ERROR_NO_UNICODE_TRANSLATION.
+        let native_error = windows::core::Error::from(error);
+        Error::Backend("native string query returned invalid text; retry discovery".into())
+            .with_context(
+                ErrorContext::new(operation).with_native_status(NativeStatus::HResult {
+                    call,
+                    bits: native_error.code().0 as u32,
+                }),
+            )
+    })
 }
 
 /// Monotonic clock in ns. Uses the core [`monotonic_now_ns`] directly. The
@@ -437,6 +459,42 @@ pub(crate) fn wait_event(handle: HANDLE, timeout_ms: u32) -> crate::native_outco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_string_conversion_retains_invalid_utf16_context() {
+        let mut valid = [b'i' as u16, b'd' as u16, 0];
+        let mut invalid = [0xd800, 0];
+        // SAFETY: both buffers are live and NUL-terminated for each conversion.
+        unsafe {
+            assert_eq!(
+                pwstr_to_string(
+                    PWSTR(valid.as_mut_ptr()),
+                    Operation::Enumerate,
+                    "IMMDevice::GetId(string)",
+                ),
+                Ok("id".into())
+            );
+            let error = pwstr_to_string(
+                PWSTR(invalid.as_mut_ptr()),
+                Operation::Enumerate,
+                "IMMDevice::GetId(string)",
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), flexaudio_core::ErrorKind::Backend);
+            assert!(error.to_string().contains("retry discovery"));
+            let Error::Context { context, .. } = error else {
+                panic!("missing string conversion context")
+            };
+            assert_eq!(context.operation(), Operation::Enumerate);
+            assert_eq!(
+                context.native_status(),
+                Some(NativeStatus::HResult {
+                    call: "IMMDevice::GetId(string)",
+                    bits: 0x8007_0459,
+                })
+            );
+        }
+    }
 
     /// Access-denied HRESULTs are classified as PermissionDenied.
     #[test]

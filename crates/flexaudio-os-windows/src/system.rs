@@ -42,8 +42,8 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
 
 use crate::common::{
-    capture_loop, init_loopback_capture, map_hr, map_hr_at, parse_mix_format, CaptureSetup,
-    ComThread, EventHandle,
+    capture_loop, init_loopback_capture, map_hr, map_hr_at, parse_mix_format, pwstr_to_string,
+    CaptureSetup, ComThread, EventHandle,
 };
 use crate::format::{native_format_from_source, retain_format_query, verify_format};
 use crate::keepalive::SilentRender;
@@ -288,9 +288,7 @@ unsafe fn endpoint_native_id(device: &IMMDevice) -> Result<String> {
     if value.is_null() {
         return Err(Error::DeviceNotFound);
     }
-    let id = value
-        .to_string()
-        .map_err(|error| map_hr_at(Operation::Enumerate, "IMMDevice::GetId(string)", error));
+    let id = pwstr_to_string(value, Operation::Enumerate, "IMMDevice::GetId(string)");
     CoTaskMemFree(Some(value.0.cast()));
     id
 }

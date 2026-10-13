@@ -12,9 +12,17 @@ mod tests {
     use super::*;
     #[test]
     fn spawn_failure_retains_kind_and_os_code_without_private_payload() {
-        let error = spawn_error("capture", std::io::Error::from_raw_os_error(11));
+        let err = std::io::Error::from_raw_os_error(11);
+        let kind = format!("{:?}", err.kind());
+        let code = format!("{:?}", err.raw_os_error());
+        let error = spawn_error("capture", err);
+        assert!(error.to_string().contains(&kind));
+        assert!(error.to_string().contains(&code));
+        let error = spawn_error(
+            "capture",
+            std::io::Error::from(std::io::ErrorKind::WouldBlock),
+        );
         assert!(error.to_string().contains("WouldBlock"));
-        assert!(error.to_string().contains("Some(11)"));
         let error = spawn_error("capture", std::io::Error::other("private payload"));
         assert!(!error.to_string().contains("private payload"));
     }
