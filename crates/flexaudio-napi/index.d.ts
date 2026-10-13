@@ -4,13 +4,15 @@
 /* Public declarations maintained to match the strict 0.5 boundary contract. */
 
 /** JS DeviceInfo. `sourceKind` is a string ("mic"|"system"|"process").
- * Sample rate and channel count are mandatory; unknown formats are not fabricated. */
+ * Unreadable mandatory formats use sampleRate=0, channels=0 and formatAvailable=false. */
 export interface JsDeviceInfo {
   id: string
   name: string
   sourceKind: string
   sampleRate: number
   channels: number
+  /** False means the mandatory capture format could not be read; retry discovery/open. */
+  formatAvailable: boolean
   isLoopback: boolean
   isDefault: boolean
 }
@@ -19,14 +21,16 @@ export interface JsDeviceInfo {
  *
  * Pass `pid` to `openStream({ kind: 'process', processId: pid })` to record that process.
  * `name` / `executable` / `bundleId` are for display (including self-reported app values);
- * the identity key is `pid`.
+ * the identity key is `pid`. Unreadable optional metadata stays absent; unknown names use pid N.
+ * Windows 87/0x80070057 is vanished; 5/0x80070005 and other image failures mean unknown.
+ * macOS !obj/0x216f626a, ESRCH=3 and ENOENT=2 are vanished; other metadata failures mean unknown.
  */
 export interface JsProcessInfo {
   /** OS process ID (nonzero). Pass to `openStream` as `processId`. */
   pid: number
   /** Display name (always nonempty). OS-reported name → executable name → bundle ID → `"pid <N>"`. */
   name: string
-  /** Executable basename (e.g. `firefox` / `chrome.exe`). Present only when available. */
+  /** Executable basename; unreadable optional metadata (including access denied) stays absent. */
   executable?: string
   /** macOS bundle ID (e.g. `com.apple.Music`). Present only when available on macOS. */
   bundleId?: string
@@ -57,6 +61,10 @@ export interface JsAudioChunk {
    * Secondary uses its own tap timeline. */
   frameIndex: bigint
   frames: number
+  /** Arrival-time label re-anchored on every native callback. Consecutive chunks may
+   * overlap or leave gaps by callback jitter; no non-overlap or bounded-monotonic guarantee.
+   * frameIndex is authoritative (gaps are loss). VAD uses epochStart.ptsNs + tMs*1e6,
+   * or epochStart.captureSample + tMs*48 for the exact sample-clock mapping. */
   ptsNs: number
   seq: bigint
   flags: number
@@ -94,6 +102,10 @@ export interface JsSecondaryChunk {
    * Secondary uses its own tap timeline. */
   frameIndex: bigint
   frames: number
+  /** Arrival-time label re-anchored on every native callback. Consecutive chunks may
+   * overlap or leave gaps by callback jitter; no non-overlap or bounded-monotonic guarantee.
+   * frameIndex is authoritative (gaps are loss). VAD uses epochStart.ptsNs + tMs*1e6,
+   * or epochStart.captureSample + tMs*48 for the exact sample-clock mapping. */
   ptsNs: number
   seq: bigint
   flags: number
@@ -191,6 +203,11 @@ export type WhisperVadEvent = { epoch: number; seq: number } & (
 
 /** Capture origins appear only on attached streams, before any VAD payload in that epoch. */
 export type AttachedWhisperVadEvent = WhisperVadEvent
+  /** captureSample counts 48 kHz frames on the dedicated capture timeline, independent
+   * of primary/secondary format and tap. captureSample + tMs*48 is exact on that timeline.
+   * Equal to primary frameIndex for the same sample only for a 48 kHz primary.
+   * At other rates units match but resampler group delay leaves origins unequal.
+   * Neither index is an offset into concatenated PCM; pause/queue drops advance them. */
   | { type: 'epochStart'; epoch: number; seq: 0; captureSample: bigint; ptsNs: number }
 
 /** Attach one canonical VAD owner; tap selects only its event carrier. */
@@ -313,6 +330,15 @@ export interface ShutdownReport {
   cleanupErrors: readonly AudioError[]
 }
 
+/** Arrival gaps without reopen emit no event/DISCONTINUITY: frameIndex stays contiguous,
+ * only primary ptsNs jumps, and attached WhisperVad keeps its epoch open.
+ * Stall: >=2 s without consumed samples, checked every 250 ms; stalled, reopen,
+ * recoverableError with 250 ms..5 s backoff, recovered. First new-generation primary
+ * data carries RECOVERED|DISCONTINUITY. WhisperVad epochEnd(finish) and new epochStart
+ * wait for new PCM; downtime does not become frames. These advisories are unordered
+ * relative to onChunk and epoch events. Attached epochs strictly increase within a
+ * stream (checked epoch+1 on rebuild); new openStream starts at 0. (epoch, seq) is
+ * unique per stream; epochEnd(error) precedes whisperVadFailed. */
 export type JsStreamEvent =
   | { type: 'chunkDropped'; count: bigint }
   | { type: 'stalled' }
@@ -453,8 +479,9 @@ export interface OpenOptions {
  * On macOS, enumeration never prompts. With undecided microphone consent it
  * throws a typed Backend error before any HAL/device/format query. Grant the
  * responsible host access or use the bounded capture-open consent flow, then retry.
- * Denied/restricted consent throws PermissionDenied. DeviceInfo formats are mandatory;
- * incomplete discovery does not return a partial or unknown-format inventory.
+ * Denied/restricted consent throws PermissionDenied. Unreadable mandatory formats
+ * use formatAvailable=false and 0/0. Optional metadata remains unknown; collection/count
+ * failures throw. Entries with no readable selectable identity may be omitted.
  * Windows enumeration does not preflight microphone permission; native enumeration
  * proceeds. Microphone capture retains its separate existing permission preflight. */
 export declare function devices(): Array<JsDeviceInfo>
@@ -590,6 +617,10 @@ export declare class FlexStream {
   /** Retained final capture primary and ordered cleanup failures; undefined until completed. */
   shutdownReport(): ShutdownReport | undefined
   /**
+   * Every successful switch creates a new generation with DISCONTINUITY. The epoch
+   * transition waits for new PCM. No re-entrant onChunk occurs during this synchronous
+   * call; return means backend replaced, not delivered. Old epochEnd need not precede
+   * the first new-generation primary chunk; use primary DISCONTINUITY as the boundary.
    * Hot-swap the input source (mic/system/process) without stopping recording.
    *
    * Request a switch to the `StreamConfig` built from `options` on the bridge thread and return

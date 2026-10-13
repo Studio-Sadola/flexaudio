@@ -25,6 +25,7 @@ pub(super) struct IntakeGeneration {
     started: Instant,
     origin: Option<i64>,
     external_gap_ns: i64,
+    released_padding: u64,
 }
 
 impl IntakeGeneration {
@@ -55,6 +56,7 @@ impl IntakeGeneration {
             started: Instant::now(),
             origin: None,
             external_gap_ns: 0,
+            released_padding: 0,
         })
     }
 
@@ -64,10 +66,10 @@ impl IntakeGeneration {
         denoise_enabled: bool,
         formats: (OutputFormat, Option<OutputFormat>),
     ) -> Result<()> {
-        advance_frame_index(
-            &shared.capture_frame_index,
+        self.advance_boundary(
+            shared,
+            self.normalizer.buffered_out_frames() as u64,
             self.normalizer.buffered_capture_frames() as u64,
-            48_000,
         )?;
         self.normalizer = build_normalizer(
             shared,
@@ -211,17 +213,42 @@ impl IntakeGeneration {
         if matches!(end, GenerationEnd::Replaced) && !progress.pushed {
             // Established DSP replacement discards its canonical remainder. Only
             // newly released startup audio changes that existing contract.
-            advance_frame_index(
-                &shared.capture_frame_index,
+            self.advance_boundary(
+                shared,
+                self.normalizer.buffered_out_frames() as u64,
                 self.normalizer.buffered_capture_frames() as u64,
-                48_000,
             )?;
             return Ok(progress);
         }
         if let Err(error) = self.normalizer.flush() {
             shared.record_cleanup(error.with_context(ErrorContext::new(Operation::Flush)));
         }
+        if matches!(end, GenerationEnd::Replaced) && shared.output_format.sample_rate == 48_000 {
+            self.released_padding = self
+                .normalizer
+                .buffered_out_frames()
+                .saturating_sub(self.normalizer.buffered_capture_frames())
+                as u64;
+        }
         Ok(progress)
+    }
+
+    /// Advance both timelines through discarded remainders or primary-only transport padding.
+    fn advance_boundary(&self, shared: &SharedState, primary: u64, capture: u64) -> Result<()> {
+        advance_frame_index(
+            &shared.primary_frame_index,
+            primary,
+            shared.output_format.sample_rate,
+        )?;
+        advance_frame_index(&shared.capture_frame_index, capture, 48_000)?;
+        Ok(())
+    }
+
+    /// Apply transport padding only after valid old-generation capture PCM has been drained.
+    pub fn reconcile_released_padding(&mut self, shared: &SharedState) -> Result<()> {
+        self.advance_boundary(shared, 0, self.released_padding)?;
+        self.released_padding = 0;
+        Ok(())
     }
 
     /// Terminal delivery is closed; retain the original format and account valid PCM.

@@ -63,3 +63,45 @@ mod tests {
         assert!(!error.to_string().contains("synthetic private"));
     }
 }
+
+// Absent registry properties retain the established requested-format defaults.
+// Explicitly invalid properties are unreadable mandatory values, never plausible defaults.
+pub(crate) fn device_format(rate: Option<&str>, channels: Option<&str>) -> (u32, u16, bool) {
+    let query = || {
+        let rate = rate
+            .map_or(Ok(48_000), str::parse::<u32>)
+            .map_err(|_| EnumerationFailure::Format.error())?;
+        let channels = channels
+            .map_or(Ok(2), str::parse::<u16>)
+            .map_err(|_| EnumerationFailure::Format.error())?;
+        Ok((rate, channels))
+    };
+    flexaudio_core::inventory::device_format(query())
+}
+
+#[cfg(test)]
+mod round3_tests {
+    use super::*;
+    #[test]
+    fn invalid_properties_keep_inventory_neighbors_without_fabricated_formats() {
+        let formats = flexaudio_core::inventory::collect(
+            Ok([
+                (Some("44100"), Some("6")),
+                (Some("broken"), Some("2")),
+                (None, None),
+                (Some("48000"), Some("0")),
+            ]),
+            |(rate, channels)| Some(device_format(rate, channels)),
+        )
+        .unwrap();
+        assert_eq!(
+            formats,
+            [
+                (44_100, 6, true),
+                (0, 0, false),
+                (48_000, 2, true),
+                (0, 0, false)
+            ]
+        );
+    }
+}

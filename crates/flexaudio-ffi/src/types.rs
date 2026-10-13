@@ -136,7 +136,10 @@ pub struct FlexChunk {
     pub len: usize,
     /// Number of frames in the chunk.
     pub frames: u32,
-    /// Monotonic presentation timestamp (ns) of the first sample.
+    /// Arrival-time label re-anchored on every native callback. Primary/secondary chunks
+    /// may overlap or leave gaps by callback jitter; no non-overlap or bounded-monotonic
+    /// guarantee. flexaudio_chunk_frame_index is authoritative (gaps are loss). Exact VAD mapping uses
+    /// epoch_start.pts_ns + t_ms*1000000 or epoch_start.capture_sample + t_ms*48.
     pub pts_ns: i64,
     /// Monotonically increasing sequence number assigned by the stream layer.
     pub seq: u64,
@@ -217,9 +220,9 @@ pub struct FlexDeviceInfo {
     pub name: *mut c_char,
     /// Source kind used to capture this device.
     pub source_kind: i32,
-    /// Native (default) sample rate (Hz).
+    /// Native rate (Hz), or 0 if unavailable; use flexaudio_device_format_available_v2.
     pub sample_rate: u32,
-    /// Native (default) channel count.
+    /// Native channel count, or 0 if unavailable (both rate/channels are 0).
     pub channels: u16,
     /// True for loopback (system-output monitor).
     pub is_loopback: bool,

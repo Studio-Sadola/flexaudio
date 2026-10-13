@@ -135,7 +135,7 @@ struct OutputTap {
     out_frame_origin: u64,
     /// PTS anchor: associates an output frame index with `device_pts` (ns).
     pts_anchor: Option<PtsAnchor>,
-    /// Exact capture clock; legacy output taps retain their original arithmetic.
+    /// Exact integer projection for capture anchors; output taps retain their legacy projection.
     canonical_clock: bool,
     padding: std::collections::VecDeque<std::ops::Range<u64>>,
 }

@@ -16,12 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Device and process discovery rejects incomplete mandatory snapshots on Windows,
-  macOS and microphones instead of skipping unreadable entries or fabricating formats.
-  Linux PipeWire output discovery and watcher notifications retain independent
-  48000 Hz / 2-channel compatibility defaults for missing or unparseable format properties.
-  Optional process metadata remains absent only when confirmed absent or its
-  process disappeared; other native query failures reject the snapshot.
+- Discovery keeps devices with unreadable mandatory formats as unavailable (0/0),
+  and keeps unreadable optional process metadata unknown instead of rejecting neighbors.
+  Collection/count failures still fail the whole call. Entries without a readable
+  selectable identity may be omitted. Linux PipeWire output discovery and watcher
+  notifications retain independent 48000 Hz / 2-channel compatibility defaults.
+- Primary/secondary PTS steps use rational arithmetic while retaining per-callback
+  arrival re-anchoring. At 48 kHz primary, frame_index and capture_sample identify
+  the same sample across replacement, recovery, loss rebuild and startup release.
 - Windows waits distinguish timeout from native failure; COM initialization accepts
   only successful initialization or the documented already-initialized cases.
 - Linux PipeWire bind failures, malformed/missing buffers, rejected renegotiation,
@@ -55,6 +57,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Rust/Python `DeviceInfo.format_available`, Node.js `JsDeviceInfo.formatAvailable`,
+  and C `flexaudio_device_format_available_v2` expose unreadable mandatory formats.
+  False uses sample rate 0 and channels 0; checked open retains typed cause/remedy.
+  ProcessInfo retains the existing `pid N` fallback and absent optional fields.
+  C v1 device structure layout is unchanged. Rust DeviceInfo struct literals must
+  supply the new field.
+- Document arrival PTS limits, canonical capture origins, stall/recovery ordering,
+  increasing attached WhisperVad epochs and synchronous source-switch boundaries.
 - `DeviceEvent::TerminalError { error }`: terminal watcher failure, exposed as
   `terminalError` in Node.js/Python and C v2 device event kind 6 with its error accessor.
   C v1 watcher polling returns the negative typed error code and sets last_error.

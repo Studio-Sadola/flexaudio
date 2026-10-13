@@ -257,6 +257,7 @@ class DeviceInfoDict(TypedDict):
     source_kind: Literal["mic", "system", "process", "mix"]
     sample_rate: int
     channels: int
+    format_available: bool
     is_loopback: bool
     is_default: bool
 class DeviceAddedEventDict(TypedDict):
@@ -296,7 +297,7 @@ class VadSettings(TypedDict, total=False):
     sample_rate: int
 
 class DeviceInfo:
-    """Advertised sample rate and channel count are mandatory, never fabricated."""
+    """Unreadable mandatory formats use sample_rate=0, channels=0, format_available=False."""
     def __repr__(self) -> str: ...
     @property
     def id(self) -> str: ...
@@ -309,11 +310,17 @@ class DeviceInfo:
     @property
     def channels(self) -> int: ...
     @property
+    def format_available(self) -> bool: ...
+    @property
     def is_loopback(self) -> bool: ...
     @property
     def is_default(self) -> bool: ...
 
 class ProcessInfo:
+    """Unreadable optional metadata stays None; unknown display names use pid N.
+    Windows 87/0x80070057 is vanished; 5/0x80070005 and other image failures mean unknown.
+    macOS !obj/0x216f626a, ESRCH=3 and ENOENT=2 are vanished; other metadata failures mean unknown.
+    """
     def __repr__(self) -> str: ...
     @property
     def pid(self) -> int: ...
@@ -334,6 +341,12 @@ class VadEvent:
     def at_sample(self) -> int: ...
 
 class AudioChunk:
+    """pts_ns is an arrival-time label re-anchored on every native callback.
+
+    Callback jitter may overlap chunks or leave gaps; no non-overlap or bounded-monotonic
+    guarantee. frame_index is authoritative (gaps are loss). Exact VAD mapping uses
+    epoch_start.pts_ns + t_ms*1_000_000, or epoch_start.capture_sample + t_ms*48.
+    """
     @property
     def frame_index(self) -> int: ...
     def __repr__(self) -> str: ...
@@ -373,6 +386,13 @@ class StreamEvent:
     startupSamplesDropped is enqueued chronologically before publishing the
     generation's first chunk. Event-first callers drain the ordinary FIFO event
     queue before PCM to observe the notice first. PCM polling does not wait for event polling.
+    Arrival gaps without reopen emit no event/DISCONTINUITY: frame_index stays
+    contiguous, only primary pts_ns jumps, and attached WhisperVad keeps its epoch open.
+    Stall: >=2 s without consumed samples, checked every 250 ms; stalled, reopen,
+    recoverableError with 250 ms..5 s backoff, recovered. First new-generation primary
+    data has RECOVERED|DISCONTINUITY. WhisperVad epoch_end(finish) and a new epoch_start
+    wait for new PCM. Downtime does not become frames. These advisories are unordered
+    relative to PCM and epoch events.
     macOS microphone capture requires decided consent before each start; it does
     not continuously monitor authorization changes or permission revocation.
 
@@ -470,7 +490,12 @@ class Stream:
         mic_device_id: Optional[str] = None, system_device_id: Optional[str] = None,
         mic_gain: float = 1.0, system_gain: float = 1.0,
         vad: Optional[VadSettings] = None, denoise: bool = False
-    ) -> None: ...
+    ) -> None:
+        """Every successful switch creates a generation with DISCONTINUITY; epoch
+        transition waits for new PCM. Return means backend replaced, not delivered.
+        Old epoch_end need not precede new primary PCM; use its DISCONTINUITY boundary.
+        """
+        ...
     def __enter__(self) -> Stream: ...
     def __exit__(self, _exc_type: Optional[object], _exc_value: Optional[object], _traceback: Optional[object]) -> bool: ...
 
@@ -574,6 +599,14 @@ class EpochEndEvent:
     def reason(self) -> Literal["finish", "reset", "error"]: ...
 
 class EpochStartEvent:
+    """capture_sample counts 48 kHz frames on the dedicated capture timeline,
+    independent of primary/secondary format and tap. capture_sample + t_ms*48 is exact.
+    Equal to primary frame_index for the same sample only when primary is 48 kHz.
+    Other primary rates share units but not the origin (resampler group delay).
+    Neither index is an offset into concatenated delivered PCM; pause/queue drops advance them.
+    Attached epochs strictly increase within a stream (checked epoch+1 on rebuild).
+    New open starts at 0; (epoch, seq) is unique per stream.
+    """
     @property
     def type(self) -> Literal["epoch_start"]: ...
     @property
@@ -654,13 +687,14 @@ class DeviceWatcher:
     def __exit__(self, _exc_type: Optional[object], _exc_value: Optional[object], _traceback: Optional[object]) -> bool: ...
 
 def devices() -> List[DeviceInfo]:
-    """Complete inventory; incomplete or failed discovery raises a typed exception.
+    """Collection/count failure raises a typed exception; per-entry metadata stays unknown.
 
     On macOS, enumeration never prompts. With undecided microphone consent it
     raises a typed Backend error before any HAL/device/format query. Grant the
     responsible host access or use the bounded capture-open consent flow, then retry.
-    Denied/restricted consent raises PermissionDenied. DeviceInfo formats are mandatory;
-    discovery never returns a partial or unknown-format inventory.
+    Denied/restricted consent raises PermissionDenied. Unreadable mandatory formats
+    use format_available=False and 0/0; other entries stay usable. Collection/count
+    failures raise; entries without readable selectable identity may be omitted.
     Windows enumeration does not preflight microphone permission; native enumeration
     proceeds. Microphone capture retains its separate existing permission preflight.
     """

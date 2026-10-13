@@ -771,15 +771,15 @@ pub unsafe extern "C" fn flexaudio_terminal_error(s: *const FlexStream) -> i32 {
 /// List available devices, allocate an array, and set `out_array` / `out_count`.
 ///
 /// Return 0 only for complete discovery. An empty complete inventory sets
-/// `out_array=NULL` / `out_count=0`. Incomplete or failed discovery (including an
+/// `out_array=NULL` / `out_count=0`. Collection/count failure (including an
 /// unreachable PipeWire daemon on Linux) returns a typed error code and sets
 /// `flexaudio_last_error` / `flexaudio_last_error_info_v2`; it is not an empty success.
 /// Free the allocated array with `flexaudio_devices_free`.
 /// On macOS, enumeration never prompts. With undecided microphone consent it returns
 /// a typed Backend error before any HAL/device/format query. Grant the responsible
 /// host access or use the bounded capture-open consent flow, then retry enumeration.
-/// Denied/restricted consent returns a permission error. DeviceInfo formats are mandatory;
-/// discovery does not return a partial or unknown-format inventory.
+/// Denied/restricted consent returns a permission error. Unreadable mandatory DeviceInfo formats
+/// use format_available=false and the 0/0 sentinel; other entries remain usable.
 /// Windows enumeration does not preflight microphone permission; native enumeration
 /// proceeds. Microphone capture retains its separate existing permission preflight.
 ///
@@ -1057,5 +1057,58 @@ mod bool_guard_tests {
             .unwrap();
         assert!(text.contains("panic caught at FFI boundary"), "{text}");
         assert!(!text.contains("private panic payload"));
+    }
+}
+
+/// Whether this device's capture format is available. Additive v2 accessor; the
+/// v1 FlexDeviceInfo layout is unchanged. False means sample_rate=0 and channels=0.
+/// Opening requires a fresh successful format query or fails with a typed
+/// cause/remedy error. Linux PipeWire's documented compatibility defaults remain available.
+/// NULL/misaligned pointers return false and set a typed InvalidArg last error.
+///
+/// # Safety
+/// `device` must point to a live FlexDeviceInfo returned by flexaudio_devices.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_device_format_available_v2(
+    device: *const FlexDeviceInfo,
+) -> bool {
+    guard_bool(|| {
+        clear_last_error();
+        if device.is_null() || !device.is_aligned() {
+            error::set_audio_error(flexaudio::Error::InvalidArg(
+                "device pointer is null or misaligned".into(),
+            ));
+            return false;
+        }
+        flexaudio::core::inventory::device_format(Ok(((*device).sample_rate, (*device).channels))).2
+    })
+}
+
+#[cfg(test)]
+mod round3_inventory_tests {
+    use super::*;
+    #[test]
+    fn v2_format_accessor_preserves_v1_layout_and_zero_sentinel() {
+        for (format, expected) in [((0, 0), false), ((48_000, 2), true)] {
+            let info = flexaudio::DeviceInfo {
+                id: "fixture".into(),
+                name: "fixture".into(),
+                source_kind: flexaudio::SourceKind::Mic,
+                sample_rate: format.0,
+                channels: format.1,
+                format_available: expected,
+                is_loopback: false,
+                is_default: false,
+            };
+            let c = convert::device_info_to_c(info);
+            unsafe {
+                assert_eq!(flexaudio_device_format_available_v2(&c), expected);
+                drop(std::ffi::CString::from_raw(c.id));
+                drop(std::ffi::CString::from_raw(c.name));
+            }
+        }
+        unsafe {
+            assert!(!flexaudio_device_format_available_v2(std::ptr::null()));
+        }
     }
 }

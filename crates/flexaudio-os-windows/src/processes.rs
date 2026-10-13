@@ -48,8 +48,8 @@ struct SessionRecord {
 ///
 /// Check first that the OS supports process loopback (build 20348 or later); otherwise return
 /// [`Error::UnsupportedOsVersion`] using the same function as capture. Return `Ok(empty)` if there
-/// are no render endpoints. Any endpoint/session/metadata query failure rejects the complete
-/// snapshot with its typed cause; no successfully read subset is returned.
+/// are no render endpoints. Collection/count failures retain their typed cause.
+/// Unreadable optional metadata stays unknown; vanished processes may be omitted.
 pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     crate::version::ensure_process_loopback_supported()?;
     let _com = ComThread::new()?;
@@ -60,8 +60,13 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>> {
     let mut image_buffer = vec![0u16; IMAGE_PATH_CAPACITY];
     let mut out = Vec::with_capacity(sessions.len());
     for session in sessions {
-        let executable = process_image_path(session.pid, &mut image_buffer)?
-            .and_then(|path| executable_basename(&path));
+        let Some(path) = flexaudio_core::inventory::process_metadata(
+            process_image_path(session.pid, &mut image_buffer),
+            flexaudio_core::inventory::windows_error_failure,
+        ) else {
+            continue;
+        };
+        let executable = path.and_then(|path| executable_basename(&path));
         out.push(ProcessInfo {
             pid: session.pid,
             name: executable.as_deref().map(display_stem).unwrap_or_default(),
@@ -217,8 +222,6 @@ fn process_image_path(pid: u32, buffer: &mut [u16]) -> Result<Option<String>> {
     unsafe {
         let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
             Ok(handle) => handle,
-            // ERROR_INVALID_PARAMETER indicates the process no longer exists.
-            Err(error) if error.code().0 as u32 == 0x8007_0057 => return Ok(None),
             Err(error) => return Err(metadata_error("OpenProcess", error)),
         };
         let mut size = buffer.len() as u32;

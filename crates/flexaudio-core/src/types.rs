@@ -63,7 +63,9 @@ pub struct AudioChunk {
     /// inserts wall-time silence: PTS and flags express the real-time gap. Within a
     /// Whisper VAD epoch, an event at t ms maps to its capture origin + t * 48.
     pub frame_index: u64,
-    /// Normalized monotonic presentation timestamp (ns) of the first sample.
+    /// Arrival-time label, re-anchored on each native callback. Callback jitter can
+    /// overlap chunks or leave gaps; no non-overlap or bounded-monotonic guarantee.
+    /// frame_index is authoritative; VAD maps epoch pts_ns + t_ms*1000000 exactly.
     pub pts_ns: i64,
     /// Monotonically increasing sequence number assigned by the stream layer.
     pub seq: u64,
@@ -102,7 +104,9 @@ pub struct SecondaryChunk {
     /// primary's buffering and drops; never use it to pair taps or anchor canonical VAD.
     pub frame_index: u64,
     /// Presentation timestamp (ns) of the first sample, relative to recording start at 0.
-    /// Uses the same recording clock as the primary [`AudioChunk`], but has independent values.
+    /// Arrival-time label re-anchored on each native callback, using the primary recording clock.
+    /// Callback jitter may overlap chunks or leave gaps; no non-overlap or bounded-monotonic
+    /// guarantee. frame_index is authoritative; VAD uses its dedicated capture epoch.
     pub pts_ns: i64,
     /// Monotonic sequence number for the secondary tap (separate counter from the primary tap).
     pub seq: u64,
@@ -136,14 +140,14 @@ pub struct DeviceInfo {
     pub name: String,
     /// Source kind used to capture this device.
     pub source_kind: SourceKind,
-    /// Native (default) device sample rate (Hz). Linux PipeWire discovery and
-    /// watcher notifications use 48000 when `audio.rate` is missing or unparseable;
-    /// this compatibility default cannot be distinguished from a measured value.
+    /// Native device rate, or 0 when `format_available` is false.
+    /// Linux PipeWire retains its compatibility 48000/2 defaults for absent properties.
     pub sample_rate: u32,
-    /// Native (default) device channel count. Linux PipeWire discovery and watcher
-    /// notifications use 2 when `audio.channels` is missing or unparseable;
-    /// this compatibility default cannot be distinguished from a measured value.
+    /// Native channel count, or 0 when `format_available` is false.
     pub channels: u16,
+    /// Whether the capture format was available. False means rate/channels are both 0;
+    /// opening requires a fresh successful query, otherwise a typed cause/remedy error.
+    pub format_available: bool,
     /// `true` for loopback (system-output monitor), `false` for a recording device (microphone).
     pub is_loopback: bool,
     /// `true` if this is the OS default device (default input / output sink).
@@ -172,7 +176,7 @@ pub struct ProcessInfo {
     /// OS process ID. Key passed to [`StreamConfig::target_pid`]. Always nonzero.
     pub pid: u32,
     /// Human-readable display name (never empty). Chosen in this order: OS-reported name (such as PipeWire `application.name`) →
-    /// executable name → bundle ID → `"pid <N>"`.
+    /// executable name → bundle ID → `"pid <N>"`. Unreadable optional metadata stays unknown.
     pub name: String,
     /// Executable basename (for example, `firefox` or `chrome.exe`). `Some` only when the OS provides it.
     /// Linux tries `/proc/<pid>/exe` and falls back to `/proc/<pid>/comm` if it cannot be read.

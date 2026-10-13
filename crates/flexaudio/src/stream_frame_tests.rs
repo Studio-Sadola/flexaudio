@@ -91,8 +91,11 @@ fn rebuild_accounts_for_discarded_capture_remainder() {
         next = stream.poll_capture();
         next.is_some()
     });
+    let primary = next_chunk(&mut stream);
     stream.stop();
     let next = next.unwrap();
+    assert_eq!(primary.data[0], next.data[0]);
+    assert_eq!(primary.frame_index, next.frame_index);
     assert_eq!(next.frame_index, 973);
     assert!(next.flags.contains(ChunkFlags::DISCONTINUITY));
     assert!(!next.flags.contains(ChunkFlags::PADDED));
@@ -360,4 +363,101 @@ fn capture_loss_reanchors_pts_without_inserting_timeline_silence() {
     assert!(capture.flags.contains(ChunkFlags::DISCONTINUITY));
     assert!(capture.pts_ns - before.pts_ns >= 40_000_000);
     stream.stop();
+}
+
+fn compare_boundary_sample(boundary: &str, startup: bool) {
+    use super::intake_generation::{GenerationEnd, IntakeGeneration};
+    for channels in [1, 2] {
+        let sink = Arc::new(Mutex::new(None));
+        let config = StreamConfig {
+            output: OutputFormat {
+                sample_rate: 48_000,
+                channels,
+            },
+            ..Default::default()
+        };
+        let mut stream = Stream::open(config, Box::new(PushBackend(sink))).unwrap();
+        stream.enable_capture_tap().unwrap();
+        let shared = &stream.shared;
+        let mut snapshot = shared.snapshot_raw(&mut []);
+        snapshot.microphone = startup;
+        let formats = (stream.config.output, None);
+        let mut input = IntakeGeneration::new(shared, &snapshot, formats, 0).unwrap();
+        let prefix_frames = if startup { 13 } else { 973 };
+        input
+            .accept(shared, &vec![0.25; prefix_frames * 2], false)
+            .unwrap();
+        if !startup {
+            let primary = input.normalizer.pop_chunk_with_metadata().unwrap();
+            let capture = input.normalizer.pop_capture_with_metadata(false).unwrap();
+            advance_frame_index(
+                &shared.primary_frame_index,
+                (primary.samples.len() / usize::from(channels)) as u64,
+                48_000,
+            )
+            .unwrap();
+            advance_frame_index(
+                &shared.capture_frame_index,
+                (capture.samples.len() / 2) as u64,
+                48_000,
+            )
+            .unwrap();
+        }
+        if boundary == "loss" {
+            input.rebuild_after_loss(shared, false, formats).unwrap();
+        } else {
+            let closed = input.finish(shared, GenerationEnd::Replaced).unwrap();
+            if closed.pushed {
+                while let Some(c) = input.normalizer.pop_chunk_with_metadata() {
+                    advance_frame_index(
+                        &shared.primary_frame_index,
+                        (c.samples.len() / usize::from(channels)) as u64,
+                        48_000,
+                    )
+                    .unwrap();
+                }
+                while let Some(c) = input.normalizer.pop_capture_with_metadata(true) {
+                    advance_frame_index(
+                        &shared.capture_frame_index,
+                        (c.samples.len() / 2) as u64,
+                        48_000,
+                    )
+                    .unwrap();
+                }
+                input.reconcile_released_padding(shared).unwrap();
+            }
+            snapshot.generation += 1;
+            snapshot.recovered = boundary == "recovery";
+            snapshot.microphone = false;
+            input = IntakeGeneration::new(shared, &snapshot, formats, 0).unwrap();
+        }
+        input.accept(shared, &[0.75; 960 * 2], false).unwrap();
+        let primary = input.normalizer.pop_chunk_with_metadata().unwrap();
+        let capture = input.normalizer.pop_capture_with_metadata(false).unwrap();
+        assert_eq!(primary.samples[0], 0.75);
+        assert_eq!(capture.samples[0], 0.75);
+        let primary_index = advance_frame_index(&shared.primary_frame_index, 960, 48_000).unwrap();
+        let capture_index = advance_frame_index(&shared.capture_frame_index, 960, 48_000).unwrap();
+        assert_eq!(
+            primary_index, capture_index,
+            "{boundary}, channels={channels}"
+        );
+    }
+}
+
+#[test]
+fn round3_same_sample_after_replacement() {
+    compare_boundary_sample("replacement", false);
+}
+#[test]
+fn round3_same_sample_after_recovery() {
+    compare_boundary_sample("recovery", false);
+}
+#[test]
+fn round3_same_sample_after_loss_rebuild() {
+    compare_boundary_sample("loss", false);
+}
+#[test]
+fn round3_same_sample_after_startup_release() {
+    compare_boundary_sample("startup release", true);
 }

@@ -228,11 +228,14 @@ impl CaptureBackend for PwSystemBackend {
         if !fan_in {
             if let Some(id) = device_id.as_deref() {
                 let devs = list_devices()?;
-                if !devs
+                let device = devs
                     .iter()
-                    .any(|device| device.is_loopback && device.id == id)
-                {
-                    return Err(Error::DeviceNotFound);
+                    .find(|device| device.is_loopback && device.id == id)
+                    .ok_or(Error::DeviceNotFound)?;
+                if !device.format_available {
+                    flexaudio_core::inventory::require_device_format(Err(
+                        EnumerationFailure::Format.error(),
+                    ))?;
                 }
             }
         }
@@ -2178,7 +2181,8 @@ fn enumeration_properties<'a>(
 ///
 /// Map these to [`DeviceInfo`]. `id` is the persistent `node.name`; `name` is `node.description`
 /// (or `node.name` if absent). `sample_rate` / `channels` use `audio.rate` / `audio.channels` if
-/// available, otherwise default to `48000 / 2`. Set `is_default = true` for the device whose
+/// available. Absent optional properties retain `48000 / 2` defaults; explicitly
+/// invalid properties use format_available=false and 0/0. Set `is_default = true` for the device whose
 /// `node.name` matches the `default` metadata (`default.audio.sink` / `default.audio.source`).
 ///
 /// Run a short-lived `MainLoop` and call `quit()` when `core.sync()` reports `done` to signal
@@ -2258,28 +2262,16 @@ fn enumerate_pw() -> Result<Vec<DeviceInfo>> {
                             .get(*pw::keys::NODE_DESCRIPTION)
                             .filter(|s| !s.is_empty())
                             .unwrap_or(node_name);
-                        // The pipewire crate feature-gates the audio.rate key constant, so specify
-                        // it as a string. It is often absent from registry node props; downstream
-                        // code then falls back to the default (48000/2).
-                        let rate = props.get("audio.rate").and_then(|s| s.parse::<u32>().ok());
-                        let channels = props
-                            .get(*pw::keys::AUDIO_CHANNELS)
-                            .and_then(|s| s.parse::<u16>().ok());
-                        if props.get("audio.rate").is_some() && rate.is_none_or(|rate| rate == 0)
-                            || props.get(*pw::keys::AUDIO_CHANNELS).is_some()
-                                && channels.is_none_or(|channels| channels == 0)
-                        {
-                            failure_for_global
-                                .borrow_mut()
-                                .get_or_insert_with(|| EnumerationFailure::Format.error());
-                            return;
-                        }
+                        let (rate, channels, _) = discovery::device_format(
+                            props.get("audio.rate"),
+                            props.get(*pw::keys::AUDIO_CHANNELS),
+                        );
                         state_for_global.borrow_mut().nodes.push(NodeRecord {
                             node_name: node_name.to_string(),
                             description: description.to_string(),
                             media_class: media_class.to_string(),
-                            rate,
-                            channels,
+                            rate: Some(rate),
+                            channels: Some(channels),
                         });
                     }
                     pw::types::ObjectType::Metadata => {
@@ -2470,13 +2462,18 @@ fn enumerate_pw() -> Result<Vec<DeviceInfo>> {
         } else {
             state.default_source.as_deref() == Some(n.node_name.as_str())
         };
+        let (sample_rate, channels, format_available) =
+            flexaudio_core::inventory::device_format(Ok((
+                n.rate.unwrap_or(NATIVE_RATE),
+                n.channels.unwrap_or(NATIVE_CHANNELS),
+            )));
         out.push(DeviceInfo {
             id: n.node_name.clone(),
             name: n.description.clone(),
             source_kind,
-            // If unavailable, default to the requested native format (48000/2).
-            sample_rate: n.rate.unwrap_or(NATIVE_RATE),
-            channels: n.channels.unwrap_or(NATIVE_CHANNELS),
+            sample_rate,
+            channels,
+            format_available,
             is_loopback,
             is_default,
         });
@@ -2832,10 +2829,11 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                                 .get(*pw::keys::NODE_DESCRIPTION)
                                 .filter(|s| !s.is_empty())
                                 .unwrap_or(node_name);
-                            let rate = props.get("audio.rate").and_then(|s| s.parse::<u32>().ok());
-                            let channels = props
-                                .get(*pw::keys::AUDIO_CHANNELS)
-                                .and_then(|s| s.parse::<u16>().ok());
+                            let (sample_rate, channels, format_available) =
+                                discovery::device_format(
+                                    props.get("audio.rate"),
+                                    props.get(*pw::keys::AUDIO_CHANNELS),
+                                );
 
                             let is_loopback = media_class == "Audio/Sink";
                             let source_kind = if is_loopback {
@@ -2857,9 +2855,9 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                                 id: node_name.to_string(),
                                 name: description.to_string(),
                                 source_kind,
-                                // If unavailable, default to the requested native format (48000/2), as in enumerate_pw.
-                                sample_rate: rate.unwrap_or(NATIVE_RATE),
-                                channels: channels.unwrap_or(NATIVE_CHANNELS),
+                                sample_rate,
+                                channels,
+                                format_available,
                                 is_loopback,
                                 is_default,
                             };
@@ -4154,6 +4152,7 @@ mod tests {
             id: "mic.a".into(),
             name: "Mic A".into(),
             source_kind: SourceKind::Mic,
+            format_available: true,
             sample_rate: NATIVE_RATE,
             channels: NATIVE_CHANNELS,
             is_loopback: false,
