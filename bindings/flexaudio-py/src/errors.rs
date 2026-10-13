@@ -125,6 +125,7 @@ impl AudioError {
         secondary: &mut Vec<AudioError>,
     ) {
         match error {
+            fa::Error::Diagnostic { source, .. } => Self::collect(source, contexts, secondary),
             fa::Error::Context { source, context } => {
                 contexts.push(ErrorContext(*context));
                 Self::collect(source, contexts, secondary);
@@ -168,6 +169,25 @@ impl AudioError {
         self.0.whisper_code().map(fa::WhisperCode::as_str)
     }
     #[getter]
+    fn diagnostic_details(&self) -> Vec<String> {
+        self.0
+            .diagnostic_details()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+    #[getter]
+    fn addon_kind(&self) -> Option<&'static str> {
+        self.0.addon_kind().map(fa::core::AddonErrorKind::as_str)
+    }
+    #[getter]
+    fn addon_message(&self) -> Option<String> {
+        match self.0.root() {
+            fa::Error::Addon { message, .. } => Some(message.clone()),
+            _ => None,
+        }
+    }
+    #[getter]
     fn advertised(&self) -> Option<NativeFormat> {
         match self.0.root() {
             fa::Error::NativeFormatChanged { advertised, .. } => Some((*advertised).into()),
@@ -195,6 +215,9 @@ impl AudioError {
             .iter()
             .map(|e| e.to_dict(py))
             .collect::<PyResult<Vec<_>>>()?;
+        d.set_item("diagnostic_details", self.diagnostic_details())?;
+        d.set_item("addon_kind", self.addon_kind())?;
+        d.set_item("addon_message", self.addon_message())?;
         d.set_item("contexts", contexts)?;
         d.set_item("secondary", secondary)?;
         if let Some(permission) = self.permission() {
@@ -347,6 +370,7 @@ class RecordingPermissionError(_AudioException, RuntimeError): pass
 class UnsupportedOsVersionError(_AudioException, RuntimeError): pass
 class DeviceLostError(_AudioException, RuntimeError): pass
 class BackendError(_AudioException, RuntimeError): pass
+class _FlacIoError(_AudioException, OSError): pass
 class NativeFormatChangedError(_AudioException, RuntimeError): pass
 class UnsupportedError(_AudioException, RuntimeError): pass
 class AmbiguousDeviceNameError(_AudioException, RuntimeError): pass
@@ -369,19 +393,23 @@ for _exception in (InvalidArgumentError, UnsupportedFormatError, InvalidStateErr
 }
 pub(crate) fn to_py_err(error: fa::Error) -> PyErr {
     Python::attach(|py| {
-        let name = match error.kind() {
-            fa::ErrorKind::InvalidArg => "InvalidArgumentError",
-            fa::ErrorKind::UnsupportedFormat => "UnsupportedFormatError",
-            fa::ErrorKind::InvalidState => "InvalidStateError",
-            fa::ErrorKind::DeviceNotFound => "DeviceNotFoundError",
-            fa::ErrorKind::PermissionDenied => "RecordingPermissionError",
-            fa::ErrorKind::UnsupportedOsVersion => "UnsupportedOsVersionError",
-            fa::ErrorKind::DeviceLost => "DeviceLostError",
-            fa::ErrorKind::Backend => "BackendError",
-            fa::ErrorKind::NativeFormatChanged => "NativeFormatChangedError",
-            fa::ErrorKind::Unsupported => "UnsupportedError",
-            fa::ErrorKind::AmbiguousDeviceName => "AmbiguousDeviceNameError",
-            _ => "BackendError",
+        let name = if error.addon_kind() == Some(fa::AddonErrorKind::FlacIo) {
+            "_FlacIoError"
+        } else {
+            match error.kind() {
+                fa::ErrorKind::InvalidArg => "InvalidArgumentError",
+                fa::ErrorKind::UnsupportedFormat => "UnsupportedFormatError",
+                fa::ErrorKind::InvalidState => "InvalidStateError",
+                fa::ErrorKind::DeviceNotFound => "DeviceNotFoundError",
+                fa::ErrorKind::PermissionDenied => "RecordingPermissionError",
+                fa::ErrorKind::UnsupportedOsVersion => "UnsupportedOsVersionError",
+                fa::ErrorKind::DeviceLost => "DeviceLostError",
+                fa::ErrorKind::Backend => "BackendError",
+                fa::ErrorKind::NativeFormatChanged => "NativeFormatChangedError",
+                fa::ErrorKind::Unsupported => "UnsupportedError",
+                fa::ErrorKind::AmbiguousDeviceName => "AmbiguousDeviceNameError",
+                _ => "BackendError",
+            }
         };
         let result = exceptions(py).and_then(|m| {
             m.getattr(name)?
@@ -551,6 +579,81 @@ mod tests {
             );
             assert!(!payload.message().contains("secret"));
             assert!(!payload.message().contains("internal_call"));
+        });
+    }
+}
+
+#[cfg(test)]
+mod retained_cause_tests {
+    use super::*;
+    #[test]
+    fn addon_and_native_detail_preserve_contexts_and_safe_display() {
+        let error = AudioError(
+            fa::Error::Addon {
+                kind: fa::core::AddonErrorKind::VadReset,
+                message: "synthetic reset cause".into(),
+            }
+            .with_context(fa::ErrorContext::new(fa::Operation::Flush))
+            .with_diagnostic_detail("synthetic native detail".into()),
+        );
+        assert_eq!(error.kind(), "backend");
+        assert_eq!(error.addon_kind(), Some("vadReset"));
+        assert_eq!(
+            error.addon_message().as_deref(),
+            Some("synthetic reset cause")
+        );
+        assert_eq!(error.diagnostic_details(), ["synthetic native detail"]);
+        assert_eq!(error.contexts()[0].operation(), "flush");
+        assert!(!error.message().contains("synthetic"));
+    }
+}
+
+#[cfg(test)]
+mod round2_tests {
+    use super::*;
+    #[test]
+    fn round2_python_flac_exceptions_retain_shared_addon_projection() {
+        Python::initialize();
+        Python::attach(|py| {
+            for cause in [
+                flexaudio_encode::EncodeError::Unsupported("injected unsupported format".into()),
+                flexaudio_encode::EncodeError::Io(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                )),
+                flexaudio_encode::EncodeError::Encoder("injected encoder failure".into()),
+            ] {
+                let expected = cause.audio_error();
+                let exception = crate::encode_err_to_py(cause);
+                match expected.addon_kind().unwrap() {
+                    fa::AddonErrorKind::FlacIo => {
+                        assert!(exception.is_instance_of::<pyo3::exceptions::PyOSError>(py))
+                    }
+                    fa::AddonErrorKind::FlacUnsupported => {
+                        assert!(exception.is_instance_of::<pyo3::exceptions::PyValueError>(py))
+                    }
+                    _ => assert!(exception.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py)),
+                }
+                let record = exception.value(py).getattr("audio_error").unwrap();
+                assert_eq!(
+                    record
+                        .getattr("addon_kind")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    expected.addon_kind().unwrap().as_str()
+                );
+                assert_eq!(
+                    record
+                        .getattr("addon_message")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    match expected.root() {
+                        fa::Error::Addon { message, .. } => message.as_str(),
+                        _ => panic!("expected addon cause"),
+                    }
+                );
+            }
         });
     }
 }

@@ -78,6 +78,32 @@ impl Stream {
         Ok((vad_state, denoiser))
     }
 
+    fn switch_with_addons(
+        &mut self,
+        new_vad: Option<CoreVad>,
+        new_denoiser: Option<CoreDenoiser>,
+        switch: impl FnOnce(&mut fa::Stream) -> fa::Result<()>,
+    ) -> PyResult<()> {
+        if self.whisper.is_none() {
+            // Drain bounded published output and close retained local addon state.
+            // Core owns in-flight generations: later old PCM remains deliverable
+            // through the new owner and core discontinuity anchors. Leave the user's
+            // pause state untouched; pausing would discard core startup prefixes.
+            self.drain_capture();
+            self.drain_output()?;
+            self.finish_addon_gap().map_err(to_py_err)?;
+        }
+        switch(&mut self.inner).map_err(to_py_err)?;
+        // Native switching remains in core; only successful switches replace addon owners.
+        self.vad = new_vad;
+        self.denoiser = if self.whisper.is_some() {
+            None
+        } else {
+            new_denoiser
+        };
+        Ok(())
+    }
+
     /// Keep the flush boundary injectable so recovery can be tested without changing the VAD API.
     fn poll_chunk_with_flush(
         &mut self,
@@ -398,22 +424,14 @@ impl Stream {
             self.output_channels,
         )?;
 
-        if self.whisper.is_some() {
-            self.inner
-                .switch_source_with_denoise(config, denoise)
-                .map_err(to_py_err)?;
-        } else {
-            self.inner.switch_source(config).map_err(to_py_err)?;
-        }
-
-        // Replace addons only after the switch succeeds (keep old addons on failure).
-        self.vad = new_vad;
-        if self.whisper.is_some() {
-            self.denoiser = None;
-        } else {
-            self.denoiser = new_denoiser;
-        }
-        Ok(())
+        let whisper = self.whisper.is_some();
+        self.switch_with_addons(new_vad, new_denoiser, |inner| {
+            if whisper {
+                inner.switch_source_with_denoise(config, denoise)
+            } else {
+                inner.switch_source(config)
+            }
+        })
     }
 
     /// Context manager support. Use as `with flexaudio.open("mic") as s:`.
@@ -762,7 +780,7 @@ stream.stop()
             .unwrap();
         let compact: String = source.split_whitespace().collect();
         assert!(
-            compact.contains("self.inner.switch_source_with_denoise(config,denoise)"),
+            compact.contains("inner.switch_source_with_denoise(config,denoise)"),
             "Python currently publishes the generation through switch_source before set_denoise"
         );
     }
@@ -1206,7 +1224,27 @@ mod repro_tests {
                 Err(actual) => {
                     Python::attach(|py| {
                         assert!(actual.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
-                        assert_eq!(actual.value(py).to_string(), error.to_string());
+                        let audio_error = actual.value(py).getattr("audio_error").unwrap();
+                        assert_eq!(
+                            audio_error
+                                .getattr("addon_kind")
+                                .unwrap()
+                                .extract::<String>()
+                                .unwrap(),
+                            "vadInference"
+                        );
+                        let flexaudio_vad::VadError::Inference(message) = &error else {
+                            panic!("inference fixture");
+                        };
+                        assert_eq!(
+                            audio_error
+                                .getattr("addon_message")
+                                .unwrap()
+                                .extract::<String>()
+                                .unwrap(),
+                            *message
+                        );
+                        assert!(!actual.value(py).to_string().contains(message));
                     });
                     break;
                 }
@@ -1318,7 +1356,27 @@ mod repro_tests {
             Python::attach(|py| {
                 for actual in errors {
                     assert!(actual.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
-                    assert_eq!(actual.value(py).to_string(), error.to_string());
+                    let audio_error = actual.value(py).getattr("audio_error").unwrap();
+                    assert_eq!(
+                        audio_error
+                            .getattr("addon_kind")
+                            .unwrap()
+                            .extract::<String>()
+                            .unwrap(),
+                        "vadInference"
+                    );
+                    let flexaudio_vad::VadError::Inference(message) = &error else {
+                        panic!("inference fixture");
+                    };
+                    assert_eq!(
+                        audio_error
+                            .getattr("addon_message")
+                            .unwrap()
+                            .extract::<String>()
+                            .unwrap(),
+                        *message
+                    );
+                    assert!(!actual.value(py).to_string().contains(message));
                 }
                 if let Some(chunk) = control_chunk {
                     let chunk = Py::new(py, chunk).unwrap();

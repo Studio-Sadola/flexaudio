@@ -2,7 +2,7 @@
 use crate::whisper_types::*;
 use crate::whisper_vad::params_from_c;
 use crate::{
-    error::{clear_last_error, code, set_last_error},
+    error::{clear_last_error, code, set_audio_error},
     guard_const_ptr, guard_i32,
     types::{FlexChunk, FlexConfig, FlexStream},
 };
@@ -98,7 +98,8 @@ pub(crate) fn attached_to_c(
 
 fn tap_status(error: &flexaudio_vad::WhisperVadTapError) -> i32 {
     use flexaudio_vad::WhisperVadTapError;
-    match error {
+    match error.root() {
+        WhisperVadTapError::Cause { primary, .. } => tap_status(primary),
         WhisperVadTapError::Vad(error) => crate::whisper_vad::error_code(error),
         WhisperVadTapError::InvalidStereoLength
         | WhisperVadTapError::InvalidPcm { .. }
@@ -111,7 +112,24 @@ fn tap_status(error: &flexaudio_vad::WhisperVadTapError) -> i32 {
 }
 
 fn reject(status: i32, message: &str) -> i32 {
-    set_last_error(message);
+    let error = match status {
+        code::FLEX_INVALID_ARG | FLEX_WHISPER_CONFLICTING_VAD => {
+            flexaudio::Error::InvalidArg(message.into())
+        }
+        code::FLEX_INVALID_STATE => flexaudio::Error::InvalidState(message.into()),
+        FLEX_WHISPER_UNSUPPORTED_TAP => flexaudio::Error::Unsupported,
+        _ => flexaudio::Error::Backend(message.into()),
+    };
+    crate::error::set_audio_error_with_message(error, message.into());
+    status
+}
+
+fn reject_tap(error: flexaudio_vad::WhisperVadTapError) -> i32 {
+    reject_audio(tap_status(&error), error.audio_error())
+}
+
+fn reject_audio(status: i32, error: flexaudio::Error) -> i32 {
+    set_audio_error(error);
     status
 }
 
@@ -216,7 +234,7 @@ pub unsafe extern "C" fn flexaudio_open_v2(
             .transpose()
         {
             Ok(tap) => tap,
-            Err(error) => return reject(tap_status(&error), &error.to_string()),
+            Err(error) => return reject_tap(error),
         };
         let stream = crate::flexaudio_open(config);
         if stream.is_null() {
@@ -299,7 +317,7 @@ pub unsafe extern "C" fn flexaudio_poll_chunk_v2(s: *mut FlexStream, out: *mut F
                 }
                 0
             }
-            Err(error) => reject(code::FLEX_FAILURE, &error.to_string()),
+            Err(error) => crate::vad::vad_failure(error),
         }
     })
 }
@@ -379,7 +397,7 @@ impl FlexStream {
         self.accept_whisper(result, flexaudio::Operation::Flush);
         self.queue_whisper_carrier();
         if let Some(error) = flush_error {
-            return reject(tap_status(&error), &error.to_string());
+            return reject_tap(error);
         }
         code::FLEX_OK
     }
@@ -791,3 +809,18 @@ mod tests {
 #[cfg(test)]
 #[path = "../tests/ffi/whisper_audit.rs"]
 mod audit_tests;
+
+#[cfg(test)]
+mod round2_tests {
+    use super::*;
+    #[test]
+    fn round2_whisper_rejection_keeps_typed_converter_cause() {
+        let error = flexaudio_vad::WhisperVadTapError::Cause {
+            primary: Box::new(flexaudio_vad::WhisperVadTapError::Conversion),
+            source: flexaudio_vad::VadError::Resample("injected converter cause".into()),
+        };
+        let expected = error.audio_error();
+        assert_eq!(reject_tap(error), code::FLEX_FAILURE);
+        assert_eq!(crate::error::last_audio_error(), Some(expected));
+    }
+}

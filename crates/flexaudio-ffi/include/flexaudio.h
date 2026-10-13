@@ -133,6 +133,9 @@
 // Startup validation saw non-finite or out-of-range microphone samples.
 #define FLEX_STARTUP_DROP_OUT_OF_RANGE 0
 
+// Device monitoring terminated; the v2 error accessor returns the retained failure.
+#define FLEX_DEVICE_EVENT_KIND_TERMINAL_ERROR 6
+
 #define FLEX_STREAM_VERSION_2 2
 
 #define FLEX_WHISPER_PRIMARY 1
@@ -1125,6 +1128,34 @@ int32_t flexaudio_event_startup_frames_v2(const struct FlexEventV2 *value, uint6
 // value must be a live event; out must be writable and aligned.
 int32_t flexaudio_event_startup_reason_v2(const struct FlexEventV2 *value, int32_t *out);
 
+// Borrow the typed watcher failure; return 1 when present, 0 for other event arms.
+// # Safety
+// value must be live; out must be writable and aligned. The view lives until value is freed.
+int32_t flexaudio_device_event_error_v2(const struct FlexDeviceEventV2 *value,
+                                        const struct FlexErrorInfoV2 **out);
+
+// Borrow the optional typed addon cause code.
+// # Safety
+// value must be live; out must be writable and aligned. Never free the string separately.
+int32_t flexaudio_error_addon_kind_v2(const struct FlexErrorInfoV2 *value, const char **out);
+
+// Borrow the optional opt-in addon cause message.
+// # Safety
+// value must be live; out must be writable and aligned. Never free the string separately.
+int32_t flexaudio_error_addon_message_v2(const struct FlexErrorInfoV2 *value, const char **out);
+
+// Count opt-in native diagnostic details, excluded from the safe display message.
+// # Safety
+// value must be live; out must be writable and aligned.
+int32_t flexaudio_error_diagnostic_count_v2(const struct FlexErrorInfoV2 *value, uint32_t *out);
+
+// Borrow a native diagnostic detail. Treat its contents as private host data.
+// # Safety
+// value must be live; out must be writable and aligned. Never free the string separately.
+int32_t flexaudio_error_diagnostic_detail_v2(const struct FlexErrorInfoV2 *value,
+                                             uint32_t index,
+                                             const char **out);
+
 // Create a VAD from a config. A NULL `config` uses the defaults (Silero-compatible).
 //
 // Returns NULL and sets last_error on failure (model load failure, invalid sample_rate, etc.).
@@ -1154,7 +1185,8 @@ int32_t flexaudio_vad_process(struct FlexVad *v,
 
 // Finalize pending speech at EOF and return a library-owned VAD event array.
 //
-// Valid destinations initialize to NULL/0, also on error. A repeated successful
+// Valid destinations initialize to NULL/0. Completed events remain available even
+// when a subsequent reset fails; free any returned event array also on error. A repeated successful
 // flush returns NULL/0 unless new input arrived. Free with `flexaudio_vad_events_free`.
 //
 // # Safety

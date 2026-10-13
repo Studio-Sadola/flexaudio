@@ -328,7 +328,7 @@ test('core capture primary, core cleanup and final Whisper failure are all retai
   }
 });
 
-for (const scenario of ['whisper-secondary-orphan', 'whisper-pending-flush']) {
+for (const scenario of ['whisper-secondary-orphan', 'whisper-pending-flush', 'whisper-pending-stop']) {
   test(`${scenario}: pending closure precedes one notification and retains its cause`, async () => {
     const log = [];
     const stream = native.__reproP9Bridge(scenario,
@@ -346,6 +346,9 @@ for (const scenario of ['whisper-secondary-orphan', 'whisper-pending-flush']) {
       assert.ok(log[carrier].chunk.frames > 0, 'an orphan secondary failure must ride real primary PCM');
       assert.ok(log.filter(entry => entry.kind === 'chunk').every(entry => entry.chunk.frames > 0));
     }
+    assert.equal(log[carrier].chunk.secondary.seq, 17n, 'secondary closure keeps the last sequence');
+    assert.equal(log[carrier].chunk.secondary.droppedBefore, 5, 'secondary closure keeps the last cumulative drops');
+    assert.equal(log[carrier].chunk.secondary.frameIndex, 0n, 'secondary closure keeps the last observed frame index');
     const report = stream.shutdownReport();
     assert.equal(report.primary, null);
     assert.equal(report.cleanupErrors.length, 1);

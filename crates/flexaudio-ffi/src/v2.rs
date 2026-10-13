@@ -644,3 +644,114 @@ mod startup_tests {
         }
     }
 }
+
+/// Borrow the typed watcher failure; return 1 when present, 0 for other event arms.
+/// # Safety
+/// value must be live; out must be writable and aligned. The view lives until value is freed.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_device_event_error_v2(
+    value: *const FlexDeviceEventV2,
+    out: *mut *const FlexErrorInfoV2,
+) -> i32 {
+    scalar(value, out, |v| {
+        Ok(v.error.as_ref().map(|error| error as *const _))
+    })
+}
+/// Borrow the optional typed addon cause code.
+/// # Safety
+/// value must be live; out must be writable and aligned. Never free the string separately.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_error_addon_kind_v2(
+    value: *const FlexErrorInfoV2,
+    out: *mut *const c_char,
+) -> i32 {
+    scalar(value, out, |v| {
+        Ok(v.addon_kind.as_ref().map(|text| text.as_ptr()))
+    })
+}
+/// Borrow the optional opt-in addon cause message.
+/// # Safety
+/// value must be live; out must be writable and aligned. Never free the string separately.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_error_addon_message_v2(
+    value: *const FlexErrorInfoV2,
+    out: *mut *const c_char,
+) -> i32 {
+    scalar(value, out, |v| {
+        Ok(v.addon_message.as_ref().map(|text| text.as_ptr()))
+    })
+}
+/// Count opt-in native diagnostic details, excluded from the safe display message.
+/// # Safety
+/// value must be live; out must be writable and aligned.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_error_diagnostic_count_v2(
+    value: *const FlexErrorInfoV2,
+    out: *mut u32,
+) -> i32 {
+    scalar(value, out, |v| {
+        u32::try_from(v.diagnostic_details.len())
+            .map(Some)
+            .map_err(|_| ())
+    })
+}
+/// Borrow a native diagnostic detail. Treat its contents as private host data.
+/// # Safety
+/// value must be live; out must be writable and aligned. Never free the string separately.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_error_diagnostic_detail_v2(
+    value: *const FlexErrorInfoV2,
+    index: u32,
+    out: *mut *const c_char,
+) -> i32 {
+    scalar(value, out, |v| {
+        v.diagnostic_details
+            .get(index as usize)
+            .map(|text| Some(text.as_ptr()))
+            .ok_or(())
+    })
+}
+
+#[cfg(test)]
+mod retained_cause_tests {
+    use super::*;
+    use flexaudio::core::{AddonErrorKind, DeviceEvent, Error, ErrorContext, Operation};
+    #[test]
+    fn terminal_watcher_exposes_borrowed_addon_and_opt_in_native_details() {
+        let error = Error::Addon {
+            kind: AddonErrorKind::VadReset,
+            message: "synthetic reset cause".into(),
+        }
+        .with_context(ErrorContext::new(Operation::Flush))
+        .with_diagnostic_detail("synthetic native detail".into());
+        let event = FlexDeviceEventV2::new(DeviceEvent::TerminalError { error });
+        let mut kind = -1;
+        let mut view = ptr::null();
+        // SAFETY: owners and aligned outputs remain live throughout these borrowed accesses.
+        unsafe {
+            assert_eq!(flexaudio_device_event_kind_v2(&event, &mut kind), 1);
+            assert_eq!(kind, 6);
+            assert_eq!(flexaudio_device_event_error_v2(&event, &mut view), 1);
+            let mut text = ptr::null();
+            assert_eq!(flexaudio_error_addon_kind_v2(view, &mut text), 1);
+            assert_eq!(std::ffi::CStr::from_ptr(text).to_str().unwrap(), "vadReset");
+            assert_eq!(flexaudio_error_addon_message_v2(view, &mut text), 1);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(text).to_str().unwrap(),
+                "synthetic reset cause"
+            );
+            let mut count = 0;
+            assert_eq!(flexaudio_error_diagnostic_count_v2(view, &mut count), 1);
+            assert_eq!(count, 1);
+            assert_eq!(flexaudio_error_diagnostic_detail_v2(view, 0, &mut text), 1);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(text).to_str().unwrap(),
+                "synthetic native detail"
+            );
+            assert!(!std::ffi::CStr::from_ptr(flexaudio_error_message_v2(view))
+                .to_str()
+                .unwrap()
+                .contains("synthetic"));
+        }
+    }
+}

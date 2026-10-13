@@ -14,9 +14,9 @@ pub(crate) struct CaptureConverter {
 }
 
 impl CaptureConverter {
-    pub fn new() -> Result<Self, ()> {
+    pub fn new() -> Result<Self, crate::VadError> {
         Ok(Self {
-            converter: PcmConverter::new_capture_48k().map_err(|_| ())?,
+            converter: PcmConverter::new_capture_48k().map_err(crate::VadError::Resample)?,
             trim: STARTUP_TRIM,
             input_frames: 0,
             output_frames: 0,
@@ -33,32 +33,32 @@ impl CaptureConverter {
         self.converter.fail_conversion();
     }
 
-    pub fn push(&mut self, stereo: &[f32]) -> Result<Vec<f32>, ()> {
+    pub fn push(&mut self, stereo: &[f32]) -> Result<Vec<f32>, crate::VadError> {
         self.input_frames = self
             .input_frames
-            .checked_add(u64::try_from(stereo.len() / 2).map_err(|_| ())?)
-            .ok_or(())?;
+            .checked_add(u64::try_from(stereo.len() / 2).map_err(|_| overflow())?)
+            .ok_or_else(overflow)?;
         self.scratch.clear();
         self.converter
             .convert(stereo, &mut self.scratch)
-            .map_err(|_| ())?;
+            .map_err(crate::VadError::Resample)?;
         Ok(self.take_valid())
     }
 
     /// Zero extension recovers filter output, never contributes to the physical source length.
     /// Retained j has source coordinate 3*j, so exactly ceil(N/3) outputs are valid.
-    pub fn drain(&mut self) -> Result<Vec<f32>, ()> {
+    pub fn drain(&mut self) -> Result<Vec<f32>, crate::VadError> {
         let mut out = Vec::new();
         if self.input_frames == 0 {
             return Ok(out);
         }
-        let remainder = usize::try_from(self.input_frames % 960).map_err(|_| ())?;
+        let remainder = usize::try_from(self.input_frames % 960).map_err(|_| overflow())?;
         let mut padding = CAPTURE_BLOCK - remainder;
         while self.output_frames < self.input_frames.div_ceil(3) {
             self.scratch.clear();
             self.converter
                 .convert(&vec![0.0; padding * 2], &mut self.scratch)
-                .map_err(|_| ())?;
+                .map_err(crate::VadError::Resample)?;
             out.extend(self.take_valid());
             padding = CAPTURE_BLOCK;
         }
@@ -77,6 +77,10 @@ impl CaptureConverter {
         self.output_frames += u64::try_from(take).expect("bounded output length");
         self.scratch[skip..skip + take].to_vec()
     }
+}
+
+fn overflow() -> crate::VadError {
+    crate::VadError::Resample("capture converter frame count exceeded its supported domain".into())
 }
 
 #[cfg(test)]

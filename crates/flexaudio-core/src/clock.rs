@@ -56,9 +56,13 @@ impl ClockNormalizer {
     ///
     /// The first call fixes the origins and uses the current [`monotonic_now_ns`] as
     /// the monotonic origin. Later calls preserve device-clock deltas.
+    /// Device rollover uses wrapping subtraction; a translated value outside i64
+    /// saturates at the nearest boundary rather than panicking or wrapping the timeline.
     pub fn normalize(&mut self, device_pts_ns: i64) -> i64 {
         match self.device_origin_ns {
-            Some(origin) => self.monotonic_origin_ns + device_pts_ns.wrapping_sub(origin),
+            Some(origin) => self
+                .monotonic_origin_ns
+                .saturating_add(device_pts_ns.wrapping_sub(origin)),
             None => {
                 self.device_origin_ns = Some(device_pts_ns);
                 self.monotonic_origin_ns = monotonic_now_ns();
@@ -141,5 +145,20 @@ mod tests {
     fn default_is_unset_like_new() {
         let n = ClockNormalizer::default();
         assert!(n.is_unset());
+    }
+}
+
+#[cfg(test)]
+mod saturation_tests {
+    use super::*;
+    #[test]
+    fn translated_clock_saturates_instead_of_panicking_or_wrapping() {
+        let mut clock = ClockNormalizer {
+            device_origin_ns: Some(0),
+            monotonic_origin_ns: 10,
+        };
+        assert_eq!(clock.normalize(i64::MAX), i64::MAX);
+        clock.monotonic_origin_ns = -10;
+        assert_eq!(clock.normalize(i64::MIN), i64::MIN);
     }
 }

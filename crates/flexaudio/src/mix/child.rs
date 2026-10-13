@@ -26,6 +26,9 @@ pub(super) struct ChildLane {
 }
 impl ChildLane {
     pub(super) fn losses(&mut self) -> Result<()> {
+        if self.diagnostics.take_discontinuity() {
+            self.notices.discontinuity();
+        }
         let total = self.consumer.overflow_count();
         if let Some(samples) = NonZeroU64::new(total.saturating_sub(self.overflow_seen)) {
             self.notices.loss(AudioLoss::raw_overflow(

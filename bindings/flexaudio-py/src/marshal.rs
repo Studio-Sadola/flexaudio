@@ -490,6 +490,8 @@ pub struct PyDeviceEvent {
     dropped_events: Option<u64>,
     #[pyo3(get)]
     message: Option<String>,
+    #[pyo3(get)]
+    error: Option<crate::errors::AudioError>,
 }
 
 #[pymethods]
@@ -516,6 +518,9 @@ impl PyDeviceEvent {
         }
         if let Some(count) = self.dropped_events {
             d.set_item("dropped_events", count)?;
+        }
+        if let Some(error) = &self.error {
+            d.set_item("error", error.to_dict(py)?)?;
         }
         if let Some(message) = &self.message {
             d.set_item("message", message)?;
@@ -551,8 +556,13 @@ pub(crate) fn device_event_to_py(ev: DeviceEvent) -> PyDeviceEvent {
         source_kind: None,
         dropped_events: None,
         message: None,
+        error: None,
     };
     result.kind = match ev {
+        DeviceEvent::TerminalError { error } => {
+            result.error = Some(crate::errors::AudioError(error));
+            "terminalError"
+        }
         DeviceEvent::Added(info) => {
             result.device = Some(info);
             "added"

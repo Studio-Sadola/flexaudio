@@ -15,32 +15,25 @@ impl Stream {
         let before = cleanup.len();
         self.drain_capture();
         if primary.is_none() {
-            if self.drain_output().is_err() {
-                cleanup.push(flush_error("binding output drain failed"));
+            if let Err(error) = self.drain_output() {
+                let cause = Python::attach(|py| {
+                    error
+                        .value(py)
+                        .getattr("audio_error")
+                        .and_then(|value| {
+                            value
+                                .extract::<PyRef<'_, crate::errors::AudioError>>()
+                                .map(|error| error.0.clone())
+                                .map_err(PyErr::from)
+                        })
+                        .unwrap_or_else(|_| {
+                            fa::Error::Backend("binding output drain failed".into())
+                        })
+                });
+                cleanup.push(cause.with_context(fa::ErrorContext::new(fa::Operation::Flush)));
             }
-            let samples = if self.output_end.is_some() {
-                self.denoiser
-                    .as_mut()
-                    .map(CoreDenoiser::flush)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let mut tail = self.final_chunk(samples);
-            if let Some(vad) = self.vad.as_mut() {
-                let process =
-                    vad.process_pcm(tail.samples(), self.output_rate, self.output_channels);
-                match process {
-                    Ok(events) => tail.set_vad_events(vad_event_pairs(events)),
-                    Err(_) => cleanup.push(flush_error("binding VAD tail processing failed")),
-                }
-                match vad.flush() {
-                    Ok(events) => tail.extend_vad_events(vad_event_pairs(events)),
-                    Err(_) => cleanup.push(flush_error("binding VAD flush failed")),
-                }
-            }
-            if tail.has_audio_or_vad() {
-                self.ready_chunks.push_back(tail);
+            if let Err(error) = self.finish_addon_gap() {
+                cleanup.push(error);
             }
         } else {
             self.ready_chunks.retain(|chunk| chunk.samples().is_empty());
@@ -60,6 +53,43 @@ impl Stream {
         let report = fa::ShutdownReport::new(primary, cleanup);
         let result = report.result();
         self.shutdown = Some(report);
+        result
+    }
+
+    pub(super) fn finish_addon_gap(&mut self) -> fa::Result<()> {
+        let samples = if self.output_end.is_some() {
+            self.denoiser
+                .as_mut()
+                .map(CoreDenoiser::flush)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut tail = self.final_chunk(samples);
+        let result = if let Some(vad) = self.vad.as_mut() {
+            let outcome = flexaudio_vad::finish_capture_gap(vad, |vad| {
+                if tail.samples().is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    vad.process_pcm(tail.samples(), self.output_rate, self.output_channels)
+                }
+            });
+            tail.set_vad_events(vad_event_pairs(outcome.flushed));
+            match outcome.processed {
+                Ok(events) => {
+                    tail.extend_vad_events(vad_event_pairs(events));
+                    Ok(())
+                }
+                Err(error) => Err(error
+                    .audio_error()
+                    .with_context(fa::ErrorContext::new(fa::Operation::Flush))),
+            }
+        } else {
+            Ok(())
+        };
+        if tail.has_audio_or_vad() {
+            self.ready_chunks.push_back(tail);
+        }
         result
     }
 
@@ -84,9 +114,6 @@ impl Stream {
         chunk.update_metrics();
         chunk
     }
-}
-fn flush_error(message: &str) -> fa::Error {
-    fa::Error::Backend(message.into()).with_context(fa::ErrorContext::new(fa::Operation::Flush))
 }
 impl Drop for Stream {
     fn drop(&mut self) {
@@ -145,6 +172,104 @@ mod tests {
             Ok(())
         }
         fn stop(&mut self) {}
+    }
+
+    #[test]
+    fn legacy_vad_shutdown_keeps_typed_addon_cause() {
+        Python::initialize();
+        Python::attach(|_| {
+            let mut stream = startup_fixture(false);
+            stream
+                .inner
+                .stop_checked()
+                .expect("quiescent synthetic producer");
+            stream
+                .vad
+                .as_mut()
+                .unwrap()
+                .inject_failure(flexaudio_vad::VadError::Resample(
+                    "injected tail cause".into(),
+                ));
+            assert!(stream.finish_shutdown().is_err());
+            let report = stream.shutdown.as_ref().unwrap();
+            assert!(report
+                .cleanup()
+                .iter()
+                .any(|error| error.addon_kind() == Some(fa::core::AddonErrorKind::VadResample)));
+            assert!(format!("{:?}", report.cleanup()).contains("injected tail cause"));
+        });
+    }
+
+    #[test]
+    fn source_switch_gap_retains_the_denoiser_tail() {
+        Python::initialize();
+        Python::attach(|_| {
+            let mut stream = startup_fixture(false);
+            stream.denoiser = Some(CoreDenoiser::new(stream.output_channels).unwrap());
+            stream
+                .inner
+                .stop_checked()
+                .expect("quiescent synthetic producer");
+            stream.drain_capture();
+            stream.drain_output().expect("old-source output");
+            let before: usize = stream
+                .ready_chunks
+                .iter()
+                .map(|chunk| chunk.samples().len())
+                .sum();
+            stream.finish_addon_gap().expect("retained denoise tail");
+            let after: usize = stream
+                .ready_chunks
+                .iter()
+                .map(|chunk| chunk.samples().len())
+                .sum();
+            assert!(
+                after > before,
+                "source switching must retain delayed denoiser output"
+            );
+            assert!(!stream.ready_chunks.back().unwrap().samples().is_empty());
+            assert_eq!(stream.vad.as_ref().unwrap().converted_sample_position(), 0);
+        });
+    }
+
+    #[test]
+    fn source_switch_gap_finalizes_existing_addon_epoch() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut stream = startup_fixture(false);
+            stream
+                .inner
+                .stop_checked()
+                .expect("quiescent synthetic producer");
+            stream.drain_capture();
+            stream.drain_output().expect("retained old-source output");
+            assert!(stream.vad.as_ref().unwrap().converted_sample_position() > 0);
+            stream.finish_addon_gap().expect("old addon gap closure");
+            assert_eq!(stream.vad.as_ref().unwrap().converted_sample_position(), 0);
+            let mut closed = 0;
+            while let Some(chunk) = stream.ready_chunks.pop_front() {
+                let object = Py::new(py, chunk).unwrap();
+                let events = object.bind(py).getattr("vad_events").unwrap();
+                if !events.is_none() {
+                    for event in events.try_iter().unwrap() {
+                        if event
+                            .unwrap()
+                            .getattr("type")
+                            .unwrap()
+                            .extract::<String>()
+                            .unwrap()
+                            == "speech_end"
+                        {
+                            closed += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                closed, 1,
+                "completed speech must remain deliverable at the source switch"
+            );
+        });
     }
 
     #[test]

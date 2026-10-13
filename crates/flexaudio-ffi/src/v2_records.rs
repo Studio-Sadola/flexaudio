@@ -67,3 +67,6 @@ pub const FLEX_DEVICE_EVENT_KIND_RESCAN_REQUIRED: i32 = 5;
 pub const FLEX_EVENT_KIND_STARTUP_SAMPLES_DROPPED: i32 = 15;
 /// Startup validation saw non-finite or out-of-range microphone samples.
 pub const FLEX_STARTUP_DROP_OUT_OF_RANGE: i32 = 0;
+
+/// Device monitoring terminated; the v2 error accessor returns the retained failure.
+pub const FLEX_DEVICE_EVENT_KIND_TERMINAL_ERROR: i32 = 6;

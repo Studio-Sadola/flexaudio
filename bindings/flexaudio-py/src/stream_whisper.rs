@@ -100,7 +100,14 @@ impl Stream {
     }
 
     pub(super) fn drain_output(&mut self) -> PyResult<()> {
-        while let Some(chunk) = self.poll_chunk_with_steps(CoreVad::flush, CoreVad::process_pcm)? {
+        // A source switch/explicit flush can run while capture still produces PCM.
+        // Drain at most one queue capacity so producer refills cannot prolong the
+        // control operation indefinitely. Stopped capture has no more than this.
+        for _ in 0..self.inner.config().ring_capacity_chunks {
+            let Some(chunk) = self.poll_chunk_with_steps(CoreVad::flush, CoreVad::process_pcm)?
+            else {
+                break;
+            };
             self.ready_chunks.push_back(chunk);
         }
         Ok(())

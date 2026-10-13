@@ -32,9 +32,9 @@ use objc2_core_audio::{
 };
 
 use flexaudio_core::process_list::executable_basename;
-use flexaudio_core::types::{ProcessInfo, Result};
+use flexaudio_core::types::{Error, ProcessInfo, Result};
 
-use crate::common::{map_os_status_at, read_cfstring_property, read_system_object_list, NO_ERR};
+use crate::common::{map_os_status_at, query_cfstring_property, read_system_object_list, NO_ERR};
 
 // libproc (always present in libSystem). Writes the PID's executable path to the buffer and
 // returns the number of bytes written, excluding NUL. Returns 0 or less on failure.
@@ -49,7 +49,7 @@ const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
 ///
 /// Versions earlier than 14.4 return [`Error::UnsupportedOsVersion`](flexaudio_core::types::Error).
 /// If the process object list itself cannot be read, map the `OSStatus` to a typed error
-/// ([`map_os_status_at`]). Skip objects whose PID cannot be read.
+/// ([`map_os_status_at`]). A failed property query rejects the entire snapshot.
 /// Includes all processes known to Core Audio, including input-only processes. No property can
 /// exclude only processes that have never had output (`Devices` lists devices in use now, and
 /// `IsRunningOutput` indicates whether output is active now).
@@ -65,31 +65,27 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>> {
             )
         })?;
 
-    let mut out = Vec::with_capacity(objects.len());
-    for object in objects {
-        let Some(pid) = read_i32_property(object, kAudioProcessPropertyPID) else {
-            continue;
-        };
+    crate::inventory::collect_complete(objects, |object| {
+        let pid = read_scalar_property::<i32>(object, kAudioProcessPropertyPID)?;
         if pid <= 0 {
-            continue;
+            return Ok(None);
         }
-        let bundle_id = read_cfstring_property(
+        let bundle_id = query_cfstring_property(
             object,
             kAudioProcessPropertyBundleID,
             kAudioObjectPropertyScopeGlobal,
-        );
+        )?;
         let is_output_active =
-            read_u32_property(object, kAudioProcessPropertyIsRunningOutput).map(|v| v != 0);
-        let executable = process_path(pid).and_then(|path| executable_basename(&path));
-        out.push(ProcessInfo {
+            Some(read_scalar_property::<u32>(object, kAudioProcessPropertyIsRunningOutput)? != 0);
+        let executable = process_path(pid)?.and_then(|path| executable_basename(&path));
+        Ok(Some(ProcessInfo {
             pid: pid as u32,
             name: executable.clone().unwrap_or_default(),
             executable,
             bundle_id,
             is_output_active,
-        });
-    }
-    Ok(out)
+        }))
+    })
 }
 
 /// Property address for the global scope and main element.
@@ -101,8 +97,8 @@ fn global_address(selector: u32) -> AudioObjectPropertyAddress {
     }
 }
 
-/// Read a 4-byte numeric property (`T` is `i32` or `u32`), or return `None` on failure.
-fn read_scalar_property<T: Copy + Default>(object: AudioObjectID, selector: u32) -> Option<T> {
+/// Query a 4-byte numeric property (`T` is `i32` or `u32`) with its native cause.
+fn read_scalar_property<T: Copy + Default>(object: AudioObjectID, selector: u32) -> Result<T> {
     let addr = global_address(selector);
     let mut value: T = T::default();
     let mut size = core::mem::size_of::<T>() as u32;
@@ -117,24 +113,36 @@ fn read_scalar_property<T: Copy + Default>(object: AudioObjectID, selector: u32)
             NonNull::new_unchecked((&mut value as *mut T).cast::<c_void>()),
         )
     };
-    if status != NO_ERR || size as usize != core::mem::size_of::<T>() {
-        return None;
+    if status != NO_ERR {
+        return Err(map_os_status_at(
+            flexaudio_core::Operation::Enumerate,
+            "AudioObjectGetPropertyData(process scalar)",
+            status,
+        ));
     }
-    Some(value)
+    if size as usize != core::mem::size_of::<T>() {
+        return Err(Error::Backend(
+            "process property returned an invalid size; retry discovery".into(),
+        )
+        .with_context(flexaudio_core::ErrorContext::new(
+            flexaudio_core::Operation::Enumerate,
+        )));
+    }
+    Ok(value)
 }
 
 /// Read a `pid_t` (`i32`) property.
 pub(crate) fn read_i32_property(object: AudioObjectID, selector: u32) -> Option<i32> {
-    read_scalar_property::<i32>(object, selector)
+    read_scalar_property::<i32>(object, selector).ok()
 }
 
 /// Read a `UInt32` property.
 pub(crate) fn read_u32_property(object: AudioObjectID, selector: u32) -> Option<u32> {
-    read_scalar_property::<u32>(object, selector)
+    read_scalar_property::<u32>(object, selector).ok()
 }
 
-/// Get the PID's absolute executable path, or `None` if unavailable.
-fn process_path(pid: i32) -> Option<String> {
+/// Query an executable path; only a disappeared process is explicitly absent.
+fn process_path(pid: i32) -> Result<Option<String>> {
     let mut buffer = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
     // SAFETY: buffer is a writable region of PROC_PIDPATHINFO_MAXSIZE bytes.
     let written = unsafe {
@@ -145,15 +153,22 @@ fn process_path(pid: i32) -> Option<String> {
         )
     };
     if written <= 0 {
-        return None;
+        let code = std::io::Error::last_os_error().raw_os_error();
+        if code == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(Error::Backend(format!("process image query failed (OS code {code:?}); check process access and retry discovery"))
+            .with_context(flexaudio_core::ErrorContext::new(flexaudio_core::Operation::Enumerate)));
     }
-    let len = (written as usize).min(buffer.len());
-    let path = String::from_utf8_lossy(&buffer[..len]).into_owned();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path)
-    }
+    let path = buffer
+        .get(..written as usize)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .ok_or_else(|| {
+            Error::Backend("process image query returned invalid text; retry discovery".into())
+        })?;
+    // proc_pidpath may include its final NUL in the returned byte count.
+    let path = path.trim_end_matches('\0').to_owned();
+    Ok((!path.is_empty()).then_some(path))
 }
 
 #[cfg(test)]
@@ -177,7 +192,9 @@ mod tests {
     /// Verify that the current process executable path can be read (checks `proc_pidpath` wiring).
     #[test]
     fn own_process_path_is_readable() {
-        let path = process_path(std::process::id() as i32).expect("own path");
+        let path = process_path(std::process::id() as i32)
+            .expect("own path query")
+            .expect("own path");
         assert!(path.starts_with('/'), "{path}");
     }
 }

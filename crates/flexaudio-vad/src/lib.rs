@@ -1,6 +1,6 @@
 //! flexaudio-vad — An offline VAD addon that runs silero-VAD in pure Rust (tract-onnx).
 //!
-//! It does not depend on `flexaudio-core` and accepts only a sample slice `&[f32]`. The silero-VAD
+//! Legacy processing accepts a sample slice `&[f32]`; diagnostic projections use `flexaudio-core`. The Silero VAD
 //! model (MIT) is embedded in the binary, so no runtime model file or network access is needed.
 //!
 //! # Streaming example
@@ -51,7 +51,7 @@ pub use whisper_tap::WhisperVadTap;
 pub use whisper_tap_types::*;
 pub use whisper_types::*;
 
-pub use capture::{process_capture_chunk, VadCaptureEngine, VadCaptureOutcome};
+pub use capture::{finish_capture_gap, process_capture_chunk, VadCaptureEngine, VadCaptureOutcome};
 pub use config::VadConfig;
 pub use resample::PcmFormat;
 pub use segmenter::Segment;
@@ -78,6 +78,13 @@ pub enum VadEvent {
 /// VAD errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VadError {
+    /// Original failure with another independently failed operation.
+    Multiple {
+        /// First observed failure.
+        primary: Box<VadError>,
+        /// Additional failure, retained with its typed identity.
+        secondary: Box<VadError>,
+    },
     /// Failed to load the model.
     ModelLoad(String),
     /// Inference failed.
@@ -95,6 +102,9 @@ pub enum VadError {
 impl std::fmt::Display for VadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            VadError::Multiple { primary, secondary } => {
+                write!(f, "{primary}; related failure: {secondary}")
+            }
             VadError::ModelLoad(m) => write!(f, "model load error: {m}"),
             VadError::Inference(m) => write!(f, "inference error: {m}"),
             VadError::InvalidConfig(m) => write!(f, "invalid config: {m}"),
@@ -105,7 +115,41 @@ impl std::fmt::Display for VadError {
     }
 }
 
-impl std::error::Error for VadError {}
+impl std::error::Error for VadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Multiple { primary, .. } => Some(primary.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl VadError {
+    /// One shared typed projection for standalone, capture and shutdown binding failures.
+    /// The original model diagnostic stays available as structured data, never safe Display.
+    pub fn audio_error(&self) -> flexaudio_core::Error {
+        use flexaudio_core::{AddonErrorKind as Kind, Error, ErrorGroup};
+        let (kind, message) = match self {
+            Self::Multiple { primary, secondary } => {
+                return Error::Multiple(ErrorGroup::new(
+                    primary.audio_error(),
+                    secondary.audio_error(),
+                    Vec::new(),
+                ))
+            }
+            Self::ModelLoad(message) => (Kind::VadModelLoad, message),
+            Self::Inference(message) => (Kind::VadInference, message),
+            Self::InvalidConfig(message) => (Kind::VadInvalidConfig, message),
+            Self::InvalidFormat(message) => (Kind::VadInvalidFormat, message),
+            Self::Resample(message) => (Kind::VadResample, message),
+            Self::Reset(message) => (Kind::VadReset, message),
+        };
+        Error::Addon {
+            kind,
+            message: message.clone(),
+        }
+    }
+}
 
 trait InferenceBackend: Send {
     fn infer(&mut self, frame: &[f32]) -> Result<f32, VadError>;
@@ -130,6 +174,9 @@ pub struct Vad {
     engine: Box<dyn InferenceBackend>,
     converted_sample_position: u64,
     failure: Option<VadError>,
+    pending_events: Vec<VadEvent>,
+    #[cfg(feature = "test-faults")]
+    injected_reset_failure: bool,
     config: VadConfig,
     segmenter: Segmenter,
 
@@ -169,6 +216,9 @@ impl Vad {
             engine: Box::new(engine),
             converted_sample_position: 0,
             failure: None,
+            pending_events: Vec::new(),
+            #[cfg(feature = "test-faults")]
+            injected_reset_failure: false,
             config,
             segmenter,
             pending: Vec::new(),
@@ -277,6 +327,15 @@ impl Vad {
             } else {
                 Some((self.converter_factory)(format, target).map_err(VadError::Resample)?)
             };
+            if self
+                .converter
+                .as_ref()
+                .is_some_and(PcmConverter::has_pending_input)
+            {
+                return Err(VadError::InvalidFormat(
+                    "cannot change PCM format while converted input is pending; flush or reset the VAD session before changing format".into(),
+                ));
+            }
             self.converter = replacement;
         }
         let Some(conv) = self.converter.as_mut() else {
@@ -352,14 +411,15 @@ impl Vad {
     ///
     /// Returns an empty vector when no speech segment is open (or the open segment
     /// is shorter than `min_speech_ms` and is discarded, matching the segmenter).
-    /// Returns a latched processing error or a reset error instead of successful events.
+    /// Returns a latched processing error or reset error. Completed events survive reset
+    /// failure and can be drained exactly once through `take_pending_events`.
     pub fn flush(&mut self) -> Result<Vec<VadEvent>, VadError> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
         let mut segments_out = Vec::new();
         self.segmenter.flush(&mut segments_out);
-        let mut events = Vec::new();
+        let mut events = self.take_pending_events();
         for seg in segments_out {
             events.push(VadEvent::SpeechStart {
                 at_sample: seg.start_sample,
@@ -369,7 +429,10 @@ impl Vad {
             });
         }
         // Start the next input in a fresh context (reset cumulative position, state, and remainder).
-        self.reset()?;
+        if let Err(error) = self.reset() {
+            self.pending_events.extend(events);
+            return Err(error);
+        }
         Ok(events)
     }
 
@@ -377,6 +440,12 @@ impl Vad {
     /// Returns [`VadError::Reset`] if rebuilding the resampler or resetting inference fails.
     /// Buffers and position are cleared only after those operations succeed.
     pub fn reset(&mut self) -> Result<(), VadError> {
+        #[cfg(feature = "test-faults")]
+        if std::mem::take(&mut self.injected_reset_failure) {
+            let error = VadError::Reset("injected reset failure".into());
+            self.failure = Some(error.clone());
+            return Err(error);
+        }
         let replacement = if self.config.sample_rate == 8_000 {
             match (self.upsampler_factory)() {
                 Ok(converter) => Some(converter),
@@ -402,6 +471,25 @@ impl Vad {
         self.converted_sample_position = 0;
         self.failure = None;
         Ok(())
+    }
+
+    /// Test-only injection for binding shutdown regressions; absent from production builds.
+    #[cfg(feature = "test-faults")]
+    #[doc(hidden)]
+    pub fn inject_failure(&mut self, error: VadError) {
+        self.failure = Some(error);
+    }
+
+    /// Test-only reset fault; absent from production builds.
+    #[cfg(feature = "test-faults")]
+    #[doc(hidden)]
+    pub fn inject_reset_failure(&mut self) {
+        self.injected_reset_failure = true;
+    }
+
+    /// Drain completed speech retained when a later reset failed.
+    pub fn take_pending_events(&mut self) -> Vec<VadEvent> {
+        std::mem::take(&mut self.pending_events)
     }
 
     /// Actual cumulative mono samples delivered by conversion at the configured VAD rate.
@@ -478,6 +566,9 @@ mod tests {
             config,
             converted_sample_position: 0,
             failure: None,
+            pending_events: Vec::new(),
+            #[cfg(feature = "test-faults")]
+            injected_reset_failure: false,
             pending: Vec::new(),
             last_probs: Vec::new(),
             converter: None,
@@ -485,6 +576,41 @@ mod tests {
             upsampler_8k: None,
             upsampler_factory: PcmConverter::new_8k_to_16k_frame_resampler,
         }
+    }
+
+    #[test]
+    fn format_change_rejects_buffered_input_without_mutation() {
+        let mut vad = test_vad(false, false);
+        vad.process_pcm(&[0.25], 48_000, 2).unwrap();
+        let position = vad.converted_sample_position();
+        let error = vad.process_pcm(&[0.0; 512], 16_000, 1).unwrap_err();
+        assert!(matches!(error, VadError::InvalidFormat(_)));
+        assert_eq!(vad.converted_sample_position(), position);
+        assert!(vad.converter.as_ref().unwrap().matches(PcmFormat {
+            sample_rate: 48_000,
+            channels: 2
+        }));
+        vad.process_pcm(&[0.25], 48_000, 2).unwrap();
+    }
+
+    #[test]
+    fn flush_reset_failure_retains_completed_speech_once() {
+        let mut vad = test_vad(false, true);
+        vad.config = base_config();
+        vad.segmenter = Segmenter::new(&vad.config);
+        vad.process(&[0.0; 1024]).unwrap();
+        assert!(matches!(vad.flush(), Err(VadError::Reset(_))));
+        // The concrete VAD is tested through the shared gap helper: reset failure
+        // must preserve the completed speech even if a second reset also fails.
+        let outcome = process_capture_chunk(&mut vad, true, Vad::flush, |_| {
+            panic!("failed reset must block processing")
+        });
+        assert_eq!(outcome.flushed.len(), 2);
+        assert!(outcome.processed.is_err());
+        let repeated = process_capture_chunk(&mut vad, true, Vad::flush, |_| {
+            panic!("failed reset must block processing")
+        });
+        assert!(repeated.flushed.is_empty());
     }
 
     #[test]

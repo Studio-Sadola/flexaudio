@@ -29,7 +29,6 @@
 #![warn(missing_docs)]
 
 use std::collections::VecDeque;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -118,26 +117,20 @@ impl CpalMicBackend {
     /// - `Some(id)` → unique device in `host.input_devices()` where `device.name()? == id`
     ///   (id is a device name returned by [`list_devices`]).
     ///
-    /// Query and cache the selected device's native format. If the device is missing, does
-    /// not match, or the query fails, cache `FALLBACK_FORMAT` (`(48000, 1)`). `new` always
-    /// succeeds without panicking or returning an error; if device_id does not match,
-    /// [`start`](Self::start) returns [`Error::DeviceNotFound`]. If consent or a device
-    /// change reveals a different format, `start` returns [`Error::NativeFormatChanged`]
-    /// before building capture, and refreshes [`native_format`](Self::native_format).
-    /// This infallible constructor never requests consent. On macOS, undecided or
-    /// denied access skips native queries and selects the fallback. Capture start rechecks consent.
-    /// Prefer [`try_new`](Self::try_new) to discover the format after consent.
+    /// Query and cache the selected device's native format without requesting consent.
+    /// This legacy infallible constructor retains any query failure as a terminal
+    /// error and event; `start` returns that cause before opening capture. A failed
+    /// query leaves a compatibility placeholder in `native_format`, never a format
+    /// used for capture. Prefer [`try_new`](Self::try_new) for checked discovery
+    /// after consent. macOS undecided or denied access fails before native queries.
     pub fn new(device_id: Option<String>) -> Self {
         // Preserve the existing nonprompting Windows capability check and fallback.
         #[cfg(target_os = "windows")]
         let purpose = permission::Purpose::Capture;
         #[cfg(not(target_os = "windows"))]
         let purpose = permission::Purpose::Enumeration;
-        let native = query_native_format(device_id.as_deref(), purpose)
-            .ok()
-            .flatten()
-            .unwrap_or(FALLBACK_FORMAT);
-        Self::with_format(device_id, native)
+        let queried = query_native_format(device_id.as_deref(), purpose);
+        Self::from_query_result(device_id, queried)
     }
 
     /// Check OS microphone permission before discovering the device format.
@@ -151,9 +144,24 @@ impl CpalMicBackend {
     /// prompt returns an actionable [`Error::Backend`] after at most 30 seconds,
     /// without querying HAL or treating the unanswered prompt as a denial.
     pub fn try_new(device_id: Option<String>) -> Result<Self> {
-        let native = query_native_format(device_id.as_deref(), permission::Purpose::Capture)?
-            .unwrap_or(FALLBACK_FORMAT);
+        let native = query_native_format(device_id.as_deref(), permission::Purpose::Capture)?;
         Ok(Self::with_format(device_id, native))
+    }
+
+    fn from_query_result(device_id: Option<String>, queried: Result<(u32, u16)>) -> Self {
+        match queried {
+            Ok(native) => Self::with_format(device_id, native),
+            Err(error) => {
+                // The legacy constructor cannot return Result. Its placeholder
+                // format is never used for capture: retain the cause before start.
+                let mut backend = Self::with_format(device_id, FALLBACK_FORMAT);
+                backend.terminal_error = Some(error.clone());
+                backend
+                    .pending_events
+                    .push_back(Event::TerminalError { error });
+                backend
+            }
+        }
     }
 
     fn with_format(device_id: Option<String>, native: (u32, u16)) -> Self {
@@ -219,10 +227,15 @@ impl CpalMicBackend {
         }
         if let Some(error) = self.callback_errors.take() {
             let error = match error {
-                cpal::StreamError::DeviceNotAvailable => Error::DeviceLost,
-                cpal::StreamError::BackendSpecific { err } => {
-                    Error::Backend(format!("microphone capture failed: {err}"))
-                }
+                callback_mailbox::CallbackFailure::Native(
+                    cpal::StreamError::DeviceNotAvailable,
+                ) => Error::DeviceLost,
+                callback_mailbox::CallbackFailure::Native(cpal::StreamError::BackendSpecific {
+                    err,
+                }) => Error::Backend(format!("microphone capture failed: {err}")),
+                callback_mailbox::CallbackFailure::Panicked => Error::Backend(
+                    "microphone data callback panicked; reopen the stream and retry".into(),
+                ),
             };
             let event = Event::TerminalError { error };
             self.retain_terminal(&event);
@@ -248,14 +261,12 @@ fn resolve_input_device(host: &cpal::Host, device_id: Option<&str>) -> Result<De
         None => host.default_input_device().ok_or(Error::DeviceNotFound),
         Some(id) => {
             let devices = host.input_devices().map_err(|error| {
-                Error::Backend(format!("enumerate microphone devices: {error}"))
-                    .with_context(ErrorContext::new(Operation::Enumerate))
+                input_config::query_failure("enumerate microphone devices", error)
             })?;
             let mut selected = None;
             for device in devices {
                 let name = device.name().map_err(|error| {
-                    Error::Backend(format!("query microphone device name: {error}"))
-                        .with_context(ErrorContext::new(Operation::Enumerate))
+                    input_config::query_failure("query microphone device name", error)
                 })?;
                 if name == id {
                     if selected.is_some() {
@@ -269,20 +280,22 @@ fn resolve_input_device(host: &cpal::Host, device_id: Option<&str>) -> Result<De
     }
 }
 
-/// Get the native `(sample_rate, channels)` format for the input device selected by
-/// `device_id`. Return `None` if resolving the device or reading its configuration fails
-/// (the caller falls back to [`FALLBACK_FORMAT`]).
-/// Consent or host acquisition failure remains a typed error, before device queries.
+/// Query the selected input device's native format without fabricating a fallback.
+/// Consent, host, selection, and configuration failures retain their typed cause.
 fn query_native_format(
     device_id: Option<&str>,
     purpose: permission::Purpose,
-) -> Result<Option<(u32, u16)>> {
+) -> Result<(u32, u16)> {
     let host = cpal_default_host(purpose)?;
-    let format = resolve_input_device(&host, device_id)
-        .ok()
-        .and_then(|device| device.default_input_config().ok())
-        .map(|config| (config.sample_rate().0, config.channels()));
-    Ok(format)
+    input_config::discover(
+        || {
+            let device = resolve_input_device(&host, device_id)?;
+            device.default_input_config().map_err(|error| {
+                input_config::query_failure("query microphone input configuration", error)
+            })
+        },
+        |config| (config.sample_rate().0, config.channels()),
+    )
 }
 
 /// Enumerate input (microphone) devices, for the microphone portion of `devices()`.
@@ -292,6 +305,7 @@ fn query_native_format(
 ///   index can change after reconnecting, while the name remains the same for the same setup.
 /// - `sample_rate` / `channels`: from `default_input_config()`. For devices whose config
 ///   cannot be read: return Backend rather than an incomplete inventory.
+///   Apply the same positive-rate and one/two-channel validation as capture setup.
 /// - `source_kind = Mic` / `is_loopback = false`.
 /// - `is_default`: `true` when the name matches `host.default_input_device()`.
 ///
@@ -309,32 +323,31 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
         .default_input_device()
         .map(|device| device.name())
         .transpose()
-        .map_err(|error| {
-            Error::Backend(format!("query default microphone name: {error}"))
-                .with_context(ErrorContext::new(Operation::Enumerate))
-        })?;
-    let devices = host.input_devices().map_err(|error| {
-        Error::Backend(format!("enumerate microphone devices: {error}"))
-            .with_context(ErrorContext::new(Operation::Enumerate))
-    })?;
+        .map_err(|error| input_config::query_failure("query default microphone name", error))?;
+    let devices = host
+        .input_devices()
+        .map_err(|error| input_config::query_failure("enumerate microphone devices", error))?;
 
     let mut out = Vec::new();
     for device in devices {
-        let name = device.name().map_err(|error| {
-            Error::Backend(format!("query microphone device name: {error}"))
-                .with_context(ErrorContext::new(Operation::Enumerate))
-        })?;
-        let config = device.default_input_config().map_err(|error| {
-            Error::Backend(format!("query microphone input configuration: {error}"))
-                .with_context(ErrorContext::new(Operation::Enumerate))
-        })?;
+        let name = device
+            .name()
+            .map_err(|error| input_config::query_failure("query microphone device name", error))?;
+        let (sample_rate, channels) = input_config::discover(
+            || {
+                device.default_input_config().map_err(|error| {
+                    input_config::query_failure("query microphone input configuration", error)
+                })
+            },
+            |config| (config.sample_rate().0, config.channels()),
+        )?;
         let is_default = default_name.as_deref() == Some(name.as_str());
         out.push(DeviceInfo {
             id: name.clone(),
             name,
             source_kind: SourceKind::Mic,
-            sample_rate: config.sample_rate().0,
-            channels: config.channels(),
+            sample_rate,
+            channels,
             is_loopback: false,
             is_default,
         });
@@ -377,8 +390,7 @@ impl CaptureBackend for CpalMicBackend {
             })
             .map_err(|e| {
                 self.stop_flag.store(true, Ordering::SeqCst);
-                Error::Backend(format!("spawn cpal mic thread: {e}"))
-                    .with_context(ErrorContext::new(Operation::Start))
+                flexaudio_core::spawn_error("CPAL microphone capture owner", e)
             })?;
         self.handle = Some(handle);
         let previous_shutdown = self.shutdown_result.take();
@@ -478,7 +490,7 @@ fn build_stream(
     let supported = input_config::checked(
         || {
             device.default_input_config().map_err(|error| {
-                Error::Backend(format!("query microphone input configuration: {error}"))
+                input_config::query_failure("query microphone input configuration", error)
             })
         },
         |config| (config.sample_rate().0, config.channels()),
@@ -487,7 +499,8 @@ fn build_stream(
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
 
-    let err_fn = move |error: cpal::StreamError| callback_errors.record(error);
+    let native_errors = callback_errors.clone();
+    let err_fn = move |error: cpal::StreamError| native_errors.record(error);
 
     // Preallocate conversion scratch for the maximum block size (native sample rate × channels
     // × MAX_SCRATCH_SECONDS). This avoids first-use/growth allocations in RT callbacks during
@@ -500,21 +513,21 @@ fn build_stream(
     // Move the sink into the callback. Non-F32 formats capture the converter.
     //
     // cpal data callbacks cross an FFI (C ABI) boundary, where a panic could cause undefined
-    // behavior. No current path is known to panic, but wrap each callback body in catch_unwind
-    // so an unexpected panic only discards that block.
+    // behavior. The shared guard records unexpected panics in the lock-free mailbox,
+    // closes PCM and lets the owner publish a typed terminal error outside the callback.
     let stream = match sample_format {
         SampleFormat::F32 => {
             let mut sink = sink;
             device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                    callback_errors.guard(|| {
                         if stop_flag.load(Ordering::SeqCst) {
                             return;
                         }
                         // Already interleaved f32.
                         sink.push(data, monotonic_now_ns());
-                    }));
+                    });
                 },
                 err_fn,
                 None,
@@ -527,13 +540,13 @@ fn build_stream(
             device.build_input_stream(
                 &config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                    callback_errors.guard(|| {
                         if stop_flag.load(Ordering::SeqCst) {
                             return;
                         }
                         fill_scratch(&mut scratch, data, |s| s as f32 / -(i16::MIN as f32));
                         sink.push(&scratch, monotonic_now_ns());
-                    }));
+                    });
                 },
                 err_fn,
                 None,
@@ -545,14 +558,14 @@ fn build_stream(
             device.build_input_stream(
                 &config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                    callback_errors.guard(|| {
                         if stop_flag.load(Ordering::SeqCst) {
                             return;
                         }
                         // Map u16 [0, 65535] to [-1, 1) around midpoint 32768.
                         fill_scratch(&mut scratch, data, |s| (s as f32 - 32_768.0) / 32_768.0);
                         sink.push(&scratch, monotonic_now_ns());
-                    }));
+                    });
                 },
                 err_fn,
                 None,
@@ -564,13 +577,13 @@ fn build_stream(
             device.build_input_stream(
                 &config,
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
-                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                    callback_errors.guard(|| {
                         if stop_flag.load(Ordering::SeqCst) {
                             return;
                         }
                         fill_scratch(&mut scratch, data, |s| s as f32 / -(i32::MIN as f32));
                         sink.push(&scratch, monotonic_now_ns());
-                    }));
+                    });
                 },
                 err_fn,
                 None,

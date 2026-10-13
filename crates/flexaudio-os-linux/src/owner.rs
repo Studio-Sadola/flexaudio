@@ -6,19 +6,6 @@ use std::thread::JoinHandle;
 
 pub(crate) type BackendEvents = Arc<Mutex<VecDeque<Event>>>;
 
-pub(crate) fn startup_error(events: &BackendEvents, message: String) -> Error {
-    let queue = events.lock().unwrap_or_else(|poison| poison.into_inner());
-    queue
-        .iter()
-        .find_map(|event| match event {
-            Event::TerminalError { error } => Some(error.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| {
-            Error::Backend(message).with_context(ErrorContext::new(Operation::Start))
-        })
-}
-
 pub(crate) fn join_worker(handle: JoinHandle<()>) -> Result<()> {
     handle.join().map_err(|_| {
         Error::Backend("pipewire worker panicked".into())

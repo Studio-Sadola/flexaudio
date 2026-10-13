@@ -178,6 +178,7 @@ pub unsafe extern "C" fn flexaudio_watcher_poll(
         }
         let watcher = &mut *w;
         match watcher.inner.poll_event() {
+            Some(DeviceEvent::TerminalError { error }) => crate::error::set_audio_error(error),
             Some(ev) => {
                 out.write(device_event_to_c(ev));
                 1

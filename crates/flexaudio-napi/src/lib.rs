@@ -111,7 +111,7 @@ enum ChunkEmit {
         epoch: u32,
     },
     StopFlushed,
-    VadError(String),
+    VadError(flexaudio::Error),
 }
 
 /// `napi_deferred` is a raw pointer. Created on the JS thread and resolved through TSFN.
@@ -215,11 +215,59 @@ fn settle_stop(env: sys::napi_env, deferred: SendDeferred, report: &FinalReport)
         }
         Ok(None) => resolve_undefined(env, deferred),
         Err(error) => {
-            if let Ok(exception) = js_env.create_error(error) {
-                let _ = unsafe { sys::napi_reject_deferred(env, deferred.0, exception.raw()) };
-            }
+            reject_stop_fallback(env, deferred, error);
         }
     }
+}
+
+/// Shared settlement policy, also tested with injected native-allocation failures.
+fn reject_with_fallback<T, E>(
+    rich: Result<T, E>,
+    fallback: impl FnOnce(E) -> T,
+    reject: impl FnOnce(T),
+) {
+    reject(match rich {
+        Ok(value) => value,
+        Err(error) => fallback(error),
+    });
+}
+
+/// Native allocation failure cannot safely be forced in a live Node environment;
+/// the shared settlement policy is fault-injected independently of N-API.
+fn reject_stop_fallback(env: sys::napi_env, deferred: SendDeferred, error: NapiError) {
+    let js_env = unsafe { Env::from_raw(env) };
+    reject_with_fallback(
+        js_env
+            .create_error(error)
+            .map(|error| unsafe { error.raw() }),
+        |_| {
+            let mut pending = false;
+            let _ = unsafe { sys::napi_is_exception_pending(env, &mut pending) };
+            if pending {
+                let mut exception = ptr::null_mut();
+                let _ = unsafe { sys::napi_get_and_clear_last_exception(env, &mut exception) };
+            }
+            let message = b"flexaudio stop failed while creating its error";
+            let mut text = ptr::null_mut();
+            let status = unsafe {
+                sys::napi_create_string_utf8(env, message.as_ptr().cast(), message.len(), &mut text)
+            };
+            let mut plain = ptr::null_mut();
+            if status == sys::Status::napi_ok
+                && unsafe { sys::napi_create_error(env, ptr::null_mut(), text, &mut plain) }
+                    == sys::Status::napi_ok
+            {
+                return plain;
+            }
+            if text.is_null() {
+                let _ = unsafe { sys::napi_get_undefined(env, &mut text) };
+            }
+            text
+        },
+        |value| {
+            let _ = unsafe { sys::napi_reject_deferred(env, deferred.0, value) };
+        },
+    );
 }
 
 fn terminal_event(error: flexaudio::Error) -> JsStreamEvent {
@@ -352,7 +400,7 @@ where
             }
             post_stop_flushed(&chunk, &settle, &phase);
         })
-        .map_err(|_| flexaudio::Error::Backend("bridge thread creation failed".into()))
+        .map_err(|error| flexaudio::core::spawn_error("bridge", error))
 }
 
 /// Weak reference to the chunk TSFN. `StopFlushed` / settlement use it to unref after resolving
@@ -507,8 +555,9 @@ fn make_chunk_tsfn(
                     )?;
                     Ok(Vec::<Unknown>::new())
                 }
-                ChunkEmit::VadError(message) => {
-                    ctx.env.throw_error(&message, None)?;
+                ChunkEmit::VadError(error) => {
+                    let exception = boundary::js_error(&ctx.env, &error)?;
+                    ctx.env.throw(exception)?;
                     Ok(Vec::<Unknown>::new())
                 }
                 ChunkEmit::StopFlushed => {
@@ -623,11 +672,7 @@ impl Task for ProcessesTask {
 /// VadError → napi::Error. Invalid configuration is a caller error: InvalidArg.
 /// Model loading/inference failures are environmental: GenericFailure.
 fn vad_err(err: VadError) -> NapiError {
-    let status = match err {
-        VadError::InvalidConfig(_) | VadError::InvalidFormat(_) => Status::InvalidArg,
-        _ => Status::GenericFailure,
-    };
-    NapiError::new(status, err.to_string())
+    boundary::to_napi_err(err.audio_error())
 }
 
 /// DenoiseError → napi::Error. Both variants indicate invalid arguments: InvalidArg.
@@ -835,6 +880,7 @@ pub struct JsDeviceEvent {
     pub id: Option<String>,
     pub source_kind: Option<String>,
     pub dropped_events: Option<BigInt>,
+    pub error: Option<JsAudioError>,
     pub message: Option<String>,
 }
 
@@ -1252,12 +1298,56 @@ struct PairingBridge {
     last_primary_seq: u64,
     last_primary_frame_index: u64,
     last_primary_dropped: u32,
+    last_secondary: SecondaryCarrierMetadata,
+}
+
+/// Last observed secondary timeline; reused by event-only stop carriers.
+#[derive(Default, Clone, Copy)]
+struct SecondaryCarrierMetadata {
+    frame_index: u64,
+    seq: u64,
+    dropped_before: u32,
+}
+
+fn secondary_carrier_counters(metadata: SecondaryCarrierMetadata) -> (BigInt, BigInt, u32) {
+    (
+        BigInt::from(metadata.frame_index),
+        BigInt::from(metadata.seq),
+        metadata.dropped_before,
+    )
+}
+
+fn secondary_event_carrier(
+    encoding: Option<SecEncoding>,
+    pts: i64,
+    events: Vec<JsVadEvent>,
+    metadata: SecondaryCarrierMetadata,
+) -> JsSecondaryChunk {
+    let (frame_index, seq, dropped_before) = secondary_carrier_counters(metadata);
+    let (data, encoding) = match encoding {
+        Some(SecEncoding::S16) => (Either::A(Int16Array::new(Vec::new())), "s16"),
+        _ => (Either::B(Float32Array::new(Vec::new())), "f32"),
+    };
+    JsSecondaryChunk {
+        frame_index,
+        data,
+        encoding: encoding.into(),
+        frames: 0,
+        pts_ns: pts,
+        seq,
+        flags: 0,
+        dropped_before,
+        peak: 0.0,
+        rms: 0.0,
+        vad_events: Some(events),
+        whisper_vad_events: None,
+    }
 }
 
 impl PairingBridge {
-    fn report_vad_error(&self, message: String) {
+    fn report_vad_error(&self, error: VadError) {
         self.on_chunk.call(
-            ChunkEmit::VadError(message),
+            ChunkEmit::VadError(error.audio_error()),
             ThreadsafeFunctionCallMode::NonBlocking,
         );
     }
@@ -1289,7 +1379,7 @@ impl PairingBridge {
             }
             Err(error) => {
                 let events = vad.take_pending_events();
-                self.report_vad_error(error.to_string());
+                self.report_vad_error(error);
                 Some(events)
             }
         }
@@ -1320,7 +1410,7 @@ impl PairingBridge {
     fn flush_vad(&mut self) {
         match self.flush_vad_events() {
             Ok(events) => self.pending_flush_events.extend(events),
-            Err(error) => self.report_vad_error(error.to_string()),
+            Err(error) => self.report_vad_error(error),
         }
     }
 
@@ -1334,11 +1424,13 @@ impl PairingBridge {
             Err(error) => {
                 record_cleanup_failure(
                     &self.report,
-                    flexaudio::Error::Backend("integrated VAD flush failed".into()).with_context(
-                        flexaudio::core::ErrorContext::new(flexaudio::core::Operation::Flush),
-                    ),
+                    error
+                        .audio_error()
+                        .with_context(flexaudio::core::ErrorContext::new(
+                            flexaudio::core::Operation::Flush,
+                        )),
                 );
-                self.report_vad_error(error.to_string());
+                self.report_vad_error(error);
                 self.vad
                     .as_mut()
                     .map_or_else(Vec::new, |vad| vad.take_pending_events())
@@ -1366,26 +1458,12 @@ impl PairingBridge {
         match self.vad_tap {
             VadTap::Primary => carrier.vad_events = Some(events),
             VadTap::Secondary => {
-                // Place secondary tap events on the secondary chunk (the consumer reads through `primary.secondary`).
-                // Match the configured encoding (samples are empty).
-                let (data, encoding) = match self.secondary.map(|c| c.encoding) {
-                    Some(SecEncoding::S16) => (Either::A(Int16Array::new(Vec::new())), "s16"),
-                    _ => (Either::B(Float32Array::new(Vec::new())), "f32"),
-                };
-                carrier.secondary = Some(JsSecondaryChunk {
-                    frame_index: BigInt::from(0u64),
-                    data,
-                    encoding: encoding.to_string(),
-                    frames: 0,
-                    pts_ns: pts,
-                    seq: BigInt::from(0u64),
-                    flags: 0,
-                    dropped_before: 0,
-                    peak: 0.0,
-                    rms: 0.0,
-                    vad_events: Some(events),
-                    whisper_vad_events: None,
-                });
+                carrier.secondary = Some(secondary_event_carrier(
+                    self.secondary.map(|cfg| cfg.encoding),
+                    pts,
+                    events,
+                    self.last_secondary,
+                ));
             }
         }
         self.on_chunk.call(
@@ -1450,6 +1528,11 @@ impl PairingBridge {
         if self.vad_tap == VadTap::Secondary && !self.pending_flush_events.is_empty() {
             vad_events = Some(self.take_pending_prepended(vad_events));
         }
+        self.last_secondary = SecondaryCarrierMetadata {
+            frame_index: chunk.frame_index,
+            seq: chunk.seq,
+            dropped_before: chunk.dropped_before,
+        };
         // Save metadata before consuming samples.
         let frames = chunk.frames as u32;
         let pts_ns = chunk.pts_ns;
@@ -2172,13 +2255,28 @@ impl Drop for FlexStream {
             }
             let report = self.report.clone();
             let terminal = self.terminal.clone();
-            let _ = thread::Builder::new()
+            let retained = Arc::new(Mutex::new(Some(h)));
+            let worker_handle = retained.clone();
+            let worker_report = report.clone();
+            let worker_terminal = terminal.clone();
+            if let Err(error) = thread::Builder::new()
                 .name("flexaudio-napi-reaper".into())
                 .spawn(move || {
-                    if h.join().is_err() {
+                    if let Some(handle) = worker_handle.lock().unwrap_or_else(lock_poisoned).take()
+                    {
+                        if handle.join().is_err() {
+                            record_bridge_failure(&worker_report, &worker_terminal);
+                        }
+                    }
+                })
+            {
+                record_cleanup_failure(&report, flexaudio::core::spawn_error("GC reaper", error));
+                if let Some(handle) = retained.lock().unwrap_or_else(lock_poisoned).take() {
+                    if handle.join().is_err() {
                         record_bridge_failure(&report, &terminal);
                     }
-                });
+                }
+            }
         }
     }
 }
@@ -2192,14 +2290,32 @@ impl Drop for FlexStream {
 pub struct DeviceWatcherHandle {
     stop_flag: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    on_event: Option<DeviceTsfn>,
 }
 
 impl DeviceWatcherHandle {
     fn shutdown(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            if h.join().is_err() {
+                if let Some(callback) = &self.on_event {
+                    callback.call(
+                        device_event_to_js(DeviceEvent::TerminalError {
+                            error: flexaudio::Error::Backend(
+                                "device bridge worker panicked; restart device watching".into(),
+                            )
+                            .with_context(
+                                flexaudio::core::ErrorContext::new(
+                                    flexaudio::core::Operation::Join,
+                                ),
+                            ),
+                        }),
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                }
+            }
         }
+        self.on_event.take();
     }
 }
 
@@ -2444,6 +2560,7 @@ pub fn open_stream(
         last_primary_seq: 0,
         last_primary_frame_index: 0,
         last_primary_dropped: 0,
+        last_secondary: SecondaryCarrierMetadata::default(),
     };
     FlexStream::spawn(
         &env,
@@ -2457,6 +2574,19 @@ pub fn open_stream(
     )
 }
 
+/// One event drain for normal watching and final owner teardown.
+fn forward_device_events(watcher: &mut flexaudio::DeviceWatcher, callback: &DeviceTsfn) -> bool {
+    let mut failed = false;
+    while let Some(event) = watcher.poll_event() {
+        failed |= matches!(event, DeviceEvent::TerminalError { .. });
+        callback.call(
+            device_event_to_js(event),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+    }
+    failed
+}
+
 /// Watch device attachment/removal and return a `DeviceWatcherHandle` that sends events to the callback.
 #[napi]
 pub fn watch_devices(
@@ -2467,6 +2597,7 @@ pub fn watch_devices(
         flexaudio::watch_devices().map_err(|error| boundary::throw_error(&env, error))?;
     let stop_flag = Arc::new(AtomicBool::new(false));
     let thread_stop = stop_flag.clone();
+    let retained_callback = on_event.clone();
 
     let handle = thread::Builder::new()
         .name("flexaudio-napi-devices".into())
@@ -2475,26 +2606,22 @@ pub fn watch_devices(
                 if thread_stop.load(Ordering::SeqCst) {
                     break;
                 }
-                while let Some(ev) = watcher.poll_event() {
-                    on_event.call(
-                        device_event_to_js(ev),
-                        ThreadsafeFunctionCallMode::NonBlocking,
-                    );
+                if forward_device_events(&mut watcher, &on_event) {
+                    break;
                 }
                 thread::sleep(DEVICE_POLL_INTERVAL);
             }
             watcher.stop();
+            forward_device_events(&mut watcher, &on_event);
         })
-        .map_err(|_| {
-            boundary::throw_error(
-                &env,
-                flexaudio::Error::Backend("device bridge thread creation failed".into()),
-            )
+        .map_err(|error| {
+            boundary::throw_error(&env, flexaudio::core::spawn_error("device bridge", error))
         })?;
 
     Ok(DeviceWatcherHandle {
         stop_flag,
         handle: Some(handle),
+        on_event: Some(retained_callback),
     })
 }
 
@@ -2683,6 +2810,7 @@ pub fn open_mock_stream(
         last_primary_seq: 0,
         last_primary_frame_index: 0,
         last_primary_dropped: 0,
+        last_secondary: SecondaryCarrierMetadata::default(),
     };
     FlexStream::spawn(
         &env,
@@ -2749,14 +2877,25 @@ impl Vad {
     /// Standalone `Vad` has no pts context, so `atNs` is `undefined` (`atSample` remains the raw cumulative
     /// position at VAD's internal rate). Returns an empty array when no utterance is open.
     #[napi]
-    pub fn flush(&mut self) -> napi::Result<Vec<JsVadEvent>> {
-        Ok(self
-            .inner
-            .flush()
-            .map_err(vad_err)?
-            .into_iter()
-            .map(vad_event_to_js)
-            .collect())
+    pub fn flush(&mut self, env: Env) -> napi::Result<Vec<JsVadEvent>> {
+        match self.inner.flush() {
+            Ok(events) => Ok(events.into_iter().map(vad_event_to_js).collect()),
+            Err(error) => {
+                let events: Vec<_> = self
+                    .inner
+                    .take_pending_events()
+                    .into_iter()
+                    .map(vad_event_to_js)
+                    .collect();
+                let mut exception = boundary::js_error(&env, &error.audio_error())?;
+                exception.set_named_property("pendingEvents", events)?;
+                env.throw(exception)?;
+                Err(NapiError::new(
+                    Status::PendingException,
+                    "VAD flush failed; drain pendingEvents",
+                ))
+            }
+        }
     }
 
     /// Initialize internal state (state / context / state machine / sample position / resampler).
@@ -3639,3 +3778,32 @@ mod reproduction_tests {
 // Build the test addon with cargo rustc --lib -- --cfg test --cfg flexaudio_repro_addon.
 #[cfg(all(flexaudio_repro_addon, feature = "test-faults"))]
 mod reproduction_bridge;
+
+#[cfg(test)]
+mod silent_failure_binding_tests {
+    use super::*;
+    #[test]
+    fn silent_failure_failed_error_creation_still_rejects_once() {
+        let mut rejected = Vec::new();
+        reject_with_fallback(
+            Err::<&str, _>(()),
+            |_| "plain fallback",
+            |value| rejected.push(value),
+        );
+        assert_eq!(rejected, ["plain fallback"]);
+    }
+    #[test]
+    fn silent_failure_secondary_tail_keeps_last_timeline_counters() {
+        let metadata = SecondaryCarrierMetadata {
+            frame_index: 9600,
+            seq: u64::MAX,
+            dropped_before: 17,
+        };
+        // Typed-array destruction requires a Node host; this shared production
+        // counter projection can be checked without N-API or real audio hardware.
+        let (frame_index, seq, dropped_before) = secondary_carrier_counters(metadata);
+        assert_eq!(frame_index.get_u64(), (false, 9600, true));
+        assert_eq!(seq.get_u64(), (false, u64::MAX, true));
+        assert_eq!(dropped_before, 17);
+    }
+}

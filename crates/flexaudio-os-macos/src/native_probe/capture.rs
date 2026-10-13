@@ -19,7 +19,7 @@ use objc2_core_audio_types::{
 use objc2_foundation::{NSArray, NSNumber, NSString};
 
 use super::io::{buffers, check, failed, float_rate, read_property, IoRegistration};
-use crate::probe::{ProbeControl, ProbeOutcome};
+use crate::probe::{ProbeCleanup, ProbeControl, ProbeOutcome};
 use crate::probe_signal::CapturedFrame;
 use crate::tap::create_aggregate_device;
 
@@ -142,6 +142,7 @@ impl CaptureState {
 }
 
 struct CaptureResources {
+    cleanup: Arc<ProbeCleanup>,
     registration: Option<IoRegistration>,
     aggregate: AudioObjectID,
     tap: AudioObjectID,
@@ -159,6 +160,7 @@ impl CaptureResources {
             // SAFETY: uniquely owned private aggregate; IOProc stop/destruction were attempted.
             // HAL's copied block keeps Arc context alive if removal fails; its gate is closed.
             let status = unsafe { AudioHardwareDestroyAggregateDevice(self.aggregate) };
+            self.cleanup.record_native("aggregate destruction", status);
             clean &= status == 0;
             if status == 0 {
                 self.aggregate = 0;
@@ -167,6 +169,8 @@ impl CaptureResources {
         if self.tap != 0 {
             // SAFETY: this owner created the tap and attempted to tear down all dependents first.
             let status = unsafe { AudioHardwareDestroyProcessTap(self.tap) };
+            self.cleanup
+                .record_native("private tap destruction", status);
             clean &= status == 0;
             if status == 0 {
                 self.tap = 0;
@@ -206,6 +210,7 @@ impl Capture {
             description.setName(&NSString::from_str("flexaudio-private-permission-probe"));
         }
         let mut resources = CaptureResources {
+            cleanup: control.cleanup_diagnostics(),
             registration: None,
             aggregate: 0,
             tap: 0,
@@ -234,9 +239,7 @@ impl Capture {
         // SAFETY: description is valid and retained until tap/aggregate destruction; UUID is owned.
         let uuid = unsafe { resources._description.UUID() }.UUIDString();
         resources.aggregate = create_aggregate_device("flexaudio-private-permission-probe", &uuid)
-            .map_err(|error| ProbeOutcome::Failed {
-                detail: format!("self-probe aggregate creation: {error}"),
-            })?;
+            .map_err(|error| ProbeOutcome::Failed { error })?;
         check(control)?;
         let state = Arc::new(CaptureState {
             frames: (0..rate as usize * 2)

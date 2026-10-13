@@ -26,7 +26,7 @@
 //! No network communication occurs at runtime (PyO3 is only a Python extension bridge; embedded VAD
 //! model, FLAC encoder, and RNNoise model require no files or network access).
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 // Alias the dependency crate `flexaudio` as `fa`. This cdylib uses the same name for `[lib] name` and
@@ -58,16 +58,7 @@ pub(crate) use errors::to_py_err;
 /// Convert VadError to a Python exception. Invalid configuration becomes `ValueError`; model loading and inference failures
 /// become `RuntimeError`.
 pub(crate) fn vad_err_to_py(err: flexaudio_vad::VadError) -> PyErr {
-    let msg = err.to_string();
-    match err {
-        flexaudio_vad::VadError::InvalidConfig(_) | flexaudio_vad::VadError::InvalidFormat(_) => {
-            PyValueError::new_err(msg)
-        }
-        flexaudio_vad::VadError::ModelLoad(_)
-        | flexaudio_vad::VadError::Inference(_)
-        | flexaudio_vad::VadError::Reset(_)
-        | flexaudio_vad::VadError::Resample(_) => PyRuntimeError::new_err(msg),
-    }
+    crate::errors::to_py_err(err.audio_error())
 }
 
 /// Convert DenoiseError to a Python exception. Invalid channel count or length is an argument error, so use `ValueError`.
@@ -79,13 +70,7 @@ pub(crate) fn denoise_err_to_py(err: flexaudio_denoise::DenoiseError) -> PyErr {
 /// and encoder errors become `RuntimeError`. Future variants (`#[non_exhaustive]`) default to
 /// `RuntimeError`.
 pub(crate) fn encode_err_to_py(err: flexaudio_encode::EncodeError) -> PyErr {
-    use flexaudio_encode::EncodeError;
-    let msg = err.to_string();
-    match err {
-        EncodeError::Unsupported(_) => PyValueError::new_err(msg),
-        EncodeError::Io(_) => pyo3::exceptions::PyOSError::new_err(msg),
-        _ => PyRuntimeError::new_err(msg),
-    }
+    crate::errors::to_py_err(err.audio_error())
 }
 
 // ---------------------------------------------------------------------------

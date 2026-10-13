@@ -150,6 +150,13 @@ pub enum WhisperVadOperation {
 /// Fail-closed errors. Diagnostics never contain PCM or probability values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhisperVadError {
+    /// Existing public failure identity with its original typed model/converter cause.
+    Cause {
+        /// Public failure identity, preserved for compatibility.
+        primary: Box<WhisperVadError>,
+        /// Original addon diagnostic, exposed only through structured access.
+        source: crate::VadError,
+    },
     /// An invalid construction-time parameter.
     InvalidParameter {
         /// Rejected field.
@@ -184,10 +191,58 @@ pub enum WhisperVadError {
 
 impl std::fmt::Display for WhisperVadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "whisper VAD error: {self:?}")
+        write!(f, "whisper VAD error: {:?}", self.root())
     }
 }
-impl std::error::Error for WhisperVadError {}
+impl WhisperVadError {
+    pub(crate) fn with_cause(self, source: crate::VadError) -> Self {
+        Self::Cause {
+            primary: Box::new(self),
+            source,
+        }
+    }
+    /// Shared standalone error projection, preserving validation/lifecycle classification
+    /// and keeping model diagnostics as an opt-in related addon cause.
+    pub fn audio_error(&self) -> flexaudio_core::Error {
+        use flexaudio_core::{Error, ErrorGroup};
+        let primary = match self.root() {
+            Self::InvalidParameter { .. }
+            | Self::InvalidProbability { .. }
+            | Self::InvalidPcm { .. }
+            | Self::Overflow { .. } => Error::InvalidArg(self.to_string()),
+            Self::SessionFinished | Self::FailedSession => Error::InvalidState(self.to_string()),
+            _ => Error::WhisperVad {
+                code: crate::WhisperVadTapError::Vad(self.clone()).code(),
+            },
+        };
+        match self.cause() {
+            Some(source) => {
+                Error::Multiple(ErrorGroup::new(primary, source.audio_error(), Vec::new()))
+            }
+            None => primary,
+        }
+    }
+
+    /// Original failure identity, ignoring retained diagnostic wrappers.
+    pub fn root(&self) -> &Self {
+        match self {
+            Self::Cause { primary, .. } => primary.root(),
+            error => error,
+        }
+    }
+    /// Original typed addon cause, when native model or converter work failed.
+    pub fn cause(&self) -> Option<&crate::VadError> {
+        match self {
+            Self::Cause { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+impl std::error::Error for WhisperVadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause().map(|source| source as &dyn std::error::Error)
+    }
+}
 
 /// Runtime errors carry exactly-once closure events even when a call fails.
 #[derive(Debug, Clone, PartialEq, Eq)]

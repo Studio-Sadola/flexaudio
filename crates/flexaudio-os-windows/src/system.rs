@@ -22,7 +22,7 @@
 //! pid or pid 0 is rejected with [`Error::InvalidArg`] before capture starts
 //! (see [`WasapiSystemBackend::with_exclude_pids`]).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -45,7 +45,7 @@ use crate::common::{
     capture_loop, init_loopback_capture, map_hr, map_hr_at, parse_mix_format, CaptureSetup,
     ComThread, EventHandle,
 };
-use crate::format::{native_format_from_source, verify_format};
+use crate::format::{native_format_from_source, retain_format_query, verify_format};
 use crate::keepalive::SilentRender;
 use crate::lifecycle::keepalive_error;
 
@@ -93,6 +93,8 @@ pub struct WasapiSystemBackend {
     handle: Option<JoinHandle<ShutdownReport>>,
     /// Runtime failure reported once by the next start (watchdog reopen).
     pending_error: Option<Error>,
+    /// Last failed checked format query, retained across the legacy format getter.
+    query_error: RefCell<Option<Error>>,
     shutdown: OwnerShutdown,
     /// Last queried format, refreshed before constructing each classic-loopback sink.
     /// While running, retain the format with which that sink was configured.
@@ -104,30 +106,32 @@ impl WasapiSystemBackend {
     ///
     /// `exclude_self == false` (default path): Query and cache the MixFormat of
     /// the endpoint selected by `device_id` (`None` uses the default render
-    /// endpoint). On failure, cache [`FALLBACK_FORMAT`] (`(48000, 2)`) without
-    /// panicking. Do not check whether `device_id` matches until the endpoint is
-    /// opened by [`start`](CaptureBackend::start).
+    /// endpoint). On failure, retain the typed query cause for checked start;
+    /// [`native_format`](CaptureBackend::native_format) keeps a compatibility
+    /// placeholder until a successful query replaces it. No capture uses a failed query.
     ///
     /// `exclude_self == true` (process loopback EXCLUDE path): `native` uses
     /// the fixed process loopback format [`PROCESS_LOOPBACK_FORMAT`] (`(48000, 2)`).
     /// Do not query MixFormat or use `device_id`, since this mechanism is not
     /// tied to an endpoint.
     pub fn new(exclude_self: bool, device_id: Option<String>) -> Self {
-        let native = if exclude_self {
-            PROCESS_LOOPBACK_FORMAT
-        } else {
-            query_native_format(device_id.as_deref()).unwrap_or(FALLBACK_FORMAT)
-        };
-        Self {
+        let backend = Self {
             exclude_self,
             exclude_pids: Vec::new(),
             device_id,
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
             pending_error: None,
+            query_error: RefCell::new(None),
             shutdown: OwnerShutdown::default(),
-            native: Cell::new(native),
-        }
+            native: Cell::new(if exclude_self {
+                PROCESS_LOOPBACK_FORMAT
+            } else {
+                FALLBACK_FORMAT
+            }),
+        };
+        backend.native_format();
+        backend
     }
 
     /// Request exclusion of a process tree. WASAPI process loopback takes one
@@ -145,9 +149,16 @@ impl WasapiSystemBackend {
     pub fn with_exclude_pids(mut self, pids: Vec<u32>) -> Self {
         self.exclude_pids = pids;
         self.native.set(match self.exclude_root() {
-            Ok(None) => query_native_format(self.device_id.as_deref()).unwrap_or(FALLBACK_FORMAT),
+            Ok(None) => retain_format_query(
+                &self.query_error,
+                query_native_format(self.device_id.as_deref()),
+            )
+            .unwrap_or(FALLBACK_FORMAT),
             // Invalid requests are rejected by `start`; never use classic loopback.
-            Ok(Some(_)) | Err(_) => PROCESS_LOOPBACK_FORMAT,
+            Ok(Some(_)) | Err(_) => {
+                self.query_error.replace(None);
+                PROCESS_LOOPBACK_FORMAT
+            }
         });
         self
     }
@@ -191,25 +202,17 @@ impl Default for WasapiSystemBackend {
     }
 }
 
-/// Get `(rate, channels)` from the MixFormat of the render endpoint selected by
-/// `device_id` (`None` uses the default). Returns `None` if unavailable without
-/// panicking. Temporarily initializes COM to perform the query.
-fn query_native_format(device_id: Option<&str>) -> Option<(u32, u16)> {
-    let _com = ComThread::new();
+/// Query the selected native format with checked COM initialization and metadata.
+fn query_native_format(device_id: Option<&str>) -> Result<(u32, u16)> {
+    let _com = ComThread::new()?;
+    // SAFETY: all COM interfaces are owned and used only on this initialized thread.
     unsafe {
         let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-        let device = resolve_render_endpoint(&enumerator, device_id).ok()?;
-        let client: IAudioClient = device.Activate(CLSCTX_ALL, None).ok()?;
-        let pwfx = client.GetMixFormat().ok()?;
-        if pwfx.is_null() {
-            return None;
-        }
-        // Read packed fields by copying their values, as in parse_mix_format.
-        let rate = core::ptr::addr_of!((*pwfx).nSamplesPerSec).read_unaligned();
-        let channels = core::ptr::addr_of!((*pwfx).nChannels).read_unaligned();
-        CoTaskMemFree(Some(pwfx as *const _ as *const _));
-        Some((rate, channels))
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|error| map_hr("CoCreateInstance(MMDeviceEnumerator)", error))?;
+        let device = resolve_render_endpoint(&enumerator, device_id)?;
+        endpoint_mix_format(&device)
+            .map_err(|error| error.with_context(ErrorContext::new(Operation::Start)))
     }
 }
 
@@ -228,7 +231,7 @@ unsafe fn resolve_render_endpoint(
     let Some(id) = device_id else {
         return enumerator
             .GetDefaultAudioEndpoint(eRender, eConsole)
-            .map_err(|_e| Error::DeviceNotFound);
+            .map_err(|error| map_hr("IMMDeviceEnumerator::GetDefaultAudioEndpoint", error));
     };
 
     let collection = enumerator
@@ -239,31 +242,39 @@ unsafe fn resolve_render_endpoint(
         .map_err(|e| map_hr("IMMDeviceCollection::GetCount", e))?;
 
     for i in 0..count {
-        let device = match collection.Item(i) {
-            Ok(d) => d,
-            Err(_e) => continue,
-        };
-        if endpoint_friendly_name(&device).as_deref() == Some(id) {
+        let device = collection
+            .Item(i)
+            .map_err(|error| map_hr("IMMDeviceCollection::Item", error))?;
+        if endpoint_friendly_name(&device)? == id {
             return Ok(device);
         }
     }
     Err(Error::DeviceNotFound)
 }
 
-/// Read FriendlyName from the endpoint's property store. Returns `None` on failure.
+/// Read the required endpoint name, preserving property-store query failures.
 ///
 /// # Safety
 /// COM must be initialized on the calling thread, and `device` must be a valid `IMMDevice`.
-unsafe fn endpoint_friendly_name(device: &IMMDevice) -> Option<String> {
-    let store = device.OpenPropertyStore(STGM_READ).ok()?;
-    let value = store.GetValue(&PKEY_Device_FriendlyName).ok()?;
-    // PROPVARIANT's Display converts through PropVariantToBSTR (including VT_LPWSTR).
+unsafe fn endpoint_friendly_name(device: &IMMDevice) -> Result<String> {
+    let store = device
+        .OpenPropertyStore(STGM_READ)
+        .map_err(|error| map_hr_at(Operation::Enumerate, "IMMDevice::OpenPropertyStore", error))?;
+    let value = store.GetValue(&PKEY_Device_FriendlyName).map_err(|error| {
+        map_hr_at(
+            Operation::Enumerate,
+            "IPropertyStore::GetValue(FriendlyName)",
+            error,
+        )
+    })?;
     let name = value.to_string();
     if name.is_empty() {
-        None
-    } else {
-        Some(name)
+        return Err(Error::Backend(
+            "output device name is unavailable; retry device discovery".into(),
+        )
+        .with_context(ErrorContext::new(Operation::Enumerate)));
     }
+    Ok(name)
 }
 
 /// Enumerate active render (output) endpoints and return them as [`DeviceInfo`] entries.
@@ -272,52 +283,51 @@ unsafe fn endpoint_friendly_name(device: &IMMDevice) -> Option<String> {
 /// `sample_rate` and `channels` from MixFormat, and has
 /// [`SourceKind::SystemLoopback`] as `source_kind` and `true` for `is_loopback`.
 /// `is_default` is set on the entry whose FriendlyName matches the default render
-/// endpoint. Skip endpoints whose FriendlyName cannot be read.
+/// endpoint. Reject the snapshot if an endpoint FriendlyName cannot be read.
 pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
-    let _com = ComThread::new();
+    let _com = ComThread::new()?;
+    // SAFETY: this scope owns COM initialization and uses interfaces on one thread.
     unsafe {
         let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| {
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|error| {
                 map_hr_at(
                     Operation::Enumerate,
                     "CoCreateInstance(MMDeviceEnumerator)",
-                    e,
+                    error,
                 )
             })?;
-
-        // Default render FriendlyName, used to set is_default. Continue if unavailable.
-        let default_name = enumerator
-            .GetDefaultAudioEndpoint(eRender, eConsole)
-            .ok()
-            .and_then(|d| endpoint_friendly_name(&d));
-
+        let default_name = match enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
+            Ok(device) => Some(endpoint_friendly_name(&device)?),
+            // E_NOTFOUND is a successfully absent default, not a failed inventory.
+            Err(error) if error.code().0 as u32 == 0x8007_0490 => None,
+            Err(error) => {
+                return Err(map_hr_at(
+                    Operation::Enumerate,
+                    "IMMDeviceEnumerator::GetDefaultAudioEndpoint",
+                    error,
+                ))
+            }
+        };
         let collection = enumerator
             .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
-            .map_err(|e| {
+            .map_err(|error| {
                 map_hr_at(
                     Operation::Enumerate,
                     "IMMDeviceEnumerator::EnumAudioEndpoints",
-                    e,
+                    error,
                 )
             })?;
-        let count = collection
-            .GetCount()
-            .map_err(|e| map_hr_at(Operation::Enumerate, "IMMDeviceCollection::GetCount", e))?;
-
-        let mut out = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            let device = match collection.Item(i) {
-                Ok(d) => d,
-                Err(_e) => continue,
-            };
-            // Skip endpoints without a FriendlyName, since no id can be created.
-            let Some(name) = endpoint_friendly_name(&device) else {
-                continue;
-            };
-            // Get rate/channels from MixFormat, or use the required native format (48000/2).
-            let (sample_rate, channels) = endpoint_mix_format(&device).unwrap_or(FALLBACK_FORMAT);
+        let count = collection.GetCount().map_err(|error| {
+            map_hr_at(Operation::Enumerate, "IMMDeviceCollection::GetCount", error)
+        })?;
+        crate::inventory::collect_complete(0..count, |index| {
+            let device = collection.Item(index).map_err(|error| {
+                map_hr_at(Operation::Enumerate, "IMMDeviceCollection::Item", error)
+            })?;
+            let name = endpoint_friendly_name(&device)?;
+            let (sample_rate, channels) = endpoint_mix_format(&device)?;
             let is_default = default_name.as_deref() == Some(name.as_str());
-            out.push(DeviceInfo {
+            Ok(Some(DeviceInfo {
                 id: name.clone(),
                 name,
                 source_kind: SourceKind::SystemLoopback,
@@ -325,26 +335,36 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
                 channels,
                 is_loopback: true,
                 is_default,
-            });
-        }
-        Ok(out)
+            }))
+        })
     }
 }
 
-/// Get `(rate, channels)` from the endpoint's MixFormat. Returns `None` if unavailable.
+/// Read the required endpoint format, preserving native query failures.
 ///
 /// # Safety
 /// COM must be initialized on the calling thread, and `device` must be a valid `IMMDevice`.
-unsafe fn endpoint_mix_format(device: &IMMDevice) -> Option<(u32, u16)> {
-    let client: IAudioClient = device.Activate(CLSCTX_ALL, None).ok()?;
-    let pwfx = client.GetMixFormat().ok()?;
+unsafe fn endpoint_mix_format(device: &IMMDevice) -> Result<(u32, u16)> {
+    let client: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|error| {
+        map_hr_at(
+            Operation::Enumerate,
+            "IMMDevice::Activate(IAudioClient)",
+            error,
+        )
+    })?;
+    let pwfx = client
+        .GetMixFormat()
+        .map_err(|error| map_hr_at(Operation::Enumerate, "IAudioClient::GetMixFormat", error))?;
     if pwfx.is_null() {
-        return None;
+        return Err(Error::Backend(
+            "output device format query returned no description; retry discovery".into(),
+        )
+        .with_context(ErrorContext::new(Operation::Enumerate)));
     }
     let rate = core::ptr::addr_of!((*pwfx).nSamplesPerSec).read_unaligned();
     let channels = core::ptr::addr_of!((*pwfx).nChannels).read_unaligned();
     CoTaskMemFree(Some(pwfx as *const _ as *const _));
-    Some((rate, channels))
+    crate::inventory::positive_format(rate, channels)
 }
 
 impl CaptureBackend for WasapiSystemBackend {
@@ -355,7 +375,12 @@ impl CaptureBackend for WasapiSystemBackend {
         native_format_from_source(
             &self.native,
             self.handle.is_none() && matches!(self.exclude_root(), Ok(None)),
-            || query_native_format(self.device_id.as_deref()),
+            || {
+                retain_format_query(
+                    &self.query_error,
+                    query_native_format(self.device_id.as_deref()),
+                )
+            },
         )
     }
 
@@ -366,6 +391,9 @@ impl CaptureBackend for WasapiSystemBackend {
             return Ok(());
         }
         if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
+        if let Some(error) = self.query_error.borrow_mut().take() {
             return Err(error);
         }
         if exclude_root.is_some() {
@@ -388,10 +416,9 @@ impl CaptureBackend for WasapiSystemBackend {
             .spawn(move || {
                 run_system_thread(exclude_root, device_id, sink, stop_flag, ready_tx, event_tx)
             })
-            .map_err(|_| {
+            .map_err(|error| {
                 self.stop_flag.store(true, Ordering::SeqCst);
-                Error::Backend("capture owner thread could not be started".into())
-                    .with_context(ErrorContext::new(Operation::Start))
+                flexaudio_core::spawn_error("WASAPI system capture owner", error)
             })?;
 
         match ready_rx.recv() {
@@ -468,7 +495,13 @@ fn run_system_thread(
     event_tx: mpsc::Sender<Event>,
 ) -> ShutdownReport {
     // Initialize COM on this thread (uninitialize on drop). Declared first, dropped last.
-    let _com = ComThread::new();
+    let _com = match ComThread::new() {
+        Ok(com) => com,
+        Err(error) => {
+            let _ = ready_tx.send(Err(error));
+            return ShutdownReport::new(None, Vec::new());
+        }
+    };
 
     // Run setup to get an initialized client, capture service, event, and channel count.
     // Branch on exclude_root; both paths return the same type.
@@ -762,7 +795,7 @@ mod tests {
     #[test]
     fn classic_loopback_with_default_endpoint_starts_and_stops_cleanly() {
         {
-            let _com = ComThread::new();
+            let _com = ComThread::new().expect("COM initialization");
             let enumerator: IMMDeviceEnumerator = unsafe {
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
                     .expect("create endpoint enumerator for classic-loopback test")

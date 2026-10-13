@@ -19,3 +19,20 @@ pub enum EncodeError {
 
 /// Result type used throughout flexaudio-encode.
 pub type Result<T> = std::result::Result<T, EncodeError>;
+
+impl EncodeError {
+    /// Shared typed binding projection with opt-in original diagnostics.
+    /// Safe Display never includes output paths or third-party encoder messages.
+    pub fn audio_error(&self) -> flexaudio_core::Error {
+        use flexaudio_core::{AddonErrorKind as Kind, Error};
+        let kind = match self {
+            Self::Io(_) => Kind::FlacIo,
+            Self::Unsupported(_) => Kind::FlacUnsupported,
+            Self::Encoder(_) => Kind::FlacEncoder,
+        };
+        Error::Addon {
+            kind,
+            message: self.to_string(),
+        }
+    }
+}

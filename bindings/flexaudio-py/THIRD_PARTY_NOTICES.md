@@ -2633,15 +2633,15 @@ SOFTWARE.
 
 Used by:
 
-- [flexaudio 0.5.3](https://crates.io/crates/flexaudio/0.5.3)
-- [flexaudio-core 0.5.3](https://crates.io/crates/flexaudio-core/0.5.3)
-- [flexaudio-denoise 0.5.3](https://crates.io/crates/flexaudio-denoise/0.5.3)
-- [flexaudio-encode 0.5.3](https://crates.io/crates/flexaudio-encode/0.5.3)
-- [flexaudio-mic 0.5.3](https://crates.io/crates/flexaudio-mic/0.5.3)
-- [flexaudio-os-linux 0.5.3](https://crates.io/crates/flexaudio-os-linux/0.5.3)
-- [flexaudio-os-macos 0.5.3](https://crates.io/crates/flexaudio-os-macos/0.5.3)
-- [flexaudio-os-windows 0.5.3](https://crates.io/crates/flexaudio-os-windows/0.5.3)
-- [flexaudio-vad 0.5.3](https://crates.io/crates/flexaudio-vad/0.5.3)
+- [flexaudio 0.5.4](https://crates.io/crates/flexaudio/0.5.4)
+- [flexaudio-core 0.5.4](https://crates.io/crates/flexaudio-core/0.5.4)
+- [flexaudio-denoise 0.5.4](https://crates.io/crates/flexaudio-denoise/0.5.4)
+- [flexaudio-encode 0.5.4](https://crates.io/crates/flexaudio-encode/0.5.4)
+- [flexaudio-mic 0.5.4](https://crates.io/crates/flexaudio-mic/0.5.4)
+- [flexaudio-os-linux 0.5.4](https://crates.io/crates/flexaudio-os-linux/0.5.4)
+- [flexaudio-os-macos 0.5.4](https://crates.io/crates/flexaudio-os-macos/0.5.4)
+- [flexaudio-os-windows 0.5.4](https://crates.io/crates/flexaudio-os-windows/0.5.4)
+- [flexaudio-vad 0.5.4](https://crates.io/crates/flexaudio-vad/0.5.4)
 
 ````text
 MIT License

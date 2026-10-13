@@ -110,7 +110,16 @@ impl<E: Engine> IntegratedVad<E> {
     }
 
     pub fn flush(&mut self) -> Result<Vec<JsVadEvent>, VadError> {
-        let events = self.engine.flush()?;
+        let flushed = self.engine.flush();
+        let events = match flushed {
+            Ok(events) => events,
+            Err(error) => {
+                let retained = self.engine.take_pending_events();
+                let mapped = self.marshal(retained)?;
+                self.pending_events.extend(mapped);
+                return Err(error);
+            }
+        };
         let mapped = self.marshal(events);
         // A successful flush reset the engine; map its events on the old clock first.
         self.has_anchor = false;

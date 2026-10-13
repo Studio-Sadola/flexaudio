@@ -42,7 +42,7 @@ test('repro_p9_device_event_union', () => {
     added: '; device: JsDeviceInfo', removed: '; id: string',
     defaultChanged: "; sourceKind: 'mic' | 'system'; id: string",
     defaultCleared: "; sourceKind: 'mic' | 'system'", rescanRequired: '; droppedEvents: bigint',
-    unknown: '; message: string',
+    terminalError: '; error: AudioError', unknown: '; message: string',
   });
 });
 test('repro_p9_event_union_control', () => {

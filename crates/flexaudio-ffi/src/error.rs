@@ -72,10 +72,9 @@ pub(crate) fn take_open_failure() -> Option<flexaudio::Error> {
 ///
 /// CString rejects embedded NUL bytes, so replace such messages with a fixed string.
 /// Always set last_error, even if the original message is lost.
+/// A message alone has no typed cause and clears any previous typed error.
 pub fn set_last_error(msg: impl Into<String>) {
-    LAST_AUDIO_ERROR.with(|slot| {
-        *slot.borrow_mut() = Some(flexaudio::Error::InvalidArg("invalid FFI argument".into()))
-    });
+    LAST_AUDIO_ERROR.with(|slot| *slot.borrow_mut() = None);
     let cstring = CString::new(msg.into())
         .unwrap_or_else(|_| CString::new("error message contained a NUL byte").unwrap());
     LAST_ERROR.with(|slot| *slot.borrow_mut() = Some(cstring));
@@ -121,11 +120,47 @@ pub(crate) fn root_code(error: &flexaudio::Error) -> i32 {
 }
 /// Store a safe message and the original typed tree together.
 pub(crate) fn set_audio_error(error: flexaudio::Error) -> i32 {
+    let message = error.to_string();
+    set_audio_error_with_message(error, message)
+}
+
+/// C v1 addon operations keep their legacy cause text while v2 retains the typed tree.
+pub(crate) fn set_audio_error_with_message(error: flexaudio::Error, message: String) -> i32 {
     let code = root_code(&error);
-    set_last_error(error.to_string());
+    set_last_error(message);
     LAST_AUDIO_ERROR.with(|slot| *slot.borrow_mut() = Some(error));
     code
 }
 pub(crate) fn last_audio_error() -> Option<flexaudio::Error> {
     LAST_AUDIO_ERROR.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+mod addon_tests {
+    use super::*;
+    #[test]
+    fn vad_failure_keeps_the_original_typed_addon_cause() {
+        let code = crate::vad::vad_failure(flexaudio_vad::VadError::Inference(
+            "injected inference cause".into(),
+        ));
+        assert_eq!(code, code::FLEX_FAILURE);
+        let error = last_audio_error().unwrap();
+        assert_eq!(
+            error.addon_kind(),
+            Some(flexaudio::core::AddonErrorKind::VadInference)
+        );
+        assert!(format!("{error:?}").contains("injected inference cause"));
+        assert!(!error.to_string().contains("injected inference cause"));
+    }
+}
+
+#[cfg(test)]
+mod round2_tests {
+    use super::*;
+    #[test]
+    fn round2_message_only_failure_has_no_fabricated_typed_cause() {
+        set_audio_error(flexaudio::Error::DeviceLost);
+        set_last_error("legacy message");
+        assert_eq!(last_audio_error(), None);
+    }
 }

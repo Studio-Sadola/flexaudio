@@ -42,6 +42,13 @@ impl AttachedWhisperVadEvent {
 /// Capture adapter errors, separate from the standalone canonical session contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhisperVadTapError {
+    /// Existing public capture failure identity with its original converter cause.
+    Cause {
+        /// Existing public capture failure identity.
+        primary: Box<WhisperVadTapError>,
+        /// Original typed converter cause.
+        source: crate::VadError,
+    },
     /// Shared model, parameter, inference or session failure.
     Vad(WhisperVadError),
     /// A capture feed must contain complete stereo frames.
@@ -74,11 +81,27 @@ impl std::fmt::Display for WhisperVadTapError {
 impl std::error::Error for WhisperVadTapError {}
 
 impl WhisperVadTapError {
+    /// Existing public failure identity, ignoring retained converter diagnostics.
+    pub fn root(&self) -> &Self {
+        match self {
+            Self::Cause { primary, .. } => primary.root(),
+            error => error,
+        }
+    }
+    /// Original typed model or converter cause, available as structured data.
+    pub fn cause(&self) -> Option<&crate::VadError> {
+        match self {
+            Self::Cause { source, .. } => Some(source),
+            Self::Vad(error) => error.cause(),
+            _ => None,
+        }
+    }
     /// One shared projection into a retained processor cleanup cause; capture stays independent.
     pub fn code(&self) -> flexaudio_core::WhisperCode {
         use flexaudio_core::WhisperCode;
         match self {
-            Self::Vad(error) => match error {
+            Self::Cause { primary, .. } => primary.code(),
+            Self::Vad(error) => match error.root() {
                 WhisperVadError::InvalidParameter { .. } => WhisperCode::InvalidParameter,
                 WhisperVadError::InvalidProbability { .. } => WhisperCode::InvalidProbability,
                 WhisperVadError::InvalidPcm { .. } => WhisperCode::InvalidPcm,
@@ -87,6 +110,7 @@ impl WhisperVadTapError {
                 WhisperVadError::Inference => WhisperCode::Inference,
                 WhisperVadError::ModelLoad => WhisperCode::ModelLoad,
                 WhisperVadError::FailedSession => WhisperCode::FailedSession,
+                WhisperVadError::Cause { primary, .. } => Self::Vad((**primary).clone()).code(),
             },
             Self::InvalidStereoLength => WhisperCode::InvalidStereoLength,
             Self::InvalidPcm { .. } => WhisperCode::InvalidPcm,
@@ -101,7 +125,15 @@ impl WhisperVadTapError {
 
     /// Retain the typed processor failure independently of capture's outcome.
     pub fn audio_error(&self) -> flexaudio_core::Error {
-        flexaudio_core::Error::WhisperVad { code: self.code() }
+        let primary = flexaudio_core::Error::WhisperVad { code: self.code() };
+        match self.cause() {
+            Some(source) => flexaudio_core::Error::Multiple(flexaudio_core::ErrorGroup::new(
+                primary,
+                source.audio_error(),
+                Vec::new(),
+            )),
+            None => primary,
+        }
     }
 }
 
@@ -126,5 +158,32 @@ impl From<WhisperVadTapError> for WhisperVadTapFailure {
             error,
             terminal_events: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod cause_tests {
+    use super::*;
+    #[test]
+    fn nested_model_cause_is_retained_without_failing_capture_shutdown() {
+        let cause = crate::VadError::Inference("injected model inference cause".into());
+        let error = WhisperVadTapError::Vad(WhisperVadError::Cause {
+            primary: Box::new(WhisperVadError::Inference),
+            source: cause.clone(),
+        });
+        let projected = error.audio_error();
+        assert_eq!(
+            projected.whisper_code(),
+            Some(flexaudio_core::WhisperCode::Inference)
+        );
+        match &projected {
+            flexaudio_core::Error::Multiple(group) => {
+                assert_eq!(group.secondary().next(), Some(&cause.audio_error()))
+            }
+            _ => panic!("original model cause must remain structured"),
+        }
+        assert!(flexaudio_core::ShutdownReport::new(None, vec![projected])
+            .result()
+            .is_ok());
     }
 }

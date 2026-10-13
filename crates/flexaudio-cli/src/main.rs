@@ -944,64 +944,57 @@ fn run_wav(
     let mut writer = RotatingWavWriter::new(&cli.out, output, cli.split_seconds);
     let mut chunk_count: u64 = 0;
 
-    // Poll chunks for the full recording duration and write them all. A duration that no clock can
-    // reach (for example `--seconds` near u64::MAX) is a typed argument error, not a panic.
-    let Some(deadline) = start.checked_add(total) else {
-        stream.stop();
-        return Err(describe_error(Error::InvalidArg(
-            "the recording duration is too large: its deadline overflows the clock".into(),
-        )));
-    };
-    while Instant::now() < deadline {
-        // Switch sources at segment boundaries, independently of output-file rotation.
-        if let Some(sch) = scheduler.as_mut() {
-            if let Err(error) = sch.tick(stream, Instant::now()) {
-                stream.stop();
-                return Err(describe_error(error));
+    let capture_result = (|| -> std::result::Result<(), String> {
+        let deadline = start.checked_add(total).ok_or_else(|| {
+            describe_error(Error::InvalidArg(
+                "the recording duration is too large: its deadline overflows the clock".into(),
+            ))
+        })?;
+        while Instant::now() < deadline {
+            if let Some(scheduler) = scheduler.as_mut() {
+                scheduler
+                    .tick(stream, Instant::now())
+                    .map_err(describe_error)?;
+            }
+            drain_capture_events(stream)?;
+            let mut got_any = false;
+            while let Some(chunk) = stream.poll_chunk() {
+                got_any = true;
+                chunk_count += 1;
+                write_wav_chunk(&mut writer, &chunk)?;
+            }
+            drain_capture_events(stream)?;
+            if !got_any {
+                thread::sleep(Duration::from_millis(10));
             }
         }
-
-        drain_capture_events(stream)?;
-        let mut got_any = false;
-        while let Some(chunk) = stream.poll_chunk() {
-            got_any = true;
-            chunk_count += 1;
-            if let Err(e) = write_wav_chunk(&mut writer, &chunk) {
-                stream.stop();
-                return Err(e);
-            }
-        }
-        drain_capture_events(stream)?;
-        if !got_any {
-            // One chunk is about 20 ms. Sleep briefly to avoid spinning.
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    let dropped = stream.dropped_chunks();
+        Ok(())
+    })();
+    // One teardown path checks both capture and file completion on every exit.
     stream.stop();
-    drain_capture_events(stream)?;
-
-    // Write any chunks remaining in the ring after stop (no dropped data).
-    while let Some(chunk) = stream.poll_chunk() {
-        chunk_count += 1;
-        write_wav_chunk(&mut writer, &chunk)?;
+    let completion_result = (|| -> std::result::Result<(), String> {
+        drain_capture_events(stream)?;
+        while let Some(chunk) = stream.poll_chunk() {
+            chunk_count += 1;
+            write_wav_chunk(&mut writer, &chunk)?;
+        }
+        Ok(())
+    })();
+    let capture_result = match (capture_result, completion_result) {
+        (Ok(()), result) => result,
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(cleanup)) if primary == cleanup => Err(primary),
+        (Err(primary), Err(cleanup)) => Err(format!("{primary}; related failure: {cleanup}")),
+    };
+    if chunk_count == 0 && capture_result.is_ok() {
+        eprintln!("Warning: No audio was captured (the source may be silent/excluded or the selected endpoint may be inactive). No WAV was created.");
     }
-
-    // Recording ran even if no chunks arrived, so do not fail. Write an empty WAV and warn (this
-    // can happen if the source is silent/excluded or the selected endpoint is inactive).
-    if chunk_count == 0 {
-        eprintln!(
-            "Warning: No audio was captured (the source may be silent/excluded or the selected endpoint \
-             may be inactive). Writing an empty WAV."
-        );
-    }
-
-    // Finish writing, finalize the open WAV header, and get peak / RMS for the full recording.
-    // WAV output is currently fixed to s16 (apply `encoding` to WAV output if f32 WAV is needed).
-    let summary = writer
-        .finish()
-        .map_err(|e| format!("Failed to write WAV: {e}"))?;
+    let dropped = stream.dropped_chunks();
+    let summary = complete_wav(capture_result, || {
+        writer
+            .finish()
+            .map_err(|error| format!("Failed to write WAV: {error}"))
+    })?;
     let total_frames = summary.total_frames;
     let stats = summary.stats;
 
@@ -1033,9 +1026,10 @@ fn run_wav(
         stats.rms,
         fmt_dbfs(rms_dbfs)
     );
-    // When split recording creates multiple files, show the first and last numbered paths (`finish`
-    // guarantees at least one file, so `files` is nonempty). For one file, show its path as before.
-    if summary.files.len() == 1 {
+    // No delivered chunks leave the destination untouched; otherwise show actual output paths.
+    if summary.files.is_empty() {
+        println!("WAV output         : none (no audio chunks received)");
+    } else if summary.files.len() == 1 {
         println!("WAV output         : {}", summary.files[0].display());
     } else {
         println!(
@@ -1406,18 +1400,12 @@ impl RotatingWavWriter {
         Ok(None)
     }
 
-    /// Finish recording and finalize the open WAV header. If no chunks arrived, write one empty WAV
-    /// as before (numbered file 1 when splitting), so the returned `files` contains at least one
-    /// entry. Also return whole-recording statistics and total frames.
+    /// Finalize only a WAV that was started by write_chunk. An untouched destination
+    /// remains untouched when capture failed before delivering its first chunk.
+    /// Return whole-recording statistics and paths of files that were actually started.
     fn finish(mut self) -> hound::Result<WavSummary> {
-        validate_output_path(&self.base)?;
         if let Some(writer) = self.writer.take() {
             writer.finalize()?;
-        } else if self.files.is_empty() {
-            // No chunks arrived. Leave an empty WAV as evidence that recording ran (legacy behavior).
-            let path = self.next_path();
-            hound::WavWriter::create(&path, self.spec)?.finalize()?;
-            self.files.push(path);
         }
         let rms = if self.samples > 0 {
             (self.sum_sq / self.samples as f64).sqrt()
@@ -1454,6 +1442,18 @@ fn write_wav_chunk(
     }
 }
 
+/// Retain capture and finalization errors in observation order.
+fn complete_wav<T>(
+    capture: std::result::Result<(), String>,
+    finish: impl FnOnce() -> std::result::Result<T, String>,
+) -> std::result::Result<T, String> {
+    match (capture, finish()) {
+        (Ok(()), result) => result,
+        (Err(primary), Ok(_)) => Err(primary),
+        (Err(primary), Err(cleanup)) => Err(format!("{primary}; related failure: {cleanup}")),
+    }
+}
+
 /// Format dBFS for readability (`-inf dBFS` for silence).
 fn fmt_dbfs(db: f64) -> String {
     if db.is_finite() {
@@ -1466,6 +1466,15 @@ fn fmt_dbfs(db: f64) -> String {
 /// Convert a [`Error`] from `flexaudio` to a human-readable message.
 ///
 /// Replace a missing-device (`DeviceNotFound`) error with guidance to run on real hardware.
+fn error_operation(error: &Error) -> Option<flexaudio::core::Operation> {
+    match error {
+        Error::Context { context, .. } => Some(context.operation()),
+        Error::Diagnostic { source, .. } => error_operation(source),
+        Error::Multiple(group) => error_operation(group.primary()),
+        _ => None,
+    }
+}
+
 fn describe_error(err: Error) -> String {
     let mut message = match &err {
         Error::DeviceNotFound => {
@@ -1476,7 +1485,20 @@ fn describe_error(err: Error) -> String {
         Error::DeviceLost => {
             "The input device was lost during capture (for example, disconnected).".into()
         }
-        _ => format!("Failed to initialize stream: {err}"),
+        _ => {
+            use flexaudio::core::Operation;
+            let prefix = match error_operation(&err) {
+                Some(Operation::Start) => "Failed to initialize stream",
+                Some(Operation::Enumerate) => "Failed to enumerate audio sources",
+                Some(Operation::Normalize | Operation::Link) => "Failed during capture",
+                Some(Operation::Flush) => "Failed to finalize stream",
+                Some(Operation::Reopen) => "Failed to reopen stream",
+                Some(Operation::Rollback) => "Failed to restore stream",
+                Some(Operation::Stop | Operation::Join) => "Failed to stop stream",
+                _ => "Stream failed",
+            };
+            format!("{prefix}: {err}")
+        }
     };
     // The user's terminal explicitly opts into structured permission diagnostics.
     // Display remains safe for other library consumers, including wrapped errors.
@@ -1805,7 +1827,7 @@ mod tests {
         assert!(describe_error(Error::DeviceLost).contains("lost"));
         // Other variants include the generic message and Display output.
         let msg = describe_error(Error::Unsupported);
-        assert!(msg.contains("Failed to initialize stream"));
+        assert!(msg.contains("Stream failed"));
     }
 
     /// The DeviceNotFound message is source-neutral (does not assume mic). It also gives useful
@@ -2143,32 +2165,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `finish` leaves one empty WAV even if no chunks arrive (preserves legacy behavior).
-    /// Without splitting it uses the base path; with splitting it uses index 1.
+    /// A writer with no chunks leaves both unsplit and split destinations untouched.
     #[test]
-    fn rotating_writer_finish_writes_empty_wav_when_no_chunks() {
+    fn rotating_writer_finish_leaves_destination_untouched_when_no_chunks() {
         let output = OutputFormat {
             sample_rate: 16_000,
             channels: 2,
         };
         let dir = test_dir("split_empty");
 
-        // No splitting -> capture.wav (as before).
+        // An unsplit destination stays absent.
         let base = dir.join("capture.wav");
         let summary = RotatingWavWriter::new(&base, output, 0)
             .finish()
             .expect("finish");
-        assert_eq!(summary.files, vec![base.clone()]);
+        assert!(summary.files.is_empty());
         assert_eq!(summary.total_frames, 0);
-        assert_eq!(wav_frames(&base), 0);
+        assert!(!base.exists());
 
-        // With splitting -> rec-001.wav (empty first file).
+        // A split destination also stays absent.
         let base2 = dir.join("rec.wav");
         let summary2 = RotatingWavWriter::new(&base2, output, 5)
             .finish()
             .expect("finish");
-        assert_eq!(summary2.files, vec![dir.join("rec-001.wav")]);
-        assert_eq!(wav_frames(&dir.join("rec-001.wav")), 0);
+        assert!(summary2.files.is_empty());
+        assert!(!dir.join("rec-001.wav").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2277,7 +2298,14 @@ mod tests {
     /// the preflight overflow error, not a device/open error, and no device is required here.
     #[test]
     fn run_rejects_duration_overflow_before_opening_stream() {
-        let cli = cli_from(&["--seconds", "18446744073709551615"]);
+        let dir = test_dir("deadline_overflow");
+        let destination = dir.join("capture.wav");
+        let cli = cli_from(&[
+            "--seconds",
+            "18446744073709551615",
+            "--out",
+            destination.to_str().unwrap(),
+        ]);
         let err = run(&cli).expect_err("overflow must be rejected before open");
         assert!(err.contains("deadline overflows the clock"), "err: {err}");
     }
@@ -2432,6 +2460,39 @@ mod reproduction_tests {
         }
         std::fs::remove_dir_all(dir).expect("remove test output");
         result
+    }
+
+    #[test]
+    fn silent_failure_runtime_wav_error_does_not_finalize_unstarted_output() {
+        let dir = test_dir("runtime-finalize");
+        let mut cli = cli_from(&["--seconds", "1"]);
+        cli.out = dir.join("missing").join("rec.wav");
+        let config = StreamConfig::default();
+        let output = config.output;
+        let backend = ReproFinalEventBackend {
+            inner: flexaudio::MockBackend::new(48_000, 1, 440.0),
+            stopped: false,
+            final_events: Vec::new().into(),
+            running_events: vec![flexaudio::Event::TerminalError {
+                error: Error::Backend("runtime test failure".into()),
+            }]
+            .into(),
+            cleanup_error: None,
+        };
+        let mut stream = Stream::open(config, Box::new(backend)).unwrap();
+        stream.start().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while stream.terminal_error().is_none() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+        let error = run_wav(&cli, &mut stream, output, None).unwrap_err();
+        assert!(error.contains("runtime test failure"), "{error}");
+        assert!(
+            !error.contains("Failed to write WAV"),
+            "unstarted output must not invent a finalization failure: {error}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2590,7 +2651,14 @@ mod reproduction_tests {
 
     #[test]
     fn repro_p12_f50_deadline_overflow() {
-        let cli = cli_from(&["--seconds", "18446744073709551615"]);
+        let dir = test_dir("deadline_overflow");
+        let destination = dir.join("capture.wav");
+        let cli = cli_from(&[
+            "--seconds",
+            "18446744073709551615",
+            "--out",
+            destination.to_str().unwrap(),
+        ]);
         let config = StreamConfig::default();
         let output = config.output;
         let mut stream = Stream::open(
@@ -2603,6 +2671,11 @@ mod reproduction_tests {
         }));
         stream.stop();
         assert!(result.is_ok(), "accepted recording duration must not panic");
+        assert!(
+            !destination.exists(),
+            "deadline failure must not create a WAV"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2630,5 +2703,72 @@ mod reproduction_tests {
         assert!(message.contains("system audio"));
         assert!(message.contains("target process access restricted"));
         assert!(!message.contains("Microphone permission denied"));
+    }
+}
+
+#[cfg(test)]
+mod operation_error_tests {
+    use super::*;
+    #[test]
+    fn silent_failure_runtime_and_cleanup_errors_use_their_operation() {
+        for (operation, expected) in [
+            (
+                flexaudio::core::Operation::Normalize,
+                "Failed during capture",
+            ),
+            (
+                flexaudio::core::Operation::Flush,
+                "Failed to finalize stream",
+            ),
+        ] {
+            let error = Error::Backend("test failure".into())
+                .with_context(flexaudio::core::ErrorContext::new(operation));
+            assert!(describe_error(error).starts_with(expected));
+        }
+    }
+}
+
+#[cfg(test)]
+mod round2_tests {
+    use super::*;
+    #[test]
+    fn round2_early_failure_never_creates_or_truncates_wav() {
+        let dir = std::env::temp_dir().join(format!("flexaudio-round2-wav-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for split in [0, 5] {
+            let base = dir.join(format!("recording-{split}.wav"));
+            let actual = if split == 0 {
+                base.clone()
+            } else {
+                split_file_path(&base, 1)
+            };
+            for existing in [false, true] {
+                if existing {
+                    std::fs::write(&actual, b"original destination").unwrap();
+                }
+                let writer = RotatingWavWriter::new(
+                    &base,
+                    OutputFormat {
+                        sample_rate: 48_000,
+                        channels: 1,
+                    },
+                    split,
+                );
+                assert_eq!(
+                    complete_wav(Err("capture failed".into()), || writer
+                        .finish()
+                        .map_err(|e| e.to_string()))
+                    .err()
+                    .unwrap(),
+                    "capture failed"
+                );
+                if existing {
+                    assert_eq!(std::fs::read(&actual).unwrap(), b"original destination");
+                } else {
+                    assert!(!actual.exists(), "early failure created a destination");
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

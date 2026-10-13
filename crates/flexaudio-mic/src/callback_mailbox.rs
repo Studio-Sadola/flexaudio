@@ -1,13 +1,18 @@
-// One preallocated slot for the first CPAL runtime failure of a capture generation.
+// One preallocated slot for the first native or callback panic failure of a capture generation.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+pub(crate) enum CallbackFailure {
+    Native(cpal::StreamError),
+    Panicked,
+}
+
 pub(crate) struct CallbackMailbox {
     claimed: AtomicBool,
     ready: AtomicBool,
-    error: UnsafeCell<Option<cpal::StreamError>>,
+    error: UnsafeCell<Option<CallbackFailure>>,
     stop_flag: Arc<AtomicBool>,
 }
 
@@ -27,7 +32,17 @@ impl CallbackMailbox {
         }
     }
 
+    pub(crate) fn guard(&self, callback: impl FnOnce()) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)).is_err() {
+            self.record_failure(CallbackFailure::Panicked);
+        }
+    }
+
     pub(crate) fn record(&self, error: cpal::StreamError) {
+        self.record_failure(CallbackFailure::Native(error));
+    }
+
+    fn record_failure(&self, error: CallbackFailure) {
         if self
             .claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -43,7 +58,7 @@ impl CallbackMailbox {
         self.ready.store(true, Ordering::Release);
     }
 
-    pub(crate) fn take(&self) -> Option<cpal::StreamError> {
+    pub(crate) fn take(&self) -> Option<CallbackFailure> {
         if !self.ready.swap(false, Ordering::Acquire) {
             return None;
         }

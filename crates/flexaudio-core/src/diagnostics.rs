@@ -3,7 +3,7 @@ use crate::loss::CaptureRejection;
 use crate::{AudioLoss, Result};
 use std::num::NonZeroU64;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -16,6 +16,7 @@ pub struct CaptureDiagnostics {
     inner: Arc<Pending>,
 }
 struct Pending {
+    discontinuity: AtomicBool,
     startup_drop: Mutex<Option<(u64, u32)>>,
     summaries: [AtomicU64; 3],
     rate: u32,
@@ -26,6 +27,7 @@ impl CaptureDiagnostics {
     pub fn new(rate: u32, channels: u16) -> Self {
         Self {
             inner: Arc::new(Pending {
+                discontinuity: AtomicBool::new(false),
                 startup_drop: Mutex::new(None),
                 summaries: std::array::from_fn(|_| AtomicU64::new(0)),
                 rate,
@@ -49,6 +51,14 @@ impl CaptureDiagnostics {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take()
+    }
+    /// Mark routing changes without allocating or locking in the native callback.
+    pub fn mark_discontinuity(&self) {
+        self.inner.discontinuity.store(true, Ordering::Release);
+    }
+    /// Consume a routing change once, outside realtime callbacks.
+    pub fn take_discontinuity(&self) -> bool {
+        self.inner.discontinuity.swap(false, Ordering::AcqRel)
     }
     fn record(&self, index: usize, samples: Option<NonZeroU64>) {
         let summary = &self.inner.summaries[index];
@@ -163,5 +173,19 @@ mod startup_tests {
         diagnostics.record_startup_drop(441, 44_100);
         assert_eq!(diagnostics.clone().take_startup_drop(), Some((441, 44_100)));
         assert_eq!(diagnostics.take_startup_drop(), None);
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    #[test]
+    fn routing_discontinuity_is_sticky_and_consumed_once() {
+        let diagnostics = CaptureDiagnostics::new(48_000, 2);
+        assert!(!diagnostics.take_discontinuity());
+        diagnostics.mark_discontinuity();
+        diagnostics.mark_discontinuity();
+        assert!(diagnostics.clone().take_discontinuity());
+        assert!(!diagnostics.take_discontinuity());
     }
 }

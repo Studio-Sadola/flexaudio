@@ -19,7 +19,7 @@ use objc2_core_audio::{
     kAudioHardwareBadPropertySizeError, kAudioHardwarePropertyTranslatePIDToProcessObject,
     kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject,
     kAudioTapPropertyFormat, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
-    AudioObjectID, AudioObjectPropertyAddress,
+    AudioObjectHasProperty, AudioObjectID, AudioObjectPropertyAddress,
 };
 use objc2_core_audio_types::{
     kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved,
@@ -108,20 +108,22 @@ fn global_address(selector: u32) -> AudioObjectPropertyAddress {
     property_address(selector, kAudioObjectPropertyScopeGlobal)
 }
 
-/// Read a CFString property (device name / UID / process bundle ID) as a `String`. Returns `None`
-/// if it cannot be read.
-///
-/// These properties return a `CFStringRef` with +1 retain (the CF Copy rule). Take ownership with
-/// `CFRetained::from_raw` and release it on drop.
-pub(crate) fn read_cfstring_property(
+/// Query an optional CFString; absence is distinct from a failed native query.
+/// Returned CFString references follow the Copy rule and are released on exit.
+pub(crate) fn query_cfstring_property(
     object: AudioObjectID,
     selector: u32,
     scope: u32,
-) -> Option<String> {
+) -> Result<Option<String>, Error> {
     let addr = property_address(selector, scope);
+    // SAFETY: addr is a live initialized property address; no property payload is read.
+    if !unsafe { AudioObjectHasProperty(object, NonNull::from(&addr)) } {
+        return Ok(None);
+    }
     let mut cf_ref: *const CFString = core::ptr::null();
-    let mut size = core::mem::size_of::<*const CFString>() as u32;
-    // SAFETY: `addr`/`size` are valid locals. `out` points to storage for one CFStringRef.
+    let expected_size = core::mem::size_of::<*const CFString>() as u32;
+    let mut size = expected_size;
+    // SAFETY: storage is writable for one owned CFStringRef and the supplied capacity.
     let status = unsafe {
         AudioObjectGetPropertyData(
             object,
@@ -132,13 +134,37 @@ pub(crate) fn read_cfstring_property(
             NonNull::new_unchecked((&mut cf_ref as *mut *const CFString).cast::<c_void>()),
         )
     };
-    if status != NO_ERR || cf_ref.is_null() {
-        return None;
+    if status != NO_ERR {
+        return Err(map_os_status_at(
+            Operation::Enumerate,
+            "AudioObjectGetPropertyData(CFString)",
+            status,
+        ));
     }
-    // SAFETY: `cf_ref` is a valid CFString returned by the OS with +1 retain. `from_raw` takes
-    // ownership, and drop releases it when this function exits.
-    let cf = unsafe { CFRetained::from_raw(NonNull::new_unchecked(cf_ref as *mut CFString)) };
-    Some(cf.to_string())
+    if size != expected_size {
+        return Err(Error::Backend(
+            "native text property returned an invalid size; retry discovery".into(),
+        )
+        .with_context(ErrorContext::new(Operation::Enumerate)));
+    }
+    let Some(cf_ref) = NonNull::new(cf_ref as *mut CFString) else {
+        return Ok(None);
+    };
+    // SAFETY: the successful native query returned a retained CFString owned by this call.
+    let cf = unsafe { CFRetained::from_raw(cf_ref) };
+    let value = cf.to_string();
+    Ok((!value.is_empty()).then_some(value))
+}
+
+/// Health inference explicitly treats a failed query as unknown and makes no denial claim.
+pub(crate) fn read_cfstring_property(
+    object: AudioObjectID,
+    selector: u32,
+    scope: u32,
+) -> Option<String> {
+    query_cfstring_property(object, selector, scope)
+        .ok()
+        .flatten()
 }
 
 /// Convert a PID to an `AudioObjectID` (process object).

@@ -1,6 +1,6 @@
 //! One checked binding teardown, shared by explicit stop and free.
 use crate::types::FlexStream;
-use flexaudio::{AudioChunk, ChunkFlags, Error, ErrorContext, Operation, ShutdownReport};
+use flexaudio::{AudioChunk, ChunkFlags, ErrorContext, Operation, ShutdownReport};
 
 impl FlexStream {
     pub(crate) fn poll_binding_event(&mut self) -> Option<flexaudio::Event> {
@@ -38,9 +38,10 @@ impl FlexStream {
                     match self.poll_processed() {
                         Ok(Some(chunk)) => chunks.push(chunk),
                         Ok(None) => break,
-                        Err(_) => {
+                        Err(error) => {
                             cleanup.push(
-                                Error::Backend("binding processing failed during shutdown".into())
+                                error
+                                    .audio_error()
                                     .with_context(ErrorContext::new(Operation::Flush)),
                             );
                             break;
@@ -56,19 +57,19 @@ impl FlexStream {
                     .map(flexaudio_denoise::Denoiser::flush)
                     .unwrap_or_default();
                 if let Some(vad) = self.vad.as_mut() {
-                    if !tail.is_empty() {
-                        match vad.process_pcm(&tail, output.sample_rate, output.channels) {
-                            Ok(e) => events.extend(e),
-                            Err(_) => cleanup.push(
-                                Error::Backend("VAD tail processing failed".into())
-                                    .with_context(ErrorContext::new(Operation::Flush)),
-                            ),
+                    let outcome = flexaudio_vad::finish_capture_gap(vad, |vad| {
+                        if tail.is_empty() {
+                            Ok(Vec::new())
+                        } else {
+                            vad.process_pcm(&tail, output.sample_rate, output.channels)
                         }
-                    }
-                    match vad.flush() {
-                        Ok(e) => events.extend(e),
-                        Err(_) => cleanup.push(
-                            Error::Backend("VAD flush failed".into())
+                    });
+                    events.extend(outcome.flushed);
+                    match outcome.processed {
+                        Ok(remaining) => events.extend(remaining),
+                        Err(error) => cleanup.push(
+                            error
+                                .audio_error()
                                 .with_context(ErrorContext::new(Operation::Flush)),
                         ),
                     }

@@ -12,7 +12,7 @@ pyo3::create_exception!(flexaudio, WhisperVadValidationError, PyValueError);
 pyo3::create_exception!(flexaudio, WhisperVadRuntimeError, PyRuntimeError);
 
 fn code(e: &WhisperVadError) -> &'static str {
-    match e {
+    match e.root() {
         WhisperVadError::InvalidParameter { .. } => "InvalidParameter",
         WhisperVadError::InvalidProbability { .. } => "InvalidProbability",
         WhisperVadError::InvalidPcm { .. } => "InvalidPcm",
@@ -21,10 +21,11 @@ fn code(e: &WhisperVadError) -> &'static str {
         WhisperVadError::Inference => "Inference",
         WhisperVadError::ModelLoad => "ModelLoad",
         WhisperVadError::FailedSession => "FailedSession",
+        WhisperVadError::Cause { primary, .. } => code(primary),
     }
 }
 pub(crate) fn failure_to_py(py: Python<'_>, f: WhisperVadFailure) -> PyErr {
-    let error = match f.error {
+    let error = match f.error.root() {
         WhisperVadError::InvalidParameter { .. }
         | WhisperVadError::InvalidProbability { .. }
         | WhisperVadError::InvalidPcm { .. }
@@ -35,6 +36,14 @@ pub(crate) fn failure_to_py(py: Python<'_>, f: WhisperVadFailure) -> PyErr {
     };
     if let Err(e) = error.value(py).setattr("code", code(&f.error)) {
         return e;
+    }
+    match Py::new(py, crate::errors::AudioError(f.error.audio_error())) {
+        Ok(audio_error) => {
+            if let Err(error) = error.value(py).setattr("audio_error", audio_error) {
+                return error;
+            }
+        }
+        Err(error) => return error,
     }
     match marshal::events_to_py(py, f.terminal_events) {
         Ok(events) => {
@@ -50,6 +59,17 @@ pub(crate) fn boundary_error(py: Python<'_>, code: &str, message: &str) -> PyErr
     let error = WhisperVadValidationError::new_err(message.to_string());
     if let Err(e) = error.value(py).setattr("code", code) {
         return e;
+    }
+    match Py::new(
+        py,
+        crate::errors::AudioError(::flexaudio::Error::InvalidArg(message.to_owned())),
+    ) {
+        Ok(audio_error) => {
+            if let Err(error) = error.value(py).setattr("audio_error", audio_error) {
+                return error;
+            }
+        }
+        Err(error) => return error,
     }
     if let Err(e) = error
         .value(py)
@@ -360,7 +380,8 @@ mod tests;
 
 pub(crate) fn tap_error(error: flexaudio_vad::WhisperVadTapError) -> PyErr {
     Python::attach(|py| {
-        let error_code = match &error {
+        let error_code = match error.root() {
+            flexaudio_vad::WhisperVadTapError::Cause { primary, .. } => primary.code().as_str(),
             flexaudio_vad::WhisperVadTapError::Vad(error) => code(error),
             flexaudio_vad::WhisperVadTapError::InvalidStereoLength => "InvalidStereoLength",
             flexaudio_vad::WhisperVadTapError::InvalidPcm { .. } => "InvalidPcm",
@@ -374,10 +395,22 @@ pub(crate) fn tap_error(error: flexaudio_vad::WhisperVadTapError) -> PyErr {
             flexaudio_vad::WhisperVadTapError::FailedSession => "FailedSession",
         };
         let result = WhisperVadRuntimeError::new_err(error.to_string());
-        let _ = result.value(py).setattr("code", error_code);
-        let _ = result
+        if let Err(error) = result.value(py).setattr("code", error_code) {
+            return error;
+        }
+        let audio_error = match Py::new(py, crate::errors::AudioError(error.audio_error())) {
+            Ok(error) => error,
+            Err(error) => return error,
+        };
+        if let Err(error) = result.value(py).setattr("audio_error", audio_error) {
+            return error;
+        }
+        if let Err(error) = result
             .value(py)
-            .setattr("terminal_events", Vec::<Py<PyAny>>::new());
+            .setattr("terminal_events", Vec::<Py<PyAny>>::new())
+        {
+            return error;
+        }
         result
     })
 }
