@@ -449,7 +449,7 @@ typedef struct FlexErrorContextV2 {
 typedef struct FlexDeviceEvent {
     // Event kind.
     int32_t kind;
-    // Stable ID (valid for `Added`/`Removed`/`DefaultChanged`; release with
+    // Selectable ID (= DeviceInfo::id; valid for `Added`/`Removed`/`DefaultChanged`; release with
     // `flexaudio_device_event_free`). NULL for `Unknown`.
     char *id;
     // Display name (`Added` only; release with `flexaudio_device_event_free`). NULL for other kinds.

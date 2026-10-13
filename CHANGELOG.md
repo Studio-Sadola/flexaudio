@@ -28,9 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exclusion fan-in also uses negotiation. Linux PipeWire output discovery and watcher
   notifications retain independent 48000 Hz / 2-channel compatibility defaults.
 - Linux process node-bind failures reject the collection with the first cause unless
-  a registry removal confirms the node vanished. Windows process discovery omits
+  a registry removal confirms the node vanished. Windows device and process discovery omit
   invalidated/vanished endpoints but retains access-denied and other typed query errors.
-  macOS selected-output opens retain unreadable direction-query causes.
+  macOS explicit-output scans skip vanished or unrelated unreadable devices; the typed
+  direction cause is returned for the requested device.
 - Primary/secondary PTS steps use rational arithmetic while retaining per-callback
   arrival re-anchoring. At 48 kHz primary, frame_index and capture_sample identify
   the same sample across replacement, recovery, loss rebuild and startup release.

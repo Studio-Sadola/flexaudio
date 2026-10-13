@@ -188,8 +188,9 @@ is readable; an unreadable name uses the native endpoint ID/UID with `name=""`
 (explicit unknown). IDs can change between discovery calls: the native fallback may
 be replaced by the recovered name. A name-based ID cannot be opened while its name
 is unreadable; the native ID remains openable in both name states. macOS devices
-with unreadable output direction are omitted from discovery; opening propagates
-the typed direction-query cause. An unreadable default query leaves
+with unreadable output direction are omitted from discovery; the typed direction
+cause is returned for the requested device. Explicit-output scans skip vanished or
+unrelated unreadable devices. An unreadable default query leaves
 `is_default=false` and does not fail discovery. Windows/macOS default opens validate
 the resolved default format. On Linux, `device_id=None` leaves `target.object` unset:
 PipeWire resolves the default sink and negotiates the format at open, without an

@@ -339,6 +339,7 @@ mod tests {
             assert_eq!(d.source_kind, SourceKind::SystemLoopback);
             assert!(d.is_loopback);
             assert!(!d.id.is_empty());
+            assert!(d.name.is_empty() || d.id == d.name);
             if d.format_available {
                 assert!(d.sample_rate > 0);
                 assert!(d.channels > 0);

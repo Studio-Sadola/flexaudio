@@ -205,6 +205,33 @@ mod endpoint_tests {
     }
 
     #[test]
+    fn device_item_query_uses_the_process_endpoint_policy() {
+        // Item is Windows-only; verify its native wiring and inject failures below it.
+        let source = include_str!("system.rs");
+        let item = source.split("collection.Item(index)").nth(1).unwrap();
+        assert!(item.starts_with(".map_err("));
+        let scan = source
+            .split("flexaudio_core::inventory::collect(Ok(0..count)")
+            .nth(1)
+            .unwrap();
+        assert!(scan
+            .split("endpoint_identity")
+            .next()
+            .unwrap()
+            .contains("crate::native_outcomes::endpoint_query("));
+        for bits in [0x8889_0004, 0x8007_0005, 0x8000_4005] {
+            let result = flexaudio_core::inventory::collect(Ok([0, 1]), |id| {
+                endpoint_query(if id == 0 { Err(fault(bits)) } else { Ok(id) })
+            });
+            if bits == 0x8889_0004 {
+                assert_eq!(result, Ok(vec![1]));
+            } else {
+                assert_eq!(result, Err(fault(bits)));
+            }
+        }
+    }
+
+    #[test]
     fn only_invalidated_or_vanished_endpoint_errors_are_omitted() {
         for bits in [0x8889_0004, 0x8007_0057, 0x8007_0490, 0x8007_0002] {
             assert_eq!(endpoint_query::<u32>(Err(fault(bits))), Ok(None));

@@ -347,7 +347,11 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
             map_hr_at(Operation::Enumerate, "IMMDeviceCollection::GetCount", error)
         })?;
         flexaudio_core::inventory::collect(Ok(0..count), |index| {
-            let Ok(device) = collection.Item(index) else {
+            let Some(device) =
+                crate::native_outcomes::endpoint_query(collection.Item(index).map_err(|error| {
+                    map_hr_at(Operation::Enumerate, "IMMDeviceCollection::Item", error)
+                }))?
+            else {
                 return Ok(None);
             };
             let Some((id, name)) = endpoint_identity(&device) else {

@@ -256,7 +256,10 @@ class DeviceInfoDict(TypedDict):
     IDs may change between queries: a native fallback may become the recovered name.
     A name-based ID cannot be opened while its name is unreadable; the native ID stays openable
     in both name states. macOS unreadable output direction is omitted from discovery;
-    open retains its typed cause. Unreadable default queries leave is_default=False.
+    the typed direction cause is returned for the requested device.
+    Unreadable default queries leave is_default=False.
+    Linux default-output opens skip the inventory/format pre-check; PipeWire resolves the sink
+    and negotiates format.
     """
     id: str
     name: str
@@ -308,7 +311,10 @@ class DeviceInfo:
     IDs may change between queries: a native fallback may become the recovered name.
     A name-based ID cannot be opened while its name is unreadable; the native ID stays openable
     in both name states. macOS unreadable output direction is omitted from discovery;
-    open retains its typed cause. Unreadable default queries leave is_default=False.
+    the typed direction cause is returned for the requested device.
+    Unreadable default queries leave is_default=False.
+    Linux default-output opens skip the inventory/format pre-check; PipeWire resolves the sink
+    and negotiates format.
     """
     def __repr__(self) -> str: ...
     @property

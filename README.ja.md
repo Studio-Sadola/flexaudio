@@ -184,8 +184,10 @@ Windows/macOS は名前を読める場合に既存の名前ベース ID を維�
 選択可能なネイティブエンドポイント ID／UID と `name=""`（明示的な不明）を使います。
 ID は検出ごとに変わることがあり、名前が再び読めるとネイティブ ID から名前に置き換わります。
 名前ベースの ID は名前が読めない間はオープンできません。ネイティブ ID は名前が読める場合も
-読めない場合もオープンできます。macOS は出力方向を読めないデバイスを検出一覧から省略し、
-オープン時には方向問い合わせの型付き原因を返します。既定デバイスの問い合わせに失敗しても
+読めない場合もオープンできます。
+macOS omits devices with unreadable output direction from discovery. The typed direction
+cause is returned for the requested device; explicit-output scans skip vanished or unrelated
+unreadable devices. 既定デバイスの問い合わせに失敗しても
 検出は失敗せず、`is_default=false` になります。Windows/macOS の既定オープンは解決した
 デバイスの形式を検査します。Linux は `device_id=None` の場合に `target.object` を設定せず、
 一覧の事前検査をせずに PipeWire がオープン時に既定 sink を解決して形式を交渉します。
