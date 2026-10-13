@@ -185,9 +185,12 @@ Windows/macOS は名前を読める場合に既存の名前ベース ID を維�
 ID は検出ごとに変わることがあり、名前が再び読めるとネイティブ ID から名前に置き換わります。
 名前ベースの ID は名前が読めない間はオープンできません。ネイティブ ID は名前が読める場合も
 読めない場合もオープンできます。
-macOS omits devices with unreadable output direction from discovery. The typed direction
-cause is returned for the requested device; explicit-output scans skip vanished or unrelated
-unreadable devices. 既定デバイスの問い合わせに失敗しても
+macOS では出力方向を読めないデバイスを検出結果から省きます。指定されたデバイスの出力方向の
+問い合わせに失敗した場合は、その型付きの原因を返します。出力デバイスを明示的に指定した場合の
+走査では、消滅したデバイスや、指定とは無関係で情報を読めないデバイスを省きます。
+指定された macOS デバイスの出力方向の問い合わせに失敗し、名前も UID も読めない場合は、
+指定した ID と照合できないため、オープンは `DeviceNotFound` を返します。
+既定デバイスの問い合わせに失敗しても
 検出は失敗せず、`is_default=false` になります。Windows/macOS の既定オープンは解決した
 デバイスの形式を検査します。Linux は `device_id=None` の場合に `target.object` を設定せず、
 一覧の事前検査をせずに PipeWire がオープン時に既定 sink を解決して形式を交渉します。
@@ -205,6 +208,7 @@ ERROR_ACCESS_DENIED（5／0x80070005）やその他の名前／画像問い合�
 Windows のプロセス検出は、無効化または消滅した出力エンドポイント
 （AUDCLNT_E_DEVICE_INVALIDATED、E_INVALIDARG、ERROR_NOT_FOUND、ERROR_FILE_NOT_FOUND）を省略します。
 アクセス拒否とその他のエンドポイント問い合わせエラーは型付き原因とともに一覧全体を失敗させます。
+Windows のデバイス検出でも、`Item()` の失敗に同じ省略／終端エラーの規則を適用します。
 Linux のプロセス検出は、registry の削除通知で消滅を確認した場合だけ bind 失敗を省略し、
 その他の bind 失敗では最初の原因を返します。
 macOS では kAudioHardwareBadObjectError（`!obj`、0x216f626a）、ESRCH（3）、ENOENT（2）を消滅とし、
@@ -253,8 +257,8 @@ last_error を設定します。`RescanRequired` は一覧の無効化を表し�
 `diagnostic_details`、C v2 の詳細件数・詳細アクセサーで明示的に取得できます。
 詳細には非公開のホスト情報が含まれる場合があるため、自動でログに出さないでください。
 `Error::Addon { kind, message }` と `AddonErrorKind` は VAD のモデル読み込み・推論・
-設定/形式・再サンプリング・reset、および FLAC の I/O・未対応入力・エンコーダー失敗を
-区別します。バインディングは `addonKind`/`addonMessage`（Python は
+不正な設定／形式・再サンプリング・reset、および FLAC の I/O・未対応入力・エンコーダー失敗の
+型付きの原因を保持します。バインディングは `addonKind`/`addonMessage`（Python は
 `addon_kind`/`addon_message`、C v2 は種別・メッセージアクセサー）を公開します。
 後から発生した終端エラー、flush と reset の同時失敗、VAD の末尾処理、Whisper VAD の
 モデル・変換原因は、主原因を置き換えず順序付きの関連エラーとして残します。
@@ -265,9 +269,9 @@ Rust に追加した `VadError::Multiple`、`WhisperVadError::Cause`、
 排出または reset してください。reset が失敗しても完成した発話イベントは残り、
 `Vad::take_pending_events()` で一度だけ取り出せます。Python の単独 flush 例外は
 `pending_events`、Node.js は `pendingEvents` を保持します。C の flush は負の結果と
-イベント出力を同時に返す場合があり、その出力も解放が必要です。ソース切り替えは
+イベント出力を同時に返す場合があり、その出力も解放が必要です。キャプチャに接続した VAD のソース切り替えは
 共有のギャップ処理で古い発話区間を閉じてからアドオンを交換します。Node.js の
-イベント専用 secondary チャンクは最後の seq・frame index・drop カウンターを保持します。
+イベント専用の副タップのチャンクは観測したシーケンス番号・フレーム番号・破棄数を保持します。
 
 macOS の自己プローブが判定不能になった場合、ネイティブの原因を保持し、無音の注意通知と
 既存の `RecoverableError` を配信します。キャプチャは継続できます。
@@ -605,7 +609,7 @@ C の権限イベント種別は引き続き 3 です。N-API/Python の権限�
   形式のネゴシエーションを完了しなければ、型付きの原因と対処方法を持つエラーでオープンが失敗します。
   完全な対象一覧に適格なソースがなければ、オープンは成功し、その後の再生を監視し続けます。
   PipeWire がない場合やウォッチャーの開始に失敗した場合、`watch_devices()` はエラーを返します。
-  デバイス列挙はすべての提供元の完全な一覧を必要とし、不完全な照会や照会の失敗はエラーになります。
+  デバイス列挙はすべての提供元から一覧を取得し、一覧自体の取得や件数の問い合わせに失敗するとエラーになります。
   ポータルを利用するデスクトップ環境では、ユーザーにキャプチャの許可を求める場合があります。
 
 ---

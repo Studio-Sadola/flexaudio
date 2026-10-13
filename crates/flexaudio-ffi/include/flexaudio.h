@@ -360,8 +360,11 @@ typedef struct FlexEvent {
 // Windows/macOS use selectable native IDs when names are unreadable. IDs may change
 // between queries: a native fallback may become the recovered name. A name-based ID
 // cannot be opened while its name is unreadable; the native ID stays openable in both
-// name states. macOS omits unreadable output direction from discovery; open retains
-// its typed cause. Unreadable default queries leave is_default=false.
+// name states. macOS omits unreadable output direction from discovery; the typed
+// direction cause is returned for the requested device. Explicit-output scans skip
+// vanished or unrelated unreadable devices. If the requested device's direction query
+// fails and neither its name nor UID is readable, open returns DeviceNotFound because
+// it cannot be matched. Unreadable default queries leave is_default=false.
 typedef struct FlexDeviceInfo {
     // Selectable ID (released by `flexaudio_devices_free`).
     char *id;
@@ -854,8 +857,12 @@ const char *flexaudio_last_error(void);
 
 // Whether this device's capture format is available. Additive v2 accessor; the
 // v1 FlexDeviceInfo layout is unchanged. False means sample_rate=0 and channels=0.
-// Opening requires a fresh successful format query or fails with a typed
-// cause/remedy error. Linux PipeWire's documented compatibility defaults remain available.
+// Windows/macOS output and microphone opens perform a fresh checked format query.
+// Explicit Linux output IDs use a fresh checked inventory and format-availability gate.
+// These checks fail with a typed cause/remedy error if the format remains unreadable.
+// Linux output opens without a device ID rely on PipeWire to resolve the default sink
+// and negotiate the format, without an inventory/format pre-check. Linux PipeWire's
+// documented compatibility defaults remain available.
 // NULL/misaligned pointers return false and set a typed InvalidArg last error.
 //
 // # Safety
