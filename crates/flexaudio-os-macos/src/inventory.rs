@@ -54,17 +54,66 @@ mod wiring_tests {
     }
 }
 
-// Share direction/identity ordering; discovery may absorb errors, opening must retain them.
+// Share direction/identity ordering; only the requested device can fail an open.
 pub(crate) fn output_device_matches(
     direction: Result<bool>,
     identity_matches: impl FnOnce() -> bool,
 ) -> Result<bool> {
-    Ok(direction? && identity_matches())
+    match direction {
+        Ok(false) => Ok(false),
+        Ok(true) => Ok(identity_matches()),
+        Err(error)
+            if flexaudio_core::inventory::macos_error_failure(&error)
+                == flexaudio_core::inventory::ProcessFailure::Vanished =>
+        {
+            Ok(false)
+        }
+        Err(error) if identity_matches() => Err(error),
+        Err(_) => Ok(false),
+    }
 }
 
 #[cfg(test)]
 mod open_tests {
     use super::*;
+    fn direction_error(value: i32) -> flexaudio_core::Error {
+        flexaudio_core::Error::Backend("direction query failed; retry open".into()).with_context(
+            flexaudio_core::ErrorContext::new(flexaudio_core::Operation::Enumerate)
+                .with_native_status(flexaudio_core::NativeStatus::OsStatus {
+                    call: "AudioObjectGetPropertyDataSize(OutputStreams)",
+                    value,
+                }),
+        )
+    }
+
+    #[test]
+    fn unrelated_direction_failure_keeps_healthy_requested_device() {
+        let mut selected = None;
+        for id in [1, 2] {
+            let direction = if id == 1 {
+                Err(direction_error(-50))
+            } else {
+                Ok(true)
+            };
+            if output_device_matches(direction, || id == 2).unwrap() {
+                selected = Some(id);
+                break;
+            }
+        }
+        assert_eq!(selected, Some(2));
+    }
+
+    #[test]
+    fn vanished_direction_failure_skips_identity_query() {
+        for value in [0x216f626a, 3, 2] {
+            assert_eq!(
+                output_device_matches(Err(direction_error(value)), || panic!("vanished identity")),
+                Ok(false)
+            );
+            assert_eq!(output_device_matches(Ok(true), || true), Ok(true));
+        }
+    }
+
     #[test]
     fn output_open_retains_direction_query_cause() {
         let error = flexaudio_core::Error::Backend("direction query failed; retry open".into())
@@ -76,7 +125,7 @@ mod open_tests {
                     }),
             );
         assert_eq!(
-            output_device_matches(Err(error.clone()), || panic!("identity query")),
+            output_device_matches(Err(error.clone()), || true),
             Err(error)
         );
         assert_eq!(

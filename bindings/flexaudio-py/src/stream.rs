@@ -137,6 +137,24 @@ impl Stream {
                 None => Ok(None),
             };
         };
+        self.process_chunk_with_steps(chunk, flush, process)
+            .map(Some)
+    }
+
+    /// One addon-processing path for delivered PCM, independent of capture scheduling.
+    fn process_chunk_with_steps(
+        &mut self,
+        chunk: fa::AudioChunk,
+        flush: impl FnOnce(
+            &mut CoreVad,
+        ) -> Result<Vec<flexaudio_vad::VadEvent>, flexaudio_vad::VadError>,
+        process: impl FnOnce(
+            &mut CoreVad,
+            &[f32],
+            u32,
+            u16,
+        ) -> Result<Vec<flexaudio_vad::VadEvent>, flexaudio_vad::VadError>,
+    ) -> PyResult<PyAudioChunk> {
         let discontinuity = chunk.flags.contains(fa::ChunkFlags::DISCONTINUITY);
         let carrier_origin = (
             chunk.seq,
@@ -212,7 +230,7 @@ impl Stream {
         if self.whisper.is_some() {
             py_chunk.set_whisper_events(std::mem::take(&mut self.whisper_events));
         }
-        Ok(Some(py_chunk))
+        Ok(py_chunk)
     }
 }
 
@@ -1012,10 +1030,20 @@ mod repro_tests {
         threshold: f32,
         max_speech_ms: u32,
     ) -> (Stream, Arc<Mutex<Option<fa::core::backend::RawSink>>>) {
+        let (mut stream, sink) = vad_fixture_unstarted(threshold, max_speech_ms);
+        // Model construction can exceed the watchdog's idle limit under parallel tests.
+        stream.inner.start().unwrap();
+        (stream, sink)
+    }
+
+    fn vad_fixture_unstarted(
+        threshold: f32,
+        max_speech_ms: u32,
+    ) -> (Stream, Arc<Mutex<Option<fa::core::backend::RawSink>>>) {
         let sink = Arc::new(Mutex::new(None));
         let mut config = fa::StreamConfig::default();
         config.output.channels = 1;
-        let mut inner = fa::Stream::open(config, Box::new(ManualBackend(sink.clone()))).unwrap();
+        let inner = fa::Stream::open(config, Box::new(ManualBackend(sink.clone()))).unwrap();
         let vad = CoreVad::new(flexaudio_vad::VadConfig {
             threshold,
             neg_threshold: Some(threshold),
@@ -1026,9 +1054,6 @@ mod repro_tests {
             sample_rate: 16_000,
         })
         .unwrap();
-        // Model construction can exceed the watchdog's idle limit under parallel tests. Start
-        // capture only when the fixture is ready to supply PCM, avoiding unrelated recovery flags.
-        inner.start().unwrap();
         (
             Stream {
                 whisper: None,
@@ -1281,33 +1306,50 @@ mod repro_tests {
     #[test]
     fn discontinuity_flush_error_resets_both_addons_and_is_reported_once() {
         use std::cell::Cell;
-        use std::time::{Duration, Instant};
 
         Python::initialize();
+        fn chunk(seq: u64, flags: fa::ChunkFlags) -> fa::AudioChunk {
+            fa::AudioChunk {
+                data: vec![0.0; 960],
+                frames: 960,
+                seq,
+                frame_index: seq * 960,
+                pts_ns: seq as i64 * 20_000_000,
+                dropped_before: 0,
+                flags,
+                peak: 0.0,
+                rms: 0.0,
+            }
+        }
         // Inject at the flush boundary: a latched core failure returns this error without resetting.
         // The no-error case uses the real flush as a control for the same reset/processing path.
         for fail_flush in [false, true] {
-            let (mut stream, sink) = vad_fixture(0.0);
-            send(&mut stream, &sink);
-            send(&mut stream, &sink);
+            // Feed the same production addon path with known delivery flags. A manually fed
+            // backend can stall while error conversion waits for the GIL, making the real
+            // watchdog reopen it and reset VAD again on an unrelated recovery chunk.
+            // Keep capture unstarted: this test owns exactly one discontinuity.
+            let (mut stream, _) = vad_fixture_unstarted(0.0, 0);
+            for seq in 0..2 {
+                stream
+                    .process_chunk_with_steps(
+                        chunk(seq, fa::ChunkFlags::empty()),
+                        CoreVad::flush,
+                        CoreVad::process_pcm,
+                    )
+                    .unwrap();
+            }
             let old_position = stream.vad.as_ref().unwrap().converted_sample_position();
             let mut denoiser = CoreDenoiser::new(1).unwrap();
             denoiser.process(&mut [0.8; 137]).unwrap();
             stream.denoiser = Some(denoiser);
-            stream.pause();
-            stream.resume().unwrap();
-            assert_eq!(
-                sink.lock().unwrap().as_mut().unwrap().push(&[0.0; 960], 0),
-                960
-            );
             let error = flexaudio_vad::VadError::Inference("injected latched VAD failure".into());
             let flush_calls = Cell::new(0);
-            let deadline = Instant::now() + Duration::from_secs(2);
             let mut reference = CoreDenoiser::new(1).unwrap();
             let mut errors = Vec::new();
             let mut control_chunk = None;
-            loop {
-                let result = stream.poll_chunk_with_flush(|vad| {
+            let result = stream.process_chunk_with_steps(
+                chunk(2, fa::ChunkFlags::DISCONTINUITY),
+                |vad| {
                     flush_calls.set(flush_calls.get() + 1);
                     assert_eq!(vad.converted_sample_position(), old_position);
                     if fail_flush {
@@ -1315,31 +1357,32 @@ mod repro_tests {
                     } else {
                         vad.flush()
                     }
-                });
-                match result {
-                    Err(actual) => {
-                        assert!(fail_flush);
-                        errors.push(actual);
-                        assert_eq!(stream.vad.as_ref().unwrap().converted_sample_position(), 0);
-                        break;
-                    }
-                    Ok(Some(chunk)) => {
-                        assert!(!fail_flush);
-                        let mut expected = [0.0; 960];
-                        reference.process(&mut expected).unwrap();
-                        assert_eq!(chunk.samples(), expected);
-                        control_chunk = Some(chunk);
-                        break;
-                    }
-                    Ok(None) => {
-                        assert!(Instant::now() < deadline, "mock chunk timed out");
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
+                },
+                CoreVad::process_pcm,
+            );
+            match result {
+                Err(actual) => {
+                    assert!(fail_flush);
+                    errors.push(actual);
+                    assert_eq!(stream.vad.as_ref().unwrap().converted_sample_position(), 0);
+                }
+                Ok(chunk) => {
+                    assert!(!fail_flush);
+                    let mut expected = [0.0; 960];
+                    reference.process(&mut expected).unwrap();
+                    assert_eq!(chunk.samples(), expected);
+                    control_chunk = Some(chunk);
                 }
             }
             assert_eq!(flush_calls.get(), 1);
-            for _ in 0..3 {
-                let chunk = send(&mut stream, &sink);
+            for seq in 3..6 {
+                let chunk = stream
+                    .process_chunk_with_steps(
+                        chunk(seq, fa::ChunkFlags::empty()),
+                        CoreVad::flush,
+                        CoreVad::process_pcm,
+                    )
+                    .unwrap();
                 let mut expected = [0.0; 960];
                 reference.process(&mut expected).unwrap();
                 assert_eq!(chunk.samples(), expected);
@@ -1351,8 +1394,6 @@ mod repro_tests {
             );
             assert!(stream.poll_chunk().unwrap().is_none());
             let _ = stream.stop();
-            // Inspect Python objects after capture stops so parallel type initialization cannot
-            // introduce a watchdog recovery discontinuity into the mock's otherwise continuous PCM.
             Python::attach(|py| {
                 for actual in errors {
                     assert!(actual.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));

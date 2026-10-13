@@ -206,16 +206,16 @@ pub enum DeviceEvent {
     /// A device was added (connected or a new node appeared).
     Added(DeviceInfo),
     /// A device was removed (disconnected or node disappeared).
-    /// PipeWire `global_remove` provides only a numeric id, so return only the stable ID (`node.name`).
+    /// PipeWire `global_remove` provides only a numeric id, so return only the selectable ID (`node.name`).
     Removed {
-        /// Stable ID of the removed device (= [`DeviceInfo::id`] = PipeWire `node.name`).
+        /// Selectable ID of the removed device (= [`DeviceInfo::id`] = PipeWire `node.name`).
         id: String,
     },
     /// The OS default device changed (default sink / source switched).
     DefaultChanged {
         /// Default endpoint domain.
         kind: DefaultDeviceKind,
-        /// Stable ID of the new default device (= `node.name`).
+        /// Selectable ID of the new default device (= [`DeviceInfo::id`]; PipeWire `node.name`).
         id: String,
     },
     /// Default endpoint no longer exists; no fabricated empty ID.

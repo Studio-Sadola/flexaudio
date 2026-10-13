@@ -9,7 +9,7 @@
  * native endpoint ID/UID when the name is unreadable. IDs may change between queries:
  * a native fallback may become the recovered name. A name-based ID cannot be opened
  * while its name is unreadable; the native ID stays openable in both name states.
- * Unreadable direction on macOS is omitted from discovery; open retains its typed cause.
+ * Unreadable direction on macOS is omitted from discovery; the typed direction cause is returned for the requested device.
  * An unreadable default query leaves isDefault=false. */
 export interface JsDeviceInfo {
   id: string
@@ -17,7 +17,8 @@ export interface JsDeviceInfo {
   sourceKind: string
   sampleRate: number
   channels: number
-  /** False means the mandatory capture format could not be read; retry discovery/open. */
+  /** False means the mandatory capture format could not be read; retry discovery/open.
+   * Linux default-output opens skip this pre-check; PipeWire resolves the sink and negotiates format. */
   formatAvailable: boolean
   isLoopback: boolean
   isDefault: boolean

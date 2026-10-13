@@ -14,7 +14,8 @@
 //! # Deadline
 //! Use the same [`LIST_DEADLINE`] for the connection (`connect`) and registry round trip. Always
 //! return, even if there is no response. Incomplete snapshots always return an error, including
-//! when output nodes have already arrived. A completed query with no output nodes returns `Ok([])`.
+//! when output nodes have already arrived. A surviving node bind failure fails the whole call;
+//! a confirmed registry removal omits that node. A completed query with no output nodes returns `Ok([])`.
 //!
 //! Return a raw list (multiple nodes with the same PID may appear more than once). The facade merges
 //! duplicates, excludes the current process, and sorts the results.
@@ -113,8 +114,9 @@ impl From<pw::Error> for BindCause {
 impl std::fmt::Display for BindCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CreationFailed => f.write_str("proxy creation failed"),
-            Self::NoMemory => f.write_str("proxy allocation failed"),
+            Self::CreationFailed | Self::NoMemory => {
+                f.write_str("daemon rejected the bind or returned a null proxy")
+            }
             Self::WrongProxyType => f.write_str("wrong proxy type"),
             Self::Spa(error) => write!(f, "{error}"),
         }
@@ -206,7 +208,8 @@ fn run_callback(
 
 /// List processes with an audio output stream (`Stream/Output/Audio`) as a raw list.
 ///
-/// Returns [`Error::Backend`] for connection, sync or callback failures.
+/// Returns [`Error::Backend`] for connection, sync, callback or surviving node bind failures.
+/// A confirmed registry removal omits the removed node instead of failing the call.
 /// Entries without a resolvable PID are omitted; executable names
 /// and activity remain optional metadata.
 pub fn list_processes() -> Result<Vec<ProcessInfo>> {
@@ -909,8 +912,19 @@ mod diagnostic_tests {
 #[cfg(test)]
 mod bind_tests {
     use super::*;
-    // Real bind allocation failures/removal races require a daemon. Inject the
+    // Real bind failures/removal races require a daemon. Inject the
     // exact pipewire-rs errors through the registry callback's shared snapshot owner.
+    #[test]
+    fn null_bind_proxy_diagnostics_do_not_invent_allocation_failure() {
+        for error in [pw::Error::NoMemory, pw::Error::CreationFailed] {
+            let rendered = BindCause::from(error).to_string();
+            assert_eq!(
+                rendered,
+                "daemon rejected the bind or returned a null proxy"
+            );
+        }
+    }
+
     #[test]
     fn surviving_node_bind_failure_rejects_collection_with_first_cause() {
         let mut snapshot = RegistrySnapshot::default();
@@ -927,7 +941,9 @@ mod bind_tests {
         let error = error.into_core();
         assert_eq!(error.kind(), flexaudio_core::ErrorKind::Backend);
         assert!(error.to_string().contains("registry.bind for node 7"));
-        assert!(error.to_string().contains("proxy allocation failed"));
+        assert!(error
+            .to_string()
+            .contains("daemon rejected the bind or returned a null proxy"));
         assert!(error.to_string().contains("retry"));
     }
 
