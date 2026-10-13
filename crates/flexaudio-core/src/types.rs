@@ -130,13 +130,15 @@ pub struct SecondaryChunk {
 /// (Linux) uses `node.name` as id (`node.description` is used for the display name `name`).
 ///
 /// Enumerating again on the same machine with the same configuration returns the same `id`. Uniqueness across
-/// different machines or operating systems is not guaranteed.
+/// different machines or operating systems is not guaranteed. Windows/macOS normally
+/// use the display name as ID, with a selectable native endpoint ID/UID when the name
+/// is unreadable. A later discovery may replace that fallback with a readable name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
     /// Stable ID. Key accepted by [`StreamConfig::device_id`] (cpal = device name /
     /// PipeWire = `node.name`).
     pub id: String,
-    /// Human-readable display name (PipeWire prefers `node.description`, falling back to `node.name`).
+    /// Human-readable display name; empty means unknown when a selectable ID exists.
     pub name: String,
     /// Source kind used to capture this device.
     pub source_kind: SourceKind,

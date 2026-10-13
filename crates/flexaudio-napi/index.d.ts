@@ -4,7 +4,10 @@
 /* Public declarations maintained to match the strict 0.5 boundary contract. */
 
 /** JS DeviceInfo. `sourceKind` is a string ("mic"|"system"|"process").
- * Unreadable mandatory formats use sampleRate=0, channels=0 and formatAvailable=false. */
+ * Unreadable mandatory formats use sampleRate=0, channels=0 and formatAvailable=false.
+ * Unknown device display names are empty strings. Windows/macOS use a selectable
+ * native endpoint ID/UID when the name-based ID is unreadable; unreadable direction
+ * on macOS is omitted. An unreadable default query leaves isDefault=false. */
 export interface JsDeviceInfo {
   id: string
   name: string
@@ -207,6 +210,7 @@ export type AttachedWhisperVadEvent = WhisperVadEvent
    * of primary/secondary format and tap. captureSample + tMs*48 is exact on that timeline.
    * Equal to primary frameIndex for the same sample only for a 48 kHz primary.
    * At other rates units match but resampler group delay leaves origins unequal.
+   * Unreconciled startup-release padding can grow the offset by up to one primary chunk per boundary.
    * Neither index is an offset into concatenated PCM; pause/queue drops advance them. */
   | { type: 'epochStart'; epoch: number; seq: 0; captureSample: bigint; ptsNs: number }
 
@@ -333,7 +337,8 @@ export interface ShutdownReport {
 /** Arrival gaps without reopen emit no event/DISCONTINUITY: frameIndex stays contiguous,
  * only primary ptsNs jumps, and attached WhisperVad keeps its epoch open.
  * Stall: >=2 s without consumed samples, checked every 250 ms; stalled, reopen,
- * recoverableError with 250 ms..5 s backoff, recovered. First new-generation primary
+ * each failed reopen attempt emits recoverableError and backs off 250 ms..5 s.
+ * On success, recovered is emitted when new PCM arrives. First new-generation primary
  * data carries RECOVERED|DISCONTINUITY. WhisperVad epochEnd(finish) and new epochStart
  * wait for new PCM; downtime does not become frames. These advisories are unordered
  * relative to onChunk and epoch events. Attached epochs strictly increase within a

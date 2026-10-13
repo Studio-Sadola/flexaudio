@@ -267,12 +267,8 @@ fn list_devices_never_panics_and_is_consistent() {
         assert_eq!(d.id, d.name);
         assert!(!d.id.is_empty(), "id (= name) is nonempty");
         if d.format_available {
-            if d.format_available {
-                assert!(d.sample_rate > 0);
-                assert!(d.channels > 0);
-            } else {
-                assert_eq!((d.sample_rate, d.channels), (0, 0));
-            }
+            assert!(d.sample_rate > 0);
+            assert!(d.channels > 0);
         } else {
             assert_eq!((d.sample_rate, d.channels), (0, 0));
         }

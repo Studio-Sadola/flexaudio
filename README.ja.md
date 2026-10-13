@@ -143,7 +143,8 @@ stream.stop();
 - `flexaudio::watch_devices() -> Result<DeviceWatcher>` — デバイスの接続・取り外しに関する通知
   （追加／削除／デフォルトの変更）をポーリングで受け取れます。
   Linux で開始に失敗するとエラーを返します。その後のデーモン、コールバック、停止処理の
-  失敗は `DeviceEvent::TerminalError { error }` を一度だけ通知します。
+  失敗は `DeviceEvent::TerminalError { error }` を通知します。後の停止／join も失敗した場合、
+  蓄積した原因を含む通知が再度届くことがあります。
   Node.js/Python では型付き `error` を持つ `terminalError`、C v2 ではデバイスイベントの
   種別 6 と `flexaudio_device_event_error_v2` で参照できます。C v1 のポーリングは根本原因の
   負のエラーコードを返し、last_error を設定します。Windows/macOS では、意図的に
@@ -179,6 +180,12 @@ Silero VAD モデルはバイナリに埋め込まれているため、実行時
 コレクションの取得や件数の問い合わせ自体が失敗すると、一覧全体を型付きエラーとして返します。
 個々の任意メタデータが読めない場合は不明のまま残します。プロセス名には既存の `pid N` を使い、
 実行ファイル名／バンドル ID は欠落させます。選択に使える識別子を読めない項目は省略できます。
+Windows/macOS は名前を読める場合に既存の名前ベース ID を維持します。名前を読めない場合は
+選択可能なネイティブエンドポイント ID／UID と `name=""`（明示的な不明）を使います。
+macOS は出力方向を読めないデバイスを分類できないため省略します。既定デバイスの問い合わせに
+失敗しても検出は失敗せず、`is_default=false` になります。デバイスに結び付く既定オープンは
+解決したデバイスの形式を検査します。Linux の除外 fan-in はデバイス単位ではなく、交渉した
+正規形式を使うため、このデバイス形式検査の対象外です。
 必須キャプチャ形式を読めないデバイスは `format_available: false`（JS は `formatAvailable`）で残し、
 **サンプルレート = 0、チャンネル数 = 0** にします。オープン時には新しく形式を問い合わせ、
 まだ読めなければ原因と再試行方法を持つ型付きエラーで失敗します。C は v1 構造体のレイアウトを維持し、
@@ -199,13 +206,15 @@ macOS では kAudioHardwareBadObjectError（`!obj`、0x216f626a）、ESRCH（3�
 `captureSample`／`capture_sample` は専用キャプチャ時間軸の 48 kHz フレーム数で、主／副タップの形式や
 `tap` に依存しません。主タップが 48 kHz なら、世代の置換、回復、損失後の再構築、起動時 PCM の解放を
 またいでも同じサンプルの `frameIndex` と一致します。他のレートでは単位だけが共通で、リサンプラーの
-群遅延を補償しないため基点は厳密に一致しません。どちらの番号も、配信 PCM を連結したバッファの
+群遅延を補償しないため基点は厳密に一致しません。起動時 PCM 解放のパディングも調整されず、
+境界ごとに主タップの最大 1 チャンク分ずつ差が増えることがあります。どちらの番号も、配信 PCM を連結したバッファの
 オフセットではありません。一時停止やキューの破棄でも、PCM を配信せずに番号は進みます。
 
 再オープンを伴わない到着間隔の空きでは、イベントや `DISCONTINUITY` は発生しません。
 `frameIndex` は連続し、主タップの `ptsNs` だけが飛び、接続された WhisperVad のエポックは開いたままです。
 消費サンプルが 2 秒以上途絶えた停止は 250 ms ごとに検知し、`stalled`、再オープン、
-250 ms〜5 秒の再試行間隔を伴う `recoverableError`、`recovered` を通知します。
+再オープンの各失敗時に `recoverableError` と 250 ms〜5 秒の再試行間隔が発生します。
+成功後、新しい PCM が来ると `recovered` を通知します。
 新世代の最初の主タップデータには `RECOVERED|DISCONTINUITY` が付き、新しい PCM が来ると
 WhisperVad は `epochEnd(finish)` で閉じ、新しい `epochStart` を始めます。停止時間はフレームに換算しません。
 この 3 種の助言と `onChunk`／エポックイベントの間に順序保証はありません。
@@ -220,7 +229,7 @@ Node.js では `epochEnd(error)` は `whisperVadFailed` より先に届きます
 Linux のルーティング変更は次に配信するチャンクに `DISCONTINUITY` を付けます。
 bind の失敗、不正・欠落バッファ、拒否した形式再交渉、コールバックの panic は、
 既存の準備完了・損失・終端通知の経路で報告します。監視の失敗は監視を終了し、
-`DeviceEvent::TerminalError { error }` を一度通知します。Node.js/Python は型付きの
+`DeviceEvent::TerminalError { error }` を通知し、後の停止／join 失敗で蓄積した原因を再通知することがあります。Node.js/Python は型付きの
 `error` を持つ `terminalError`、C v2 はデバイスイベント種別 6 と
 `flexaudio_device_event_error_v2` を公開します。C v1 の poll は負の原因コードを返し、
 last_error を設定します。`RescanRequired` は一覧の無効化を表し、監視失敗とは区別します。

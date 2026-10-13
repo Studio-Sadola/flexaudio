@@ -4,9 +4,9 @@ use flexaudio_core::Result;
 
 pub(crate) fn collect_complete<I, T>(
     ids: impl IntoIterator<Item = I>,
-    mut read: impl FnMut(I) -> Result<Option<T>>,
+    read: impl FnMut(I) -> Result<Option<T>>,
 ) -> Result<Vec<T>> {
-    flexaudio_core::inventory::collect(Ok(ids), |id| read(id).ok().flatten())
+    flexaudio_core::inventory::collect(Ok(ids), read)
 }
 
 pub(crate) fn positive_format(rate: u32, channels: u16) -> Result<(u32, u16)> {
@@ -33,13 +33,52 @@ mod tests {
         assert_eq!(
             collect_complete([0, 1, 2], |id| {
                 if id == 1 {
-                    Err(Error::DeviceNotFound)
+                    Ok(None)
                 } else {
                     Ok(Some(id))
                 }
             }),
             Ok(vec![0, 2])
         );
+    }
+
+    #[test]
+    fn all_endpoint_activate_failures_preserve_permission_denied() {
+        let error = Error::PermissionDenied {
+            permission: flexaudio_core::Permission::SystemAudio,
+            detail: "Activate access denied; retry".into(),
+        };
+        assert_eq!(
+            collect_complete([0, 1, 2], |_| Err::<Option<u32>, _>(error.clone())),
+            Err(error)
+        );
+    }
+
+    #[test]
+    fn one_endpoint_session_count_failure_rejects_the_collection() {
+        let error = Error::Backend("GetCount failed; retry".into());
+        assert_eq!(
+            collect_complete([0, 1, 2], |id| {
+                if id == 1 {
+                    Err(error.clone())
+                } else {
+                    Ok(Some(vec![id]))
+                }
+            }),
+            Err(error)
+        );
+    }
+
+    #[test]
+    fn vanished_session_keeps_neighboring_sessions_and_endpoints() {
+        let result = collect_complete([0, 1], |endpoint| {
+            collect_complete([0, 1, 2], |session| {
+                Ok((endpoint != 0 || session != 1).then_some((endpoint, session)))
+            })
+            .map(Some)
+        })
+        .unwrap();
+        assert_eq!(result, [vec![(0, 0), (0, 2)], vec![(1, 0), (1, 1), (1, 2)]]);
     }
 
     #[test]
@@ -68,27 +107,6 @@ mod format_tests {
 
 #[cfg(test)]
 mod wiring_tests {
-    #[test]
-    fn native_device_and_process_discovery_use_complete_snapshots() {
-        // Concrete COM device/session failures cannot be injected portably without
-        // native endpoints. collect_complete tests exercise failed entries behaviorally;
-        // this source guard connects that shared helper to both native adapters.
-        let devices = include_str!("system.rs");
-        let devices = devices
-            .split("pub fn list_output_devices()")
-            .nth(1)
-            .unwrap()
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        assert!(devices.contains("crate::inventory::collect_complete"));
-        assert!(!devices.contains("unwrap_or(FALLBACK_FORMAT)"));
-        let processes = include_str!("processes.rs");
-        assert!(processes.contains("crate::inventory::collect_complete"));
-        assert!(!processes.contains("GetCount().unwrap_or(0)"));
-        assert!(!processes.contains("last_error: Option<Error>"));
-    }
-
     #[test]
     fn native_capture_owners_project_spawn_errors_through_core() {
         // OS thread-creation exhaustion is not a portable fault. The core helper

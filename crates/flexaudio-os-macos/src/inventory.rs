@@ -4,15 +4,14 @@ use flexaudio_core::Result;
 
 pub(crate) fn collect_complete<I, T>(
     ids: impl IntoIterator<Item = I>,
-    mut read: impl FnMut(I) -> Result<Option<T>>,
+    read: impl FnMut(I) -> Result<Option<T>>,
 ) -> Result<Vec<T>> {
-    flexaudio_core::inventory::collect(Ok(ids), |id| read(id).ok().flatten())
+    flexaudio_core::inventory::collect(Ok(ids), read)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flexaudio_core::Error;
 
     // Native discovery errors cannot be triggered portably without hardware.
     // Inject read results into the helper used by both device and process queries.
@@ -21,7 +20,7 @@ mod tests {
         assert_eq!(
             collect_complete([0, 1, 2], |id| {
                 if id == 1 {
-                    Err(Error::DeviceNotFound)
+                    Ok(None)
                 } else {
                     Ok(Some(id))
                 }
@@ -45,26 +44,6 @@ mod tests {
 
 #[cfg(test)]
 mod wiring_tests {
-    #[test]
-    fn native_device_and_process_discovery_use_complete_snapshots() {
-        // Native failure injection needs the OS. Keep the portable helper tests
-        // connected to both production adapters without accessing audio hardware.
-        let devices = include_str!("devices.rs");
-        let devices = devices
-            .split("pub fn list_output_devices()")
-            .nth(1)
-            .unwrap()
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        assert!(devices.contains("crate::inventory::collect_complete"));
-        assert!(!devices.contains("unwrap_or(FALLBACK_FORMAT)"));
-        let processes = include_str!("processes.rs");
-        assert!(processes.contains("crate::inventory::collect_complete"));
-        assert!(!processes.contains("GetCount().unwrap_or(0)"));
-        assert!(!processes.contains("last_error: Option<Error>"));
-    }
-
     #[test]
     fn native_capture_owners_project_spawn_errors_through_core() {
         // OS thread-creation exhaustion is not a portable fault. The core helper

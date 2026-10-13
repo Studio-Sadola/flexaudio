@@ -437,7 +437,7 @@ mod tests {
     /// Valid Mix gains pass the same preflight as the public open path.
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     #[test]
-    fn mix_config_with_valid_gains_opens() {
+    fn valid_mix_gains_pass_preflight_and_open_mock_composite() {
         let config = StreamConfig {
             kind: SourceKind::Mix,
             mix_mic_gain: 0.5,

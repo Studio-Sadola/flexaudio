@@ -40,7 +40,8 @@ pub struct FlexWhisperEpochStart {
     /// 48 kHz frames on the dedicated capture timeline, independent of primary/secondary
     /// format and tap. capture_sample + t_ms*48 is exact. Equal to primary frame_index
     /// for the same sample only when primary is 48 kHz. Other rates share units but not
-    /// the origin (resampler group delay). Neither index is an offset into concatenated
+    /// the origin (resampler group delay); unreconciled startup-release padding can
+    /// grow the offset by up to one primary chunk per boundary. Neither index is an offset into concatenated
     /// delivered PCM; pause and queue drops advance indices without delivering.
     pub capture_sample: u64,
     pub pts_ns: i64,

@@ -252,6 +252,9 @@ class StartupSamplesDroppedEventDict(TypedDict):
 StreamEventDict = Union[StartupSamplesDroppedEventDict, ChunkDroppedEventDict, StalledEventDict, RecoveredEventDict, PermissionDeniedEventDict, PermissionPendingEventDict, PermissionGrantedEventDict, SilenceWhileSourceActiveEventDict, DeviceLostEventDict, LegacyErrorEventDict, TerminalErrorEventDict, RecoverableErrorEventDict, ShutdownErrorEventDict, AudioLossEventDict, ClippedEventDict, UnknownEventDict]
 
 class DeviceInfoDict(TypedDict):
+    """Unknown display names are empty. Windows/macOS use native IDs if names are unreadable.
+    macOS unreadable output direction is omitted; unreadable default queries leave is_default=False.
+    """
     id: str
     name: str
     source_kind: Literal["mic", "system", "process", "mix"]
@@ -389,7 +392,8 @@ class StreamEvent:
     Arrival gaps without reopen emit no event/DISCONTINUITY: frame_index stays
     contiguous, only primary pts_ns jumps, and attached WhisperVad keeps its epoch open.
     Stall: >=2 s without consumed samples, checked every 250 ms; stalled, reopen,
-    recoverableError with 250 ms..5 s backoff, recovered. First new-generation primary
+    each failed reopen attempt emits recoverableError and backs off 250 ms..5 s.
+    On success, recovered is emitted when new PCM arrives. First new-generation primary
     data has RECOVERED|DISCONTINUITY. WhisperVad epoch_end(finish) and a new epoch_start
     wait for new PCM. Downtime does not become frames. These advisories are unordered
     relative to PCM and epoch events.
@@ -603,6 +607,7 @@ class EpochStartEvent:
     independent of primary/secondary format and tap. capture_sample + t_ms*48 is exact.
     Equal to primary frame_index for the same sample only when primary is 48 kHz.
     Other primary rates share units but not the origin (resampler group delay).
+    Unreconciled startup-release padding can grow the offset by up to one primary chunk per boundary.
     Neither index is an offset into concatenated delivered PCM; pause/queue drops advance them.
     Attached epochs strictly increase within a stream (checked epoch+1 on rebuild).
     New open starts at 0; (epoch, seq) is unique per stream.

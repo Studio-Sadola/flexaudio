@@ -356,7 +356,9 @@ typedef struct FlexEvent {
 // Information for one enumerated device (corresponds to [`flexaudio::DeviceInfo`]).
 //
 // `id` / `name` are flexaudio-owned, NUL-terminated UTF-8 strings. Release the entire array with
-// `flexaudio_devices_free` (do not use C `free`).
+// `flexaudio_devices_free` (do not use C `free`). Unknown names are empty strings;
+// Windows/macOS use selectable native IDs when names are unreadable. macOS omits
+// unreadable output direction; unreadable default queries leave is_default=false.
 typedef struct FlexDeviceInfo {
     // Stable ID (released by `flexaudio_devices_free`).
     char *id;
@@ -527,7 +529,8 @@ typedef struct FlexWhisperEpochStart {
     // 48 kHz frames on the dedicated capture timeline, independent of primary/secondary
     // format and tap. capture_sample + t_ms*48 is exact. Equal to primary frame_index
     // for the same sample only when primary is 48 kHz. Other rates share units but not
-    // the origin (resampler group delay). Neither index is an offset into concatenated
+    // the origin (resampler group delay); unreconciled startup-release padding can
+    // grow the offset by up to one primary chunk per boundary. Neither index is an offset into concatenated
     // delivered PCM; pause and queue drops advance indices without delivering.
     uint64_t capture_sample;
     int64_t pts_ns;

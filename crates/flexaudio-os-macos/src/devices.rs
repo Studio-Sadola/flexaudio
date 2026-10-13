@@ -2,9 +2,9 @@
 //!
 //! [`list_output_devices`] enumerates output (playback) devices and returns a list of [`DeviceInfo`].
 //! When [`MacSystemBackend`](crate::MacSystemBackend) creates a tap for a specific device, it uses
-//! [`uid_for_device_name`] to resolve the public ID (the device name) to a CoreAudio device UID.
+//! [`resolve_output_device_uid`] to resolve a public name-based ID or native-UID fallback to a CoreAudio device UID.
 //!
-//! Match the `DeviceInfo` shape used by all OS backends: `id` and `name` are both the device name,
+//! Named devices keep name-based IDs. Unreadable names use a selectable UID and an empty name,
 //! `sample_rate` / `channels` describe the device format, `is_loopback` is always `true` (output
 //! monitor), and `is_default` is `true` when this is the default output device.
 //!
@@ -228,7 +228,7 @@ fn default_output_device() -> Result<AudioObjectID> {
     Ok(device)
 }
 
-/// Query the required device name (`kAudioObjectPropertyName`).
+/// Query the optional display name (`kAudioObjectPropertyName`).
 fn device_name(device: AudioObjectID) -> Result<String> {
     query_cfstring_property(
         device,
@@ -251,26 +251,26 @@ fn device_uid(device: AudioObjectID) -> Result<String> {
 /// Enumerate output (playback) devices.
 ///
 /// Each [`DeviceInfo`]:
-/// - `id` / `name`: device name (`kAudioObjectPropertyName`).
+/// - `id` / `name`: device name, or native UID / empty name if the display name is unreadable.
 /// - `source_kind`: [`SourceKind::SystemLoopback`].
 /// - `sample_rate` / `channels`: the successfully queried native output format.
 /// - `is_loopback`: always `true` (output monitor).
 /// - `is_default`: `true` if this is the default output device.
 ///
-/// TCC permission is not needed. Reject an incomplete inventory instead of skipping unreadable entries.
+/// TCC permission is not needed. Collection failures are terminal. Omit devices
+/// with unreadable direction (cannot classify) or no selectable identity.
 pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
     let default_id = default_output_device().unwrap_or(0);
     crate::inventory::collect_complete(all_device_ids(read_system_object_list)?, |id| {
-        if !is_output_device(id)? {
+        let Some((identity, name)) = output_device_identity(id) else {
             return Ok(None);
-        }
-        let name = device_name(id)?;
+        };
         let (sample_rate, channels, format_available) = flexaudio_core::inventory::device_format(
             device_sample_rate(id)
                 .and_then(|rate| device_channels(id).map(|channels| (rate, channels))),
         );
         Ok(Some(DeviceInfo {
-            id: name.clone(),
+            id: identity,
             name,
             source_kind: SourceKind::SystemLoopback,
             sample_rate,
@@ -282,26 +282,46 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
     })
 }
 
-/// Resolve a CoreAudio device UID from an output device name.
-///
-/// Convert the `id` (device name) from [`list_output_devices`] to the UID required by a tap.
-/// Use the first match if names are duplicated. Return `Ok(None)` if no device matches (the caller
-/// returns [`Error::DeviceNotFound`](flexaudio_core::types::Error)). If the device list cannot be read,
-/// return the corresponding error from [`map_os_status_at`].
-pub(crate) fn uid_for_device_name(name: &str) -> Result<Option<String>> {
-    for id in all_device_ids(read_system_object_list)? {
-        if !is_output_device(id)? {
-            continue;
+/// One identity/classification path for both discovery and selected-device open.
+fn output_device_identity(id: AudioObjectID) -> Option<(String, String)> {
+    if !is_output_device(id).unwrap_or(false) {
+        return None;
+    }
+    flexaudio_core::inventory::device_identity(device_name(id), || device_uid(id))
+}
+
+/// Validate the actual selected/default device's format before creating any tap.
+fn require_output_format(id: AudioObjectID) -> Result<(u32, u16)> {
+    flexaudio_core::inventory::require_device_format(
+        device_sample_rate(id)
+            .and_then(|rate| device_channels(id).map(|channels| (rate, channels))),
+    )
+}
+
+/// Resolve a name-based inventory ID or its unknown-name UID fallback.
+/// None retains default tap routing after validating the resolved default device.
+pub(crate) fn resolve_output_device_uid(requested_id: Option<&str>) -> Result<Option<String>> {
+    let Some(requested_id) = requested_id else {
+        let id = default_output_device()?;
+        if id == 0 {
+            return Err(Error::DeviceNotFound);
         }
-        if device_name(id).ok().as_deref() == Some(name) {
-            flexaudio_core::inventory::require_device_format(
-                device_sample_rate(id)
-                    .and_then(|rate| device_channels(id).map(|channels| (rate, channels))),
-            )?;
+        require_output_format(id)?;
+        return Ok(None);
+    };
+    for id in all_device_ids(read_system_object_list)? {
+        if is_output_device(id).unwrap_or(false)
+            && flexaudio_core::inventory::device_identity_matches(
+                requested_id,
+                device_name(id),
+                || device_uid(id),
+            )
+        {
+            require_output_format(id)?;
             return device_uid(id).map(Some);
         }
     }
-    Ok(None)
+    Err(Error::DeviceNotFound)
 }
 
 #[cfg(test)]
@@ -371,12 +391,12 @@ mod tests {
         );
     }
 
-    /// Resolving a nonexistent name to a UID returns `None`.
+    /// Resolving a nonexistent inventory ID returns DeviceNotFound.
     #[test]
-    fn uid_for_unknown_device_is_none() {
+    fn unknown_output_device_is_not_found() {
         assert!(matches!(
-            uid_for_device_name("flexaudio-no-such-output-device-xyzzy"),
-            Ok(None)
+            resolve_output_device_uid(Some("flexaudio-no-such-output-device-xyzzy")),
+            Err(Error::DeviceNotFound)
         ));
     }
 }
