@@ -104,36 +104,37 @@ unsafe fn collect_sessions() -> Result<Vec<SessionRecord>> {
         .GetCount()
         .map_err(|e| map_hr_at(Operation::Enumerate, "IMMDeviceCollection::GetCount", e))?;
 
-    let by_endpoint = crate::inventory::collect_complete(0..endpoint_count, |index| {
-        let Ok(device) = collection.Item(index) else {
-            return Ok(None);
-        };
-        let manager: IAudioSessionManager2 =
-            device.Activate(CLSCTX_ALL, None).map_err(|error| {
+    let by_endpoint = flexaudio_core::inventory::collect(Ok(0..endpoint_count), |index| {
+        crate::native_outcomes::endpoint_query((|| {
+            let device = collection.Item(index).map_err(|error| {
+                map_hr_at(Operation::Enumerate, "IMMDeviceCollection::Item", error)
+            })?;
+            let manager: IAudioSessionManager2 =
+                device.Activate(CLSCTX_ALL, None).map_err(|error| {
+                    map_hr_at(
+                        Operation::Enumerate,
+                        "IMMDevice::Activate(IAudioSessionManager2)",
+                        error,
+                    )
+                })?;
+            let session_list = manager.GetSessionEnumerator().map_err(|error| {
                 map_hr_at(
                     Operation::Enumerate,
-                    "IMMDevice::Activate(IAudioSessionManager2)",
+                    "IAudioSessionManager2::GetSessionEnumerator",
                     error,
                 )
             })?;
-        let session_list = manager.GetSessionEnumerator().map_err(|error| {
-            map_hr_at(
-                Operation::Enumerate,
-                "IAudioSessionManager2::GetSessionEnumerator",
-                error,
-            )
-        })?;
-        let session_count = session_list.GetCount().map_err(|error| {
-            map_hr_at(
-                Operation::Enumerate,
-                "IAudioSessionEnumerator::GetCount",
-                error,
-            )
-        })?;
-        let sessions = crate::inventory::collect_complete(0..session_count, |session_index| {
-            read_session(&session_list, session_index)
-        })?;
-        Ok(Some(sessions))
+            let session_count = session_list.GetCount().map_err(|error| {
+                map_hr_at(
+                    Operation::Enumerate,
+                    "IAudioSessionEnumerator::GetCount",
+                    error,
+                )
+            })?;
+            flexaudio_core::inventory::collect(Ok(0..session_count), |session_index| {
+                read_session(&session_list, session_index)
+            })
+        })())
     })?;
     Ok(by_endpoint.into_iter().flatten().collect())
 }

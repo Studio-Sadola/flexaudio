@@ -21,9 +21,9 @@
 //! # Selecting an output device (`device_id`)
 //! Select an output device with `device_id` in [`MacSystemBackend::new`].
 //! - `None` (default) → global tap for the default output.
-//! - `Some(name)` → create a tap for the named output device with
-//!   `initExcludingProcesses:andDeviceUID:withStream:` (resolve name → UID through
-//!   [`uid_for_device_name`](crate::devices::uid_for_device_name)). If no device matches,
+//! - `Some(id)` → create a tap for the output device selected by name or native UID with
+//!   `initExcludingProcesses:andDeviceUID:withStream:` (resolve through
+//!   [`resolve_output_device_uid`](crate::devices::resolve_output_device_uid)). If no device matches,
 //!   `start` returns [`Error::DeviceNotFound`]. Enumerate devices with
 //!   [`list_output_devices`](crate::list_output_devices).
 //!
@@ -160,7 +160,7 @@ impl MacSystemBackend {
     /// When `exclude_self` is `true`, `start` adds the calling process ([`std::process::id`]) to
     /// the exclusion set (feedback prevention). When `false`, the tap captures all system audio.
     ///
-    /// If `device_id` is `Some(name)`, create a tap for the named output device (resolve name →
+    /// If `device_id` is `Some(id)`, select the output by name or native UID (resolve to
     /// UID at `start`, returning [`Error::DeviceNotFound`] if missing). `None` selects the
     /// default output. Process exclusions also apply when a device is selected.
     ///

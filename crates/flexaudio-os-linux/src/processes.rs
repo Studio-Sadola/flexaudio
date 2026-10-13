@@ -61,6 +61,8 @@ struct RegistrySnapshot {
     client_name: HashMap<u32, String>,
     /// Node global ID → application output node.
     nodes: HashMap<u32, OutputNode>,
+    /// Bind failures in arrival order; removal events retire only vanished entries.
+    bind_failures: Vec<SnapshotError>,
 }
 
 /// Typed internal failures, rendered at the existing public `Error::Backend` boundary.
@@ -80,7 +82,61 @@ enum SnapshotError {
         code: i32,
         cause: String,
     },
+    Bind {
+        node_id: u32,
+        cause: BindCause,
+    },
     Incomplete,
+}
+
+// Preserve the typed variants supplied by pipewire-rs, which exposes no errno
+// for a null bind proxy. Only a registry removal confirms that a node vanished.
+#[derive(Debug, PartialEq, Eq)]
+enum BindCause {
+    CreationFailed,
+    NoMemory,
+    WrongProxyType,
+    Spa(pw::spa::utils::result::Error),
+}
+
+impl From<pw::Error> for BindCause {
+    fn from(error: pw::Error) -> Self {
+        match error {
+            pw::Error::CreationFailed => Self::CreationFailed,
+            pw::Error::NoMemory => Self::NoMemory,
+            pw::Error::WrongProxyType => Self::WrongProxyType,
+            pw::Error::SpaError(error) => Self::Spa(error),
+        }
+    }
+}
+
+impl std::fmt::Display for BindCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreationFailed => f.write_str("proxy creation failed"),
+            Self::NoMemory => f.write_str("proxy allocation failed"),
+            Self::WrongProxyType => f.write_str("wrong proxy type"),
+            Self::Spa(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl RegistrySnapshot {
+    fn record_bind_failure(&mut self, node_id: u32, error: pw::Error) {
+        self.bind_failures.push(SnapshotError::Bind {
+            node_id,
+            cause: error.into(),
+        });
+    }
+
+    fn remove_global(&mut self, id: u32) {
+        self.nodes.remove(&id);
+        self.client_pid.remove(&id);
+        self.client_name.remove(&id);
+        self.bind_failures.retain(
+            |error| !matches!(error, SnapshotError::Bind { node_id, .. } if *node_id == id),
+        );
+    }
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -96,6 +152,9 @@ impl std::fmt::Display for SnapshotError {
                 f,
                 "pipewire object {object_id} error {code}: {}",
                 std::io::Error::from_raw_os_error(code.saturating_neg())
+            ),
+            Self::Bind { node_id, cause } => write!(
+                f, "pipewire registry.bind for node {node_id} failed: {cause}; check audio-session access and retry discovery"
             ),
             Self::Incomplete => write!(
                 f,
@@ -261,6 +320,8 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, SnapshotError> {
     let snapshot_for_global = snapshot.clone();
     let registry_for_global = registry.clone();
     let bound_for_global = bound_nodes.clone();
+    let failure_for_remove = failure.clone();
+    let snapshot_for_remove = snapshot.clone();
     let _registry_listener = registry
         .add_listener_local()
         .global(move |global| {
@@ -310,9 +371,12 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, SnapshotError> {
                         // Bind for state and mandatory application PID information.
                         let node: pw::node::Node = match registry_for_global.bind(global) {
                             Ok(node) => node,
-                            // Node binding is entry-level: retain readable PID/name properties,
-                            // or let PID resolution omit the node if bound info was required.
-                            Err(_) => return,
+                            Err(error) => {
+                                snapshot_for_global
+                                    .borrow_mut()
+                                    .record_bind_failure(global.id, error);
+                                return;
+                            }
                         };
                         let failure_for_info = failure_for_global.clone();
                         let snapshot_for_info = snapshot_for_global.clone();
@@ -354,6 +418,11 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, SnapshotError> {
                     }
                     _ => {}
                 }
+            });
+        })
+        .global_remove(move |id| {
+            run_callback(&failure_for_remove, "registry global_remove", || {
+                snapshot_for_remove.borrow_mut().remove_global(id);
             });
         })
         .register();
@@ -466,13 +535,16 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, SnapshotError> {
 fn finish_snapshot(
     complete: bool,
     failure: Option<SnapshotError>,
-    collected: RegistrySnapshot,
+    mut collected: RegistrySnapshot,
 ) -> std::result::Result<RegistrySnapshot, SnapshotError> {
     if let Some(error) = failure {
         return Err(error);
     }
     if !complete {
         return Err(SnapshotError::Incomplete);
+    }
+    if !collected.bind_failures.is_empty() {
+        return Err(collected.bind_failures.remove(0));
     }
     Ok(collected)
 }
@@ -831,5 +903,69 @@ mod diagnostic_tests {
         assert!(!error.to_string().contains("synthetic daemon detail"));
         assert!(error.to_string().contains("-5"));
         assert_eq!(error.kind(), flexaudio_core::ErrorKind::Backend);
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+    // Real bind allocation failures/removal races require a daemon. Inject the
+    // exact pipewire-rs errors through the registry callback's shared snapshot owner.
+    #[test]
+    fn surviving_node_bind_failure_rejects_collection_with_first_cause() {
+        let mut snapshot = RegistrySnapshot::default();
+        snapshot.record_bind_failure(7, pw::Error::NoMemory);
+        snapshot.record_bind_failure(8, pw::Error::WrongProxyType);
+        let error = finish_snapshot(true, None, snapshot).unwrap_err();
+        assert_eq!(
+            error,
+            SnapshotError::Bind {
+                node_id: 7,
+                cause: BindCause::NoMemory
+            }
+        );
+        let error = error.into_core();
+        assert_eq!(error.kind(), flexaudio_core::ErrorKind::Backend);
+        assert!(error.to_string().contains("registry.bind for node 7"));
+        assert!(error.to_string().contains("proxy allocation failed"));
+        assert!(error.to_string().contains("retry"));
+    }
+
+    #[test]
+    fn removed_node_bind_failure_is_omitted_and_neighbor_is_kept() {
+        let mut snapshot = RegistrySnapshot::default();
+        snapshot.nodes.insert(
+            7,
+            OutputNode {
+                entry: NodeEntry {
+                    app_pid: Some(7),
+                    ..NodeEntry::default()
+                },
+                app_name: None,
+                running: None,
+            },
+        );
+        snapshot.nodes.insert(
+            8,
+            OutputNode {
+                entry: NodeEntry {
+                    app_pid: Some(8),
+                    ..NodeEntry::default()
+                },
+                app_name: None,
+                running: Some(true),
+            },
+        );
+        snapshot.record_bind_failure(7, pw::Error::NoMemory);
+        snapshot.remove_global(7);
+        let snapshot = finish_snapshot(true, None, snapshot).unwrap();
+        let processes = build_process_list(&snapshot, |_| None).unwrap();
+        assert_eq!(
+            processes
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            [8]
+        );
     }
 }

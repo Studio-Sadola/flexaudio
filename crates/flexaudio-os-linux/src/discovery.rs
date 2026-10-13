@@ -128,3 +128,69 @@ mod round4_tests {
         assert_eq!(node_identity("Stream/Output/Audio", None), None);
     }
 }
+
+// Shared start/reopen selection seam; the native worker receives the result unchanged.
+pub(crate) fn capture_target(
+    fan_in: bool,
+    requested_id: Option<String>,
+    inventory: impl FnOnce() -> flexaudio_core::Result<Vec<flexaudio_core::DeviceInfo>>,
+) -> flexaudio_core::Result<Option<String>> {
+    if fan_in || requested_id.is_none() {
+        return Ok(requested_id);
+    }
+    let devices = inventory()?;
+    let device =
+        flexaudio_core::inventory::selected_output_device(&devices, requested_id.as_deref())?;
+    Ok(Some(device.id.clone()))
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn default_open_never_queries_failing_inventory() {
+        let called = Cell::new(false);
+        let result = capture_target(false, None, || {
+            called.set(true);
+            Err(EnumerationFailure::CoreGone.error())
+        });
+        assert_eq!(result, Ok(None));
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn default_open_never_requires_identified_default() {
+        assert_eq!(
+            capture_target(false, None, || {
+                panic!("inventory with no identified default must not be queried")
+            }),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn explicit_open_keeps_checked_inventory_and_format_gate() {
+        let device = flexaudio_core::DeviceInfo {
+            id: "sink".into(),
+            name: "Sink".into(),
+            source_kind: flexaudio_core::SourceKind::SystemLoopback,
+            sample_rate: 0,
+            channels: 0,
+            format_available: false,
+            is_loopback: true,
+            is_default: false,
+        };
+        let error = capture_target(false, Some("sink".into()), || Ok(vec![device])).unwrap_err();
+        assert!(error.to_string().contains("could not be read"));
+        assert_eq!(
+            capture_target(false, Some("missing".into()), || Ok(vec![])),
+            Err(flexaudio_core::Error::DeviceNotFound)
+        );
+        assert_eq!(
+            capture_target(true, Some("ignored".into()), || panic!("fan-in inventory")),
+            Ok(Some("ignored".into()))
+        );
+    }
+}

@@ -2,13 +2,6 @@
 
 use flexaudio_core::Result;
 
-pub(crate) fn collect_complete<I, T>(
-    ids: impl IntoIterator<Item = I>,
-    read: impl FnMut(I) -> Result<Option<T>>,
-) -> Result<Vec<T>> {
-    flexaudio_core::inventory::collect(Ok(ids), read)
-}
-
 pub(crate) fn positive_format(rate: u32, channels: u16) -> Result<(u32, u16)> {
     if rate == 0 || channels == 0 {
         return Err(flexaudio_core::Error::Backend(
@@ -23,7 +16,7 @@ pub(crate) fn positive_format(rate: u32, channels: u16) -> Result<(u32, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use flexaudio_core::inventory::collect;
     use flexaudio_core::Error;
 
     // Native discovery errors cannot be triggered portably without hardware.
@@ -31,7 +24,7 @@ mod tests {
     #[test]
     fn unreadable_identity_omits_only_that_entry() {
         assert_eq!(
-            collect_complete([0, 1, 2], |id| {
+            collect(Ok([0, 1, 2]), |id| {
                 if id == 1 {
                     Ok(None)
                 } else {
@@ -49,7 +42,7 @@ mod tests {
             detail: "Activate access denied; retry".into(),
         };
         assert_eq!(
-            collect_complete([0, 1, 2], |_| Err::<Option<u32>, _>(error.clone())),
+            collect(Ok([0, 1, 2]), |_| Err::<Option<u32>, _>(error.clone())),
             Err(error)
         );
     }
@@ -58,7 +51,7 @@ mod tests {
     fn one_endpoint_session_count_failure_rejects_the_collection() {
         let error = Error::Backend("GetCount failed; retry".into());
         assert_eq!(
-            collect_complete([0, 1, 2], |id| {
+            collect(Ok([0, 1, 2]), |id| {
                 if id == 1 {
                     Err(error.clone())
                 } else {
@@ -71,8 +64,8 @@ mod tests {
 
     #[test]
     fn vanished_session_keeps_neighboring_sessions_and_endpoints() {
-        let result = collect_complete([0, 1], |endpoint| {
-            collect_complete([0, 1, 2], |session| {
+        let result = collect(Ok([0, 1]), |endpoint| {
+            collect(Ok([0, 1, 2]), |session| {
                 Ok((endpoint != 0 || session != 1).then_some((endpoint, session)))
             })
             .map(Some)
@@ -84,11 +77,11 @@ mod tests {
     #[test]
     fn only_successful_ineligible_entries_are_skipped() {
         assert_eq!(
-            collect_complete([0, 1, 2], |id| Ok((id != 1).then_some(id))),
+            collect(Ok([0, 1, 2]), |id| Ok((id != 1).then_some(id))),
             Ok(vec![0, 2])
         );
         assert_eq!(
-            collect_complete(Vec::<u32>::new(), |id| Ok(Some(id))),
+            collect(Ok(Vec::<u32>::new()), |id| Ok(Some(id))),
             Ok(Vec::new())
         );
     }
@@ -121,5 +114,25 @@ mod wiring_tests {
                 .unwrap();
             assert!(spawn.contains("flexaudio_core::spawn_error"));
         }
+    }
+}
+
+#[cfg(test)]
+mod collection_tests {
+    #[test]
+    fn native_device_and_process_discovery_use_complete_snapshots() {
+        for source in [include_str!("system.rs"), include_str!("processes.rs")] {
+            assert!(source.contains("flexaudio_core::inventory::collect("));
+            assert!(!source.contains("collect_complete("));
+        }
+        let error =
+            flexaudio_core::Error::Backend("collection query failed; retry discovery".into());
+        assert_eq!(
+            flexaudio_core::inventory::collect::<u32, u32>(
+                Err::<Vec<u32>, _>(error.clone()),
+                |_| panic!("entry query after collection failure")
+            ),
+            Err(error)
+        );
     }
 }

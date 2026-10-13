@@ -185,20 +185,32 @@ Unreadable per-entry optional metadata stays unknown; process names use the exis
 `pid N` fallback and absent executable/bundle ID. Entries with no readable selectable
 identity may be omitted. Windows/macOS retain existing name-based IDs when the name
 is readable; an unreadable name uses the native endpoint ID/UID with `name=""`
-(explicit unknown), which remains selectable. macOS devices with unreadable output
-direction are omitted because they cannot be classified. An unreadable default
-query leaves `is_default=false` and does not fail discovery. Device-scoped default
-opens validate the resolved default format. Linux exclusion fan-in is not device-scoped
-and uses its negotiated canonical format, so it is exempt from this device-format gate.
+(explicit unknown). IDs can change between discovery calls: the native fallback may
+be replaced by the recovered name. A name-based ID cannot be opened while its name
+is unreadable; the native ID remains openable in both name states. macOS devices
+with unreadable output direction are omitted from discovery; opening propagates
+the typed direction-query cause. An unreadable default query leaves
+`is_default=false` and does not fail discovery. Windows/macOS default opens validate
+the resolved default format. On Linux, `device_id=None` leaves `target.object` unset:
+PipeWire resolves the default sink and negotiates the format at open, without an
+inventory pre-check. Linux exclusion fan-in is also not device-scoped and uses its
+negotiated canonical format.
 An unreadable mandatory device format keeps the device with
 `format_available: false` (JS `formatAvailable`) and **sample rate = 0, channels = 0**.
-Opening performs a fresh checked query and fails with a typed cause and retry remedy
-if the format remains unreadable. C keeps the v1 struct layout and exposes
+Windows/macOS output and microphone opens perform a fresh checked format query.
+Explicit Linux output IDs use a fresh checked inventory and format-availability gate.
+These checks fail with a typed cause and retry remedy if the format remains unreadable;
+Linux default output opens rely on PipeWire resolution and negotiation instead. C keeps the v1 struct layout and exposes
 `flexaudio_device_format_available_v2`. Linux PipeWire output discovery and watcher
 notifications retain their independent 48000 Hz / 2-channel compatibility defaults
 for missing optional properties; those defaults are available, not measured.
 Windows process ERROR_INVALID_PARAMETER (87 / HRESULT 0x80070057) means vanished;
 ERROR_ACCESS_DENIED (5 / 0x80070005) and other image/name failures mean unknown metadata.
+Windows process discovery omits invalidated or vanished render endpoints
+(AUDCLNT_E_DEVICE_INVALIDATED, E_INVALIDARG, ERROR_NOT_FOUND, ERROR_FILE_NOT_FOUND);
+access denied and other endpoint query failures terminate the call with a typed cause.
+Linux process discovery omits a failed node bind only when a registry removal confirms
+the node vanished; other bind failures reject the collection with the first cause.
 macOS kAudioHardwareBadObjectError (`!obj`, 0x216f626a), ESRCH (3), and ENOENT (2)
 mean vanished; other property/path failures mean unknown metadata.
 

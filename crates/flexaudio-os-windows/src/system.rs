@@ -346,7 +346,7 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
         let count = collection.GetCount().map_err(|error| {
             map_hr_at(Operation::Enumerate, "IMMDeviceCollection::GetCount", error)
         })?;
-        crate::inventory::collect_complete(0..count, |index| {
+        flexaudio_core::inventory::collect(Ok(0..count), |index| {
             let Ok(device) = collection.Item(index) else {
                 return Ok(None);
             };

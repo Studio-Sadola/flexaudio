@@ -253,7 +253,10 @@ StreamEventDict = Union[StartupSamplesDroppedEventDict, ChunkDroppedEventDict, S
 
 class DeviceInfoDict(TypedDict):
     """Unknown display names are empty. Windows/macOS use native IDs if names are unreadable.
-    macOS unreadable output direction is omitted; unreadable default queries leave is_default=False.
+    IDs may change between queries: a native fallback may become the recovered name.
+    A name-based ID cannot be opened while its name is unreadable; the native ID stays openable
+    in both name states. macOS unreadable output direction is omitted from discovery;
+    open retains its typed cause. Unreadable default queries leave is_default=False.
     """
     id: str
     name: str
@@ -300,7 +303,13 @@ class VadSettings(TypedDict, total=False):
     sample_rate: int
 
 class DeviceInfo:
-    """Unreadable mandatory formats use sample_rate=0, channels=0, format_available=False."""
+    """Unreadable mandatory formats use sample_rate=0, channels=0, format_available=False.
+    Unknown display names are empty. Windows/macOS use native IDs if names are unreadable.
+    IDs may change between queries: a native fallback may become the recovered name.
+    A name-based ID cannot be opened while its name is unreadable; the native ID stays openable
+    in both name states. macOS unreadable output direction is omitted from discovery;
+    open retains its typed cause. Unreadable default queries leave is_default=False.
+    """
     def __repr__(self) -> str: ...
     @property
     def id(self) -> str: ...

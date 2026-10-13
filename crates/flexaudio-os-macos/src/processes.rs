@@ -66,7 +66,7 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>> {
             )
         })?;
 
-    crate::inventory::collect_complete(objects, |object| {
+    flexaudio_core::inventory::collect(Ok(objects), |object| {
         let pid = match read_scalar_property::<i32>(object, kAudioProcessPropertyPID) {
             Ok(pid) => pid,
             Err(_) => {
