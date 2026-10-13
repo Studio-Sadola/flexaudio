@@ -46,14 +46,14 @@ pub use flexaudio_core::{AddonErrorKind, StartupDropReason};
 /// Linux microphones use only cpal IDs, which the microphone backend can resolve.
 /// PipeWire Audio/Source IDs are omitted because they cannot select a cpal input.
 ///
-/// Success means a complete authoritative inventory across every provider.
-/// A confirmed empty inventory is valid; query failure returns Err, even if another
-/// provider returned devices. A partial inventory must never be treated as complete.
+/// Collection/count failures return Err even if another provider returned devices.
+/// Per-entry optional metadata stays unknown; unreadable identities may be omitted.
+/// Unreadable formats keep entries with format_available=false and 0/0.
 /// On macOS, enumeration never prompts. With undecided microphone consent it returns
 /// a typed [`Error::Backend`] before any HAL/device/format query. Grant the responsible
 /// host access or use the bounded capture-open consent flow, then retry enumeration.
-/// Denied/restricted consent returns [`Error::PermissionDenied`]. DeviceInfo formats
-/// are mandatory; discovery does not return a partial or unknown-format inventory.
+/// Denied/restricted consent returns [`Error::PermissionDenied`]. Unreadable mandatory DeviceInfo formats
+/// use format_available=false and the 0/0 sentinel; other entries remain usable.
 /// Windows enumeration does not preflight microphone permission; native enumeration
 /// proceeds. Microphone capture retains its separate existing permission preflight.
 pub fn devices() -> Result<Vec<DeviceInfo>> {

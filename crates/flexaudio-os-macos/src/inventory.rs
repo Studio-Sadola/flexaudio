@@ -1,4 +1,4 @@
-//! Complete native snapshots: only explicitly ineligible entries may be skipped.
+//! Native per-entry policy, using the shared collection owner.
 
 use flexaudio_core::Result;
 
@@ -6,39 +6,28 @@ pub(crate) fn collect_complete<I, T>(
     ids: impl IntoIterator<Item = I>,
     mut read: impl FnMut(I) -> Result<Option<T>>,
 ) -> Result<Vec<T>> {
-    let mut entries = Vec::new();
-    for id in ids {
-        if let Some(entry) = read(id)? {
-            entries.push(entry);
-        }
-    }
-    Ok(entries)
+    flexaudio_core::inventory::collect(Ok(ids), |id| read(id).ok().flatten())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flexaudio_core::{Error, ErrorContext, NativeStatus, Operation};
+    use flexaudio_core::Error;
 
     // Native discovery errors cannot be triggered portably without hardware.
     // Inject read results into the helper used by both device and process queries.
     #[test]
-    fn failed_middle_entry_rejects_the_entire_snapshot_with_its_cause() {
-        let cause = Error::Backend("native inventory query failed; retry discovery".into())
-            .with_context(ErrorContext::new(Operation::Enumerate).with_native_status(
-                NativeStatus::OsStatus {
-                    call: "fixture_property",
-                    value: -50,
-                },
-            ));
-        let inventory = collect_complete([0, 1, 2], |id| {
-            if id == 1 {
-                Err(cause.clone())
-            } else {
-                Ok(Some(id))
-            }
-        });
-        assert_eq!(inventory, Err(cause));
+    fn unreadable_identity_omits_only_that_entry() {
+        assert_eq!(
+            collect_complete([0, 1, 2], |id| {
+                if id == 1 {
+                    Err(Error::DeviceNotFound)
+                } else {
+                    Ok(Some(id))
+                }
+            }),
+            Ok(vec![0, 2])
+        );
     }
 
     #[test]

@@ -287,15 +287,15 @@ fn query_native_format(
     purpose: permission::Purpose,
 ) -> Result<(u32, u16)> {
     let host = cpal_default_host(purpose)?;
-    input_config::discover(
+    let device = resolve_input_device(&host, device_id)?;
+    flexaudio_core::inventory::require_device_format(input_config::discover(
         || {
-            let device = resolve_input_device(&host, device_id)?;
             device.default_input_config().map_err(|error| {
                 input_config::query_failure("query microphone input configuration", error)
             })
         },
         |config| (config.sample_rate().0, config.channels()),
-    )
+    ))
 }
 
 /// Enumerate input (microphone) devices, for the microphone portion of `devices()`.
@@ -304,7 +304,7 @@ fn query_native_format(
 /// - `id` / `name`: cpal has no persistent device ID, so use the device name for both. The
 ///   index can change after reconnecting, while the name remains the same for the same setup.
 /// - `sample_rate` / `channels`: from `default_input_config()`. For devices whose config
-///   cannot be read: return Backend rather than an incomplete inventory.
+///   cannot be read: retain the entry with format_available=false and 0/0.
 ///   Apply the same positive-rate and one/two-channel validation as capture setup.
 /// - `source_kind = Mic` / `is_loopback = false`.
 /// - `is_default`: `true` when the name matches `host.default_input_device()`.
@@ -322,25 +322,24 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
     let default_name = host
         .default_input_device()
         .map(|device| device.name())
-        .transpose()
-        .map_err(|error| input_config::query_failure("query default microphone name", error))?;
+        .and_then(std::result::Result::ok);
     let devices = host
         .input_devices()
         .map_err(|error| input_config::query_failure("enumerate microphone devices", error))?;
 
     let mut out = Vec::new();
     for device in devices {
-        let name = device
-            .name()
-            .map_err(|error| input_config::query_failure("query microphone device name", error))?;
-        let (sample_rate, channels) = input_config::discover(
-            || {
-                device.default_input_config().map_err(|error| {
-                    input_config::query_failure("query microphone input configuration", error)
-                })
-            },
-            |config| (config.sample_rate().0, config.channels()),
-        )?;
+        // CPAL exposes no separate ID; an unreadable identity cannot be selected.
+        let Ok(name) = device.name() else { continue };
+        let (sample_rate, channels, format_available) =
+            flexaudio_core::inventory::device_format(input_config::discover(
+                || {
+                    device.default_input_config().map_err(|error| {
+                        input_config::query_failure("query microphone input configuration", error)
+                    })
+                },
+                |config| (config.sample_rate().0, config.channels()),
+            ));
         let is_default = default_name.as_deref() == Some(name.as_str());
         out.push(DeviceInfo {
             id: name.clone(),
@@ -348,6 +347,7 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
             source_kind: SourceKind::Mic,
             sample_rate,
             channels,
+            format_available,
             is_loopback: false,
             is_default,
         });

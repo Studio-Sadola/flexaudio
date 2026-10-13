@@ -108,6 +108,10 @@ fn run_intake_inner(
                     break 'intake;
                 }
             }
+            if let Err(error) = input.reconcile_released_padding(&shared) {
+                shared.fail_terminal(error.with_context(ErrorContext::new(Operation::Normalize)));
+                break 'intake;
+            }
             input = match intake_generation::IntakeGeneration::new(
                 &shared,
                 &snapshot,

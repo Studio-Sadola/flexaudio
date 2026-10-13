@@ -259,18 +259,23 @@ fn device_uid(device: AudioObjectID) -> Result<String> {
 ///
 /// TCC permission is not needed. Reject an incomplete inventory instead of skipping unreadable entries.
 pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
-    let default_id = default_output_device()?;
+    let default_id = default_output_device().unwrap_or(0);
     crate::inventory::collect_complete(all_device_ids(read_system_object_list)?, |id| {
         if !is_output_device(id)? {
             return Ok(None);
         }
         let name = device_name(id)?;
+        let (sample_rate, channels, format_available) = flexaudio_core::inventory::device_format(
+            device_sample_rate(id)
+                .and_then(|rate| device_channels(id).map(|channels| (rate, channels))),
+        );
         Ok(Some(DeviceInfo {
             id: name.clone(),
             name,
             source_kind: SourceKind::SystemLoopback,
-            sample_rate: device_sample_rate(id)?,
-            channels: device_channels(id)?,
+            sample_rate,
+            channels,
+            format_available,
             is_loopback: true,
             is_default: id == default_id && default_id != 0,
         }))
@@ -288,7 +293,11 @@ pub(crate) fn uid_for_device_name(name: &str) -> Result<Option<String>> {
         if !is_output_device(id)? {
             continue;
         }
-        if device_name(id)? == name {
+        if device_name(id).ok().as_deref() == Some(name) {
+            flexaudio_core::inventory::require_device_format(
+                device_sample_rate(id)
+                    .and_then(|rate| device_channels(id).map(|channels| (rate, channels))),
+            )?;
             return device_uid(id).map(Some);
         }
     }
@@ -311,8 +320,12 @@ mod tests {
             assert!(d.is_loopback);
             assert!(!d.id.is_empty());
             assert_eq!(d.id, d.name);
-            assert!(d.sample_rate > 0);
-            assert!(d.channels > 0);
+            if d.format_available {
+                assert!(d.sample_rate > 0);
+                assert!(d.channels > 0);
+            } else {
+                assert_eq!((d.sample_rate, d.channels), (0, 0));
+            }
         }
     }
 

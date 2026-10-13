@@ -133,17 +133,32 @@ impl OutputTap {
     pub(super) fn pts_for_out_frame(&self, out_frame: u64) -> i64 {
         match self.pts_anchor {
             None => crate::clock::monotonic_now_ns(),
-            Some(anchor) if !self.canonical_clock => {
-                let frame_delta = out_frame as i64 - anchor.out_frame as i64;
-                let ns_per_out_frame = 1_000_000_000_i64 / self.output.sample_rate as i64;
-                anchor.pts_ns + frame_delta * ns_per_out_frame
-            }
             Some(anchor) => {
                 let frame_delta = i128::from(out_frame) - i128::from(anchor.out_frame);
                 let pts = i128::from(anchor.pts_ns)
                     + (frame_delta * 1_000_000_000).div_euclid(i128::from(self.output.sample_rate));
                 i64::try_from(pts).unwrap_or(if pts < 0 { i64::MIN } else { i64::MAX })
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod round3_tests {
+    use super::*;
+    #[test]
+    fn all_taps_use_rational_pts_steps_and_reanchor_each_push() {
+        for rate in [48_000, 44_100, 16_000] {
+            let mut tap = OutputTap::new(OutputFormat {
+                sample_rate: rate,
+                channels: 2,
+            })
+            .unwrap();
+            tap.update_pts_anchor(0, 1_000_000_000).unwrap();
+            assert_eq!(tap.pts_for_out_frame(u64::from(rate / 50)), 1_020_000_000);
+            tap.update_pts_anchor(960, 1_019_000_000).unwrap();
+            assert_eq!(tap.pts_for_out_frame(u64::from(rate / 50)), 1_019_000_000);
+            assert_eq!(tap.pts_for_out_frame(0), 999_000_000);
         }
     }
 }

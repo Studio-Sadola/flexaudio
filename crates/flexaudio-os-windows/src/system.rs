@@ -211,8 +211,7 @@ fn query_native_format(device_id: Option<&str>) -> Result<(u32, u16)> {
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
                 .map_err(|error| map_hr("CoCreateInstance(MMDeviceEnumerator)", error))?;
         let device = resolve_render_endpoint(&enumerator, device_id)?;
-        endpoint_mix_format(&device)
-            .map_err(|error| error.with_context(ErrorContext::new(Operation::Start)))
+        flexaudio_core::inventory::require_device_format(endpoint_mix_format(&device))
     }
 }
 
@@ -297,7 +296,7 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
                 )
             })?;
         let default_name = match enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
-            Ok(device) => Some(endpoint_friendly_name(&device)?),
+            Ok(device) => endpoint_friendly_name(&device).ok(),
             // E_NOTFOUND is a successfully absent default, not a failed inventory.
             Err(error) if error.code().0 as u32 == 0x8007_0490 => None,
             Err(error) => {
@@ -325,7 +324,8 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
                 map_hr_at(Operation::Enumerate, "IMMDeviceCollection::Item", error)
             })?;
             let name = endpoint_friendly_name(&device)?;
-            let (sample_rate, channels) = endpoint_mix_format(&device)?;
+            let (sample_rate, channels, format_available) =
+                flexaudio_core::inventory::device_format(endpoint_mix_format(&device));
             let is_default = default_name.as_deref() == Some(name.as_str());
             Ok(Some(DeviceInfo {
                 id: name.clone(),
@@ -333,6 +333,7 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
                 source_kind: SourceKind::SystemLoopback,
                 sample_rate,
                 channels,
+                format_available,
                 is_loopback: true,
                 is_default,
             }))

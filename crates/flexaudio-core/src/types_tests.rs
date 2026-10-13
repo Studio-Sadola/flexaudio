@@ -145,6 +145,7 @@ fn device_info_builds_and_clones() {
         source_kind: SourceKind::Mic,
         sample_rate: 48_000,
         channels: 2,
+        format_available: true,
         is_loopback: false,
         is_default: true,
     };
@@ -156,6 +157,7 @@ fn device_info_builds_and_clones() {
 
     let sys = DeviceInfo {
         source_kind: SourceKind::SystemLoopback,
+        format_available: true,
         is_loopback: true,
         is_default: false,
         ..mic.clone()

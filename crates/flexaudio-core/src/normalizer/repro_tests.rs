@@ -2,7 +2,7 @@
 use super::*;
 
 #[test]
-fn legacy_pts_arithmetic_is_pinned_across_rebuild() {
+fn rational_pts_arithmetic_is_pinned_across_rebuild() {
     let secondary = OutputFormat {
         sample_rate: 16_000,
         channels: 1,
@@ -26,9 +26,7 @@ fn legacy_pts_arithmetic_is_pinned_across_rebuild() {
     n.push(&vec![0.25; 2880 * 2], 100_000_000).unwrap();
     primary.extend(std::iter::from_fn(|| n.pop_chunk()).map(|(_, pts)| pts));
     second.extend(std::iter::from_fn(|| n.pop_secondary()).map(|(_, pts)| pts));
-    // aecdc40: frame_delta * (1_000_000_000 / rate), with each push's
-    // projected output anchor. Stream clock normalization subtracts the
-    // first primary timestamp (160 ns), shared by both output taps.
+    // Rational sample steps retain each push's arrival anchor across rebuild.
     let epoch = primary[0];
     primary.iter_mut().for_each(|pts| *pts -= epoch);
     second
@@ -38,14 +36,14 @@ fn legacy_pts_arithmetic_is_pinned_across_rebuild() {
         primary,
         [
             0,
-            19_999_680,
-            39_999_360,
-            99_999_840,
-            119_999_520,
-            139_999_200
+            20_000_000,
+            40_000_000,
+            100_000_000,
+            120_000_000,
+            140_000_000
         ]
     );
-    assert_eq!(second, [0, 19_999_840, 99_999_840, 119_999_840]);
+    assert_eq!(second, [0, 20_000_000, 100_000_000, 120_000_000]);
 }
 
 #[test]

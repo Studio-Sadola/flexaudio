@@ -317,6 +317,7 @@ mod tests {
             source_kind: SourceKind::Mic,
             sample_rate: 48_000,
             channels: 2,
+            format_available: true,
             is_loopback: false,
             is_default: true,
         }));

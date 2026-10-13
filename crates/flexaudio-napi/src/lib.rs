@@ -701,6 +701,7 @@ pub struct JsDeviceInfo {
     pub source_kind: String,
     pub sample_rate: u32,
     pub channels: u16,
+    pub format_available: bool,
     pub is_loopback: bool,
     pub is_default: bool,
 }
@@ -1014,6 +1015,7 @@ fn device_info_to_js(info: DeviceInfo) -> JsDeviceInfo {
         source_kind: source_kind_str(info.source_kind),
         sample_rate: info.sample_rate,
         channels: info.channels,
+        format_available: info.format_available,
         is_loopback: info.is_loopback,
         is_default: info.is_default,
     }
@@ -2342,8 +2344,8 @@ impl Drop for DeviceWatcherHandle {
 /// On macOS, enumeration never prompts. With undecided microphone consent it throws
 /// a typed Backend error before any HAL/device/format query. Grant the responsible
 /// host access or use the bounded capture-open consent flow, then retry enumeration.
-/// Denied/restricted consent throws PermissionDenied. DeviceInfo formats are mandatory;
-/// discovery does not return a partial or unknown-format inventory.
+/// Denied/restricted consent throws PermissionDenied. Unreadable mandatory DeviceInfo formats
+/// use format_available=false and the 0/0 sentinel; other entries remain usable.
 /// Windows enumeration does not preflight microphone permission; native enumeration
 /// proceeds. Microphone capture retains its separate existing permission preflight.
 #[napi]
@@ -3377,6 +3379,7 @@ mod tests {
             id: "node-1".to_string(),
             name: "Mic A".to_string(),
             source_kind: SourceKind::Mic,
+            format_available: true,
             sample_rate: 48_000,
             channels: 2,
             is_loopback: false,
@@ -3439,6 +3442,7 @@ mod tests {
             id: "id-x".to_string(),
             name: "Name X".to_string(),
             source_kind: SourceKind::SystemLoopback,
+            format_available: true,
             sample_rate: 44_100,
             channels: 1,
             is_loopback: true,

@@ -266,8 +266,16 @@ fn list_devices_never_panics_and_is_consistent() {
         // Stable key: cpal uses the device name as the ID.
         assert_eq!(d.id, d.name);
         assert!(!d.id.is_empty(), "id (= name) is nonempty");
-        assert!(d.sample_rate > 0);
-        assert!(d.channels > 0);
+        if d.format_available {
+            if d.format_available {
+                assert!(d.sample_rate > 0);
+                assert!(d.channels > 0);
+            } else {
+                assert_eq!((d.sample_rate, d.channels), (0, 0));
+            }
+        } else {
+            assert_eq!((d.sample_rate, d.channels), (0, 0));
+        }
     }
     // At most one default input device.
     assert!(devices.iter().filter(|d| d.is_default).count() <= 1);

@@ -49,7 +49,8 @@ const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
 ///
 /// Versions earlier than 14.4 return [`Error::UnsupportedOsVersion`](flexaudio_core::types::Error).
 /// If the process object list itself cannot be read, map the `OSStatus` to a typed error
-/// ([`map_os_status_at`]). A failed property query rejects the entire snapshot.
+/// ([`map_os_status_at`]). Unreadable optional properties stay unknown; vanished
+/// objects and entries without a readable PID may be omitted.
 /// Includes all processes known to Core Audio, including input-only processes. No property can
 /// exclude only processes that have never had output (`Devices` lists devices in use now, and
 /// `IsRunningOutput` indicates whether output is active now).
@@ -66,18 +67,33 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>> {
         })?;
 
     crate::inventory::collect_complete(objects, |object| {
-        let pid = read_scalar_property::<i32>(object, kAudioProcessPropertyPID)?;
+        let pid = match read_scalar_property::<i32>(object, kAudioProcessPropertyPID) {
+            Ok(pid) => pid,
+            Err(_) => {
+                // Without a readable PID there is no representable process identity.
+                // Vanished objects and other unreadable identities are omitted.
+                return Ok(None);
+            }
+        };
         if pid <= 0 {
             return Ok(None);
         }
-        let bundle_id = query_cfstring_property(
-            object,
-            kAudioProcessPropertyBundleID,
-            kAudioObjectPropertyScopeGlobal,
-        )?;
+        let Some(bundle_id) = flexaudio_core::inventory::process_metadata(
+            query_cfstring_property(
+                object,
+                kAudioProcessPropertyBundleID,
+                kAudioObjectPropertyScopeGlobal,
+            ),
+            flexaudio_core::inventory::macos_error_failure,
+        ) else {
+            return Ok(None);
+        };
         let is_output_active =
-            Some(read_scalar_property::<u32>(object, kAudioProcessPropertyIsRunningOutput)? != 0);
-        let executable = process_path(pid)?.and_then(|path| executable_basename(&path));
+            read_scalar_property::<u32>(object, kAudioProcessPropertyIsRunningOutput)
+                .ok()
+                .map(|active| active != 0);
+        let executable = flexaudio_core::inventory::optional(process_path(pid))
+            .and_then(|path| executable_basename(&path));
         Ok(Some(ProcessInfo {
             pid: pid as u32,
             name: executable.clone().unwrap_or_default(),
@@ -154,7 +170,10 @@ fn process_path(pid: i32) -> Result<Option<String>> {
     };
     if written <= 0 {
         let code = std::io::Error::last_os_error().raw_os_error();
-        if code == Some(libc::ESRCH) {
+        if code.is_some_and(|code| {
+            flexaudio_core::inventory::macos_process_failure(code)
+                == flexaudio_core::inventory::ProcessFailure::Vanished
+        }) {
             return Ok(None);
         }
         return Err(Error::Backend(format!("process image query failed (OS code {code:?}); check process access and retry discovery"))

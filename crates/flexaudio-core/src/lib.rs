@@ -37,6 +37,7 @@ pub mod error_context;
 mod errors;
 mod spawn_error;
 pub use spawn_error::spawn_error;
+pub mod inventory;
 mod loss;
 pub mod normalizer;
 pub mod process_list;

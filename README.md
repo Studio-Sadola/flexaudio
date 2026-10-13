@@ -6,6 +6,7 @@ on the tap's canonical 48 kHz timeline, continues across reopen, and exposes
 queue drops as gaps. Set it from the producing timeline when constructing
 chunks; use `frame_index: 0` for a single synthetic chunk starting at zero.
 The C `FlexChunk` v1 layout is unchanged.
+Rust `DeviceInfo` struct literals must also supply `format_available` (0.5.4).
 
 **English** | [Japanese](README.ja.md)
 
@@ -128,13 +129,13 @@ The facade crate `flexaudio` re-exports everything you need:
   (CPAL, all platforms) and system output endpoints (Linux: PipeWire sinks;
   Windows: active render endpoints; macOS: output devices) in one list.
   Linux microphone IDs are CPAL IDs; PipeWire Audio/Source nodes are not advertised
-  as microphones. Incomplete or failed discovery returns an error, including
+  as microphones. Collection or count failure returns an error, including
   when the PipeWire daemon is unreachable on Linux.
   On macOS, enumeration never prompts: undecided microphone consent returns a
   typed `Backend` error before any HAL/device/format query. Grant the responsible
   host access or use the bounded capture-open consent flow, then retry discovery.
-  Denied/restricted consent returns `PermissionDenied`. DeviceInfo sample rate
-  and channel count are mandatory; no partial or unknown-format inventory is returned.
+  Denied/restricted consent returns `PermissionDenied`. Unreadable mandatory formats
+  use the 0/0 sentinel and `format_available=false`; other devices remain usable.
   Linux PipeWire output formats retain the compatibility defaults described in
   [Failure reporting](#failure-reporting-in-054).
   Windows enumeration does not preflight microphone permission; native enumeration
@@ -178,17 +179,55 @@ terminal. Legacy VAD and WhisperVad are mutually exclusive on a stream.
 
 ## Failure reporting in 0.5.4
 
-Discovery fails the whole snapshot when a mandatory device name, classification,
-format, process PID or session query fails. Unreadable mandatory entries are not
-silently skipped. Linux PipeWire output discovery and device watcher notifications
-are an exception for formats: missing or unparseable `audio.rate` / `audio.channels`
-properties still default independently to 48000 Hz / 2 channels. These values are
-compatibility defaults, not measured formats; `DeviceInfo` does not distinguish them.
-Optional process metadata is absent only when confirmed absent or when its
-process disappeared; other native metadata query failures reject the snapshot.
+Collection/enumeration or count failures fail the whole call with a typed error.
+Unreadable per-entry optional metadata stays unknown; process names use the existing
+`pid N` fallback and absent executable/bundle ID. Entries with no readable selectable
+identity may be omitted. An unreadable mandatory device format keeps the device with
+`format_available: false` (JS `formatAvailable`) and **sample rate = 0, channels = 0**.
+Opening performs a fresh checked query and fails with a typed cause and retry remedy
+if the format remains unreadable. C keeps the v1 struct layout and exposes
+`flexaudio_device_format_available_v2`. Linux PipeWire output discovery and watcher
+notifications retain their independent 48000 Hz / 2-channel compatibility defaults
+for missing optional properties; those defaults are available, not measured.
+Windows process ERROR_INVALID_PARAMETER (87 / HRESULT 0x80070057) means vanished;
+ERROR_ACCESS_DENIED (5 / 0x80070005) and other image/name failures mean unknown metadata.
+macOS kAudioHardwareBadObjectError (`!obj`, 0x216f626a), ESRCH (3), and ENOENT (2)
+mean vanished; other property/path failures mean unknown metadata.
+
 Windows native waits distinguish
 an actual timeout from a failed wait, and COM initialization reports unexpected
 HRESULT failures.
+
+Primary and secondary `ptsNs` (`pts_ns` in Rust/Python/C) are arrival-time labels,
+re-anchored on every native callback. Rational sample steps apply within an anchor,
+but callback jitter can make consecutive chunks overlap or leave gaps; there is no
+non-overlap or bounded-monotonic guarantee. `frameIndex` / `frame_index` is the
+authoritative position; gaps report loss. VAD's exact sample-clock mapping uses
+`epochStart.ptsNs + tMs * 1_000_000`, or `epochStart.captureSample` plus `tMs * 48`.
+`captureSample` / `capture_sample` counts 48 kHz frames on the dedicated capture
+timeline, independent of primary/secondary formats and `tap`. It equals primary
+`frameIndex` for the same sample when primary is 48 kHz, including generation
+replacement, recovery, loss rebuild and startup PCM release. At other primary rates
+the axes share units but not an exact origin: resampler group delay is not compensated.
+Neither index is an offset into concatenated delivered PCM: pause and queue drops
+advance indices without delivering samples.
+
+An arrival gap without reopen emits no event or `DISCONTINUITY`: `frameIndex`
+remains contiguous, only primary `ptsNs` jumps, and attached WhisperVad keeps its
+epoch open. A stall (at least 2 s without consumed samples, checked every 250 ms)
+emits `stalled`, reopens with `recoverableError` and 250 ms..5 s backoff, then emits
+`recovered`. The first new-generation primary data chunk has
+`RECOVERED|DISCONTINUITY`; WhisperVad closes with `epochEnd(finish)` and starts a
+new epoch when new PCM arrives. Downtime does not become frames. These three
+advisories are unordered relative to `onChunk` and epoch events.
+Attached WhisperVad epochs strictly increase within a stream (checked epoch + 1
+on rebuild); each new `openStream` starts at 0 and `(epoch, seq)` is unique per
+stream. In Node.js, `epochEnd(error)` precedes `whisperVadFailed`.
+Every successful `switchSource` creates a generation with `DISCONTINUITY`, with
+the epoch transition deferred until new PCM. The synchronous call does not invoke
+`onChunk` re-entrantly; return means the backend was replaced, not that data was
+delivered. Old `epochEnd` is not guaranteed before the first new-generation primary
+chunk; consumers use primary `DISCONTINUITY` as the boundary.
 
 Linux routing changes mark the next delivered chunk `DISCONTINUITY`. Failed binds,
 malformed/missing buffers, rejected renegotiation and callback panics surface through
@@ -570,8 +609,8 @@ permission events keep type `permissionDenied` and add `permission`
   or PulseAudio session).
 - System and per-process capture require a running **PipeWire** session. If
   PipeWire is absent or watcher startup fails, `watch_devices()` returns an error.
-  Device discovery requires a complete inventory from every provider; an incomplete
-  or failed query returns an error. Under a portal-based desktop, the user may be
+  Device discovery requires a collection from every provider; a collection/count
+  failure returns an error. Under a portal-based desktop, the user may be
   prompted to grant capture access.
 
 ---

@@ -30,6 +30,8 @@ pub struct PyDeviceInfo {
     #[pyo3(get)]
     channels: u16,
     #[pyo3(get)]
+    format_available: bool,
+    #[pyo3(get)]
     is_loopback: bool,
     #[pyo3(get)]
     is_default: bool,
@@ -39,12 +41,13 @@ pub struct PyDeviceInfo {
 impl PyDeviceInfo {
     fn __repr__(&self) -> String {
         format!(
-            "DeviceInfo(id={:?}, name={:?}, source_kind={:?}, sample_rate={}, channels={}, is_loopback={}, is_default={})",
+            "DeviceInfo(id={:?}, name={:?}, source_kind={:?}, sample_rate={}, channels={}, format_available={}, is_loopback={}, is_default={})",
             self.id,
             self.name,
             self.source_kind,
             self.sample_rate,
             self.channels,
+            bool_repr(self.format_available),
             bool_repr(self.is_loopback),
             bool_repr(self.is_default),
         )
@@ -58,6 +61,7 @@ pub(crate) fn device_info_to_py(info: DeviceInfo) -> PyDeviceInfo {
         source_kind: source_kind_str(info.source_kind).to_string(),
         sample_rate: info.sample_rate,
         channels: info.channels,
+        format_available: info.format_available,
         is_loopback: info.is_loopback,
         is_default: info.is_default,
     }
@@ -506,6 +510,7 @@ impl PyDeviceEvent {
             device.set_item("source_kind", source_kind_str(info.source_kind))?;
             device.set_item("sample_rate", info.sample_rate)?;
             device.set_item("channels", info.channels)?;
+            device.set_item("format_available", info.format_available)?;
             device.set_item("is_loopback", info.is_loopback)?;
             device.set_item("is_default", info.is_default)?;
             d.set_item("device", device)?;
@@ -742,6 +747,7 @@ mod tests {
             source_kind: SourceKind::SystemLoopback,
             sample_rate: 44_100,
             channels: 1,
+            format_available: true,
             is_loopback: true,
             is_default: false,
         };
@@ -771,6 +777,7 @@ mod tests {
             source_kind: SourceKind::Mic,
             sample_rate: 48_000,
             channels: 2,
+            format_available: true,
             is_loopback: false,
             is_default: true,
         };

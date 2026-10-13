@@ -312,7 +312,10 @@ typedef struct FlexChunk {
     size_t len;
     // Number of frames in the chunk.
     uint32_t frames;
-    // Monotonic presentation timestamp (ns) of the first sample.
+    // Arrival-time label re-anchored on every native callback. Primary/secondary chunks
+    // may overlap or leave gaps by callback jitter; no non-overlap or bounded-monotonic
+    // guarantee. flexaudio_chunk_frame_index is authoritative (gaps are loss). Exact VAD mapping uses
+    // epoch_start.pts_ns + t_ms*1000000 or epoch_start.capture_sample + t_ms*48.
     int64_t pts_ns;
     // Monotonically increasing sequence number assigned by the stream layer.
     uint64_t seq;
@@ -361,9 +364,9 @@ typedef struct FlexDeviceInfo {
     char *name;
     // Source kind used to capture this device.
     int32_t source_kind;
-    // Native (default) sample rate (Hz).
+    // Native rate (Hz), or 0 if unavailable; use flexaudio_device_format_available_v2.
     uint32_t sample_rate;
-    // Native (default) channel count.
+    // Native channel count, or 0 if unavailable (both rate/channels are 0).
     uint16_t channels;
     // True for loopback (system-output monitor).
     bool is_loopback;
@@ -521,6 +524,11 @@ typedef union FlexWhisperVadPayload {
 } FlexWhisperVadPayload;
 
 typedef struct FlexWhisperEpochStart {
+    // 48 kHz frames on the dedicated capture timeline, independent of primary/secondary
+    // format and tap. capture_sample + t_ms*48 is exact. Equal to primary frame_index
+    // for the same sample only when primary is 48 kHz. Other rates share units but not
+    // the origin (resampler group delay). Neither index is an offset into concatenated
+    // delivered PCM; pause and queue drops advance indices without delivering.
     uint64_t capture_sample;
     int64_t pts_ns;
 } FlexWhisperEpochStart;
@@ -783,15 +791,15 @@ int32_t flexaudio_terminal_error(const struct FlexStream *s);
 // List available devices, allocate an array, and set `out_array` / `out_count`.
 //
 // Return 0 only for complete discovery. An empty complete inventory sets
-// `out_array=NULL` / `out_count=0`. Incomplete or failed discovery (including an
+// `out_array=NULL` / `out_count=0`. Collection/count failure (including an
 // unreachable PipeWire daemon on Linux) returns a typed error code and sets
 // `flexaudio_last_error` / `flexaudio_last_error_info_v2`; it is not an empty success.
 // Free the allocated array with `flexaudio_devices_free`.
 // On macOS, enumeration never prompts. With undecided microphone consent it returns
 // a typed Backend error before any HAL/device/format query. Grant the responsible
 // host access or use the bounded capture-open consent flow, then retry enumeration.
-// Denied/restricted consent returns a permission error. DeviceInfo formats are mandatory;
-// discovery does not return a partial or unknown-format inventory.
+// Denied/restricted consent returns a permission error. Unreadable mandatory DeviceInfo formats
+// use format_available=false and the 0/0 sentinel; other entries remain usable.
 // Windows enumeration does not preflight microphone permission; native enumeration
 // proceeds. Microphone capture retains its separate existing permission preflight.
 //
@@ -837,6 +845,16 @@ void flexaudio_processes_free(struct FlexProcessInfo *arr, size_t count);
 // Valid until the next FFI call on the same thread updates last_error. Returns NULL if there
 // is no error. The returned pointer is owned by flexaudio; do not free it from C.
 const char *flexaudio_last_error(void);
+
+// Whether this device's capture format is available. Additive v2 accessor; the
+// v1 FlexDeviceInfo layout is unchanged. False means sample_rate=0 and channels=0.
+// Opening requires a fresh successful format query or fails with a typed
+// cause/remedy error. Linux PipeWire's documented compatibility defaults remain available.
+// NULL/misaligned pointers return false and set a typed InvalidArg last error.
+//
+// # Safety
+// `device` must point to a live FlexDeviceInfo returned by flexaudio_devices.
+bool flexaudio_device_format_available_v2(const struct FlexDeviceInfo *device);
 
 // Creates a denoiser for the given channel count (1 = mono, 2 = interleaved stereo).
 //

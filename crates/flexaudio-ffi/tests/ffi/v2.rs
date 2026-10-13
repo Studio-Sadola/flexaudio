@@ -474,6 +474,7 @@ fn v2_borrowed_device_and_error_views_survive_tls_changes() {
             source_kind: fa::SourceKind::Mic,
             sample_rate: 48_000,
             channels: 1,
+            format_available: true,
             is_loopback: false,
             is_default: true,
         },
