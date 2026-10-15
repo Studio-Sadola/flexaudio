@@ -116,7 +116,7 @@ fn fifo_overflow(overflow: bool) {
     let lost = before + 1920 - after;
     assert!(
         lost == 0 || event.is_some(),
-        "F08/M3: fifo_discarded_samples={lost}, child_ring_overflow={}, event={event:?}",
+        "fifo_discarded_samples={lost}, child_ring_overflow={}, event={event:?}",
         lane.consumer.overflow_count()
     );
     if overflow {

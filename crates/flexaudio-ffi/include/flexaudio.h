@@ -383,8 +383,10 @@ typedef struct FlexVadOptions {
     float threshold;
     int32_t min_speech_ms;
     int32_t min_silence_ms;
-    // Maximum segmentation budget in integer milliseconds; 0 means unbounded.
-    // A nonzero value must exceed 32 + 2 * speech_pad_ms; smaller values are rejected.
+    // Maximum segmentation budget in integer milliseconds. Zero or values above
+    // 100000000 use the effectively unbounded INT_MAX/2-sample sentinel (1073741823 samples).
+    // Other nonzero values must be at least 32 + 2 * speech_pad_ms.
+    // Zero split budgets are valid; negative budgets are rejected.
     // The final segment merger can join neighboring splits.
     uint32_t max_speech_ms;
     int32_t speech_pad_ms;
@@ -1060,6 +1062,9 @@ const char *flexaudio_error_message_v2(const struct FlexErrorInfoV2 *value);
 
 // Borrow the stable VAD cause code until the error owner is freed.
 // NULL means this error has no VAD cause; invalid pointers set last_error.
+// Codes: InvalidParameter, InvalidProbability, InvalidPcm, Overflow, SessionFinished,
+// Inference, ModelLoad, FailedSession, InvalidStereoLength, CaptureSampleOverflow,
+// PtsOutOfRange, UnsupportedTap, UnsupportedConversionClock, Conversion, Stopped.
 // # Safety
 // value must be a live readable error owner. Do not free the borrowed string.
 const char *flexaudio_error_vad_code_v2(const struct FlexErrorInfoV2 *value);

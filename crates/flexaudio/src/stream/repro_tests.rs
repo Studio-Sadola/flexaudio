@@ -301,7 +301,7 @@ fn poison(poison: bool) {
     let event = stream.poll_event();
     assert!(
         event.is_some(),
-        "M5: diagnostic queued after poison but poll_event returned {event:?}"
+        "diagnostic queued after poison but poll_event returned {event:?}"
     );
 }
 #[test]
@@ -345,7 +345,7 @@ fn tail_metadata(partial: bool) {
     let padding = chunk.data.iter().filter(|&&s| s == 0.0).count();
     assert!(
         !partial || !chunk.flags.is_empty(),
-        "F14/M1: real_samples=200, generated_padding={padding}, flags={:?}, frames={}",
+        "real_samples=200, generated_padding={padding}, flags={:?}, frames={}",
         chunk.flags,
         chunk.frames
     );
@@ -416,7 +416,7 @@ fn secondary_loss(overflow: bool) {
     let event = stream.poll_event();
     assert!(
         dropped == 0 || event.is_some(),
-        "M4: secondary_dropped_before={dropped}, primary_dropped={}, event={event:?}",
+        "secondary_dropped_before={dropped}, primary_dropped={}, event={event:?}",
         stream.dropped_chunks()
     );
 }

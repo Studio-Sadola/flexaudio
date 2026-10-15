@@ -249,7 +249,12 @@ consume(vad.finish()); // True EOF; infer one zero-padded partial frame if neede
 
 The immutable parameters are `threshold` (0.5), `minSpeechMs` (250),
 `minSilenceMs` (100), `maxSpeechMs` (0, unbounded), and
-`speechPadMs` (30). Minimum durations and padding accept integer 0..134217 ms; zero is literal. `maxSpeechMs` accepts unsigned integer milliseconds, with 0 meaning unbounded. Positive values must exceed `32 + 2 * speechPadMs`; their split budget is exactly `maxSpeechMs * 16 - 512 - 2 * speechPadMs * 16` samples. Unsupported values throw `InvalidParameter`.
+`speechPadMs` (30). Minimum durations and padding accept integer 0..134217 ms; zero is literal. `maxSpeechMs` accepts unsigned integer milliseconds. Zero or values above 100000000 use the legacy `INT_MAX/2`-sample sentinel (1073741823 samples), which is effectively unbounded. Other positive values must be at least `32 + 2 * speechPadMs`; their split budget is exactly `maxSpeechMs * 16 - 512 - 2 * speechPadMs * 16` samples. Zero budgets are valid (for example, 1000 ms with 484 ms padding); negative budgets throw `InvalidParameter`.
+
+In 0.5.x, fractional `maxSpeechDurationS` values were truncated to whole seconds.
+To preserve identical segmentation, migrate with
+`maxSpeechMs = trunc(seconds) * 1000` (for example, 30.9 seconds becomes 30000 ms).
+
 Unknown keys, invalid types, out-of-range PCM and nonfinite values throw errors
 with stable `code` values. Drain the exception's `terminalEvents` through the
 same consumer before handling a fatal failure; validation errors carry `[]`.

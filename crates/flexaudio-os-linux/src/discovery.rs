@@ -78,7 +78,7 @@ pub(crate) fn device_format(rate: Option<&str>, channels: Option<&str>) -> (u32,
 }
 
 #[cfg(test)]
-mod round3_tests {
+mod device_format_tests {
     use super::*;
     #[test]
     fn invalid_properties_keep_inventory_neighbors_without_fabricated_formats() {
@@ -113,7 +113,7 @@ pub(crate) fn node_identity<'a>(media_class: &str, name: Option<&'a str>) -> Opt
 }
 
 #[cfg(test)]
-mod round4_tests {
+mod node_identity_tests {
     use super::*;
     #[test]
     fn missing_audio_node_identity_keeps_inventory_and_watcher_neighbors() {

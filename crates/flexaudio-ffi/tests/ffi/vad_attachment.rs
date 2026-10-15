@@ -387,6 +387,69 @@ fn vad_code_borrow_preserves_context_and_rejects_invalid_owners() {
 }
 
 #[test]
+fn every_shared_vad_code_survives_c_error_projection() {
+    use flexaudio::VadErrorCode::*;
+    for code in [
+        InvalidParameter,
+        InvalidProbability,
+        InvalidPcm,
+        Overflow,
+        SessionFinished,
+        Inference,
+        ModelLoad,
+        FailedSession,
+        InvalidStereoLength,
+        CaptureSampleOverflow,
+        PtsOutOfRange,
+        UnsupportedTap,
+        UnsupportedConversionClock,
+        Conversion,
+        Stopped,
+    ] {
+        let error = crate::v2_storage::FlexErrorInfoV2::new(flexaudio::Error::Vad { code });
+        unsafe {
+            let value = crate::v2::flexaudio_error_vad_code_v2(&error);
+            assert!(!value.is_null());
+            assert_eq!(
+                std::ffi::CStr::from_ptr(value).to_str().unwrap(),
+                code.as_str()
+            );
+        }
+    }
+}
+
+#[test]
+fn validated_attachment_owns_parsed_options() {
+    unsafe {
+        let base: FlexConfig = mem::zeroed();
+        let mut options = FlexStreamVadOptions {
+            params: crate::vad::flexaudio_vad_default_options(),
+            provisional: 1,
+            tap: FLEX_VAD_PRIMARY,
+        };
+        options.params.max_speech_ms = 1000;
+        options.params.speech_pad_ms = 484;
+        let config = FlexStreamConfigV2 {
+            size: u32::try_from(mem::size_of::<FlexStreamConfigV2>()).unwrap(),
+            version: FLEX_STREAM_VERSION_2,
+            config: &base,
+            vad: &options,
+        };
+        let parsed = validate(&config).unwrap_or_else(|status| panic!("invalid config: {status}"));
+        // The checked value must not borrow or re-read the caller's options.
+        options.params.max_speech_ms = 1;
+        options.provisional = 0;
+        assert!(params_from_c(&options.params).is_err());
+        assert_eq!(options.provisional, 0);
+        let (params, runtime) = parsed.vad.unwrap();
+        assert_eq!(params.max_speech_ms, 1000);
+        assert_eq!(params.speech_pad_ms, 484);
+        assert!(runtime.provisional);
+        assert!(flexaudio_vad::VadTap::new(params, runtime).is_ok());
+    }
+}
+
+#[test]
 fn free_releases_attached_stream_and_unread_outputs() {
     use std::sync::atomic::{AtomicBool, Ordering};
     struct OwnedBackend(Arc<AtomicBool>);

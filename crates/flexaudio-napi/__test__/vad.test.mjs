@@ -403,13 +403,15 @@ standaloneTest('standalone input rate and channels are strict optional format va
 });
 
 standaloneTest('millisecond split budgets reject unsupported values without truncation', () => {
-  for (const maxSpeechMs of [1, 32, 92, 900.5, -1, Infinity]) {
+  for (const maxSpeechMs of [1, 32, 91, 900.5, -1, Infinity]) {
     rejectsCode(() => new Vad({ maxSpeechMs }), 'InvalidParameter');
   }
-  for (const maxSpeechMs of [93, 900, 1000, 0]) {
+  for (const maxSpeechMs of [92, 93, 900, 1000, 0, 100001000]) {
     const vad = new Vad({ maxSpeechMs });
     vad.finish();
   }
+  const zeroBudget = new Vad({ maxSpeechMs: 1000, speechPadMs: 484 });
+  assert.deepEqual(zeroBudget.finish(), [{ type: 'epochEnd', epoch: 0, seq: 0, reason: 'finish' }]);
 });
 
 standaloneTest('valid full-scale source PCM survives finite resampling overshoot', () => {

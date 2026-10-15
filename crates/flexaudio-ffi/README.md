@@ -288,8 +288,10 @@ probabilities without inference; its owned segment arrays use
 `free`. A handle cannot be mutated concurrently. NULL input is allowed only at
 zero length; mandatory output pointers cannot be NULL.
 
-`max_speech_ms` uses integer milliseconds; 0 means unbounded. Values below one
-inference frame plus twice the padding budget are rejected. Fixed 200 ms
+`max_speech_ms` uses integer milliseconds; 0 or values above 100000000 use the effectively
+unbounded legacy `INT_MAX/2`-sample sentinel (1073741823 samples). Other positive values below
+one inference frame plus twice the padding budget are rejected; equality (a zero split
+budget) is valid. Fixed 200 ms
 merging can undo maximum-duration splits, so final segment duration/finalization
 latency is unbounded. Optional provisional pieces have a separate 30000 ms cap.
 There are no audio-copying or timestamp-map APIs.

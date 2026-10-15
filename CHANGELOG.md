@@ -49,7 +49,7 @@ Golden segment endpoints remain unchanged for the existing 16 kHz mono path.
 | Python | `WhisperVadEvent`, `AttachedWhisperVadEvent`, `WhisperCode` and prefixed error types | Generic `VadEvent`, `AttachedVadEvent`, `VadErrorCode` and VAD error names |
 | Python | `WhisperVadStreamOptions`, `WhisperSpeechSegment`, `WhisperCloseReason`, `WhisperCutReason`, `WhisperVadValidationError`, `WhisperVadRuntimeError` | `StreamVadOptions`, `SpeechSegment`, `VadCloseReason`, `VadCutReason`, `VadValidationError`, `VadRuntimeError` |
 | Python | `AudioChunk.whisper_vad_events`, `AudioError.whisper_code`, `BackendErrorDict.whisper_code` | `vad_events`, `vad_code`, `vad_code` |
-| Python | `whisper_vad=`, `flush_whisper_vad()`, `whisper_code`, duration fields | `vad=`, `flush_vad()`, `vad_code`, `min_speech_ms`, `min_silence_ms`, `max_speech_ms` |
+| Python | `whisper_vad=`, `flush_whisper_vad()`, `whisper_code`, duration fields | `vad=` on `open()`, `flush_vad()`, `vad_code`, `min_speech_ms`, `min_silence_ms`, `max_speech_ms`; the VAD attachment persists across source switches |
 | Python | Earlier `Vad`/`VadSettings`, `_VadFlushErrorFields`, start/end sample events and legacy integrated controls | Removed; use the unified session and attached stream options |
 | C | `FlexWhisperVad*`, `FlexWhisper*` payloads, `flexaudio_whisper_*` | Generic `FlexVad*` types and `flexaudio_vad_*` functions |
 | C | `FLEX_WHISPER_*`, `flexaudio_error_whisper_code_v2` | `FLEX_VAD_*` in a distinct status range and `flexaudio_error_vad_code_v2` |
@@ -65,6 +65,10 @@ Golden segment endpoints remain unchanged for the existing 16 kHz mono path.
 | C | Earlier `FlexVadConfig`, `FlexVadEvent` sample events and integrated configuration | Removed; use unified millisecond options/events and v2 attachment configuration |
 | All | `PermissionGranted` / `permissionGranted` | Removed; C event number 9 is reserved and never reused |
 
+In 0.5.x, fractional `maxSpeechDurationS` values were truncated to whole seconds.
+To preserve identical segmentation, migrate with
+`maxSpeechMs = trunc(seconds) * 1000` (for example, 30.9 seconds becomes 30000 ms).
+
 ### Defaults and behavior
 
 - Attached and standalone VAD share defaults: threshold 0.5, minimum speech
@@ -73,10 +77,12 @@ Golden segment endpoints remain unchanged for the existing 16 kHz mono path.
 - C supplied `FlexVadOptions` values preserve literal zeros. The earlier
   `FlexVadConfig` zero-sentinel defaults are removed; use NULL parameters or
   `flexaudio_vad_default_options()` for the shared defaults.
-- Maximum speech duration is integer milliseconds; omitted or zero is unbounded.
-  Nonzero values use the exact 16 kHz split budget
-  `16 * maxSpeechMs - 512 - 32 * speechPadMs`; nonpositive budgets return
-  `InvalidParameter`. Subsecond values are never truncated to whole seconds.
+- Maximum speech duration is integer milliseconds; omitted, zero, or values above
+  100,000,000 ms use the legacy `INT_MAX/2`-sample sentinel (1,073,741,823 samples),
+  which is effectively unbounded. Other nonzero values use the exact 16 kHz split
+  budget `16 * maxSpeechMs - 512 - 32 * speechPadMs`; negative budgets return
+  `InvalidParameter`, while zero budgets are valid (1000 ms with 484 ms padding,
+  for example). Subsecond values are never truncated to whole seconds.
   Later merging can reunite splits, so this is not a final-duration/latency bound.
 - Standalone VAD accepts optional input rate/channels (16000/1 by default),
   converts internally, and reports milliseconds on the input timeline with

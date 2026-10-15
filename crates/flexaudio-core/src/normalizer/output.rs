@@ -144,7 +144,7 @@ impl OutputTap {
 }
 
 #[cfg(test)]
-mod round3_tests {
+mod pts_tests {
     use super::*;
     #[test]
     fn all_taps_use_rational_pts_steps_and_reanchor_each_push() {

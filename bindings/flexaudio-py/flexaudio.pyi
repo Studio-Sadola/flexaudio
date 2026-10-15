@@ -28,7 +28,7 @@ StreamEventType = Literal["startupSamplesDropped",
     "recoverableError", "shutdownError", "audioLoss", "clipped", "unknown"
 ]
 RecordingPermission = Literal["microphone", "systemAudio"]
-VadErrorCode = Literal["InvalidParameter", "InvalidProbability", "InvalidPcm", "Overflow", "SessionFinished", "Inference", "ModelLoad", "FailedSession", "InvalidStereoLength", "CaptureSampleOverflow", "PtsOutOfRange", "UnsupportedConversionClock", "Conversion", "Stopped"]
+VadErrorCode = Literal["InvalidParameter", "InvalidProbability", "InvalidPcm", "Overflow", "SessionFinished", "Inference", "ModelLoad", "FailedSession", "InvalidStereoLength", "CaptureSampleOverflow", "PtsOutOfRange", "UnsupportedTap", "UnsupportedConversionClock", "Conversion", "Stopped"]
 
 MixLane = Literal["microphone", "systemAudio"]
 
@@ -472,6 +472,8 @@ class Stream:
         """Every successful switch creates a generation with DISCONTINUITY; epoch
         transition waits for new PCM. Return means backend replaced, not delivered.
         Old epoch_end need not precede new primary PCM; use its DISCONTINUITY boundary.
+        The VAD attachment configured with vad at open() persists across switches;
+        new PCM starts a new VAD epoch. Omitting denoise disables noise suppression.
         """
         ...
     def __enter__(self) -> Stream: ...
@@ -607,7 +609,9 @@ class Vad:
     Input defaults to mono16k. Other positive rates/channel counts are converted internally;
     event milliseconds use the input timeline with converter group delay compensated.
     After raw input validation, finite resampler overshoot is clipped internally to [-1, 1].
-    max_speech_ms=0 means unbounded; other values must exceed 32+2*speech_pad_ms.
+    max_speech_ms=0 or values above 100000000 use the effectively unbounded
+    INT_MAX/2-sample sentinel (1073741823 samples). Other positive values must be
+    at least 32+2*speech_pad_ms; zero split budgets are valid, negative ones rejected.
     Buffer input is copied into owned storage for Python 3.8 stable-ABI support.
     """
     def __init__(self, threshold: float = 0.5, min_speech_ms: int = 250,

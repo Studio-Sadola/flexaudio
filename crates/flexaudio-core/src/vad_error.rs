@@ -25,6 +25,8 @@ pub enum VadErrorCode {
     CaptureSampleOverflow,
     /// The capture timestamp exceeded its supported domain.
     PtsOutOfRange,
+    /// The requested capture tap is unavailable for this binding or configuration.
+    UnsupportedTap,
     /// Conversion could not establish an exact sample-aligned clock.
     UnsupportedConversionClock,
     /// Capture conversion failed.
@@ -48,6 +50,7 @@ impl VadErrorCode {
             Self::InvalidStereoLength => "InvalidStereoLength",
             Self::CaptureSampleOverflow => "CaptureSampleOverflow",
             Self::PtsOutOfRange => "PtsOutOfRange",
+            Self::UnsupportedTap => "UnsupportedTap",
             Self::UnsupportedConversionClock => "UnsupportedConversionClock",
             Self::Conversion => "Conversion",
             Self::Stopped => "Stopped",
@@ -70,6 +73,7 @@ impl VadErrorCode {
             Self::InvalidStereoLength => "capture input does not contain complete stereo frames",
             Self::CaptureSampleOverflow => "the capture sample count exceeds the supported domain",
             Self::PtsOutOfRange => "the capture timestamp exceeds the supported domain",
+            Self::UnsupportedTap => "the requested capture tap is unavailable",
             Self::UnsupportedConversionClock => {
                 "conversion cannot establish an exact sample-aligned clock"
             }

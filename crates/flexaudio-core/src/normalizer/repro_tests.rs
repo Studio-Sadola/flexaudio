@@ -1,4 +1,4 @@
-//! Offline audit reproductions. No devices are opened.
+//! Offline conversion, timeline, and flush regression tests.
 use super::*;
 
 #[test]
@@ -175,7 +175,7 @@ fn partial_frame(split: bool) {
     n.flush().unwrap();
     assert!(
         n.pop_chunk().is_some(),
-        "H8: partial input frames discarded rather than retained: output_frames={}",
+        "partial input frames discarded rather than retained: output_frames={}",
         n.buffered_out_frames()
     );
 }

@@ -2399,7 +2399,7 @@ mod reproduction_tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
-    // Offline audit reproductions. These exercise the existing CLI paths without devices.
+    // Offline CLI output, validation, and configuration regression tests.
     struct ReproFinalEventBackend {
         inner: flexaudio::MockBackend,
         stopped: bool,
@@ -2742,11 +2742,12 @@ mod operation_error_tests {
 }
 
 #[cfg(test)]
-mod round2_tests {
+mod wav_failure_tests {
     use super::*;
     #[test]
-    fn round2_early_failure_never_creates_or_truncates_wav() {
-        let dir = std::env::temp_dir().join(format!("flexaudio-round2-wav-{}", std::process::id()));
+    fn early_failure_never_creates_or_truncates_wav() {
+        let dir =
+            std::env::temp_dir().join(format!("flexaudio-wav-failure-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for split in [0, 5] {
             let base = dir.join(format!("recording-{split}.wav"));

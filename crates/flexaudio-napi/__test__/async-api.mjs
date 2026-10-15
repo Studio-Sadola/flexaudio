@@ -7,7 +7,7 @@
 //     onChunk is not called after resolve.
 // (c) Calling stop() from onChunk still resolves (does not hang).
 // (d) Calling stop() twice resolves both Promises.
-// (e) Calling stop() after it has stopped resolves immediately on the JS thread (P1 path a).
+// (e) Calling stop() after it has stopped resolves immediately on the JS thread.
 //     A mock cannot create TSFN Closing (napi TSFN Closing is the Node shutdown state).
 //     Immediate resolve after Stopped covers this case instead.
 
@@ -116,7 +116,7 @@ async function testStopTwice() {
 }
 
 async function testStopAfterAlreadyStoppedResolvesImmediately() {
-  // P1 path (a): if the phase is already Stopped, call resolve_undefined on the JS thread
+  // If the phase is already Stopped, call resolve_undefined on the JS thread
   // without waiting for a TSFN round trip. A mock cannot create TSFN Closing (napi
   // Closing is the environment state during Node shutdown).
   const stream = native.__openMockStream(48000, 2, 440.0, () => {});

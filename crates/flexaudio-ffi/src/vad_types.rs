@@ -7,8 +7,10 @@ pub struct FlexVadOptions {
     pub threshold: f32,
     pub min_speech_ms: i32,
     pub min_silence_ms: i32,
-    /// Maximum segmentation budget in integer milliseconds; 0 means unbounded.
-    /// A nonzero value must exceed 32 + 2 * speech_pad_ms; smaller values are rejected.
+    /// Maximum segmentation budget in integer milliseconds. Zero or values above
+    /// 100000000 use the effectively unbounded INT_MAX/2-sample sentinel (1073741823 samples).
+    /// Other nonzero values must be at least 32 + 2 * speech_pad_ms.
+    /// Zero split budgets are valid; negative budgets are rejected.
     /// The final segment merger can join neighboring splits.
     pub max_speech_ms: u32,
     pub speech_pad_ms: i32,

@@ -176,10 +176,17 @@ let final_events = vad.finish()?;
 `speech_pad_ms: 30`、`max_speech_ms: 0`（無制限）です。`VadRuntimeOptions.provisional` は
 既定で false です。単独処理と接続処理の既定値は同じで、製品ごとの上限は呼び出し側から明示します。
 
-`maxSpeechMs`（`max_speech_ms`）は整数ミリ秒です。正の値では、16 kHz サンプル数による分割予算
-`16 * maxSpeechMs - 512 - 32 * speechPadMs` を使います。秒未満でも切り捨てず、900 ms は
-900 ms として扱います。予算が正でない場合は `InvalidParameter` で拒否します。後の結合により分割が
-再結合されるため、最終区間長や通知遅延の厳密な上限ではありません。省略と 0 は無制限です。
+`maxSpeechMs` (`max_speech_ms`) is integer milliseconds. Omitted, zero, or values above
+100,000,000 ms use the effectively unbounded legacy `INT_MAX/2`-sample sentinel
+(1,073,741,823 samples). Other nonzero values use the exact 16 kHz split budget
+`16 * maxSpeechMs - 512 - 32 * speechPadMs`, including subsecond values.
+Negative budgets are rejected with `InvalidParameter`; zero budgets are valid
+(for example, 1000 ms with 484 ms padding). Merging can reunite splits, so this
+does not bound final segment duration or delivery latency.
+
+In 0.5.x, fractional `maxSpeechDurationS` values were truncated to whole seconds.
+To preserve identical segmentation, migrate with
+`maxSpeechMs = trunc(seconds) * 1000` (for example, 30.9 seconds becomes 30000 ms).
 
 Node.js の単独 `process(samples, inputSampleRate?, inputChannels?)` は既定で
 16000 Hz、1 チャンネルです。Python は同じ既定値で `input_sample_rate` と `input_channels` を

@@ -4256,9 +4256,9 @@ mod silent_failure_tests {
 }
 
 #[cfg(test)]
-mod round2_tests {
+mod spawn_cause_tests {
     #[test]
-    fn round2_native_owners_preserve_spawn_causes() {
+    fn native_owners_preserve_spawn_causes() {
         // Deterministic std::thread spawn exhaustion cannot be injected portably.
         // Core spawn_error tests cover the cause projection; check all native wiring here.
         let source = include_str!("lib.rs");

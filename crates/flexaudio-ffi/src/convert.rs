@@ -265,8 +265,6 @@ pub fn chunk_to_c(chunk: AudioChunk) -> FlexChunk {
         dropped_before,
         peak,
         rms,
-        // The caller (poll_processed) adds VAD events later, only when enabled.
-        // Default is "none".
     }
 }
 
@@ -281,7 +279,6 @@ pub unsafe fn free_chunk_data(chunk: &mut FlexChunk) {
         chunk.data = ptr::null_mut();
         chunk.len = 0;
     }
-    // The VAD event array is also owned by this chunk, so free it too.
 }
 
 /// Preserve the signed counter range without wrapping exact u64 values negative.

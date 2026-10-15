@@ -362,14 +362,17 @@ impl Drop for MacSystemBackend {
     }
 }
 
-/// Owner-thread body for the tap chain (shared by system / process capture).
-///
-/// Build the chain with [`build_tap_chain`] for `kind` and report success/failure through
+/// Capture selection and diagnostic policy for the tap owner thread.
 pub(crate) struct TapThreadConfig {
+    /// Process inclusion/exclusion and optional output device for the tap chain.
     pub kind: TapKind,
+    /// Enable the bounded diagnostic probe when an active source produces silence.
     pub silence_probe: bool,
 }
 
+/// Owner-thread body for the tap chain (shared by system / process capture).
+///
+/// Build the chain with [`build_tap_chain`] for `config.kind` and report success/failure through
 /// `ready_tx`. After success, the IOProc continues processing blocks while this owner
 /// checks source activity and, once per generation, runs a bounded private self-probe.
 /// On stop or terminal denial, drop [`TapChain`] to release resources in reverse order.

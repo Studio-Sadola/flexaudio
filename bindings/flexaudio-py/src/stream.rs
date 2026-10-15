@@ -245,9 +245,9 @@ impl Stream {
     /// values are validated even for mic/process sources before accessing any device.
     /// Applies to system capture and the system side of mix, alongside `exclude_self`.
     ///
-    /// Specify `vad` / `denoise` again to configure integrated addons. A source change makes audio
-    /// discontinuous, so rebuild addons as requested (reset their internal state). If omitted, defaults
-    /// (`vad=None` / `denoise=False`) disable addons, as with open; specify them on each switch.
+    /// The VAD attachment configured with `vad` at `open()` persists across switches. New PCM
+    /// starts a new VAD epoch at the discontinuity. `denoise` configures noise suppression for
+    /// the new source; omitting it disables noise suppression (`denoise=False`).
     #[pyo3(signature = (
         kind,
         *,

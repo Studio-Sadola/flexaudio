@@ -446,18 +446,18 @@ fn compare_boundary_sample(boundary: &str, startup: bool) {
 }
 
 #[test]
-fn round3_same_sample_after_replacement() {
+fn same_sample_after_replacement() {
     compare_boundary_sample("replacement", false);
 }
 #[test]
-fn round3_same_sample_after_recovery() {
+fn same_sample_after_recovery() {
     compare_boundary_sample("recovery", false);
 }
 #[test]
-fn round3_same_sample_after_loss_rebuild() {
+fn same_sample_after_loss_rebuild() {
     compare_boundary_sample("loss", false);
 }
 #[test]
-fn round3_same_sample_after_startup_release() {
+fn same_sample_after_startup_release() {
     compare_boundary_sample("startup release", true);
 }

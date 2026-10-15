@@ -1,6 +1,7 @@
-"""Declaration regressions for the approved closed 0.5 binding contracts."""
+"""Declaration regressions for closed public binding contracts."""
 import ast
 from pathlib import Path
+import re
 import unittest
 
 
@@ -118,6 +119,30 @@ class DeclarationContracts(unittest.TestCase):
         self.assertEqual(self.fields("BackendErrorDict")["vad_code"], "VadErrorCode")
         self.assertEqual(backend.__optional_keys__, {"vad_code"})
         self.assertEqual(backend.__required_keys__, {"kind", "message", "contexts", "secondary", "diagnostic_details", "addon_kind", "addon_message"})
+
+    def test_vad_error_codes_match_rust_typescript_and_c(self):
+        root = Path(__file__).resolve().parents[3]
+        rust = (root / "crates/flexaudio-core/src/vad_error.rs").read_text()
+        variants = rust.split("pub enum VadErrorCode {", 1)[1].split("}", 1)[0]
+        expected = set(re.findall(r"^    (\w+),$", variants, re.MULTILINE))
+        spellings = dict(re.findall(r'Self::(\w+) => "(\w+)"', rust))
+        self.assertEqual(spellings, {name: name for name in expected})
+        python_codes = self.aliases["VadErrorCode"].slice.elts
+        self.assertEqual({node.value for node in python_codes}, expected)
+        typescript = (root / "crates/flexaudio-napi/index.d.ts").read_text()
+        declaration = typescript.split("export type VadErrorCode =", 1)[1].split("/**", 1)[0]
+        self.assertEqual(set(re.findall(r"'(\w+)'", declaration)), expected)
+        header = (root / "crates/flexaudio-ffi/include/flexaudio.h").read_text()
+        codes = header.split("// Codes: ", 1)[1].split("// # Safety", 1)[0]
+        self.assertEqual(set(re.findall(r"\b[A-Z]\w+\b", codes)), expected)
+
+    def test_switch_documents_persistent_vad_and_per_switch_denoise(self):
+        method = next(node for node in self.classes["Stream"].body
+                      if isinstance(node, ast.FunctionDef) and node.name == "switch_source")
+        self.assertNotIn("vad", {argument.arg for argument in method.args.kwonlyargs})
+        doc = ast.get_docstring(method)
+        self.assertIn("persists across switches", doc)
+        self.assertIn("Omitting denoise disables noise suppression", doc)
 
 
 if __name__ == "__main__":

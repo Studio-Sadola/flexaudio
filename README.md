@@ -184,12 +184,19 @@ let final_events = vad.finish()?;
 `VadRuntimeOptions.provisional` defaults to false. Attached and standalone use the
 same defaults; applications explicitly select their own duration caps.
 
-`maxSpeechMs` (`max_speech_ms`) is an integer number of milliseconds. A nonzero
+`maxSpeechMs` (`max_speech_ms`) is an integer number of milliseconds. Omitted,
+zero, or values above 100,000,000 ms use the legacy `INT_MAX/2`-sample sentinel
+(1,073,741,823 samples), which is effectively unbounded. Any other nonzero
 value uses the exact split budget `16 * maxSpeechMs - 512 - 32 * speechPadMs`
 in 16 kHz samples, including for subsecond values: 900 ms is 900 ms, with no
-seconds truncation. Nonpositive budgets are rejected with `InvalidParameter`.
+seconds truncation. Negative budgets are rejected with `InvalidParameter`;
+a zero split budget is valid (for example, 1000 ms with 484 ms padding).
 Segmentation can merge neighboring splits, so this is not a strict bound on final
-segment duration or delivery latency. Omitted values and zero are unbounded.
+segment duration or delivery latency.
+
+In 0.5.x, fractional `maxSpeechDurationS` values were truncated to whole seconds.
+To preserve identical segmentation, migrate with
+`maxSpeechMs = trunc(seconds) * 1000` (for example, 30.9 seconds becomes 30000 ms).
 
 Standalone Node.js `process(samples, inputSampleRate?, inputChannels?)` defaults
 to 16000 Hz and one channel. Python uses `input_sample_rate` and `input_channels`

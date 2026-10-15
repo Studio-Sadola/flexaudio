@@ -260,6 +260,37 @@ fn all_high_integer_max_splits_can_be_remerged() {
         )
     );
 }
+
+#[test]
+fn large_maximum_preserves_legacy_sentinel_segmentation() {
+    let probabilities = runs(&[(0.9, 2_097_153), (0.0, 20)]);
+    for max_speech_ms in [0, 100_001_000, u32::MAX] {
+        assert_eq!(
+            pairs(&run(
+                VadOptions {
+                    max_speech_ms,
+                    ..Default::default()
+                },
+                &probabilities,
+            )),
+            [(0, 67_108_890)],
+            "maximum {max_speech_ms} must use the legacy INT_MAX/2 sample budget"
+        );
+    }
+}
+
+#[test]
+fn zero_split_budget_preserves_legacy_segmentation() {
+    let options = VadOptions {
+        max_speech_ms: 1000,
+        speech_pad_ms: 484,
+        ..Default::default()
+    };
+    assert_eq!(
+        pairs(&run(options, &runs(&[(0.9, 10), (0.0, 20)]))),
+        [(0, 770)]
+    );
+}
 #[test]
 fn raw_merge_gap_strict_boundary_and_chain() {
     for gap in [3199, 3200, 3201] {

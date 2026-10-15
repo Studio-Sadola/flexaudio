@@ -15,7 +15,9 @@ pub struct VadOptions {
     /// Silence confirmation duration, in 0..=134217 ms. Default 100.
     pub min_silence_ms: u32,
     /// Maximum split budget in integer milliseconds; zero is unbounded.
-    /// A positive value must exceed 32 + 2 * speech_pad_ms. The raw split
+    /// Values above 100_000_000 ms use the same INT_MAX/2-sample sentinel as
+    /// zero, preserving the effectively unbounded 0.5.x seconds behavior.
+    /// Other positive values must be at least 32 + 2 * speech_pad_ms. The raw split
     /// budget is max_speech_ms * 16 - 512 - 2 * speech_pad_ms * 16 samples.
     /// Merging can undo splits, so this does not bound final duration or latency.
     pub max_speech_ms: u32,
@@ -70,12 +72,11 @@ impl VadOptions {
         }
         let pad = u64::from(self.speech_pad_ms) * 16;
         let sentinel = u64::try_from(i32::MAX / 2).expect("positive constant");
-        let max_speech = if self.max_speech_ms == 0 {
+        let max_speech = if self.max_speech_ms == 0 || self.max_speech_ms > 100_000_000 {
             sentinel
         } else {
             (u64::from(self.max_speech_ms) * 16)
                 .checked_sub(FRAME + 2 * pad)
-                .filter(|budget| *budget > 0)
                 .ok_or_else(|| invalid(Field::MaxSpeechMs, Reason::OutOfRange))?
         };
         Ok(DerivedParams {
@@ -160,8 +161,10 @@ mod tests {
         assert_eq!(budget(1000).unwrap(), 14_528);
         assert_eq!(budget(30_900).unwrap(), 492_928);
         assert_eq!(budget(100_000_000).unwrap(), 1_599_998_528);
-        assert_eq!(budget(100_001_000).unwrap(), 1_600_014_528);
-        for ms in [1, 31, 32, 91, 92] {
+        assert_eq!(budget(100_000_001).unwrap(), 1_073_741_823);
+        assert_eq!(budget(100_001_000).unwrap(), 1_073_741_823);
+        assert_eq!(budget(u32::MAX).unwrap(), 1_073_741_823);
+        for ms in [1, 31, 32, 91] {
             assert!(matches!(
                 budget(ms),
                 Err(VadError::InvalidParameter {
@@ -170,6 +173,19 @@ mod tests {
                 })
             ));
         }
+        assert_eq!(budget(92).unwrap(), 0);
         assert_eq!(budget(93).unwrap(), 16);
+        let options = VadOptions {
+            max_speech_ms: 1000,
+            speech_pad_ms: 484,
+            ..Default::default()
+        };
+        assert_eq!(options.derive().unwrap().max_speech, 0);
+        assert!(VadOptions {
+            max_speech_ms: 999,
+            ..options
+        }
+        .validate()
+        .is_err());
     }
 }

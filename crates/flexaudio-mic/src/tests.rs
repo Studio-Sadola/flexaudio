@@ -366,7 +366,7 @@ fn microphone_native_query_uses_the_checked_discovery_helper() {
 }
 
 #[test]
-fn round2_callback_panic_closes_pcm_and_publishes_one_typed_terminal() {
+fn callback_panic_closes_pcm_and_publishes_one_typed_terminal() {
     let mut backend = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
     backend.callback_errors.guard(|| panic!("injected callback panic"));
     assert!(backend.stop_flag.load(Ordering::SeqCst));
@@ -379,7 +379,7 @@ fn round2_callback_panic_closes_pcm_and_publishes_one_typed_terminal() {
 }
 
 #[test]
-fn round2_microphone_inventory_uses_validated_native_formats() {
+fn microphone_inventory_uses_validated_native_formats() {
     // CPAL's concrete Device cannot inject formats without native hardware.
     // input_config discovery tests exercise the validation; this checks adapter wiring.
     let source = include_str!("lib.rs");

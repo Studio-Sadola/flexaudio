@@ -133,7 +133,12 @@ fn reject_audio(status: i32, error: flexaudio::Error) -> i32 {
     status
 }
 
-unsafe fn validate<'a>(config: *const FlexStreamConfigV2) -> Result<&'a FlexConfig, i32> {
+struct ValidatedConfig<'a> {
+    base: &'a FlexConfig,
+    vad: Option<(flexaudio_vad::VadOptions, flexaudio_vad::VadRuntimeOptions)>,
+}
+
+unsafe fn validate<'a>(config: *const FlexStreamConfigV2) -> Result<ValidatedConfig<'a>, i32> {
     if config.is_null() || !config.is_aligned() {
         return Err(reject(
             code::FLEX_INVALID_ARG,
@@ -157,7 +162,7 @@ unsafe fn validate<'a>(config: *const FlexStreamConfigV2) -> Result<&'a FlexConf
     }
     let base = &*config.config;
     crate::convert::validate_config(base).map_err(|()| code::FLEX_INVALID_ARG)?;
-    if !config.vad.is_null() {
+    let vad = if !config.vad.is_null() {
         if !config.vad.is_aligned() {
             return Err(reject(
                 code::FLEX_INVALID_ARG,
@@ -186,10 +191,18 @@ unsafe fn validate<'a>(config: *const FlexStreamConfigV2) -> Result<&'a FlexConf
                 "InvalidArgument: provisional must be 0 or 1",
             ));
         }
-        params_from_c(&options.params)
+        let params = params_from_c(&options.params)
             .map_err(|message| reject(code::FLEX_INVALID_ARG, message))?;
-    }
-    Ok(base)
+        Some((
+            params,
+            flexaudio_vad::VadRuntimeOptions {
+                provisional: options.provisional != 0,
+            },
+        ))
+    } else {
+        None
+    };
+    Ok(ValidatedConfig { base, vad })
 }
 
 /// Open a versioned primary stream, returning a typed result code and last_error.
@@ -210,26 +223,19 @@ pub unsafe extern "C" fn flexaudio_open_v2(
             );
         }
         out.write(ptr::null_mut());
-        let envelope = config;
-        let config = match validate(config) {
+        let validated = match validate(config) {
             Ok(c) => c,
             Err(status) => return status,
         };
-        let options = (*envelope).vad.as_ref();
-        let vad_tap = match options
-            .map(|options| {
-                flexaudio_vad::VadTap::new(
-                    params_from_c(&options.params).expect("validated parameters"),
-                    flexaudio_vad::VadRuntimeOptions {
-                        provisional: options.provisional != 0,
-                    },
-                )
-            })
+        let vad_tap = match validated
+            .vad
+            .map(|(params, runtime)| flexaudio_vad::VadTap::new(params, runtime))
             .transpose()
         {
             Ok(tap) => tap,
             Err(error) => return reject_tap(error),
         };
+        let config = validated.base;
         let stream = crate::flexaudio_open(config);
         if stream.is_null() {
             crate::error::last_audio_error()
@@ -780,8 +786,8 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "../tests/ffi/vad_tap_audit.rs"]
-mod audit_tests;
+#[path = "../tests/ffi/vad_attachment.rs"]
+mod attachment_tests;
 
 #[cfg(test)]
 mod error_projection_tests {

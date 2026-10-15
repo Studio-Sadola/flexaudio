@@ -252,8 +252,10 @@ Parameters are `threshold=0.5`, `min_speech_ms=250`,
 `min_silence_ms=100`, `max_speech_ms=0`, and
 `speech_pad_ms=30`. Supplied zero values stay zero. Durations must be integers
 in 0..134217; bool durations, unknown keys, invalid PCM and nonfinite parameters
-are rejected. `max_speech_ms` is integer milliseconds; 0 means unbounded. Values below
-one inference frame plus twice the padding budget are rejected. Fixed
+are rejected. `max_speech_ms` is integer milliseconds; 0 or values above 100000000 use the
+effectively unbounded legacy `INT_MAX/2`-sample sentinel (1073741823 samples). Other positive
+values below one inference frame plus twice the padding budget are rejected; equality
+(a zero split budget) is valid. Fixed
 200 ms merging can undo splits: it does **not** bound final segment duration or
 latency. Optional provisional cuts independently cap pieces at 30000 ms.
 

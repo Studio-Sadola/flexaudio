@@ -29,10 +29,12 @@ exactly-once terminal events in `VadFailure`; consume those events before report
 
 Defaults are threshold 0.5, minimum speech 250 ms, minimum silence 100 ms, padding 30 ms,
 unbounded maximum speech, and provisional hints disabled. Standalone and attached VAD share
-these defaults. `max_speech_ms` is an integer. Zero means unbounded; positive values must exceed
-`32 + 2 * speech_pad_ms`. The exact raw split budget is
+these defaults. `max_speech_ms` is an integer. Zero or values above 100000000 use the effectively
+unbounded legacy `INT_MAX/2`-sample sentinel (1073741823 samples). Other positive values must be
+at least `32 + 2 * speech_pad_ms`. The exact raw split budget is
 `max_speech_ms * 16 - 512 - 2 * speech_pad_ms * 16` samples. No seconds conversion or truncation
-is applied. Subsequent interval merging can reunite splits, so this setting does not guarantee a
+is applied. Zero split budgets are valid; negative budgets are rejected. Subsequent interval
+merging can reunite splits, so this setting does not guarantee a
 maximum final interval length or delivery latency. Final endpoints retain whisper.cpp's 10 ms
 rounding behavior and may extend beyond physical EOF within the padded model frame.
 

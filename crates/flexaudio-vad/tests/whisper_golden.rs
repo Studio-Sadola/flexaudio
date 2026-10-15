@@ -134,18 +134,7 @@ fn check_fixture(data: &str) {
 }
 
 // Frozen fixtures describe the older seconds API. Translate its effective
-// integer-second/sentinel settings; expected segment values remain untouched.
+// integer-second settings; expected segment values remain untouched.
 fn migrated_maximum(params: &Params) -> u32 {
-    let seconds = params.max_speech_duration_s;
-    if seconds > 100_000.0 {
-        return 0;
-    }
-    let milliseconds = seconds.trunc() * 1000.0;
-    assert!(milliseconds.is_finite() && (0.0..=100_000_000.0).contains(&milliseconds));
-    let milliseconds = milliseconds as u32;
-    if u64::from(milliseconds) <= 32 + 2 * u64::from(params.speech_pad_ms) {
-        0
-    } else {
-        milliseconds
-    }
+    (params.max_speech_duration_s.trunc() * 1000.0) as u32
 }

@@ -307,5 +307,5 @@ fn capacity() -> VadError {
 }
 
 #[cfg(test)]
-#[path = "segmenter_tests.rs"]
+#[path = "whisper_cpp_segments_tests.rs"]
 mod tests;

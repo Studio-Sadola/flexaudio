@@ -135,7 +135,7 @@ export interface VadOptions {
   minSpeechMs?: number
   /** Integer 0..134217 ms, default 100. */
   minSilenceMs?: number
-  /** Integer milliseconds, default 0 (unbounded). Positive values must exceed 32 + 2*speechPadMs; the split budget is maxSpeechMs*16 - 512 - 2*speechPadMs*16 samples. Unsupported values throw InvalidParameter. Merging can undo splits. */
+  /** Integer milliseconds. Zero (default) or values above 100000000 use the effectively unbounded INT_MAX/2-sample sentinel (1073741823 samples). Other positive values must be at least 32 + 2*speechPadMs; the split budget is maxSpeechMs*16 - 512 - 2*speechPadMs*16 samples. Zero budgets are valid; negative budgets throw InvalidParameter. Merging can undo splits. */
   maxSpeechMs?: number
   /** Integer 0..134217 ms, default 30. */
   speechPadMs?: number

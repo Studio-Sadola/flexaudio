@@ -1,4 +1,4 @@
-//! Offline C ABI audit reproductions. No native audio devices are opened.
+//! Offline C ABI validation, processing, and ownership regressions.
 use crate::error::{clear_last_error, code};
 use crate::types::{FlexChunk, FlexConfig, FlexProcessMode, FlexSourceKind, FlexStream};
 use flexaudio as fa;

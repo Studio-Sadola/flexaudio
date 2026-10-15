@@ -182,10 +182,10 @@ mod diagnostic_tests {
 }
 
 #[cfg(test)]
-mod round2_tests {
+mod inventory_format_tests {
     use super::*;
     #[test]
-    fn round2_inventory_formats_share_capture_validation() {
+    fn inventory_formats_share_capture_validation() {
         for (format, kind) in [
             ((0, 1), flexaudio_core::ErrorKind::InvalidArg),
             ((48_000, 0), flexaudio_core::ErrorKind::InvalidArg),

@@ -466,6 +466,9 @@ pub unsafe extern "C" fn flexaudio_error_message_v2(
 }
 /// Borrow the stable VAD cause code until the error owner is freed.
 /// NULL means this error has no VAD cause; invalid pointers set last_error.
+/// Codes: InvalidParameter, InvalidProbability, InvalidPcm, Overflow, SessionFinished,
+/// Inference, ModelLoad, FailedSession, InvalidStereoLength, CaptureSampleOverflow,
+/// PtsOutOfRange, UnsupportedTap, UnsupportedConversionClock, Conversion, Stopped.
 /// # Safety
 /// value must be a live readable error owner. Do not free the borrowed string.
 #[no_mangle]
