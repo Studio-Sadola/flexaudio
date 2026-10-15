@@ -265,7 +265,7 @@ jobs:
           FLEXAUDIO_REPRO_ADDON: ${{ github.workspace }}/crates/flexaudio-napi/__test__/repro.node
           FLEXAUDIO_TEST_ADDON: ${{ github.workspace }}/crates/flexaudio-napi/__test__/repro.node
           FLEXAUDIO_RELEASE_ADDON: ${{ github.workspace }}/crates/flexaudio-napi/__test__/plain-debug.node
-        run: node --test __test__/binding-contract.test.mjs __test__/binding-declarations.test.mjs __test__/vad.test.mjs
+        run: node --test __test__/binding-contract.test.mjs __test__/binding-declarations.test.mjs __test__/vad.test.mjs __test__/vad-concurrency.test.mjs
 
   smoke-linux-pipewire:
     name: Self-exclusion smoke (Linux / real PipeWire)
