@@ -271,26 +271,6 @@ fn terminal_suppresses_tails_and_retains_final_losses_and_cleanup() {
 }
 
 #[test]
-fn mix_forwards_mic_grant_once_and_rejects_system_grants() {
-    let pending = Event::PermissionPending {
-        permission: flexaudio_core::Permission::Microphone,
-        detail: "microphone consent is pending".into(),
-    };
-    let mic = Child::new(vec![
-        pending.clone(),
-        Event::PermissionGranted,
-        Event::PermissionGranted,
-    ]);
-    let system = Child::new(vec![Event::PermissionGranted, Event::PermissionGranted]);
-    let mut mix = CompositeBackend::new(Box::new(mic), Box::new(system), 1.0, 1.0);
-    start(&mut mix);
-    let forwarded = events(&mut mix);
-    assert_eq!(forwarded, vec![pending, Event::PermissionGranted]);
-    assert!(mix.shutdown.is_none());
-    assert!(mix.stop_checked().is_ok());
-}
-
-#[test]
 fn startup_rollback_retains_primary_and_checked_cleanup() {
     let mut mic = Child::new(vec![]);
     mic.stop_error = true;

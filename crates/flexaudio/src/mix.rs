@@ -64,7 +64,6 @@ pub(crate) struct CompositeBackend {
     shutdown: Option<ShutdownReport>,
     poll_system_first: bool,
     poll_notices: bool,
-    mic_granted: bool,
 }
 
 impl CompositeBackend {
@@ -87,7 +86,6 @@ impl CompositeBackend {
             shutdown: None,
             poll_system_first: false,
             poll_notices: false,
-            mic_granted: false,
         }
     }
 
@@ -105,13 +103,6 @@ impl CompositeBackend {
                 ) =>
             {
                 Some(error.clone())
-            }
-            Event::PermissionGranted => {
-                if lane != MixLane::Microphone || self.mic_granted || self.notices.failed() {
-                    return None;
-                }
-                self.mic_granted = true;
-                return Some(Event::PermissionGranted);
             }
             Event::AudioLoss { loss } => {
                 let loss = if matches!(loss.path(), AudioPath::Capture { lane: None }) {
@@ -207,7 +198,6 @@ impl CaptureBackend for CompositeBackend {
         }
         let previous_report = self.shutdown.take();
         let previous_notices = std::mem::replace(&mut self.notices, Arc::new(Notices::default()));
-        let previous_granted = std::mem::replace(&mut self.mic_granted, false);
         self.stopping = Arc::new(AtomicBool::new(false));
         let started = (|| {
             let mut mic = start_child(&mut self.mic, MixLane::Microphone, self.notices.clone())?;
@@ -270,7 +260,6 @@ impl CaptureBackend for CompositeBackend {
             if previous_report.is_some() {
                 self.shutdown = previous_report;
                 self.notices = previous_notices;
-                self.mic_granted = previous_granted;
             }
             return result;
         }

@@ -84,7 +84,7 @@ pub struct JsAudioError {
     pub advertised: Option<JsNativeFormat>,
     pub actual: Option<JsNativeFormat>,
     /// Typed attached-addon cause, projected as a backend error in the shared report.
-    pub whisper_code: Option<String>,
+    pub vad_code: Option<String>,
     pub addon_kind: Option<String>,
     pub addon_message: Option<String>,
     pub diagnostic_details: Vec<String>,
@@ -173,7 +173,7 @@ pub(super) fn audio_error(error: &Error) -> JsAudioError {
         Error::PermissionDenied { .. } => "permissionDenied",
         Error::UnsupportedOsVersion => "unsupportedOsVersion",
         Error::DeviceLost => "deviceLost",
-        Error::Backend(_) | Error::WhisperVad { .. } => "backend",
+        Error::Backend(_) | Error::Vad { .. } => "backend",
         Error::Addon { .. } => match error.kind() {
             ErrorKind::InvalidArg => "invalidArg",
             ErrorKind::UnsupportedFormat => "unsupportedFormat",
@@ -208,7 +208,7 @@ pub(super) fn audio_error(error: &Error) -> JsAudioError {
             .map(|permission| permission.as_str().into()),
         advertised,
         actual,
-        whisper_code: error.whisper_code().map(|code| code.as_str().into()),
+        vad_code: error.vad_code().map(|code| code.as_str().into()),
         addon_kind: error.addon_kind().map(|kind| kind.as_str().into()),
         addon_message: match error.root() {
             Error::Addon { message, .. } => Some(message.clone()),
@@ -320,10 +320,6 @@ pub(super) fn event_to_js(event: Event) -> JsStreamEvent {
             result.message = Some(Error::PermissionDenied { permission, detail }.to_string());
             "permissionDenied"
         }
-        Event::PermissionGranted => {
-            result.permission = Some("microphone".into());
-            "permissionGranted"
-        }
         Event::SilenceWhileSourceActive { detail } => {
             result.message = Some(detail);
             "silenceWhileSourceActive"
@@ -414,7 +410,7 @@ pub(super) fn device_event_to_js(event: DeviceEvent) -> JsDeviceEvent {
     result
 }
 
-#[cfg(any(test, all(flexaudio_repro_addon, feature = "test-faults")))]
+#[cfg(any(test, all(flexaudio_test_addon, feature = "test-faults")))]
 pub(super) fn fixture_error(kind: &str) -> Error {
     match kind {
         "invalidArg" => Error::InvalidArg("invalid rate".into()),
@@ -572,7 +568,6 @@ mod tests {
                 "terminalError",
             ),
             (Event::Clipped, "clipped"),
-            (Event::PermissionGranted, "permissionGranted"),
         ] {
             assert_eq!(event_to_js(event).kind, expected);
         }

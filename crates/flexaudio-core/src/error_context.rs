@@ -171,11 +171,7 @@ impl ShutdownReport {
     pub fn result(&self) -> Result<()> {
         let first = match self.primary.as_ref() {
             Some(primary) => primary,
-            None => match self
-                .cleanup
-                .iter()
-                .find(|error| error.whisper_code().is_none())
-            {
+            None => match self.cleanup.iter().find(|error| error.vad_code().is_none()) {
                 Some(error) => error,
                 None => return Ok(()),
             },
@@ -199,14 +195,14 @@ impl ShutdownReport {
 }
 
 #[cfg(test)]
-mod whisper_tests {
+mod vad_tests {
     use super::*;
-    use crate::WhisperCode;
+    use crate::VadErrorCode;
 
     #[test]
-    fn whisper_only_shutdown_succeeds_and_retains_the_typed_cause() {
-        let cause = Error::WhisperVad {
-            code: WhisperCode::Inference,
+    fn vad_only_shutdown_succeeds_and_retains_the_typed_cause() {
+        let cause = Error::Vad {
+            code: VadErrorCode::Inference,
         }
         .with_context(ErrorContext::new(Operation::Flush));
         let report = ShutdownReport::new(None, vec![cause.clone()]);
@@ -214,8 +210,8 @@ mod whisper_tests {
         assert!(report.primary().is_none());
         assert_eq!(report.cleanup(), &[cause]);
         assert_eq!(
-            report.cleanup()[0].whisper_code(),
-            Some(WhisperCode::Inference)
+            report.cleanup()[0].vad_code(),
+            Some(VadErrorCode::Inference)
         );
         assert!(report.cleanup()[0]
             .to_string()
@@ -224,28 +220,28 @@ mod whisper_tests {
     }
 
     #[test]
-    fn capture_shutdown_message_excludes_isolated_whisper_related_causes() {
+    fn capture_shutdown_message_excludes_isolated_vad_related_causes() {
         let capture = Error::DeviceLost
             .with_context(ErrorContext::new(Operation::Stop))
             .with_context(ErrorContext::new(Operation::Stop));
         for operation in [Operation::Normalize, Operation::Flush] {
-            let whisper = Error::WhisperVad {
-                code: WhisperCode::Inference,
+            let vad = Error::Vad {
+                code: VadErrorCode::Inference,
             }
             .with_context(ErrorContext::new(operation));
-            let report = ShutdownReport::new(Some(capture.clone()), vec![whisper.clone()]);
+            let report = ShutdownReport::new(Some(capture.clone()), vec![vad.clone()]);
             let error = report
                 .result()
                 .expect_err("capture loss must still fail stop");
             assert_eq!(error.to_string(), "device lost during stop during stop");
             assert_eq!(error.root(), &Error::DeviceLost);
-            assert_eq!(report.cleanup(), std::slice::from_ref(&whisper));
+            assert_eq!(report.cleanup(), std::slice::from_ref(&vad));
             match error {
                 Error::Multiple(group) => {
-                    assert_eq!(group.secondary().collect::<Vec<_>>(), [&whisper]);
+                    assert_eq!(group.secondary().collect::<Vec<_>>(), [&vad]);
                     assert_eq!(
-                        group.secondary().next().and_then(Error::whisper_code),
-                        Some(WhisperCode::Inference)
+                        group.secondary().next().and_then(Error::vad_code),
+                        Some(VadErrorCode::Inference)
                     );
                 }
                 _ => panic!("the rejecting error must retain typed related failures"),
@@ -254,15 +250,15 @@ mod whisper_tests {
     }
 
     #[test]
-    fn capture_shutdown_message_retains_non_whisper_related_causes() {
+    fn capture_shutdown_message_retains_non_vad_related_causes() {
         let capture = Error::DeviceLost.with_context(ErrorContext::new(Operation::Stop));
         let cleanup = Error::Backend("the backend could not finish its shutdown".into())
             .with_context(ErrorContext::new(Operation::Join));
-        let whisper = Error::WhisperVad {
-            code: WhisperCode::Inference,
+        let vad = Error::Vad {
+            code: VadErrorCode::Inference,
         }
         .with_context(ErrorContext::new(Operation::Flush));
-        let report = ShutdownReport::new(Some(capture), vec![whisper, cleanup]);
+        let report = ShutdownReport::new(Some(capture), vec![vad, cleanup]);
         let error = report
             .result()
             .expect_err("capture loss must still fail stop");
@@ -271,29 +267,29 @@ mod whisper_tests {
     }
 
     #[test]
-    fn real_shutdown_failures_remain_primary_and_retain_whisper_related_causes() {
-        let whisper = Error::WhisperVad {
-            code: WhisperCode::Conversion,
+    fn real_shutdown_failures_remain_primary_and_retain_vad_related_causes() {
+        let vad = Error::Vad {
+            code: VadErrorCode::Conversion,
         };
         let capture = Error::DeviceLost;
-        let report = ShutdownReport::new(Some(capture.clone()), vec![whisper.clone()]);
+        let report = ShutdownReport::new(Some(capture.clone()), vec![vad.clone()]);
         let error = report
             .result()
             .expect_err("capture loss must still fail stop");
         assert_eq!(error.root(), &capture);
         assert!(
-            matches!(error, Error::Multiple(ref group) if group.secondary().next() == Some(&whisper))
+            matches!(error, Error::Multiple(ref group) if group.secondary().next() == Some(&vad))
         );
 
         // A real cleanup failure is the rejecting cause, even if VAD failed first.
         let cleanup = Error::Backend("the backend could not finish its shutdown".into());
-        let report = ShutdownReport::new(None, vec![whisper.clone(), cleanup.clone()]);
+        let report = ShutdownReport::new(None, vec![vad.clone(), cleanup.clone()]);
         let error = report
             .result()
             .expect_err("backend teardown failure must still fail stop");
         assert_eq!(error.root(), &cleanup);
         assert!(
-            matches!(error, Error::Multiple(ref group) if group.secondary().next() == Some(&whisper))
+            matches!(error, Error::Multiple(ref group) if group.secondary().next() == Some(&vad))
         );
     }
 }

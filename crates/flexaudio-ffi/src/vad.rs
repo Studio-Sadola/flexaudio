@@ -1,418 +1,556 @@
-//! Independent handle and C ABI for the VAD (speech segment detection) addon.
-//!
-//! [`FlexVad`] wraps [`flexaudio_vad::Vad`] in an opaque handle and can be used independently of a
-//! stream (feed it any f32 samples already available in any format). It is separate from the VAD
-//! integrated into a stream (`FlexConfig::has_vad`).
-//!
-//! It follows the crate-wide conventions (guard against panics, check NULL, report failures via last_error).
-//! The output event array is allocated with `into_boxed_slice` and freed with [`flexaudio_vad_events_free`].
+//! Thin standalone C adapters over the shared generic VAD session.
 
-use std::slice;
-
-use flexaudio_vad::Vad;
-
-use crate::convert::{vad_config_from_c, vad_events_to_c};
-use crate::convert::{valid_array, valid_pointer};
 use crate::error::{clear_last_error, code, set_audio_error};
-use crate::types::{FlexVadConfig, FlexVadEvent};
+use crate::vad_types::*;
 use crate::{guard_i32, guard_ptr};
+use flexaudio_vad::{
+    EpochEndReason, PreviewCloseReason, PreviewCutReason, Vad, VadError, VadEvent, VadEventKind,
+    VadFailure, VadOptions, VadPostProcessor, VadRuntimeOptions,
+};
+use std::{mem, ptr, slice};
 
-/// Opaque VAD handle containing [`flexaudio_vad::Vad`] (which holds one ONNX session).
-/// Create it with `flexaudio_vad_new` and free it with `flexaudio_vad_free`.
+/// Opaque exclusively owned session. Construct off the capture callback.
 pub struct FlexVad {
-    pub(crate) inner: Vad,
+    inner: Vad,
+}
+/// Opaque probability-only segmentation owner.
+pub struct FlexVadPostProcessor {
+    inner: VadPostProcessor,
 }
 
-/// Create a VAD from a config. A NULL `config` uses the defaults (Silero-compatible).
-///
-/// Returns NULL and sets last_error on failure (model load failure, invalid sample_rate, etc.).
-/// Free the returned handle with `flexaudio_vad_free`.
-///
-/// # Safety
-/// `config` must be NULL or point to a valid `FlexVadConfig`.
+pub(crate) fn params_from_c(p: &FlexVadOptions) -> Result<VadOptions, &'static str> {
+    let duration = |v| u32::try_from(v).map_err(|_| "InvalidParameter: negative duration");
+    let params = VadOptions {
+        threshold: p.threshold,
+        min_speech_ms: duration(p.min_speech_ms)?,
+        min_silence_ms: duration(p.min_silence_ms)?,
+        max_speech_ms: p.max_speech_ms,
+        speech_pad_ms: duration(p.speech_pad_ms)?,
+    };
+    params
+        .validate()
+        .map_err(|_| "InvalidParameter: outside the supported parameter domain")?;
+    Ok(params)
+}
+
+pub(crate) fn error_code(e: &VadError) -> i32 {
+    match e.root() {
+        VadError::InvalidParameter { .. }
+        | VadError::InvalidProbability { .. }
+        | VadError::InvalidPcm { .. }
+        | VadError::Overflow { .. } => code::FLEX_INVALID_ARG,
+        VadError::SessionFinished | VadError::FailedSession => code::FLEX_INVALID_STATE,
+        VadError::Inference | VadError::ModelLoad => code::FLEX_FAILURE,
+        VadError::Cause { primary, .. } => error_code(primary),
+    }
+}
+
+fn close_reason(r: PreviewCloseReason) -> u32 {
+    match r {
+        PreviewCloseReason::Hysteresis => FLEX_VAD_HYSTERESIS,
+        PreviewCloseReason::Finish => FLEX_VAD_FINISH,
+        PreviewCloseReason::Reset => FLEX_VAD_RESET,
+        PreviewCloseReason::Error => FLEX_VAD_ERROR,
+    }
+}
+fn cut_reason(r: PreviewCutReason) -> u32 {
+    match r {
+        PreviewCutReason::Limit => FLEX_VAD_LIMIT,
+        PreviewCutReason::Hysteresis => FLEX_VAD_HYSTERESIS,
+        PreviewCutReason::Finish => FLEX_VAD_FINISH,
+        PreviewCutReason::Reset => FLEX_VAD_RESET,
+        PreviewCutReason::Error => FLEX_VAD_ERROR,
+    }
+}
+fn end_reason(r: EpochEndReason) -> u32 {
+    match r {
+        EpochEndReason::Finish => FLEX_VAD_FINISH,
+        EpochEndReason::Reset => FLEX_VAD_RESET,
+        EpochEndReason::Error => FLEX_VAD_ERROR,
+    }
+}
+
+pub(crate) fn event_to_c(event: VadEvent) -> FlexVadEvent {
+    // Zero inactive union storage before writing only the active fields.
+    let mut out: FlexVadEvent = unsafe { mem::zeroed() };
+    out.epoch = event.epoch;
+    out.seq = event.seq;
+    match event.kind {
+        VadEventKind::Segment(s) => {
+            out.r#type = FLEX_VAD_SEGMENT;
+            out.data.segment.start_ms = s.start_ms;
+            out.data.segment.end_ms = s.end_ms;
+        }
+        VadEventKind::ProvisionalSpeechStart { at_ms } => {
+            out.r#type = FLEX_VAD_SPEECH_START;
+            out.data.speech_start.at_ms = at_ms;
+        }
+        VadEventKind::ProvisionalSpeechEnd { at_ms, reason } => {
+            out.r#type = FLEX_VAD_SPEECH_END;
+            out.data.speech_end.at_ms = at_ms;
+            out.data.speech_end.reason = close_reason(reason);
+        }
+        VadEventKind::ProvisionalCut {
+            start_ms,
+            end_ms,
+            reason,
+        } => {
+            out.r#type = FLEX_VAD_CUT;
+            out.data.cut.start_ms = start_ms;
+            out.data.cut.end_ms = end_ms;
+            out.data.cut.reason = cut_reason(reason);
+        }
+        VadEventKind::EpochEnd { reason } => {
+            out.r#type = FLEX_VAD_EPOCH_END;
+            out.data.epoch_end.reason = end_reason(reason);
+        }
+    }
+    out
+}
+
+pub(crate) unsafe fn input<'a, T>(p: *const T, len: usize) -> Result<&'a [T], &'static str> {
+    if len > (isize::MAX as usize) / mem::size_of::<T>() {
+        return Err("InvalidArgument: slice length exceeds isize::MAX");
+    }
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if p.is_null() || !p.is_aligned() {
+        return Err("InvalidArgument: null or misaligned input");
+    }
+    Ok(slice::from_raw_parts(p, len))
+}
+
+pub(crate) unsafe fn prepare<T>(out: *mut *mut T, len: *mut usize) -> Result<(), &'static str> {
+    // Clear each independently valid output even if its companion is invalid.
+    if !out.is_null() && out.is_aligned() {
+        out.write(ptr::null_mut());
+    }
+    if !len.is_null() && len.is_aligned() {
+        len.write(0);
+    }
+    if out.is_null() || len.is_null() || !out.is_aligned() || !len.is_aligned() {
+        return Err("InvalidArgument: null or misaligned output");
+    }
+    Ok(())
+}
+pub(crate) unsafe fn write_array<T>(items: Vec<T>, out: *mut *mut T, len: *mut usize) {
+    if !items.is_empty() {
+        let mut items = items.into_boxed_slice();
+        len.write(items.len());
+        out.write(items.as_mut_ptr());
+        mem::forget(items);
+    }
+}
+fn invalid(message: &str) -> i32 {
+    crate::error::set_audio_error_with_message(
+        flexaudio::Error::InvalidArg(message.into()),
+        message.into(),
+    );
+    code::FLEX_INVALID_ARG
+}
+unsafe fn read_params(p: *const FlexVadOptions) -> Result<VadOptions, &'static str> {
+    if p.is_null() {
+        return Ok(VadOptions::default());
+    }
+    if !p.is_aligned() {
+        return Err("InvalidArgument: misaligned params");
+    }
+    params_from_c(&*p)
+}
+
+/// Five pinned defaults. Supplied structs use literal fields, including zero.
 #[no_mangle]
-pub unsafe extern "C" fn flexaudio_vad_new(config: *const FlexVadConfig) -> *mut FlexVad {
+pub extern "C" fn flexaudio_vad_default_options() -> FlexVadOptions {
+    crate::guard_value(unsafe { mem::zeroed() }, || FlexVadOptions {
+        threshold: 0.5,
+        min_speech_ms: 250,
+        min_silence_ms: 100,
+        max_speech_ms: 0,
+        speech_pad_ms: 30,
+    })
+}
+
+/// Create a session; NULL params/options use defaults. Returns NULL plus last_error on error.
+/// # Safety
+/// Optional pointers must refer to initialized aligned structs.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_vad_new(
+    params: *const FlexVadOptions,
+    options: *const FlexVadRuntimeOptions,
+) -> *mut FlexVad {
     guard_ptr(|| {
         clear_last_error();
-        if !config.is_null() && !valid_pointer(config) {
-            set_audio_error(flexaudio::Error::InvalidArg(
-                "invalid VAD config pointer".into(),
-            ));
-            return std::ptr::null_mut();
-        }
-        // NULL means “all defaults.” Otherwise copy the values into VadConfig, including sentinels.
-        let vad_config = match config.as_ref() {
-            Some(c) => vad_config_from_c(c),
-            None => Default::default(),
+        let params = match read_params(params) {
+            Ok(p) => p,
+            Err(e) => {
+                invalid(e);
+                return ptr::null_mut();
+            }
         };
-        match Vad::new(vad_config) {
+        let provisional = if options.is_null() {
+            false
+        } else {
+            if !options.is_aligned() || (*options).provisional > 1 {
+                invalid("InvalidArgument: provisional must be 0 or 1");
+                return ptr::null_mut();
+            }
+            (*options).provisional == 1
+        };
+        match Vad::new(params, VadRuntimeOptions { provisional }) {
             Ok(inner) => Box::into_raw(Box::new(FlexVad { inner })),
             Err(e) => {
-                vad_failure(e);
-                std::ptr::null_mut()
+                set_audio_error(e.audio_error());
+                ptr::null_mut()
             }
         }
     })
 }
 
-/// Process samples in any format (`in_rate` / `in_ch`, interleaved f32) through VAD,
-/// allocate the confirmed event array, and set `out` / `out_len`.
-///
-/// Internally, convert to mono and resample to the VAD rate before processing ([`flexaudio_vad::Vad::process_pcm`]).
-/// If there are no events, set `out=NULL` / `out_len=0`. Free the allocated array with
-/// `flexaudio_vad_events_free`. Returns 0 on success or a negative value on error.
-///
+unsafe fn stream_result(
+    result: Result<Vec<VadEvent>, VadFailure>,
+    out: *mut *mut FlexVadEvent,
+    len: *mut usize,
+) -> i32 {
+    let (events, status) = match result {
+        Ok(events) => (events, code::FLEX_OK),
+        Err(failure) => {
+            let status = error_code(&failure.error);
+            set_audio_error(failure.error.audio_error());
+            (failure.terminal_events, status)
+        }
+    };
+    write_array(events.into_iter().map(event_to_c).collect(), out, len);
+    status
+}
+
+/// Feed normalized interleaved PCM at the specified positive rate and channel count.
+/// Input is converted to mono16k internally; event times use the input timeline,
+/// compensated for converter group delay. After raw input validation, finite resampler
+/// overshoot is clipped internally to [-1, 1]. Use 16000/1 for direct mono16k input.
+/// On failure still drain/free the owned terminal event array.
 /// # Safety
-/// `v` must be a valid handle; `samples` must be a valid array of `len` elements (NULL is allowed when `len=0`);
-/// `out` / `out_len` must point to valid writable locations.
+/// Handle is exclusively owned; input/output allocations must be valid for their lengths.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_vad_process(
     v: *mut FlexVad,
     samples: *const f32,
     len: usize,
-    in_rate: u32,
-    in_ch: u16,
+    input_sample_rate: u32,
+    input_channels: u16,
     out: *mut *mut FlexVadEvent,
     out_len: *mut usize,
 ) -> i32 {
     guard_i32(|| {
         clear_last_error();
-        if !valid_pointer(out) || !valid_pointer(out_len) {
-            return set_audio_error(flexaudio::Error::InvalidArg(
-                "invalid VAD output destination".into(),
-            ));
+        if let Err(e) = prepare(out, out_len) {
+            return invalid(e);
         }
-        out.write(std::ptr::null_mut());
-        out_len.write(0);
-        if !valid_pointer(v) || !valid_array(samples, len) {
-            return set_audio_error(flexaudio::Error::InvalidArg(
-                "invalid VAD handle or sample array".into(),
-            ));
+        if v.is_null() || !v.is_aligned() {
+            return invalid("InvalidArgument: invalid VAD handle");
         }
-        let vad = &mut *v;
-        let input = if len == 0 {
-            &[]
-        } else {
-            slice::from_raw_parts(samples, len)
+        let samples = match input(samples, len) {
+            Ok(s) => s,
+            Err(e) => return invalid(e),
         };
-        let events = match vad.inner.process_pcm(input, in_rate, in_ch) {
-            Ok(events) => events,
-            Err(error) => return vad_failure(error),
-        };
-        let (ptr, ev_len) = vad_events_to_c(events);
-        out.write(ptr);
-        out_len.write(ev_len);
-        code::FLEX_OK
+        stream_result(
+            (*v).inner
+                .process_pcm(samples, input_sample_rate, input_channels),
+            out,
+            out_len,
+        )
     })
 }
 
-/// Finalize pending speech at EOF and return a library-owned VAD event array.
-///
-/// Valid destinations initialize to NULL/0. Completed events remain available even
-/// when a subsequent reset fails; free any returned event array also on error. A repeated successful
-/// flush returns NULL/0 unless new input arrived. Free with `flexaudio_vad_events_free`.
-///
+/// Return owned events, including terminal closure on failure.
 /// # Safety
-/// `v` must be a live handle; `out`/`out_len` must be aligned writable destinations.
+/// Handle and mandatory outputs must be valid and exclusively owned during mutation.
 #[no_mangle]
-pub unsafe extern "C" fn flexaudio_vad_flush(
+pub unsafe extern "C" fn flexaudio_vad_finish(
     v: *mut FlexVad,
     out: *mut *mut FlexVadEvent,
     out_len: *mut usize,
 ) -> i32 {
     guard_i32(|| {
         clear_last_error();
-        if !valid_pointer(out) || !valid_pointer(out_len) {
-            return set_audio_error(flexaudio::Error::InvalidArg(
-                "invalid VAD output destination".into(),
-            ));
+        if let Err(e) = prepare(out, out_len) {
+            return invalid(e);
         }
-        out.write(std::ptr::null_mut());
-        out_len.write(0);
-        if !valid_pointer(v) {
-            return set_audio_error(flexaudio::Error::InvalidArg("invalid VAD handle".into()));
+        if v.is_null() || !v.is_aligned() {
+            return invalid("InvalidArgument: invalid VAD handle");
         }
-        let events = match (*v).inner.flush() {
-            Ok(events) => events,
-            Err(error) => {
-                let (events, len) = vad_events_to_c((*v).inner.take_pending_events());
-                out.write(events);
-                out_len.write(len);
-                return vad_failure(error);
-            }
-        };
-        let (events, len) = vad_events_to_c(events);
-        out.write(events);
-        out_len.write(len);
-        code::FLEX_OK
+        stream_result((*v).inner.finish(), out, out_len)
     })
 }
-
-/// Map addon failures by their typed variant; raw inference diagnostics stay private.
-pub(crate) fn vad_failure(error: flexaudio_vad::VadError) -> i32 {
-    set_audio_error(error.audio_error())
-}
-
-/// Free an event array allocated by `flexaudio_vad_process` or `flexaudio_vad_flush`. NULL / 0 is safe.
-///
+/// Return owned events, including terminal closure on failure.
 /// # Safety
-/// `events` / `len` must come from `flexaudio_vad_process` (or be NULL / 0).
+/// Handle and mandatory outputs must be valid and exclusively owned during mutation.
 #[no_mangle]
-pub unsafe extern "C" fn flexaudio_vad_events_free(events: *mut FlexVadEvent, len: usize) {
-    guard_i32(|| {
-        crate::convert::free_vad_events(events, len);
-        code::FLEX_OK
-    });
-}
-
-/// Reset VAD state (internal state / context / remainder buffer / resampler).
-///
-/// # Safety
-/// `v` must be a valid handle (NULL is InvalidArg).
-#[no_mangle]
-pub unsafe extern "C" fn flexaudio_vad_reset(v: *mut FlexVad) -> i32 {
+pub unsafe extern "C" fn flexaudio_vad_reset(
+    v: *mut FlexVad,
+    out: *mut *mut FlexVadEvent,
+    out_len: *mut usize,
+) -> i32 {
     guard_i32(|| {
         clear_last_error();
-        if !valid_pointer(v) {
-            return set_audio_error(flexaudio::Error::InvalidArg("invalid VAD handle".into()));
+        if let Err(e) = prepare(out, out_len) {
+            return invalid(e);
         }
-        if let Err(error) = (*v).inner.reset() {
-            return vad_failure(error);
+        if v.is_null() || !v.is_aligned() {
+            return invalid("InvalidArgument: invalid VAD handle");
+        }
+        stream_result((*v).inner.reset(), out, out_len)
+    })
+}
+
+/// Borrow latest probabilities until the next session mutation/free. Empty arrays return NULL.
+/// # Safety
+/// Handle and all mandatory output pointers must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_vad_probabilities(
+    v: *const FlexVad,
+    first_frame: *mut u64,
+    out: *mut *const f32,
+    out_len: *mut usize,
+) -> i32 {
+    guard_i32(|| {
+        clear_last_error();
+        if !first_frame.is_null() && first_frame.is_aligned() {
+            first_frame.write(0);
+        }
+        if !out.is_null() && out.is_aligned() {
+            out.write(ptr::null());
+        }
+        if !out_len.is_null() && out_len.is_aligned() {
+            out_len.write(0);
+        }
+        if v.is_null()
+            || !v.is_aligned()
+            || first_frame.is_null()
+            || !first_frame.is_aligned()
+            || out.is_null()
+            || !out.is_aligned()
+            || out_len.is_null()
+            || !out_len.is_aligned()
+        {
+            return invalid("InvalidArgument: invalid probabilities handle/output");
+        }
+        let batch = (*v).inner.last_frame_probabilities();
+        first_frame.write(batch.first_frame_index);
+        out_len.write(batch.values.len());
+        if !batch.values.is_empty() {
+            out.write(batch.values.as_ptr());
         }
         code::FLEX_OK
     })
 }
 
-/// Free a VAD handle. NULL is safe.
-///
+/// Create the inference-independent 16k/512 probability processor. NULL uses defaults.
 /// # Safety
-/// `v` must be a handle returned by `flexaudio_vad_new` (or NULL).
-/// Do not use `v` after freeing it.
+/// Params must be NULL or a valid aligned struct.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_vad_postprocessor_new(
+    p: *const FlexVadOptions,
+) -> *mut FlexVadPostProcessor {
+    guard_ptr(|| {
+        clear_last_error();
+        let p = match read_params(p) {
+            Ok(p) => p,
+            Err(e) => {
+                invalid(e);
+                return ptr::null_mut();
+            }
+        };
+        match VadPostProcessor::new(p) {
+            Ok(inner) => Box::into_raw(Box::new(FlexVadPostProcessor { inner })),
+            Err(e) => {
+                set_audio_error(e.audio_error());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+unsafe fn segment_result(
+    result: Result<Vec<flexaudio_vad::SpeechSegment>, VadError>,
+    out: *mut *mut FlexSpeechSegment,
+    len: *mut usize,
+) -> i32 {
+    match result {
+        Ok(items) => {
+            write_array(
+                items
+                    .into_iter()
+                    .map(|s| FlexSpeechSegment {
+                        start_ms: s.start_ms,
+                        end_ms: s.end_ms,
+                    })
+                    .collect(),
+                out,
+                len,
+            );
+            code::FLEX_OK
+        }
+        Err(e) => {
+            set_audio_error(e.audio_error());
+            error_code(&e)
+        }
+    }
+}
+
+/// Feed finite [0,1] probabilities. Validation preserves processor state.
+/// # Safety
+/// Handle, input and output allocations must be valid for their lengths.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_vad_postprocessor_process(
+    v: *mut FlexVadPostProcessor,
+    samples: *const f32,
+    len: usize,
+    out: *mut *mut FlexSpeechSegment,
+    out_len: *mut usize,
+) -> i32 {
+    guard_i32(|| {
+        clear_last_error();
+        if let Err(e) = prepare(out, out_len) {
+            return invalid(e);
+        }
+        if v.is_null() || !v.is_aligned() {
+            return invalid("InvalidArgument: invalid processor handle");
+        }
+        let samples = match input(samples, len) {
+            Ok(s) => s,
+            Err(e) => return invalid(e),
+        };
+        segment_result((*v).inner.process(samples), out, out_len)
+    })
+}
+/// Finish probability segmentation without inference.
+/// # Safety
+/// Handle and outputs must be valid and exclusively owned during mutation.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_vad_postprocessor_finish(
+    v: *mut FlexVadPostProcessor,
+    out: *mut *mut FlexSpeechSegment,
+    out_len: *mut usize,
+) -> i32 {
+    guard_i32(|| {
+        clear_last_error();
+        if let Err(e) = prepare(out, out_len) {
+            return invalid(e);
+        }
+        if v.is_null() || !v.is_aligned() {
+            return invalid("InvalidArgument: invalid processor handle");
+        }
+        segment_result((*v).inner.finish(), out, out_len)
+    })
+}
+/// Discard the probability timeline.
+/// # Safety
+/// Handle must be valid and exclusively owned.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_vad_postprocessor_reset(v: *mut FlexVadPostProcessor) -> i32 {
+    guard_i32(|| {
+        clear_last_error();
+        if v.is_null() || !v.is_aligned() {
+            return invalid("InvalidArgument: invalid processor handle");
+        }
+        (*v).inner.reset();
+        code::FLEX_OK
+    })
+}
+
+/// Release an exclusively owned handle. NULL is safe.
+/// # Safety
+/// Non-NULL must be a live handle of this exact type returned by its constructor.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_vad_free(v: *mut FlexVad) {
     guard_i32(|| {
+        if !v.is_null() && !v.is_aligned() {
+            return invalid("InvalidArgument: misaligned VAD handle");
+        }
         if !v.is_null() {
-            if !valid_pointer(v) {
-                return set_audio_error(flexaudio::Error::InvalidArg("invalid VAD handle".into()));
-            }
             drop(Box::from_raw(v));
         }
         code::FLEX_OK
     });
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::FlexVadEvent;
-
-    /// Run new → process (silence) → reset → free without panicking, and keep event-array
-    /// allocation and deallocation consistent (smoke check for into_boxed_slice ownership).
-    #[test]
-    fn vad_new_process_free_smoke() {
-        // NULL config = all defaults.
-        let v = unsafe { flexaudio_vad_new(std::ptr::null()) };
-        assert!(!v.is_null(), "vad_new failed: model load?");
-
-        // Process 48k/stereo silence (no speech events are expected by default, so out=NULL).
-        let samples = vec![0.0f32; 48_000 * 2];
-        let mut out: *mut FlexVadEvent = std::ptr::null_mut();
-        let mut out_len: usize = 123; // overwritten below
-        let rc = unsafe {
-            flexaudio_vad_process(
-                v,
-                samples.as_ptr(),
-                samples.len(),
-                48_000,
-                2,
-                &mut out,
-                &mut out_len,
-            )
-        };
-        assert_eq!(rc, code::FLEX_OK);
-        // There are no events in silence (NULL / 0).
-        assert!(out.is_null());
-        assert_eq!(out_len, 0);
-        unsafe { flexaudio_vad_events_free(out, out_len) };
-
-        // Empty input is safe too.
-        let rc2 = unsafe {
-            flexaudio_vad_process(v, std::ptr::null(), 0, 48_000, 2, &mut out, &mut out_len)
-        };
-        assert_eq!(rc2, code::FLEX_OK);
-        assert!(out.is_null());
-        assert_eq!(out_len, 0);
-
-        assert_eq!(unsafe { flexaudio_vad_reset(v) }, code::FLEX_OK);
-        unsafe { flexaudio_vad_free(v) };
-    }
-
-    #[test]
-    fn standalone_flush_returns_completed_events_also_on_reset_failure() {
-        // The embedded engine reset is infallible; the test-only fault simulates
-        // an external inference backend's reset failure without audio hardware.
-        let mut handle = FlexVad {
-            inner: Vad::new(flexaudio_vad::VadConfig {
-                threshold: 0.0,
-                neg_threshold: Some(0.0),
-                min_speech_ms: 0,
-                speech_pad_ms: 0,
-                ..Default::default()
-            })
-            .unwrap(),
-        };
-        handle.inner.process(&[0.1; 1024]).unwrap();
-        handle.inner.inject_reset_failure();
-        let mut events = std::ptr::null_mut();
-        let mut len = 0;
-        let status = unsafe { flexaudio_vad_flush(&mut handle, &mut events, &mut len) };
-        assert_eq!(status, code::FLEX_FAILURE);
-        assert_eq!(len, 2);
-        let completed = unsafe { std::slice::from_raw_parts(events, len) };
-        assert_eq!(completed[0].kind, 0);
-        assert_eq!(completed[1].kind, 1);
-        assert_eq!(
-            crate::error::last_audio_error().unwrap().addon_kind(),
-            Some(flexaudio::core::AddonErrorKind::VadReset)
-        );
-        unsafe { flexaudio_vad_events_free(events, len) };
-        assert_eq!(
-            unsafe { flexaudio_vad_flush(&mut handle, &mut events, &mut len) },
-            code::FLEX_FAILURE
-        );
-        assert!(events.is_null());
-        assert_eq!(len, 0, "failed-reset speech must only be delivered once");
-    }
-
-    #[test]
-    fn vad_invalid_format_returns_failure_detail() {
-        let v = unsafe { flexaudio_vad_new(std::ptr::null()) };
-        assert!(!v.is_null());
-        let mut out = std::ptr::null_mut();
-        let mut len = 123;
-        for (rate, channels, reason) in [(16_000, 0, "channels"), (0, 1, "sample rate")] {
-            let result = unsafe {
-                flexaudio_vad_process(v, std::ptr::null(), 0, rate, channels, &mut out, &mut len)
-            };
-            assert_eq!(result, code::FLEX_INVALID_ARG);
-            assert!(out.is_null());
-            assert_eq!(len, 0);
-            let message = unsafe { std::ffi::CStr::from_ptr(crate::error::last_error_ptr()) }
-                .to_str()
-                .unwrap();
-            let error = crate::error::last_audio_error().expect("typed format error retained");
-            assert_eq!(error.kind(), flexaudio::ErrorKind::InvalidArg);
-            let flexaudio::Error::Addon {
-                kind: flexaudio::core::AddonErrorKind::VadInvalidFormat,
-                message: detail,
-            } = &error
-            else {
-                panic!("invalid format must preserve its typed addon cause");
-            };
-            assert!(detail.contains(reason));
-            let expected = flexaudio_vad::Vad::new(flexaudio_vad::VadConfig::default())
-                .unwrap()
-                .process_pcm(&[], rate, channels)
-                .unwrap_err()
-                .audio_error();
-            assert_eq!(
-                error, expected,
-                "FFI must retain the entire typed addon cause"
-            );
-            assert!(message.contains(reason));
+/// Release an exclusively owned handle. NULL is safe.
+/// # Safety
+/// Non-NULL must be a live handle of this exact type returned by its constructor.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_vad_postprocessor_free(v: *mut FlexVadPostProcessor) {
+    guard_i32(|| {
+        if !v.is_null() && !v.is_aligned() {
+            return invalid("InvalidArgument: misaligned VAD handle");
         }
-        unsafe { flexaudio_vad_free(v) };
-    }
-
-    /// NULL handle and NULL output pointer return InvalidArg (no panic).
-    #[test]
-    fn vad_null_args_are_invalid() {
-        let mut out: *mut FlexVadEvent = std::ptr::null_mut();
-        let mut out_len: usize = 0;
-        let rc = unsafe {
-            flexaudio_vad_process(
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                0,
-                16_000,
-                1,
-                &mut out,
-                &mut out_len,
-            )
-        };
-        assert_eq!(rc, code::FLEX_INVALID_ARG);
-        assert_eq!(
-            unsafe { flexaudio_vad_reset(std::ptr::null_mut()) },
-            code::FLEX_INVALID_ARG
-        );
-        // Freeing NULL is safe.
-        unsafe { flexaudio_vad_free(std::ptr::null_mut()) };
-    }
+        if !v.is_null() {
+            drop(Box::from_raw(v));
+        }
+        code::FLEX_OK
+    });
+}
+/// Release an owned result array with its original length. NULL/0 is safe.
+/// # Safety
+/// Non-NULL must be an array of this exact type and original length returned by this API.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_vad_events_free(v: *mut FlexVadEvent, len: usize) {
+    guard_i32(|| {
+        if !(v.is_null() && len == 0)
+            && (!crate::convert::valid_array(v, len) || v.is_null() || len == 0)
+        {
+            return invalid("InvalidArgument: invalid VAD result array");
+        }
+        if !v.is_null() {
+            drop(Box::from_raw(ptr::slice_from_raw_parts_mut(v, len)));
+        }
+        code::FLEX_OK
+    });
+}
+/// Release an owned result array with its original length. NULL/0 is safe.
+/// # Safety
+/// Non-NULL must be an array of this exact type and original length returned by this API.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_vad_segments_free(v: *mut FlexSpeechSegment, len: usize) {
+    guard_i32(|| {
+        if !(v.is_null() && len == 0)
+            && (!crate::convert::valid_array(v, len) || v.is_null() || len == 0)
+        {
+            return invalid("InvalidArgument: invalid VAD result array");
+        }
+        if !v.is_null() {
+            drop(Box::from_raw(ptr::slice_from_raw_parts_mut(v, len)));
+        }
+        code::FLEX_OK
+    });
 }
 
 #[cfg(test)]
-mod boundary_tests {
-    use super::*;
-    use std::ptr;
+#[path = "../tests/ffi/vad.rs"]
+mod tests;
 
+#[cfg(test)]
+mod status_tests {
     #[test]
-    fn vad_flush_and_process_validate_output_handle_and_slice() {
-        unsafe {
-            let mut out = ptr::dangling_mut();
-            let mut len = 99;
-            assert_eq!(
-                flexaudio_vad_flush(ptr::null_mut(), &mut out, &mut len),
-                code::FLEX_INVALID_ARG
-            );
-            assert!(out.is_null());
-            assert_eq!(len, 0);
-            assert_eq!(
-                flexaudio_vad_flush(ptr::null_mut(), ptr::dangling_mut::<u8>().cast(), &mut len),
-                code::FLEX_INVALID_ARG
-            );
-            assert_eq!(
-                flexaudio_vad_flush(ptr::dangling_mut::<u8>().cast(), &mut out, &mut len),
-                code::FLEX_INVALID_ARG
-            );
-            let handle = flexaudio_vad_new(ptr::null());
-            assert!(!handle.is_null());
-            for (samples, sample_count) in [
-                (ptr::dangling::<u8>().cast::<f32>(), 1),
-                (ptr::dangling::<f32>(), usize::MAX),
-                (ptr::null(), 1),
-            ] {
-                out = ptr::dangling_mut();
-                len = 99;
-                assert_eq!(
-                    flexaudio_vad_process(
-                        handle,
-                        samples,
-                        sample_count,
-                        16000,
-                        1,
-                        &mut out,
-                        &mut len
-                    ),
-                    code::FLEX_INVALID_ARG
-                );
-                assert!(out.is_null());
-                assert_eq!(len, 0);
-            }
-            assert_eq!(
-                flexaudio_vad_flush(handle, &mut out, &mut len),
-                code::FLEX_OK
-            );
-            assert!(out.is_null());
-            assert_eq!(len, 0);
-            flexaudio_vad_events_free(ptr::dangling_mut::<u8>().cast(), 1);
-            assert_eq!(
-                crate::error::last_audio_error().unwrap().kind(),
-                flexaudio::ErrorKind::InvalidArg
-            );
-            flexaudio_vad_events_free(ptr::null_mut(), 1);
-            flexaudio_vad_events_free(ptr::dangling_mut(), usize::MAX);
-            flexaudio_vad_events_free(ptr::null_mut(), 0);
-            flexaudio_vad_free(handle);
+    fn all_status_codes_are_unique() {
+        use crate::error::code::*;
+        let codes = [
+            FLEX_OK,
+            FLEX_INVALID_ARG,
+            FLEX_FAILURE,
+            FLEX_PANIC,
+            FLEX_INVALID_STATE,
+            FLEX_DEVICE_NOT_FOUND,
+            FLEX_DEVICE_LOST,
+            FLEX_PERMISSION_DENIED,
+            FLEX_UNSUPPORTED_OS_VERSION,
+            FLEX_UNSUPPORTED,
+            FLEX_UNSUPPORTED_FORMAT,
+            FLEX_NATIVE_FORMAT_CHANGED,
+            FLEX_AMBIGUOUS_DEVICE_NAME,
+            crate::vad_integration::FLEX_VAD_UNSUPPORTED_TAP,
+            crate::vad_integration::FLEX_VAD_UNSUPPORTED_CONVERSION_CLOCK,
+        ];
+        for (index, code) in codes.iter().enumerate() {
+            assert!(!codes[..index].contains(code), "duplicate status {code}");
         }
     }
 }

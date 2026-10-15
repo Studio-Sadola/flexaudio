@@ -13,7 +13,7 @@
 pub use crate::error_context::{ErrorContext, ErrorGroup, NativeStatus, Operation, ShutdownReport};
 pub use crate::errors::{Error, ErrorKind};
 pub use crate::loss::{AudioLoss, AudioPath, LossReason, MixLane, OutputTap};
-pub use crate::WhisperCode;
+pub use crate::VadErrorCode;
 use bitflags::bitflags;
 
 /// Sample rate (Hz) of the internal canonical form. All streams are normalized to this rate first.
@@ -61,7 +61,7 @@ pub struct AudioChunk {
     /// Continues across native backend restart, reopen, recovery, pause and source switches. A dropped
     /// chunk leaves a gap equal to its canonical frame length. DISCONTINUITY never
     /// inserts wall-time silence: PTS and flags express the real-time gap. Within a
-    /// Whisper VAD epoch, an event at t ms maps to its capture origin + t * 48.
+    /// VAD epoch, an event at t ms maps to its capture origin + t * 48.
     pub frame_index: u64,
     /// Arrival-time label, re-anchored on each native callback. Callback jitter can
     /// overlap chunks or leave gaps; no non-overlap or bounded-monotonic guarantee.
@@ -399,6 +399,11 @@ pub struct StreamConfig {
     /// exclusion set. This applies to the system-side child capture of
     /// [`SourceKind::Mix`] and is ignored by microphone and process sources.
     pub exclude_self: bool,
+    /// Enable the macOS silence diagnostic signal (default true). After sustained
+    /// exact zeros with active source output, a private probe renders a quiet tone.
+    /// False disables the probe for system/process capture and the system Mix lane.
+    /// Ignored on other platforms and for microphone capture.
+    pub silence_probe: bool,
     /// Additional process IDs whose playback is excluded from a system capture.
     /// Applies only to a system source and the system side of [`SourceKind::Mix`];
     /// microphone and process sources ignore it. The effective exclusion set is
@@ -469,6 +474,7 @@ impl Default for StreamConfig {
             target_pid: None,
             mode: ProcessMode::Include,
             exclude_self: false,
+            silence_probe: true,
             exclude_pids: Vec::new(),
             output: OutputFormat::default(),
             secondary_output: None,
@@ -574,6 +580,7 @@ pub enum Event {
         detail: String,
     },
     /// Recording consent remains undecided. Advisory only: capture continues.
+    /// Available for custom backends; built-in backends do not emit this notice.
     PermissionPending {
         /// Recording permission awaiting a decision.
         permission: Permission,
@@ -612,8 +619,6 @@ pub enum Event {
     },
     /// Advisory coalesced upstream clipping; not associated with an exact output chunk.
     Clipped,
-    /// Late microphone consent after Pending in the same live generation.
-    PermissionGranted,
 }
 
 /// Result type used throughout flexaudio-core.

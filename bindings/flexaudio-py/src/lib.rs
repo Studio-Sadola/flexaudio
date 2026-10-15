@@ -4,7 +4,7 @@
 //! (for Node), adapted to PyO3.
 //!
 //! Design:
-//! - `open(...)` calls `flexaudio::open` and then `start()` before returning [`Stream`]
+//! - `open(...)` calls `flexaudio::open` and then `start()` before returning [`stream::Stream`]
 //!   (like napi `open_stream`, open also starts the stream).
 //! - Polling APIs (`poll_chunk` / `poll_event`) are fast and non-blocking, so they do not release the GIL.
 //!   Since pyclass methods run with the GIL held, concurrent access to the internal `flexaudio::Stream`
@@ -18,10 +18,10 @@
 //! - This file (`lib.rs`): shared helpers (error and enum conversion), `devices()`, and pymodule registration.
 //! - `marshal`: data types passed to Python (AudioChunk / StreamEvent / DeviceInfo / VadEvent /
 //!   DeviceEvent) and their conversions.
-//! - `config`: convert and validate Python arguments as core configs (StreamConfig / VadConfig).
+//! - `config`: convert and validate Python arguments as core configs (StreamConfig).
 //! - `stream`: recording stream [`Stream`], `open()`, and integrated VAD / denoise.
-//! - `vad` / `denoise` / `encode`: standalone addons ([`Vad`] / [`Denoiser`] / [`FlacEncoder`]).
-//! - `watcher`: device hotplug monitoring ([`DeviceWatcher`] and `watch_devices()`).
+//! - `vad` / `denoise` / `encode`: standalone addons ([`vad::Vad`] / [`denoise::Denoiser`] / [`encode::FlacEncoder`]).
+//! - `watcher`: device hotplug monitoring ([`watcher::DeviceWatcher`] and `watch_devices()`).
 //!
 //! No network communication occurs at runtime (PyO3 is only a Python extension bridge; embedded VAD
 //! model, FLAC encoder, and RNNoise model require no files or network access).
@@ -40,12 +40,11 @@ mod denoise;
 mod encode;
 mod errors;
 mod marshal;
+mod pcm_buffer;
 mod stream;
 mod vad;
+mod vad_marshal;
 mod watcher;
-mod whisper_buffer;
-mod whisper_marshal;
-mod whisper_vad;
 
 use marshal::{device_info_to_py, process_info_to_py};
 
@@ -54,12 +53,6 @@ use marshal::{device_info_to_py, process_info_to_py};
 // ---------------------------------------------------------------------------
 
 pub(crate) use errors::to_py_err;
-
-/// Convert VadError to a Python exception. Invalid configuration becomes `ValueError`; model loading and inference failures
-/// become `RuntimeError`.
-pub(crate) fn vad_err_to_py(err: flexaudio_vad::VadError) -> PyErr {
-    crate::errors::to_py_err(err.audio_error())
-}
 
 /// Convert DenoiseError to a Python exception. Invalid channel count or length is an argument error, so use `ValueError`.
 pub(crate) fn denoise_err_to_py(err: flexaudio_denoise::DenoiseError) -> PyErr {
@@ -167,12 +160,10 @@ fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<marshal::PyStreamEvent>()?;
     m.add_class::<marshal::PyDeviceInfo>()?;
     m.add_class::<marshal::PyProcessInfo>()?;
-    m.add_class::<marshal::PyVadEvent>()?;
     m.add_class::<marshal::PyDeviceEvent>()?;
 
     // Standalone addons and monitoring.
-    whisper_vad::register(m)?;
-    m.add_class::<vad::Vad>()?;
+    vad::register(m)?;
     m.add_class::<denoise::Denoiser>()?;
     m.add_class::<encode::FlacEncoder>()?;
     m.add_class::<watcher::DeviceWatcher>()?;
@@ -250,8 +241,6 @@ mod tests {
     #[test]
     fn addon_err_maps_without_panic() {
         // Also verify addon error conversion does not panic (only the type branch is tested).
-        let _ = vad_err_to_py(flexaudio_vad::VadError::InvalidConfig("x".into()));
-        let _ = vad_err_to_py(flexaudio_vad::VadError::ModelLoad("x".into()));
         let _ = denoise_err_to_py(flexaudio_denoise::DenoiseError::InvalidChannels(3));
         let _ = encode_err_to_py(flexaudio_encode::EncodeError::Unsupported("x".into()));
     }
@@ -261,7 +250,7 @@ mod tests {
 mod repro_tests {
     use super::*;
     #[test]
-    fn repro_p10_f44_device_errors_keep_distinct_kinds() {
+    fn device_errors_keep_distinct_kinds() {
         Python::initialize();
         Python::attach(|py| {
             let missing = to_py_err(fa::Error::DeviceNotFound);
@@ -273,7 +262,7 @@ mod repro_tests {
         });
     }
     #[test]
-    fn repro_p10_control_invalid_arg_is_value_error() {
+    fn invalid_arg_is_value_error() {
         Python::initialize();
         Python::attach(|py| {
             let error = to_py_err(fa::Error::InvalidArg("benign validation".into()));
@@ -310,7 +299,7 @@ failures = []
 for duration in (0, 10, 40, 4294967295):
     try:
         flexaudio.open('mic', chunk_ms=duration, denoise=True, output_rate=16000,
-                       vad={'threshold': 'invalid'})
+                       vad=flexaudio.StreamVadOptions())
     except flexaudio.InvalidArgumentError as error:
         assert error.audio_error.kind == 'invalidArg'
         assert 'chunk_ms' in str(error)

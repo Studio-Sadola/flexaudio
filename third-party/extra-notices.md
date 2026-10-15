@@ -51,8 +51,8 @@ SOFTWARE.
 The embedded `flexaudio-vad` implementation ports segmentation processing from
 whisper.cpp pin `85a69493a601d4ff5a834064f7b7bac250bd8739` (function
 `whisper_vad_segments_from_probs`, lines 5211–5444). The upstream source notes
-the Silero lineage of its silence split rule. This notice covers segmentation,
-not whisperd's separate audio copying or timestamp mapping.
+the Silero lineage of its silence split rule. This notice covers the adapted
+segmentation implementation.
 
 ```text
 MIT License

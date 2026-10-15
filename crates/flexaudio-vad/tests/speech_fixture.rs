@@ -6,7 +6,7 @@
 //! `assets/silero_vad.onnx` = upstream Silero VAD v6.2.1). Probabilities must differ by no
 //! more than 1e-4, and threshold-0.5 decisions must match on every frame.
 
-use flexaudio_vad::{get_speech_timestamps, Vad, VadConfig};
+use flexaudio_vad::{Vad, VadEventKind, VadOptions, VadRuntimeOptions};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -92,9 +92,10 @@ fn tract_matches_ort_frame_probs_on_speech_fixture() {
     let expected = load_expected_probs(&fixture_path(FIXTURE_PROBS));
     assert_eq!(expected.len(), 64_000 / 512);
 
-    let mut vad = Vad::new(VadConfig::default()).expect("model load");
+    let mut vad =
+        Vad::new(VadOptions::default(), VadRuntimeOptions::default()).expect("model load");
     let _events = vad.process(&samples).unwrap();
-    let got = vad.last_frame_probabilities();
+    let got = vad.last_frame_probabilities().values;
     assert_eq!(
         got.len(),
         expected.len(),
@@ -124,57 +125,80 @@ fn tract_matches_ort_frame_probs_on_speech_fixture() {
     );
 }
 
-/// 8 kHz input is accepted and produces input-rate-based frame counts and speech events.
+/// Arbitrary source rates retain millisecond times on the source timeline.
 #[test]
-fn eight_khz_input_emits_events_in_input_rate_units() {
-    let (rate, samples16) = load_pcm16_mono_wav(&fixture_path(FIXTURE_WAV));
-    assert_eq!(rate, 16_000);
-    // Integer 1/2 decimation: keep even-indexed samples. 4 s × 8 kHz = 32000;
-    // 256 samples per frame gives 125 frames.
+fn eight_khz_input_produces_millisecond_events() {
+    let (_, samples16) = load_pcm16_mono_wav(&fixture_path(FIXTURE_WAV));
     let samples8: Vec<f32> = samples16.iter().step_by(2).copied().collect();
-    assert_eq!(samples8.len(), 32_000);
-
-    let cfg = VadConfig {
-        sample_rate: 8_000,
-        ..VadConfig::default()
-    };
-    let mut vad = Vad::new(cfg.clone()).expect("8 kHz model load");
-    let during = vad.process(&samples8).unwrap();
-    let probs = vad.last_frame_probabilities();
-    assert_eq!(
-        probs.len(),
-        32_000 / 256,
-        "8 kHz frame count uses the input rate (256 samples/frame)"
-    );
-    for &p in probs {
-        assert!((0.0..=1.0).contains(&p), "prob {p} out of [0,1]");
+    let mut vad = Vad::new(VadOptions::default(), VadRuntimeOptions::default()).unwrap();
+    let mut events = vad.process_pcm(&samples8, 8_000, 1).unwrap();
+    events.extend(vad.finish().unwrap());
+    let segments: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            VadEventKind::Segment(segment) => Some(segment),
+            _ => None,
+        })
+        .collect();
+    assert!(!segments.is_empty());
+    for segment in segments {
+        assert!(segment.start_ms < 4_050);
+        assert!(segment.end_ms <= 4_050);
+        assert!(segment.end_ms > segment.start_ms);
     }
+}
 
-    let flushed = vad.flush().unwrap();
-    let mut events = during;
-    events.extend(flushed);
-    assert!(
+#[test]
+fn converted_stereo_speech_onset_matches_mono_within_one_frame() {
+    let (_, samples16) = load_pcm16_mono_wav(&fixture_path(FIXTURE_WAV));
+    let stereo48: Vec<f32> = samples16.iter().flat_map(|sample| [*sample; 6]).collect();
+    let mut direct = Vad::new(VadOptions::default(), VadRuntimeOptions::default()).unwrap();
+    let mut converted = Vad::new(VadOptions::default(), VadRuntimeOptions::default()).unwrap();
+    let mut mono_events = direct.process(&samples16).unwrap();
+    mono_events.extend(direct.finish().unwrap());
+    let mut stereo_events = converted.process_pcm(&stereo48, 48_000, 2).unwrap();
+    stereo_events.extend(converted.finish().unwrap());
+    let start = |events: Vec<flexaudio_vad::VadEvent>| {
         events
-            .iter()
-            .any(|e| matches!(e, flexaudio_vad::VadEvent::SpeechStart { .. })),
-        "speech events are produced from real 8 kHz audio: {events:?}"
-    );
+            .into_iter()
+            .find_map(|event| match event.kind {
+                VadEventKind::Segment(segment) => Some(segment.start_ms),
+                _ => None,
+            })
+            .expect("speech fixture must produce a segment")
+    };
+    assert!(start(mono_events).abs_diff(start(stereo_events)) <= 32);
+}
 
-    let segs = get_speech_timestamps(&samples8, &cfg).expect("batch 8 kHz");
-    assert!(!segs.is_empty(), "8 kHz batch also produces segments");
-    let input_len = samples8.len() as u64;
-    let pad = cfg.sample_rate as u64 * u64::from(cfg.speech_pad_ms) / 1000;
-    for s in &segs {
-        assert!(
-            s.start_sample < input_len + pad,
-            "start {} is not in 8 kHz sample units (len={input_len})",
-            s.start_sample
-        );
-        assert!(
-            s.end_sample <= input_len + pad,
-            "end {} is not in 8 kHz sample units (len={input_len} pad={pad})",
-            s.end_sample
-        );
-        assert!(s.end_sample > s.start_sample);
+#[test]
+fn converted_full_scale_constant_and_step_pcm_remain_valid_through_eof() {
+    for (rate, channels) in [(8_000, 1), (44_100, 1), (48_000, 2)] {
+        for step in [false, true] {
+            let frames = usize::try_from(rate / 5).unwrap();
+            let samples: Vec<f32> = (0..frames)
+                .flat_map(|frame| {
+                    let value = if step && frame < frames / 2 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    std::iter::repeat_n(value, usize::from(channels))
+                })
+                .collect();
+            let mut vad = Vad::new(VadOptions::default(), VadRuntimeOptions::default()).unwrap();
+            let midpoint = samples.len() / 2;
+            vad.process_pcm(&samples[..midpoint], rate, channels)
+                .unwrap();
+            vad.process_pcm(&samples[midpoint..], rate, channels)
+                .unwrap();
+            let events = vad.finish().unwrap();
+            assert!(matches!(
+                events.last().unwrap().kind,
+                VadEventKind::EpochEnd {
+                    reason: flexaudio_vad::EpochEndReason::Finish
+                }
+            ));
+            assert!(vad.finish().unwrap().is_empty());
+        }
     }
 }

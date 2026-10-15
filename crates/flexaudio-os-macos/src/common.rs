@@ -425,7 +425,7 @@ mod repro_tests {
     use super::*;
 
     #[test]
-    fn repro_p7mac_bad_device_retains_operation_and_status() {
+    fn regression_bad_device_retains_operation_and_status() {
         let error = map_os_status("AudioDeviceStart", 0x21646576);
         assert_eq!(error.kind(), flexaudio_core::ErrorKind::DeviceNotFound);
         let Error::Context { context, .. } = &error else {

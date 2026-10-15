@@ -21,9 +21,8 @@ use bridge_drain::start_bridge_stream;
 mod flac_encoder;
 mod shutdown;
 use boundary::{device_event_to_js, event_to_js, to_napi_err, JsAudioError, JsAudioLoss};
-mod vad_integration;
-mod whisper_integration;
-mod whisper_vad;
+mod attachment;
+mod vad;
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -53,22 +52,12 @@ use flexaudio::{
 
 // Core types for the three addons. Import aliases to avoid the `#[napi]` wrappers (Vad / Denoiser).
 use flexaudio_denoise::{DenoiseError, Denoiser as CoreDenoiser};
-use flexaudio_vad::{Vad as CoreVad, VadConfig, VadError, VadEvent};
 
 /// pts window for pairing the secondary tap (60ms = 3 chunks). The secondary trails by 20–60ms,
 /// so this window matches timestamps even with a delay of up to 3 chunks.
 const PAIR_WINDOW_NS: i64 = 60_000_000;
 /// Width of a 20ms chunk in ns.
 const CHUNK_SPAN_NS: i64 = 20_000_000;
-
-/// Default `max_speech_ms` for the integrated VAD path (`openStream`), used only
-/// when the caller leaves `vad.maxSpeechMs` unset. silero's own default is 0
-/// (unbounded), which lets a monologue with no real silence stall the segment —
-/// and hence recognition latency — indefinitely. Real-time capture bounds it at
-/// 30 s so an over-long utterance is force-split. The standalone `Vad` class
-/// keeps silero's default (0); only the integrated path holds this opinion.
-/// An explicit `maxSpeechMs` (including `0`) always wins.
-const INTEGRATED_VAD_MAX_SPEECH_MS_DEFAULT: u32 = 30_000;
 
 /// Which tap runs integrated VAD.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -102,16 +91,15 @@ type DeviceTsfn = ThreadsafeFunction<JsDeviceEvent, ErrorStrategy::Fatal>;
 enum ChunkEmit {
     StartupDropped(Box<JsStreamEvent>),
     Chunk(Box<JsAudioChunk>),
-    WhisperFlushed(SendDeferred, Option<flexaudio_vad::WhisperVadTapError>),
-    /// A whisper-only failure: the closing carrier is already queued on this same TSFN,
+    VadFlushed(SendDeferred, Option<flexaudio_vad::VadTapError>),
+    /// A VAD-only failure: the closing carrier is already queued on this same TSFN,
     /// and the notification is handed to onEvent only after it (never an uncaught throw).
-    WhisperFailed {
-        error: flexaudio_vad::WhisperVadTapError,
-        stage: shutdown::WhisperFailureStage,
+    VadFailed {
+        error: flexaudio_vad::VadTapError,
+        stage: shutdown::VadFailureStage,
         epoch: u32,
     },
     StopFlushed,
-    VadError(flexaudio::Error),
 }
 
 /// `napi_deferred` is a raw pointer. Created on the JS thread and resolved through TSFN.
@@ -330,8 +318,8 @@ fn take_stop_waiters(phase: &Mutex<StopPhase>) -> Vec<SendDeferred> {
 
 /// Durable copy of the core's terminal failure, retained after the bridge exits.
 ///
-/// A whisper-compatible VAD failure is not a capture failure: it is reported once through
-/// `whisperVadFailed` and retained in the shutdown report's cleanup causes.
+/// A streaming VAD failure is not a capture failure: it is reported once through
+/// `vadFailed` and retained in the shutdown report's cleanup causes.
 #[derive(Clone)]
 struct StreamTerminal(flexaudio::Error);
 impl std::fmt::Display for StreamTerminal {
@@ -440,7 +428,7 @@ fn make_user_chunk_cb(
     Ok(UserCallback::new(env.raw(), refer))
 }
 
-/// Retain the original event callback for ordered Whisper delivery. Core notifications
+/// Retain the original event callback for ordered VAD delivery. Core notifications
 /// use an unreferenced TSFN; the chunk queue owns the event-loop lifetime through stop.
 fn make_stream_event_callbacks(
     env: &Env,
@@ -513,11 +501,11 @@ fn make_chunk_tsfn(
                     );
                     if denied
                         && !(chunk.frames == 0
-                            && (chunk.whisper_vad_events.is_some()
+                            && (chunk.vad_events.is_some()
                                 || chunk
                                     .secondary
                                     .as_ref()
-                                    .is_some_and(|tap| tap.whisper_vad_events.is_some())))
+                                    .is_some_and(|tap| tap.vad_events.is_some())))
                     {
                         return Ok(Vec::new());
                     }
@@ -536,30 +524,26 @@ fn make_chunk_tsfn(
                     func.call(*chunk)?;
                     Ok(Vec::<Unknown>::new())
                 }
-                ChunkEmit::WhisperFlushed(deferred, error) => {
-                    whisper_integration::settle_flush(&ctx.env, deferred, error)?;
+                ChunkEmit::VadFlushed(deferred, error) => {
+                    attachment::settle_flush(&ctx.env, deferred, error)?;
                     Ok(Vec::<Unknown>::new())
                 }
-                ChunkEmit::WhisperFailed {
+                ChunkEmit::VadFailed {
                     error,
                     stage,
                     epoch,
                 } => {
                     // The failure's terminal carrier was queued on this same TSFN before
-                    // this value, so its onChunk call ran first. A whisper-only failure is
+                    // this value, so its onChunk call ran first. A VAD-only failure is
                     // reported to onEvent; it must never become an uncaught exception.
                     call_ordered_event(
                         &ctx.env,
                         on_event.as_ref(),
-                        whisper_integration::failure_event(&error, stage, epoch),
+                        attachment::failure_event(&error, stage, epoch),
                     )?;
                     Ok(Vec::<Unknown>::new())
                 }
-                ChunkEmit::VadError(error) => {
-                    let exception = boundary::js_error(&ctx.env, &error)?;
-                    ctx.env.throw(exception)?;
-                    Ok(Vec::<Unknown>::new())
-                }
+
                 ChunkEmit::StopFlushed => {
                     for deferred in take_stop_waiters(&stop_phase) {
                         settle_stop(ctx.env.raw(), deferred, &report);
@@ -669,12 +653,6 @@ impl Task for ProcessesTask {
     }
 }
 
-/// VadError → napi::Error. Invalid configuration is a caller error: InvalidArg.
-/// Model loading/inference failures are environmental: GenericFailure.
-fn vad_err(err: VadError) -> NapiError {
-    boundary::to_napi_err(err.audio_error())
-}
-
 /// DenoiseError → napi::Error. Both variants indicate invalid arguments: InvalidArg.
 fn denoise_err(err: DenoiseError) -> NapiError {
     NapiError::new(Status::InvalidArg, err.to_string())
@@ -732,7 +710,7 @@ pub struct JsProcessInfo {
 /// Delivery shape (0.3.0): `onChunk` in `openStream(options, onChunk)` receives **one argument**
 /// (this primary chunk). Secondary tap (`secondaryOutput`) chunks arrive in the primary chunk's
 /// `secondary` property, rather than a second argument. Finalized VAD events also arrive on
-/// the selected `vadTap` chunk's `vadEvents`, rather than a separate callback
+/// the selected `vad.tap` chunk's `vadEvents`, rather than a separate callback
 /// ('primary': `chunk.vadEvents`; 'secondary': `chunk.secondary?.vadEvents`).
 ///
 /// `vadEvents` is populated only when `vad` is specified in `openStream`. When VAD is disabled,
@@ -748,11 +726,9 @@ pub struct JsAudioChunk {
     pub dropped_before: u32,
     pub peak: f64,
     pub rms: f64,
-    /// VAD events finalized in this chunk (only when `vadTap` is 'primary').
-    pub vad_events: Option<Vec<JsVadEvent>>,
-    /// Attached whisper-compatible events on the selected tap only.
-    #[napi(ts_type = "AttachedWhisperVadEvent[]")]
-    pub whisper_vad_events: Option<Vec<whisper_vad::JsWhisperVadEvent>>,
+    /// Attached streaming events on the selected tap only.
+    #[napi(ts_type = "AttachedVadEvent[]")]
+    pub vad_events: Option<Vec<vad::JsVadEvent>>,
     /// Timestamp-matched secondary tap chunk (only with `secondaryOutput`). Delivered as a pair in
     /// the same callback (`primary.secondary` in `onChunk(primary)`, not a second argument). It is
     /// `undefined` when the secondary has not arrived. Match primary↔secondary by `ptsNs` (time);
@@ -780,34 +756,9 @@ pub struct JsSecondaryChunk {
     /// Computed from f32 before quantization (preserves meter precision even with s16).
     pub peak: f64,
     pub rms: f64,
-    /// VAD events finalized in this chunk (only when `vadTap` is 'secondary').
-    pub vad_events: Option<Vec<JsVadEvent>>,
-    /// Attached whisper-compatible events on the selected tap only.
-    #[napi(ts_type = "AttachedWhisperVadEvent[]")]
-    pub whisper_vad_events: Option<Vec<whisper_vad::JsWhisperVadEvent>>,
-}
-
-/// JS VAD event (speech segment start/end).
-///
-/// `type` is limited to `'speechStart' | 'speechEnd'` (consistent with other events' `type`).
-///
-/// `atSample` is an absolute sample position **at VAD's internal rate (`sampleRate`=8000 or 16000,
-/// default 16000)**, not the input chunk's sample rate (raw silero value for standalone/debug use).
-/// Convert to seconds with `Number(atSample) / sampleRate`; approximate the input sample position with
-/// `atSample * BigInt(inputSampleRate) / BigInt(sampleRate)`.
-#[napi(object)]
-#[derive(Debug)]
-pub struct JsVadEvent {
-    /// 'speechStart' | 'speechEnd' (speech segment start/end).
-    #[napi(js_name = "type", ts_type = "'speechStart' | 'speechEnd'")]
-    pub kind: String,
-    pub at_sample: BigInt,
-    /// Absolute nanoseconds from recording zero (`number`=f64). Populated only through integrated VAD
-    /// (`vad` in `openStream`), computed from chunk `ptsNs` and the within-chunk offset at VAD's
-    /// internal rate. Delivered in the same chunk and monotonic non-decreasing across chunks. Final
-    /// `flushVad` events use the same `vadEvents` array. Standalone `Vad` (`process`/`flush`) has no pts
-    /// context, so this is `undefined`. (Time is bounded by recording length: `number`; u64 counters use `bigint`.)
-    pub at_ns: Option<i64>,
+    /// Attached streaming events on the selected tap only.
+    #[napi(ts_type = "AttachedVadEvent[]")]
+    pub vad_events: Option<Vec<vad::JsVadEvent>>,
 }
 
 /// JS native format (returned by `FlexStream.nativeFormat`).
@@ -817,39 +768,14 @@ pub struct JsNativeFormat {
     pub channels: u16,
 }
 
-/// Integrated VAD settings (shared by `OpenOptions.vad` and the `Vad` constructor).
-///
-/// All fields are optional; omitted fields use silero defaults (`VadConfig::default`).
-#[napi(object)]
-pub struct VadOptions {
-    /// Probability threshold for speech start (>=). Default 0.5.
-    pub threshold: Option<f64>,
-    /// Lower (silence-side) threshold for silence start (<). Defaults to `max(threshold - 0.15, 0.01)`.
-    pub neg_threshold: Option<f64>,
-    /// Minimum accepted speech duration (ms). Default 250.
-    pub min_speech_ms: Option<u32>,
-    /// Silence duration required to finalize speech end (ms). Default 100.
-    pub min_silence_ms: Option<u32>,
-    /// Padding extending segment boundaries on both sides (ms). Default 30.
-    pub speech_pad_ms: Option<u32>,
-    /// Maximum segment length (ms). 0 = unbounded. Exceeding this forces a split.
-    ///
-    /// Standalone `Vad` follows silero with default 0 (unbounded). **Integrated VAD (`vad` in `openStream`)
-    /// defaults to 30000ms (caps long stretches of speech so realtime latency stays bounded)**.
-    /// An explicit value (including `0`) always wins.
-    pub max_speech_ms: Option<u32>,
-    /// VAD internal sample rate. Only 8000 or 16000. Default 16000.
-    pub sample_rate: Option<u32>,
-}
-
 /// Stream notification. permissionDenied is terminal, with permission and
-/// cause/remedy in message. permissionPending and permissionGranted remain for custom
-/// Rust backends and compatibility; built-in sources on every OS emit neither arm.
+/// cause/remedy in message. permissionPending remains for custom
+/// Rust backends; built-in sources on every OS do not emit this advisory.
 /// A custom permissionPending is advisory: consent remains undecided and capture continues.
 /// silenceWhileSourceActive
 /// is advisory: the system-audio diagnosis is inconclusive and capture continues.
 /// Missing permission and genuine digital silence remain possible in that case.
-/// whisperVadFailed is advisory for capture: the attached whisper VAD session failed,
+/// vadFailed is advisory for capture: the attached VAD session failed,
 /// carrying its typed code, and capture, PCM delivery, pause/resume, switchSource and
 /// stop keep working. It is delivered after that failure's `epochEnd(error)` carrier.
 #[napi(object)]
@@ -868,7 +794,7 @@ pub struct JsStreamEvent {
     pub error: Option<JsAudioError>,
     pub loss: Option<JsAudioLoss>,
     pub message: Option<String>,
-    /// Present on whisperVadFailed: the epoch whose VAD session failed.
+    /// Present on vadFailed: the epoch whose VAD session failed.
     pub epoch: Option<u32>,
 }
 
@@ -900,7 +826,7 @@ pub struct SecondaryOutputOptions {
     pub encoding: Option<String>,
 }
 
-/// Options for openStream / __openMockStream.
+/// Options for openStream.
 #[napi(object)]
 pub struct OpenOptions {
     /// "mic" | "system" | "process" | "mix"
@@ -949,21 +875,17 @@ pub struct OpenOptions {
     pub mic_gain: Option<f64>,
     /// Pre-mix multiplier for the system side (linear, mix only). Default 1.0.
     pub system_gain: Option<f64>,
-    /// Integrated VAD settings. When specified, the tap selected by `vadTap` passes through VAD and
-    /// finalized events attach to that tap's chunk `vadEvents` (audio is unchanged). Omission disables VAD.
-    pub vad: Option<VadOptions>,
-    /// Whisper-compatible VAD options. Validated before any device is opened.
+    /// VAD-compatible VAD options. Validated before any device is opened.
     /// Requires the shared canonical capture feed with exact producer provenance.
-    #[napi(ts_type = "WhisperVadStreamOptions")]
-    pub whisper_vad: Option<napi::JsUnknown>,
-    /// Tap to run VAD on. 'primary' (default) | 'secondary'. 'secondary' requires
-    /// `secondaryOutput`; a 16k/mono secondary avoids resampling for efficiency.
-    pub vad_tap: Option<String>,
+    #[napi(ts_type = "StreamVadOptions")]
+    pub vad: Option<napi::JsUnknown>,
     /// true enables recording-time noise suppression. **Only available with 48000 Hz output**
     /// (RNNoise is fixed at 48kHz). Applied once to the internal 48kHz/stereo canonical form;
     /// both primary and secondary taps receive denoised audio (+10ms fixed latency). Setting true
     /// at any other rate makes `openStream` throw InvalidArg. Omission/false disables noise suppression.
     pub denoise: Option<bool>,
+    /// Enable the macOS silence diagnostic probe. Default true.
+    pub silence_probe: Option<bool>,
     /// Secondary output tap. When specified, returns paired chunks in another format simultaneously
     /// (`primary.secondary` in `onChunk`). Omission means no secondary tap, preserving previous behavior.
     pub secondary_output: Option<SecondaryOutputOptions>,
@@ -1046,39 +968,8 @@ fn chunk_to_js(chunk: AudioChunk) -> JsAudioChunk {
         rms: chunk.rms as f64,
         // Unset by default. The bridge overwrites it when integrated VAD is enabled on the primary tap.
         vad_events: None,
-        whisper_vad_events: None,
         // The pairing bridge inserts a timestamp-matched secondary chunk (undefined if none).
         secondary: None,
-    }
-}
-
-fn vad_event_to_js(ev: VadEvent) -> JsVadEvent {
-    vad_event_to_js_abs(ev, None)
-}
-
-/// Map [`VadEvent`] to JS. `at_ns` is absolute time from recording zero (integrated VAD only;
-/// `None` for standalone `Vad`). `at_sample` is the raw cumulative position at VAD's internal rate.
-fn vad_event_to_js_abs(ev: VadEvent, at_ns: Option<i64>) -> JsVadEvent {
-    let (kind, at_sample) = match ev {
-        VadEvent::SpeechStart { at_sample } => ("speechStart", BigInt::from(at_sample)),
-        VadEvent::SpeechEnd { at_sample } => ("speechEnd", BigInt::from(at_sample)),
-    };
-    JsVadEvent {
-        kind: kind.to_string(),
-        at_sample,
-        at_ns,
-    }
-}
-
-/// Convert 'primary' | 'secondary' to [`VadTap`]. `None`/omission defaults to Primary.
-fn parse_vad_tap(s: Option<&str>) -> napi::Result<VadTap> {
-    match s {
-        None | Some("primary") => Ok(VadTap::Primary),
-        Some("secondary") => Ok(VadTap::Secondary),
-        Some(other) => Err(NapiError::new(
-            Status::InvalidArg,
-            format!("unknown vadTap: {other:?} (expected primary|secondary)"),
-        )),
     }
 }
 
@@ -1092,36 +983,6 @@ fn parse_sec_encoding(s: Option<&str>) -> napi::Result<SecEncoding> {
             format!("unknown secondaryOutput.encoding: {other:?} (expected f32|s16)"),
         )),
     }
-}
-
-/// [`VadOptions`] → [`VadConfig`]. Omitted fields fall back to silero defaults.
-/// Omitted `neg_threshold` stays `None` (the default formula in `VadConfig` applies).
-fn build_vad_config(o: &VadOptions) -> VadConfig {
-    let d = VadConfig::default();
-    VadConfig {
-        threshold: o.threshold.map(|v| v as f32).unwrap_or(d.threshold),
-        neg_threshold: o.neg_threshold.map(|v| v as f32),
-        min_speech_ms: o.min_speech_ms.unwrap_or(d.min_speech_ms),
-        min_silence_ms: o.min_silence_ms.unwrap_or(d.min_silence_ms),
-        speech_pad_ms: o.speech_pad_ms.unwrap_or(d.speech_pad_ms),
-        max_speech_ms: o.max_speech_ms.unwrap_or(d.max_speech_ms),
-        sample_rate: o.sample_rate.unwrap_or(d.sample_rate),
-    }
-}
-
-/// [`VadOptions`] → [`VadConfig`] for the integrated `openStream` path.
-///
-/// Identical to [`build_vad_config`] except that an unset `maxSpeechMs` defaults
-/// to [`INTEGRATED_VAD_MAX_SPEECH_MS_DEFAULT`] (30 s) instead of silero's 0
-/// (unbounded), bounding real-time latency for a monologue with no silence. An
-/// explicit value — including `0` to restore unbounded behavior — always wins.
-/// The standalone `Vad` class stays silero-faithful and never applies this.
-fn build_integrated_vad_config(o: &VadOptions) -> VadConfig {
-    let mut cfg = build_vad_config(o);
-    if o.max_speech_ms.is_none() {
-        cfg.max_speech_ms = INTEGRATED_VAD_MAX_SPEECH_MS_DEFAULT;
-    }
-    cfg
 }
 
 /// Validate integrated denoise's 48kHz requirement (pure function, separated for testing).
@@ -1189,6 +1050,7 @@ fn build_config(options: &OpenOptions) -> napi::Result<StreamConfig> {
         exclude_self: options.exclude_self.unwrap_or(false),
         exclude_pids,
         gain: options.gain.unwrap_or(1.0) as f32,
+        silence_probe: options.silence_probe.unwrap_or(true),
         // mix only (the facade ignores these for mic/system/process). Per-side gains default to 1.0.
         mix_mic_device_id: options.mic_device_id.clone(),
         mix_system_device_id: options.system_device_id.clone(),
@@ -1253,42 +1115,23 @@ enum BridgeCmd {
     SetGain(f32),
     /// Return a current-value snapshot synchronously (for getters).
     Query(QueryCmd),
-    /// Force-finalize integrated VAD's open utterance (`flushVad`). This runtime operation does not
-    /// change config (`secondaryOutput` / encoding are fixed at open). Unlike audio
-    /// stop-flush, it attaches the final speechEnd to the next tap chunk.
-    FlushVad,
-    FlushWhisperVad(SendDeferred),
+    FlushVad(SendDeferred),
 }
 
-/// Secondary tap marshaling configuration (rate/channels/encoding).
+/// Secondary tap encoding; core owns its rate and channel configuration.
 #[derive(Clone, Copy)]
 struct SecondaryTapCfg {
-    rate: u32,
-    channels: u16,
     encoding: SecEncoding,
 }
 
-/// Bridge thread emission state. Converts primary/secondary chunks to JS, runs integrated VAD on
-/// the selected tap, pairs within the pts window (60ms), and delivers to `onChunk`.
-///
-/// denoise has moved to core (internal canonical form) and is absent here. A single VAD instance
-/// is bound to one tap (`vad_tap`), consuming pre-quantization f32 in Rust. Secondary s16 conversion follows VAD.
+/// Pair PCM taps within the timestamp window and deliver to `onChunk`.
+/// One capture owner supplies VAD events; tap selection changes only their carrier.
+/// Denoising runs in core before canonical capture and output conversion.
 struct PairingBridge {
     on_chunk: ChunkTsfn,
-    whisper: Option<whisper_integration::WhisperBridge>,
+    attachment: Option<attachment::VadBridge>,
     stop_phase: Arc<Mutex<StopPhase>>,
     report: FinalReport,
-    /// Integrated VAD (only when configured). One instance, one tap.
-    vad: Option<vad_integration::IntegratedVad>,
-    vad_tap: VadTap,
-    /// Latest successful VAD anchor for trailing carriers.
-    vad_anchor_pts: i64,
-    /// VAD events finalized by runtime `flushVad`, awaiting a chunk to carry them.
-    /// Prepended to `vadEvents` of the next VAD tap chunk queued in the FIFO.
-    pending_flush_events: Vec<JsVadEvent>,
-    /// Primary tap output format (passed to `process_pcm` when VAD uses primary).
-    output_rate: u32,
-    output_channels: u16,
     /// Secondary tap format/encoding (only when configured).
     secondary: Option<SecondaryTapCfg>,
     /// Pairing FIFOs. Drain both taps completely each iteration, then match within the pts window.
@@ -1322,7 +1165,6 @@ fn secondary_carrier_counters(metadata: SecondaryCarrierMetadata) -> (BigInt, Bi
 fn secondary_event_carrier(
     encoding: Option<SecEncoding>,
     pts: i64,
-    events: Vec<JsVadEvent>,
     metadata: SecondaryCarrierMetadata,
 ) -> JsSecondaryChunk {
     let (frame_index, seq, dropped_before) = secondary_carrier_counters(metadata);
@@ -1341,195 +1183,54 @@ fn secondary_event_carrier(
         dropped_before,
         peak: 0.0,
         rms: 0.0,
-        vad_events: Some(events),
-        whisper_vad_events: None,
+        vad_events: None,
     }
 }
 
 impl PairingBridge {
-    fn report_vad_error(&self, error: VadError) {
-        self.on_chunk.call(
-            ChunkEmit::VadError(error.audio_error()),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
-    }
-
-    /// Feed the bound tap's pre-quantization f32 to VAD and return finalized events with absolute time
-    /// from recording zero. Reset and re-anchor on discontinuity flags / `dropped_before` increments.
-    /// Returns `None` when VAD is not configured.
-    fn run_vad(
-        &mut self,
-        samples: &[f32],
-        in_rate: u32,
-        in_channels: u16,
-        pts_ns: i64,
-        discontinuity: bool,
-        dropped_before: u32,
-    ) -> Option<Vec<JsVadEvent>> {
-        let vad = self.vad.as_mut()?;
-        match vad.process(
-            samples,
-            in_rate,
-            in_channels,
-            pts_ns,
-            discontinuity,
-            dropped_before,
-        ) {
-            Ok(events) => {
-                self.vad_anchor_pts = vad.anchor_pts;
-                Some(events)
-            }
-            Err(error) => {
-                let events = vad.take_pending_events();
-                self.report_vad_error(error);
-                Some(events)
-            }
-        }
-    }
-
-    /// Take pending flushVad events and prepend them to this chunk's VAD events (if any).
-    /// Flush events finalize the previous utterance, so their timestamps precede new events
-    /// from this chunk and they belong first.
-    fn take_pending_prepended(&mut self, own: Option<Vec<JsVadEvent>>) -> Vec<JsVadEvent> {
-        let mut merged = std::mem::take(&mut self.pending_flush_events);
-        if let Some(ev) = own {
-            merged.extend(ev);
-        }
-        merged
-    }
-
-    /// Force-finalize integrated VAD's open utterance and return finalized JS events with `atNs`
-    /// (absolute time based on the latest anchor). `flush()` resets VAD, so reset the cumulative
-    /// counter to 0. Empty if no utterance is open.
-    fn flush_vad_events(&mut self) -> Result<Vec<JsVadEvent>, VadError> {
-        match self.vad.as_mut() {
-            Some(vad) => vad.flush(),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// Runtime finalization uses the next selected tap chunk as its carrier.
-    fn flush_vad(&mut self) {
-        match self.flush_vad_events() {
-            Ok(events) => self.pending_flush_events.extend(events),
-            Err(error) => self.report_vad_error(error),
-        }
-    }
-
     /// Deliver all residual secondaries, then one final zero-frame terminator.
-    fn flush_vad_final(&mut self) {
+    fn emit_terminator(&mut self) {
         while let Some(secondary) = self.secondary_fifo.pop_front() {
             self.emit_secondary_envelope(secondary);
         }
-        let js = match self.flush_vad_events() {
-            Ok(events) => events,
-            Err(error) => {
-                record_cleanup_failure(
-                    &self.report,
-                    error
-                        .audio_error()
-                        .with_context(flexaudio::core::ErrorContext::new(
-                            flexaudio::core::Operation::Flush,
-                        )),
-                );
-                self.report_vad_error(error);
-                self.vad
-                    .as_mut()
-                    .map_or_else(Vec::new, |vad| vad.take_pending_events())
-            }
-        };
-        // Prepend any runtime pending events (chronological order).
-        let mut events = std::mem::take(&mut self.pending_flush_events);
-        events.extend(js);
-        // Preserve non-decreasing primary pts: carrier pts is the greater of the latest anchor and last delivered pts.
-        let pts = self.vad_anchor_pts.max(self.last_emitted_primary_pts);
-        let mut carrier = JsAudioChunk {
+        let carrier = JsAudioChunk {
             frame_index: BigInt::from(self.last_primary_frame_index),
             data: Float32Array::new(Vec::new()),
             frames: 0,
-            pts_ns: pts,
+            pts_ns: self.last_emitted_primary_pts,
             seq: BigInt::from(self.last_primary_seq),
             flags: 0,
             dropped_before: self.last_primary_dropped,
             peak: 0.0,
             rms: 0.0,
             vad_events: None,
-            whisper_vad_events: None,
             secondary: None,
         };
-        match self.vad_tap {
-            VadTap::Primary => carrier.vad_events = Some(events),
-            VadTap::Secondary => {
-                carrier.secondary = Some(secondary_event_carrier(
-                    self.secondary.map(|cfg| cfg.encoding),
-                    pts,
-                    events,
-                    self.last_secondary,
-                ));
-            }
-        }
         self.on_chunk.call(
             ChunkEmit::Chunk(Box::new(carrier)),
             ThreadsafeFunctionCallMode::NonBlocking,
         );
     }
 
-    /// Accept a primary chunk. Run VAD if primary is selected, convert to JS, and queue in the FIFO.
+    /// Marshal primary PCM, attach pending events for its selected carrier, and queue it.
     fn on_primary(&mut self, chunk: AudioChunk) {
         self.last_primary_seq = chunk.seq;
         self.last_primary_frame_index = chunk.frame_index;
         self.last_primary_dropped = chunk.dropped_before;
-        let (rate, ch) = (self.output_rate, self.output_channels);
-        let mut vad_events = if self.vad_tap == VadTap::Primary {
-            let disc = chunk.flags.contains(ChunkFlags::DISCONTINUITY);
-            self.run_vad(
-                &chunk.data,
-                rate,
-                ch,
-                chunk.pts_ns,
-                disc,
-                chunk.dropped_before,
-            )
-        } else {
-            None
-        };
-        // Prepend pending flushVad events (such as the previous utterance's final speechEnd).
-        if self.vad_tap == VadTap::Primary && !self.pending_flush_events.is_empty() {
-            vad_events = Some(self.take_pending_prepended(vad_events));
-        }
         let mut js = chunk_to_js(chunk);
-        js.vad_events = vad_events;
-        if let Some(whisper) = self.whisper.as_mut() {
-            if whisper.tap == VadTap::Primary {
-                js.whisper_vad_events = Some(whisper.take_events());
+        if let Some(attachment) = self.attachment.as_mut() {
+            if attachment.tap == VadTap::Primary {
+                js.vad_events = Some(attachment.take_events());
             }
         }
         self.primary_fifo.push_back(js);
     }
 
-    /// Accept a secondary chunk. Run VAD on pre-quantization f32 if secondary is selected, then marshal
-    /// to `Int16Array`/`Float32Array` according to encoding and queue in the FIFO.
+    /// Marshal secondary PCM to its encoding and queue it; attach events at delivery.
     fn on_secondary(&mut self, chunk: SecondaryChunk) {
         let Some(cfg) = self.secondary else {
             return; // Do nothing without secondary tap settings (defensive).
         };
-        let mut vad_events = if self.vad_tap == VadTap::Secondary {
-            let disc = chunk.flags.contains(ChunkFlags::DISCONTINUITY);
-            self.run_vad(
-                &chunk.samples,
-                cfg.rate,
-                cfg.channels,
-                chunk.pts_ns,
-                disc,
-                chunk.dropped_before,
-            )
-        } else {
-            None
-        };
-        // Prepend pending flushVad events (only when the VAD tap is secondary).
-        if self.vad_tap == VadTap::Secondary && !self.pending_flush_events.is_empty() {
-            vad_events = Some(self.take_pending_prepended(vad_events));
-        }
         self.last_secondary = SecondaryCarrierMetadata {
             frame_index: chunk.frame_index,
             seq: chunk.seq,
@@ -1569,9 +1270,8 @@ impl PairingBridge {
             dropped_before,
             peak,
             rms,
-            vad_events,
-            whisper_vad_events: self
-                .whisper
+            vad_events: self
+                .attachment
                 .as_mut()
                 .filter(|owner| owner.tap == VadTap::Secondary)
                 .map(|_| Vec::new()),
@@ -1580,12 +1280,12 @@ impl PairingBridge {
     }
 
     fn emit_secondary_envelope(&mut self, mut secondary: JsSecondaryChunk) {
-        if let Some(whisper) = self
-            .whisper
+        if let Some(attachment) = self
+            .attachment
             .as_mut()
             .filter(|owner| owner.tap == VadTap::Secondary)
         {
-            secondary.whisper_vad_events = Some(whisper.take_events());
+            secondary.vad_events = Some(attachment.take_events());
         }
         let carrier = JsAudioChunk {
             data: Float32Array::new(Vec::new()),
@@ -1598,7 +1298,6 @@ impl PairingBridge {
             peak: 0.0,
             rms: 0.0,
             vad_events: None,
-            whisper_vad_events: None,
             secondary: Some(secondary),
         };
         self.last_emitted_primary_pts = carrier.pts_ns;
@@ -1622,7 +1321,7 @@ impl PairingBridge {
                     Some(s) => {
                         if s.pts_ns < p_pts - PAIR_WINDOW_NS / 2 {
                             // Secondary too old (e.g. primary dropped): discard the orphan and inspect the next secondary.
-                            if self.whisper.is_some() {
+                            if self.attachment.is_some() {
                                 // Preserve this secondary PCM on a real primary carrier.
                                 // Empty midstream envelopes look like stop to consumers;
                                 // the secondary retains its own original clock metadata.
@@ -1645,12 +1344,12 @@ impl PairingBridge {
             self.last_emitted_primary_pts = p.pts_ns.max(self.last_emitted_primary_pts);
             let mut matched = matched;
             if let Some(secondary) = matched.as_mut() {
-                if let Some(whisper) = self
-                    .whisper
+                if let Some(attachment) = self
+                    .attachment
                     .as_mut()
                     .filter(|owner| owner.tap == VadTap::Secondary)
                 {
-                    secondary.whisper_vad_events = Some(whisper.take_events());
+                    secondary.vad_events = Some(attachment.take_events());
                 }
             }
             p.secondary = matched;
@@ -1748,25 +1447,22 @@ impl FlexStream {
                                 // Ignore a dropped receiver.
                                 let _ = q.result_tx.send(snap);
                             }
-                            // Runtime flushVad: finalize the open utterance and attach final events to the next
-                            // VAD tap chunk (pending).
-                            BridgeCmd::FlushVad => bridge.flush_vad(),
-                            BridgeCmd::FlushWhisperVad(deferred) => {
+                            BridgeCmd::FlushVad(deferred) => {
                                 bridge.drain_stream(
                                     &mut stream,
                                     on_event.as_ref(),
                                     &thread_terminal,
                                 );
-                                bridge.flush_whisper(false);
-                                // flushWhisperVad reinitializes on success, so a previous
-                                // whisper-only failure no longer applies to this stream.
-                                bridge.report_whisper_failure();
+                                bridge.flush_attachment(false);
+                                // flushVad reinitializes on success, so a previous
+                                // VAD-only failure no longer applies to this stream.
+                                bridge.report_attachment_failure();
                                 let error = bridge
-                                    .whisper
+                                    .attachment
                                     .as_ref()
                                     .and_then(|owner| owner.error.clone());
                                 bridge.on_chunk.call(
-                                    ChunkEmit::WhisperFlushed(deferred, error),
+                                    ChunkEmit::VadFlushed(deferred, error),
                                     ThreadsafeFunctionCallMode::NonBlocking,
                                 );
                             }
@@ -1780,20 +1476,20 @@ impl FlexStream {
                     // Drain all arriving primary/secondary chunks into the bridge. Run VAD/quantization, pair within
                     // the pts window, and deliver to onChunk.
                     bridge.drain_stream(&mut stream, on_event.as_ref(), &thread_terminal);
-                    // A whisper-only failure never becomes the capture terminal: it is
-                    // reported once through whisperVadFailed and retained as cleanup.
-                    bridge.report_whisper_failure();
+                    // A VAD-only failure never becomes the capture terminal: it is
+                    // reported once through vadFailed and retained as cleanup.
+                    bridge.report_attachment_failure();
                     thread::sleep(POLL_INTERVAL);
                 }
                 // Drain chunks remaining in the rings before stopping, then deliver pairs.
                 bridge.drain_stream(&mut stream, on_event.as_ref(), &thread_terminal);
-                // stop() ordering (addendum 2-2):
+                // Stop ordering:
                 //   1. Audio stop-flush: core flush queues the trailing tail (denoise delay line + resampler
                 //      remainder) into the rings.
                 //   2. Feed that tail through VAD into the FIFOs, then deliver audio through normal pairing.
-                //   3. flushVad: force-finalize the open utterance and reliably deliver the final speechEnd with
+                //   3. flushVad: force-finalize the open utterance and reliably deliver the final VAD events with
                 //      a dedicated trailing carrier (independent of pairing; no drops even without a primary tail).
-                // This delivers both trailing recorded audio (2) and final speechEnd (3). Audio stop-flush and
+                // This delivers both trailing recorded audio (2) and final VAD events (3). Audio stop-flush and
                 // flushVad are separate (audio samples versus VAD events).
                 let _ = stream.stop_checked();
                 // Stop can discover a pending backend denial. The shared drain
@@ -1804,13 +1500,13 @@ impl FlexStream {
                         bridge.emit_secondary_envelope(secondary);
                     }
                 }
-                if bridge.whisper.is_some() {
-                    bridge.flush_whisper(true);
-                    // Deliver the one whisperVadFailed notification (if not already sent)
+                if bridge.attachment.is_some() {
+                    bridge.flush_attachment(true);
+                    // Deliver the one vadFailed notification (if not already sent)
                     // before stop() settles; the retained report carries it afterwards.
-                    bridge.report_whisper_failure();
+                    bridge.report_attachment_failure();
                 } else if stream.terminal_error().is_none() {
-                    bridge.flush_vad_final();
+                    bridge.emit_terminator();
                 }
                 // Publish completion only after core and addon teardown are both known.
                 bridge.retain_shutdown_outcome(stream.shutdown_report());
@@ -1984,9 +1680,9 @@ impl FlexStream {
     }
 
     /// Stored **capture** terminal failure, or undefined when capture has not terminally
-    /// failed. An attached whisper-compatible VAD failure is not a capture failure: it is
-    /// reported once as a `whisperVadFailed` event and retained in `shutdownReport()`'s
-    /// cleanup causes, so this remains undefined after a whisper-only failure.
+    /// failed. An attached streaming VAD failure is not a capture failure: it is
+    /// reported once as a `vadFailed` event and retained in `shutdownReport()`'s
+    /// cleanup causes, so this remains undefined after a VAD-only failure.
     /// Remains available after stop and does not consume onEvent notifications.
     #[napi]
     pub fn terminal_error(&self) -> Either<JsStreamEvent, Undefined> {
@@ -2018,7 +1714,7 @@ impl FlexStream {
     /// `seq` stays continuous across switches; the first chunk afterward has the DISCONTINUITY flag.
     /// `options.gain` is ignored (gain is stream state; use `setGain` to change it).
     ///
-    /// A whisper-compatible VAD failure does not block a source switch: the switch closes
+    /// A streaming VAD failure does not block a source switch: the switch closes
     /// the old epoch and the next capture frame reinitializes the VAD session.
     ///
     /// Throws if `stop()` has already completed (the bridge thread has stopped).
@@ -2102,7 +1798,7 @@ impl FlexStream {
     }
 
     /// Unpause and resume delivery. The first chunk afterward is a discontinuity, which also
-    /// reinitializes a failed whisper-compatible VAD session; it never throws for that failure.
+    /// reinitializes a failed streaming VAD session; it never throws for that failure.
     /// Throws if `stop()` has already completed.
     #[napi]
     pub fn resume(&self, env: Env) -> napi::Result<()> {
@@ -2135,38 +1831,9 @@ impl FlexStream {
             .map_err(|error| boundary::throw_error(&env, error))
     }
 
-    /// Force-finalize integrated VAD's currently open utterance (runtime operation).
-    ///
-    /// silero emits no `speechEnd` until silence arrives. Call this when pausing recognition or
-    /// finalizing the last utterance at recording end. If an utterance is open, its final `speechEnd`
-    /// (and paired `speechStart`) are prepended to `vadEvents` of the next tap chunk (with `atNs`
-    /// from recording zero). Chunks arrive every 20ms, so latency is ≤ 1 chunk. VAD then
-    /// resets and detects the next utterance with fresh context.
-    ///
-    /// This **does not change config** (independent of `secondaryOutput`/encoding being fixed at open
-    /// and unchangeable through `switchSource`). It is also separate from audio stop-flush and does not
-    /// modify audio samples. No-op if VAD is not configured. `stop()` calls this automatically after audio
-    /// stop-flush. Throws if `stop()` has already completed.
-    #[napi]
-    pub fn flush_vad(&self) -> napi::Result<()> {
-        let cmd_tx = {
-            let g = self.inner.lock().unwrap_or_else(lock_poisoned);
-            g.cmd_tx.clone().ok_or_else(|| {
-                NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
-            })?
-        };
-        cmd_tx.send(BridgeCmd::FlushVad).map_err(|_| {
-            NapiError::new(
-                Status::GenericFailure,
-                "bridge thread is not running".to_string(),
-            )
-        })?;
-        Ok(())
-    }
-
     /// Drain an attached epoch and deliver its closing carrier before promise settlement.
     #[napi(ts_return_type = "Promise<void>")]
-    pub fn flush_whisper_vad(&self, env: Env) -> napi::Result<JsObject> {
+    pub fn flush_vad(&self, env: Env) -> napi::Result<JsObject> {
         let sender = self
             .inner
             .lock()
@@ -2176,7 +1843,7 @@ impl FlexStream {
             .ok_or_else(|| NapiError::new(Status::GenericFailure, "stream already stopped"))?;
         let (deferred, promise) = create_js_promise(&env)?;
         sender
-            .send(BridgeCmd::FlushWhisperVad(deferred))
+            .send(BridgeCmd::FlushVad(deferred))
             .map_err(|_| NapiError::new(Status::GenericFailure, "bridge thread is not running"))?;
         Ok(promise)
     }
@@ -2391,11 +2058,11 @@ pub fn processes() -> AsyncTask<ProcessesTask> {
 /// configure the bundle or grant the responsible host access before retrying.
 /// Opening is synchronous; use a worker thread for GUI hosts.
 /// The 30 s bound covers undecided consent, not authorized native queries.
-/// Built-in sources on every OS emit neither permissionPending nor permissionGranted; those arms
+/// Built-in sources on every OS do not emit permissionPending; that advisory
 /// remain for custom Rust backends and compatibility. Each microphone start requires
 /// decided consent; authorization changes and revocation are not continuously monitored.
 /// With onEvent, startupSamplesDropped precedes the affected generation's first
-/// onChunk and attached Whisper epochStart. Recovered and other advisories use
+/// onChunk and attached VAD epochStart. Recovered and other advisories use
 /// independent callbacks and may arrive before or after the startup notice.
 /// Windows checks Microphone privacy, including
 /// Let desktop apps access your microphone.
@@ -2408,30 +2075,16 @@ pub fn processes() -> AsyncTask<ProcessesTask> {
 /// and continues. The signal may enter capture when our own process is included
 /// (e.g. excludeSelf: false). Stopping cancels the probe without a late event.
 ///
-/// `options.denoise` enables noise suppression in core (internal canonical form), so both primary
-/// and secondary taps receive denoised audio. `options.vad` runs VAD on the tap selected by `vadTap`
-/// and attaches finalized events to that tap's chunk `vadEvents` (with absolute `atNs` from
-/// recording zero). `options.secondaryOutput` enables the secondary tap, returning paired chunks
-/// in another format (`primary.secondary` in `onChunk`). The denoise 48kHz requirement and
-/// invalid VAD settings are checked and rejected here before opening the stream.
+/// `denoise`, `secondaryOutput` and `vad` are independent optional processing features.
+/// Denoise requires 48 kHz output and affects both taps. The attached VAD consumes
+/// the canonical capture feed; `vad.tap` selects the event carrier only. Both standalone
+/// and attached VAD default to an unbounded maximum speech duration. Call `flushVad()`
+/// to finish/reset its current epoch and await delivery of closing events.
 ///
-/// Standard operation enables the secondary tap and VAD for the entire
-/// recording. Toggle transcription by keeping or discarding the delivered
-/// results, not by re-opening the stream; the secondary format is fixed at open
-/// (see `switchSource`), so the recognition resample + VAD run on every
-/// recording — budget for them as a constant cost, not an opt-in. The integrated
-/// VAD defaults `maxSpeechMs` to 30 s (see `VadOptions`) so a monologue with no
-/// silence stays bounded; call `flushVad` to force-close the open utterance
-/// (e.g. when pausing recognition). Per-chunk `vadEvents[].atNs` is a recording
-/// zero-based absolute time that is monotonic non-decreasing across chunks.
-///
-/// `onChunk` is called with **one** argument, the primary `JsAudioChunk`. When
-/// `secondaryOutput` is set, the paired secondary chunk arrives as
-/// `chunk.secondary` (it is not a second callback argument). VAD results ride
-/// on the chunk of the tap selected by `vadTap`: `chunk.vadEvents` for
-/// 'primary', `chunk.secondary?.vadEvents` for 'secondary'. Do not block
-/// synchronously inside `onChunk` (defer heavy work to a later task); blocking
-/// stalls terminator delivery and delays `stop()` resolving.
+/// `onChunk` receives one primary chunk; secondary PCM appears as `chunk.secondary`.
+/// VAD events appear on the selected tap as `vadEvents`. The 20 ms chunk size is fixed
+/// because capture conversion and event ordering share that cadence. Avoid synchronous
+/// heavy work in callbacks; it delays delivery and stop settlement.
 #[napi]
 pub fn open_stream(
     env: Env,
@@ -2444,25 +2097,20 @@ pub fn open_stream(
         Function<JsStreamEvent, Unknown>,
     >,
 ) -> napi::Result<FlexStream> {
-    let whisper_options = options
-        .whisper_vad
+    let attachment_options = options
+        .vad
         .as_ref()
         .map(|value| {
             // SAFETY: borrow the live JS value during synchronous parsing only.
             let value = unsafe { napi::JsUnknown::from_raw_unchecked(env.raw(), value.raw()) };
-            whisper_vad::stream_options(
-                value,
-                options.vad.is_some(),
-                options.vad_tap.is_some(),
-                options.secondary_output.is_some(),
-            )
+            vad::stream_options(value, options.secondary_output.is_some())
         })
         .transpose()
-        .map_err(|error| whisper_vad::throw_boundary(&env, error))?;
-    let whisper = whisper_options
-        .map(|(params, options, tap)| whisper_integration::WhisperBridge::new(params, options, tap))
+        .map_err(|error| vad::throw_boundary(&env, error))?;
+    let attachment = attachment_options
+        .map(|(params, options, tap)| attachment::VadBridge::new(params, options, tap))
         .transpose()
-        .map_err(|error| whisper_integration::throw_error(&env, error))?;
+        .map_err(|error| attachment::throw_error(&env, error))?;
     let config = build_config(&options).map_err(|error| {
         if options.chunk_ms.is_some_and(|ms| ms != 20.0) {
             boundary::throw_error(
@@ -2474,7 +2122,6 @@ pub fn open_stream(
         }
     })?;
     let output_rate = config.output.sample_rate;
-    let output_channels = config.output.channels;
 
     // Integrated denoise: first validate the public contract's 48kHz requirement (unchanged). Delegate to core
     // if enabled (facade set_denoise; denoise applies to the internal 48k/stereo canonical form).
@@ -2484,37 +2131,15 @@ pub fn open_stream(
     // Parse secondary tap encoding / VAD tap.
     let secondary = match &options.secondary_output {
         Some(s) => Some(SecondaryTapCfg {
-            rate: s.rate,
-            channels: s.channels,
             encoding: parse_sec_encoding(s.encoding.as_deref())?,
         }),
         None => None,
     };
-    let vad_tap = parse_vad_tap(options.vad_tap.as_deref())?;
-    if vad_tap == VadTap::Secondary && secondary.is_none() {
-        return Err(NapiError::new(
-            Status::InvalidArg,
-            "vadTap 'secondary' requires secondaryOutput".to_string(),
-        ));
-    }
-
-    // Integrated VAD: construct when specified (model loading/invalid settings throw here). The internal VAD
-    // rate is the denominator for absolute time calculation. The integrated path defaults maxSpeechMs
-    // to 30s if omitted (standalone Vad keeps silero's faithful 0=unbounded default).
-    let (vad, vad_rate) = match &options.vad {
-        Some(o) => {
-            let cfg = build_integrated_vad_config(o);
-            let rate = cfg.sample_rate;
-            (Some(CoreVad::new(cfg).map_err(vad_err)?), rate)
-        }
-        None => (None, 16_000),
-    };
-
     let mut stream = flexaudio::open(config).map_err(|error| boundary::throw_error(&env, error))?;
     if denoise_enabled {
         stream.set_denoise(true);
     }
-    if whisper.is_some() {
+    if attachment.is_some() {
         stream
             .enable_capture_tap()
             .map_err(|error| boundary::throw_error(&env, error))?;
@@ -2545,16 +2170,10 @@ pub fn open_stream(
         event_callback,
     )?;
     let bridge = PairingBridge {
-        whisper,
+        attachment,
         on_chunk: on_chunk.as_ref().clone(),
         stop_phase,
         report: report.clone(),
-        vad: vad.map(|owner| vad_integration::IntegratedVad::new(owner, vad_rate)),
-        vad_tap,
-        vad_anchor_pts: 0,
-        pending_flush_events: Vec::new(),
-        output_rate,
-        output_channels,
         secondary,
         primary_fifo: VecDeque::new(),
         secondary_fifo: VecDeque::new(),
@@ -2631,7 +2250,7 @@ pub fn watch_devices(
 #[cfg(feature = "test-faults")]
 #[napi]
 #[allow(non_upper_case_globals)]
-pub const __whisperVadTestFaults: bool = true;
+pub const __vadTestFaults: bool = true;
 
 /// Test-only; outside the public API.
 ///
@@ -2643,18 +2262,14 @@ pub const __whisperVadTestFaults: bool = true;
 /// `secondaryEncoding` is 'f32'|'s16', default 'f32'), allowing pairing, s16 quantization, and
 /// `Int16Array` marshaling to be verified without real audio (no actual capture needed).
 ///
-/// Passing `vadThreshold` enables integrated VAD (`vadTap` is 'primary'|'secondary', default
-/// 'primary'), allowing `flushVad`, `vadEvents` `atNs`, and automatic `stop()` flush to be verified
-/// without real audio. Tests construct it with `minSpeechMs=0`, so threshold 0 lets `flushVad`
-/// reliably finalize open utterances (verifies RT finalization even with synthetic waves lacking silence).
-///
-/// `whisperVad` attaches the canonical VAD owner; `onEvent` receives stream notifications
-/// (including `whisperVadFailed`). `whisperVadFailAtChunk` fails the VAD session on that 1-based
-/// capture chunk and `whisperVadResetFailures` fails the next reinitializations, so a
-/// whisper-only failure and its recovery path can be exercised without a model fault or device.
+/// `vad` attaches the canonical VAD owner; `onEvent` receives stream notifications
+/// (including `vadFailed`). `vadFailAtChunk` fails the VAD session on that 1-based
+/// capture chunk and `vadResetFailures` fails the next reinitializations, so a
+/// VAD-only failure and its recovery path can be exercised without a model fault or device.
 ///
 /// JS name is `__openMockStream`. Leading `__` marks it outside the public API. napi's default
 /// conversion drops leading underscores, producing `openMockStream`, so `js_name` fixes the name.
+#[cfg(feature = "test-faults")]
 #[napi(js_name = "__openMockStream")]
 #[allow(clippy::too_many_arguments)]
 pub fn open_mock_stream(
@@ -2669,54 +2284,37 @@ pub fn open_mock_stream(
     secondary_rate: Option<u32>,
     secondary_channels: Option<u16>,
     secondary_encoding: Option<String>,
-    vad_threshold: Option<f64>,
-    vad_tap: Option<String>,
-    whisper_vad: Option<napi::JsUnknown>,
+    vad: Option<napi::JsUnknown>,
     #[napi(ts_arg_type = "((event: JsStreamEvent) => void) | undefined | null")] on_event: Option<
         Function<JsStreamEvent, Unknown>,
     >,
-    whisper_vad_fail_at_chunk: Option<f64>,
-    whisper_vad_reset_failures: Option<f64>,
+    vad_fail_at_chunk: Option<f64>,
+    vad_reset_failures: Option<f64>,
 ) -> napi::Result<FlexStream> {
-    let (fault_chunk, reset_faults) = whisper_integration::validate_fault_options(
-        whisper_vad.is_some(),
-        whisper_vad_fail_at_chunk,
-        whisper_vad_reset_failures,
-    )
-    .map_err(|error| whisper_vad::throw_boundary(&env, error))?;
+    let (fault_chunk, reset_faults) =
+        attachment::validate_fault_options(vad.is_some(), vad_fail_at_chunk, vad_reset_failures)
+            .map_err(|error| vad::throw_boundary(&env, error))?;
     #[cfg(not(feature = "test-faults"))]
     let _ = (fault_chunk, reset_faults);
-    let whisper_options = whisper_vad
-        .map(|value| {
-            whisper_vad::stream_options(
-                value,
-                vad_threshold.is_some(),
-                vad_tap.is_some(),
-                secondary_rate.is_some(),
-            )
-        })
+    let attachment_options = vad
+        .map(|value| vad::stream_options(value, secondary_rate.is_some()))
         .transpose()
-        .map_err(|error| whisper_vad::throw_boundary(&env, error))?;
-    let whisper = whisper_options
-        .map(|(params, options, tap)| whisper_integration::WhisperBridge::new(params, options, tap))
+        .map_err(|error| vad::throw_boundary(&env, error))?;
+    let attachment = attachment_options
+        .map(|(params, options, tap)| attachment::VadBridge::new(params, options, tap))
         .transpose()
-        .map_err(|error| whisper_integration::throw_error(&env, error))?;
+        .map_err(|error| attachment::throw_error(&env, error))?;
     #[cfg(feature = "test-faults")]
-    let mut whisper = whisper;
+    let mut attachment = attachment;
     #[cfg(feature = "test-faults")]
-    if let Some(bridge) = whisper.as_mut() {
+    if let Some(bridge) = attachment.as_mut() {
         bridge.inject_faults(fault_chunk, reset_faults);
     }
     // Secondary tap (only when configured). Validate encoding and build marshaling settings.
     let secondary_cfg = match secondary_rate {
-        Some(rate) => {
-            let ch = secondary_channels.unwrap_or(1);
-            Some(SecondaryTapCfg {
-                rate,
-                channels: ch,
-                encoding: parse_sec_encoding(secondary_encoding.as_deref())?,
-            })
-        }
+        Some(_) => Some(SecondaryTapCfg {
+            encoding: parse_sec_encoding(secondary_encoding.as_deref())?,
+        }),
         None => None,
     };
     let config = StreamConfig {
@@ -2725,37 +2323,12 @@ pub fn open_mock_stream(
             sample_rate,
             channels,
         },
-        secondary_output: secondary_cfg.map(|c| OutputFormat {
-            sample_rate: c.rate,
-            channels: c.channels,
+        secondary_output: secondary_rate.map(|rate| OutputFormat {
+            sample_rate: rate,
+            channels: secondary_channels.unwrap_or(1),
         }),
         ..Default::default()
     };
-    // Integrated VAD (test-only, when `vadThreshold` is specified). Construct with min_speech=0 so
-    // flushVad reliably finalizes even short open utterances. Internal VAD rate is fixed at 16000.
-    let vad_tap = parse_vad_tap(vad_tap.as_deref())?;
-    if vad_tap == VadTap::Secondary && secondary_cfg.is_none() {
-        return Err(NapiError::new(
-            Status::InvalidArg,
-            "vadTap 'secondary' requires a secondary tap".to_string(),
-        ));
-    }
-    let vad = match vad_threshold {
-        Some(thr) => {
-            let cfg = VadConfig {
-                threshold: thr as f32,
-                neg_threshold: Some(thr as f32),
-                min_speech_ms: 0,
-                min_silence_ms: 0,
-                speech_pad_ms: 0,
-                max_speech_ms: 0,
-                sample_rate: 16_000,
-            };
-            Some(CoreVad::new(cfg).map_err(vad_err)?)
-        }
-        None => None,
-    };
-
     let backend = Box::new(flexaudio::MockBackend::new(
         sample_rate,
         channels,
@@ -2763,14 +2336,13 @@ pub fn open_mock_stream(
     ));
     let mut stream = flexaudio::Stream::open(config, backend)
         .map_err(|error| boundary::throw_error(&env, error))?;
-    if whisper.is_some() {
+    if attachment.is_some() {
         stream
             .enable_capture_tap()
             .map_err(|error| boundary::throw_error(&env, error))?;
     }
     start_bridge_stream(&env, &mut stream)?;
-    // The mock path bypasses integrated denoise. VAD runs only when `vadThreshold` is specified (for
-    // verification of flushVad, vadEvents, and pairing paths).
+    // Mock capture exercises the same attachment and delivery paths without audio hardware.
     let stop_phase = Arc::new(Mutex::new(StopPhase::Running));
     let terminal: TerminalError = Arc::new(Mutex::new(None));
     let report: FinalReport = Arc::new(Mutex::new(None));
@@ -2795,16 +2367,10 @@ pub fn open_mock_stream(
         event_callback,
     )?;
     let bridge = PairingBridge {
-        whisper,
+        attachment,
         on_chunk: on_chunk.as_ref().clone(),
         stop_phase,
         report: report.clone(),
-        vad: vad.map(|owner| vad_integration::IntegratedVad::new(owner, 16_000)),
-        vad_tap,
-        vad_anchor_pts: 0,
-        pending_flush_events: Vec::new(),
-        output_rate: sample_rate,
-        output_channels: channels,
         secondary: secondary_cfg,
         primary_fifo: VecDeque::new(),
         secondary_fifo: VecDeque::new(),
@@ -2824,87 +2390,6 @@ pub fn open_mock_stream(
         terminal,
         true,
     )
-}
-
-// ---------------------------------------------------------------------------
-// Standalone addon 1: Vad (small wrapper for streaming silero-VAD)
-// ---------------------------------------------------------------------------
-
-/// Offline VAD handle (silero-VAD on ONNX, embedded model).
-///
-/// Each instance owns one ONNX session. Feed arbitrary-format interleaved f32 (`inputSampleRate` /
-/// `inputChannels`) to [`Vad::process`]; it converts to mono at the VAD rate internally,
-/// detects speech segments, and returns finalized [`JsVadEvent`] values. Use this to classify arbitrary
-/// sample sequences yourself instead of using integrated VAD in `openStream`.
-#[napi]
-pub struct Vad {
-    inner: CoreVad,
-}
-
-#[napi]
-impl Vad {
-    /// Construct VAD from a settings object (load the embedded model). Invalid settings
-    /// (sampleRate other than 8000/16000, threshold outside `[0,1]`, etc.) yield InvalidArg;
-    /// model loading failure yields GenericFailure.
-    #[napi(constructor)]
-    pub fn new(options: VadOptions) -> napi::Result<Self> {
-        let inner = CoreVad::new(build_vad_config(&options)).map_err(vad_err)?;
-        Ok(Vad { inner })
-    }
-
-    /// Process arbitrary-format interleaved f32 and return finalized [`JsVadEvent`] values.
-    ///
-    /// Partial frames carry over internally, so input can be split anywhere. `atSample` uses
-    /// VAD's internal rate (see [`JsVadEvent`]).
-    #[napi]
-    pub fn process(
-        &mut self,
-        samples: Float32Array,
-        input_sample_rate: u32,
-        input_channels: u16,
-    ) -> napi::Result<Vec<JsVadEvent>> {
-        Ok(self
-            .inner
-            .process_pcm(&samples[..], input_sample_rate, input_channels)
-            .map_err(vad_err)?
-            .into_iter()
-            .map(vad_event_to_js)
-            .collect())
-    }
-
-    /// Force-finalize the currently open utterance and return finalized [`JsVadEvent`] values (same behavior
-    /// as reaching input end). Internal state then resets; the next `process` starts with fresh
-    /// context. No model inference runs, making this lightweight and deterministic.
-    ///
-    /// Standalone `Vad` has no pts context, so `atNs` is `undefined` (`atSample` remains the raw cumulative
-    /// position at VAD's internal rate). Returns an empty array when no utterance is open.
-    #[napi]
-    pub fn flush(&mut self, env: Env) -> napi::Result<Vec<JsVadEvent>> {
-        match self.inner.flush() {
-            Ok(events) => Ok(events.into_iter().map(vad_event_to_js).collect()),
-            Err(error) => {
-                let events: Vec<_> = self
-                    .inner
-                    .take_pending_events()
-                    .into_iter()
-                    .map(vad_event_to_js)
-                    .collect();
-                let mut exception = boundary::js_error(&env, &error.audio_error())?;
-                exception.set_named_property("pendingEvents", events)?;
-                env.throw(exception)?;
-                Err(NapiError::new(
-                    Status::PendingException,
-                    "VAD flush failed; drain pendingEvents",
-                ))
-            }
-        }
-    }
-
-    /// Initialize internal state (state / context / state machine / sample position / resampler).
-    #[napi]
-    pub fn reset(&mut self) -> napi::Result<()> {
-        self.inner.reset().map_err(vad_err)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3103,8 +2588,7 @@ mod tests {
             mic_gain: None,
             system_gain: None,
             vad: None,
-            vad_tap: None,
-            whisper_vad: None,
+            silence_probe: None,
             denoise: None,
             secondary_output: None,
         }
@@ -3223,10 +2707,9 @@ mod tests {
             system_device_id: None,
             mic_gain: None,
             system_gain: None,
-            vad: None,
-            vad_tap: None,
             denoise: None,
-            whisper_vad: None,
+            vad: None,
+            silence_probe: None,
             secondary_output: None,
         };
         let cfg = build_config(&opts).unwrap();
@@ -3458,113 +2941,6 @@ mod tests {
         assert!(!js.is_default);
     }
 
-    // --- Integrated options: OpenOptions carries vad/denoise ---
-
-    #[test]
-    fn open_options_carries_vad_and_denoise() {
-        // vad/denoise are interpreted by open_stream, not StreamConfig. Verify build_config passes
-        // unaffected by these options (orthogonal to recording configuration).
-        let mut opts = options_with_kind("mic");
-        opts.denoise = Some(true);
-        opts.vad = Some(VadOptions {
-            threshold: Some(0.4),
-            neg_threshold: None,
-            min_speech_ms: None,
-            min_silence_ms: None,
-            speech_pad_ms: None,
-            max_speech_ms: None,
-            sample_rate: None,
-        });
-        let cfg = build_config(&opts).unwrap();
-        assert_eq!(cfg.kind, SourceKind::Mic);
-        assert_eq!(cfg.output.sample_rate, 48_000);
-    }
-
-    // --- build_vad_config (VadOptions → VadConfig) ---
-
-    /// VadOptions with every field omitted.
-    fn empty_vad_options() -> VadOptions {
-        VadOptions {
-            threshold: None,
-            neg_threshold: None,
-            min_speech_ms: None,
-            min_silence_ms: None,
-            speech_pad_ms: None,
-            max_speech_ms: None,
-            sample_rate: None,
-        }
-    }
-
-    #[test]
-    fn build_vad_config_defaults_match_silero() {
-        let cfg = build_vad_config(&empty_vad_options());
-        let d = VadConfig::default();
-        assert_eq!(cfg.threshold, d.threshold);
-        // Omitted negThreshold stays None (the default formula in VadConfig applies).
-        assert_eq!(cfg.neg_threshold, None);
-        assert_eq!(cfg.min_speech_ms, d.min_speech_ms);
-        assert_eq!(cfg.min_silence_ms, d.min_silence_ms);
-        assert_eq!(cfg.speech_pad_ms, d.speech_pad_ms);
-        assert_eq!(cfg.max_speech_ms, d.max_speech_ms);
-        assert_eq!(cfg.sample_rate, d.sample_rate);
-    }
-
-    #[test]
-    fn build_vad_config_reflects_all_fields() {
-        let opts = VadOptions {
-            threshold: Some(0.7),
-            neg_threshold: Some(0.2),
-            min_speech_ms: Some(120),
-            min_silence_ms: Some(200),
-            speech_pad_ms: Some(40),
-            max_speech_ms: Some(5000),
-            sample_rate: Some(8000),
-        };
-        let cfg = build_vad_config(&opts);
-        assert_eq!(cfg.threshold, 0.7);
-        assert_eq!(cfg.neg_threshold, Some(0.2));
-        assert_eq!(cfg.min_speech_ms, 120);
-        assert_eq!(cfg.min_silence_ms, 200);
-        assert_eq!(cfg.speech_pad_ms, 40);
-        assert_eq!(cfg.max_speech_ms, 5000);
-        assert_eq!(cfg.sample_rate, 8000);
-    }
-
-    // --- build_integrated_vad_config (integrated maxSpeechMs default 30s; addendum 2-3) ---
-
-    #[test]
-    fn integrated_vad_config_defaults_max_speech_to_30s() {
-        // The integrated path supplies 30_000 when maxSpeechMs is omitted (bounds monologues).
-        let cfg = build_integrated_vad_config(&empty_vad_options());
-        assert_eq!(cfg.max_speech_ms, INTEGRATED_VAD_MAX_SPEECH_MS_DEFAULT);
-        assert_eq!(cfg.max_speech_ms, 30_000);
-        // Other fields match build_vad_config (silero defaults).
-        let d = VadConfig::default();
-        assert_eq!(cfg.threshold, d.threshold);
-        assert_eq!(cfg.neg_threshold, None);
-        assert_eq!(cfg.min_speech_ms, d.min_speech_ms);
-        assert_eq!(cfg.min_silence_ms, d.min_silence_ms);
-        assert_eq!(cfg.speech_pad_ms, d.speech_pad_ms);
-        assert_eq!(cfg.sample_rate, d.sample_rate);
-    }
-
-    #[test]
-    fn integrated_vad_config_respects_explicit_max_speech() {
-        // Explicit values are respected.
-        let mut o = empty_vad_options();
-        o.max_speech_ms = Some(5_000);
-        assert_eq!(build_integrated_vad_config(&o).max_speech_ms, 5_000);
-        // Explicit 0 (unbounded) restores silero's default (explicit values override default replacement).
-        o.max_speech_ms = Some(0);
-        assert_eq!(build_integrated_vad_config(&o).max_speech_ms, 0);
-    }
-
-    #[test]
-    fn standalone_vad_config_keeps_silero_max_speech() {
-        // Standalone Vad (build_vad_config) stays faithful to silero: default 0 (unbounded).
-        assert_eq!(build_vad_config(&empty_vad_options()).max_speech_ms, 0);
-    }
-
     // --- check_denoise_rate (denoise's 48kHz requirement) ---
 
     #[test]
@@ -3592,36 +2968,6 @@ mod tests {
         // encode: encoder internals yield GenericFailure.
         let e = encode_err(EncodeError::Encoder("boom".to_string()).into());
         assert_eq!(e.status, Status::GenericFailure);
-        // vad: invalid settings yield InvalidArg.
-        let e = vad_err(VadError::InvalidConfig("nope".to_string()));
-        assert_eq!(e.status, Status::InvalidArg);
-        // vad: model loading failure yields GenericFailure.
-        let e = vad_err(VadError::ModelLoad("x".to_string()));
-        assert_eq!(e.status, Status::GenericFailure);
-    }
-
-    // --- vad_event_to_js (kind strings, atSample) ---
-
-    #[test]
-    fn vad_event_to_js_maps_variants() {
-        let start = vad_event_to_js(VadEvent::SpeechStart { at_sample: 512 });
-        assert_eq!(start.kind, "speechStart");
-        assert_eq!(start.at_sample.get_u64(), (false, 512, true));
-        // Standalone path (no absolute time context): atNs = undefined.
-        assert_eq!(start.at_ns, None);
-        let end = vad_event_to_js(VadEvent::SpeechEnd { at_sample: 4096 });
-        assert_eq!(end.kind, "speechEnd");
-        assert_eq!(end.at_sample.get_u64(), (false, 4096, true));
-        assert_eq!(end.at_ns, None);
-    }
-
-    #[test]
-    fn vad_event_to_js_abs_carries_recording_time() {
-        // Integrated path carries absolute atNs from recording zero (atSample remains the raw internal-rate position).
-        let ev = vad_event_to_js_abs(VadEvent::SpeechEnd { at_sample: 8000 }, Some(1_500_000_000));
-        assert_eq!(ev.kind, "speechEnd");
-        assert_eq!(ev.at_sample.get_u64(), (false, 8000, true));
-        assert_eq!(ev.at_ns, Some(1_500_000_000));
     }
 }
 
@@ -3630,23 +2976,7 @@ mod reproduction_tests {
     use super::*;
 
     #[test]
-    fn vad_at_sample_bigint_preserves_u64() {
-        for count in [9_007_199_254_740_993, 9_223_372_036_854_775_808, u64::MAX] {
-            for event in [
-                VadEvent::SpeechStart { at_sample: count },
-                VadEvent::SpeechEnd { at_sample: count },
-            ] {
-                for pts in [None, Some(1_500_000_000)] {
-                    let event = vad_event_to_js_abs(event, pts);
-                    assert_eq!(event.at_sample.get_u64(), (false, count, true));
-                    assert_eq!(event.at_ns, pts);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn repro_p9_error_kind() {
+    fn binding_contract_error_kind() {
         let missing = to_napi_err(flexaudio::Error::DeviceNotFound);
         let lost = to_napi_err(flexaudio::Error::DeviceLost);
         assert_eq!(missing.status, Status::GenericFailure);
@@ -3659,20 +2989,20 @@ mod reproduction_tests {
     }
 
     #[test]
-    fn repro_p9_invalid_arg_kind() {
+    fn binding_contract_invalid_arg_kind() {
         let mapped = to_napi_err(flexaudio::Error::InvalidArg("invalid rate".into()));
         assert_eq!(mapped.status, Status::InvalidArg);
     }
 
     #[test]
-    fn repro_p9_error_control() {
+    fn binding_contract_error_control() {
         let mapped = to_napi_err(flexaudio::Error::Backend("control cause".into()));
         assert_eq!(mapped.status, Status::GenericFailure);
         assert!(mapped.reason.contains("control cause"));
     }
 
     #[test]
-    fn repro_p9_counter_cast() {
+    fn binding_contract_counter_cast() {
         let event = event_to_js(Event::ChunkDropped { count: u64::MAX });
         assert!(
             event.count.as_ref().unwrap().get_u64() == (false, u64::MAX, true),
@@ -3680,7 +3010,7 @@ mod reproduction_tests {
         );
     }
     #[test]
-    fn repro_p9_counter_control() {
+    fn binding_contract_counter_control() {
         assert_eq!(
             event_to_js(Event::ChunkDropped { count: 7 })
                 .count
@@ -3691,7 +3021,7 @@ mod reproduction_tests {
     }
 
     #[test]
-    fn repro_p9_event_union() {
+    fn binding_contract_event_union() {
         // A widening to arbitrary strings prevents exhaustive checking of the public event contract.
         let declarations = include_str!("../index.d.ts");
         let stream = declarations
@@ -3711,7 +3041,6 @@ mod reproduction_tests {
             "recovered",
             "permissionDenied",
             "permissionPending",
-            "permissionGranted",
             "silenceWhileSourceActive",
             "deviceLost",
             "error",
@@ -3721,7 +3050,7 @@ mod reproduction_tests {
             "audioLoss",
             "clipped",
             "unknown",
-            "whisperVadFailed",
+            "vadFailed",
         ] {
             assert!(stream.contains(&format!("type: '{tag}'")), "missing {tag}");
         }
@@ -3731,13 +3060,13 @@ mod reproduction_tests {
         }
         assert!(stream.contains("type: 'audioLoss'; loss: AudioLoss"));
         assert!(
-            stream.contains("type: 'whisperVadFailed'; error: AudioError; epoch: number"),
-            "a whisper failure must carry its typed error and failed epoch"
+            stream.contains("type: 'vadFailed'; error: AudioError; epoch: number"),
+            "an attached VAD failure must carry its typed error and failed epoch"
         );
     }
 
     #[test]
-    fn repro_p9_device_event_union() {
+    fn binding_contract_device_event_union() {
         let declarations = include_str!("../index.d.ts");
         let device = declarations
             .split("export type JsDeviceEvent =")
@@ -3763,24 +3092,10 @@ mod reproduction_tests {
         assert!(device.contains("type: 'rescanRequired'; droppedEvents: bigint"));
         assert!(device.contains("type: 'defaultCleared'; sourceKind: 'mic' | 'system'"));
     }
-
-    #[test]
-    fn repro_p9_event_union_control() {
-        let declarations = include_str!("../index.d.ts");
-        let vad = declarations
-            .split("export interface JsVadEvent {")
-            .nth(1)
-            .unwrap()
-            .split('}')
-            .next()
-            .unwrap();
-        assert!(!vad.contains("type: string"));
-        assert!(vad.contains("speechStart"));
-    }
 }
 
-// Build the test addon with cargo rustc --lib -- --cfg test --cfg flexaudio_repro_addon.
-#[cfg(all(flexaudio_repro_addon, feature = "test-faults"))]
+// Build the test addon with cargo rustc --example capture_test_addon --features test-faults -- --cfg flexaudio_test_addon.
+#[cfg(all(flexaudio_test_addon, feature = "test-faults"))]
 mod reproduction_bridge;
 
 #[cfg(test)]

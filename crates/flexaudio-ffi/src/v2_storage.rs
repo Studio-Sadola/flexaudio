@@ -71,7 +71,7 @@ impl Context {
 pub struct FlexErrorInfoV2 {
     pub(crate) root: Error,
     pub(crate) message: CString,
-    pub(crate) whisper_code: Option<CString>,
+    pub(crate) vad_code: Option<CString>,
     pub(crate) addon_kind: Option<CString>,
     pub(crate) addon_message: Option<CString>,
     pub(crate) diagnostic_details: Vec<CString>,
@@ -114,7 +114,7 @@ impl FlexErrorInfoV2 {
                 .collect(),
             root: error.root().clone(),
             message: cstring(error.to_string()),
-            whisper_code: error.whisper_code().map(|code| cstring(code.as_str())),
+            vad_code: error.vad_code().map(|code| cstring(code.as_str())),
             contexts,
             secondary,
         }
@@ -182,10 +182,6 @@ impl FlexEventV2 {
                 out.kind = 8;
                 out.permission = Some(permission(p));
                 out.message = Some(cstring(p.guidance()));
-            }
-            Event::PermissionGranted => {
-                out.kind = FLEX_EVENT_KIND_PERMISSION_GRANTED;
-                out.permission = Some(1);
             }
             Event::AudioLoss { loss } => {
                 out.kind = FLEX_EVENT_KIND_AUDIO_LOSS;

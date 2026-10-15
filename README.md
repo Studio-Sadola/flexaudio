@@ -1,6 +1,10 @@
 # flexaudio
 
-Rust migration to 0.5: `AudioChunk` and `SecondaryChunk` struct literals must
+Version 0.6.0 replaces the two earlier VAD APIs with one generic `Vad`.
+See the [0.6.0 migration table](CHANGELOG.md#060---2026-10-15).
+The 0.5.x series is deprecated.
+
+Rust capture migration from 0.4: `AudioChunk` and `SecondaryChunk` struct literals must
 include the new public `frame_index: u64` field. It is the first frame's index
 on the tap's canonical 48 kHz timeline, continues across reopen, and exposes
 queue drops as gaps. Set it from the producing timeline when constructing
@@ -53,9 +57,9 @@ Three capture sources × three operating systems. ✅ = implemented and verified
   `Error::Unsupported`.
 - Per-process capture requires a `target_pid` in `StreamConfig`.
 - `SourceKind::Mix` combines microphone and system capture on all three platforms.
-- **0.5 VAD:** `WhisperVad` adds whisper.cpp-compatible postprocessing and an
-  attached capture tap alongside the existing `Vad`, in Rust, Node.js, Python
-  and C. Both use an embedded model and run offline.
+- **0.6 VAD:** one generic `Vad` provides streaming segmentation, frame
+  probabilities, provisional hints and an attached capture tap in Rust, Node.js,
+  Python and C. Its embedded Silero model runs offline.
 - **Typed diagnostics:** inspect loss, clipping, permission and recoverable/fatal
   events, plus retained capture and cleanup failures.
 
@@ -65,19 +69,19 @@ Three capture sources × three operating systems. ✅ = implemented and verified
 
 ```toml
 [dependencies]
-flexaudio = "0.5"
+flexaudio = "0.6"
 ```
 
 or:
 
 ```sh
-cargo add flexaudio@0.5
+cargo add flexaudio@0.6
 ```
 
 The Voice Activity Detection add-on is a separate crate:
 
 ```sh
-cargo add flexaudio-vad@0.5
+cargo add flexaudio-vad@0.6
 ```
 
 ---
@@ -159,22 +163,53 @@ The facade crate `flexaudio` re-exports everything you need:
   `DeviceEvent`, `DefaultDeviceKind`, `Event`, `Permission`, `Error`, `ErrorKind`,
   `ErrorContext`, `AddonErrorKind`, `AudioLoss`, `ShutdownReport`, `Result`.
 
-Voice activity detection (`flexaudio-vad`): `Vad::new` / `Vad::process` for
-streaming `SpeechStart` / `SpeechEnd` events, and `get_speech_timestamps` for
-batch segmentation. The Silero VAD model is embedded in the binary, so VAD runs
-fully offline with no runtime model file or network access. In 0.5,
-`WhisperVad` / `WhisperVadPostProcessor` / `whisper_speech_segments` add
-postprocessing ported from whisper.cpp: final millisecond segments on a 10 ms
-grid, optional provisional speech/cut events, and padded final-frame inference.
-Compatibility concerns the pinned postprocessing algorithm; different model
-versions need not produce identical probabilities. `WhisperVadTap` attaches to
-canonical capture with epoch clock anchors and flush/stop closure delivery.
-A capture index gap, PTS reanchor or discontinuity closes the intact prefix and re-anchors the
-next accepted frame in a fresh epoch; missing audio never becomes padding. A VAD
-session failure latches the tap until the next discontinuity or a successful
-flush reinitializes it, and is a failure of that session only: capture and PCM
-delivery continue, and the affected epoch closes once with its typed error
-terminal. Legacy VAD and WhisperVad are mutually exclusive on a stream.
+Voice activity detection (`flexaudio-vad`) uses one `Vad` engine for standalone
+and attached processing. `VadPostProcessor` and `speech_segments` expose the same
+segmentation independently of capture. The embedded Silero v6 model runs fully
+offline. Segmentation is ported from whisper.cpp `85a69493`; final segment endpoints
+are integer milliseconds on its 10 ms grid. Compatibility covers postprocessing
+for identical frame probabilities, rather than probabilities from different models.
+
+```rust
+use flexaudio_vad::{Vad, VadOptions, VadRuntimeOptions};
+
+let mut vad = Vad::new(VadOptions::default(), VadRuntimeOptions::default())?;
+let events = vad.process(&vec![0.0; 16_000])?; // Default: 16 kHz mono.
+let final_events = vad.finish()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`VadOptions` defaults are `threshold: 0.5`, `min_speech_ms: 250`,
+`min_silence_ms: 100`, `speech_pad_ms: 30`, and `max_speech_ms: 0` (unbounded).
+`VadRuntimeOptions.provisional` defaults to false. Attached and standalone use the
+same defaults; applications explicitly select their own duration caps.
+
+`maxSpeechMs` (`max_speech_ms`) is an integer number of milliseconds. A nonzero
+value uses the exact split budget `16 * maxSpeechMs - 512 - 32 * speechPadMs`
+in 16 kHz samples, including for subsecond values: 900 ms is 900 ms, with no
+seconds truncation. Nonpositive budgets are rejected with `InvalidParameter`.
+Segmentation can merge neighboring splits, so this is not a strict bound on final
+segment duration or delivery latency. Omitted values and zero are unbounded.
+
+Standalone Node.js `process(samples, inputSampleRate?, inputChannels?)` defaults
+to 16000 Hz and one channel. Python uses `input_sample_rate` and `input_channels`
+with the same defaults. Rust uses `process_pcm(samples,
+input_sample_rate, input_channels)` for converted input and `process(samples)` for
+16 kHz mono. Accepted input formats are converted internally; event times remain
+milliseconds on the input timeline, with converter group delay compensated.
+Finite resampler overshoot is clipped internally to normalized PCM; raw input must
+remain finite and within [-1, 1]. Golden equality applies to 16 kHz mono input.
+
+`VadTap` attaches to canonical capture with `epochStart` anchors (`captureSample`
+and `ptsNs`), final `segment` events, optional `provisionalSpeechStart`,
+`provisionalSpeechEnd`, and `provisionalCut` hints, and `epochEnd` closure.
+`StreamVadOptions` configures the attachment; Node.js uses `OpenOptions.vad`.
+Flush/stop delivers closure events. Capture index gaps and discontinuities close
+the intact prefix and anchor the next accepted frame in a new epoch; missing audio
+never becomes padding. A VAD session failure latches that tap until a discontinuity
+or successful flush resets it. Capture and PCM delivery continue; the affected
+epoch closes once with a typed error. Capture chunks remain fixed at 20 ms because
+the canonical 960-frame capture blocks and converter phase alignment depend on it.
 
 ---
 
@@ -239,17 +274,17 @@ Neither index is an offset into concatenated delivered PCM: pause and queue drop
 advance indices without delivering samples.
 
 An arrival gap without reopen emits no event or `DISCONTINUITY`: `frameIndex`
-remains contiguous, only primary `ptsNs` jumps, and attached WhisperVad keeps its
+remains contiguous, only primary `ptsNs` jumps, and attached Vad keeps its
 epoch open. A stall (at least 2 s without consumed samples, checked every 250 ms)
 emits `stalled` and attempts to reopen. Each failed reopen attempt emits
 `recoverableError` and backs off from 250 ms to 5 s. After a successful reopen,
 `recovered` is emitted when new PCM arrives. The first new-generation primary data chunk has
-`RECOVERED|DISCONTINUITY`; WhisperVad closes with `epochEnd(finish)` and starts a
+`RECOVERED|DISCONTINUITY`; Vad closes with `epochEnd(finish)` and starts a
 new epoch when new PCM arrives. Downtime does not become frames. These three
 advisories are unordered relative to `onChunk` and epoch events.
-Attached WhisperVad epochs strictly increase within a stream (checked epoch + 1
+Attached Vad epochs strictly increase within a stream (checked epoch + 1
 on rebuild); each new `openStream` starts at 0 and `(epoch, seq)` is unique per
-stream. In Node.js, `epochEnd(error)` precedes `whisperVadFailed`.
+stream. In Node.js, `epochEnd(error)` precedes `vadFailed`.
 Every successful `switchSource` creates a generation with `DISCONTINUITY`, with
 the epoch transition deferred until new PCM. The synchronous call does not invoke
 `onChunk` re-entrantly; return means the backend was replaced, not that data was
@@ -270,19 +305,14 @@ it may contain private host data and should not be logged automatically.
 inference, invalid configuration/format, resampling/reset and FLAC I/O,
 unsupported input or encoder failure. Bindings expose `addonKind`/`addonMessage`
 (Python: `addon_kind`/`addon_message`; C v2: addon kind/message accessors).
-Later terminal failures, combined flush/reset failures, VAD tails and Whisper VAD
+Later terminal failures, combined flush/reset failures, VAD tails and VAD
 model/conversion causes remain ordered related errors rather than replacing the
-primary. Additive Rust `VadError::Multiple`, `WhisperVadError::Cause` and
-`WhisperVadTapError::Cause` arms retain those typed causes.
+primary. Rust `InferenceError::Multiple`, `VadError::Cause` and
+`VadTapError::Cause` arms retain those typed causes.
 
-Legacy VAD rejects format changes while converted input is pending; drain or reset
-explicitly before changing the format. Completed speech events survive a failed reset
-and are drained once with `Vad::take_pending_events()`. Python standalone flush
-exceptions carry `pending_events`, Node.js flush exceptions carry `pendingEvents`,
-and C flush can return a negative error with populated event output that must still
-be freed. Attached source switches close the old speech epoch through the shared gap
-lifecycle before replacing addons. Event-only secondary Node.js carriers preserve
-observed sequence, frame index and drop counters.
+VAD failures preserve typed model, converter and session causes. Attached source
+switches close the old epoch through the shared gap lifecycle before replacing
+the attachment. Event-only carriers deliver closure without inventing PCM.
 
 An inconclusive macOS self-probe preserves its native reason and emits an existing
 `RecoverableError` alongside the silence advisory; capture remains usable.
@@ -312,7 +342,7 @@ a safe explanation. Handle `AudioLoss`, `Clipped`, `RecoverableError`,
 subsequent output `DISCONTINUITY`; `PADDED=8` and `CLIPPED=16` describe output
 integrity. Peak/RMS reflect delivered samples after denoise/gain in every binding.
 
-For Node.js, use bigint arithmetic for u64 counters (including VAD `atSample`,
+For Node.js, use bigint arithmetic for u64 counters (including VAD `seq`,
 chunk-drop and loss counts); PTS stays number. Chunk interfaces require
 `frameIndex`, and event types are closed discriminated unions. Lifecycle getters
 `terminalError()` / `shutdownReport()` return `undefined` when absent. Callback
@@ -377,7 +407,7 @@ affected microphone generation (native frame count), including in Mix. Node.js
 uses `startupSamplesDropped` with bigint `frames` and `reason: 'outOfRange'`;
 Python uses the same tag and integer count. C v2 exposes event kind 15 and typed
 frame/reason accessors; the CLI prints a safe warning. The startup notice precedes
-that generation's first Node.js `onChunk` callback and attached Whisper VAD
+that generation's first Node.js `onChunk` callback and attached VAD
 `epochStart`. Provide `onEvent` to receive the Node.js notice. Recovered and other
 advisories use independent callbacks and may arrive before or after the startup
 notice; this ordering guarantee covers only startup notice versus affected PCM.
@@ -531,9 +561,9 @@ for Mix), and suppresses further audio and automatic reopening. Create a new
 stream after correcting permission; `start`, `resume`, and `switch_source` on a
 terminally failed stream return its stored error.
 
-Built-in backends currently emit neither `PermissionPending` nor
-`PermissionGranted`, for any capture source on any OS. Their event arms remain
-available for custom Rust backends and compatibility. A macOS authorization-query
+Built-in backends do not emit `PermissionPending`; that event remains available
+for custom Rust backends. `PermissionGranted` is removed in 0.6.0; its C event
+number is reserved. A macOS authorization-query
 failure returns a typed backend error before capture starts; it does not invent
 a permission denial. A microphone configuration that
 differs from its advertised native format is rejected before capture builds with
@@ -600,6 +630,10 @@ permission events keep type `permissionDenied` and add `permission`
   event and terminal-error APIs retain the cause and privacy-setting remedy.
   The diagnostic signal can appear in your recording if your capture includes
   our own process (for example, system capture with `excludeSelf: false`).
+- The probe is enabled by default. Set Rust `StreamConfig.silence_probe: false`,
+  Node.js `silenceProbe: false`, Python `silence_probe=False`, or the C open option
+  to disable diagnostic signal playback. This opt-out applies to system,
+  per-process and the system lane of Mix capture; microphone consent is unchanged.
 - If the self-probe cannot establish either outcome (for example, setup failure,
   missing render/capture callbacks, or timeout), flexaudio emits
   `Event::SilenceWhileSourceActive { detail }` once for that generation
@@ -657,7 +691,7 @@ The workspace pins MSRV via `rust-version` in each crate.
 flexaudio follows [Semantic Versioning](https://semver.org/). While the crate is
 in the **0.x** series, the public API is **not yet stable**: per SemVer, a bump
 of the **minor** version (`0.2 → 0.3`) may contain breaking changes, while
-**patch** bumps (`0.2.0 → 0.2.1`) are backward-compatible. Pin to `0.5` to opt
+**patch** bumps (`0.2.0 → 0.2.1`) are backward-compatible. Pin to `0.6` to opt
 into compatible updates only. See [`CHANGELOG.md`](CHANGELOG.md).
 
 ---

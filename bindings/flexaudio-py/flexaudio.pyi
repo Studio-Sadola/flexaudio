@@ -20,15 +20,15 @@ exception; FlacEncoder propagates finalization errors only on normal exit.
 """
 
 from os import PathLike
-from typing import List, Literal, Optional, Protocol, Sequence, Tuple, TypedDict, Union
+from typing import List, Literal, Optional, Sequence, Tuple, TypedDict, Union
 
 StreamEventType = Literal["startupSamplesDropped",
     "chunkDropped", "stalled", "recovered", "permissionDenied", "permissionPending",
     "silenceWhileSourceActive", "deviceLost", "error", "terminalError",
-    "recoverableError", "shutdownError", "audioLoss", "clipped", "permissionGranted", "unknown"
+    "recoverableError", "shutdownError", "audioLoss", "clipped", "unknown"
 ]
 RecordingPermission = Literal["microphone", "systemAudio"]
-WhisperCode = Literal["InvalidParameter", "InvalidProbability", "InvalidPcm", "Overflow", "SessionFinished", "Inference", "ModelLoad", "FailedSession", "InvalidStereoLength", "CaptureSampleOverflow", "PtsOutOfRange", "UnsupportedConversionClock", "Conversion", "Stopped"]
+VadErrorCode = Literal["InvalidParameter", "InvalidProbability", "InvalidPcm", "Overflow", "SessionFinished", "Inference", "ModelLoad", "FailedSession", "InvalidStereoLength", "CaptureSampleOverflow", "PtsOutOfRange", "UnsupportedConversionClock", "Conversion", "Stopped"]
 
 MixLane = Literal["microphone", "systemAudio"]
 
@@ -72,7 +72,7 @@ class DeviceLostErrorDict(_AudioErrorFields):
 class _BackendErrorRequiredFields(_AudioErrorFields):
     kind: Literal["backend"]
 class BackendErrorDict(_BackendErrorRequiredFields, total=False):
-    whisper_code: WhisperCode
+    vad_code: VadErrorCode
 class UnsupportedFormatErrorDict(_AudioErrorFields):
     kind: Literal["unsupportedFormat"]
 class NativeFormatChangedErrorDict(_AudioErrorFields):
@@ -111,7 +111,7 @@ class AudioError:
     @property
     def permission(self) -> Optional[RecordingPermission]: ...
     @property
-    def whisper_code(self) -> Optional[WhisperCode]: ...
+    def vad_code(self) -> Optional[VadErrorCode]: ...
     @property
     def advertised(self) -> Optional[NativeFormat]: ...
     @property
@@ -216,9 +216,7 @@ class PermissionPendingEventDict(TypedDict):
     type: Literal["permissionPending"]
     permission: RecordingPermission
     message: str
-class PermissionGrantedEventDict(TypedDict):
-    type: Literal["permissionGranted"]
-    permission: Literal["microphone"]
+
 class SilenceWhileSourceActiveEventDict(TypedDict):
     type: Literal["silenceWhileSourceActive"]
     message: str
@@ -249,7 +247,7 @@ class StartupSamplesDroppedEventDict(TypedDict):
     frames: int
     reason: Literal["outOfRange"]
 
-StreamEventDict = Union[StartupSamplesDroppedEventDict, ChunkDroppedEventDict, StalledEventDict, RecoveredEventDict, PermissionDeniedEventDict, PermissionPendingEventDict, PermissionGrantedEventDict, SilenceWhileSourceActiveEventDict, DeviceLostEventDict, LegacyErrorEventDict, TerminalErrorEventDict, RecoverableErrorEventDict, ShutdownErrorEventDict, AudioLossEventDict, ClippedEventDict, UnknownEventDict]
+StreamEventDict = Union[StartupSamplesDroppedEventDict, ChunkDroppedEventDict, StalledEventDict, RecoveredEventDict, PermissionDeniedEventDict, PermissionPendingEventDict, SilenceWhileSourceActiveEventDict, DeviceLostEventDict, LegacyErrorEventDict, TerminalErrorEventDict, RecoverableErrorEventDict, ShutdownErrorEventDict, AudioLossEventDict, ClippedEventDict, UnknownEventDict]
 
 class DeviceInfoDict(TypedDict):
     """Unknown display names are empty. Windows/macOS use native IDs if names are unreadable.
@@ -289,21 +287,6 @@ class DeviceTerminalErrorDict(TypedDict):
     type: Literal["terminalError"]
     error: AudioErrorDict
 DeviceEventDict = Union[DeviceTerminalErrorDict, DeviceAddedEventDict, DeviceRemovedEventDict, DefaultChangedEventDict, DefaultClearedEventDict, RescanRequiredEventDict, UnknownEventDict]
-
-# Structural fields on a typed exception raised specifically by standalone Vad.flush.
-# This typing helper does not represent an instantiable native class.
-class _VadFlushErrorFields(Protocol):
-    audio_error: AudioError
-    pending_events: List["VadEvent"]
-
-class VadSettings(TypedDict, total=False):
-    threshold: float
-    neg_threshold: Optional[float]
-    min_speech_ms: int
-    min_silence_ms: int
-    speech_pad_ms: int
-    max_speech_ms: int
-    sample_rate: int
 
 class DeviceInfo:
     """Unreadable mandatory formats use sample_rate=0, channels=0, format_available=False.
@@ -351,13 +334,6 @@ class ProcessInfo:
     @property
     def is_output_active(self) -> Optional[bool]: ...
 
-class VadEvent:
-    def __repr__(self) -> str: ...
-    @property
-    def type(self) -> str: ...
-    @property
-    def at_sample(self) -> int: ...
-
 class AudioChunk:
     """pts_ns is an arrival-time label re-anchored on every native callback.
 
@@ -371,9 +347,7 @@ class AudioChunk:
     @property
     def data(self) -> bytes: ...
     @property
-    def vad_events(self) -> List[VadEvent]: ...
-    @property
-    def whisper_vad_events(self) -> Optional[List[AttachedWhisperVadEvent]]: ...
+    def vad_events(self) -> Optional[List[AttachedVadEvent]]: ...
     @property
     def frames(self) -> int: ...
     @property
@@ -392,10 +366,8 @@ class AudioChunk:
 class StreamEvent:
     """Stream notification; silenceWhileSourceActive is advisory.
 
-    Built-in backends emit neither permissionPending nor permissionGranted on any
-    OS or capture source. Their event arms remain for custom Rust backends and
-    compatibility. A custom permissionPending is advisory; a custom
-    permissionGranted can report late microphone consent. permissionDenied is terminal
+    permissionPending is advisory and remains available for custom Rust backends.
+    Built-in sources do not emit it. permissionDenied is terminal
     and carries permission and a cause/remedy message. silenceWhileSourceActive
     means the system-audio diagnosis is inconclusive; capture continues because
     missing permission and genuine digital silence remain possible. error carries
@@ -405,11 +377,11 @@ class StreamEvent:
     generation's first chunk. Event-first callers drain the ordinary FIFO event
     queue before PCM to observe the notice first. PCM polling does not wait for event polling.
     Arrival gaps without reopen emit no event/DISCONTINUITY: frame_index stays
-    contiguous, only primary pts_ns jumps, and attached WhisperVad keeps its epoch open.
+    contiguous, only primary pts_ns jumps, and attached Vad keeps its epoch open.
     Stall: >=2 s without consumed samples, checked every 250 ms; stalled, reopen,
     each failed reopen attempt emits recoverableError and backs off 250 ms..5 s.
     On success, recovered is emitted when new PCM arrives. First new-generation primary
-    data has RECOVERED|DISCONTINUITY. WhisperVad epoch_end(finish) and a new epoch_start
+    data has RECOVERED|DISCONTINUITY. Vad epoch_end(finish) and a new epoch_start
     wait for new PCM. Downtime does not become frames. These advisories are unordered
     relative to PCM and epoch events.
     macOS microphone capture requires decided consent before each start; it does
@@ -463,7 +435,7 @@ class Stream:
         """Stop once and retain the outcome; open a new stream to capture again."""
         ...
     def shutdown_report(self) -> Optional[ShutdownReport]: ...
-    def flush_whisper_vad(self) -> None: ...
+    def flush_vad(self) -> None: ...
     def pause(self) -> None: ...
     def resume(self) -> None: ...
     def is_paused(self) -> bool: ...
@@ -472,20 +444,7 @@ class Stream:
     def native_format(self) -> Tuple[int, int]: ...
     def dropped_chunks(self) -> int: ...
     def poll_chunk(self) -> Optional[AudioChunk]:
-        """Poll PCM and finalized VAD boundary pairs (start and end together).
-
-        PCM polling does not wait for event polling. Event-first callers can
-        drain poll_event before PCM to observe startup notices already enqueued
-        before the affected generation's first chunk was published.
-
-        On DISCONTINUITY (flags & 1), flushed pre-gap events come first and
-        retain the old at_sample clock. Fixed 20 ms chunks cannot complete a
-        fresh 32 ms VAD frame: every event on that chunk is pre-gap, and events
-        on later chunks use the new clock, restarted at zero. A timestamp
-        decrease is not a reliable timeline marker. Flush errors still reset
-        VAD and denoise before being raised; that poll consumes the chunk.
-        After a successful reset, later polls do not repeat the flush error.
-        """
+        """Switch sources while retaining attached VAD epoch closure and capture anchors."""
         ...
     def poll_event(self) -> Optional[StreamEvent]:
         """Poll the ordinary FIFO event queue; PCM polling remains independent.
@@ -508,7 +467,7 @@ class Stream:
         output_channels: int = 2, chunk_ms: int = 20, gain: float = 1.0,
         mic_device_id: Optional[str] = None, system_device_id: Optional[str] = None,
         mic_gain: float = 1.0, system_gain: float = 1.0,
-        vad: Optional[VadSettings] = None, denoise: bool = False
+        denoise: bool = False, silence_probe: bool = True
     ) -> None:
         """Every successful switch creates a generation with DISCONTINUITY; epoch
         transition waits for new PCM. Return means backend replaced, not delivered.
@@ -518,36 +477,26 @@ class Stream:
     def __enter__(self) -> Stream: ...
     def __exit__(self, _exc_type: Optional[object], _exc_value: Optional[object], _traceback: Optional[object]) -> bool: ...
 
-class Vad:
-    def __init__(self, threshold: float = 0.5, min_speech_ms: int = 250,
-                 min_silence_ms: int = 100, speech_pad_ms: int = 30,
-                 max_speech_ms: int = 0, sample_rate: int = 16000,
-                 neg_threshold: Optional[float] = None) -> None: ...
-    def process(self, samples: Sequence[float], input_sample_rate: int, input_channels: int) -> List[VadEvent]: ...
-    def flush(self) -> List[VadEvent]: ...
-    def reset(self) -> None: ...
+VadCloseReason = Literal["hysteresis", "finish", "reset", "error"]
+VadCutReason = Literal["limit", "hysteresis", "finish", "reset", "error"]
 
-
-WhisperCloseReason = Literal["hysteresis", "finish", "reset", "error"]
-WhisperCutReason = Literal["limit", "hysteresis", "finish", "reset", "error"]
-
-class WhisperVadParams:
+class VadOptions:
     def __init__(self, *, threshold: float = 0.5,
-                 min_speech_duration_ms: int = 250, min_silence_duration_ms: int = 100,
-                 max_speech_duration_s: float = 3.4028234663852886e38,
+                 min_speech_ms: int = 250, min_silence_ms: int = 100,
+                 max_speech_ms: int = 0,
                  speech_pad_ms: int = 30) -> None: ...
     @property
     def threshold(self) -> float: ...
     @property
-    def min_speech_duration_ms(self) -> int: ...
+    def min_speech_ms(self) -> int: ...
     @property
-    def min_silence_duration_ms(self) -> int: ...
+    def min_silence_ms(self) -> int: ...
     @property
-    def max_speech_duration_s(self) -> float: ...
+    def max_speech_ms(self) -> int: ...
     @property
     def speech_pad_ms(self) -> int: ...
 
-class WhisperSpeechSegment:
+class SpeechSegment:
     @property
     def start_ms(self) -> int: ...
     @property
@@ -591,7 +540,7 @@ class ProvisionalSpeechEndEvent:
     @property
     def at_ms(self) -> int: ...
     @property
-    def reason(self) -> WhisperCloseReason: ...
+    def reason(self) -> VadCloseReason: ...
 
 class ProvisionalCutEvent:
     @property
@@ -605,7 +554,7 @@ class ProvisionalCutEvent:
     @property
     def end_ms(self) -> int: ...
     @property
-    def reason(self) -> WhisperCutReason: ...
+    def reason(self) -> VadCutReason: ...
 
 class EpochEndEvent:
     @property
@@ -638,52 +587,56 @@ class EpochStartEvent:
     @property
     def pts_ns(self) -> int: ...
 
-WhisperVadEvent = Union[SegmentEvent, ProvisionalSpeechStartEvent,
+VadEvent = Union[SegmentEvent, ProvisionalSpeechStartEvent,
                         ProvisionalSpeechEndEvent, ProvisionalCutEvent, EpochEndEvent]
-AttachedWhisperVadEvent = Union[WhisperVadEvent, EpochStartEvent]
+AttachedVadEvent = Union[VadEvent, EpochStartEvent]
 
-class WhisperVadValidationError(ValueError):
+class VadValidationError(ValueError):
     audio_error: AudioError
     code: str
-    terminal_events: List[WhisperVadEvent]
+    terminal_events: List[VadEvent]
 
-class WhisperVadRuntimeError(RuntimeError):
+class VadRuntimeError(RuntimeError):
     audio_error: AudioError
     code: str
-    terminal_events: List[WhisperVadEvent]
+    terminal_events: List[VadEvent]
 
-class WhisperVad:
+class Vad:
     """Accepts float sequences or contiguous 1-D native float32 buffers.
 
+    Input defaults to mono16k. Other positive rates/channel counts are converted internally;
+    event milliseconds use the input timeline with converter group delay compensated.
+    After raw input validation, finite resampler overshoot is clipped internally to [-1, 1].
+    max_speech_ms=0 means unbounded; other values must exceed 32+2*speech_pad_ms.
     Buffer input is copied into owned storage for Python 3.8 stable-ABI support.
     """
-    def __init__(self, threshold: float = 0.5, min_speech_duration_ms: int = 250,
-                 min_silence_duration_ms: int = 100,
-                 max_speech_duration_s: float = 3.4028234663852886e38,
+    def __init__(self, threshold: float = 0.5, min_speech_ms: int = 250,
+                 min_silence_ms: int = 100,
+                 max_speech_ms: int = 0,
                  speech_pad_ms: int = 30, provisional: bool = False) -> None: ...
-    def process(self, samples: Union[Sequence[float], memoryview]) -> List[WhisperVadEvent]: ...
-    def finish(self) -> List[WhisperVadEvent]: ...
-    def reset(self) -> List[WhisperVadEvent]: ...
+    def process(self, samples: Union[Sequence[float], memoryview], input_sample_rate: int = 16000, input_channels: int = 1) -> List[VadEvent]: ...
+    def finish(self) -> List[VadEvent]: ...
+    def reset(self) -> List[VadEvent]: ...
     def last_frame_probabilities(self) -> FrameProbabilities: ...
 
-class WhisperVadPostProcessor:
-    def __init__(self, params: Optional[WhisperVadParams] = None) -> None: ...
-    def process(self, probabilities: Union[Sequence[float], memoryview]) -> List[WhisperSpeechSegment]: ...
-    def finish(self) -> List[WhisperSpeechSegment]: ...
+class VadPostProcessor:
+    def __init__(self, params: Optional[VadOptions] = None) -> None: ...
+    def process(self, probabilities: Union[Sequence[float], memoryview]) -> List[SpeechSegment]: ...
+    def finish(self) -> List[SpeechSegment]: ...
     def reset(self) -> None: ...
 
-class WhisperVadStreamOptions:
-    def __init__(self, *, params: Optional[WhisperVadParams] = None,
+class StreamVadOptions:
+    def __init__(self, *, params: Optional[VadOptions] = None,
                  provisional: bool = False, tap: Literal["primary", "secondary"] = "primary") -> None: ...
     @property
-    def params(self) -> WhisperVadParams: ...
+    def params(self) -> VadOptions: ...
     @property
     def provisional(self) -> bool: ...
     @property
     def tap(self) -> Literal["primary"]: ...
 
-def whisper_speech_segments(samples: Union[Sequence[float], memoryview],
-                            params: Optional[WhisperVadParams] = None) -> List[WhisperSpeechSegment]: ...
+def speech_segments(samples: Union[Sequence[float], memoryview],
+                            params: Optional[VadOptions] = None) -> List[SpeechSegment]: ...
 
 
 class Denoiser:
@@ -731,14 +684,14 @@ def open(
     output_channels: int = 2, chunk_ms: int = 20, gain: float = 1.0,
     mic_device_id: Optional[str] = None, system_device_id: Optional[str] = None,
     mic_gain: float = 1.0, system_gain: float = 1.0,
-    vad: Optional[VadSettings] = None, denoise: bool = False,
-    whisper_vad: Optional[WhisperVadStreamOptions] = None
+    denoise: bool = False, silence_probe: bool = True,
+    vad: Optional[StreamVadOptions] = None
 ) -> Stream:
     """Open capture synchronously; macOS microphone consent must be decided.
 
     Bundled prompts wait at most 30 seconds; an unanswered prompt raises a typed
     backend error without starting capture. Answer the prompt and retry. Built-in
-    backends emit neither permissionPending nor permissionGranted on any OS/source.
+    backends do not emit permissionPending; custom Rust backends may emit it.
     The 30-second bound covers undecided consent, not authorized native queries.
     PCM polling does not wait for event polling. To observe startup notices
     first, drain the ordinary FIFO event queue before polling PCM.

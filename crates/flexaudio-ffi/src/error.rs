@@ -140,9 +140,10 @@ mod addon_tests {
     use super::*;
     #[test]
     fn vad_failure_keeps_the_original_typed_addon_cause() {
-        let code = crate::vad::vad_failure(flexaudio_vad::VadError::Inference(
-            "injected inference cause".into(),
-        ));
+        let code = set_audio_error(
+            flexaudio_vad::InferenceError::Inference("injected inference cause".into())
+                .audio_error(),
+        );
         assert_eq!(code, code::FLEX_FAILURE);
         let error = last_audio_error().unwrap();
         assert_eq!(
@@ -155,10 +156,10 @@ mod addon_tests {
 }
 
 #[cfg(test)]
-mod round2_tests {
+mod error_projection_tests {
     use super::*;
     #[test]
-    fn round2_message_only_failure_has_no_fabricated_typed_cause() {
+    fn typed_message_only_failure_has_no_fabricated_typed_cause() {
         set_audio_error(flexaudio::Error::DeviceLost);
         set_last_error("legacy message");
         assert_eq!(last_audio_error(), None);

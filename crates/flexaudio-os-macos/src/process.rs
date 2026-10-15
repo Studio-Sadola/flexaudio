@@ -29,7 +29,7 @@ use flexaudio_core::{ErrorContext, Operation, ShutdownReport};
 
 use crate::common::{translate_pid_to_object, FALLBACK_FORMAT};
 use crate::probe::PublicationGate;
-use crate::system::run_tap_thread;
+use crate::system::{run_tap_thread, TapThreadConfig};
 use crate::tap::TapKind;
 use crate::terminal::{StartAction, TerminalFailure};
 
@@ -50,6 +50,7 @@ pub struct MacProcessBackend {
     mode: ProcessMode,
     /// Running flag (guards duplicate starts, signals stop, and tracks drop state). `Send`.
     stop_flag: Arc<AtomicBool>,
+    silence_probe: bool,
     /// Probe publication and stop are ordered; the lock is released before joining.
     publication: Arc<PublicationGate>,
     /// Owner-reported terminal failure, retained after stop and mailbox consumption.
@@ -71,6 +72,7 @@ impl MacProcessBackend {
             target_pid,
             mode,
             stop_flag: Arc::new(AtomicBool::new(false)),
+            silence_probe: true,
             publication: Arc::new(PublicationGate::default()),
             terminal: Arc::new(TerminalFailure::default()),
             handle: None,
@@ -78,6 +80,12 @@ impl MacProcessBackend {
             events: None,
             native: FALLBACK_FORMAT,
         }
+    }
+
+    /// Enable or disable the private silence diagnostic signal. Enabled by default.
+    pub fn with_silence_probe(mut self, enabled: bool) -> Self {
+        self.silence_probe = enabled;
+        self
     }
 
     /// PID of the process to capture.
@@ -114,6 +122,7 @@ impl CaptureBackend for MacProcessBackend {
         self.stop_flag.store(false, Ordering::SeqCst);
 
         let stop_flag = self.stop_flag.clone();
+        let silence_probe = self.silence_probe;
         let publication = self.publication.clone();
         let terminal = self.terminal.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
@@ -143,7 +152,10 @@ impl CaptureBackend for MacProcessBackend {
                     }
                 };
                 run_tap_thread(
-                    kind,
+                    TapThreadConfig {
+                        kind,
+                        silence_probe,
+                    },
                     sink,
                     stop_flag,
                     publication,
@@ -215,6 +227,17 @@ impl Drop for MacProcessBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silence_probe_defaults_on_and_can_be_disabled() {
+        assert!(MacProcessBackend::new(1234, ProcessMode::Include).silence_probe);
+        assert!(
+            !MacProcessBackend::new(1234, ProcessMode::Include)
+                .with_silence_probe(false)
+                .silence_probe
+        );
+    }
+
     use flexaudio_core::raw_ring;
 
     #[test]
@@ -280,7 +303,7 @@ mod repro_tests {
     use flexaudio_core::raw_ring;
 
     #[test]
-    fn repro_p7mac_oversized_target_pid_is_invalid_arg() {
+    fn regression_oversized_target_pid_is_invalid_arg() {
         // On macOS 14.4+, this must fail before any native PID translation or tap creation.
         let mut backend = MacProcessBackend::new(u32::MAX, ProcessMode::Include);
         let (producer, _consumer) = raw_ring(16);
@@ -293,7 +316,7 @@ mod repro_tests {
     }
 
     #[test]
-    fn repro_p7mac_stop_reports_owner_panic() {
+    fn regression_stop_reports_owner_panic() {
         let mut backend = MacProcessBackend::new(1, ProcessMode::Include);
         backend.handle = Some(thread::spawn(|| panic!("injected owner failure")));
         backend.stop();

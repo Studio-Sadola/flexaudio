@@ -6,7 +6,6 @@
 use std::os::raw::c_char;
 
 use flexaudio_denoise::Denoiser;
-use flexaudio_vad::Vad;
 
 /// Audio source kind to record (corresponds to [`flexaudio::SourceKind`]).
 #[repr(C)]
@@ -30,47 +29,6 @@ pub enum FlexProcessMode {
     Include = 0,
     /// Capture all system audio except the target PID.
     Exclude = 1,
-}
-
-/// VAD (voice activity detection) configuration. Passed to `FlexConfig::vad` and `flexaudio_vad_new`.
-///
-/// For each value, the sentinel 0 selects the default from [`flexaudio_vad::VadConfig`].
-/// `threshold` 0 → 0.5, `neg_threshold` 0 → Silero formula `max(threshold-0.15, 0.01)`,
-/// `min_speech_ms` 0 → 250, `min_silence_ms` 0 → 100, `speech_pad_ms` 0 → 30,
-/// `sample_rate` 0 → 16000. `max_speech_ms` 0 means unlimited (the default).
-///
-/// [`flexaudio_vad_new`]: crate::flexaudio_vad_new
-#[repr(C)]
-pub struct FlexVadConfig {
-    /// Probability threshold (>=) for speech start. 0 selects 0.5.
-    pub threshold: f32,
-    /// Lower (silence-side) threshold (<) for silence start.
-    /// 0 selects the Silero formula automatically.
-    pub neg_threshold: f32,
-    /// Minimum accepted speech duration (ms). Shorter segments are discarded. 0 selects 250.
-    pub min_speech_ms: u32,
-    /// Silence duration (ms) required to finalize speech end. 0 selects 100.
-    pub min_silence_ms: u32,
-    /// Padding (ms) added before and after segment boundaries. 0 selects 30.
-    pub speech_pad_ms: u32,
-    /// Maximum segment duration (ms). 0 is unlimited (default). Longer segments are forcibly split.
-    pub max_speech_ms: u32,
-    /// Sample rate (8000 or 16000). 0 selects 16000.
-    pub sample_rate: u32,
-}
-
-/// One event finalized by VAD. Stored in the output array of `flexaudio_vad_process` and in `FlexChunk::vad_events`
-///.
-///
-/// `at_sample` is measured at the internal VAD rate (`sample_rate` = 8000/16000), not at the input
-/// sample rate (same as [`flexaudio_vad::VadEvent`]).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FlexVadEvent {
-    /// Kind. 0 = speech start (SpeechStart), 1 = speech end (SpeechEnd).
-    pub kind: i32,
-    /// Event sample position at the internal VAD rate (start inclusive / end exclusive).
-    pub at_sample: i64,
 }
 
 /// Configuration for opening a stream. Passed to `flexaudio_open` / `flexaudio_switch_source`.
@@ -116,12 +74,8 @@ pub struct FlexConfig {
     /// processes data in place just before `poll_chunk` returns (before VAD).
     /// Boolean integer: only 0 and 1 are valid.
     pub denoise: u8,
-    /// Whether to apply VAD (voice activity detection) to the stream. When `true`, each polled chunk is processed
-    /// by VAD according to `vad` and populates `FlexChunk::vad_events`.
-    /// Boolean integer: only 0 and 1 are valid.
-    pub has_vad: u8,
-    /// VAD configuration (used only when `has_vad` is `true`; ignored when `false`).
-    pub vad: FlexVadConfig,
+    /// Silence diagnosis probe: 0 = default (enabled), 1 = enabled, 2 = disabled.
+    pub silence_probe: u8,
 }
 
 /// One captured audio chunk, populated by `flexaudio_poll_chunk`.
@@ -151,16 +105,6 @@ pub struct FlexChunk {
     pub peak: f32,
     /// Root-mean-square of delivered samples after denoise (linear).
     pub rms: f32,
-    /// Events finalized by VAD for this chunk. NULL when VAD is disabled or there are no events
-    /// (`vad_events_len = 0`). When non-NULL, `flexaudio_chunk_free` releases it
-    /// together with `data`.
-    /// On DISCONTINUITY, flushed pre-gap events precede any post-gap events. The core's fixed
-    /// 20 ms chunks are shorter than a fresh 32 ms VAD frame, so this chunk contains only pre-gap
-    /// events; all events on subsequent chunks use the new sample clock, restarted at zero.
-    /// SpeechStart and SpeechEnd are delivered together when a segment is finalized.
-    pub vad_events: *mut FlexVadEvent,
-    /// Number of `vad_events`. 0 when VAD is disabled or there are no events.
-    pub vad_events_len: usize,
 }
 
 /// Stream event kind (corresponds to [`flexaudio::Event`]).
@@ -276,31 +220,29 @@ pub struct FlexProcessInfo {
 /// addons (denoise / VAD); C code holds only a pointer. Create with `flexaudio_open` and
 /// release with `flexaudio_free`.
 ///
-/// Keep addons here as part of the stream state (thin wrapper). Before `poll_chunk`
-/// returns, process data through denoise → VAD. `flexaudio_switch_source` replaces only the source;
+/// Keep addons here as part of the stream state. VAD consumes canonical capture before
+/// output conversion. `flexaudio_switch_source` replaces only the source;
 /// addons retain their configuration from open (same as gain).
 pub struct FlexStream {
     pub(crate) inner: flexaudio::Stream,
     pub(crate) shutdown: Option<flexaudio::ShutdownReport>,
     pub(crate) shutdown_event_index: usize,
     pub(crate) last_output: Option<(u64, i64, u64)>,
-    pub(crate) whisper: Option<flexaudio_vad::WhisperVadTap>,
-    pub(crate) whisper_events: Vec<flexaudio_vad::AttachedWhisperVadEvent>,
-    pub(crate) whisper_origin: (u64, i64),
-    pub(crate) whisper_error: Option<flexaudio_vad::WhisperVadTapError>,
-    pub(crate) whisper_cleanup: Vec<flexaudio::Error>,
-    pub(crate) ready_chunks: std::collections::VecDeque<crate::whisper_integration::FlexChunkV2>,
+    pub(crate) vad_tap: Option<flexaudio_vad::VadTap>,
+    pub(crate) vad_events: Vec<flexaudio_vad::AttachedVadEvent>,
+    pub(crate) vad_origin: (u64, i64),
+    pub(crate) vad_error: Option<flexaudio_vad::VadTapError>,
+    pub(crate) vad_cleanup: Vec<flexaudio::Error>,
+    pub(crate) ready_chunks: std::collections::VecDeque<crate::vad_integration::FlexChunkV2>,
     /// Noise suppressor when enabled (requires 48 kHz; constructed at open). `None` when disabled.
     pub(crate) denoiser: Option<Denoiser>,
-    /// VAD when enabled (constructed at open). `None` when disabled.
-    pub(crate) vad: Option<Vad>,
 }
 
 impl Drop for FlexStream {
     fn drop(&mut self) {
         for mut chunk in self.ready_chunks.drain(..) {
             unsafe {
-                crate::whisper_integration::flexaudio_chunk_free_v2(&mut chunk);
+                crate::vad_integration::flexaudio_chunk_free_v2(&mut chunk);
             }
         }
     }

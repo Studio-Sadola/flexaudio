@@ -23,6 +23,8 @@ Thumbs.db
 
 # Rust
 /target
+# Local implementation specifications are never release inputs.
+/.spec*/
 # Commit Cargo.lock because the workspace includes distributable cdylib/Python wheel artifacts.
 
 # The VAD model must be bundled for fully offline use. Re-include it after the *.onnx exclusion.

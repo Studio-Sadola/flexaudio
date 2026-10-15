@@ -46,7 +46,7 @@ pub mod raw_ring;
 pub mod secondary_ring;
 pub mod startup;
 pub mod types;
-mod whisper_error;
+mod vad_error;
 
 // Re-export the main types at the crate root.
 pub use backend::{CaptureBackend, RawSink};
@@ -65,7 +65,7 @@ pub use types::{
 
 pub use diagnostics::CaptureDiagnostics;
 pub use startup::StartupDropReason;
-pub use whisper_error::WhisperCode;
+pub use vad_error::VadErrorCode;
 
 /// Public spelling of the canonical chunk-duration option.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -18,7 +18,7 @@ offline — no model files to ship, no network at runtime.
 ## Install
 
 ```sh
-npm install @studio-sadola/flexaudio@0.5
+npm install @studio-sadola/flexaudio@0.6
 ```
 
 The correct prebuilt native binary for your platform is pulled in automatically
@@ -149,32 +149,31 @@ target an output endpoint. Microphone selection is unaffected.
 `onChunk` is called with **one** argument, the primary chunk. When
 `secondaryOutput` is set, the paired secondary chunk travels **inside** it as
 `chunk.secondary` — it is not a second callback argument. VAD events ride on the
-chunk of the tap selected by `vadTap`. Do not block synchronously inside
+chunk of the tap selected by `vad.tap`. Do not block synchronously inside
 `onChunk` (defer heavy work); blocking stalls terminator delivery and delays
 `stop()` resolving.
+
+One possible use is saving the primary PCM while analyzing a smaller secondary format:
 
 ```js
 const stream = openStream(
   {
     kind: 'system',
-    outputRate: 48000, outputChannels: 2,                       // primary: save
-    secondaryOutput: { rate: 16000, channels: 1, encoding: 's16' }, // secondary: recognize
-    vad: { threshold: 0.5 },
-    vadTap: 'secondary',
+    outputRate: 48000, outputChannels: 2,
+    secondaryOutput: { rate: 16000, channels: 1, encoding: 's16' },
+    vad: { params: { threshold: 0.5 }, tap: 'primary' },
   },
-  (chunk) => {                    // ONE argument
-    save(chunk.data);             // Float32Array, 48 kHz stereo
-    const sec = chunk.secondary;  // undefined on rounds where it has not arrived yet
-    if (sec) {
-      recognize(sec.data);        // Int16Array because encoding is 's16'
-      for (const ev of sec.vadEvents ?? []) {
-        // ev.type: 'speechStart' | 'speechEnd'; ev.atNs: time since recording start
-      }
+  (chunk) => {
+    save(chunk.data);
+    if (chunk.secondary) analyze(chunk.secondary.data);
+    for (const event of chunk.vadEvents ?? []) {
+      // Segment startMs/endMs are relative to the epoch origin.
+      consume(event);
     }
-    // With vadTap: 'primary' (the default) the events are on chunk.vadEvents instead.
   },
 );
 ```
+
 
 Pair primary and secondary chunks by `ptsNs` (a zero-based recording clock),
 never by `seq`: each tap counts its own sequence. Relative timing depends on
@@ -187,8 +186,8 @@ call `openStream` to capture again.
 
 Use `bigint` arithmetic for u64 counters: primary/secondary `seq`,
 `droppedChunks()`, `chunkDropped.count`, loss `samples` (when known),
-`rescanRequired.droppedEvents`, and VAD `atSample`. For example, increment a
-sequence with `chunk.seq + 1n`. `ptsNs` and VAD `atNs` remain `number` timestamps;
+`rescanRequired.droppedEvents`, and VAD `captureSample`. For example, increment a
+sequence with `chunk.seq + 1n`. `ptsNs` and VAD milliseconds remain `number` timestamps;
 `frames`, `flags`, and the u32 `droppedBefore` field also remain `number`.
 
 ## Voice activity detection, noise suppression, FLAC
@@ -201,11 +200,8 @@ const { Vad, Denoiser, FlacEncoder, openStream } = require('@studio-sadola/flexa
 
 // VAD: feed any format; it resamples internally to the VAD rate (16 kHz).
 const vad = new Vad({ threshold: 0.5, minSilenceMs: 100 });
-for (const ev of vad.process(samples, 48000, 2)) {
-  // ev.type: 'speechStart' | 'speechEnd'
-  // ev.atSample is a bigint on the VAD's internal 16 kHz sample clock.
-  const wholeSeconds = ev.atSample / 16000n; // exact bigint quotient
-  const seconds = Number(ev.atSample) / 16000; // approximate number for display
+for (const ev of [...vad.process(samples, 48000, 2), ...vad.finish()]) {
+  if (ev.type === 'segment') console.log(ev.startMs, ev.endMs);
 }
 
 // Noise suppression: 48 kHz only, returns the denoised copy (mono here).
@@ -225,7 +221,7 @@ order denoise → VAD:
 
 ```js
 const stream = openStream(
-  { kind: 'mic', outputRate: 48000, denoise: true, vad: { threshold: 0.5 } },
+  { kind: 'mic', outputRate: 48000, denoise: true, vad: { params: { threshold: 0.5 }, tap: 'primary' } },
   (chunk) => {
     // chunk.data is already noise-suppressed; chunk.vadEvents holds VAD events
   },
@@ -235,26 +231,25 @@ const stream = openStream(
 `denoise` requires `outputRate: 48000` (RNNoise is 48 kHz only) — any other rate
 makes `openStream` throw.
 
-## Whisper-compatible standalone VAD
+## Streaming VAD
 
-`WhisperVad` uses the embedded Silero v6 model and the segmentation rules from
-whisper.cpp pin `85a69493a601d4ff5a834064f7b7bac250bd8739`. Feed normalized
-mono `Float32Array` PCM at 16000 Hz. Run its synchronous inference in a Node
+`Vad` uses the embedded Silero v6 model and the segmentation rules from
+whisper.cpp pin `85a69493a601d4ff5a834064f7b7bac250bd8739`. Feed normalized interleaved `Float32Array` PCM; the default input is 16000 Hz mono. Other input formats are converted internally with group-delay compensation so events stay on the input timeline. Finite resampling overshoot is clipped to [-1,1]; invalid source PCM and nonfinite converter output are rejected. Run its synchronous inference in a Node
 Worker when used during recording.
 The embedded model SHA-256 is
 `7776b81ad1b0350c15d7f1555943b9232eb53e9ca5d989c6d0cea9ebc8664d87`;
 using v6 does not promise the same probabilities as whisper.cpp's v5 model.
 
 ```js
-const { WhisperVad } = require('@studio-sadola/flexaudio');
-const vad = new WhisperVad({ provisional: true });
+const { Vad } = require('@studio-sadola/flexaudio');
+const vad = new Vad({ provisional: true });
 for (const mono16k of decodedChunks) consume(vad.process(mono16k));
 consume(vad.finish()); // True EOF; infer one zero-padded partial frame if needed.
 ```
 
-The immutable parameters are `threshold` (0.5), `minSpeechDurationMs` (250),
-`minSilenceDurationMs` (100), `maxSpeechDurationS` (finite f32::MAX), and
-`speechPadMs` (30). Integer duration fields accept 0..134217; zero is literal.
+The immutable parameters are `threshold` (0.5), `minSpeechMs` (250),
+`minSilenceMs` (100), `maxSpeechMs` (0, unbounded), and
+`speechPadMs` (30). Minimum durations and padding accept integer 0..134217 ms; zero is literal. `maxSpeechMs` accepts unsigned integer milliseconds, with 0 meaning unbounded. Positive values must exceed `32 + 2 * speechPadMs`; their split budget is exactly `maxSpeechMs * 16 - 512 - 2 * speechPadMs * 16` samples. Unsupported values throw `InvalidParameter`.
 Unknown keys, invalid types, out-of-range PCM and nonfinite values throw errors
 with stable `code` values. Drain the exception's `terminalEvents` through the
 same consumer before handling a fatal failure; validation errors carry `[]`.
@@ -273,35 +268,34 @@ for the latest successful call, including an EOF tail. Processing an empty
 array clears that batch without advancing the frame timeline. One model frame
 consumes 512 samples (32 ms); that stride differs from the final 10 ms grid.
 
-`openStream` accepts `whisperVad: { params: { ... }, provisional: true, tap }`.
-Legacy `vad`/`vadTap` are mutually exclusive with attachment; secondary requires
-an enabled secondary output. One VAD owner consumes the producer's shared 48 kHz
+`openStream` accepts `vad: { params: { ... }, provisional: true, tap }`.
+A secondary event carrier requires an enabled secondary output. One VAD owner consumes the producer's shared 48 kHz
 stereo branch before output conversion. The selected chunk carries
-`whisperVadEvents`, beginning each epoch with its exact `captureSample` bigint and
+`vadEvents`, beginning each epoch with its exact `captureSample` bigint and
 `ptsNs` origin. Every audio chunk exposes `frameIndex: bigint` in 48 kHz units;
 output taps keep independent producer timelines across native restarts and gaps.
-`flushWhisperVad()` delivers an empty closing carrier before its promise resolves;
+`flushVad()` delivers an empty closing carrier before its promise resolves;
 `stop()` drains capture and closes its last epoch before settlement.
 
 An attached VAD failure is a failure of the **VAD session only**. It is reported once
-as `onEvent({ type: 'whisperVadFailed', error, epoch })`, after the carrier whose
-`whisperVadEvents` end with `epochEnd(error)`; `error.whisperCode` names the typed
+as `onEvent({ type: 'vadFailed', error, epoch })`, after the carrier whose
+`vadEvents` end with `epochEnd(error)`; `error.vadCode` names the typed
 cause. Capture, PCM delivery, `pause`/`resume`, `switchSource` and `stop` keep
 working, and `terminalError()` stays undefined (it means capture primary only). The
-shutdown report keeps the cause in `cleanupErrors` with its `whisperCode` and leaves
+shutdown report keeps the cause in `cleanupErrors` with its `vadCode` and leaves
 `primary` for real capture failures. The next discontinuity (the flag, a capture
 index gap, a PTS reanchor, or the first chunk after `resume`/`switchSource`) reinitializes converter
 and model, so the following frame starts a new anchored epoch; a failed
 reinitialization keeps the session failed without repeating the event, until
-`flushWhisperVad()` succeeds. Missing capture audio never becomes padding, and a
+`flushVad()` succeeds. Missing capture audio never becomes padding, and a
 capture index gap closes the intact prefix instead of failing it.
 
 Standalone tests do not open audio devices. After building/copying the addon as
 in `__test__/run-smoke.sh`, run
-`node __test__/whisper-vad.test.mjs` from this crate. The script uses `node:test`
+`node __test__/vad.test.mjs` from this crate. The script uses `node:test`
 and reports each available case. Failure-isolation cases require a test addon built
-with `--features test-faults`; production builds reject injection with
-`TestFaultsUnavailable`. The release workflows do not enable this feature.
+with `--features test-faults` and the test-only loader. Release JavaScript,
+declarations and native exports omit all mock/fault controls. The release workflows do not enable this feature.
 
 ## Building the loader (`index.js` / `index.d.ts`)
 
@@ -316,7 +310,7 @@ npx napi build --platform --release   # also produces the .node binary
 
 `napi build` writes `index.js`, `index.d.ts`, and the platform `.node` artifact.
 `index.js` and `index.d.ts` are committed; the `.node` binaries are git-ignored.
-The declarations also maintain the strict whisper event unions and parameter
+The declarations also maintain the strict attachment event unions and parameter
 types used by the custom marshaller. Preserve those declarations and review the
 generated diff when regenerating exports.
 
@@ -338,3 +332,5 @@ and bundled assets: the embedded Silero VAD model (built-in VAD add-on), the
 pure-Rust tract inference crates, and RNNoise via nnnoiseless with embedded
 weights (noise suppression).
 See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+The macOS silence diagnostic probe is enabled by default. Set `silenceProbe: false` in `openStream` to disable its short diagnostic signal after sustained exact-zero capture. Other platforms ignore the option.

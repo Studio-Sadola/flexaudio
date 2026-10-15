@@ -43,9 +43,7 @@ pub struct FlexErrorContextV2 {
     pub native_call: *const std::os::raw::c_char,
 }
 
-/// Late microphone consent for custom backends/compatibility; permission getter returns 1.
-/// Built-in backends emit neither pending nor granted notices on any OS/source.
-pub const FLEX_EVENT_KIND_PERMISSION_GRANTED: i32 = 9;
+/// Event kind 9 is reserved and must not be reused.
 /// Validated interval sample loss.
 pub const FLEX_EVENT_KIND_AUDIO_LOSS: i32 = 10;
 /// Cleanup failure; does not replace the capture primary.

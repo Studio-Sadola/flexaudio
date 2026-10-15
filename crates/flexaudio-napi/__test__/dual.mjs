@@ -9,10 +9,7 @@
 //   2. Secondary s16 is an Int16Array; 16 kHz/mono has 320 samples; encoding=='s16'.
 //   3. The recording clock starts at 0 (the first primary chunk has ptsNs === 0).
 //   4. Primary and secondary pts are non-decreasing. Paired pts differ by no more than 60 ms.
-//  [B] flushVad (Addendum 2-2):
-//   5. An open speech segment → flushVad → speechEnd appears in the next chunk's vadEvents.
-//   6. vadEvents atNs starts at recording time 0 (>= 0) and is non-decreasing.
-//   7. stop() automatically runs flushVad after the audio stop-flush, delivering the final speechEnd.
+// Epoch closure and finalized segments are checked for both selected event carriers.
 
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -20,7 +17,7 @@ import { dirname, join } from 'node:path';
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
-const native = require(join(here, 'flexaudio.node'));
+const { native } = await import('./test-native.mjs');
 
 function assert(cond, msg) {
   if (!cond) {
@@ -88,93 +85,22 @@ async function dualOutput() {
   console.log('[A] DUAL OK');
 }
 
-// Share the check that vadEvents atNs starts at recording time 0 and is non-decreasing.
-function checkVadEvents(events) {
-  let last = -1;
-  for (const ev of events) {
-    assert(ev.type === 'speechStart' || ev.type === 'speechEnd', `unexpected vad event type ${ev.type}`);
-    assert(typeof ev.atNs === 'number', `atNs must be a number, got ${ev.atNs} (${typeof ev.atNs})`);
-    assert(ev.atNs >= 0, `atNs must be recording-0-based (>= 0), got ${ev.atNs}`);
-    assert(ev.atNs >= last, `atNs must be non-decreasing: ${ev.atNs} < ${last}`);
-    last = ev.atNs;
+async function closure(tap, explicit) {
+  const events = [];
+  const stream = native.__openMockStream(48000, 2, 440, chunk => {
+    events.push(...(chunk.vadEvents ?? []), ...(chunk.secondary?.vadEvents ?? []));
+  }, 16000, 1, 's16', { tap, params: { threshold: 0, minSpeechMs: 0, speechPadMs: 0 } });
+  try {
+    await sleep(300);
+    assert(events.some(event => event.type === 'epochStart'), 'capture origin must precede payloads');
+    if (explicit) await stream.flushVad();
+  } finally {
+    await stream.stop();
   }
+  assert(events.some(event => event.type === 'segment'), 'flush must preserve finalized speech');
+  assert(events.at(-1).type === 'epochEnd', 'stop must deliver epoch closure');
 }
-
-// Collect from both taps so vadEvents are captured whether VAD runs on the primary or secondary tap.
-function collectEvents(primary, sink) {
-  if (primary.vadEvents) for (const ev of primary.vadEvents) sink.push(ev);
-  const s = primary.secondary;
-  if (s && s.vadEvents) for (const ev of s.vadEvents) sink.push(ev);
-}
-
-// [B] flushVad: force-finalize an open segment while running; its final speechEnd appears in the next chunk (vadTap='primary').
-async function flushVadMidStream() {
-  const events = [];
-  // With vadTap primary and threshold 0, every frame counts as speech; no silence arrives, so the segment
-  // stays open. process does not finalize it.
-  const stream = native.__openMockStream(
-    48000, 2, 440.0,
-    (primary) => collectEvents(primary, events),
-    undefined, undefined, undefined, // No secondary tap.
-    0.0, 'primary',                  // vadThreshold=0, vadTap='primary'
-  );
-
-  await sleep(300);
-  // No silence arrives, so no speech event is finalized before flushVad.
-  assert(events.length === 0, `expected no vad events before flushVad, got ${events.length}`);
-
-  stream.flushVad();
-  await sleep(150); // Let the next chunk carry the flush event.
-
-  const ends = events.filter((e) => e.type === 'speechEnd');
-  const starts = events.filter((e) => e.type === 'speechStart');
-  console.log(`[B1] after flushVad: ${starts.length} speechStart, ${ends.length} speechEnd`);
-  assert(ends.length >= 1, `expected a speechEnd after flushVad, got ${show(events)}`);
-  assert(starts.length >= 1, `flushVad should also emit the paired speechStart`);
-  checkVadEvents(events);
-  console.log('[B2] atNs recording-0-based & monotonic OK');
-
-  await stream.stop();
-  checkVadEvents(events); // Still non-decreasing after stop auto-flush.
-  console.log('[B] FLUSHVAD MID-STREAM OK');
-}
-
-// [C] stop() auto-flushVad: stop with an open segment without calling flushVad explicitly.
-// With this synthetic wave, no silence arrives to close the segment. A speechEnd therefore proves stop()
-// automatically ran flushVad after the audio stop-flush. Test the standard setup (Addendum 2-1),
-// using vadTap='secondary' (the secondary 16 kHz resampler always produces a stop-flush tail).
-async function flushVadOnStop() {
-  const events = [];
-  const stream = native.__openMockStream(
-    48000, 2, 440.0,
-    (primary) => collectEvents(primary, events),
-    16000, 1, 's16',   // Secondary tap 16 kHz/mono/s16 (standard setup).
-    0.0, 'secondary',  // vadThreshold=0, vadTap='secondary'
-  );
-
-  await sleep(300);
-  assert(events.length === 0, `expected no vad events before stop, got ${events.length}`);
-
-  await stream.stop();      // Do not call flushVad; stop should run it automatically.
-
-  const ends = events.filter((e) => e.type === 'speechEnd');
-  console.log(`[C1] speechEnd delivered via stop auto-flush: ${ends.length}`);
-  assert(ends.length >= 1, `stop() must auto-run flushVad and deliver a final speechEnd, got ${show(events)}`);
-  checkVadEvents(events);
-  console.log('[C] FLUSHVAD ON STOP OK');
-}
-
-async function main() {
-  await dualOutput();
-  await flushVadMidStream();
-  await flushVadOnStop();
-  console.log('DUAL OK');
-}
-
-main().then(
-  () => process.exit(0),
-  (e) => {
-    console.error('DUAL ERROR:', e);
-    process.exit(1);
-  },
-);
+await dualOutput();
+await closure('primary', true);
+await closure('secondary', false);
+console.log('DUAL OK');

@@ -67,16 +67,28 @@ impl flexaudio::core::CaptureBackend for ShutdownFixtureBackend {
 #[napi::bindgen_prelude::ctor]
 fn register_test_exports() {
     #[cfg(test)]
-    napi::bindgen_prelude::register_module_export(None, "__reproP9Bridge\0", export_bridge);
+    napi::bindgen_prelude::register_module_export(None, "__bindingContractBridge\0", export_bridge);
     #[cfg(test)]
     napi::bindgen_prelude::register_module_export(None, "__openMockStream\0", export_mock);
-    napi::bindgen_prelude::register_module_export(None, "__reproP9VadEvents\0", export_vad_events);
-    napi::bindgen_prelude::register_module_export(None, "__reproP9Error\0", export_error);
-    napi::bindgen_prelude::register_module_export(None, "__reproP9Payloads\0", export_payloads);
-    napi::bindgen_prelude::register_module_export(None, "__reproP9ChunkMs\0", export_chunk_ms);
     napi::bindgen_prelude::register_module_export(
         None,
-        "__reproP9AsyncError\0",
+        "__bindingContractVadEvents\0",
+        export_vad_events,
+    );
+    napi::bindgen_prelude::register_module_export(None, "__bindingContractError\0", export_error);
+    napi::bindgen_prelude::register_module_export(
+        None,
+        "__bindingContractPayloads\0",
+        export_payloads,
+    );
+    napi::bindgen_prelude::register_module_export(
+        None,
+        "__bindingContractChunkMs\0",
+        export_chunk_ms,
+    );
+    napi::bindgen_prelude::register_module_export(
+        None,
+        "__bindingContractAsyncError\0",
         export_async_error,
     );
 }
@@ -95,7 +107,7 @@ impl Task for ErrorTask {
 
 unsafe fn export_async_error(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
     let env = Env::from_raw(raw_env);
-    let function = env.create_function_from_closure("__reproP9AsyncError", |ctx| {
+    let function = env.create_function_from_closure("__bindingContractAsyncError", |ctx| {
         let kind = ctx
             .get::<napi::JsString>(0)?
             .into_utf8()?
@@ -108,7 +120,7 @@ unsafe fn export_async_error(raw_env: sys::napi_env) -> napi::Result<sys::napi_v
 
 unsafe fn export_chunk_ms(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
     let env = Env::from_raw(raw_env);
-    let function = env.create_function_from_closure("__reproP9ChunkMs", |ctx| {
+    let function = env.create_function_from_closure("__bindingContractChunkMs", |ctx| {
         let options = ctx.get::<napi::JsObject>(0)?;
         let options = unsafe { OpenOptions::from_napi_value(ctx.env.raw(), options.raw())? };
         let config = build_config(&options).map_err(|error| {
@@ -133,6 +145,7 @@ unsafe fn export_chunk_ms(raw_env: sys::napi_env) -> napi::Result<sys::napi_valu
     Ok(function.raw())
 }
 
+#[cfg(test)]
 fn js_stream(env: &Env, stream: FlexStream) -> napi::Result<JsObject> {
     let stream = Arc::new(stream);
     let mut object = env.create_object()?;
@@ -161,10 +174,8 @@ fn js_stream(env: &Env, stream: FlexStream) -> napi::Result<JsObject> {
     )?;
     let flush_stream = stream.clone();
     object.set_named_property(
-        "flushWhisperVad",
-        env.create_function_from_closure("flushWhisperVad", move |ctx| {
-            flush_stream.flush_whisper_vad(*ctx.env)
-        })?,
+        "flushVad",
+        env.create_function_from_closure("flushVad", move |ctx| flush_stream.flush_vad(*ctx.env))?,
     )?;
     let switch_stream = stream.clone();
     object.set_named_property(
@@ -181,18 +192,18 @@ fn js_stream(env: &Env, stream: FlexStream) -> napi::Result<JsObject> {
 
 unsafe fn export_vad_events(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
     let env = Env::from_raw(raw_env);
-    let function = env.create_function_from_closure("__reproP9VadEvents", |_| {
-        let mut events = Vec::new();
-        for count in [9_007_199_254_740_993, 9_223_372_036_854_775_808, u64::MAX] {
-            for event in [
-                VadEvent::SpeechStart { at_sample: count },
-                VadEvent::SpeechEnd { at_sample: count },
-            ] {
-                for pts in [None, Some(1_500_000_000)] {
-                    events.push(vad_event_to_js_abs(event, pts));
-                }
-            }
-        }
+    let function = env.create_function_from_closure("__bindingContractVadEvents", |_| {
+        let events = [9_007_199_254_740_993, 9_223_372_036_854_775_808, u64::MAX]
+            .into_iter()
+            .map(|capture_sample| {
+                vad::JsVadEvent(flexaudio_vad::AttachedVadEvent::EpochStart {
+                    epoch: 0,
+                    seq: 0,
+                    capture_sample,
+                    pts_ns: 1_500_000_000,
+                })
+            })
+            .collect::<Vec<_>>();
         Ok(events)
     })?;
     Ok(function.raw())
@@ -201,7 +212,7 @@ unsafe fn export_vad_events(raw_env: sys::napi_env) -> napi::Result<sys::napi_va
 unsafe fn export_error(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
     let env = Env::from_raw(raw_env);
     let function =
-        env.create_function_from_closure("__reproP9Error", |ctx| -> napi::Result<()> {
+        env.create_function_from_closure("__bindingContractError", |ctx| -> napi::Result<()> {
             let kind = ctx
                 .get::<napi::JsString>(0)?
                 .into_utf8()?
@@ -218,7 +229,7 @@ unsafe fn export_error(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> 
 unsafe fn export_payloads(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
     use flexaudio::core::{AudioLoss, MixLane, OutputTap};
     let env = Env::from_raw(raw_env);
-    let function = env.create_function_from_closure("__reproP9Payloads", |ctx| {
+    let function = env.create_function_from_closure("__bindingContractPayloads", |ctx| {
         let mut streams = vec![
             event_to_js(Event::RecoverableError {
                 error: flexaudio::Error::DeviceLost,
@@ -254,7 +265,6 @@ unsafe fn export_payloads(raw_env: sys::napi_env) -> napi::Result<sys::napi_valu
             streams.push(event_to_js(Event::AudioLoss { loss }));
         }
         streams.push(event_to_js(Event::Clipped));
-        streams.push(event_to_js(Event::PermissionGranted));
         let mut object = ctx.env.create_object()?;
         object.set_named_property("streams", streams)?;
         object.set_named_property("devices", devices)?;
@@ -266,7 +276,7 @@ unsafe fn export_payloads(raw_env: sys::napi_env) -> napi::Result<sys::napi_valu
 #[cfg(test)]
 unsafe fn export_bridge(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
     let env = Env::from_raw(raw_env);
-    let function = env.create_function_from_closure("__reproP9Bridge", |ctx| {
+    let function = env.create_function_from_closure("__bindingContractBridge", |ctx| {
         let scenario = ctx
             .get::<napi::JsString>(0)?
             .into_utf8()?
@@ -274,7 +284,7 @@ unsafe fn export_bridge(raw_env: sys::napi_env) -> napi::Result<sys::napi_value>
             .to_owned();
         let callback = ctx.get::<napi::JsFunction>(1)?;
         let callback = unsafe { Function::from_napi_value(ctx.env.raw(), callback.raw())? };
-        let stream = repro_p9_bridge(
+        let stream = binding_contract_bridge(
             *ctx.env,
             scenario,
             callback,
@@ -323,32 +333,22 @@ unsafe fn export_mock(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
             if ctx.length <= 7 {
                 None
             } else {
-                ctx.get::<Option<f64>>(7)?
+                ctx.get::<Option<napi::JsUnknown>>(7)?
             },
             if ctx.length <= 8 {
                 None
             } else {
-                ctx.get::<Option<String>>(8)?
+                ctx.get::<Option<Function<JsStreamEvent, Unknown>>>(8)?
             },
             if ctx.length <= 9 {
                 None
             } else {
-                ctx.get::<Option<napi::JsUnknown>>(9)?
+                ctx.get::<Option<f64>>(9)?
             },
             if ctx.length <= 10 {
                 None
             } else {
-                ctx.get::<Option<Function<JsStreamEvent, Unknown>>>(10)?
-            },
-            if ctx.length <= 11 {
-                None
-            } else {
-                ctx.get::<Option<f64>>(11)?
-            },
-            if ctx.length <= 12 {
-                None
-            } else {
-                ctx.get::<Option<f64>>(12)?
+                ctx.get::<Option<f64>>(10)?
             },
         )?;
         js_stream(ctx.env, stream)
@@ -356,8 +356,8 @@ unsafe fn export_mock(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
     Ok(function.raw())
 }
 
-#[napi(js_name = "__reproP9Bridge")]
-pub fn repro_p9_bridge(
+#[napi(js_name = "__bindingContractBridge")]
+pub fn binding_contract_bridge(
     env: Env,
     scenario: String,
     on_chunk: Function<JsAudioChunk, Unknown>,
@@ -403,20 +403,12 @@ pub fn repro_p9_bridge(
         }
     }
     let mut bridge = PairingBridge {
-        whisper: None,
+        attachment: None,
         on_chunk: chunk.as_ref().clone(),
         stop_phase: phase.clone(),
         report: report.clone(),
-        vad: None,
-        vad_tap: VadTap::Primary,
 
-        vad_anchor_pts: 0,
-        pending_flush_events: Vec::new(),
-        output_rate: 48000,
-        output_channels: 1,
         secondary: Some(SecondaryTapCfg {
-            rate: 48000,
-            channels: 1,
             encoding: SecEncoding::F32,
         }),
         primary_fifo: VecDeque::new(),
@@ -429,14 +421,13 @@ pub fn repro_p9_bridge(
     };
     if scenario == "startup-order" || startup_drain_fixture {
         bridge.secondary = None;
-        bridge.output_channels = 2;
-        bridge.whisper = Some(
-            whisper_integration::WhisperBridge::new(
-                flexaudio_vad::WhisperVadParams::default(),
-                flexaudio_vad::WhisperVadOptions::default(),
+        bridge.attachment = Some(
+            attachment::VadBridge::new(
+                flexaudio_vad::VadOptions::default(),
+                flexaudio_vad::VadRuntimeOptions::default(),
                 VadTap::Primary,
             )
-            .map_err(|error| whisper_integration::throw_error(&env, error))?,
+            .map_err(|error| attachment::throw_error(&env, error))?,
         );
         let mut stream = flexaudio::Stream::open(
             StreamConfig::default(),
@@ -464,33 +455,33 @@ pub fn repro_p9_bridge(
     }
     if matches!(
         scenario.as_str(),
-        "whisper-secondary-orphan" | "whisper-pending-flush" | "whisper-pending-stop"
+        "attachment-secondary-orphan" | "attachment-pending-flush" | "attachment-pending-stop"
     ) {
-        let mut whisper = whisper_integration::WhisperBridge::new(
-            flexaudio_vad::WhisperVadParams::default(),
-            flexaudio_vad::WhisperVadOptions::default(),
+        let mut attachment = attachment::VadBridge::new(
+            flexaudio_vad::VadOptions::default(),
+            flexaudio_vad::VadRuntimeOptions::default(),
             VadTap::Secondary,
         )
-        .map_err(|error| whisper_integration::throw_error(&env, error))?;
-        whisper.inject_faults(Some(2), 0);
-        bridge.whisper = Some(whisper);
+        .map_err(|error| attachment::throw_error(&env, error))?;
+        attachment.inject_faults(Some(2), 0);
+        bridge.attachment = Some(attachment);
     }
     if matches!(
         scenario.as_str(),
-        "whisper-process"
-            | "whisper-flush"
-            | "whisper-process-cleanup"
-            | "whisper-flush-cleanup"
-            | "whisper-flush-primary"
+        "attachment-process"
+            | "attachment-flush"
+            | "attachment-process-cleanup"
+            | "attachment-flush-cleanup"
+            | "attachment-flush-primary"
     ) {
-        let mut whisper = whisper_integration::WhisperBridge::new(
-            flexaudio_vad::WhisperVadParams::default(),
-            flexaudio_vad::WhisperVadOptions::default(),
+        let mut attachment = attachment::VadBridge::new(
+            flexaudio_vad::VadOptions::default(),
+            flexaudio_vad::VadRuntimeOptions::default(),
             VadTap::Primary,
         )
-        .map_err(|error| whisper_integration::throw_error(&env, error))?;
-        whisper.inject_shutdown_failure(scenario.starts_with("whisper-process"));
-        bridge.whisper = Some(whisper);
+        .map_err(|error| attachment::throw_error(&env, error))?;
+        attachment.inject_shutdown_failure(scenario.starts_with("attachment-process"));
+        bridge.attachment = Some(attachment);
         let mut stream = flexaudio::Stream::open(
             StreamConfig::default(),
             Box::new(ShutdownFixtureBackend {
@@ -505,8 +496,8 @@ pub fn repro_p9_bridge(
             .enable_capture_tap()
             .map_err(|error| boundary::throw_error(&env, error))?;
         start_bridge_stream(&env, &mut stream)?;
-        if let Some(whisper) = bridge.whisper.as_mut() {
-            whisper
+        if let Some(attachment) = bridge.attachment.as_mut() {
+            attachment
                 .prime_shutdown_fixture_capture(&mut stream)
                 .map_err(|error| boundary::throw_error(&env, error))?;
         }
@@ -562,21 +553,21 @@ pub fn repro_p9_bridge(
                     record_cleanup_failure(&bridge.report,
                         flexaudio::Error::Backend("The synthetic stop prologue skipped accepted startup input; forward queued stream events before polling PCM.".into()));
                 }
-                bridge.flush_whisper(scenario == "startup-stop-prologue");
-                bridge.report_whisper_failure();
+                bridge.flush_attachment(scenario == "startup-stop-prologue");
+                bridge.report_attachment_failure();
                 bridge.retain_shutdown_outcome(stream.shutdown_report());
                 return;
             }
             if scenario == "panic" {
-                panic!("repro: C F37 bridge failure");
+                panic!("synthetic bridge failure");
             }
-            if matches!(scenario.as_str(), "whisper-secondary-orphan" | "whisper-pending-flush" | "whisper-pending-stop") {
-                let mut whisper = bridge
-                    .whisper
+            if matches!(scenario.as_str(), "attachment-secondary-orphan" | "attachment-pending-flush" | "attachment-pending-stop") {
+                let mut attachment = bridge
+                    .attachment
                     .take()
                     .expect("the scenario owns its initialized VAD attachment");
                 for index in 0..2 {
-                    whisper.process(AudioChunk {
+                    attachment.process(AudioChunk {
                         data: vec![0.0; 1920],
                         frames: 960,
                         frame_index: index * 960,
@@ -588,7 +579,7 @@ pub fn repro_p9_bridge(
                         rms: 0.0,
                     });
                 }
-                bridge.whisper = Some(whisper);
+                bridge.attachment = Some(attachment);
                 bridge.on_secondary(SecondaryChunk {
                     samples: vec![0.0; 960],
                     frames: 960,
@@ -600,8 +591,8 @@ pub fn repro_p9_bridge(
                     peak: 0.0,
                     rms: 0.0,
                 });
-                bridge.report_whisper_failure(); // No carrier yet: retain the notification.
-                if scenario == "whisper-secondary-orphan" {
+                bridge.report_attachment_failure(); // No carrier yet: retain the notification.
+                if scenario == "attachment-secondary-orphan" {
                     bridge.on_primary(AudioChunk {
                         data: vec![0.0; 960],
                         frames: 960,
@@ -615,9 +606,9 @@ pub fn repro_p9_bridge(
                     });
                     bridge.drain_pairs();
                 } else {
-                    bridge.flush_whisper(scenario == "whisper-pending-stop"); // Recovery/stop must not erase pending failure.
+                    bridge.flush_attachment(scenario == "attachment-pending-stop"); // Recovery/stop must not erase pending failure.
                 }
-                bridge.report_whisper_failure();
+                bridge.report_attachment_failure();
                 bridge.retain_shutdown_outcome(None);
                 return;
             }
@@ -638,11 +629,9 @@ pub fn repro_p9_bridge(
                 peak: 0.25,
                 rms: 0.25,
             });
-            bridge.secondary_fifo.back_mut().unwrap().vad_events = Some(vec![JsVadEvent {
-                kind: "speechEnd".into(),
-                at_sample: BigInt::from(960u64),
-                at_ns: Some(20_000_000),
-            }]);
+            bridge.secondary_fifo.back_mut().unwrap().vad_events = Some(vec![vad::JsVadEvent(flexaudio_vad::AttachedVadEvent::Vad(flexaudio_vad::VadEvent {
+                epoch: 0, seq: 0, kind: flexaudio_vad::VadEventKind::Segment(flexaudio_vad::SpeechSegment { start_ms: 0, end_ms: 20 }),
+            }))]);
             bridge.on_primary(AudioChunk {
                 frame_index: 0,
                 data: vec![0.25; 960],
@@ -655,7 +644,7 @@ pub fn repro_p9_bridge(
                 rms: 0.25,
             });
             bridge.drain_pairs();
-            bridge.flush_vad_final();
+            bridge.emit_terminator();
         },
     )
     .map_err(|error| boundary::throw_error(&env, error))?;

@@ -20,6 +20,7 @@ crate-type = ["cdylib"]
 # cargo test --workspace builds this live addon for the Node integration test.
 [[example]]
 name = "capture_test_addon"
+required-features = ["test-faults"]
 path = "src/lib.rs"
 crate-type = ["cdylib"]
 test = false
@@ -52,4 +53,4 @@ napi-derive = "2.16"
 napi-build = "2"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(flexaudio_repro_addon)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(flexaudio_test_addon)'] }

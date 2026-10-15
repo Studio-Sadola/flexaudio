@@ -140,6 +140,7 @@ pub struct MacSystemBackend {
     device_id: Option<String>,
     /// Running flag (guards repeated start, signals stop, and tracks drop state). `Send`.
     stop_flag: Arc<AtomicBool>,
+    silence_probe: bool,
     /// Serializes probe-result publication with the stop signal (never with owner join).
     publication: Arc<PublicationGate>,
     /// Owner-reported terminal failure, retained after stop and mailbox consumption.
@@ -175,6 +176,7 @@ impl MacSystemBackend {
             exclude_pids: Vec::new(),
             device_id,
             stop_flag: Arc::new(AtomicBool::new(false)),
+            silence_probe: true,
             publication: Arc::new(PublicationGate::default()),
             terminal: Arc::new(TerminalFailure::default()),
             handle: None,
@@ -182,6 +184,12 @@ impl MacSystemBackend {
             events: None,
             native: FALLBACK_FORMAT,
         }
+    }
+
+    /// Enable or disable the private silence diagnostic signal. Enabled by default.
+    pub fn with_silence_probe(mut self, enabled: bool) -> Self {
+        self.silence_probe = enabled;
+        self
     }
 
     /// Exclude these pids' output in addition to `exclude_self`. Each pid is
@@ -229,6 +237,7 @@ impl CaptureBackend for MacSystemBackend {
         self.stop_flag.store(false, Ordering::SeqCst);
 
         let stop_flag = self.stop_flag.clone();
+        let silence_probe = self.silence_probe;
         let publication = self.publication.clone();
         let terminal = self.terminal.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
@@ -281,7 +290,10 @@ impl CaptureBackend for MacSystemBackend {
                     };
                 let kind = system_tap_kind(ids, device_uid);
                 run_tap_thread(
-                    kind,
+                    TapThreadConfig {
+                        kind,
+                        silence_probe,
+                    },
                     sink,
                     stop_flag,
                     publication,
@@ -353,11 +365,16 @@ impl Drop for MacSystemBackend {
 /// Owner-thread body for the tap chain (shared by system / process capture).
 ///
 /// Build the chain with [`build_tap_chain`] for `kind` and report success/failure through
+pub(crate) struct TapThreadConfig {
+    pub kind: TapKind,
+    pub silence_probe: bool,
+}
+
 /// `ready_tx`. After success, the IOProc continues processing blocks while this owner
 /// checks source activity and, once per generation, runs a bounded private self-probe.
 /// On stop or terminal denial, drop [`TapChain`] to release resources in reverse order.
 pub(crate) fn run_tap_thread(
-    kind: TapKind,
+    config: TapThreadConfig,
     sink: RawSink,
     stop_flag: Arc<AtomicBool>,
     publication: Arc<PublicationGate>,
@@ -365,6 +382,7 @@ pub(crate) fn run_tap_thread(
     ready_tx: mpsc::Sender<Result<()>>,
     event_tx: mpsc::Sender<Event>,
 ) -> Result<()> {
+    let kind = config.kind;
     let activity = ActivityQuery::new(&kind);
     // CATapDescription / aggregate display name (private, so collisions are harmless; debug only).
     let label = match &kind {
@@ -388,8 +406,10 @@ pub(crate) fn run_tap_thread(
 
     let origin = std::time::Instant::now();
     let mut generation_probe = GenerationProbe::default();
-    let mut detector = chain
-        .observed_format
+    let mut detector = config
+        .silence_probe
+        .then_some(chain.observed_format)
+        .flatten()
         .map(|(rate, channels)| SilenceDetector::new(rate, channels));
     // Process queries and message allocation stay on this owner thread, never in the IOProc.
     while !stop_flag.load(Ordering::SeqCst) {
@@ -471,6 +491,17 @@ pub(crate) fn run_tap_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silence_probe_defaults_on_and_can_be_disabled() {
+        assert!(MacSystemBackend::new(false, None).silence_probe);
+        assert!(
+            !MacSystemBackend::new(false, None)
+                .with_silence_probe(false)
+                .silence_probe
+        );
+    }
+
     use flexaudio_core::raw_ring;
 
     #[test]
@@ -747,12 +778,12 @@ mod repro_tests {
     use super::*;
 
     #[test]
-    fn repro_p7mac_unresolved_host_exclusion_fails_closed() {
+    fn regression_unresolved_host_exclusion_fails_closed() {
         assert!(resolve_exclusion(Ok(0), true, || Ok(())).is_err());
     }
 
     #[test]
-    fn repro_p7mac_unresolved_live_exclusion_fails_closed() {
+    fn regression_unresolved_live_exclusion_fails_closed() {
         assert!(resolve_exclusion(Ok(0), false, || Ok(())).is_err());
     }
 }

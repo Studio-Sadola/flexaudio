@@ -537,7 +537,7 @@ mod repro_tests {
     }
 
     #[test]
-    fn repro_p7mac_grouped_channels_preserve_frame_order() {
+    fn regression_grouped_channels_preserve_frame_order() {
         let mut front = [0.001, 0.002, 0.011, 0.012];
         let mut rear = [0.003, 0.004, 0.013, 0.014];
         let list = TwoBuffers {
@@ -573,7 +573,7 @@ mod repro_tests {
     }
 
     #[test]
-    fn repro_p7mac_unequal_planes_do_not_silently_truncate() {
+    fn regression_unequal_planes_do_not_silently_truncate() {
         let mut left = [0.001, 0.002, 0.003];
         let mut right = [0.004, 0.005];
         let list = TwoBuffers {
@@ -613,7 +613,7 @@ mod repro_tests {
     }
 
     #[test]
-    fn repro_p7mac_buffer_channels_must_match_sink() {
+    fn regression_buffer_channels_must_match_sink() {
         let mut samples = [0.001, 0.002];
         let list = AudioBufferList {
             mNumberBuffers: 1,

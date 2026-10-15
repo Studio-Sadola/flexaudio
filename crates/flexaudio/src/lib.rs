@@ -28,7 +28,7 @@ pub use flexaudio_core::types::{
     AudioChunk, AudioLoss, AudioPath, ChunkFlags, DefaultDeviceKind, DeviceEvent, DeviceInfo,
     Error, ErrorContext, ErrorGroup, ErrorKind, Event, LossReason, MixLane, NativeStatus,
     Operation, OutputFormat, OutputTap, Permission, ProcessInfo, ProcessMode, Result,
-    SecondaryChunk, ShutdownReport, SourceKind, StreamConfig, WhisperCode,
+    SecondaryChunk, ShutdownReport, SourceKind, StreamConfig, VadErrorCode,
 };
 pub use flexaudio_core::{AddonErrorKind, StartupDropReason};
 
@@ -260,6 +260,7 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
             config.exclude_self,
             config.exclude_pids.clone(),
             config.device_id.clone(),
+            config.silence_probe,
         )?,
 
         // Per-process output loopback is supported on Linux / Windows / macOS and requires target_pid.
@@ -284,7 +285,10 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    Box::new(flexaudio_os_macos::MacProcessBackend::new(pid, config.mode))
+                    Box::new(
+                        flexaudio_os_macos::MacProcessBackend::new(pid, config.mode)
+                            .with_silence_probe(config.silence_probe),
+                    )
                 }
             }
             #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
@@ -307,6 +311,7 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
                 config.exclude_self,
                 config.exclude_pids.clone(),
                 config.mix_system_device_id.clone(),
+                config.silence_probe,
             )?;
             Box::new(mix::CompositeBackend::new(
                 mic,
@@ -332,7 +337,10 @@ fn build_system_backend(
     exclude_self: bool,
     exclude_pids: Vec<u32>,
     device_id: Option<String>,
+    silence_probe: bool,
 ) -> Result<Box<dyn CaptureBackend>> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = silence_probe;
     #[cfg(target_os = "linux")]
     {
         Ok(Box::new(
@@ -351,7 +359,8 @@ fn build_system_backend(
     {
         Ok(Box::new(
             flexaudio_os_macos::MacSystemBackend::new(exclude_self, device_id)
-                .with_exclude_pids(exclude_pids),
+                .with_exclude_pids(exclude_pids)
+                .with_silence_probe(silence_probe),
         ))
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]

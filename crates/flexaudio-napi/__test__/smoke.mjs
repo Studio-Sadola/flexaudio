@@ -10,15 +10,7 @@
 //     - Confirm that at least one chunk arrives.
 //  3. The process exits cleanly without hanging after stop().
 
-import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
-
-const require = createRequire(import.meta.url);
-const here = dirname(fileURLToPath(import.meta.url));
-const addonPath = join(here, 'flexaudio.node');
-
-const native = require(addonPath);
+import { native } from './test-native.mjs';
 
 function assert(cond, msg) {
   if (!cond) {

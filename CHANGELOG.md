@@ -8,9 +8,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **0.x stability note:** while in the `0.x` series the public API is not yet
 > stable. Per SemVer, a **minor** bump (`0.2 → 0.3`) may include breaking
 > changes; **patch** bumps (`0.2.0 → 0.2.1`) remain backward-compatible. Pin to
-> `0.5` to receive only compatible updates.
+> `0.6` to receive only compatible updates.
 
 ## [Unreleased]
+
+## [0.6.0] - 2026-10-15
+
+### Breaking migration
+
+The 0.5.x series is deprecated. One generic `Vad` now provides the previous
+streaming segmenter, embedded Silero v6 inference, per-frame probabilities,
+provisional hints and capture attachment across Rust, Node.js, Python and C.
+The earlier speech-start/speech-end implementation is removed without aliases.
+Golden segment endpoints remain unchanged for the existing 16 kHz mono path.
+
+| Binding | Previous public API | 0.6.0 API or migration |
+|---|---|---|
+| Rust | `WhisperVad` | `Vad` |
+| Rust | `WhisperVadParams` | `VadOptions` |
+| Rust | `WhisperVadOptions` | `VadRuntimeOptions` |
+| Rust | `WhisperVadPostProcessor`, `whisper_speech_segments` | `VadPostProcessor`, `speech_segments` |
+| Rust | `WhisperSpeechSegment` | `SpeechSegment` |
+| Rust | `WhisperVadEvent`, `WhisperVadEventKind`, `AttachedWhisperVadEvent` | `VadEvent`, `VadEventKind`, `AttachedVadEvent` |
+| Rust | `WhisperVadTap`, `WhisperVadTapError`, `WhisperVadTapFailure` | `VadTap`, `VadTapError`, `VadTapFailure` |
+| Rust | `WhisperVadError`, `WhisperVadFailure`, `WhisperVadParameter`, `WhisperVadParameterReason`, `WhisperVadOperation` | `VadError`, `VadFailure`, `VadParameter`, `VadParameterReason`, `VadOperation` |
+| Rust | `WhisperCode`, `Error::WhisperVad`, `Error::whisper_code()` | `VadErrorCode`, `Error::Vad`, `Error::vad_code()` |
+| Rust | Earlier `Vad`, `VadConfig`, `Segment`, `get_speech_timestamps`, `VadCaptureEngine`, `VadCaptureOutcome`, `process_capture_chunk`, `finish_capture_gap` | Removed; use the unified session, `VadOptions`, `SpeechSegment`, `speech_segments`, and `VadTap` |
+| Rust | Earlier `Vad::{flush,config,converted_sample_position,take_pending_events,inject_failure,inject_reset_failure}`, `VadConfig::{aggressive,balanced,conservative,resolved_neg_threshold}`, `Segment::{start_ms,end_ms,len_samples}` | Removed with the earlier engine; use the surviving session lifecycle and explicit options |
+| Rust | Earlier `VadError` | Backend/converter causes are `InferenceError`; session failures are `VadError` |
+| Rust | `min_speech_duration_ms`, `min_silence_duration_ms`, `max_speech_duration_s` | `min_speech_ms`, `min_silence_ms`, `max_speech_ms` |
+| Node.js | `WhisperVad`, `WhisperVadParams`, `WhisperVadEvent`, `AttachedWhisperVadEvent`, `WhisperVadCloseReason` | `Vad`, `VadOptions`, `VadEvent`, `AttachedVadEvent`, `VadCloseReason` |
+| Node.js | `WhisperVadStreamOptions`, `OpenOptions.whisperVad` | `StreamVadOptions`, `OpenOptions.vad` |
+| Node.js | `minSpeechDurationMs`, `minSilenceDurationMs`, `maxSpeechDurationS` | `minSpeechMs`, `minSilenceMs`, integer `maxSpeechMs` |
+| Node.js | `flushWhisperVad()`, `whisperVadFailed`, `whisperCode`, `WhisperVadErrorCode` | `flushVad()`, `vadFailed`, `vadCode`, `VadErrorCode` |
+| Node.js | `WhisperVadError` | `VadError` |
+| Node.js | `JsAudioChunk.whisperVadEvents`, `JsSecondaryChunk.whisperVadEvents` | `vadEvents` with the unified event payloads |
+| Node.js | Earlier `Vad`, `JsVadEvent`, `VadFlushException`, `vadThreshold`, `vadTap`, `negThreshold`, `sampleRate` VAD mode, earlier `flushVad()` reset semantics | Removed; use final millisecond `segment` events and explicit `finish()`/`reset()` |
+| Node.js | `__openMockStream`, `__whisperVadTestFaults`, internal fault arguments | Removed from the published loader, declarations and native exports; device-free tests use a separate loader/build |
+| Python | `WhisperVad`, `WhisperVadParams`, `WhisperVadPostProcessor`, `whisper_speech_segments` | `Vad`, `VadOptions`, `VadPostProcessor`, `speech_segments` |
+| Python | `WhisperVadEvent`, `AttachedWhisperVadEvent`, `WhisperCode` and prefixed error types | Generic `VadEvent`, `AttachedVadEvent`, `VadErrorCode` and VAD error names |
+| Python | `WhisperVadStreamOptions`, `WhisperSpeechSegment`, `WhisperCloseReason`, `WhisperCutReason`, `WhisperVadValidationError`, `WhisperVadRuntimeError` | `StreamVadOptions`, `SpeechSegment`, `VadCloseReason`, `VadCutReason`, `VadValidationError`, `VadRuntimeError` |
+| Python | `AudioChunk.whisper_vad_events`, `AudioError.whisper_code`, `BackendErrorDict.whisper_code` | `vad_events`, `vad_code`, `vad_code` |
+| Python | `whisper_vad=`, `flush_whisper_vad()`, `whisper_code`, duration fields | `vad=`, `flush_vad()`, `vad_code`, `min_speech_ms`, `min_silence_ms`, `max_speech_ms` |
+| Python | Earlier `Vad`/`VadSettings`, `_VadFlushErrorFields`, start/end sample events and legacy integrated controls | Removed; use the unified session and attached stream options |
+| C | `FlexWhisperVad*`, `FlexWhisper*` payloads, `flexaudio_whisper_*` | Generic `FlexVad*` types and `flexaudio_vad_*` functions |
+| C | `FLEX_WHISPER_*`, `flexaudio_error_whisper_code_v2` | `FLEX_VAD_*` in a distinct status range and `flexaudio_error_vad_code_v2` |
+| C | `flexaudio_whisper_vad_default_params` | `flexaudio_vad_default_options` |
+| C | `flexaudio_whisper_vad_{new,process,finish,reset,probabilities,free}` | `flexaudio_vad_{new,process,finish,reset,probabilities,free}` |
+| C | `flexaudio_whisper_postprocessor_{new,process,finish,reset,free}` | `flexaudio_vad_postprocessor_{new,process,finish,reset,free}` |
+| C | `flexaudio_whisper_events_free`, `flexaudio_whisper_segments_free` | `flexaudio_vad_events_free`, `flexaudio_vad_segments_free` |
+| C | `flexaudio_flush_whisper_vad`, `flexaudio_chunk_whisper_vad_events`, `flexaudio_error_whisper_code_v2` | `flexaudio_flush_vad`, `flexaudio_chunk_vad_events`, `flexaudio_error_vad_code_v2` |
+| C | `FlexWhisperVad`, `FlexWhisperVadParams`, `FlexWhisperVadOptions`, `FlexWhisperVadPostProcessor`, `FlexWhisperVadStreamOptions`, `FlexWhisperSpeechSegment` | `FlexVad`, `FlexVadOptions`, `FlexVadRuntimeOptions`, `FlexVadPostProcessor`, `FlexStreamVadOptions`, `FlexSpeechSegment` |
+| C | `FlexWhisper{SpeechStart,SpeechEnd,Cut,EpochEnd,EpochStart}`, `FlexWhisperVad{Payload,Event}`, `FlexAttachedWhisperVad{Payload,Event}` | `FlexVad{SpeechStart,SpeechEnd,Cut,EpochEnd,EpochStart}`, `FlexVad{Payload,Event}`, `FlexAttachedVad{Payload,Event}` |
+| C | `FlexStreamConfigV2.whisper_vad`, `FlexChunkV2.whisper_vad_events{,_len}` | `vad`, `vad_events{,_len}` |
+| C | Earlier `flexaudio_vad_flush`, `FlexConfig.has_vad`, `FlexConfig.vad`, `FlexChunk.vad_events{,_len}`, `FLEX_WHISPER_CONFLICTING_VAD` | Removed; use attached v2 configuration and surviving finish/reset lifecycle |
+| C | Earlier `FlexVadConfig`, `FlexVadEvent` sample events and integrated configuration | Removed; use unified millisecond options/events and v2 attachment configuration |
+| All | `PermissionGranted` / `permissionGranted` | Removed; C event number 9 is reserved and never reused |
+
+### Defaults and behavior
+
+- Attached and standalone VAD share defaults: threshold 0.5, minimum speech
+  250 ms, minimum silence 100 ms, padding 30 ms, unbounded maximum, provisional
+  hints disabled. The earlier Node.js integrated 30000 ms maximum is removed.
+- C supplied `FlexVadOptions` values preserve literal zeros. The earlier
+  `FlexVadConfig` zero-sentinel defaults are removed; use NULL parameters or
+  `flexaudio_vad_default_options()` for the shared defaults.
+- Maximum speech duration is integer milliseconds; omitted or zero is unbounded.
+  Nonzero values use the exact 16 kHz split budget
+  `16 * maxSpeechMs - 512 - 32 * speechPadMs`; nonpositive budgets return
+  `InvalidParameter`. Subsecond values are never truncated to whole seconds.
+  Later merging can reunite splits, so this is not a final-duration/latency bound.
+- Standalone VAD accepts optional input rate/channels (16000/1 by default),
+  converts internally, and reports milliseconds on the input timeline with
+  converter group delay compensated. Finite resampler overshoot is clipped only
+  inside the standalone converter; raw normalized PCM validation stays strict.
+  Rust uses `process_pcm` for other formats.
+- Capture retains the 20 ms chunk requirement because its 960-frame canonical
+  blocks and converter phase alignment depend on it. Epochs, source-clock
+  anchors, provisional hints, EOF padding and failure isolation remain available.
+- macOS silence probing stays enabled by default. `silence_probe` / `silenceProbe`
+  lets applications disable its diagnostic tone without changing microphone consent.
+  C `FlexConfig.silence_probe` uses 0/default or 1/enabled and 2/disabled; other
+  values are invalid. The CLI exposes `--no-silence-probe`.
+- `PermissionPending` remains available to custom backends; built-in backends
+  do not emit it.
+
+### Fixed and packaging
+
+- VAD C status values no longer collide with core error codes; uniqueness is checked.
+- `flexaudio_free` always releases the stream and drops unread outputs. Stop and
+  drain first when final PCM or VAD events are needed.
+- Adapter contract fixtures inherit toolchain locations from the environment.
+- Public documentation, notices and fixture names use product-neutral language;
+  upstream attribution and all general-purpose capture/diagnostic fixes remain.
+- All distributed package versions are 0.6.0.
+
+[0.6.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.4...v0.6.0
 
 ## [0.5.4] - 2026-10-13
 
@@ -232,8 +325,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   teardown, tails or events. A stopped stream is spent: `start()` returns
   `InvalidState`; this was already true in 0.4 and is now explicit.
 - `AudioLoss`, `Clipped`, `RecoverableError`, `ShutdownError` and
-  `PermissionGranted` stream events. `PermissionGranted` was requested by
-  tranext and reports late microphone consent after a pending advisory.
+  `PermissionGranted` stream events (the grant event is retired in 0.6.0).
   Loss includes path, reason, format and an optional scalar-sample count;
   capture-tap overflow is also reported. The next output after observed loss
   carries `DISCONTINUITY`. Mix clipping is a coalesced advisory without exact
@@ -743,7 +835,7 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
   publication and interactive approval of new packages in scopes
   requiring 2FA. (1840fbb)
 
-[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.6.0...HEAD
 [0.5.2]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.4.0...v0.5.0

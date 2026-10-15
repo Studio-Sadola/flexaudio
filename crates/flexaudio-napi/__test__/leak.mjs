@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
-const native = require(join(here, 'flexaudio.node'));
+const { native } = await import('./test-native.mjs');
 
 if (typeof global.gc !== 'function') {
   console.error('leak.mjs requires node --expose-gc (global.gc is missing)');

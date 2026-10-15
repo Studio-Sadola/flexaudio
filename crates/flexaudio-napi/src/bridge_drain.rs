@@ -42,7 +42,6 @@ impl PairingBridge {
         if stream.terminal_error().is_some() {
             self.primary_fifo.clear();
             self.secondary_fifo.clear();
-            self.pending_flush_events.clear();
         }
     }
 }

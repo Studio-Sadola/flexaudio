@@ -33,10 +33,9 @@ mod v2;
 mod v2_records;
 mod v2_storage;
 mod vad;
+mod vad_integration;
+mod vad_types;
 mod watch;
-mod whisper_integration;
-mod whisper_types;
-mod whisper_vad;
 
 // This crate builds C libraries rather than an rlib, so compile the FFI regression tests
 // as a unit-test module while keeping their source under tests/.
@@ -134,8 +133,8 @@ fn fail(err: flexaudio::Error) -> i32 {
 /// The bound covers the undecided consent wait, not authorized native queries.
 /// Opening is synchronous; GUI hosts should use a worker thread.
 ///
-/// If `config.denoise` / `config.has_vad` is enabled, build the corresponding add-ons (noise
-/// suppression / VAD) here and attach them to the stream (`poll_chunk` applies denoise → VAD).
+/// `config.denoise` enables noise suppression on delivered PCM. Use `flexaudio_open_v2`
+/// with `FlexStreamVadOptions` to attach VAD on the canonical capture branch.
 /// When denoise is enabled, the output rate must be 48000 (otherwise return NULL and set
 /// last_error; RNNoise requires 48 kHz). Free the returned handle with `flexaudio_free`.
 /// This is equivalent to `flexaudio_open_with_exclude_pids(config, NULL, 0)`.
@@ -207,7 +206,7 @@ unsafe fn open_with_exclude_pids(
         };
         // Build add-ons (denoise / VAD) first. Reject a 48 kHz constraint violation or model
         // loading failure here (build_addons has set last_error). Return before touching devices.
-        let (denoiser, vad) = match integration::build_addons(config) {
+        let denoiser = match integration::build_addons(config) {
             Ok(pair) => pair,
             Err(()) => return std::ptr::null_mut(),
         };
@@ -216,15 +215,14 @@ unsafe fn open_with_exclude_pids(
                 shutdown: None,
                 shutdown_event_index: 0,
                 last_output: None,
-                whisper: None,
-                whisper_events: Vec::new(),
-                whisper_origin: (0, 0),
-                whisper_error: None,
-                whisper_cleanup: Vec::new(),
+                vad_tap: None,
+                vad_events: Vec::new(),
+                vad_origin: (0, 0),
+                vad_error: None,
+                vad_cleanup: Vec::new(),
                 ready_chunks: std::collections::VecDeque::new(),
                 inner,
                 denoiser,
-                vad,
             })),
             Err(e) => {
                 #[cfg(test)]
@@ -237,10 +235,7 @@ unsafe fn open_with_exclude_pids(
 }
 
 /// Run checked stop, then free the stream. NULL-safe. Cleanup failure remains in last_error.
-/// Attached v2 streams must be polled through their terminal carrier before free.
-/// If attached chunks remain unread, keep the handle alive and set last_error; poll
-/// with poll_chunk_v2 and call free again rather than silently losing closure events.
-/// Ordinary streams release unread PCM tails on free; call stop and poll first to retain them.
+/// Unread PCM and VAD events are dropped. Stop and drain first to retain final outputs.
 ///
 /// # Safety
 /// `s` must be a handle returned by `flexaudio_open` (or NULL). Do not use `s` after freeing it.
@@ -257,15 +252,6 @@ pub unsafe extern "C" fn flexaudio_free(s: *mut FlexStream) {
         }
         let mut stream = Box::from_raw(s);
         let result = stream.stop_binding();
-        if stream.whisper.is_some()
-            && (!stream.ready_chunks.is_empty() || !stream.whisper_events.is_empty())
-        {
-            set_last_error(
-                "PendingWhisperVadEvents: poll_chunk_v2 until drained, then call free again",
-            );
-            let _ = Box::into_raw(stream);
-            return code::FLEX_FAILURE;
-        }
         drop(stream);
         match result {
             Ok(()) => code::FLEX_OK,
@@ -293,7 +279,7 @@ pub unsafe extern "C" fn flexaudio_start(s: *mut FlexStream) -> i32 {
         match stream.inner.start() {
             Ok(()) => {
                 for mut chunk in stream.ready_chunks.drain(..) {
-                    crate::whisper_integration::flexaudio_chunk_free_v2(&mut chunk);
+                    crate::vad_integration::flexaudio_chunk_free_v2(&mut chunk);
                 }
                 stream.shutdown = None;
                 stream.shutdown_event_index = 0;
@@ -497,10 +483,8 @@ pub unsafe extern "C" fn flexaudio_dropped_chunks(s: *const FlexStream) -> u64 {
 /// enter the ordinary FIFO event queue before the generation's first chunk is published;
 /// event-first callers can observe them before polling that PCM.
 ///
-/// If add-ons are enabled, the chunk passes through denoise → VAD before it is returned. When
-/// VAD is enabled, confirmed events are stored in `out.vad_events` (with count
-/// `out.vad_events_len`) and freed along with `data` by `flexaudio_chunk_free` (NULL/0 when
-/// disabled or when there are no events).
+/// Optional noise suppression updates the returned PCM. Attached VAD streams require
+/// `flexaudio_poll_chunk_v2`, which also delivers ordered VAD events and epoch origins.
 ///
 /// # Safety
 /// `s` must be a valid handle, and `out` must point to a valid `FlexChunk` destination.
@@ -519,7 +503,7 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
             set_last_error("flexaudio_poll_chunk: out pointer is null");
             return code::FLEX_INVALID_ARG;
         }
-        if stream.whisper.is_some() {
+        if stream.vad_tap.is_some() {
             set_last_error("InvalidState: attached streams require flexaudio_poll_chunk_v2");
             return code::FLEX_INVALID_ARG;
         }
@@ -530,12 +514,12 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
                     out.write(chunk.chunk);
                     return 1;
                 }
-                whisper_integration::flexaudio_chunk_free_v2(&mut chunk);
+                vad_integration::flexaudio_chunk_free_v2(&mut chunk);
             }
             fail(error);
             return code::FLEX_FAILURE;
         }
-        // Write the result after add-ons (denoise → VAD); pass through unchanged if disabled.
+        // Apply optional noise suppression before publishing PCM.
         match stream.poll_processed() {
             Ok(Some(chunk)) => {
                 out.write(chunk);
@@ -548,7 +532,10 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
                 }
                 None => 0,
             },
-            Err(error) => crate::vad::vad_failure(error),
+            Err(error) => {
+                error::set_audio_error(error.audio_error());
+                code::FLEX_FAILURE
+            }
         }
     })
 }
@@ -636,10 +623,8 @@ pub unsafe extern "C" fn flexaudio_poll_event(s: *mut FlexStream, out: *mut Flex
 }
 
 /// Hot-swap the input source without stopping capture. `config.gain` is ignored because gain is
-/// stream state; change it with `flexaudio_set_gain`. `config.denoise` / `config.has_vad` /
-/// `config.vad` are also ignored because the add-ons configured at open remain in use. Since
-/// `switch_source` cannot change the output format, the 48 kHz constraint and VAD settings do
-/// not change.
+/// stream state; change it with `flexaudio_set_gain`. Add-on settings from open remain
+/// in use; `config.denoise` is ignored. The output format cannot change on a switch.
 /// This is equivalent to `flexaudio_switch_source_with_exclude_pids(s, config, NULL, 0)`.
 ///
 /// # Safety
@@ -972,15 +957,14 @@ mod permission_tests {
             shutdown: None,
             shutdown_event_index: 0,
             last_output: None,
-            whisper: None,
-            whisper_events: Vec::new(),
-            whisper_origin: (0, 0),
-            whisper_error: None,
-            whisper_cleanup: Vec::new(),
+            vad_tap: None,
+            vad_events: Vec::new(),
+            vad_origin: (0, 0),
+            vad_error: None,
+            vad_cleanup: Vec::new(),
             ready_chunks: std::collections::VecDeque::new(),
             inner: denied_stream(),
             denoiser: None,
-            vad: None,
         };
         let mut chunk = std::mem::MaybeUninit::<FlexChunk>::uninit();
         // SAFETY: stream is live and all output pointers reference writable local destinations.
@@ -1013,15 +997,14 @@ mod permission_tests {
             shutdown: None,
             shutdown_event_index: 0,
             last_output: None,
-            whisper: None,
-            whisper_events: Vec::new(),
-            whisper_origin: (0, 0),
-            whisper_error: None,
-            whisper_cleanup: Vec::new(),
+            vad_tap: None,
+            vad_events: Vec::new(),
+            vad_origin: (0, 0),
+            vad_error: None,
+            vad_cleanup: Vec::new(),
             ready_chunks: std::collections::VecDeque::new(),
             inner,
             denoiser: None,
-            vad: None,
         };
         // SAFETY: a valid local stream handle and explicitly permitted NULL are supplied.
         unsafe {
@@ -1033,8 +1016,8 @@ mod permission_tests {
 }
 
 #[cfg(test)]
-#[path = "../tests/ffi/repro_p11.rs"]
-mod repro_p11_tests;
+#[path = "../tests/ffi/ffi_boundary_validation.rs"]
+mod ffi_boundary_validation_tests;
 
 #[cfg(test)]
 #[path = "../tests/ffi/header.rs"]
@@ -1089,7 +1072,7 @@ pub unsafe extern "C" fn flexaudio_device_format_available_v2(
 }
 
 #[cfg(test)]
-mod round3_inventory_tests {
+mod inventory_policy_tests {
     use super::*;
     #[test]
     fn v2_format_accessor_preserves_v1_layout_and_zero_sentinel() {

@@ -147,7 +147,7 @@ mod repro_tests {
     use super::*;
     #[test]
     #[cfg(target_os = "linux")]
-    fn repro_p2_watcher_start_error() {
+    fn regression_watcher_start_error() {
         // Environment is restricted to a child process, so concurrently running
         // tests and the user's PipeWire session are untouched. No daemon is started.
         if std::env::var_os("FLEXAUDIO_REPRO_WATCHER_CHILD").is_none() {
@@ -156,7 +156,7 @@ mod repro_tests {
             std::fs::create_dir(&directory).unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
-                    "device_watcher::repro_tests::repro_p2_watcher_start_error",
+                    "device_watcher::repro_tests::regression_watcher_start_error",
                     "--exact",
                     "--include-ignored",
                     "--nocapture",
@@ -179,11 +179,11 @@ mod repro_tests {
         let result = watch_devices();
         assert!(
             result.is_err(),
-            "F26: native startup error={original}; facade returned Ok(NoopWatcher)"
+            "native startup error={original}; facade returned Ok(NoopWatcher)"
         );
     }
     #[test]
-    fn repro_p2_watcher_start_error_control() {
+    fn regression_watcher_start_error_control() {
         // Intentional no-op is benign on unsupported platforms, unlike failed
         // Linux startup. Exercise the same facade wrapper and pull interface.
         let mut watcher = DeviceWatcher {

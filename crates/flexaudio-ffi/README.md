@@ -11,7 +11,7 @@ In addition to core capture, this exposes three add-ons to C:
 - **FLAC** (streaming lossless compression of recording chunks, with rotation) — `flexaudio_flac_*`
 - **denoise** (noise suppression with RNNoise) — `flexaudio_denoise_*`
 
-VAD / denoise can also be built into a stream (`has_vad` / `denoise` in `FlexConfig`).
+Denoise uses `FlexConfig.denoise`; VAD attaches through `FlexStreamConfigV2.vad`.
 Device connection, disconnection, and default-device changes (hotplug) are available through
 the `flexaudio_watch_devices` family.
 Use `flexaudio_processes` to list candidates for per-process capture: processes with audio
@@ -146,76 +146,28 @@ Windows requires every listed PID to equal one process tree root (the current pr
 Linux matches exact PIDs without descendants. macOS honors the selected device alongside
 exclusion; Linux and Windows ignore device selection while exclusion is active.
 
-## Add denoise / VAD to a Stream
+## Noise Suppression and Attached VAD
 
-When `denoise` / `has_vad` is enabled, each chunk passes through **denoise → VAD** just before
-`flexaudio_poll_chunk` returns it. denoise requires 48 kHz output (`flexaudio_open` returns
-NULL if `output_rate` is not 48000). Confirmed VAD events are stored in
-`FlexChunk::vad_events` and freed along with `data` by `flexaudio_chunk_free`.
+Set `FlexConfig.denoise=1` to enable RNNoise on 48000 Hz output. With attached
+VAD, noise suppression runs on the shared capture branch before segmentation
+and output conversion. Otherwise it processes delivered chunks during polling.
+It introduces a 480-sample delay per channel; stop and poll to retain its tail.
+See the generic VAD section below for canonical capture attachment.
 
-VAD emits `SpeechStart` and `SpeechEnd` together when a segment is finalized,
-not when speech first begins. On `DISCONTINUITY` (`flags & 1`), an open pre-gap
-segment is flushed before the post-gap PCM is processed. Flushed events come
-first and retain their pre-gap `at_sample` values; VAD then restarts its sample
-clock at zero. Positions are measured at the VAD rate (16000 or 8000 Hz), not
-in the chunk's PCM or `pts_ns` timeline.
-
-Consumers distinguish timelines by the discontinuity chunk: the core always
-delivers 20 ms chunks, which cannot complete a fresh 32 ms VAD inference frame.
-Consequently **all events on the discontinuity chunk belong to the pre-gap
-timeline**, and all events on subsequent chunks belong to the new timeline.
-Handle that chunk's events under the previous timeline before advancing your
-VAD timeline; the chunk's PCM itself already belongs to the post-gap timeline.
-For example, a flushed pair at 0/512 on the discontinuity chunk is old; a pair
-at 0/1024 delivered later is new. Do not infer the boundary from a decrease in
-`at_sample`: delayed post-gap speech need not produce one. A mixed event list
-from larger chunks would require an explicit flushed-event count or timeline
-identifier; larger chunks are not supported by the current core.
-
-If the discontinuity flush fails, VAD reset is still attempted and denoise is
-still reset before `flexaudio_poll_chunk` returns `FLEX_FAILURE` and records the
-flush error in `flexaudio_last_error()`. That poll consumes the chunk. When
-reset succeeds, later chunks process normally without repeating that flush
-error. If VAD reset itself fails, its failure remains latched and subsequent
-processing reports it until a reset succeeds.
-
-```c
-FlexConfig cfg = {0};
-cfg.kind = FLEX_SOURCE_KIND_MIC;
-cfg.denoise = true;      // Requires 48k output (output_rate=0 means 48000)
-cfg.has_vad = true;      // All-zero cfg.vad uses Silero defaults (threshold 0.5, etc.)
-
-FlexStream *s = flexaudio_open(&cfg);
-/* ... start / poll ... */
-/* Use the drain_events helper from Basic Capture before every PCM poll. */
-if (drain_events(s) == 0 && flexaudio_poll_chunk(s, &chunk) == 1) {
-    for (size_t i = 0; i < chunk.vad_events_len; i++) {
-        FlexVadEvent ev = chunk.vad_events[i];   // kind: 0=start / 1=end
-        printf("%s @ %lld\n", ev.kind == 0 ? "speech-start" : "speech-end",
-               (long long)ev.at_sample);
-    }
-    flexaudio_chunk_free(&chunk);    // Free both data and vad_events
-}
-```
+`FlexConfig.silence_probe` accepts 0 (default enabled), 1 (enabled), or 2
+(disabled); other values are rejected. The macOS silence diagnosis probe plays
+a 1 kHz, 300 ms tone at amplitude 1e-5 after five seconds of exact-zero system
+capture. Set 2 to disable this optional diagnostic.
 
 ## Standalone Handles (Without a Stream)
 
 ### VAD
 
-You can pass f32 samples in any format; they are converted to mono and resampled to the VAD
-rate internally. Free the event array with `flexaudio_vad_events_free`.
-
-```c
-FlexVad *vad = flexaudio_vad_new(NULL);        // NULL = default settings
-FlexVadEvent *events = NULL;
-size_t n = 0;
-// samples: 48k/stereo interleaved f32 (len elements)
-if (flexaudio_vad_process(vad, samples, len, 48000, 2, &events, &n) == FLEX_OK) {
-    for (size_t i = 0; i < n; i++) { /* events[i].kind / at_sample */ }
-    flexaudio_vad_events_free(events, n);
-}
-flexaudio_vad_free(vad);
-```
+The generic VAD section below describes standalone sessions and capture
+attachment. Standalone input accepts arbitrary positive rates/channel counts,
+converts internally to mono16k, and reports integer milliseconds on the input
+timeline with converter group delay compensated. After raw input validation,
+finite resampler overshoot is clipped internally to [-1, 1].
 
 ### FLAC
 
@@ -289,29 +241,31 @@ and the embedded Silero model notice. From the repository root, regenerate it wi
 `scripts/gen-third-party-notices.sh`; CI checks it with
 `scripts/gen-third-party-notices.sh --check`.
 
-## Whisper-compatible VAD (additive ABI)
+## Generic VAD
 
-`flexaudio_whisper_vad_new(NULL, NULL)` creates a standalone mono16k normalized
+`flexaudio_vad_new(NULL, NULL)` creates a standalone mono16k normalized
 float32 session with the five pinned whisper.cpp segmentation defaults and
 preview disabled. The embedded inference model is Silero v6; segmentation is
 pinned to `85a69493a601d4ff5a834064f7b7bac250bd8739`. Use
-`flexaudio_whisper_vad_default_params()` to initialize parameters. An actual
+`flexaudio_vad_default_options()` to initialize parameters. An actual
 parameter struct uses literal values, including zero; signed durations reject
-negatives and values above 134217 ms. `FlexWhisperVadOptions.provisional` is a
+negatives and values above 134217 ms. `FlexVadRuntimeOptions.provisional` is a
 fixed-width byte accepting only 0 or 1.
 
 ```c
-FlexWhisperVad *vad = flexaudio_whisper_vad_new(NULL, NULL);
+FlexVad *vad = flexaudio_vad_new(NULL, NULL);
 if (vad) {
-    FlexWhisperVadEvent *events = NULL;
+    FlexVadEvent *events = NULL;
     size_t count = 0;
     float silence[513] = {0};
-    int32_t rc = flexaudio_whisper_vad_process(vad, silence, 513, &events, &count);
+    int32_t rc = flexaudio_vad_process(vad, silence, 513, 16000, 1, &events, &count);
+    if (rc < 0) fprintf(stderr, "%s\n", flexaudio_last_error());
     /* Consume/free events even when rc < 0: failure can carry terminal closure. */
-    flexaudio_whisper_events_free(events, count);
-    rc = flexaudio_whisper_vad_finish(vad, &events, &count);
-    flexaudio_whisper_events_free(events, count);
-    flexaudio_whisper_vad_free(vad);
+    flexaudio_vad_events_free(events, count);
+    rc = flexaudio_vad_finish(vad, &events, &count);
+    if (rc < 0) fprintf(stderr, "%s\n", flexaudio_last_error());
+    flexaudio_vad_events_free(events, count);
+    flexaudio_vad_free(vad);
 }
 ```
 
@@ -325,37 +279,41 @@ idempotent. `reset` returns closure before starting a new epoch. Consume all
 returned events, including typed fatal-error terminal batches on negative
 results. Validation returns NULL/0 outputs and preserves session state.
 
-`flexaudio_whisper_vad_probabilities` borrows the latest call's probability
+`flexaudio_vad_probabilities` borrows the latest call's probability
 array and first frame index until the next mutation/free. Copy it for longer
-retention. `flexaudio_whisper_postprocessor_*` processes 16k/512 frame
+retention. `flexaudio_vad_postprocessor_*` processes 16k/512 frame
 probabilities without inference; its owned segment arrays use
-`flexaudio_whisper_segments_free`, whereas event arrays use
-`flexaudio_whisper_events_free`. Pass the exact original lengths and never C
+`flexaudio_vad_segments_free`, whereas event arrays use
+`flexaudio_vad_events_free`. Pass the exact original lengths and never C
 `free`. A handle cannot be mutated concurrently. NULL input is allowed only at
 zero length; mandatory output pointers cannot be NULL.
 
-Maximum speech seconds retain pinned truncation/sentinel behavior. Fixed 200 ms
+`max_speech_ms` uses integer milliseconds; 0 means unbounded. Values below one
+inference frame plus twice the padding budget are rejected. Fixed 200 ms
 merging can undo maximum-duration splits, so final segment duration/finalization
 latency is unbounded. Optional provisional pieces have a separate 30000 ms cap.
 There are no audio-copying or timestamp-map APIs.
 
 `FlexStreamConfigV2`, `FlexChunkV2`, `flexaudio_open_v2`,
-`flexaudio_poll_chunk_v2`, and `flexaudio_chunk_free_v2` preserve the frozen v1
-config/chunk layouts. Initialize the versioned config's size to `sizeof` and
-version to `FLEX_STREAM_VERSION_2`; its config pointer references the unchanged
-v1 struct. A NULL `whisper_vad` selects ordinary capture. New-mode options reject
-legacy-VAD conflicts and secondary taps with explicit codes. Primary attachment
+`flexaudio_poll_chunk_v2`, and `flexaudio_chunk_free_v2` provide versioned
+configuration and chunks. Initialize the versioned config's size to `sizeof` and
+version to `FLEX_STREAM_VERSION_2`; its config pointer references `FlexConfig`. A NULL `vad` selects ordinary capture. Secondary taps are rejected with a dedicated VAD status code. Primary attachment
 uses producer-assigned canonical capture indices and valid tail lengths; attached
 events use a separate versioned union, including EPOCH_START=6 and its u64
-capture/i64 PTS origin. `flexaudio_flush_whisper_vad` is a no-op when disabled.
+capture/i64 PTS origin. `flexaudio_flush_vad` is a no-op when disabled.
 Both flush and stop finish processing internally and retain versioned chunks.
 PCM polling remains independent of event polling after flush or stop. Event-first
 callers can drain stream events before retained chunks to observe startup notices
 already enqueued before their generation's first chunk was published.
 
-An attached Whisper VAD failure closes its epoch once while capture and polling
+An attached VAD failure closes its epoch once while capture and polling
 continue. `flexaudio_stop` returns `FLEX_OK` for a VAD-only failure, and the
 shutdown report retains it among cleanup causes while its capture primary stays
-absent. Borrow its stable typed code with `flexaudio_error_whisper_code_v2` on
+absent. Borrow its stable typed code with `flexaudio_error_vad_code_v2` on
 the cleanup error. The next discontinuity or a successful explicit flush
 reinitializes the shared session before a new origin is published.
+
+`flexaudio_free` always stops and releases a live stream, including unread PCM
+and VAD events. Stop and drain first when final outputs are needed. Event kind 9
+is reserved; it is never reused. `permissionPending` remains for custom backends.
+VAD status codes occupy a distinct range starting at -100.

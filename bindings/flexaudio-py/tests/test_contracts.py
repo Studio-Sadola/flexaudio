@@ -40,7 +40,6 @@ class DeclarationContracts(unittest.TestCase):
             "RecoveredEventDict": ("recovered", None),
             "PermissionDeniedEventDict": ("permissionDenied", "permission"),
             "PermissionPendingEventDict": ("permissionPending", "permission"),
-            "PermissionGrantedEventDict": ("permissionGranted", "permission"),
             "SilenceWhileSourceActiveEventDict": ("silenceWhileSourceActive", "message"),
             "DeviceLostEventDict": ("deviceLost", None),
             "LegacyErrorEventDict": ("error", "message"),
@@ -59,7 +58,6 @@ class DeclarationContracts(unittest.TestCase):
             if payload is not None:
                 self.assertIn(payload, fields)
             self.assertFalse(any(field.startswith("Optional[") for field in fields.values()))
-        self.assertEqual(self.fields("PermissionGrantedEventDict")["permission"], "Literal['microphone']")
 
     def test_startup_drop_payload_is_typed(self):
         self.assertEqual(self.fields("StartupSamplesDroppedEventDict")["frames"], "int")
@@ -89,7 +87,7 @@ class DeclarationContracts(unittest.TestCase):
             common = {"kind", "message", "contexts", "secondary", "diagnostic_details", "addon_kind", "addon_message"}
             specific = {
                 "RecordingPermission": {"permission"}, "NativeFormatChanged": {"advertised", "actual"},
-                "Backend": {"whisper_code"},
+                "Backend": {"vad_code"},
             }.get(name, set())
             self.assertEqual(set(fields), common | specific)
             self.assertEqual(fields["diagnostic_details"], "List[str]")
@@ -102,7 +100,7 @@ class DeclarationContracts(unittest.TestCase):
         self.assertEqual(set(self.fields("AudioLossDict")), {"path", "reason", "samples", "sample_rate", "channels"})
         self.assertEqual(set(self.fields("ShutdownReportDict")), {"primary", "cleanup_errors"})
 
-    def test_backend_whisper_code_is_optional_and_exclusive(self):
+    def test_backend_vad_code_is_optional_and_exclusive(self):
         # Execute only the declarations, so this test needs no native extension.
         end = next(
             index for index, node in enumerate(self.tree.body)
@@ -115,10 +113,10 @@ class DeclarationContracts(unittest.TestCase):
         exec(compile(declarations, "flexaudio.pyi", "exec"), namespace)
         for name in self.members("AudioErrorDict"):
             fields = self.fields(name)
-            self.assertEqual("whisper_code" in fields, name == "BackendErrorDict")
+            self.assertEqual("vad_code" in fields, name == "BackendErrorDict")
         backend = namespace["BackendErrorDict"]
-        self.assertEqual(self.fields("BackendErrorDict")["whisper_code"], "WhisperCode")
-        self.assertEqual(backend.__optional_keys__, {"whisper_code"})
+        self.assertEqual(self.fields("BackendErrorDict")["vad_code"], "VadErrorCode")
+        self.assertEqual(backend.__optional_keys__, {"vad_code"})
         self.assertEqual(backend.__required_keys__, {"kind", "message", "contexts", "secondary", "diagnostic_details", "addon_kind", "addon_message"})
 
 

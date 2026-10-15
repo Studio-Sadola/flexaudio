@@ -8,7 +8,7 @@
 //!
 //! Run: `cargo run -p flexaudio-vad --example probe`
 
-use flexaudio_vad::{Vad, VadConfig};
+use flexaudio_vad::{Vad, VadOptions, VadRuntimeOptions};
 
 fn main() {
     // Deterministic input: 440 Hz sine at amplitude 0.5.
@@ -19,10 +19,11 @@ fn main() {
         samples.push(v);
     }
 
-    let mut vad = Vad::new(VadConfig::default()).expect("model load");
+    let mut vad =
+        Vad::new(VadOptions::default(), VadRuntimeOptions::default()).expect("model load");
     // Submit all input at once. Internally, it is batched into 512-sample windows for inference; read raw probabilities.
     vad.process(&samples).unwrap();
-    let probs = vad.last_frame_probabilities();
+    let probs = vad.last_frame_probabilities().values;
 
     for p in probs.iter().take(10) {
         println!("{p:.6}");

@@ -6,7 +6,7 @@ use std::ffi::CStr;
 use std::ptr;
 
 use crate::error::code;
-use crate::types::{FlexConfig, FlexProcessMode, FlexSourceKind, FlexStream, FlexVadConfig};
+use crate::types::{FlexConfig, FlexProcessMode, FlexSourceKind, FlexStream};
 use crate::{
     flexaudio_free, flexaudio_last_error, flexaudio_open, flexaudio_open_with_exclude_pids,
     flexaudio_switch_source, flexaudio_switch_source_with_exclude_pids,
@@ -28,16 +28,7 @@ fn config(kind: i32) -> FlexConfig {
         mix_mic_gain: 0.0,
         mix_system_gain: 0.0,
         denoise: 0,
-        has_vad: 0,
-        vad: FlexVadConfig {
-            threshold: 0.0,
-            neg_threshold: 0.0,
-            min_speech_ms: 0,
-            min_silence_ms: 0,
-            speech_pad_ms: 0,
-            max_speech_ms: 0,
-            sample_rate: 0,
-        },
+        silence_probe: 0,
     }
 }
 
@@ -102,15 +93,14 @@ fn mock_handle() -> Handle {
         shutdown: None,
         shutdown_event_index: 0,
         last_output: None,
-        whisper: None,
-        whisper_events: Vec::new(),
-        whisper_origin: (0, 0),
-        whisper_error: None,
-        whisper_cleanup: Vec::new(),
+        vad_tap: None,
+        vad_events: Vec::new(),
+        vad_origin: (0, 0),
+        vad_error: None,
+        vad_cleanup: Vec::new(),
         ready_chunks: std::collections::VecDeque::new(),
         inner,
         denoiser: None,
-        vad: None,
     })))
 }
 

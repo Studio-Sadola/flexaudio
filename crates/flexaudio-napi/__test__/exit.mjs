@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
-const native = require(join(here, 'flexaudio.node'));
+const { native } = await import('./test-native.mjs');
 
 const stream = native.__openMockStream(48000, 2, 440.0, () => {});
 await new Promise((r) => setTimeout(r, 80));

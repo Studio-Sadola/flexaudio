@@ -572,10 +572,10 @@ mod addon_cause_tests {
 }
 
 #[cfg(test)]
-mod round2_tests {
+mod error_projection_tests {
     use super::*;
     #[test]
-    fn round2_flac_create_preserves_argument_and_addon_causes() {
+    fn typed_flac_create_preserves_argument_and_addon_causes() {
         for (path, rate, channels, addon) in [
             (std::ptr::null(), 16_000, 1, None),
             (
@@ -609,7 +609,7 @@ mod round2_tests {
         }
     }
     #[test]
-    fn round2_flac_v1_message_keeps_os_cause_and_v2_typed_cause() {
+    fn typed_flac_v1_message_keeps_os_cause_and_v2_typed_cause() {
         let cause = EncodeError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         let expected = cause.to_string();
         assert_eq!(flac_err(cause), code::FLEX_FAILURE);

@@ -165,8 +165,8 @@ impl AudioError {
         self.0.permission().map(fa::Permission::as_str)
     }
     #[getter]
-    fn whisper_code(&self) -> Option<&'static str> {
-        self.0.whisper_code().map(fa::WhisperCode::as_str)
+    fn vad_code(&self) -> Option<&'static str> {
+        self.0.vad_code().map(fa::VadErrorCode::as_str)
     }
     #[getter]
     fn diagnostic_details(&self) -> Vec<String> {
@@ -223,8 +223,8 @@ impl AudioError {
         if let Some(permission) = self.permission() {
             d.set_item("permission", permission)?;
         }
-        if let Some(code) = self.whisper_code() {
-            d.set_item("whisper_code", code)?;
+        if let Some(code) = self.vad_code() {
+            d.set_item("vad_code", code)?;
         }
         if let (Some(advertised), Some(actual)) = (self.advertised(), self.actual()) {
             d.set_item("advertised", advertised.to_dict(py)?)?;
@@ -609,10 +609,10 @@ mod retained_cause_tests {
 }
 
 #[cfg(test)]
-mod round2_tests {
+mod error_projection_tests {
     use super::*;
     #[test]
-    fn round2_python_flac_exceptions_retain_shared_addon_projection() {
+    fn typed_python_flac_exceptions_retain_shared_addon_projection() {
         Python::initialize();
         Python::attach(|py| {
             for cause in [

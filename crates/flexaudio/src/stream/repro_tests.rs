@@ -89,11 +89,11 @@ fn restart(restart: bool) {
     );
 }
 #[test]
-fn repro_p2_restart() {
+fn regression_restart() {
     restart(true);
 }
 #[test]
-fn repro_p2_restart_control() {
+fn regression_restart_control() {
     restart(false);
 }
 
@@ -118,15 +118,15 @@ fn rollback(fail: bool) {
     assert!(
         !fail
             || matches!(&error, Error::Multiple(group) if group.secondary().any(|error| matches!(error, Error::Context { context, .. } if context.operation() == Operation::Rollback))),
-        "F10: both opens failed but returned cause={error:?}; rollback cause absent"
+        "both opens failed but returned cause={error:?}; rollback cause absent"
     );
 }
 #[test]
-fn repro_p2_rollback() {
+fn regression_rollback() {
     rollback(true);
 }
 #[test]
-fn repro_p2_rollback_control() {
+fn regression_rollback_control() {
     rollback(false);
 }
 
@@ -186,15 +186,15 @@ fn recovery(feed: bool) {
     // A recovery is legitimate only when samples were actually delivered afterwards.
     assert!(
         !recovered || delivered > 0,
-        "F11: StreamRecovered emitted with no samples ever supplied: delivered_frames={delivered}, recovered={recovered}"
+        "StreamRecovered emitted with no samples ever supplied: delivered_frames={delivered}, recovered={recovered}"
     );
 }
 #[test]
-fn repro_p2_false_recovery() {
+fn regression_false_recovery() {
     recovery(false);
 }
 #[test]
-fn repro_p2_false_recovery_control() {
+fn regression_false_recovery_control() {
     recovery(true);
 }
 
@@ -244,11 +244,11 @@ fn final_buffer(late: bool) {
     assert!(delivered > 0, "NEW-final-buffer: intake exited before backend final push: delivered_frames={delivered}, stranded_raw_samples={pending}");
 }
 #[test]
-fn repro_p2_final_buffer() {
+fn regression_final_buffer() {
     final_buffer(true);
 }
 #[test]
-fn repro_p2_final_buffer_control() {
+fn regression_final_buffer_control() {
     final_buffer(false);
 }
 
@@ -274,14 +274,14 @@ fn initial_snapshot(stale: bool) {
     );
     let chunk = stream.poll_chunk().unwrap();
     let real = chunk.data.iter().filter(|&&s| s == 0.25).count();
-    assert_eq!(real, 1920, "F06: new mono ring interpreted with stale stereo snapshot: real_output_samples={real}, expected=1920");
+    assert_eq!(real, 1920, "new mono ring interpreted with stale stereo snapshot: real_output_samples={real}, expected=1920");
 }
 #[test]
-fn repro_p2_generation_snapshot() {
+fn regression_generation_snapshot() {
     initial_snapshot(true);
 }
 #[test]
-fn repro_p2_generation_snapshot_control() {
+fn regression_generation_snapshot_control() {
     initial_snapshot(false);
 }
 
@@ -305,11 +305,11 @@ fn poison(poison: bool) {
     );
 }
 #[test]
-fn repro_p2_event_poison() {
+fn regression_event_poison() {
     poison(true);
 }
 #[test]
-fn repro_p2_event_poison_control() {
+fn regression_event_poison_control() {
     poison(false);
 }
 
@@ -323,15 +323,15 @@ fn shutdown(panic: bool) {
     let terminal = stream.terminal_error();
     assert!(
         !panic || event.is_some() || terminal.is_some(),
-        "F37: injected stop panic swallowed: event={event:?}, terminal_error={terminal:?}"
+        "injected stop panic swallowed: event={event:?}, terminal_error={terminal:?}"
     );
 }
 #[test]
-fn repro_p2_shutdown_panic() {
+fn regression_shutdown_panic() {
     shutdown(true);
 }
 #[test]
-fn repro_p2_shutdown_panic_control() {
+fn regression_shutdown_panic_control() {
     shutdown(false);
 }
 
@@ -351,11 +351,11 @@ fn tail_metadata(partial: bool) {
     );
 }
 #[test]
-fn repro_p2_padding_metadata() {
+fn regression_padding_metadata() {
     tail_metadata(true);
 }
 #[test]
-fn repro_p2_padding_metadata_control() {
+fn regression_padding_metadata_control() {
     tail_metadata(false);
 }
 
@@ -370,17 +370,17 @@ fn clipping(clip: bool) {
     let event = stream.poll_event();
     assert!(
         !clip || !chunk.flags.is_empty() || event.is_some(),
-        "F16: saturated sample={}, flags={:?}, event={event:?}",
+        "saturated sample={}, flags={:?}, event={event:?}",
         chunk.data[0],
         chunk.flags
     );
 }
 #[test]
-fn repro_p2_clipping_metadata() {
+fn regression_clipping_metadata() {
     clipping(true);
 }
 #[test]
-fn repro_p2_clipping_metadata_control() {
+fn regression_clipping_metadata_control() {
     clipping(false);
 }
 
@@ -421,11 +421,11 @@ fn secondary_loss(overflow: bool) {
     );
 }
 #[test]
-fn repro_p2_secondary_drop_event() {
+fn regression_secondary_drop_event() {
     secondary_loss(true);
 }
 #[test]
-fn repro_p2_secondary_drop_event_control() {
+fn regression_secondary_drop_event_control() {
     secondary_loss(false);
 }
 
@@ -434,11 +434,11 @@ fn repro_p2_secondary_drop_event_control() {
 // production spawn code or exhausting the host's process/thread quota.
 #[test]
 #[cfg(target_os = "linux")]
-fn repro_p2_spawn_failure() {
+fn regression_spawn_failure() {
     if std::env::var_os("FLEXAUDIO_REPRO_SPAWN_CHILD").is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "stream::repro_tests::repro_p2_spawn_failure",
+                "stream::repro_tests::regression_spawn_failure",
                 "--exact",
                 "--include-ignored",
                 "--nocapture",
@@ -513,11 +513,11 @@ fn repro_p2_spawn_failure() {
     drop(stream);
     assert!(
         !live.load(Ordering::SeqCst),
-        "F12: {error}; Drop after failed startup left backend active=true"
+        "{error}; Drop after failed startup left backend active=true"
     );
 }
 #[test]
-fn repro_p2_spawn_failure_control() {
+fn regression_spawn_failure_control() {
     let be = Backend::silent();
     let live = be.live.clone();
     let mut stream = open(be);

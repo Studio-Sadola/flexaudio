@@ -150,8 +150,7 @@ pub struct PyAudioChunk {
     samples: Vec<f32>,
     // Events finalized by integrated VAD (start/end and absolute sample position). The getter
     // converts them to PyVadEvent. Empty when disabled.
-    vad_events: Vec<(bool, u64)>,
-    whisper_events: Option<Vec<flexaudio_vad::AttachedWhisperVadEvent>>,
+    vad_events: Option<Vec<flexaudio_vad::AttachedVadEvent>>,
     #[pyo3(get)]
     frame_index: u64,
     #[pyo3(get)]
@@ -183,28 +182,19 @@ impl PyAudioChunk {
         PyBytes::new(py, &buf)
     }
 
-    /// New-mode events are absent when whisper attachment is disabled.
+    /// New-mode events are absent when vad_tap attachment is disabled.
     #[getter]
-    fn whisper_vad_events(&self, py: Python<'_>) -> PyResult<Option<Vec<Py<PyAny>>>> {
-        self.whisper_events
+    fn vad_events(&self, py: Python<'_>) -> PyResult<Option<Vec<Py<PyAny>>>> {
+        self.vad_events
             .as_ref()
             .map(|events| {
                 events
                     .iter()
                     .cloned()
-                    .map(|event| crate::whisper_marshal::attached_to_py(py, event))
+                    .map(|event| crate::vad_marshal::attached_to_py(py, event))
                     .collect()
             })
             .transpose()
-    }
-
-    /// Integrated VAD events finalized for this chunk. Empty when VAD is disabled.
-    #[getter]
-    fn vad_events(&self) -> Vec<PyVadEvent> {
-        self.vad_events
-            .iter()
-            .map(|&(is_start, at_sample)| PyVadEvent::new(is_start, at_sample))
-            .collect()
     }
 
     fn __repr__(&self) -> String {
@@ -217,27 +207,20 @@ impl PyAudioChunk {
             self.dropped_before,
             self.peak,
             self.rms,
-            self.vad_events.len(),
+            self.vad_events.as_ref().map_or(0, Vec::len),
         )
     }
 }
 
 impl PyAudioChunk {
-    pub(crate) fn set_whisper_events(
-        &mut self,
-        events: Vec<flexaudio_vad::AttachedWhisperVadEvent>,
-    ) {
-        self.whisper_events = Some(events);
+    pub(crate) fn set_vad_events(&mut self, events: Vec<flexaudio_vad::AttachedVadEvent>) {
+        self.vad_events = Some(events);
     }
 
-    pub(crate) fn extend_vad_events(&mut self, events: Vec<(bool, u64)>) {
-        self.vad_events.extend(events);
-    }
     pub(crate) fn has_audio_or_vad(&self) -> bool {
         !self.samples.is_empty()
-            || !self.vad_events.is_empty()
             || self
-                .whisper_events
+                .vad_events
                 .as_ref()
                 .is_some_and(|events| !events.is_empty())
     }
@@ -261,26 +244,16 @@ impl PyAudioChunk {
         };
     }
 
-    /// Mutable sample reference for in-place denoising (used during poll).
-    pub(crate) fn samples_mut(&mut self) -> &mut [f32] {
-        &mut self.samples
-    }
-
     /// Sample reference for VAD to read (used during poll).
     pub(crate) fn samples(&self) -> &[f32] {
         &self.samples
-    }
-
-    /// Set events finalized by integrated VAD (start flag and absolute sample position).
-    pub(crate) fn set_vad_events(&mut self, events: Vec<(bool, u64)>) {
-        self.vad_events = events;
     }
 }
 
 pub(crate) fn chunk_to_py(chunk: AudioChunk) -> PyAudioChunk {
     PyAudioChunk {
         frame_index: chunk.frame_index,
-        whisper_events: None,
+        vad_events: None,
         frames: chunk.frames,
         pts_ns: chunk.pts_ns,
         seq: chunk.seq,
@@ -289,7 +262,6 @@ pub(crate) fn chunk_to_py(chunk: AudioChunk) -> PyAudioChunk {
         peak: chunk.peak,
         rms: chunk.rms,
         samples: chunk.data,
-        vad_events: Vec::new(),
     }
 }
 
@@ -383,10 +355,6 @@ pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
             "startupSamplesDropped"
         }
         Event::Clipped => "clipped",
-        Event::PermissionGranted => {
-            result.permission = Some("microphone".into());
-            "permissionGranted"
-        }
         Event::ChunkDropped { count } => {
             result.count = Some(count);
             "chunkDropped"
@@ -419,55 +387,6 @@ pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
     }
     .into();
     result
-}
-
-// ---------------------------------------------------------------------------
-// VadEvent (pyclass and getters)
-// ---------------------------------------------------------------------------
-
-/// Speech-boundary event finalized by VAD. `type` is "speech_start" or "speech_end".
-///
-/// `at_sample` is an absolute sample index at the **VAD internal rate (16000 or 8000)**, not an
-/// index into the input samples (same for `Vad.process` and integrated VAD). Convert to seconds with
-/// `at_sample / sample_rate`.
-#[pyclass(module = "flexaudio", name = "VadEvent", frozen)]
-pub struct PyVadEvent {
-    #[pyo3(get, name = "type")]
-    kind: String,
-    #[pyo3(get)]
-    at_sample: u64,
-}
-
-#[pymethods]
-impl PyVadEvent {
-    fn __repr__(&self) -> String {
-        format!(
-            "VadEvent(type={:?}, at_sample={})",
-            self.kind, self.at_sample
-        )
-    }
-}
-
-impl PyVadEvent {
-    /// Create from the start flag and absolute sample position (`true` = speech_start).
-    pub(crate) fn new(is_start: bool, at_sample: u64) -> PyVadEvent {
-        PyVadEvent {
-            kind: if is_start {
-                "speech_start"
-            } else {
-                "speech_end"
-            }
-            .to_string(),
-            at_sample,
-        }
-    }
-}
-
-pub(crate) fn vad_event_to_py(ev: flexaudio_vad::VadEvent) -> PyVadEvent {
-    match ev {
-        flexaudio_vad::VadEvent::SpeechStart { at_sample } => PyVadEvent::new(true, at_sample),
-        flexaudio_vad::VadEvent::SpeechEnd { at_sample } => PyVadEvent::new(false, at_sample),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -606,7 +525,7 @@ mod tests {
     use fa::SourceKind;
 
     #[test]
-    fn whisper_only_event_batches_remain_deliverable() {
+    fn vad_tap_only_event_batches_remain_deliverable() {
         let mut carrier = chunk_to_py(AudioChunk {
             frame_index: 0,
             data: Vec::new(),
@@ -619,11 +538,11 @@ mod tests {
             rms: 0.0,
         });
         assert!(!carrier.has_audio_or_vad());
-        carrier.set_whisper_events(vec![flexaudio_vad::AttachedWhisperVadEvent::Vad(
-            flexaudio_vad::WhisperVadEvent {
+        carrier.set_vad_events(vec![flexaudio_vad::AttachedVadEvent::Vad(
+            flexaudio_vad::VadEvent {
                 epoch: 0,
                 seq: 1,
-                kind: flexaudio_vad::WhisperVadEventKind::EpochEnd {
+                kind: flexaudio_vad::VadEventKind::EpochEnd {
                     reason: flexaudio_vad::EpochEndReason::Error,
                 },
             },
@@ -632,7 +551,7 @@ mod tests {
             carrier.has_audio_or_vad(),
             "an event-only terminal must not be discarded"
         );
-        carrier.set_whisper_events(Vec::new());
+        carrier.set_vad_events(Vec::new());
         assert!(!carrier.has_audio_or_vad());
     }
 
@@ -736,7 +655,6 @@ mod tests {
         assert_eq!(py.dropped_before, 3);
         assert_eq!(py.samples, vec![0.0, 1.0, -1.0, 0.5]);
         // Integrated VAD events are empty by default.
-        assert!(py.vad_events.is_empty());
     }
 
     #[test]
@@ -757,16 +675,6 @@ mod tests {
         assert_eq!(py.sample_rate, 44_100);
         assert!(py.is_loopback);
         assert!(!py.is_default);
-    }
-
-    #[test]
-    fn vad_event_to_py_maps_both_variants() {
-        let start = vad_event_to_py(flexaudio_vad::VadEvent::SpeechStart { at_sample: 512 });
-        assert_eq!(start.kind, "speech_start");
-        assert_eq!(start.at_sample, 512);
-        let end = vad_event_to_py(flexaudio_vad::VadEvent::SpeechEnd { at_sample: 1024 });
-        assert_eq!(end.kind, "speech_end");
-        assert_eq!(end.at_sample, 1024);
     }
 
     #[test]
@@ -833,7 +741,6 @@ mod parity_tests {
                     "shutdownError",
                     "error",
                 ),
-                (Event::PermissionGranted, "permissionGranted", "permission"),
                 (
                     Event::AudioLoss {
                         loss: fa::AudioLoss::raw_overflow(

@@ -1,6 +1,6 @@
-//! Independent pinned-oracle fixtures provided by the coordinator.
+//! Independent whisper.cpp segmentation fixtures with frozen expected outputs.
 use flate2::read::GzDecoder;
-use flexaudio_vad::{WhisperVadParams, WhisperVadPostProcessor};
+use flexaudio_vad::{VadOptions, VadPostProcessor};
 use serde::Deserialize;
 use std::io::Read;
 
@@ -22,8 +22,10 @@ struct Case {
 #[serde(deny_unknown_fields)]
 struct Params {
     threshold: f32,
-    min_speech_duration_ms: u32,
-    min_silence_duration_ms: u32,
+    #[serde(rename = "min_speech_duration_ms")]
+    min_speech_ms: u32,
+    #[serde(rename = "min_silence_duration_ms")]
+    min_silence_ms: u32,
     max_speech_duration_s: f32,
     speech_pad_ms: u32,
 }
@@ -32,7 +34,7 @@ struct Params {
 fn pinned_whisper_cpp_golden_in_random_partitions() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/whisper_vad_golden.json");
-    let data=std::fs::read_to_string(&path).unwrap_or_else(|error|panic!("Required pinned whisper.cpp golden fixture is missing or unreadable: {} ({error}). The coordinator must provide it; this conformance test must not be skipped.",path.display()));
+    let data=std::fs::read_to_string(&path).unwrap_or_else(|error|panic!("Required pinned whisper.cpp golden fixture is missing or unreadable: {} ({error}). This conformance test requires the committed fixture.",path.display()));
     check_fixture(&data);
 }
 
@@ -42,7 +44,7 @@ fn extreme_pinned_whisper_cpp_golden_in_random_partitions() {
         .join("tests/fixtures/whisper_vad_golden_extreme.json.gz");
     let file = std::fs::File::open(&path).unwrap_or_else(|error| {
         panic!(
-            "Required extreme pinned whisper.cpp golden fixture is missing or unreadable: {} ({error}). The coordinator must provide it; this conformance test must not be skipped.",
+            "Required extreme pinned whisper.cpp golden fixture is missing or unreadable: {} ({error}). This conformance test requires the committed fixture.",
             path.display()
         )
     });
@@ -84,16 +86,16 @@ fn check_fixture(data: &str) {
                 })
             })
             .collect();
-        let params = WhisperVadParams {
+        let params = VadOptions {
             threshold: case.params.threshold,
-            min_speech_duration_ms: case.params.min_speech_duration_ms,
-            min_silence_duration_ms: case.params.min_silence_duration_ms,
-            max_speech_duration_s: case.params.max_speech_duration_s,
+            min_speech_ms: case.params.min_speech_ms,
+            min_silence_ms: case.params.min_silence_ms,
+            max_speech_ms: migrated_maximum(&case.params),
             speech_pad_ms: case.params.speech_pad_ms,
         };
         for partition in 0..20 {
             let mut processor =
-                WhisperVadPostProcessor::new(params.clone()).expect("valid oracle parameters");
+                VadPostProcessor::new(params.clone()).expect("valid oracle parameters");
             let mut segments = Vec::new();
             let mut offset = 0;
             while offset < probabilities.len() {
@@ -128,5 +130,22 @@ fn check_fixture(data: &str) {
                 case.name, partition
             );
         }
+    }
+}
+
+// Frozen fixtures describe the older seconds API. Translate its effective
+// integer-second/sentinel settings; expected segment values remain untouched.
+fn migrated_maximum(params: &Params) -> u32 {
+    let seconds = params.max_speech_duration_s;
+    if seconds > 100_000.0 {
+        return 0;
+    }
+    let milliseconds = seconds.trunc() * 1000.0;
+    assert!(milliseconds.is_finite() && (0.0..=100_000_000.0).contains(&milliseconds));
+    let milliseconds = milliseconds as u32;
+    if u64::from(milliseconds) <= 32 + 2 * u64::from(params.speech_pad_ms) {
+        0
+    } else {
+        milliseconds
     }
 }

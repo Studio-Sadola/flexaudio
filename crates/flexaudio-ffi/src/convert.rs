@@ -14,12 +14,11 @@ use std::slice;
 use flexaudio::{
     AudioChunk, DeviceInfo, Event, OutputFormat, ProcessInfo, ProcessMode, SourceKind, StreamConfig,
 };
-use flexaudio_vad::{VadConfig, VadEvent};
 
 use crate::error::set_last_error;
 use crate::types::{
     FlexChunk, FlexConfig, FlexDeviceInfo, FlexEvent, FlexEventKind, FlexOutputActivity,
-    FlexProcessInfo, FlexProcessMode, FlexSourceKind, FlexVadConfig, FlexVadEvent,
+    FlexProcessInfo, FlexProcessMode, FlexSourceKind,
 };
 
 // Values used when mapping sentinel 0 to defaults (matching StreamConfig defaults).
@@ -129,11 +128,13 @@ pub(crate) fn validate_config(config: &FlexConfig) -> Result<(), ()> {
     for (field, value) in [
         ("exclude_self", config.exclude_self),
         ("denoise", config.denoise),
-        ("has_vad", config.has_vad),
     ] {
         if value > 1 {
             return invalid_config(&format!("{field} must be 0 or 1"));
         }
+    }
+    if config.silence_probe > 2 {
+        return invalid_config("silence_probe must be 0, 1, or 2");
     }
     if config.chunk_ms != 0 && config.chunk_ms != DEFAULT_CHUNK_MS {
         return ::flexaudio::core::validate_chunk_ms(config.chunk_ms).map_err(|error| {
@@ -219,6 +220,7 @@ pub unsafe fn build_config(
         // mode is process-only; exclude_self is system-only. The facade handles them separately.
         mode: process_mode_from_c(config.mode)?,
         exclude_self: config.exclude_self != 0,
+        silence_probe: config.silence_probe != 2,
         exclude_pids,
         chunk_ms: if config.chunk_ms == 0 {
             DEFAULT_CHUNK_MS
@@ -265,8 +267,6 @@ pub fn chunk_to_c(chunk: AudioChunk) -> FlexChunk {
         rms,
         // The caller (poll_processed) adds VAD events later, only when enabled.
         // Default is "none".
-        vad_events: ptr::null_mut(),
-        vad_events_len: 0,
     }
 }
 
@@ -282,109 +282,14 @@ pub unsafe fn free_chunk_data(chunk: &mut FlexChunk) {
         chunk.len = 0;
     }
     // The VAD event array is also owned by this chunk, so free it too.
-    free_vad_events(chunk.vad_events, chunk.vad_events_len);
-    chunk.vad_events = ptr::null_mut();
-    chunk.vad_events_len = 0;
 }
 
-/// Convert `FlexVadConfig` to [`VadConfig`] (sentinel 0 selects the default).
-///
-/// Defaults come from [`VadConfig::default`]; only nonzero fields override them.
-/// For `max_speech_ms`, 0 means "unlimited" and is not treated as a sentinel.
-/// For `neg_threshold`, 0 maps to `None` (automatic Silero-style selection).
-pub fn vad_config_from_c(c: &FlexVadConfig) -> VadConfig {
-    let d = VadConfig::default();
-    VadConfig {
-        threshold: if c.threshold == 0.0 {
-            d.threshold
-        } else {
-            c.threshold
-        },
-        neg_threshold: if c.neg_threshold == 0.0 {
-            d.neg_threshold
-        } else {
-            Some(c.neg_threshold)
-        },
-        min_speech_ms: if c.min_speech_ms == 0 {
-            d.min_speech_ms
-        } else {
-            c.min_speech_ms
-        },
-        min_silence_ms: if c.min_silence_ms == 0 {
-            d.min_silence_ms
-        } else {
-            c.min_silence_ms
-        },
-        speech_pad_ms: if c.speech_pad_ms == 0 {
-            d.speech_pad_ms
-        } else {
-            c.speech_pad_ms
-        },
-        // 0 means "unlimited" (the default), so pass it through.
-        max_speech_ms: c.max_speech_ms,
-        sample_rate: if c.sample_rate == 0 {
-            d.sample_rate
-        } else {
-            c.sample_rate
-        },
-    }
-}
-
-/// Preserve the signed v1 range without wrapping exact u64 values negative.
+/// Preserve the signed counter range without wrapping exact u64 values negative.
 fn signed_position(value: u64) -> i64 {
     i64::try_from(value).unwrap_or_else(|_| {
         set_last_error("v1 counter exceeds INT64_MAX; value saturated");
         i64::MAX
     })
-}
-
-/// Convert [`VadEvent`] to `FlexVadEvent` (start = 0 / end = 1).
-pub fn vad_event_to_c(ev: VadEvent) -> FlexVadEvent {
-    match ev {
-        VadEvent::SpeechStart { at_sample } => FlexVadEvent {
-            kind: 0,
-            at_sample: signed_position(at_sample),
-        },
-        VadEvent::SpeechEnd { at_sample } => FlexVadEvent {
-            kind: 1,
-            at_sample: signed_position(at_sample),
-        },
-    }
-}
-
-/// Convert a sequence of [`VadEvent`] values to a C array (`*mut FlexVadEvent` + element count).
-///
-/// If empty, allocate nothing and return `(NULL, 0)` (C recognizes either NULL or len==0 as
-/// absent). Otherwise, allocate exactly the element count with `into_boxed_slice` so
-/// `free_vad_events` can reconstruct and free it with the same count (`shrink_to_fit` is not used).
-pub fn vad_events_to_c(events: Vec<VadEvent>) -> (*mut FlexVadEvent, usize) {
-    if events.is_empty() {
-        return (ptr::null_mut(), 0);
-    }
-    let boxed: Box<[FlexVadEvent]> = events.into_iter().map(vad_event_to_c).collect();
-    let len = boxed.len();
-    let data = Box::into_raw(boxed) as *mut FlexVadEvent;
-    (data, len)
-}
-
-/// Reconstruct and drop the array allocated by `vad_events_to_c`. NULL / 0 is a no-op.
-///
-/// # Safety
-/// `ptr`/`len` must be values returned by `vad_events_to_c` (or NULL/0).
-pub unsafe fn free_vad_events(ptr: *mut FlexVadEvent, len: usize) {
-    if ptr.is_null() && len == 0 {
-        return;
-    }
-    if !valid_array(ptr, len) || ptr.is_null() || len == 0 {
-        crate::error::set_audio_error(flexaudio::Error::InvalidArg(
-            "invalid VAD event array".into(),
-        ));
-        return;
-    }
-    // FlexVadEvent is Copy and owns no heap data, so reconstructing and dropping the boxed
-    // slice is sufficient (no per-element cleanup is needed).
-    let slice = slice::from_raw_parts_mut(ptr, len);
-    drop(Box::from_raw(slice as *mut [FlexVadEvent]));
 }
 
 /// Convert [`Event`] to `FlexEvent`. Put `Error` messages in last_error (`FlexEvent` itself
@@ -452,10 +357,7 @@ pub fn event_to_c(ev: Event) -> FlexEvent {
                 count: 0,
             }
         }
-        Event::StartupSamplesDropped { .. }
-        | Event::AudioLoss { .. }
-        | Event::Clipped
-        | Event::PermissionGranted => {
+        Event::StartupSamplesDropped { .. } | Event::AudioLoss { .. } | Event::Clipped => {
             // New advisory events have no representable v1 payload.
             FlexEvent {
                 kind: FlexEventKind::Unknown as i32,
@@ -634,7 +536,6 @@ mod tests {
             assert_eq!(last_audio_error(), Some(error.clone()));
         }
         for event in [
-            Event::PermissionGranted,
             Event::Clipped,
             Event::AudioLoss {
                 loss: flexaudio::AudioLoss::raw_overflow(None, None, 48000, 2).unwrap(),
@@ -651,13 +552,6 @@ mod tests {
             assert_eq!(event_to_c(Event::ChunkDropped { count }).count, i64::MAX);
             assert!(!crate::error::last_error_ptr().is_null());
             clear_last_error();
-            for event in [
-                VadEvent::SpeechStart { at_sample: count },
-                VadEvent::SpeechEnd { at_sample: count },
-            ] {
-                assert_eq!(vad_event_to_c(event).at_sample, i64::MAX);
-                assert!(!crate::error::last_error_ptr().is_null());
-            }
         }
         clear_last_error();
         let legacy = event_to_c(Event::Error("secret diagnostic must stay private".into()));
@@ -667,19 +561,6 @@ mod tests {
             .unwrap();
         assert_eq!(message, "backend error: legacy capture failure");
         assert!(!message.contains("secret diagnostic"));
-    }
-
-    // All-zero fields in FlexVadConfig mean all defaults.
-    fn zero_vad_config() -> FlexVadConfig {
-        FlexVadConfig {
-            threshold: 0.0,
-            neg_threshold: 0.0,
-            min_speech_ms: 0,
-            min_silence_ms: 0,
-            speech_pad_ms: 0,
-            max_speech_ms: 0,
-            sample_rate: 0,
-        }
     }
 
     // Build FlexConfig for tests (NULL strings = defaults, numeric 0 = sentinel).
@@ -699,9 +580,25 @@ mod tests {
             mix_mic_gain: 0.0,
             mix_system_gain: 0.0,
             denoise: 0,
-            has_vad: 0,
-            vad: zero_vad_config(),
+            silence_probe: 0,
         }
+    }
+
+    #[test]
+    fn silence_probe_accepts_only_documented_states() {
+        for (state, enabled) in [(0, true), (1, true), (2, false)] {
+            let mut config = make_config(FlexSourceKind::Mic as i32);
+            config.silence_probe = state;
+            assert_eq!(
+                unsafe { build_config(&config, Vec::new()) }
+                    .unwrap()
+                    .silence_probe,
+                enabled
+            );
+        }
+        let mut config = make_config(FlexSourceKind::Mic as i32);
+        config.silence_probe = 3;
+        assert!(unsafe { build_config(&config, Vec::new()) }.is_err());
     }
 
     #[test]
@@ -709,6 +606,7 @@ mod tests {
         let c = make_config(FlexSourceKind::Mic as i32);
         let cfg = unsafe { build_config(&c, Vec::new()) }.unwrap();
         assert_eq!(cfg.kind, SourceKind::Mic);
+        assert!(cfg.silence_probe);
         // Sentinel 0 selects the default.
         assert_eq!(cfg.output.sample_rate, 48_000);
         assert_eq!(cfg.output.channels, 2);
@@ -1064,119 +962,5 @@ mod tests {
         let out2 = resolve_output(&c2);
         assert_eq!(out2.sample_rate, 16_000);
         assert_eq!(out2.channels, 1);
-    }
-
-    #[test]
-    fn vad_config_all_zero_is_default() {
-        // All-zero FlexVadConfig matches VadConfig::default().
-        let cfg = vad_config_from_c(&zero_vad_config());
-        assert_eq!(cfg, VadConfig::default());
-    }
-
-    #[test]
-    fn vad_config_reflects_explicit_values() {
-        let c = FlexVadConfig {
-            threshold: 0.4,
-            neg_threshold: 0.2,
-            min_speech_ms: 300,
-            min_silence_ms: 200,
-            speech_pad_ms: 40,
-            max_speech_ms: 5000,
-            sample_rate: 8000,
-        };
-        let cfg = vad_config_from_c(&c);
-        assert_eq!(cfg.threshold, 0.4);
-        assert_eq!(cfg.neg_threshold, Some(0.2));
-        assert_eq!(cfg.min_speech_ms, 300);
-        assert_eq!(cfg.min_silence_ms, 200);
-        assert_eq!(cfg.speech_pad_ms, 40);
-        assert_eq!(cfg.max_speech_ms, 5000);
-        assert_eq!(cfg.sample_rate, 8000);
-    }
-
-    #[test]
-    fn vad_config_max_speech_zero_stays_unlimited() {
-        // max_speech_ms 0 means "unlimited", so it is not a sentinel (0 → 0).
-        let mut c = zero_vad_config();
-        c.max_speech_ms = 0;
-        assert_eq!(vad_config_from_c(&c).max_speech_ms, 0);
-    }
-
-    #[test]
-    fn vad_event_maps_start_and_end() {
-        assert_eq!(
-            vad_event_to_c(VadEvent::SpeechStart { at_sample: 512 }),
-            FlexVadEvent {
-                kind: 0,
-                at_sample: 512,
-            }
-        );
-        assert_eq!(
-            vad_event_to_c(VadEvent::SpeechEnd { at_sample: 1024 }),
-            FlexVadEvent {
-                kind: 1,
-                at_sample: 1024,
-            }
-        );
-    }
-
-    #[test]
-    fn vad_events_empty_is_null() {
-        // Empty event lists allocate nothing and return (NULL, 0); free is a no-op.
-        let (ptr, len) = vad_events_to_c(Vec::new());
-        assert!(ptr.is_null());
-        assert_eq!(len, 0);
-        unsafe { free_vad_events(ptr, len) };
-    }
-
-    #[test]
-    fn vad_events_roundtrip_and_free() {
-        // Round-trip a hand-built event list through into_boxed_slice, readback, and free
-        // (verify exact-size allocation/free consistency without shrink_to_fit).
-        let events = vec![
-            VadEvent::SpeechStart { at_sample: 0 },
-            VadEvent::SpeechEnd { at_sample: 512 },
-            VadEvent::SpeechStart { at_sample: 2048 },
-        ];
-        let (ptr, len) = vad_events_to_c(events);
-        assert_eq!(len, 3);
-        assert!(!ptr.is_null());
-        let view = unsafe { slice::from_raw_parts(ptr, len) };
-        assert_eq!(view[0].kind, 0);
-        assert_eq!(view[0].at_sample, 0);
-        assert_eq!(view[1].kind, 1);
-        assert_eq!(view[1].at_sample, 512);
-        assert_eq!(view[2].kind, 0);
-        assert_eq!(view[2].at_sample, 2048);
-        unsafe { free_vad_events(ptr, len) };
-    }
-
-    #[test]
-    fn free_chunk_data_also_frees_vad_events() {
-        // Allocate both data from chunk_to_c and appended vad_events; verify free_chunk_data
-        // releases both and resets them to NULL/0 (double-free is safe too).
-        let chunk = AudioChunk {
-            frame_index: 0,
-            data: vec![0.0, 0.1, 0.2, 0.3],
-            frames: 2,
-            pts_ns: 0,
-            seq: 0,
-            flags: ChunkFlags::empty(),
-            dropped_before: 0,
-            peak: 0.3,
-            rms: 0.1,
-        };
-        let mut fc = chunk_to_c(chunk);
-        let (ptr, len) = vad_events_to_c(vec![VadEvent::SpeechStart { at_sample: 0 }]);
-        fc.vad_events = ptr;
-        fc.vad_events_len = len;
-
-        unsafe { free_chunk_data(&mut fc) };
-        assert!(fc.data.is_null());
-        assert_eq!(fc.len, 0);
-        assert!(fc.vad_events.is_null());
-        assert_eq!(fc.vad_events_len, 0);
-        // Safe to free twice.
-        unsafe { free_chunk_data(&mut fc) };
     }
 }

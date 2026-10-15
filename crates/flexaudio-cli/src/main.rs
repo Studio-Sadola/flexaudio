@@ -226,6 +226,10 @@ struct Cli {
     #[arg(long, default_value_t = 2)]
     output_channels: u16,
 
+    /// Disable the macOS silence diagnosis probe tone.
+    #[arg(long)]
+    no_silence_probe: bool,
+
     /// Input gain (linear multiplier). Default 1.0; 1.0 leaves audio unchanged, 2.0 is about +6 dB,
     /// and 0.0 is silence. Samples are clamped to ±1.0 after multiplication. Negative and NaN
     /// values are errors.
@@ -349,6 +353,7 @@ fn parse_sources(spec: &str) -> std::result::Result<Vec<Segment>, String> {
 fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
     StreamConfig {
         kind,
+        silence_probe: !cli.no_silence_probe,
         output: cli.output_format(),
         target_pid: cli.process_id,
         // `mode` applies only to process segments (the facade ignores it for mic/system).
@@ -1707,6 +1712,14 @@ mod tests {
     /// `config_for_kind` correctly copies shared CLI settings (output / pid / mode / exclude_self /
     /// device_id) into StreamConfig and overrides kind with the argument.
     #[test]
+    fn silence_probe_defaults_on_and_can_be_disabled() {
+        let defaults = cli_from(&[]);
+        assert!(config_for_kind(&defaults, SourceKind::SystemLoopback).silence_probe);
+        let disabled = cli_from(&["--no-silence-probe"]);
+        assert!(!config_for_kind(&disabled, SourceKind::SystemLoopback).silence_probe);
+    }
+
+    #[test]
     fn config_for_kind_reflects_cli_settings() {
         let cli = cli_from(&[
             "--source",
@@ -2496,7 +2509,7 @@ mod reproduction_tests {
     }
 
     #[test]
-    fn repro_p12_f48_legacy_fatal_final_event() {
+    fn legacy_fatal_final_event() {
         let result = repro_wav_capture(Some(flexaudio::Event::Error(
             "normalizer push failed: injected fatal DSP failure".into(),
         )));
@@ -2507,7 +2520,7 @@ mod reproduction_tests {
     }
 
     #[test]
-    fn repro_p12_f48_control_and_typed_terminal() {
+    fn control_and_typed_terminal() {
         assert!(repro_wav_capture(None).is_ok());
         let result = repro_wav_capture(Some(flexaudio::Event::TerminalError {
             error: Error::Backend("injected terminal failure".into()),
@@ -2518,7 +2531,7 @@ mod reproduction_tests {
     }
 
     #[test]
-    fn repro_p12_reopen_warnings_continue_until_recovery() {
+    fn reopen_warnings_continue_until_recovery() {
         use flexaudio::core::{ErrorContext, Operation};
         let warning = || flexaudio::Event::RecoverableError {
             error: Error::Backend("normalizer push failed: recoverable reopen failure".into())
@@ -2529,7 +2542,7 @@ mod reproduction_tests {
             vec![
                 warning(),
                 flexaudio::Event::Clipped,
-                flexaudio::Event::PermissionGranted,
+                flexaudio::Event::StreamRecovered,
                 flexaudio::Event::AudioLoss {
                     loss: flexaudio::core::AudioLoss::raw_overflow(
                         None,
@@ -2546,7 +2559,7 @@ mod reproduction_tests {
     }
 
     #[test]
-    fn repro_p12_poll_panic_warning_does_not_fail_recording() {
+    fn poll_panic_warning_does_not_fail_recording() {
         repro_capture_events(
             vec![flexaudio::Event::RecoverableError {
                 error: Error::Backend("backend event polling panicked".into()),
@@ -2558,7 +2571,7 @@ mod reproduction_tests {
     }
 
     #[test]
-    fn repro_p12_shutdown_failure_drains_and_fails() {
+    fn shutdown_failure_drains_and_fails() {
         let error = repro_capture_events(
             Vec::new(),
             vec![
@@ -2566,7 +2579,7 @@ mod reproduction_tests {
                     error: Error::Backend("cleanup failed".into()),
                 },
                 flexaudio::Event::Clipped,
-                flexaudio::Event::PermissionGranted,
+                flexaudio::Event::StreamRecovered,
             ],
             Some(Error::Backend("producer shutdown failed".into())),
         )
@@ -2637,7 +2650,7 @@ mod reproduction_tests {
     }
 
     #[test]
-    fn repro_p12_f50_split_overflow() {
+    fn split_overflow() {
         let cli = cli_from(&["--split-seconds", "18446744073709551615"]);
         let result = std::panic::catch_unwind(|| {
             RotatingWavWriter::new(
@@ -2650,7 +2663,7 @@ mod reproduction_tests {
     }
 
     #[test]
-    fn repro_p12_f50_deadline_overflow() {
+    fn deadline_overflow() {
         let dir = test_dir("deadline_overflow");
         let destination = dir.join("capture.wav");
         let cli = cli_from(&[
@@ -2679,7 +2692,7 @@ mod reproduction_tests {
     }
 
     #[test]
-    fn repro_p12_f50_control() {
+    fn control() {
         let cli = cli_from(&["--split-seconds", "1"]);
         let writer = RotatingWavWriter::new(
             Path::new("unused.wav"),
@@ -2693,7 +2706,7 @@ mod reproduction_tests {
     }
 
     #[test]
-    fn repro_p12_split_path_and_permission_controls() {
+    fn split_path_and_permission_controls() {
         assert!(validate_output_path(Path::new(".")).is_err());
         assert!(validate_output_path(Path::new("recording.wav")).is_ok());
         let message = describe_error(Error::PermissionDenied {

@@ -29,8 +29,8 @@ impl FlexStream {
         let mut cleanup = core.cleanup().to_vec();
         self.shutdown_event_index = cleanup.len();
         if core.primary().is_none() {
-            if self.whisper.is_some() {
-                self.stop_whisper();
+            if self.vad_tap.is_some() {
+                self.stop_vad_tap();
             } else {
                 // Collect first, then queue: polling also reads the retained delivery queue.
                 let mut chunks = Vec::new();
@@ -48,7 +48,6 @@ impl FlexStream {
                         }
                     }
                 }
-                let mut events = Vec::new();
                 let output = self.inner.config().output;
                 let tail = self
                     .denoiser
@@ -56,25 +55,7 @@ impl FlexStream {
                     .filter(|_| self.last_output.is_some())
                     .map(flexaudio_denoise::Denoiser::flush)
                     .unwrap_or_default();
-                if let Some(vad) = self.vad.as_mut() {
-                    let outcome = flexaudio_vad::finish_capture_gap(vad, |vad| {
-                        if tail.is_empty() {
-                            Ok(Vec::new())
-                        } else {
-                            vad.process_pcm(&tail, output.sample_rate, output.channels)
-                        }
-                    });
-                    events.extend(outcome.flushed);
-                    match outcome.processed {
-                        Ok(remaining) => events.extend(remaining),
-                        Err(error) => cleanup.push(
-                            error
-                                .audio_error()
-                                .with_context(ErrorContext::new(Operation::Flush)),
-                        ),
-                    }
-                }
-                if !tail.is_empty() || !events.is_empty() {
+                if !tail.is_empty() {
                     let (frame_index, pts_ns, seq) = self.last_output.unwrap_or((0, 0, 0));
                     let (peak, rms) = crate::integration::peak_rms(&tail);
                     let chunk = AudioChunk {
@@ -88,10 +69,7 @@ impl FlexStream {
                         peak,
                         rms,
                     };
-                    let mut chunk = crate::convert::chunk_to_c(chunk);
-                    let (pointer, len) = crate::convert::vad_events_to_c(events);
-                    chunk.vad_events = pointer;
-                    chunk.vad_events_len = len;
+                    let chunk = crate::convert::chunk_to_c(chunk);
                     chunks.push(chunk);
                 }
                 for chunk in chunks {
@@ -104,9 +82,9 @@ impl FlexStream {
             if let Some(d) = self.denoiser.as_mut() {
                 d.reset();
             }
-            self.stop_whisper();
+            self.stop_vad_tap();
         }
-        cleanup.extend(self.whisper_cleanup.iter().cloned());
+        cleanup.extend(self.vad_cleanup.iter().cloned());
         let report = ShutdownReport::new(core.primary().cloned(), cleanup);
         let result = report.result();
         self.shutdown = Some(report);

@@ -1,10 +1,5 @@
-// Dependency policy: add a DLL to the allowlist only when there is evidence that Windows itself provides it.
-// The evidence-backed list is OS_RESOLVED_DLL_NAMES in tranext's build/check-win-pe-imports.mjs.
-// Do not expand the allowlist to silence reports. Forbidden patterns take precedence over allowed
-// names, so they are caught even if mistakenly added to the allowlist.
-
-// The English reason comments below are copied verbatim from tranext's build/check-win-pe-imports.mjs (2c6cf74).
-// DLLs Windows itself always resolves: importing one of these is never a missing dependency.
+// System DLL allowlist for supported Windows N-API distributions.
+// Unexpected runtime dependencies fail closed.
 export const ALLOWED_DLL_NAMES = Object.freeze([
   // Win32 base + core COM/OLE: loaded into (or reachable from) every process.
   'kernel32.dll',

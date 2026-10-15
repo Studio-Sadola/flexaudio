@@ -39,10 +39,6 @@ impl CaptureEventReporter {
                 eprintln!("Warning: upstream audio was clipped; exact output chunk attribution is unavailable");
                 Ok(())
             }
-            Event::PermissionGranted => {
-                eprintln!("Microphone recording permission granted");
-                Ok(())
-            }
             Event::PermissionPending { detail, .. }
             | Event::SilenceWhileSourceActive { detail } => {
                 eprintln!("Warning: {detail}");

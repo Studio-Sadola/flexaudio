@@ -1,4 +1,4 @@
-//! Frozen 0.4 v1 physical layouts for the supported 64-bit C ABIs.
+//! Physical layouts for the 0.6 C ABI for the supported 64-bit C ABIs.
 //!
 //! These expectations apply to Linux x86_64/aarch64, Windows x86_64 MSVC,
 //! and macOS x86_64/aarch64: four-byte enums, one-byte bool, eight-byte
@@ -34,25 +34,21 @@ macro_rules! assert_layout {
     target_pointer_width = "64",
     any(target_os = "linux", target_os = "windows", target_os = "macos")
 ))]
-fn v1_all_fields_retain_04_supported_64_bit_layout() {
+fn all_fields_have_supported_64_bit_layout() {
     assert_eq!(size_of::<i32>(), 4);
     assert_eq!(size_of::<u8>(), 1);
     assert_eq!(size_of::<FlexSourceKind>(), 4);
     assert_eq!(size_of::<FlexProcessMode>(), 4);
     assert_eq!(size_of::<FlexEventKind>(), 4);
     assert_eq!(size_of::<FlexOutputActivity>(), 4);
-    assert_layout!(FlexVadConfig, 28, 4;
-        threshold = 0 => f32, neg_threshold = 4 => f32, min_speech_ms = 8 => u32,
-        min_silence_ms = 12 => u32, speech_pad_ms = 16 => u32, max_speech_ms = 20 => u32, sample_rate = 24 => u32);
-    assert_layout!(FlexVadEvent, 16, 8; kind = 0 => i32, at_sample = 8 => i64);
-    assert_layout!(FlexConfig, 104, 8;
+    assert_layout!(FlexConfig, 80, 8;
         kind = 0 => FlexSourceKind, device_id = 8 => *const c_char, process_id = 16 => u32, mode = 20 => FlexProcessMode, exclude_self = 24 => bool,
         output_rate = 28 => u32, output_channels = 32 => u16, chunk_ms = 36 => u32, gain = 40 => f32,
         mix_mic_device_id = 48 => *const c_char, mix_system_device_id = 56 => *const c_char, mix_mic_gain = 64 => f32,
-        mix_system_gain = 68 => f32, denoise = 72 => bool, has_vad = 73 => bool, vad = 76 => FlexVadConfig);
-    assert_layout!(FlexChunk, 72, 8;
+        mix_system_gain = 68 => f32, denoise = 72 => u8, silence_probe = 73 => u8);
+    assert_layout!(FlexChunk, 56, 8;
         data = 0 => *mut f32, len = 8 => usize, frames = 16 => u32, pts_ns = 24 => i64, seq = 32 => u64, flags = 40 => u32,
-        dropped_before = 44 => u32, peak = 48 => f32, rms = 52 => f32, vad_events = 56 => *mut FlexVadEvent, vad_events_len = 64 => usize);
+        dropped_before = 44 => u32, peak = 48 => f32, rms = 52 => f32);
     assert_layout!(FlexEvent, 16, 8; kind = 0 => FlexEventKind, count = 8 => i64);
     assert_layout!(FlexDeviceInfo, 32, 8;
         id = 0 => *mut c_char, name = 8 => *mut c_char, source_kind = 16 => FlexSourceKind, sample_rate = 20 => u32, channels = 24 => u16,

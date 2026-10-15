@@ -7,7 +7,7 @@ per-process loopback) written in Rust. Built with PyO3 and maturin.
 ## Install
 
 ```sh
-pip install "flexaudio>=0.5,<0.6"
+pip install "flexaudio>=0.6,<0.7"
 ```
 
 ## Usage
@@ -126,56 +126,22 @@ Platform behavior:
 - Linux matches exact PIDs, without excluding descendants. Linux and Windows
   ignore the selected system device while exclusion is active.
 
-### Integrated denoise and VAD
+### Noise suppression and attached VAD
 
-`open()` (and `switch_source()`) accept `denoise=True` and `vad={...}` to run
-noise suppression and voice-activity detection inside `poll_chunk()`. The
-processing order is denoise -> VAD. `peak` and `rms` measure the final delivered
-float PCM after denoise and gain, before integer encoding. Graceful `stop()`
-queues the actual 480-frame (10 ms) denoiser tail and pending VAD boundaries;
-continue polling after stop to receive them. Repeated stop does not repeat tails.
-Capture terminal failure suppresses remaining PCM and audio tails.
+`denoise=True` enables RNNoise. Without VAD it processes delivered PCM during
+polling; with VAD it processes the shared capture branch before VAD and output
+conversion. It requires 48000 Hz output and introduces 480 samples/channel of delay.
+Graceful stop queues the denoiser tail; continue polling to receive final output.
 
-```python
-with flexaudio.open("mic", denoise=True, vad={"threshold": 0.5}) as stream:
-    drain_events(stream)  # Use the helper from Usage before every PCM poll.
-    chunk = stream.poll_chunk()
-    if chunk is not None:
-        samples = np.frombuffer(chunk.data, dtype=np.float32)  # denoised audio
-        for ev in chunk.vad_events:                            # speech boundaries
-            print(ev.type, ev.at_sample)                       # "speech_start"/"speech_end"
-```
+Attach the same generic VAD engine with
+`vad=flexaudio.StreamVadOptions(provisional=True)`. Each chunk's `vad_events`
+contains ordered segments, optional provisional hints, and epoch markers.
+The fixed 20 ms chunk size preserves canonical capture conversion and ordering;
+other chunk durations are rejected before opening a device.
 
-`denoise` requires a 48000 Hz output (`denoise=True` with any other
-`output_rate` raises `ValueError`); the first 480 samples/channel are silence
-from the denoiser's fixed delay. `vad` is a dict with the same keys as the
-standalone `Vad` (below). `at_sample` is measured at the VAD's internal rate
-(16000 or 8000 Hz), not the input rate.
-
-VAD emits `speech_start` and `speech_end` together when a segment is finalized,
-not when speech first begins. On `DISCONTINUITY` (`chunk.flags & 1`), an open
-pre-gap segment is flushed before the post-gap PCM is processed. Flushed events
-come first and retain their pre-gap `at_sample` values; VAD then restarts its
-sample clock at zero. These positions are separate from `chunk.pts_ns`.
-
-Consumers distinguish timelines by the discontinuity chunk: the core always
-delivers 20 ms chunks, which cannot complete a fresh 32 ms VAD inference frame.
-Consequently **all events on the discontinuity chunk belong to the pre-gap
-timeline**, and all events on subsequent chunks belong to the new timeline.
-Handle that chunk's events under the previous timeline before advancing your
-VAD timeline; the chunk's PCM itself already belongs to the post-gap timeline.
-For example, a flushed pair at 0/512 on the discontinuity chunk is old; a pair
-at 0/1024 delivered later is new. Do not infer the boundary from a decrease in
-`at_sample`: delayed post-gap speech need not produce one. A mixed event list
-from larger chunks would require an explicit flushed-event count or timeline
-identifier; larger chunks are not supported by the current core.
-
-If the discontinuity flush fails, VAD reset is still attempted and denoise is
-still reset before `poll_chunk()` raises the flush error through its existing
-exception path. That poll consumes the chunk. When reset succeeds, later
-chunks process normally without repeating that flush error. If VAD reset
-itself fails, its failure remains latched and subsequent processing reports
-it until a reset succeeds.
+On macOS, `silence_probe=False` disables the silence diagnosis tone. The default
+is enabled: after five seconds of exact-zero system capture, a 1 kHz tone at
+amplitude 1e-5 plays for 300 ms to help distinguish permission failure from silence.
 
 ### Standalone add-ons
 
@@ -183,9 +149,9 @@ The same building blocks are available as independent classes.
 
 ```python
 # Voice activity detection over arbitrary-format PCM (mono/stereo, any rate).
-vad = flexaudio.Vad(threshold=0.5, min_silence_ms=100)  # silero defaults
+vad = flexaudio.Vad(threshold=0.5, min_silence_ms=100)
 for ev in vad.process(samples, input_sample_rate=48000, input_channels=2):
-    print(ev.type, ev.at_sample)
+    print(ev.type)
 
 # Noise suppression (48 kHz, +/-1.0 normalized interleaved f32).
 den = flexaudio.Denoiser(channels=1)
@@ -230,9 +196,8 @@ path, reason, optional positive scalar-interleaved sample count, rate, and chann
 exact chunk attribution; flags 8 (`PADDED`) and 16 (`CLIPPED`) instead describe
 that delivered chunk. Padding alone does not imply a gap.
 
-Built-in backends emit neither `permissionPending` nor `permissionGranted` for
-any capture source on any OS. Those event arms remain for custom Rust backends
-and compatibility. From 0.5.3, macOS microphone capture requires decided consent
+`permissionPending` remains available for custom Rust backends; built-in sources
+do not emit it. From 0.5.3, macOS microphone capture requires decided consent
 before each start and does not continuously monitor authorization or revocation.
 `error` and `terminalError` are terminal; `recoverableError` continues
 capture. `terminal_error()` retains the typed capture primary. `shutdown_report()`
@@ -258,11 +223,15 @@ their models/tables and require no runtime files or network access:
 - **flexaudio-denoise** — uses [nnnoiseless](https://github.com/jneem/nnnoiseless)
   (BSD-3-Clause), a Rust port of RNNoise with embedded model weights.
 
-### Whisper-compatible VAD
+### Generic VAD
 
-`WhisperVad` runs embedded Silero v6 on normalized mono float32 at 16 kHz, with
+`Vad` runs embedded Silero v6 on normalized float32, with
 segmentation matching whisper.cpp pin `85a69493a601d4ff5a834064f7b7bac250bd8739`.
-It accepts a sequence or a contiguous one-dimensional native float32 buffer;
+`process(samples, input_sample_rate=16000, input_channels=1)` accepts arbitrary
+positive input rates/channel counts and converts to mono16k internally. Event
+times use the input timeline, compensated for converter group delay. After raw
+input validation, finite resampler overshoot is clipped internally to [-1, 1]. It accepts
+a sequence or a contiguous one-dimensional native float32 buffer;
 NumPy is optional. Buffer input is copied through Python bytes into owned Rust
 float32 storage for Python 3.8 stable-ABI compatibility, and sequence input is
 copied for that feed. Instances stay on their creating thread.
@@ -271,7 +240,7 @@ copied for that feed. Instances stay on their creating thread.
 import array
 import flexaudio
 
-vad = flexaudio.WhisperVad(provisional=True)
+vad = flexaudio.Vad(provisional=True)
 events = vad.process(memoryview(array.array('f', [0.0] * 513)))
 events += vad.finish()
 for event in events:
@@ -279,11 +248,12 @@ for event in events:
         print(event.start_ms, event.end_ms)
 ```
 
-Parameters are `threshold=0.5`, `min_speech_duration_ms=250`,
-`min_silence_duration_ms=100`, `max_speech_duration_s=3.4028234663852886e38`, and
+Parameters are `threshold=0.5`, `min_speech_ms=250`,
+`min_silence_ms=100`, `max_speech_ms=0`, and
 `speech_pad_ms=30`. Supplied zero values stay zero. Durations must be integers
 in 0..134217; bool durations, unknown keys, invalid PCM and nonfinite parameters
-are rejected. The seconds budget is truncated by the pinned algorithm, and
+are rejected. `max_speech_ms` is integer milliseconds; 0 means unbounded. Values below
+one inference frame plus twice the padding budget are rejected. Fixed
 200 ms merging can undo splits: it does **not** bound final segment duration or
 latency. Optional provisional cuts independently cap pieces at 30000 ms.
 
@@ -293,30 +263,28 @@ Events are read-only variant objects with snake_case fields and type tags:
 final endpoints use the 10 ms grid and can exceed physical EOF. `finish()`
 infers one zero-padded partial frame when needed, closes the epoch, and is
 idempotent. Call `reset()` to start another epoch; its returned closure events
-must also be consumed. Processing after finish raises `WhisperVadRuntimeError`.
+must also be consumed. Processing after finish raises `VadRuntimeError`.
 Typed errors carry `code` and `terminal_events`; drain those events even when
 processing fails. `last_frame_probabilities()` returns the latest call's frame
 index and an owned read-only float32 memoryview, independent of future calls.
 
-`WhisperVadPostProcessor(WhisperVadParams(...))` accepts probabilities from the
+`VadPostProcessor(VadOptions(...))` accepts probabilities from the
 16 kHz/512-sample frame geometry and delegates to the same segmentation kernel.
-`whisper_speech_segments(samples, params=None)` is the single whole-PCM helper
+`speech_segments(samples, params=None)` is the single whole-PCM helper
 and uses the same streaming process/finish path with preview disabled.
 
-The additive capture option is `open(...,
-whisper_vad=WhisperVadStreamOptions(params=..., provisional=True, tap='primary'))`.
-It rejects simultaneous legacy `vad` with `ConflictingVad`, and secondary with
-`UnsupportedTap`. The producer's shared 48 kHz stereo branch supplies valid PCM
+The capture option is `open(...,
+vad=StreamVadOptions(params=..., provisional=True, tap='primary'))`.
+Secondary taps are rejected with `UnsupportedTap`. The producer's shared 48 kHz stereo branch supplies valid PCM
 and authoritative frame indices before output conversion. Attached chunks carry
-`whisper_vad_events`; each epoch begins with its saved `capture_sample` and `pts_ns`
+`vad_events`; each epoch begins with its saved `capture_sample` and `pts_ns`
 origin. `AudioChunk.frame_index` is a producer-owned 48 kHz timeline position.
-`flush_whisper_vad()` and `stop()` queue ordered closing carriers even without new
+`flush_vad()` and `stop()` queue ordered closing carriers even without new
 PCM. Poll until the terminal carrier is consumed before releasing the stream.
 An attached VAD failure is a failure of that session only: capture and PCM
 delivery continue, and polling delivers its closing events without raising the
 processor failure. `stop()` succeeds for a VAD-only failure; its shutdown report
-retains the cause in `cleanup_errors` with `whisper_code`, and `primary` remains
-capture-only. The next discontinuity (or a successful `flush_whisper_vad()`)
+retains the cause in `cleanup_errors` with `vad_code`, and `primary` remains
+capture-only. The next discontinuity (or a successful `flush_vad()`)
 reinitializes the session so its next frame starts a new anchored epoch.
-Disabled attachment has `AudioChunk.whisper_vad_events=None` and flush is a no-op.
-Legacy `Vad` and its integration keep their existing behavior.
+Disabled attachment has `AudioChunk.vad_events=None` and flush is a no-op.

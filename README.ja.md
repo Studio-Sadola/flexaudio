@@ -1,5 +1,9 @@
 # flexaudio
 
+0.6.0 では、従来の 2 つの VAD API を 1 つの汎用 `Vad` に統合しました。
+[0.6.0 の移行表](CHANGELOG.md#060---2026-10-15)を参照してください。
+0.5.x 系は非推奨です。
+
 Rust の 0.5 への移行: `AudioChunk` と `SecondaryChunk` の構造体リテラルには、
 新しい公開フィールド `frame_index: u64` が必要です。各タップの基準となる 48 kHz
 タイムライン上で、チャンクの最初のフレームを指します。再オープン後も連続し、
@@ -51,9 +55,8 @@ stream.stop();
   その OS でサポートされていないソースを指定すると、`Error::Unsupported` が返ります。
 - プロセス単位のキャプチャには、`StreamConfig` の `target_pid` が必要です。
 - `SourceKind::Mix` は、3 つのプラットフォームすべてでマイクとシステム出力を組み合わせます。
-- **0.5 の VAD:** 従来の `Vad` に加え、`WhisperVad` が whisper.cpp 互換の後処理と
-  キャプチャに接続するタップを提供します。Rust・Node.js・Python・C に対応し、
-  どちらも埋め込みモデルでオフライン動作します。
+- **0.6 の VAD:** 1 つの汎用 `Vad` が区間分割、フレーム確率、暫定通知、キャプチャへの
+  接続を Rust、Node.js、Python、C に提供します。埋め込んだ Silero モデルでオフライン動作します。
 - **型付き診断:** 音声損失、クリッピング、権限、一時的／終端のエラーのイベントと、
   保持されたキャプチャ／後片付けの失敗を確認できます。
 
@@ -63,19 +66,19 @@ stream.stop();
 
 ```toml
 [dependencies]
-flexaudio = "0.5"
+flexaudio = "0.6"
 ```
 
 または、次のコマンドを使います。
 
 ```sh
-cargo add flexaudio@0.5
+cargo add flexaudio@0.6
 ```
 
 音声区間検出（VAD）のアドオンは、別のクレートです。
 
 ```sh
-cargo add flexaudio-vad@0.5
+cargo add flexaudio-vad@0.6
 ```
 
 ---
@@ -154,24 +157,47 @@ stream.stop();
   `DeviceEvent`, `DefaultDeviceKind`, `Event`, `Permission`, `Error`, `ErrorKind`,
   `ErrorContext`, `AddonErrorKind`, `AudioLoss`, `ShutdownReport`, `Result`。
 
-音声区間検出（`flexaudio-vad`）では、`Vad::new` / `Vad::process` でストリーミングの
-`SpeechStart` / `SpeechEnd` イベントを取得し、`get_speech_timestamps` でバッチ処理による区間分割を行います。
-Silero VAD モデルはバイナリに埋め込まれているため、実行時のモデルファイルやネットワークアクセスを必要とせず、
-完全にオフラインで動作します。0.5 では `WhisperVad` / `WhisperVadPostProcessor` /
-`whisper_speech_segments` が whisper.cpp から移植した後処理を提供します。確定区間は
-10 ms 刻みの整数ミリ秒で返し、任意の暫定発話／分割イベントと、末尾の不完全フレームを
-パディングして推論する機能があります。互換性の対象は固定された後処理アルゴリズムです。
-異なるモデルバージョンで推論確率が一致するとは限りません。`WhisperVadTap` は
-基準となるキャプチャへ接続し、エポックの時計の基点と flush／停止時の終了イベントを届けます。
-キャプチャのフレーム番号が飛んだ場合や不連続が通知された場合は、そこまでの区間を確定して閉じ、
-次の受け付けたフレームから新しいエポックとして基点を取り直します。欠落した音声をパディングで
-埋めることはありません。VAD セッション自体が失敗した場合は、次の不連続か成功した flush まで
-そのセッションを失敗状態のまま保持し、キャプチャ側は動き続けます（影響を受けたエポックは
-型付きエラー終端で一度だけ閉じます）。
-同じストリームで従来の VAD と WhisperVad を同時に有効にすることはできません。
-0.5.3 では、従来の VAD で不連続時の flush が成功した後に reset や処理が失敗しても、
-確定済みの終了イベントを元の時刻で一度だけ届けます。元の失敗も報告し、Python/C では
-次のポーリング用にゼロフレームのチャンクへ保持します。
+音声区間検出（`flexaudio-vad`）は、単独処理とキャプチャへの接続で同じ `Vad` エンジンを使います。
+`VadPostProcessor` と `speech_segments` でキャプチャに依存しない区間分割も利用できます。
+Silero v6 モデルを埋め込み、完全にオフラインで動作します。区間分割は whisper.cpp `85a69493` からの
+移植で、確定区間の端点は 10 ms 刻みの整数ミリ秒です。同じフレーム確率に対する後処理を互換対象とし、
+異なるモデルの推論確率が一致することは保証しません。
+
+```rust
+use flexaudio_vad::{Vad, VadOptions, VadRuntimeOptions};
+
+let mut vad = Vad::new(VadOptions::default(), VadRuntimeOptions::default())?;
+let events = vad.process(&vec![0.0; 16_000])?;
+let final_events = vad.finish()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`VadOptions` の既定値は `threshold: 0.5`、`min_speech_ms: 250`、`min_silence_ms: 100`、
+`speech_pad_ms: 30`、`max_speech_ms: 0`（無制限）です。`VadRuntimeOptions.provisional` は
+既定で false です。単独処理と接続処理の既定値は同じで、製品ごとの上限は呼び出し側から明示します。
+
+`maxSpeechMs`（`max_speech_ms`）は整数ミリ秒です。正の値では、16 kHz サンプル数による分割予算
+`16 * maxSpeechMs - 512 - 32 * speechPadMs` を使います。秒未満でも切り捨てず、900 ms は
+900 ms として扱います。予算が正でない場合は `InvalidParameter` で拒否します。後の結合により分割が
+再結合されるため、最終区間長や通知遅延の厳密な上限ではありません。省略と 0 は無制限です。
+
+Node.js の単独 `process(samples, inputSampleRate?, inputChannels?)` は既定で
+16000 Hz、1 チャンネルです。Python は同じ既定値で `input_sample_rate` と `input_channels` を
+使います。Rust は変換入力に `process_pcm(samples, input_sample_rate,
+input_channels)`、16 kHz モノラルには `process(samples)` を使います。内部で形式を変換し、
+イベント時刻は変換器の群遅延を補償した入力時間軸上のミリ秒です。リサンプリングで生じる有限な
+振幅の超過だけを内部で [-1, 1] に制限します。生の入力は有限で [-1, 1] の範囲である必要があります。
+厳密な golden 一致は
+16 kHz モノラルを対象とします。
+
+`VadTap` は基準キャプチャへ接続し、`captureSample` と `ptsNs` を持つ `epochStart`、確定した
+`segment`、任意の `provisionalSpeechStart`／`provisionalSpeechEnd`／`provisionalCut`、および
+`epochEnd` を届けます。接続設定は `StreamVadOptions`、Node.js は `OpenOptions.vad` です。
+flush／停止時にも終了を通知します。不連続やフレーム番号の欠落ではそこまでの区間を閉じ、次の入力で
+新しいエポックを開始します。欠落音声をパディングで埋めません。VAD の失敗はその接続だけに保持し、
+不連続または成功した flush で復帰します。音声キャプチャは継続し、影響したエポックを型付きエラーで
+一度だけ閉じます。960 フレームの基準ブロックと変換位相の整合を保つため、キャプチャのチャンク長は
+20 ms に固定します。
 
 ---
 
@@ -228,16 +254,16 @@ macOS では kAudioHardwareBadObjectError（`!obj`、0x216f626a）、ESRCH（3�
 オフセットではありません。一時停止やキューの破棄でも、PCM を配信せずに番号は進みます。
 
 再オープンを伴わない到着間隔の空きでは、イベントや `DISCONTINUITY` は発生しません。
-`frameIndex` は連続し、主タップの `ptsNs` だけが飛び、接続された WhisperVad のエポックは開いたままです。
+`frameIndex` は連続し、主タップの `ptsNs` だけが飛び、接続された Vad のエポックは開いたままです。
 消費サンプルが 2 秒以上途絶えた停止は 250 ms ごとに検知し、`stalled`、再オープン、
 再オープンの各失敗時に `recoverableError` と 250 ms〜5 秒の再試行間隔が発生します。
 成功後、新しい PCM が来ると `recovered` を通知します。
 新世代の最初の主タップデータには `RECOVERED|DISCONTINUITY` が付き、新しい PCM が来ると
-WhisperVad は `epochEnd(finish)` で閉じ、新しい `epochStart` を始めます。停止時間はフレームに換算しません。
+Vad は `epochEnd(finish)` で閉じ、新しい `epochStart` を始めます。停止時間はフレームに換算しません。
 この 3 種の助言と `onChunk`／エポックイベントの間に順序保証はありません。
-接続された WhisperVad のエポック番号はストリーム内で厳密に増加し、再構築では検査付きで 1 を足します。
+接続された Vad のエポック番号はストリーム内で厳密に増加し、再構築では検査付きで 1 を足します。
 新しい `openStream` は 0 から始まり、`(epoch, seq)` は各ストリーム内で一意です。
-Node.js では `epochEnd(error)` は `whisperVadFailed` より先に届きます。
+Node.js では `epochEnd(error)` は `vadFailed` より先に届きます。
 成功した `switchSource` は必ず `DISCONTINUITY` を持つ新世代を作り、エポック遷移は新しい PCM まで延期します。
 同期呼び出し中に `onChunk` が再入することはありません。戻り値が成功しても、意味するのはバックエンドの
 置換であり、データの配信ではありません。古い `epochEnd` が新世代の最初の主チャンクより先に届く保証は
@@ -260,18 +286,14 @@ last_error を設定します。`RescanRequired` は一覧の無効化を表し�
 不正な設定／形式・再サンプリング・reset、および FLAC の I/O・未対応入力・エンコーダー失敗の
 型付きの原因を保持します。バインディングは `addonKind`/`addonMessage`（Python は
 `addon_kind`/`addon_message`、C v2 は種別・メッセージアクセサー）を公開します。
-後から発生した終端エラー、flush と reset の同時失敗、VAD の末尾処理、Whisper VAD の
+後から発生した終端エラー、flush と reset の同時失敗、VAD の末尾処理、VAD の
 モデル・変換原因は、主原因を置き換えず順序付きの関連エラーとして残します。
-Rust に追加した `VadError::Multiple`、`WhisperVadError::Cause`、
-`WhisperVadTapError::Cause` が型付きの原因を保持します。
+Rust に追加した `InferenceError::Multiple`、`VadError::Cause`、
+`VadTapError::Cause` が型付きの原因を保持します。
 
-従来の VAD は変換済み入力が残っている間の形式変更を拒否します。変更前に明示的に
-排出または reset してください。reset が失敗しても完成した発話イベントは残り、
-`Vad::take_pending_events()` で一度だけ取り出せます。Python の単独 flush 例外は
-`pending_events`、Node.js は `pendingEvents` を保持します。C の flush は負の結果と
-イベント出力を同時に返す場合があり、その出力も解放が必要です。キャプチャに接続した VAD のソース切り替えは
-共有のギャップ処理で古い発話区間を閉じてからアドオンを交換します。Node.js の
-イベント専用の副タップのチャンクは観測したシーケンス番号・フレーム番号・破棄数を保持します。
+VAD の失敗では、モデル・変換器・セッションの型付き原因を保持します。ソースの切り替えは共有の
+ギャップ処理で古いエポックを閉じてから接続を交換します。イベント専用のチャンクで PCM を作らずに
+終了を届けます。
 
 macOS の自己プローブが判定不能になった場合、ネイティブの原因を保持し、無音の注意通知と
 既存の `RecoverableError` を配信します。キャプチャは継続できます。
@@ -301,7 +323,7 @@ Mix の片側で致命的なエラーが起きると両側を停止し、どち�
 `DISCONTINUITY` が付き、`PADDED=8` と `CLIPPED=16` が出力の状態を示します。
 すべてのバインディングで peak／RMS はノイズ除去とゲイン適用後の配信サンプルから計測します。
 
-Node.js では u64 カウンター（VAD の `atSample`、チャンク損失数、音声損失数を含む）を
+Node.js では u64 カウンター（VAD の `seq`、チャンク損失数、音声損失数を含む）を
 bigint で計算してください。PTS は number のままです。チャンクの型には `frameIndex` が
 必須となり、イベントの型は判別可能な閉じた union になりました。
 `terminalError()`／`shutdownReport()` は値がない場合 `undefined` を返します。
@@ -365,7 +387,7 @@ Mix にも適用します。Node.js は `startupSamplesDropped` と bigint の `
 `reason: 'outOfRange'`、Python は同じタグと整数のフレーム数を使います。
 C v2 はイベント種別 15 と型付きフレーム／理由の参照 API、CLI は安全な警告を提供します。
 
-Node.js では `onEvent` を渡すと、該当世代の最初の `onChunk` と接続した Whisper VAD の
+Node.js では `onEvent` を渡すと、該当世代の最初の `onChunk` と接続した VAD の
 `epochStart` より先に起動時通知を届けます。`Recovered` などの別の助言は独立した
 コールバック経路を使い、起動時通知の前後どちらにも届く可能性があります。
 Rust/Python/C の取得型 API では、世代の最初のチャンクを公開する前に通知を時系列順で
@@ -516,9 +538,9 @@ JS のイベントループをブロックしないようにしています。
 権限を修正した後は新しいストリームを作成してください。終端エラーのあるストリームの
 `start`、`resume`、`switch_source` は保持されたエラーを返します。
 
-組み込みバックエンドは、すべての OS とキャプチャソースで `PermissionPending` も
-`PermissionGranted` も発行しません。これらのイベントの選択肢は、カスタム Rust バックエンドと
-互換性のために保持します。macOS の認可状態を照会できない場合は、キャプチャを開始する前に
+組み込みバックエンドは `PermissionPending` を発行しません。このイベントはカスタム Rust
+バックエンド用に残します。`PermissionGranted` は 0.6.0 で削除し、C のイベント番号 9 は予約します。
+macOS の認可状態を照会できない場合は、キャプチャを開始する前に
 型付きバックエンドエラーを返し、権限が拒否されたと推測しません。
 マイクの構成が事前に通知したネイティブ形式と
 異なる場合は、キャプチャを構築する前に `Error::NativeFormatChanged { advertised, actual }`
@@ -586,6 +608,11 @@ C の権限イベント種別は引き続き 3 です。N-API/Python の権限�
   **画面収録とシステムオーディオ録音**の **システムオーディオ録音**を確認してください。
   責任を持つホストアプリ（例えば Terminal）のアクセスを有効にし、そのアプリを再起動して新しいストリームで再試行してください。
 
+プローブは既定で有効です。Rust の `StreamConfig.silence_probe: false`、Node.js の
+`silenceProbe: false`、Python の `silence_probe=False`、または C のオープンオプションで
+診断信号の再生を無効化できます。システム音声・プロセス音声・Mix のシステム側に適用し、
+マイクの同意確認は変更しません。
+
 ### Windows
 
 - マイクのキャプチャ（Mix のマイク入力も含みます）は公開されている `AppCapability` の同意 API を確認します。
@@ -630,7 +657,7 @@ flexaudio は [Semantic Versioning](https://semver.org/) に従います。
 クレートが **0.x** 系である間は、公開 API は**まだ安定していません**。
 SemVer に従い、**マイナー**バージョンの更新（`0.2 → 0.3`）には互換性を壊す変更が含まれる場合がありますが、
 **パッチ**バージョンの更新（`0.2.0 → 0.2.1`）は後方互換性を保ちます。
-互換性のある更新だけを受け取るには、バージョンを `0.5` に固定してください。
+互換性のある更新だけを受け取るには、バージョンを `0.6` に固定してください。
 [`CHANGELOG.md`](CHANGELOG.md) を参照してください。
 
 ---

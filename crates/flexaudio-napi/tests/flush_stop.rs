@@ -1,5 +1,5 @@
 //! Exercise the real Node command queue and promise settlement through the cdylib.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "test-faults"))]
 #[test]
 fn flush_requested_immediately_before_stop_always_settles() {
     let deps = std::env::current_exe()
@@ -27,9 +27,9 @@ const native = require(process.argv[1]);
 (async () => {
   for (let i = 0; i < 16; i++) {
     const stream = native.__openMockStream(48000, 2, 0, () => {},
-      undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined,
       { tap: 'primary', params: {} });
-    const p = stream.flushWhisperVad();
+    const p = stream.flushVad();
     const settled = p.then(() => 'resolved', error => {
       assert.equal(typeof error.code, 'string');
       return 'rejected';

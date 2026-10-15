@@ -1,7 +1,7 @@
 /* tslint:disable */
 /* eslint-disable */
 
-/* Public declarations maintained to match the strict 0.5 boundary contract. */
+/* Public declarations maintained to match the strict 0.6 boundary contract. */
 
 /** JS DeviceInfo. `sourceKind` is a string ("mic"|"system"|"process").
  * Unreadable mandatory formats use sampleRate=0, channels=0 and formatAvailable=false.
@@ -54,7 +54,7 @@ export interface JsProcessInfo {
  * Delivery shape (0.3.0): `onChunk` in `openStream(options, onChunk)` receives **one argument**
  * (this primary chunk). Secondary tap (`secondaryOutput`) chunks arrive in the primary chunk's
  * `secondary` property, rather than a second argument. Finalized VAD events also arrive on
- * the selected `vadTap` chunk's `vadEvents`, rather than a separate callback
+ * the selected `vad.tap` chunk's `vadEvents`, rather than a separate callback
  * ('primary': `chunk.vadEvents`; 'secondary': `chunk.secondary?.vadEvents`).
  *
  * `vadEvents` is populated only when `vad` is specified in `openStream`. When VAD is disabled,
@@ -79,10 +79,8 @@ export interface JsAudioChunk {
   /** Final float PCM after denoise/gain and before integer encoding. */
   peak: number
   rms: number
-  /** VAD events finalized in this chunk (only when `vadTap` is 'primary'). */
-  vadEvents?: Array<JsVadEvent>
-  /** Attached events on the selected tap only; absent when whisperVad is disabled. */
-  whisperVadEvents?: AttachedWhisperVadEvent[]
+  /** Attached events on the selected tap only; absent when vad is disabled. */
+  vadEvents?: AttachedVadEvent[]
   /**
    * Timestamp-matched secondary tap chunk (only with `secondaryOutput`). Delivered as a pair in
    * the same callback (`primary.secondary` in `onChunk(primary)`, not a second argument). It is
@@ -121,95 +119,42 @@ export interface JsSecondaryChunk {
   /** Final float PCM after denoise/gain and before integer encoding. */
   peak: number
   rms: number
-  /** VAD events finalized in this chunk (only when `vadTap` is 'secondary'). */
-  vadEvents?: Array<JsVadEvent>
-  /** Attached events on the selected tap only; absent when whisperVad is disabled. */
-  whisperVadEvents?: AttachedWhisperVadEvent[]
-}
-/**
- * JS VAD event (speech segment start/end).
- *
- * `type` is limited to `'speechStart' | 'speechEnd'` (consistent with other events' `type`).
- *
- * `atSample` is an absolute sample position **at VAD's internal rate (`sampleRate`=8000 or 16000,
- * default 16000)**, not the input chunk's sample rate (raw silero value for standalone/debug use).
- * Convert to seconds with `Number(atSample) / sampleRate`; approximate the input sample position with
- * `atSample * BigInt(inputSampleRate) / BigInt(sampleRate)`.
- */
-export interface JsVadEvent {
-  /** 'speechStart' | 'speechEnd' (speech segment start/end). */
-  type: 'speechStart' | 'speechEnd'
-  atSample: bigint
-  /**
-   * Absolute nanoseconds from recording zero (`number`=f64). Populated only through integrated VAD
-   * (`vad` in `openStream`), computed from chunk `ptsNs` and the within-chunk offset at VAD's
-   * internal rate. Delivered in the same chunk and monotonic non-decreasing across chunks. Final
-   * `flushVad` events use the same `vadEvents` array. Standalone `Vad` (`process`/`flush`) has no pts
-   * context, so this is `undefined`. (Time is bounded by recording length: `number`; u64 counters use `bigint`.)
-   */
-  atNs?: number
+  /** Attached events on the selected tap only; absent when vad is disabled. */
+  vadEvents?: AttachedVadEvent[]
 }
 /** JS native format (returned by `FlexStream.nativeFormat`). */
 export interface JsNativeFormat {
   sampleRate: number
   channels: number
 }
-/**
- * Integrated VAD settings (shared by `OpenOptions.vad` and the `Vad` constructor).
- *
- * All fields are optional; omitted fields use silero defaults (`VadConfig::default`).
- */
+/** Streaming segmentation settings, shared by standalone and attached VAD. */
 export interface VadOptions {
-  /** Probability threshold for speech start (>=). Default 0.5. */
-  threshold?: number
-  /** Lower (silence-side) threshold for silence start (<). Defaults to `max(threshold - 0.15, 0.01)`. */
-  negThreshold?: number
-  /** Minimum accepted speech duration (ms). Default 250. */
-  minSpeechMs?: number
-  /** Silence duration required to finalize speech end (ms). Default 100. */
-  minSilenceMs?: number
-  /** Padding extending segment boundaries on both sides (ms). Default 30. */
-  speechPadMs?: number
-  /**
-   * Maximum segment length (ms). 0 = unbounded. Exceeding this forces a split.
-   *
-   * Standalone `Vad` follows silero with default 0 (unbounded). **Integrated VAD (`vad` in `openStream`)
-   * defaults to 30000ms (caps long stretches of speech so realtime latency stays bounded)**.
-   * An explicit value (including `0`) always wins.
-   */
-  maxSpeechMs?: number
-  /** VAD internal sample rate. Only 8000 or 16000. Default 16000. */
-  sampleRate?: number
-}
-
-/** Immutable whisper.cpp 85a69493 segmentation settings; literal zero stays zero. */
-export interface WhisperVadParams {
   /** Finite [0,1], default 0.5. */
   threshold?: number
   /** Integer 0..134217 ms, default 250. */
-  minSpeechDurationMs?: number
+  minSpeechMs?: number
   /** Integer 0..134217 ms, default 100. */
-  minSilenceDurationMs?: number
-  /** Finite 0..f32::MAX seconds; fractions are truncated. Merging can undo splits. */
-  maxSpeechDurationS?: number
+  minSilenceMs?: number
+  /** Integer milliseconds, default 0 (unbounded). Positive values must exceed 32 + 2*speechPadMs; the split budget is maxSpeechMs*16 - 512 - 2*speechPadMs*16 samples. Unsupported values throw InvalidParameter. Merging can undo splits. */
+  maxSpeechMs?: number
   /** Integer 0..134217 ms, default 30. */
   speechPadMs?: number
   /** Add immediate hints and nonoverlapping pieces <=30000 ms; default false. */
   provisional?: boolean
 }
 
-export type WhisperVadCloseReason = 'hysteresis' | 'finish' | 'reset' | 'error'
+export type VadCloseReason = 'hysteresis' | 'finish' | 'reset' | 'error'
 /** Epoch-relative integer milliseconds. Final segment endpoints use the 10 ms grid. */
-export type WhisperVadEvent = { epoch: number; seq: number } & (
+export type VadEvent = { epoch: number; seq: number } & (
   | { type: 'segment'; startMs: number; endMs: number }
   | { type: 'provisionalSpeechStart'; atMs: number }
-  | { type: 'provisionalSpeechEnd'; atMs: number; reason: WhisperVadCloseReason }
-  | { type: 'provisionalCut'; startMs: number; endMs: number; reason: 'limit' | WhisperVadCloseReason }
+  | { type: 'provisionalSpeechEnd'; atMs: number; reason: VadCloseReason }
+  | { type: 'provisionalCut'; startMs: number; endMs: number; reason: 'limit' | VadCloseReason }
   | { type: 'epochEnd'; reason: 'finish' | 'reset' | 'error' }
 )
 
 /** Capture origins appear only on attached streams, before any VAD payload in that epoch. */
-export type AttachedWhisperVadEvent = WhisperVadEvent
+export type AttachedVadEvent = VadEvent
   /** captureSample counts 48 kHz frames on the dedicated capture timeline, independent
    * of primary/secondary format and tap. captureSample + tMs*48 is exact on that timeline.
    * Equal to primary frameIndex for the same sample only for a 48 kHz primary.
@@ -219,8 +164,8 @@ export type AttachedWhisperVadEvent = WhisperVadEvent
   | { type: 'epochStart'; epoch: number; seq: 0; captureSample: bigint; ptsNs: number }
 
 /** Attach one canonical VAD owner; tap selects only its event carrier. */
-export interface WhisperVadStreamOptions {
-  params?: Omit<WhisperVadParams, 'provisional'>
+export interface StreamVadOptions {
+  params?: Omit<VadOptions, 'provisional'>
   provisional?: boolean
   tap: 'primary' | 'secondary'
 }
@@ -231,34 +176,38 @@ export interface FrameProbabilities {
   values: Float32Array
 }
 
-export type WhisperVadErrorCode = 'InvalidParameter' | 'InvalidPcm' | 'InvalidProbability'
+export type VadErrorCode = 'InvalidParameter' | 'InvalidPcm' | 'InvalidProbability'
   | 'Overflow' | 'SessionFinished' | 'Inference' | 'ModelLoad' | 'FailedSession'
-  | 'ConflictingVad' | 'UnsupportedTap' | 'UnsupportedConversionClock' | 'TestFaultsUnavailable'
+  | 'UnsupportedTap' | 'UnsupportedConversionClock'
   | 'InvalidStereoLength' | 'CaptureSampleOverflow' | 'PtsOutOfRange' | 'Conversion' | 'Stopped'
 
 /** Drain terminalEvents through the normal consumer even when a call throws. */
-export interface WhisperVadError extends Error {
-  code: WhisperVadErrorCode
-  terminalEvents: WhisperVadEvent[]
+export interface VadError extends Error {
+  code: VadErrorCode
+  terminalEvents: VadEvent[]
   /** Present on checked capture shutdown; includes every primary and cleanup cause. */
   audioError?: AudioError
 }
 
 /** Synchronous, serialized inference; use a Node Worker for realtime processing. */
-export declare class WhisperVad {
-  constructor(params?: WhisperVadParams)
-  /** Normalized [-1,1] mono float32 PCM at 16000 Hz; input is not retained. */
-  process(mono16k: Float32Array): WhisperVadEvent[]
+export declare class Vad {
+  constructor(params?: VadOptions)
+  /** Normalized [-1,1] interleaved float32 PCM; defaults to 16000 Hz, mono.
+   * Other rates/channels are converted internally. Events use the input timeline in
+   * milliseconds, compensated for converter group delay. Finite converter overshoot
+   * is clipped to [-1,1]; invalid source PCM and nonfinite converter output are rejected.
+   * Input is not retained. */
+  process(samples: Float32Array, inputSampleRate?: number, inputChannels?: number): VadEvent[]
   /** True EOF pads one partial frame; repeated finish returns []. */
-  finish(): WhisperVadEvent[]
+  finish(): VadEvent[]
   /** Closes hints and discards pending finals, then starts a fresh epoch. */
-  reset(): WhisperVadEvent[]
+  reset(): VadEvent[]
   lastFrameProbabilities(): FrameProbabilities
 }
 /**
  * Stream notification. permissionDenied is terminal, with permission and
- * cause/remedy in message. permissionPending and permissionGranted are retained for
- * custom Rust backends and compatibility; built-in backends emit neither arm on
+ * cause/remedy in message. permissionPending is retained for
+ * custom Rust backends; built-in backends emit no permissionPending on
  * any OS or capture source. A custom permissionPending is advisory. silenceWhileSourceActive
  * is advisory: the system-audio diagnosis is inconclusive and capture continues.
  * Missing permission and genuine digital silence remain possible in that case.
@@ -298,16 +247,13 @@ export type AudioError = {
   | { kind: 'permissionDenied'; permission: 'microphone' | 'systemAudio' }
   | { kind: 'unsupportedOsVersion' }
   | { kind: 'deviceLost' }
-  | { kind: 'backend'; whisperCode?: WhisperVadErrorCode }
+  | { kind: 'backend'; vadCode?: VadErrorCode }
   | { kind: 'unsupportedFormat' }
   | { kind: 'nativeFormatChanged'; advertised: JsNativeFormat; actual: JsNativeFormat }
   | { kind: 'unsupported' }
   | { kind: 'ambiguousDeviceName' }
   | { kind: 'unknown' }
 )
-
-/** Legacy standalone Vad.flush rejection; completed speech survives a reset failure. */
-export interface VadFlushException extends AudioException { pendingEvents: JsVadEvent[] }
 
 export interface AudioException extends Error {
   code: 'FLEX_INVALID_ARG' | 'FLEX_INVALID_STATE' | 'FLEX_DEVICE_NOT_FOUND'
@@ -330,48 +276,47 @@ export interface AudioLoss {
 }
 
 export interface ShutdownReport {
-  /** Capture failure only; an attached whisper-compatible VAD failure is never the capture
-   * primary, so it stays null for a whisper-only failure (see whisperVadFailed). */
+  /** Capture failure only; an attached streaming VAD failure is never the capture
+   * primary, so it stays null for an attached VAD failure (see vadFailed). */
   primary: AudioError | null
-  /** Core teardown, then the attached whisper VAD failure, then addon final flush failures,
-   * retained in order. A whisper failure keeps its typed whisperCode here. */
+  /** Core teardown, then the attached VAD failure, then addon final flush failures,
+   * retained in order. An attached VAD failure keeps its typed vadCode here. */
   cleanupErrors: readonly AudioError[]
 }
 
 /** Arrival gaps without reopen emit no event/DISCONTINUITY: frameIndex stays contiguous,
- * only primary ptsNs jumps, and attached WhisperVad keeps its epoch open.
+ * only primary ptsNs jumps, and attached Vad keeps its epoch open.
  * Stall: >=2 s without consumed samples, checked every 250 ms; stalled, reopen,
  * each failed reopen attempt emits recoverableError and backs off 250 ms..5 s.
  * On success, recovered is emitted when new PCM arrives. First new-generation primary
- * data carries RECOVERED|DISCONTINUITY. WhisperVad epochEnd(finish) and new epochStart
+ * data carries RECOVERED|DISCONTINUITY. Vad epochEnd(finish) and new epochStart
  * wait for new PCM; downtime does not become frames. These advisories are unordered
  * relative to onChunk and epoch events. Attached epochs strictly increase within a
  * stream (checked epoch+1 on rebuild); new openStream starts at 0. (epoch, seq) is
- * unique per stream; epochEnd(error) precedes whisperVadFailed. */
+ * unique per stream; epochEnd(error) precedes vadFailed. */
 export type JsStreamEvent =
   | { type: 'chunkDropped'; count: bigint }
   | { type: 'stalled' }
   | { type: 'recovered' }
   | { type: 'permissionDenied'; permission: 'microphone' | 'systemAudio'; message: string }
   | { type: 'permissionPending'; permission: 'microphone' | 'systemAudio'; message: string }
-  | { type: 'permissionGranted'; permission: 'microphone' }
   | { type: 'silenceWhileSourceActive'; message: string }
   | { type: 'deviceLost' }
   | { type: 'error'; message: string }
   | { type: 'terminalError'; error: AudioError }
   | { type: 'recoverableError'; error: AudioError }
   | { type: 'shutdownError'; error: AudioError }
-  /** The attached whisper-compatible VAD session failed; capture, PCM delivery, pause/resume,
-   * switchSource and stop keep working. `error.whisperCode` names the typed cause. Delivered
-   * after the carrier whose `whisperVadEvents` end with `epochEnd(error)`, and before stop
+  /** The attached streaming VAD session failed; capture, PCM delivery, pause/resume,
+   * switchSource and stop keep working. `error.vadCode` names the typed cause. Delivered
+   * after the carrier whose `vadEvents` end with `epochEnd(error)`, and before stop
    * resolves. Reported once per failure; the next discontinuity reinitializes the session
    * and the following failure is
    * reported again. `epoch` is the failed epoch (the one closed by that `epochEnd(error)`). */
-  | { type: 'whisperVadFailed'; error: AudioError; epoch: number }
+  | { type: 'vadFailed'; error: AudioError; epoch: number }
   | { type: 'audioLoss'; loss: AudioLoss }
   /** Coalesced upstream clipping; no exact chunk, count, timestamp or lane attribution. */
   | { type: 'clipped' }
-  /** Delivered before this generation's first onChunk and attached Whisper VAD epochStart. */
+  /** Delivered before this generation's first onChunk and attached VAD epochStart. */
   | { type: 'startupSamplesDropped'; frames: bigint; reason: 'outOfRange' }
   | { type: 'unknown'; message: string }
 
@@ -401,7 +346,7 @@ export interface SecondaryOutputOptions {
    */
   encoding?: string
 }
-/** Options for openStream / __openMockStream. */
+/** Options for openStream. */
 export interface OpenOptions {
   /** "mic" | "system" | "process" | "mix" */
   kind: string
@@ -459,18 +404,10 @@ export interface OpenOptions {
   micGain?: number
   /** Pre-mix multiplier for the system side (linear, mix only). Default 1.0. */
   systemGain?: number
-  /**
-   * Integrated VAD settings. When specified, the tap selected by `vadTap` passes through VAD and
-   * finalized events attach to that tap's chunk `vadEvents` (audio is unchanged). Omission disables VAD.
-   */
-  vad?: VadOptions
-  /** Strictly exclusive with vad/vadTap; fed by canonical capture, with tap selecting the event carrier. */
-  whisperVad?: WhisperVadStreamOptions
-  /**
-   * Tap to run VAD on. 'primary' (default) | 'secondary'. 'secondary' requires
-   * `secondaryOutput`; a 16k/mono secondary avoids resampling for efficiency.
-   */
-  vadTap?: string
+  /** Attach VAD to canonical capture; tap selects only the event carrier. */
+  vad?: StreamVadOptions
+  /** Enable the macOS silence diagnostic probe. Default true; ignored on other systems. */
+  silenceProbe?: boolean
   /**
    * true enables recording-time noise suppression. **Only available with 48000 Hz output**
    * (RNNoise is fixed at 48kHz). Applied once to the internal 48kHz/stereo canonical form;
@@ -530,8 +467,8 @@ export declare function processes(): Promise<Array<JsProcessInfo>>
  * fails immediately; configure the bundle or grant the responsible host access
  * before retrying. openStream is synchronous; use a worker thread for GUI hosts.
  * The 30 s bound covers undecided consent, not authorized native queries.
- * Built-in sources on every OS emit neither permissionPending nor permissionGranted;
- * those arms remain for custom Rust backends and compatibility. macOS microphone
+ * Built-in sources on every OS do not emit permissionPending;
+ * that advisory remains for custom Rust backends. macOS microphone
  * capture requires decided consent before each start and does not continuously
  * monitor authorization changes or revocation. With onEvent, startupSamplesDropped
  * is delivered before the affected generation's first onChunk and attached epochStart.
@@ -547,63 +484,17 @@ export declare function processes(): Promise<Array<JsProcessInfo>>
  * and continues. The signal may enter capture when our own process is included
  * (e.g. excludeSelf: false). Stopping cancels the probe without a late event.
  *
- * `options.denoise` enables noise suppression in core (internal canonical form), so both primary
- * and secondary taps receive denoised audio. `options.vad` runs VAD on the tap selected by `vadTap`
- * and attaches finalized events to that tap's chunk `vadEvents` (with absolute `atNs` from
- * recording zero). `options.secondaryOutput` enables the secondary tap, returning paired chunks
- * in another format (`primary.secondary` in `onChunk`). The denoise 48kHz requirement and
- * invalid VAD settings are checked and rejected here before opening the stream.
- *
- * Standard operation enables the secondary tap and VAD for the entire
- * recording. Toggle transcription by keeping or discarding the delivered
- * results, not by re-opening the stream; the secondary format is fixed at open
- * (see `switchSource`), so the recognition resample + VAD run on every
- * recording — budget for them as a constant cost, not an opt-in. The integrated
- * VAD defaults `maxSpeechMs` to 30 s (see `VadOptions`) so a monologue with no
- * silence stays bounded; call `flushVad` to force-close the open utterance
- * (e.g. when pausing recognition). Per-chunk `vadEvents[].atNs` is a recording
- * zero-based absolute time that is monotonic non-decreasing across chunks.
- *
- * `onChunk` is called with **one** argument, the primary `JsAudioChunk`. When
- * `secondaryOutput` is set, the paired secondary chunk arrives as
- * `chunk.secondary` (it is not a second callback argument). VAD results ride
- * on the chunk of the tap selected by `vadTap`: `chunk.vadEvents` for
- * 'primary', `chunk.secondary?.vadEvents` for 'secondary'. Do not block
- * synchronously inside `onChunk` (defer heavy work to a later task); blocking
- * stalls terminator delivery and delays `stop()` resolving.
+ * `denoise`, `secondaryOutput` and `vad` are independent optional features.
+ * The attached VAD consumes canonical capture; `vad.tap` selects its event carrier.
+ * Both VAD modes default to an unbounded maximum speech duration. `flushVad()`
+ * finishes/resets the current epoch and waits for closing-event delivery.
+ * The 20 ms chunk size is fixed because conversion and ordered event delivery
+ * share that cadence. The callback receives one primary chunk; secondary PCM is
+ * in `chunk.secondary`. Avoid heavy synchronous work in callbacks.
  */
 export declare function openStream(options: OpenOptions, onChunk: (chunk: JsAudioChunk) => void, onEvent?: ((event: JsStreamEvent) => void) | undefined | null): FlexStream
 /** Watch device changes. Linux startup failure throws AudioException. RescanRequired invalidates incremental caches. */
 export declare function watchDevices(onEvent: (event: JsDeviceEvent) => void): DeviceWatcherHandle
-/** Test-only capability marker, present only when fault injection is compiled. */
-export declare const __whisperVadTestFaults: true | undefined
-
-/**
- * Test-only; outside the public API.
- *
- * Create a stream by passing `MockBackend` to low-level `Stream::open`, then run it through the
- * same bridge / TSFN path as `open_stream`. End-to-end verification of all marshaling paths
- * (Float32Array, BigInt, peak/rms, frames) without real audio. Do not use in production code.
- *
- * Passing `secondaryRate` enables the secondary tap (`secondaryChannels` defaults to 1;
- * `secondaryEncoding` is 'f32'|'s16', default 'f32'), allowing pairing, s16 quantization, and
- * `Int16Array` marshaling to be verified without real audio (no actual capture needed).
- *
- * Passing `vadThreshold` enables integrated VAD (`vadTap` is 'primary'|'secondary', default
- * 'primary'), allowing `flushVad`, `vadEvents` `atNs`, and automatic `stop()` flush to be verified
- * without real audio. Tests construct it with `minSpeechMs=0`, so threshold 0 lets `flushVad`
- * reliably finalize open utterances (verifies RT finalization even with synthetic waves lacking silence).
- *
- * `onEvent` receives stream notifications, including `whisperVadFailed`.
- * `whisperVadFailAtChunk` injects a model failure on the 1-based canonical capture chunk;
- * `whisperVadResetFailures` fails that many subsequent reinitializations. Both are test-only
- * and require an addon built with `test-faults`; other builds reject either argument with
- * `TestFaultsUnavailable`, because fault injection is not compiled into production.
- *
- * JS name is `__openMockStream`. Leading `__` marks it outside the public API. napi's default
- * conversion drops leading underscores, producing `openMockStream`, so `js_name` fixes the name.
- */
-export declare function __openMockStream(sampleRate: number, channels: number, freqHz: number, onChunk: (chunk: JsAudioChunk) => void, secondaryRate?: number | undefined | null, secondaryChannels?: number | undefined | null, secondaryEncoding?: string | undefined | null, vadThreshold?: number | undefined | null, vadTap?: string | undefined | null, whisperVad?: WhisperVadStreamOptions | undefined | null, onEvent?: ((event: JsStreamEvent) => void) | undefined | null, whisperVadFailAtChunk?: number | undefined | null, whisperVadResetFailures?: number | undefined | null): FlexStream
 /**
  * Recording stream handle. Internally, the bridge thread owns and polls `flexaudio::Stream`
  * and sends chunks/events to JS through TSFN.
@@ -614,8 +505,8 @@ export declare class FlexStream {
    * stop (the last PCM and `frames:0` terminator) have been delivered to JS.
    * Repeated calls return the same retained success or failure after completion. Calling
    * inside `onChunk` does not freeze JS because joining happens off the JS thread.
-   * A whisper-only failure resolves and remains in shutdownReport().cleanupErrors with its
-   * typed whisperCode. Rejects with AudioException on capture or other cleanup failure;
+   * An attached VAD-only failure resolves and remains in shutdownReport().cleanupErrors with its
+   * typed vadCode. Rejects with AudioException on capture or other cleanup failure;
    * audioError retains all related causes. Capture failure suppresses
    * further PCM and the normal terminator. Cleanup-only failure preserves valid graceful output.
    * The stopped stream is spent; call openStream to capture again.
@@ -649,23 +540,8 @@ export declare class FlexStream {
   pause(): void
   /** Unpause delivery. Throws the stored error on terminal failure. */
   resume(): void
-  /**
-   * Force-finalize integrated VAD's currently open utterance (runtime operation).
-   *
-   * silero emits no `speechEnd` until silence arrives. Call this when pausing recognition or
-   * finalizing the last utterance at recording end. If an utterance is open, its final `speechEnd`
-   * (and paired `speechStart`) are prepended to `vadEvents` of the next tap chunk (with `atNs`
-   * from recording zero). Chunks arrive every 20ms, so latency is ≤ 1 chunk. VAD then
-   * resets and detects the next utterance with fresh context.
-   *
-   * This **does not change config** (independent of `secondaryOutput`/encoding being fixed at open
-   * and unchangeable through `switchSource`). It is also separate from audio stop-flush and does not
-   * modify audio samples. No-op if VAD is not configured. `stop()` calls this automatically after audio
-   * stop-flush. Throws if `stop()` has already completed.
-   */
-  flushVad(): void
   /** Drain/finish/reset an attached epoch; its closing carrier is delivered before settlement. */
-  flushWhisperVad(): Promise<void>
+  flushVad(): Promise<void>
   /**
    * Change input gain (linear multiplier). 1.0=unchanged, 2.0=about +6dB, 0.0=silence. Callable
    * any time during recording; takes effect on the next chunk (20ms granularity). Multiplied samples
@@ -693,40 +569,6 @@ export declare class FlexStream {
 export declare class DeviceWatcherHandle {
   /** Stop watching and join the bridge thread. Safe to call repeatedly. */
   stop(): void
-}
-/**
- * Offline VAD handle (silero-VAD on ONNX, embedded model).
- *
- * Each instance owns one ONNX session. Feed arbitrary-format interleaved f32 (`inputSampleRate` /
- * `inputChannels`) to [`Vad::process`]; it converts to mono at the VAD rate internally,
- * detects speech segments, and returns finalized [`JsVadEvent`] values. Use this to classify arbitrary
- * sample sequences yourself instead of using integrated VAD in `openStream`.
- */
-export declare class Vad {
-  /**
-   * Construct VAD from a settings object (load the embedded model). Invalid settings
-   * (sampleRate other than 8000/16000, threshold outside `[0,1]`, etc.) yield InvalidArg;
-   * model loading failure yields GenericFailure.
-   */
-  constructor(options: VadOptions)
-  /**
-   * Process arbitrary-format interleaved f32 and return finalized [`JsVadEvent`] values.
-   *
-   * Partial frames carry over internally, so input can be split anywhere. `atSample` uses
-   * VAD's internal rate (see [`JsVadEvent`]).
-   */
-  process(samples: Float32Array, inputSampleRate: number, inputChannels: number): Array<JsVadEvent>
-  /**
-   * Force-finalize the currently open utterance and return finalized [`JsVadEvent`] values (same behavior
-   * as reaching input end). Internal state then resets; the next `process` starts with fresh
-   * context. No model inference runs, making this lightweight and deterministic.
-   *
-   * Standalone `Vad` has no pts context, so `atNs` is `undefined` (`atSample` remains the raw cumulative
-   * position at VAD's internal rate). Returns an empty array when no utterance is open.
-   */
-  flush(): Array<JsVadEvent>
-  /** Initialize internal state (state / context / state machine / sample position / resampler). */
-  reset(): void
 }
 /**
  * Writer that incrementally saves recording chunks to FLAC files with lossless compression.

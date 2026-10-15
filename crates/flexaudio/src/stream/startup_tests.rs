@@ -377,7 +377,7 @@ fn pending_startup_report_precedes_ordered_primary_secondary_and_capture() -> Re
     );
     assert!(
         stream.poll_capture_ordered().is_none(),
-        "Whisper capture escaped before its startup event"
+        "Capture tap escaped before its startup event"
     );
     assert!(matches!(
         stream.poll_event(),

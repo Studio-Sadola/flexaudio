@@ -464,12 +464,12 @@ pub unsafe extern "C" fn flexaudio_error_message_v2(
         v.message.as_ptr()
     })
 }
-/// Borrow the stable Whisper VAD cause code until the error owner is freed.
-/// NULL means this error has no Whisper VAD cause; invalid pointers set last_error.
+/// Borrow the stable VAD cause code until the error owner is freed.
+/// NULL means this error has no VAD cause; invalid pointers set last_error.
 /// # Safety
 /// value must be a live readable error owner. Do not free the borrowed string.
 #[no_mangle]
-pub unsafe extern "C" fn flexaudio_error_whisper_code_v2(
+pub unsafe extern "C" fn flexaudio_error_vad_code_v2(
     value: *const FlexErrorInfoV2,
 ) -> *const c_char {
     guard_const_ptr(|| {
@@ -479,7 +479,7 @@ pub unsafe extern "C" fn flexaudio_error_whisper_code_v2(
             return ptr::null();
         }
         (*value)
-            .whisper_code
+            .vad_code
             .as_ref()
             .map_or(ptr::null(), |code| code.as_ptr())
     })

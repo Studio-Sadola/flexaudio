@@ -84,7 +84,7 @@ fn child_overflow(overflow: bool) {
     let event = be.poll_event();
     let dropped = lost.load(Ordering::SeqCst);
     assert!(!overflow || dropped > 0, "fixture must overflow child ring");
-    assert!(dropped == 0 || event.is_some(), "F08: child_dropped_samples={dropped}, delivered_mixed_samples={delivered}, event={event:?}; loss disappeared at mixer boundary");
+    assert!(dropped == 0 || event.is_some(), "child_dropped_samples={dropped}, delivered_mixed_samples={delivered}, event={event:?}; loss disappeared at mixer boundary");
     if overflow {
         assert!(matches!(event, Some(Event::AudioLoss { loss })
             if loss.path() == AudioPath::Capture { lane: Some(MixLane::Microphone) }
@@ -94,11 +94,11 @@ fn child_overflow(overflow: bool) {
     }
 }
 #[test]
-fn repro_p3_child_overflow() {
+fn regression_child_overflow() {
     child_overflow(true);
 }
 #[test]
-fn repro_p3_child_overflow_control() {
+fn regression_child_overflow_control() {
     child_overflow(false);
 }
 
@@ -129,11 +129,11 @@ fn fifo_overflow(overflow: bool) {
     assert!(lane.notices.poll().is_none());
 }
 #[test]
-fn repro_p3_fifo_overflow() {
+fn regression_fifo_overflow() {
     fifo_overflow(true);
 }
 #[test]
-fn repro_p3_fifo_overflow_control() {
+fn regression_fifo_overflow_control() {
     fifo_overflow(false);
 }
 
@@ -153,15 +153,15 @@ fn final_tail(late: bool) {
     let got = consumer.pop_slice(&mut vec![0.0; RAW_RING_SAMPLES]) + before;
     assert!(
         got > 0,
-        "F13: children each supplied 1920 final samples during stop, mixer delivered_samples={got}"
+        "children each supplied 1920 final samples during stop, mixer delivered_samples={got}"
     );
 }
 #[test]
-fn repro_p3_final_tail() {
+fn regression_final_tail() {
     final_tail(true);
 }
 #[test]
-fn repro_p3_final_tail_control() {
+fn regression_final_tail_control() {
     final_tail(false);
 }
 
@@ -176,7 +176,7 @@ fn shutdown(panic: bool) {
     let event = be.poll_event();
     assert!(
         !panic || event.is_some(),
-        "F37: child stop panic swallowed: event={event:?}"
+        "child stop panic swallowed: event={event:?}"
     );
     if panic {
         assert!(
@@ -187,17 +187,17 @@ fn shutdown(panic: bool) {
     assert!(be.poll_event().is_none());
 }
 #[test]
-fn repro_p3_shutdown_panic() {
+fn regression_shutdown_panic() {
     shutdown(true);
 }
 #[test]
-fn repro_p3_shutdown_panic_control() {
+fn regression_shutdown_panic_control() {
     shutdown(false);
 }
 
 // Control and regression evidence for the 0.4.0 child terminal-event transport.
 #[test]
-fn repro_p3_terminal_lane_already_fixed() {
+fn regression_terminal_lane_already_fixed() {
     let mut mic = Burst::new(0);
     mic.terminal = true;
     let mic_stops = mic.stops.clone();
@@ -217,7 +217,7 @@ fn repro_p3_terminal_lane_already_fixed() {
     assert_eq!(system_stops.load(Ordering::SeqCst), 1);
 }
 #[test]
-fn repro_p3_terminal_lane_control() {
+fn regression_terminal_lane_control() {
     let mut be = CompositeBackend::new(
         Box::new(Burst::new(1920)),
         Box::new(Burst::new(1920)),
@@ -264,7 +264,7 @@ fn clipping(clip: bool) {
     assert_eq!(chunk.data[0], if clip { 1.0 } else { 0.4 });
     assert!(
         !clip || !chunk.flags.is_empty() || event.is_some(),
-        "F16: mixed 0.8 + 0.8 saturated to {}, flags={:?}, event={event:?}",
+        "mixed 0.8 + 0.8 saturated to {}, flags={:?}, event={event:?}",
         chunk.data[0],
         chunk.flags
     );
@@ -272,11 +272,11 @@ fn clipping(clip: bool) {
     assert!(stream.poll_event().is_none());
 }
 #[test]
-fn repro_p3_clipping_metadata() {
+fn regression_clipping_metadata() {
     clipping(true);
 }
 #[test]
-fn repro_p3_clipping_metadata_control() {
+fn regression_clipping_metadata_control() {
     clipping(false);
 }
 
@@ -305,16 +305,16 @@ fn valid_dsp(rate: u32) {
     let result = lane.ingest(&mut vec![0.0; RAW_RING_SAMPLES]);
     assert!(
         result.is_ok(),
-        "F09: valid-format stock DSP unexpectedly failed: {result:?}"
+        "valid-format stock DSP unexpectedly failed: {result:?}"
     );
 }
 #[test]
-fn repro_p3_dsp_failure_not_reproduced() {
+fn regression_dsp_failure_not_reproduced() {
     for rate in [8_000, 16_000, 44_100, 96_000, 192_000] {
         valid_dsp(rate);
     }
 }
 #[test]
-fn repro_p3_dsp_failure_control() {
+fn regression_dsp_failure_control() {
     valid_dsp(48_000);
 }

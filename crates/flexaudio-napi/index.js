@@ -316,7 +316,7 @@ if (!nativeBinding) {
   throw error
 }
 
-const { FlexStream, DeviceWatcherHandle, devices, processes, openStream, watchDevices, __openMockStream, Vad, FlacEncoder, Denoiser } = nativeBinding
+const { FlexStream, DeviceWatcherHandle, devices, processes, openStream, watchDevices, Vad, FlacEncoder, Denoiser } = nativeBinding
 
 module.exports.FlexStream = FlexStream
 module.exports.DeviceWatcherHandle = DeviceWatcherHandle
@@ -324,9 +324,6 @@ module.exports.devices = devices
 module.exports.processes = processes
 module.exports.openStream = openStream
 module.exports.watchDevices = watchDevices
-module.exports.__openMockStream = __openMockStream
-module.exports.__whisperVadTestFaults = nativeBinding.__whisperVadTestFaults
 module.exports.Vad = Vad
-module.exports.WhisperVad = nativeBinding.WhisperVad
 module.exports.FlacEncoder = FlacEncoder
 module.exports.Denoiser = Denoiser

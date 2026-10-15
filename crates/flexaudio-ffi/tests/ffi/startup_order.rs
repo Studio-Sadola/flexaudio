@@ -21,15 +21,15 @@ impl flexaudio::CaptureBackend for StartupBackend {
     fn stop(&mut self) {}
 }
 
-fn startup_stream(attach_whisper: bool) -> FlexStream {
+fn startup_stream(attach_vad_tap: bool) -> FlexStream {
     let mut inner =
         flexaudio::Stream::open(flexaudio::StreamConfig::default(), Box::new(StartupBackend))
             .expect("synthetic startup stream");
-    let whisper = if attach_whisper {
+    let vad_tap = if attach_vad_tap {
         inner.enable_capture_tap().expect("canonical capture tap");
         Some(
-            flexaudio_vad::WhisperVadTap::new(Default::default(), Default::default())
-                .expect("offline whisper tap"),
+            flexaudio_vad::VadTap::new(Default::default(), Default::default())
+                .expect("offline vad_tap tap"),
         )
     } else {
         None
@@ -37,26 +37,22 @@ fn startup_stream(attach_whisper: bool) -> FlexStream {
     inner.start().expect("synthetic startup");
     // Joining the intake makes pending output deterministic without consuming its notice.
     inner.stop_checked().expect("synthetic capture shutdown");
-    binding_stream(inner, whisper)
+    binding_stream(inner, vad_tap)
 }
 
-fn binding_stream(
-    inner: flexaudio::Stream,
-    whisper: Option<flexaudio_vad::WhisperVadTap>,
-) -> FlexStream {
+fn binding_stream(inner: flexaudio::Stream, vad_tap: Option<flexaudio_vad::VadTap>) -> FlexStream {
     FlexStream {
         inner,
         shutdown: None,
         shutdown_event_index: 0,
         last_output: None,
-        whisper,
-        whisper_events: Vec::new(),
-        whisper_origin: (0, 0),
-        whisper_error: None,
-        whisper_cleanup: Vec::new(),
+        vad_tap,
+        vad_events: Vec::new(),
+        vad_origin: (0, 0),
+        vad_error: None,
+        vad_cleanup: Vec::new(),
         ready_chunks: Default::default(),
         denoiser: None,
-        vad: None,
     }
 }
 
@@ -94,20 +90,20 @@ fn c_startup_notice_is_queued_before_first_pcm_poll() {
 }
 
 #[test]
-fn c_whisper_epoch_does_not_require_startup_event_poll() {
+fn c_vad_tap_epoch_does_not_require_startup_event_poll() {
     let mut stream = startup_stream(true);
-    stream.drain_whisper_capture();
+    stream.drain_vad_capture();
     assert!(matches!(
-        stream.whisper_events.first(),
-        Some(flexaudio_vad::AttachedWhisperVadEvent::EpochStart {
+        stream.vad_events.first(),
+        Some(flexaudio_vad::AttachedVadEvent::EpochStart {
             capture_sample: 480,
             pts_ns: 10_000_000,
             ..
         })
     ));
-    let count = stream.whisper_events.len();
-    stream.drain_whisper_capture();
-    assert_eq!(stream.whisper_events.len(), count);
+    let count = stream.vad_events.len();
+    stream.drain_vad_capture();
+    assert_eq!(stream.vad_events.len(), count);
     assert!(matches!(
         stream.poll_binding_event(),
         Some(flexaudio::Event::StartupSamplesDropped { frames: 480, .. })
@@ -138,7 +134,7 @@ fn startup_notice_does_not_erase_c_stop_pcm() {
 }
 
 #[test]
-fn startup_notice_does_not_close_c_whisper_before_pending_capture() {
+fn startup_notice_does_not_close_c_vad_tap_before_pending_capture() {
     let mut stream = startup_stream(true);
     stream.stop_binding().expect("durable attached C shutdown");
     assert!(
@@ -147,21 +143,21 @@ fn startup_notice_does_not_close_c_whisper_before_pending_capture() {
     );
     // SAFETY: both owners are live; each returned chunk is freed exactly once.
     unsafe {
-        let mut chunk: crate::whisper_integration::FlexChunkV2 = std::mem::zeroed();
+        let mut chunk: crate::vad_integration::FlexChunkV2 = std::mem::zeroed();
         assert_eq!(
-            crate::whisper_integration::flexaudio_poll_chunk_v2(&mut stream, &mut chunk),
+            crate::vad_integration::flexaudio_poll_chunk_v2(&mut stream, &mut chunk),
             1
         );
-        let events = if chunk.whisper_vad_events_len == 0 {
+        let events = if chunk.vad_events_len == 0 {
             &[][..]
         } else {
-            assert!(!chunk.whisper_vad_events.is_null());
-            std::slice::from_raw_parts(chunk.whisper_vad_events, chunk.whisper_vad_events_len)
+            assert!(!chunk.vad_events.is_null());
+            std::slice::from_raw_parts(chunk.vad_events, chunk.vad_events_len)
         };
         assert!(events
             .iter()
-            .any(|event| { event.r#type == crate::whisper_integration::FLEX_WHISPER_EPOCH_START }));
-        crate::whisper_integration::flexaudio_chunk_free_v2(&mut chunk);
+            .any(|event| { event.r#type == crate::vad_integration::FLEX_VAD_EPOCH_START }));
+        crate::vad_integration::flexaudio_chunk_free_v2(&mut chunk);
     }
     stream.stop_binding().expect("repeated attached C shutdown");
     assert!(matches!(
@@ -175,7 +171,7 @@ fn startup_notice_does_not_close_c_whisper_before_pending_capture() {
 fn startup_notice_does_not_make_c_flush_skip_pending_capture() {
     let mut stream = startup_stream(true);
     // SAFETY: the stream is a live, exclusively owned synthetic capture handle.
-    let result = unsafe { crate::whisper_integration::flexaudio_flush_whisper_vad(&mut stream) };
+    let result = unsafe { crate::vad_integration::flexaudio_flush_vad(&mut stream) };
     assert_eq!(result, crate::error::code::FLEX_OK);
     assert!(
         !stream.ready_chunks.is_empty(),
@@ -183,20 +179,17 @@ fn startup_notice_does_not_make_c_flush_skip_pending_capture() {
     );
     // SAFETY: each successful carrier is owned and released by this test.
     unsafe {
-        let mut chunk: crate::whisper_integration::FlexChunkV2 = std::mem::zeroed();
+        let mut chunk: crate::vad_integration::FlexChunkV2 = std::mem::zeroed();
         assert_eq!(
-            crate::whisper_integration::flexaudio_poll_chunk_v2(&mut stream, &mut chunk),
+            crate::vad_integration::flexaudio_poll_chunk_v2(&mut stream, &mut chunk),
             1
         );
         assert_eq!(chunk.chunk.pts_ns, 10_000_000);
-        assert!(chunk.whisper_vad_events_len > 0);
-        assert!(!chunk.whisper_vad_events.is_null());
-        let first = &*chunk.whisper_vad_events;
-        assert_eq!(
-            first.r#type,
-            crate::whisper_integration::FLEX_WHISPER_EPOCH_START
-        );
-        crate::whisper_integration::flexaudio_chunk_free_v2(&mut chunk);
+        assert!(chunk.vad_events_len > 0);
+        assert!(!chunk.vad_events.is_null());
+        let first = &*chunk.vad_events;
+        assert_eq!(first.r#type, crate::vad_integration::FLEX_VAD_EPOCH_START);
+        crate::vad_integration::flexaudio_chunk_free_v2(&mut chunk);
     }
     stream
         .stop_binding()
@@ -301,8 +294,8 @@ fn c_startup_timeout_is_terminal_without_event_polling() {
             // SAFETY: both outputs and the exclusively owned stream are valid stack owners.
             let result = unsafe {
                 if versioned {
-                    let mut chunk: crate::whisper_integration::FlexChunkV2 = std::mem::zeroed();
-                    crate::whisper_integration::flexaudio_poll_chunk_v2(&mut stream, &mut chunk)
+                    let mut chunk: crate::vad_integration::FlexChunkV2 = std::mem::zeroed();
+                    crate::vad_integration::flexaudio_poll_chunk_v2(&mut stream, &mut chunk)
                 } else {
                     let mut chunk: crate::types::FlexChunk = std::mem::zeroed();
                     crate::flexaudio_poll_chunk(&mut stream, &mut chunk)

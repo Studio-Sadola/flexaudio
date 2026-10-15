@@ -1,5 +1,5 @@
 //! Preprocessing for [`crate::Vad::process_pcm`]. Converts interleaved PCM in any format to mono,
-//! resamples it to the VAD operating rate (16000 or 8000), and prepares it for the existing
+//! resamples it to the model rate (16000), and prepares it for the existing
 //! 16k/mono path.
 //!
 //! It follows the flexaudio-core normalizer: mono conversion uses a simple average across
@@ -23,14 +23,14 @@ pub struct PcmFormat {
 
 impl PcmFormat {
     /// Validate supported PCM input rates (8,000–192,000 Hz) and nonzero channels.
-    pub fn validate(self) -> Result<(), crate::VadError> {
+    pub fn validate(self) -> Result<(), crate::InferenceError> {
         if self.channels == 0 {
-            return Err(crate::VadError::InvalidFormat(
+            return Err(crate::InferenceError::InvalidFormat(
                 "channels must be nonzero".into(),
             ));
         }
         if !(8_000..=192_000).contains(&self.sample_rate) {
-            return Err(crate::VadError::InvalidFormat(format!(
+            return Err(crate::InferenceError::InvalidFormat(format!(
                 "sample rate must be within 8000..=192000 Hz, got {}",
                 self.sample_rate
             )));
@@ -45,8 +45,6 @@ impl PcmFormat {
 /// The input format ([`PcmFormat`]) and target rate are fixed at construction. If the input rate
 /// matches the target, only mono conversion is performed and no resampler is used.
 pub(crate) struct PcmConverter {
-    format: PcmFormat,
-    input_seen: bool,
     channels: usize,
     /// Sample-rate converter for the target rate. `None` if the input rate matches (mono
     /// conversion only).
@@ -82,26 +80,26 @@ impl PcmConverter {
         )
     }
 
-    /// Create a dedicated converter that maps VAD's 8 kHz frames (256 samples) to 16 kHz frames
-    /// (512 samples) while preserving continuity.
-    pub(crate) fn new_8k_to_16k_frame_resampler() -> Result<Self, String> {
-        let mut converter = Self::new_with_resampler_chunk(
-            PcmFormat {
-                sample_rate: 8_000,
-                channels: 1,
-            },
-            16_000,
-            Some(256),
-            false,
-        )?;
+    /// Reuse the sample-aligned capture phase for 48 kHz input, and the same
+    /// sinc converter with its reported group delay for all other input rates.
+    pub(crate) fn new_aligned(format: PcmFormat) -> Result<Self, String> {
+        if format.sample_rate == 48_000 {
+            Self::new_with_resampler_chunk(format, 16_000, None, true)
+        } else {
+            Self::new(format, 16_000)
+        }
+    }
 
-        // rubato's sinc waits for future taps at startup, so the first real frame would produce
-        // only 508 samples. Feed 256 samples of silent pre-roll first and discard its output.
-        // After that, each real frame produces 512 samples without zero-padding or splitting
-        // frames at real audio boundaries.
-        let mut discarded = Vec::new();
-        converter.convert(&[0.0; 256], &mut discarded)?;
-        Ok(converter)
+    pub(crate) fn output_delay(&self) -> usize {
+        self.resampler
+            .as_ref()
+            .map_or(0, |resampler| resampler.inner.output_delay())
+    }
+
+    pub(crate) fn input_block(&self) -> usize {
+        self.resampler
+            .as_ref()
+            .map_or(1, |resampler| resampler.chunk_in_frames)
     }
 
     fn new_with_resampler_chunk(
@@ -123,8 +121,6 @@ impl PcmConverter {
             )?)
         };
         Ok(PcmConverter {
-            format,
-            input_seen: false,
             channels,
             resampler,
             remainder: Vec::new(),
@@ -137,18 +133,6 @@ impl PcmConverter {
     #[cfg(test)]
     pub(crate) fn fail_conversion(&mut self) {
         self.fail_conversion = true;
-    }
-
-    /// Whether this converter handles the given input format.
-    pub(crate) fn matches(&self, format: PcmFormat) -> bool {
-        self.format == format
-    }
-
-    /// A resampler retains filter history even when its block accumulator is empty.
-    /// Replacing it would lose the delayed output of that input; only a checked
-    /// flush/reset boundary may abandon this history under the legacy EOF contract.
-    pub(crate) fn has_pending_input(&self) -> bool {
-        !self.remainder.is_empty() || (self.resampler.is_some() && self.input_seen)
     }
 
     /// Downmix interleaved input to mono, resample if needed, and append target-rate mono samples
@@ -165,7 +149,6 @@ impl PcmConverter {
         if self.fail_conversion {
             return Err("injected conversion failure".into());
         }
-        self.input_seen |= !interleaved.is_empty();
         // Append this input to the previous remainder and downmix only complete frames.
         self.remainder.extend_from_slice(interleaved);
         let frames = self.remainder.len() / self.channels;
@@ -466,25 +449,6 @@ mod tests {
             conv.convert(chunk, &mut split).unwrap();
         }
         assert_eq!(bulk, split);
-    }
-
-    #[test]
-    fn frame_resampler_returns_one_16k_frame_per_8k_frame() {
-        let mut converter = PcmConverter::new_8k_to_16k_frame_resampler().unwrap();
-        let mut output = Vec::new();
-        let input: Vec<f32> = (0..(256 * 4))
-            .map(|i| (2.0 * PI * 440.0 * i as f32 / 8_000.0).sin() * 0.5)
-            .collect();
-
-        for frame in input.as_chunks::<256>().0 {
-            let before = output.len();
-            converter.convert(frame, &mut output).unwrap();
-            assert_eq!(
-                output.len() - before,
-                512,
-                "8 kHz frame must yield exactly one 16 kHz model frame"
-            );
-        }
     }
 
     fn rms(samples: &[f32]) -> f32 {

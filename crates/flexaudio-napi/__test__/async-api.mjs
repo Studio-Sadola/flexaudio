@@ -17,7 +17,7 @@ import { dirname, join } from 'node:path';
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
-const native = require(join(here, 'flexaudio.node'));
+const { native } = await import('./test-native.mjs');
 
 function assert(cond, msg) {
   if (!cond) {

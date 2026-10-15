@@ -1,18 +1,18 @@
 //! One retained outcome for core teardown and attached addon processing.
 use super::*;
 use flexaudio::core::{ErrorContext, Operation};
-use flexaudio_vad::WhisperVadTapError;
+use flexaudio_vad::VadTapError;
 use napi::bindgen_prelude::Null;
 
 #[derive(Clone)]
-pub(super) struct WhisperFailure {
-    pub error: WhisperVadTapError,
-    pub stage: WhisperFailureStage,
+pub(super) struct VadFailure {
+    pub error: VadTapError,
+    pub stage: VadFailureStage,
 }
 
-impl WhisperFailure {
+impl VadFailure {
     /// Typed audio-error projection: a backend failure carrying the operation context and the
-    /// stable whisper code that names the addon cause. Diagnostics name the cause only, never
+    /// stable attachment code that names the addon cause. Diagnostics name the cause only, never
     /// PCM, a device name or a secret.
     pub(super) fn audio_error(&self) -> boundary::JsAudioError {
         boundary::audio_error(
@@ -25,13 +25,13 @@ impl WhisperFailure {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum WhisperFailureStage {
+pub(super) enum VadFailureStage {
     Process,
     RuntimeFlush,
     StopFlush,
 }
 
-impl WhisperFailureStage {
+impl VadFailureStage {
     pub fn operation(self) -> Operation {
         match self {
             Self::Process => Operation::Normalize,
@@ -43,7 +43,7 @@ impl WhisperFailureStage {
 #[derive(Default)]
 pub(super) struct ShutdownReport {
     pub core: Option<flexaudio::core::ShutdownReport>,
-    pub whisper: Vec<WhisperFailure>,
+    pub attachment: Vec<VadFailure>,
     pub binding_cleanup: Vec<flexaudio::Error>,
 }
 
@@ -51,7 +51,7 @@ impl ShutdownReport {
     pub fn from_core(core: Option<flexaudio::core::ShutdownReport>) -> Self {
         Self {
             core,
-            whisper: Vec::new(),
+            attachment: Vec::new(),
             binding_cleanup: Vec::new(),
         }
     }
@@ -68,7 +68,7 @@ impl ShutdownReport {
             .as_ref()
             .map(|report| report.cleanup().to_vec())
             .unwrap_or_default();
-        cleanup.extend(self.whisper.iter().map(|failure| {
+        cleanup.extend(self.attachment.iter().map(|failure| {
             failure
                 .error
                 .audio_error()
@@ -102,10 +102,10 @@ impl ShutdownReport {
 mod tests {
     use super::*;
 
-    fn whisper_failure() -> WhisperFailure {
-        WhisperFailure {
-            error: WhisperVadTapError::Vad(flexaudio_vad::WhisperVadError::Inference),
-            stage: WhisperFailureStage::Process,
+    fn attachment_failure() -> VadFailure {
+        VadFailure {
+            error: VadTapError::Vad(flexaudio_vad::VadError::Inference),
+            stage: VadFailureStage::Process,
         }
     }
 
@@ -113,20 +113,17 @@ mod tests {
     fn attached_vad_failure_is_cleanup_only_and_keeps_its_typed_code() {
         let report = ShutdownReport {
             core: None,
-            whisper: vec![whisper_failure()],
+            attachment: vec![attachment_failure()],
             binding_cleanup: Vec::new(),
         };
         let js = report.to_js();
         assert!(
             matches!(js.primary, Either::B(Null)),
-            "a whisper-only failure must not be the capture primary"
+            "an attached VAD-only failure must not be the capture primary"
         );
         assert_eq!(js.cleanup_errors.len(), 1);
         assert_eq!(js.cleanup_errors[0].kind, "backend");
-        assert_eq!(
-            js.cleanup_errors[0].whisper_code.as_deref(),
-            Some("Inference")
-        );
+        assert_eq!(js.cleanup_errors[0].vad_code.as_deref(), Some("Inference"));
         assert_eq!(js.cleanup_errors[0].contexts[0].operation, "normalize");
     }
 
@@ -137,7 +134,7 @@ mod tests {
                 Some(flexaudio::Error::DeviceLost),
                 Vec::new(),
             )),
-            whisper: vec![whisper_failure()],
+            attachment: vec![attachment_failure()],
             binding_cleanup: Vec::new(),
         };
         let js = report.to_js();
@@ -146,36 +143,30 @@ mod tests {
         };
         assert_eq!(primary.kind, "deviceLost");
         assert_eq!(js.cleanup_errors.len(), 1);
-        assert_eq!(
-            js.cleanup_errors[0].whisper_code.as_deref(),
-            Some("Inference")
-        );
+        assert_eq!(js.cleanup_errors[0].vad_code.as_deref(), Some("Inference"));
     }
 
     #[test]
     fn a_stop_flush_vad_failure_is_cleanup_and_keeps_the_flush_context() {
         let report = ShutdownReport {
             core: None,
-            whisper: vec![WhisperFailure {
-                error: WhisperVadTapError::Conversion,
-                stage: WhisperFailureStage::StopFlush,
+            attachment: vec![VadFailure {
+                error: VadTapError::Conversion,
+                stage: VadFailureStage::StopFlush,
             }],
             binding_cleanup: Vec::new(),
         };
         let js = report.to_js();
         assert!(matches!(js.primary, Either::B(Null)));
         assert_eq!(js.cleanup_errors.len(), 1);
-        assert_eq!(
-            js.cleanup_errors[0].whisper_code.as_deref(),
-            Some("Conversion")
-        );
+        assert_eq!(js.cleanup_errors[0].vad_code.as_deref(), Some("Conversion"));
         assert_eq!(js.cleanup_errors[0].contexts[0].operation, "flush");
     }
     #[test]
-    fn whisper_only_stop_succeeds_and_binding_cleanup_keeps_the_rejecting_root() {
+    fn attachment_only_stop_succeeds_and_binding_cleanup_keeps_the_rejecting_root() {
         let mut report = ShutdownReport {
             core: None,
-            whisper: vec![whisper_failure()],
+            attachment: vec![attachment_failure()],
             binding_cleanup: Vec::new(),
         };
         assert!(report.outcome().result().is_ok());
@@ -187,11 +178,8 @@ mod tests {
             .result()
             .expect_err("a bridge failure must still reject stop");
         let mapped = boundary::audio_error(&error);
-        assert!(mapped.whisper_code.is_none());
+        assert!(mapped.vad_code.is_none());
         assert_eq!(mapped.secondary.len(), 1);
-        assert_eq!(
-            mapped.secondary[0].whisper_code.as_deref(),
-            Some("Inference")
-        );
+        assert_eq!(mapped.secondary[0].vad_code.as_deref(), Some("Inference"));
     }
 }

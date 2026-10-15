@@ -15,12 +15,12 @@ documentation = "https://docs.rs/flexaudio-vad"
 
 [features]
 # Compiles the capture owner's fault injection used only by binding self-tests
-# (`WhisperVadTap::inject_failure` / `inject_reset_failure`). Off by default: no
+# (`VadTap::inject_failure` / `inject_reset_failure`). Off by default: no
 # production caller can latch a failure.
 test-faults = []
 
 [dependencies]
-flexaudio-core = { path = "../flexaudio-core", version = "0.5.4" }
+flexaudio-core = { path = "../flexaudio-core", version = "0.6.0" }
 # Run silero-VAD offline with the pure-Rust ONNX inference engine tract-onnx. No C/C++ runtime or
 # onnxruntime DLL is needed (a single self-contained binary). Optimize the plan once at startup with
 # `into_optimized` and reuse it for every frame.

@@ -15,7 +15,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"   # flexaudio root
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "== cargo build -p flexaudio-napi (release) =="
-cargo build -p flexaudio-napi --release --manifest-path "$ROOT/Cargo.toml"
+cargo build -p flexaudio-napi --release --features test-faults --manifest-path "$ROOT/Cargo.toml"
 
 # Find the cdylib artifact (package name flexaudio-napi -> platform-specific filename).
 RELEASE_DIR="$ROOT/target/release"

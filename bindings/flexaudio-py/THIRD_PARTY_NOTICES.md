@@ -2633,15 +2633,15 @@ SOFTWARE.
 
 Used by:
 
-- [flexaudio 0.5.4](https://crates.io/crates/flexaudio/0.5.4)
-- [flexaudio-core 0.5.4](https://crates.io/crates/flexaudio-core/0.5.4)
-- [flexaudio-denoise 0.5.4](https://crates.io/crates/flexaudio-denoise/0.5.4)
-- [flexaudio-encode 0.5.4](https://crates.io/crates/flexaudio-encode/0.5.4)
-- [flexaudio-mic 0.5.4](https://crates.io/crates/flexaudio-mic/0.5.4)
-- [flexaudio-os-linux 0.5.4](https://crates.io/crates/flexaudio-os-linux/0.5.4)
-- [flexaudio-os-macos 0.5.4](https://crates.io/crates/flexaudio-os-macos/0.5.4)
-- [flexaudio-os-windows 0.5.4](https://crates.io/crates/flexaudio-os-windows/0.5.4)
-- [flexaudio-vad 0.5.4](https://crates.io/crates/flexaudio-vad/0.5.4)
+- [flexaudio 0.6.0](https://crates.io/crates/flexaudio/0.6.0)
+- [flexaudio-core 0.6.0](https://crates.io/crates/flexaudio-core/0.6.0)
+- [flexaudio-denoise 0.6.0](https://crates.io/crates/flexaudio-denoise/0.6.0)
+- [flexaudio-encode 0.6.0](https://crates.io/crates/flexaudio-encode/0.6.0)
+- [flexaudio-mic 0.6.0](https://crates.io/crates/flexaudio-mic/0.6.0)
+- [flexaudio-os-linux 0.6.0](https://crates.io/crates/flexaudio-os-linux/0.6.0)
+- [flexaudio-os-macos 0.6.0](https://crates.io/crates/flexaudio-os-macos/0.6.0)
+- [flexaudio-os-windows 0.6.0](https://crates.io/crates/flexaudio-os-windows/0.6.0)
+- [flexaudio-vad 0.6.0](https://crates.io/crates/flexaudio-vad/0.6.0)
 
 ````text
 MIT License
@@ -3231,7 +3231,7 @@ Mozilla Public License Version 2.0
     means any form of the work other than Source Code Form.
 
 1.7. "Larger Work"
-    means a work that combines Covered Software with other material, in 
+    means a work that combines Covered Software with other material, in
     a separate file or files, that is not Covered Software.
 
 1.8. "License"
@@ -3701,8 +3701,8 @@ SOFTWARE.
 The embedded `flexaudio-vad` implementation ports segmentation processing from
 whisper.cpp pin `85a69493a601d4ff5a834064f7b7bac250bd8739` (function
 `whisper_vad_segments_from_probs`, lines 5211–5444). The upstream source notes
-the Silero lineage of its silence split rule. This notice covers segmentation,
-not whisperd's separate audio copying or timestamp mapping.
+the Silero lineage of its silence split rule. This notice covers the adapted
+segmentation implementation.
 
 ```text
 MIT License

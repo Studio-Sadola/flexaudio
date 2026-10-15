@@ -93,7 +93,7 @@ jobs:
           -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
           -p flexaudio-encode -p flexaudio-denoise
           -p flexaudio-ffi
-      - name: Test Whisper fault isolation (device-free)
+      - name: Test VAD fault isolation (device-free)
         run: cargo test -p flexaudio-vad --features test-faults
       # Do not enable extension-module: Rust test executables need to link libpython.
       - name: Test Python binding Rust isolation (device-free)
@@ -105,7 +105,7 @@ jobs:
           pip install -q 'maturin[patchelf]'
           maturin build --manifest-path bindings/flexaudio-py/Cargo.toml --out /tmp/wheels
           pip install --no-index --find-links /tmp/wheels flexaudio
-          python -m unittest bindings/flexaudio-py/tests/test_contracts.py bindings/flexaudio-py/tests/test_whisper_buffer.py -v
+          python -m unittest bindings/flexaudio-py/tests/test_contracts.py bindings/flexaudio-py/tests/test_pcm_buffer.py -v
           # Discovery fails closed: without a PipeWire daemon (this runner) devices()
           # raises a typed BackendError instead of returning a partial list.
           python -c "
@@ -165,7 +165,7 @@ jobs:
       - name: Install wheel and exercise float32 input
         run: |
           python -m pip install --no-index --find-links dist flexaudio
-          python -m unittest bindings/flexaudio-py/tests/test_whisper_buffer.py -v
+          python -m unittest bindings/flexaudio-py/tests/test_pcm_buffer.py -v
 
   windows-napi-reproducibility:
     name: Reproducible Windows x64 N-API release
@@ -245,17 +245,17 @@ jobs:
         run: node --test crates/flexaudio-napi/__test__/check-pe-dependencies.test.mjs
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
-      - name: N-API smoke / dual / async-api (mock only)
-        run: bash crates/flexaudio-napi/__test__/run-smoke.sh
       - name: Build plain debug addon (without fault injection)
         timeout-minutes: 15
         run: |
           cargo build -p flexaudio-napi
           cp target/debug/libflexaudio_napi.so crates/flexaudio-napi/__test__/plain-debug.node
+      - name: N-API smoke / dual / async-api (mock only)
+        run: bash crates/flexaudio-napi/__test__/run-smoke.sh
       - name: Build fault-injection reproduction addon
         timeout-minutes: 15
         run: |
-          cargo rustc -p flexaudio-napi --example capture_test_addon --features test-faults --crate-type cdylib -- --cfg test --cfg flexaudio_repro_addon
+          cargo rustc -p flexaudio-napi --example capture_test_addon --features test-faults --crate-type cdylib -- --cfg flexaudio_test_addon
           cp target/debug/examples/libcapture_test_addon.so crates/flexaudio-napi/__test__/repro.node
       - name: Test N-API failure isolation (device-free)
         timeout-minutes: 5
@@ -263,8 +263,9 @@ jobs:
         env:
           FLEXAUDIO_RUN_REPRO: '1'
           FLEXAUDIO_REPRO_ADDON: ${{ github.workspace }}/crates/flexaudio-napi/__test__/repro.node
-          FLEXAUDIO_TEST_ADDON: ${{ github.workspace }}/crates/flexaudio-napi/__test__/plain-debug.node
-        run: node --test __test__/repro_p9.test.mjs __test__/repro_p9_declarations.test.mjs __test__/whisper-vad.test.mjs
+          FLEXAUDIO_TEST_ADDON: ${{ github.workspace }}/crates/flexaudio-napi/__test__/repro.node
+          FLEXAUDIO_RELEASE_ADDON: ${{ github.workspace }}/crates/flexaudio-napi/__test__/plain-debug.node
+        run: node --test __test__/binding-contract.test.mjs __test__/binding-declarations.test.mjs __test__/vad.test.mjs
 
   smoke-linux-pipewire:
     name: Self-exclusion smoke (Linux / real PipeWire)

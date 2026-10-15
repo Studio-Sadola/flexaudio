@@ -328,6 +328,7 @@ impl Stream {
             target_pid: new_config.target_pid,
             mode: new_config.mode,
             exclude_self: new_config.exclude_self,
+            silence_probe: new_config.silence_probe,
             exclude_pids: new_config.exclude_pids,
             ..self.config.clone()
         };

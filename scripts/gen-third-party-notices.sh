@@ -49,12 +49,16 @@ manifests=(
     'crates/flexaudio-napi/Cargo.toml'
     'bindings/flexaudio-py/Cargo.toml'
     'crates/flexaudio-ffi/Cargo.toml'
+    'crates/flexaudio-vad/Cargo.toml'
+    'crates/flexaudio/Cargo.toml'
     'Cargo.toml'
 )
 notices=(
     'crates/flexaudio-napi/THIRD_PARTY_NOTICES.md'
     'bindings/flexaudio-py/THIRD_PARTY_NOTICES.md'
     'crates/flexaudio-ffi/THIRD_PARTY_NOTICES.md'
+    'crates/flexaudio-vad/THIRD_PARTY_NOTICES.md'
+    'crates/flexaudio/THIRD_PARTY_NOTICES.md'
     'THIRD_PARTY_NOTICES.md'
 )
 
@@ -75,6 +79,9 @@ for index in "${!manifests[@]}"; do
     "${generate_cmd[@]}" > "$temp_dir/$index.md"
     printf '\n' >> "$temp_dir/$index.md"
     cat -- third-party/extra-notices.md >> "$temp_dir/$index.md"
+    # Normalize upstream line endings and trailing spaces for generated Markdown.
+    tr -d '\r' < "$temp_dir/$index.md" | sed 's/[[:blank:]]*$//' > "$temp_dir/$index.lf.md"
+    mv -- "$temp_dir/$index.lf.md" "$temp_dir/$index.md"
 done
 
 if "$check"; then

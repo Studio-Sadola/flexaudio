@@ -268,7 +268,6 @@ fn v2_advisory_messages_do_not_project_backend_detail() {
 #[test]
 fn v2_new_stream_event_tags_and_typed_error_payloads() {
     let events = [
-        (fa::Event::PermissionGranted, 9, None),
         (
             fa::Event::AudioLoss {
                 loss: fa::AudioLoss::raw_overflow(None, None, 48_000, 2).unwrap(),
@@ -629,14 +628,13 @@ fn stream(
         shutdown: None,
         shutdown_event_index: 0,
         last_output: None,
-        whisper: None,
-        whisper_events: Vec::new(),
-        whisper_origin: (0, 0),
-        whisper_error: None,
-        whisper_cleanup: Vec::new(),
+        vad_tap: None,
+        vad_events: Vec::new(),
+        vad_origin: (0, 0),
+        vad_error: None,
+        vad_cleanup: Vec::new(),
         ready_chunks: VecDeque::new(),
         denoiser: denoise.then(|| flexaudio_denoise::Denoiser::new(1).unwrap()),
-        vad: None,
     };
     assert_eq!(unsafe { crate::flexaudio_start(&mut stream) }, 0);
     (stream, state, stops)
@@ -678,7 +676,7 @@ fn v2_poll_invalid_output_keeps_event_and_initializes_valid_output() {
         .lock()
         .unwrap()
         .events
-        .push_back(fa::Event::PermissionGranted);
+        .push_back(fa::Event::StreamRecovered);
     assert_eq!(unsafe { crate::flexaudio_stop(&mut stream) }, 0);
     let mut bytes = [0_u64; 2];
     let bad_out = unsafe {
@@ -695,7 +693,7 @@ fn v2_poll_invalid_output_keeps_event_and_initializes_valid_output() {
         assert_eq!(flexaudio_poll_event_v2(&mut stream, &mut event), 1);
         let mut tag = -99;
         assert_eq!(flexaudio_event_kind_v2(event, &mut tag), 1);
-        assert_eq!(tag, 9);
+        assert_eq!(tag, 2);
         flexaudio_event_free_v2(event);
         event = ptr::dangling_mut();
         assert_eq!(flexaudio_poll_event_v2(&mut stream, &mut event), 0);
@@ -715,9 +713,9 @@ fn v2_checked_stop_retains_cleanup_without_capture_primary_and_emits_once() {
     let cleanup = fa::Error::Unsupported.with_context(fa::ErrorContext::new(fa::Operation::Stop));
     let (mut stream, _, stops) = stream(Some(cleanup), false);
     // Record the isolated VAD cause through the same owner used by capture and flush.
-    stream.accept_whisper(
-        Err(flexaudio_vad::WhisperVadTapFailure {
-            error: flexaudio_vad::WhisperVadTapError::Conversion,
+    stream.accept_vad_tap(
+        Err(flexaudio_vad::VadTapFailure {
+            error: flexaudio_vad::VadTapError::Conversion,
             terminal_events: Vec::new(),
         }),
         fa::Operation::Normalize,
@@ -738,12 +736,12 @@ fn v2_checked_stop_retains_cleanup_without_capture_primary_and_emits_once() {
         assert_eq!(kind(flexaudio_shutdown_cleanup_v2(report, 0)), -9);
         let binding = flexaudio_shutdown_cleanup_v2(report, 1);
         assert_eq!(kind(binding), -2);
-        let whisper_code = flexaudio_error_whisper_code_v2(binding);
-        assert!(!whisper_code.is_null());
+        let vad_code = flexaudio_error_vad_code_v2(binding);
+        assert!(!vad_code.is_null());
         assert_eq!(
-            CStr::from_ptr(whisper_code)
+            CStr::from_ptr(vad_code)
                 .to_str()
-                .expect("stable Whisper code must be valid UTF-8"),
+                .expect("stable VAD code must be valid UTF-8"),
             "Conversion"
         );
         let mut event = ptr::null_mut();

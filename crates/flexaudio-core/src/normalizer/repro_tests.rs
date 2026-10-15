@@ -120,14 +120,20 @@ fn short_tail(rate: u32) {
     n.push(&vec![0.25; 200], 0).unwrap();
     n.flush().unwrap();
     let buffered = n.buffered_out_frames();
-    assert!(buffered > 0, "F13: 100 real input frames vanished after flush: output_frames={buffered}, stage1_pending={}", n.stage1_resampler.as_ref().map_or(0, |r| r.in_accum.len() / 2));
+    assert!(
+        buffered > 0,
+        "100 real input frames vanished after flush: output_frames={buffered}, stage1_pending={}",
+        n.stage1_resampler
+            .as_ref()
+            .map_or(0, |r| r.in_accum.len() / 2)
+    );
 }
 #[test]
-fn repro_p1_short_44100_tail() {
+fn regression_short_44100_tail() {
     short_tail(44_100);
 }
 #[test]
-fn repro_p1_short_44100_tail_control() {
+fn regression_short_44100_tail_control() {
     short_tail(48_000);
 }
 
@@ -143,11 +149,11 @@ fn multichannel(channel: usize) {
     );
 }
 #[test]
-fn repro_p1_center_channel() {
+fn regression_center_channel() {
     multichannel(2);
 }
 #[test]
-fn repro_p1_center_channel_control() {
+fn regression_center_channel_control() {
     multichannel(0);
 }
 
@@ -174,11 +180,11 @@ fn partial_frame(split: bool) {
     );
 }
 #[test]
-fn repro_p1_partial_frames() {
+fn regression_partial_frames() {
     partial_frame(true);
 }
 #[test]
-fn repro_p1_partial_frames_control() {
+fn regression_partial_frames_control() {
     partial_frame(false);
 }
 
@@ -224,11 +230,11 @@ fn flush_error(inject: bool) {
     assert_eq!(n.flush(), result, "repeated flush retains its result");
 }
 #[test]
-fn repro_p1_flush_error() {
+fn regression_flush_error() {
     flush_error(true);
 }
 #[test]
-fn repro_p1_flush_error_control() {
+fn regression_flush_error_control() {
     flush_error(false);
 }
 

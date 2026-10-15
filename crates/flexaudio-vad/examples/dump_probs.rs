@@ -1,7 +1,7 @@
 //! Dump raw Silero probabilities from a 16 kHz mono signed-16-bit PCM WAV.
-//! Usage: cargo run --release -p flexaudio-vad --example dump_probs -- [--whisper] <in.wav> <out.json>
+//! Usage: cargo run --release -p flexaudio-vad --example dump_probs -- <in.wav> <out.json>
 
-use flexaudio_vad::{Vad, VadConfig, WhisperVad, WhisperVadOptions, WhisperVadParams};
+use flexaudio_vad::{Vad, VadOptions, VadRuntimeOptions};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -103,40 +103,25 @@ fn read_samples(bytes: &[u8]) -> io::Result<Vec<f32>> {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let whisper = args.first().is_some_and(|arg| arg == "--whisper");
-    let paths = if whisper { &args[1..] } else { &args[..] };
+    let paths = &args[..];
     if paths.len() != 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: cargo run --release -p flexaudio-vad --example dump_probs -- [--whisper] <in.wav> <out.json>",
+            "usage: cargo run --release -p flexaudio-vad --example dump_probs -- <in.wav> <out.json>",
         )
         .into());
     }
     let samples = read_samples(&fs::read(&paths[0])?)?;
     // Segmentation settings affect events only; these defaults leave raw probabilities unchanged.
     let mut probs = Vec::with_capacity(samples.len().div_ceil(FRAME_SAMPLES));
-    if whisper {
-        let mut vad = WhisperVad::new(WhisperVadParams::default(), WhisperVadOptions::default())?;
-        for chunk in samples.chunks(FRAME_SAMPLES) {
-            vad.process(chunk)?;
-            probs.extend_from_slice(vad.last_frame_probabilities().values);
-        }
-        // Whisper EOF infers one zero-padded partial frame: ceil(n_samples / 512).
-        vad.finish()?;
+    let mut vad = Vad::new(VadOptions::default(), VadRuntimeOptions::default())?;
+    for chunk in samples.chunks(FRAME_SAMPLES) {
+        vad.process(chunk)?;
         probs.extend_from_slice(vad.last_frame_probabilities().values);
-    } else {
-        let mut vad = Vad::new(VadConfig {
-            sample_rate: 16_000,
-            ..VadConfig::default()
-        })?;
-        for chunk in samples.chunks(FRAME_SAMPLES) {
-            vad.process(chunk)?;
-            probs.extend_from_slice(vad.last_frame_probabilities());
-        }
-        // Legacy flush discards the trailing partial frame without inference and clears
-        // latest probabilities. Collect before flush: floor(n_samples / 512).
-        vad.flush()?;
     }
+    // EOF infers one zero-padded partial frame: ceil(n_samples / 512).
+    vad.finish()?;
+    probs.extend_from_slice(vad.last_frame_probabilities().values);
     if probs.iter().any(|prob| !prob.is_finite()) {
         return Err(invalid_wav("VAD returned a non-finite probability; cannot write JSON").into());
     }

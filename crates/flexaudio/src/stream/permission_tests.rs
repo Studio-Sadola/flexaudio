@@ -470,7 +470,7 @@ fn poll_panic_then_event(denied: bool) {
     events.lock().unwrap().push_back(if denied {
         denied_event()
     } else {
-        Event::PermissionGranted
+        Event::StreamRecovered
     });
     assert_eq!(
         drain_backend_events(&stream.shared),
@@ -485,7 +485,7 @@ fn poll_panic_then_event(denied: bool) {
         assert!(stream.poll_chunk().is_none());
         assert_eq!(stream.poll_event(), Some(denied_event()));
     } else {
-        assert_eq!(stream.poll_event(), Some(Event::PermissionGranted));
+        assert_eq!(stream.poll_event(), Some(Event::StreamRecovered));
         assert!(stream.terminal_error().is_none());
     }
     stream.stop();
