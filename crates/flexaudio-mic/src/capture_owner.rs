@@ -13,19 +13,15 @@ use crate::{build_stream, permission};
 
 pub(crate) fn run(
     sink: RawSink,
-    device_id: Option<String>,
+    device: cpal::Device,
+    supported: cpal::SupportedStreamConfig,
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<()>>,
     callback_errors: Arc<CallbackMailbox>,
 ) {
-    // Query again on the owner to cover revocation between construction and start.
+    // Recheck consent on the owner to cover revocation between construction and start.
     // No authorization work runs in a cpal audio callback.
-    let stream = match build_stream(
-        sink,
-        device_id.as_deref(),
-        stop_flag.clone(),
-        callback_errors,
-    ) {
+    let stream = match build_stream(sink, device, supported, stop_flag.clone(), callback_errors) {
         Ok(stream) => stream,
         Err(error) => {
             let _ = ready_tx.send(Err(permission::after_failure(error)));

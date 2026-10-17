@@ -57,8 +57,8 @@ fn every_native_host_query_requires_an_explicit_consent_purpose() {
         .nth(1)
         .expect("capture owner stream builder");
     assert!(
-        capture.contains("cpal_default_host(permission::Purpose::Capture)"),
-        "each capture generation must check consent before native device resolution"
+        capture.contains("permission::preflight(permission::Purpose::Capture)"),
+        "each capture generation must check consent before using the resolved device"
     );
     assert_eq!(
         source.matches("cpal::default_host()").count(),
@@ -355,9 +355,8 @@ fn infallible_constructor_retains_query_failure_before_start() {
 
 #[test]
 fn microphone_native_query_uses_the_checked_discovery_helper() {
-    // CPAL Device is concrete and cannot inject native query failures without hardware.
-    // No portable behavioral wiring test is possible; input_config discovery tests
-    // inject query failures through the shared helper, and this guards adapter wiring.
+    // The selection tests count injected queries; this also guards validation
+    // wiring in the concrete CPAL adapter without opening native devices.
     let source = include_str!("lib.rs");
     let query = source.split("fn query_native_format(").nth(1).unwrap().split("pub fn list_devices()").next().unwrap();
     assert!(query.contains("input_config::discover"));
@@ -385,4 +384,13 @@ fn microphone_inventory_uses_validated_native_formats() {
     let source = include_str!("lib.rs");
     let inventory = source.split("pub fn list_devices()").nth(1).unwrap().split("impl CaptureBackend").next().unwrap();
     assert!(inventory.contains("input_config::discover("));
+}
+
+#[test]
+fn resolved_cpal_input_can_move_to_its_capture_owner() {
+    fn require_send<T: Send>() {}
+    require_send::<cpal::Device>();
+    require_send::<cpal::SupportedStreamConfig>();
+    require_send::<PendingInput>();
+    require_send::<CpalMicBackend>();
 }

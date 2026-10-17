@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are attributed to this capture's own released proxy or to a link target
   verified as gone. Permission errors, surviving targets and unrelated errors
   still stop the capture. Startup succeeds when no playback stream remains.
+- Microphone capture resolves the input device and queries its native format
+  once per open instead of twice. On Linux each lookup opens PipeWire-backed
+  ALSA PCMs, and the PipeWire ALSA plugin retains a few kilobytes per
+  open/close, so repeated opens now grow memory about half as fast.
 - Linux: errors that occur after a capture has started no longer use the
   "capture setup" wording, and the native PipeWire error tuple is kept in
   `diagnosticDetails`.

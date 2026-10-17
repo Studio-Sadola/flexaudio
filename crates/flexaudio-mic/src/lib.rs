@@ -8,8 +8,8 @@
 //! [`CaptureBackend`] requires `Send`, but [`cpal::Stream`] is `!Send` and cannot be stored
 //! directly in the backend struct. [`start`](CpalMicBackend::start) spawns a thread that
 //! builds and plays the stream, then parks until signaled to stop. That thread drops the
-//! stream on shutdown, stopping capture. The struct stores only `Send` values (a stop flag,
-//! [`JoinHandle`], and the cached format).
+//! stream on shutdown, stopping capture. The resolved device and configuration are `Send`
+//! and move from discovery to the owner without another native query.
 //!
 //! ```no_run
 //! use flexaudio_mic::CpalMicBackend;
@@ -46,6 +46,8 @@ mod capture_owner;
 
 mod callback_mailbox;
 mod input_config;
+mod input_selection;
+
 #[cfg(target_os = "macos")]
 mod mac_permission;
 #[cfg(any(target_os = "macos", test))]
@@ -58,6 +60,9 @@ mod windows_policy;
 
 #[cfg(windows)]
 mod windows_keeper;
+
+type PendingInput = input_selection::InputSelection<Device, cpal::SupportedStreamConfig>;
+type QueriedInput = (PendingInput, (u32, u16));
 
 /// Fallback format `(48000 Hz, mono)` returned by
 /// [`native_format`](CpalMicBackend::native_format) when no input device is available.
@@ -87,17 +92,20 @@ fn cpal_default_host(purpose: permission::Purpose) -> Result<cpal::Host> {
 /// from a device selected by name (`device_id = Some(id)`), then sends them to [`RawSink`].
 /// See the module docs for details.
 ///
-/// This type is `Send`. It stores only a stop flag, [`JoinHandle`], cached format, and
-/// device_id; the `!Send` [`cpal::Stream`] stays on its owner thread.
+/// This type is `Send`. It stores a stop flag, [`JoinHandle`], cached format,
+/// device ID and pending device/configuration; the `!Send` [`cpal::Stream`] stays on
+/// its owner thread.
 pub struct CpalMicBackend {
     /// Stop signal for the owner thread. When `true`, it drops the stream and exits.
     stop_flag: Arc<AtomicBool>,
     /// Handle to the thread that owns the cpal stream (`Some` after start).
     handle: Option<JoinHandle<()>>,
-    /// Native format queried and cached by `new`.
+    /// Native format queried and cached by construction or a format-change error.
     native: (u32, u16),
     /// ID (device name) of the selected input device. `None` uses the default input device.
     device_id: Option<String>,
+    /// Discovery result consumed by the first capture generation.
+    selection: PendingInput,
     /// Control-thread teardown notifications; callbacks never query consent.
     events: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
@@ -144,13 +152,17 @@ impl CpalMicBackend {
     /// prompt returns an actionable [`Error::Backend`] after at most 30 seconds,
     /// without querying HAL or treating the unanswered prompt as a denial.
     pub fn try_new(device_id: Option<String>) -> Result<Self> {
-        let native = query_native_format(device_id.as_deref(), permission::Purpose::Capture)?;
-        Ok(Self::with_format(device_id, native))
+        let selection = query_native_format(device_id.as_deref(), permission::Purpose::Capture)?;
+        Ok(Self::from_query_result(device_id, Ok(selection)))
     }
 
-    fn from_query_result(device_id: Option<String>, queried: Result<(u32, u16)>) -> Self {
+    fn from_query_result(device_id: Option<String>, queried: Result<QueriedInput>) -> Self {
         match queried {
-            Ok(native) => Self::with_format(device_id, native),
+            Ok((selection, native)) => {
+                let mut backend = Self::with_format(device_id, native);
+                backend.selection = selection;
+                backend
+            }
             Err(error) => {
                 // The legacy constructor cannot return Result. Its placeholder
                 // format is never used for capture: retain the cause before start.
@@ -173,6 +185,7 @@ impl CpalMicBackend {
             handle: None,
             native,
             device_id,
+            selection: input_selection::InputSelection::empty(),
             events,
             event_tx,
             terminal_error: None,
@@ -183,6 +196,8 @@ impl CpalMicBackend {
     }
 
     fn teardown(&mut self) -> Result<()> {
+        // Closing before the first start must also release the discovery handle.
+        self.selection = input_selection::InputSelection::empty();
         if let Some(result) = &self.shutdown_result {
             return result.clone();
         }
@@ -285,17 +300,31 @@ fn resolve_input_device(host: &cpal::Host, device_id: Option<&str>) -> Result<De
 fn query_native_format(
     device_id: Option<&str>,
     purpose: permission::Purpose,
-) -> Result<(u32, u16)> {
-    let host = cpal_default_host(purpose)?;
-    let device = resolve_input_device(&host, device_id)?;
-    flexaudio_core::inventory::require_device_format(input_config::discover(
+) -> Result<QueriedInput> {
+    input_selection::InputSelection::query(
         || {
-            device.default_input_config().map_err(|error| {
-                input_config::query_failure("query microphone input configuration", error)
-            })
+            let device = query_input_device(device_id, purpose)?;
+            let supported = query_input_config(&device);
+            // Preserve discovery's error context, including configuration failures.
+            flexaudio_core::inventory::require_device_format(input_config::discover(
+                || supported.as_ref().map_err(Clone::clone),
+                |config| (config.sample_rate().0, config.channels()),
+            ))?;
+            Ok((device, supported?))
         },
         |config| (config.sample_rate().0, config.channels()),
-    ))
+    )
+}
+
+fn query_input_device(device_id: Option<&str>, purpose: permission::Purpose) -> Result<Device> {
+    let host = cpal_default_host(purpose)?;
+    resolve_input_device(&host, device_id)
+}
+
+fn query_input_config(device: &Device) -> Result<cpal::SupportedStreamConfig> {
+    device
+        .default_input_config()
+        .map_err(|error| input_config::query_failure("query microphone input configuration", error))
 }
 
 /// Enumerate input (microphone) devices, for the microphone portion of `devices()`.
@@ -377,8 +406,17 @@ impl CaptureBackend for CpalMicBackend {
         ));
 
         let stop_flag = self.stop_flag.clone();
-        // cpal::Device is !Send, so pass only the device_id string and resolve it on the thread.
-        let device_id = self.device_id.clone();
+        // Device and SupportedStreamConfig are Send on the supported CPAL hosts.
+        // Consume discovery once; subsequent starts resolve afresh for hot-plug changes.
+        let (device, supported) = self
+            .selection
+            .take_or_query(|| {
+                let device =
+                    query_input_device(self.device_id.as_deref(), permission::Purpose::Capture)?;
+                let supported = query_input_config(&device)?;
+                Ok((device, supported))
+            })
+            .map_err(permission::after_failure)?;
         let callback_errors = self.callback_errors.clone();
         // Ready channel reports build/play success or failure from the owner thread to start().
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
@@ -386,7 +424,14 @@ impl CaptureBackend for CpalMicBackend {
         let handle = thread::Builder::new()
             .name("flexaudio-mic-cpal".into())
             .spawn(move || {
-                capture_owner::run(sink, device_id, stop_flag, ready_tx, callback_errors);
+                capture_owner::run(
+                    sink,
+                    device,
+                    supported,
+                    stop_flag,
+                    ready_tx,
+                    callback_errors,
+                );
             })
             .map_err(|e| {
                 self.stop_flag.store(true, Ordering::SeqCst);
@@ -468,31 +513,24 @@ fn fill_scratch<T: Copy>(scratch: &mut Vec<f32>, data: &[T], convert: impl Fn(T)
     }
 }
 
-/// Build (but do not yet play) an input stream for the device selected by `device_id`.
-/// `device_id = None` selects the default input device. Return [`Error::DeviceNotFound`] if
-/// no device matches.
+/// Build (but do not yet play) an input stream using the resolved device and configuration.
 ///
 /// Select a callback for each sample format: pass F32 through directly and convert I16/U16/I32
 /// to `f32` in `[-1.0, 1.0]` before sending to [`RawSink::push`]. Every buffer is delivered;
 /// discarding leading buffers by amplitude was unproved and dropped real audio.
 fn build_stream(
     sink: RawSink,
-    device_id: Option<&str>,
+    device: Device,
+    supported: cpal::SupportedStreamConfig,
     stop_flag: Arc<AtomicBool>,
     callback_errors: Arc<callback_mailbox::CallbackMailbox>,
 ) -> Result<cpal::Stream> {
-    let host = cpal_default_host(permission::Purpose::Capture)?;
-    // None selects default; Some must uniquely match an advertised CPAL name.
-    let device = resolve_input_device(&host, device_id)?;
+    permission::preflight(permission::Purpose::Capture)?;
 
     // The same checked configuration is passed to CPAL below. Never feed a sink
     // configured from a fallback or stale device format with different samples.
     let supported = input_config::checked(
-        || {
-            device.default_input_config().map_err(|error| {
-                input_config::query_failure("query microphone input configuration", error)
-            })
-        },
+        || Ok(supported),
         |config| (config.sample_rate().0, config.channels()),
         (sink.native_rate(), sink.native_channels()),
     )?;
