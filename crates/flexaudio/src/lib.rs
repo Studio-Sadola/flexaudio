@@ -94,6 +94,8 @@ pub fn devices() -> Result<Vec<DeviceInfo>> {
 /// separate from capture-stream-level [`core::Event`].
 ///
 /// Linux watches the PipeWire registry and returns Err on startup failure.
+/// Only system output changes are reported, using the same IDs as [`devices`].
+/// PipeWire microphone IDs cannot select CPAL inputs, so microphone changes are omitted.
 /// Unsupported platforms intentionally provide a no-op watcher.
 pub fn watch_devices() -> Result<DeviceWatcher> {
     device_watcher::watch_devices()

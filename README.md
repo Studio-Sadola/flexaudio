@@ -151,7 +151,10 @@ The facade crate `flexaudio` re-exports everything you need:
   processes are included; use `is_output_active` to check current playback and
   `pid` as `target_pid` for per-process capture.
 - `flexaudio::watch_devices() -> Result<DeviceWatcher>` — pull-style device
-  notifications. Linux startup failure returns an error; later daemon, callback,
+  notifications. Linux reports PipeWire system output additions, removals and
+  default changes using the same output IDs as `devices()`. Microphone changes
+  are not reported: CPAL microphone IDs cannot be resolved from PipeWire nodes.
+  Linux startup failure returns an error; later daemon, callback,
   or shutdown failures produce `DeviceEvent::TerminalError { error }`. A later
   stop/join failure can emit another notification with accumulated causes.
   Node.js/Python expose `terminalError` with a typed `error`; C v2 exposes device
@@ -440,7 +443,8 @@ including idle time at the start of capture. Classic WASAPI loopback keeps a
 shared-mode render stream on the same output endpoint active with silence only,
 using the endpoint's mix format. It does not change endpoint volume or mute.
 Failure to create or start this silent stream fails capture start; a runtime
-failure stops capture production and follows the existing stall/reopen error path.
+failure terminates capture with a typed `Event::TerminalError` and stops both
+streams. It does not enter stall/reopen recovery; open a new stream to retry.
 Process loopback, including system capture with exclusions, does not use it.
 
 The capturing process can appear as an audio session in Windows Volume Mixer
