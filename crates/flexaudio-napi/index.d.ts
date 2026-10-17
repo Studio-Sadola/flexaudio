@@ -529,6 +529,8 @@ export declare class FlexStream {
    * Requesting a change makes `switch_source` return InvalidArg, thrown here as an exception. Chunk
    * `seq` stays continuous across switches; the first chunk afterward has the DISCONTINUITY flag.
    * `options.gain` is ignored (gain is stream state; use `setGain` to change it).
+   * Only the stream configuration is applied. `options.denoise` and `options.vad` are ignored;
+   * the existing denoise and VAD settings remain in effect.
    *
    * Throws if `stop()` has already completed (the bridge thread has stopped).
    */
