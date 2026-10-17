@@ -65,6 +65,28 @@ Three capture sources × three operating systems. ✅ = implemented and verified
 
 ---
 
+## Binding feature matrix
+
+These are the capture interfaces; standalone add-ons are separate. Attached VAD
+always processes the shared canonical capture branch; primary/secondary selects
+which output carries its events. — = not exposed.
+
+| Feature | Rust | Node | Python | C | CLI |
+|---|---|---|---|---|---|
+| Delivery model | Poll | Callbacks over internal polling | Poll | Poll | Internal polling → stdout/WAV |
+| Secondary output tap | Yes | Yes (`chunk.secondary`) | — | — | — |
+| Attached VAD (primary/secondary) | Canonical capture via `VadTap` | Primary or secondary carrier | Primary only | Primary only (v2) | — |
+| Denoise | Canonical 48 kHz; any output rate | Requires 48 kHz output | Requires 48 kHz output | Requires 48 kHz output | — |
+| Ring capacity | Configurable; default 50 chunks | 50 chunks | 50 chunks | 50 chunks | 50 chunks |
+| Source switching | `switch_source` | `switchSource`; retains add-on settings | `switch_source` | `flexaudio_switch_source` | `--sources` schedule |
+| Event detail | Typed events/errors/loss | Typed events/errors/loss | Typed events/errors/loss | v1 flattened; v2 detailed | stderr diagnostics/loss summaries |
+| Silence probe control | `silence_probe` | `silenceProbe` | `silence_probe` | `silence_probe`: 0/1 on, 2 off | `--no-silence-probe` |
+| Gain 0 | Mute | Mute | Mute | Config gains: unity (1.0); runtime `flexaudio_set_gain(s, 0)`: mute | Mute |
+
+The optional silence diagnosis probe is macOS-only and enabled by default.
+
+---
+
 ## Install
 
 ```toml
@@ -267,11 +289,12 @@ Windows native waits distinguish
 an actual timeout from a failed wait, and COM initialization reports unexpected
 HRESULT failures.
 
-Primary and secondary `ptsNs` (`pts_ns` in Rust/Python/C) are arrival-time labels,
-re-anchored on every native callback. Rational sample steps apply within an anchor,
-but callback jitter can make consecutive chunks overlap or leave gaps; there is no
-non-overlap or bounded-monotonic guarantee. `frameIndex` / `frame_index` is the
-authoritative position; gaps report loss. VAD's exact sample-clock mapping uses
+Primary and secondary `ptsNs` (`pts_ns` in Rust/Python/C) are arrival-time labels
+assigned when samples are ingested and re-anchored per ingest. Microphone and
+loopback use the same timing origin on every OS; device timestamps are not used.
+Labels are clamped non-decreasing, but chunks can overlap or repeat timestamps;
+this is not a media clock. `frameIndex` / `frame_index` is the authoritative
+position; gaps report loss. VAD's exact sample-clock mapping uses
 `epochStart.ptsNs + tMs * 1_000_000`, or `epochStart.captureSample` plus `tMs * 48`.
 `captureSample` / `capture_sample` counts 48 kHz frames on the dedicated capture
 timeline, independent of primary/secondary formats and `tap`. It equals primary

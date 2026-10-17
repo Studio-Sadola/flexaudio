@@ -1,9 +1,10 @@
-//! Helpers for normalizing device PTS and monotonic clocks to shared `i64` nanoseconds.
+//! Helpers for translating timestamps to process-monotonic `i64` nanoseconds.
 //!
-//! Loopback sources have device-clock PTS, while microphone (cpal) sources have only
-//! relative, opaque timestamps. The core maps both to a shared monotonic clock using
-//! the origin offset captured when the source opens. Cross-stream synchronization is
-//! best effort.
+//! Built-in microphone and loopback backends on every OS pass monotonic arrival times
+//! to `RawSink::push`, which discards them: the raw ring carries samples only. The
+//! facade assigns a fresh arrival time at ingest and translates it with
+//! [`ClockNormalizer`]. Device timestamps are not used by the capture pipeline;
+//! these labels do not provide media-clock or cross-stream synchronization.
 
 use std::time::Instant;
 
@@ -15,24 +16,22 @@ pub fn monotonic_now_ns() -> i64 {
     monotonic_base().elapsed().as_nanos() as i64
 }
 
-/// Monotonic clock origin, fixed once when the process starts.
+/// Process-wide monotonic clock origin, initialized on first use.
 fn monotonic_base() -> Instant {
     use std::sync::OnceLock;
     static BASE: OnceLock<Instant> = OnceLock::new();
     *BASE.get_or_init(Instant::now)
 }
 
-/// Normalizes device PTS to the shared monotonic clock.
+/// Translates input timestamps to the process-monotonic clock.
 ///
-/// Records the device PTS origin and monotonic clock origin on the first sample.
-/// Later calls return `device_pts - device_origin + monotonic_origin`, shifting the
-/// device clock onto the monotonic timeline while preserving its rate.
-///
-/// For sources without device PTS, such as microphones, pass each sample's arrival
-/// time ([`monotonic_now_ns`]) as `device_pts`.
+/// Records the input timestamp and monotonic clock origins on the first call.
+/// Later calls return `device_pts - device_origin + monotonic_origin`, preserving
+/// input deltas. Despite the parameter names, the facade supplies ingest arrival
+/// times ([`monotonic_now_ns`]) for both microphone and loopback, not device PTS.
 #[derive(Debug, Clone)]
 pub struct ClockNormalizer {
-    /// Device PTS origin recorded on the first sample (ns).
+    /// Input timestamp origin recorded on the first call (ns).
     device_origin_ns: Option<i64>,
     /// Monotonic clock origin recorded on the first sample (ns).
     monotonic_origin_ns: i64,
@@ -52,11 +51,11 @@ impl ClockNormalizer {
         self.device_origin_ns.is_none()
     }
 
-    /// Maps device PTS (ns) to normalized monotonic PTS (ns).
+    /// Maps an input timestamp (ns) to the process-monotonic timeline (ns).
     ///
     /// The first call fixes the origins and uses the current [`monotonic_now_ns`] as
-    /// the monotonic origin. Later calls preserve device-clock deltas.
-    /// Device rollover uses wrapping subtraction; a translated value outside i64
+    /// the monotonic origin. Later calls preserve input timestamp deltas.
+    /// Input timestamp rollover uses wrapping subtraction; a translated value outside i64
     /// saturates at the nearest boundary rather than panicking or wrapping the timeline.
     pub fn normalize(&mut self, device_pts_ns: i64) -> i64 {
         match self.device_origin_ns {

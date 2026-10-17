@@ -24,8 +24,9 @@
 //! is collected in an internal accumulator and split at 20ms boundaries. The resampler and
 //! accumulator carry any remainder forward.
 //!
-//! PTS is assigned by tracking the input-to-output sample-offset ratio from `device_pts`
-//! corresponding to the first sample of each output chunk. The stream layer assigns `seq`.
+//! PTS is projected from the supplied timestamp using input-to-output sample offsets.
+//! The facade supplies ingest arrival times as `device_pts`, not device timestamps,
+//! and assigns `seq`.
 
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
@@ -317,7 +318,8 @@ impl Normalizer {
     /// Accumulate interleaved input samples.
     ///
     /// Incomplete trailing frames are retained until a later push completes them.
-    /// `device_pts_ns` is the device-provided PTS for the first frame in this push.
+    /// `device_pts_ns` labels the first frame in this push; the facade supplies an ingest
+    /// arrival time, not a device timestamp.
     ///
     /// Returns [`Error::Backend`] if rubato's `process` fails. This avoids silently stopping the
     /// capture thread with a panic and lets the caller stop the stream explicitly.

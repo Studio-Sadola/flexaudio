@@ -48,6 +48,9 @@ await stream.stop();
 ```
 
 `stream.switchSource(options)` hot-swaps the input source without stopping.
+It applies only the stream configuration: `options.denoise` and `options.vad`
+are ignored, and the existing denoise and VAD settings remain in effect.
+`options.gain` is also ignored; use `setGain()` to change gain.
 `watchDevices(cb)` reports hotplug (added / removed / defaultChanged) events
 on Linux via PipeWire. On Windows/macOS, it uses a no-op watcher and emits no
 device-change events.

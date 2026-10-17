@@ -1712,6 +1712,8 @@ impl FlexStream {
     /// `outputChannels`) cannot change during a switch (it would change frames in a continuous stream).
     /// Requesting a change makes `switch_source` return InvalidArg, thrown here as an exception. Chunk
     /// `seq` stays continuous across switches; the first chunk afterward has the DISCONTINUITY flag.
+    /// Only the stream configuration is applied. `options.denoise` and `options.vad` are ignored;
+    /// the existing denoise and VAD settings remain in effect.
     /// `options.gain` is ignored (gain is stream state; use `setGain` to change it).
     ///
     /// A streaming VAD failure does not block a source switch: the switch closes
