@@ -447,13 +447,18 @@ fn advance_frame_index(counter: &AtomicU64, frames: u64, rate: u32) -> Result<u6
             "frame index sample rate must be nonzero".into(),
         ));
     }
-    let previous = counter
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |index| {
-            let next = index.checked_add(frames)?;
-            u64::try_from(u128::from(next) * 48_000 / u128::from(rate)).ok()?;
-            Some(next)
-        })
-        .map_err(|_| Error::InvalidState("canonical frame timeline exhausted".into()))?;
+    let mut previous = counter.load(Ordering::SeqCst);
+    loop {
+        let next = previous
+            .checked_add(frames)
+            .ok_or_else(|| Error::InvalidState("canonical frame timeline exhausted".into()))?;
+        u64::try_from(u128::from(next) * 48_000 / u128::from(rate))
+            .map_err(|_| Error::InvalidState("canonical frame timeline exhausted".into()))?;
+        match counter.compare_exchange_weak(previous, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(index) => previous = index,
+        }
+    }
     u64::try_from(u128::from(previous) * 48_000 / u128::from(rate))
         .map_err(|_| Error::InvalidState("canonical frame timeline exhausted".into()))
 }

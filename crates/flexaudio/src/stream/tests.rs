@@ -3,6 +3,25 @@ use crate::mock::{MockBackend, PanicMode, PanickingMockBackend, StallThenPanicOn
 use flexaudio_core::types::SourceKind;
 use std::time::Instant;
 
+#[test]
+fn advance_frame_index_returns_previous_canonical_index() {
+    let counter = AtomicU64::new(441);
+    assert_eq!(advance_frame_index(&counter, 441, 44_100).unwrap(), 480);
+    assert_eq!(counter.load(Ordering::SeqCst), 882);
+}
+
+#[test]
+fn advance_frame_index_rejects_exhaustion_without_advancing() {
+    for (index, rate) in [(u64::MAX, 48_000), (u64::MAX / 2, 24_000)] {
+        let counter = AtomicU64::new(index);
+        assert!(matches!(
+            advance_frame_index(&counter, 1, rate),
+            Err(Error::InvalidState(message)) if message == "canonical frame timeline exhausted"
+        ));
+        assert_eq!(counter.load(Ordering::SeqCst), index);
+    }
+}
+
 /// Helper to collect chunks by polling until the deadline.
 fn collect_for(stream: &mut Stream, dur: Duration) -> Vec<AudioChunk> {
     let mut chunks = Vec::new();
