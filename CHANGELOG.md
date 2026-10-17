@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-18
+
 ### Fixed
 
 - Linux: a `system` capture with `excludeSelf` no longer fails with
@@ -27,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Linux: errors that occur after a capture has started no longer use the
   "capture setup" wording, and the native PipeWire error tuple is kept in
   `diagnosticDetails`.
+
+### Known issues
+
+- Linux: with PipeWire's ALSA plugin (observed on PipeWire 1.0.5), each
+  `snd_pcm_open`/`snd_pcm_close` cycle for a PipeWire-backed PCM retains about
+  4 KB inside the plugin. Opening a microphone through cpal performs several
+  such opens, so applications that reopen microphone streams very frequently
+  see slow memory growth that is not caused by flexaudio.
 
 ## [0.6.0] - 2026-10-15
 
@@ -857,7 +867,8 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
   publication and interactive approval of new packages in scopes
   requiring 2FA. (1840fbb)
 
-[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/Studio-Sadola/flexaudio/compare/v0.6.0...v0.6.1
 [0.5.2]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Studio-Sadola/flexaudio/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.4.0...v0.5.0
