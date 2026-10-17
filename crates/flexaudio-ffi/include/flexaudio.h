@@ -1248,9 +1248,12 @@ const struct FlexAttachedVadEvent *flexaudio_chunk_vad_events(const struct FlexC
 
 // Start monitoring device connection and default changes, then return a watcher handle.
 //
-// On Linux, continuously monitor the PipeWire registry. Startup failure returns NULL
+// Linux reports PipeWire system output additions, removals and default changes using
+// the same output IDs as `devices()`. Microphone and default-microphone changes are
+// not reported: CPAL microphone IDs cannot be resolved from PipeWire nodes.
+// Windows/macOS return a valid no-op handle. Linux startup failure returns NULL
 // with `flexaudio_last_error` and typed `flexaudio_last_error_info_v2`, rather than
-// a no-op handle. Unsupported operating systems return a valid no-op handle. Release it with
+// a no-op handle. Release it with
 // `flexaudio_watcher_free`.
 struct FlexWatcher *flexaudio_watch_devices(void);
 

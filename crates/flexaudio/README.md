@@ -32,8 +32,11 @@ stream.stop();
 - `open(StreamConfig)` selects the right backend by source + OS.
 - `Stream::poll_chunk` / `poll_event` — simple pull loop; no callbacks required.
 - `Stream::switch_source` — hot-swap source without stopping the stream.
-- `devices()` enumerates devices; `watch_devices()` reports hotplug notifications
-  on Linux via PipeWire. Windows/macOS return a no-op watcher.
+- `devices()` enumerates devices; `watch_devices()` reports Linux PipeWire system
+  output additions, removals and default changes using the same output IDs as
+  `devices()`. Microphone and default-microphone changes are not reported: CPAL
+  microphone IDs cannot be resolved from PipeWire nodes. Windows/macOS return a
+  no-op watcher.
   Discovery returns a complete inventory or an error, including when PipeWire is
   unavailable. Linux microphone entries use only CPAL device-name IDs; PipeWire
   source-node IDs are omitted because the microphone backend cannot open them.
