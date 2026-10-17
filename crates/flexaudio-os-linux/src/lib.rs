@@ -57,7 +57,9 @@ use readiness::{negotiation_timeout_error, Readiness, NEGOTIATION_DEADLINE};
 mod watcher_failures;
 use watcher_failures::{fail_watcher, finish_watch_worker, run_watcher_callback};
 mod watcher_queue;
-use watcher_queue::{lock_events, transition_default, WatchEventQueue, WatchEvents};
+use watcher_queue::{lock_events, WatchEventQueue, WatchEvents};
+mod watcher_state;
+use watcher_state::WatchState;
 
 use pipewire as pw;
 use pw::proxy::ProxyT;
@@ -478,12 +480,7 @@ impl CaptureBackend for PwProcessBackend {
         // - Include: Link every Stream/Output/Audio node owned by the target PID (a process can
         //   own several output streams).
         // - Exclude: Link all Stream/Output/Audio nodes except the target PID (fan-in).
-        let select = match self.mode {
-            ProcessMode::Include => PidSelect::Include(self.target_pid),
-            ProcessMode::Exclude => {
-                PidSelect::Exclude(std::collections::HashSet::from([self.target_pid]))
-            }
-        };
+        let select = PidSelect::process(self.target_pid, self.mode)?;
 
         // Stop channel for the loop thread (the receiver is attached to the loop).
         let (stop_tx, stop_rx) = pw::channel::channel::<Terminate>();
@@ -901,6 +898,15 @@ enum PidSelect {
 }
 
 impl PidSelect {
+    fn process(target_pid: u32, mode: ProcessMode) -> Result<Self> {
+        if target_pid == 0 {
+            return Err(Error::InvalidArg("target_pid must be positive".into()));
+        }
+        Ok(match mode {
+            ProcessMode::Include => Self::Include(target_pid),
+            ProcessMode::Exclude => Self::Exclude(std::collections::HashSet::from([target_pid])),
+        })
+    }
     /// Use the same decision when creating links and when revoking stale links.
     fn selects_node(
         &self,
@@ -2600,10 +2606,13 @@ fn extract_json_name(value: &str) -> Option<String> {
 /// [`Arc<Mutex<VecDeque>>`], stop flag, stop [`pipewire::channel::Sender`], and [`JoinHandle`]).
 ///
 /// # Published events
-/// - [`DeviceEvent::Added`]: Audio/Sink|Source nodes that appear after the initial scan. Nodes
+/// - [`DeviceEvent::Added`]: Audio/Sink nodes that appear after the initial scan. Nodes
 ///   already present during the scan are registered but not published.
 /// - [`DeviceEvent::Removed`]: Nodes removed while watching (id = `node.name`).
-/// - [`DeviceEvent::DefaultChanged`]: Default sink/source changes (from default metadata).
+/// - [`DeviceEvent::DefaultChanged`]: Default sink changes (from default metadata).
+///
+/// Audio/Source and default-source changes are omitted: microphone capture and unified
+/// discovery use CPAL device names, which cannot be resolved from PipeWire node names.
 ///
 /// # PipeWire unavailable
 /// If the PipeWire daemon is unavailable or connection fails, [`start`](Self::start) returns
@@ -2742,22 +2751,6 @@ impl Drop for PwDeviceWatcher {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-/// Local state shared throughout the watcher loop (`!Send`, confined to the thread).
-#[derive(Default)]
-struct WatchState {
-    /// Reverse map of registry global id → [`DeviceInfo`] for events.
-    /// `global_remove` provides only the numeric id, so use this to recover `node.name`.
-    by_global_id: std::collections::HashMap<u32, DeviceInfo>,
-    /// Whether the initial scan (the first two-stage sync→done barrier) has completed.
-    /// While `false`, register incoming globals but do not publish `Added`.
-    initial_scan_done: bool,
-    /// Default sink `node.name` (from `default.audio.sink` metadata).
-    /// Publish changes after the initial scan as [`DeviceEvent::DefaultChanged`].
-    default_sink: Option<String>,
-    /// Default source `node.name` (from `default.audio.source` metadata).
-    default_source: Option<String>,
 }
 
 /// PipeWire watcher loop thread body.
@@ -2917,11 +2910,8 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                             // may not have arrived during the initial scan, in which case it is false
                             // and a later DefaultChanged event corrects it.
                             let mut st = state_for_global.borrow_mut();
-                            let is_default = if is_loopback {
-                                st.default_sink.as_deref() == Some(node_name)
-                            } else {
-                                st.default_source.as_deref() == Some(node_name)
-                            };
+                            let is_default =
+                                is_loopback && st.default_sink.as_deref() == Some(node_name);
 
                             let info = DeviceInfo {
                                 id: node_name.to_string(),
@@ -2933,13 +2923,12 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                                 is_loopback,
                                 is_default,
                             };
-                            st.by_global_id.insert(global.id, info.clone());
-                            let initial_scan_done = st.initial_scan_done;
+                            let event = st.add_device(global.id, info);
                             drop(st);
 
                             // During the initial scan, only register nodes. Publish Added only for later arrivals.
-                            if initial_scan_done {
-                                enqueue_event(&events_for_global, DeviceEvent::Added(info));
+                            if let Some(event) = event {
+                                enqueue_event(&events_for_global, event);
                             }
                         }
                         pw::types::ObjectType::Metadata => {
@@ -2959,50 +2948,42 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                             let state_for_meta = state_for_global.clone();
                             let loop_for_meta = loop_for_global.clone();
                             let events_for_meta = events_for_global.clone();
-                            let listener =
-                                metadata
-                                    .add_listener_local()
-                                    .property(move |_subject, key, _type, value| {
-                                        // Property callbacks also cross FFI, so wrap them in catch_unwind.
-                                        run_watcher_callback(
-                                            &events_for_meta,
-                                            || loop_for_meta.quit(),
-                                            || {
-                                                // A null key clears every default property for this subject.
-                                                for (property, kind) in [
-                                        (
-                                            "default.audio.sink",
-                                            flexaudio_core::DefaultDeviceKind::SystemAudio,
-                                        ),
-                                        (
-                                            "default.audio.source",
-                                            flexaudio_core::DefaultDeviceKind::Microphone,
-                                        ),
-                                    ] {
-                                        if key.is_some_and(|key| key != property) {
-                                            continue;
-                                        }
-                                        let next = key.and(value).and_then(extract_json_name);
-                                        let mut state = state_for_meta.borrow_mut();
-                                        let publish = state.initial_scan_done;
-                                        let previous = if property == "default.audio.sink" {
-                                            &mut state.default_sink
-                                        } else {
-                                            &mut state.default_source
-                                        };
-                                        let event = transition_default(previous, next, kind);
-                                        drop(state);
-                                        if publish {
-                                            if let Some(event) = event {
-                                                enqueue_event(&events_for_meta, event);
+                            let listener = metadata
+                                .add_listener_local()
+                                .property(move |_subject, key, _type, value| {
+                                    // Property callbacks also cross FFI, so wrap them in catch_unwind.
+                                    run_watcher_callback(
+                                        &events_for_meta,
+                                        || loop_for_meta.quit(),
+                                        || {
+                                            // A null key clears every default property for this subject.
+                                            for (property, kind) in [
+                                                (
+                                                    "default.audio.sink",
+                                                    flexaudio_core::DefaultDeviceKind::SystemAudio,
+                                                ),
+                                                (
+                                                    "default.audio.source",
+                                                    flexaudio_core::DefaultDeviceKind::Microphone,
+                                                ),
+                                            ] {
+                                                if key.is_some_and(|key| key != property) {
+                                                    continue;
+                                                }
+                                                let next =
+                                                    key.and(value).and_then(extract_json_name);
+                                                let mut state = state_for_meta.borrow_mut();
+                                                let event = state.update_default(next, kind);
+                                                drop(state);
+                                                if let Some(event) = event {
+                                                    enqueue_event(&events_for_meta, event);
+                                                }
                                             }
-                                        }
-                                    }
-                                            },
-                                        );
-                                        0
-                                    })
-                                    .register();
+                                        },
+                                    );
+                                    0
+                                })
+                                .register();
                             meta_keep_for_global
                                 .borrow_mut()
                                 .push((Box::new(metadata), Box::new(listener)));
@@ -3020,9 +3001,9 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                 || {
                     // Publish Removed only for nodes in the reverse map. Ignore ids absent from the
                     // map (non-node globals such as Metadata may also be removed).
-                    let removed = state_for_remove.borrow_mut().by_global_id.remove(&id);
-                    if let Some(info) = removed {
-                        enqueue_event(&events_for_remove, DeviceEvent::Removed { id: info.id });
+                    let event = state_for_remove.borrow_mut().remove_device(id);
+                    if let Some(event) = event {
+                        enqueue_event(&events_for_remove, event);
                     }
                 },
             );
@@ -3390,6 +3371,19 @@ mod tests {
         assert_eq!(be.mode(), ProcessMode::Exclude);
         let be2 = PwProcessBackend::new(1, ProcessMode::Include);
         assert_eq!(be2.mode(), ProcessMode::Include);
+    }
+
+    #[test]
+    fn process_target_zero_is_rejected_before_native_setup() {
+        for mode in [ProcessMode::Include, ProcessMode::Exclude] {
+            assert!(matches!(
+                PidSelect::process(0, mode),
+                Err(Error::InvalidArg(message)) if message == "target_pid must be positive"
+            ));
+            let selection = PidSelect::process(42, mode).unwrap();
+            assert_eq!(selection.selects(Some(42)), mode == ProcessMode::Include);
+            assert_eq!(selection.selects(Some(43)), mode == ProcessMode::Exclude);
+        }
     }
 
     /// Stopping before start and stopping twice are safe (do not panic).

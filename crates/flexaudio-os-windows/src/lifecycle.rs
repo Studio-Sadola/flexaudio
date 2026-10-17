@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_render_failure_is_returned_and_cleanup_remains_ordered() {
+    fn runtime_render_failure_publishes_terminal_error_and_cleanup_remains_ordered() {
         let trace = Trace::default();
         let mut session = Session::start_and_report(
             client("capture", &trace, None),
@@ -283,7 +283,20 @@ mod tests {
         )
         .unwrap();
         session.keepalive.as_mut().unwrap().fail = Some("fill");
-        assert!(session.service_keepalive().is_err());
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let report = crate::owner::finish_capture(
+            session.service_keepalive(),
+            || session.stop(),
+            &events_tx,
+        );
+        let error = Error::Backend("render.fill".into());
+        assert_eq!(report.primary(), Some(&error));
+        assert!(report.cleanup().is_empty());
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(flexaudio_core::Event::TerminalError { error: observed }) if observed == error
+        ));
+        assert!(events_rx.try_recv().is_err());
         drop(session);
         assert_eq!(
             &trace.borrow()[3..],

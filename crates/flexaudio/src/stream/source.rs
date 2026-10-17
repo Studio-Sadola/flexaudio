@@ -248,8 +248,9 @@ impl Stream {
     /// changes to chunk frames/data.len would break the continuous stream. Reject such requests with
     /// [`Error::InvalidArg`].
     ///
-    /// On success, update only the mutable `config` fields (`kind` / `device_id` / `target_pid` /
-    /// `mode` / `exclude_self` / `exclude_pids`). Keep `output` / `chunk_ms` /
+    /// On success, update the source fields (`kind` / `device_id` / `target_pid` /
+    /// `mode` / `exclude_self` / `exclude_pids` / `silence_probe` and all four `mix_*` fields).
+    /// Reject changes to `output` / `secondary_output` / `chunk_ms` and keep
     /// `ring_capacity_chunks` unchanged. Ignore `new_config.gain` too (gain is stream state and does
     /// not change on source switch; change it with [`set_gain`](Self::set_gain)).
     ///
@@ -278,6 +279,15 @@ impl Stream {
         new_config: StreamConfig,
         denoise: Option<bool>,
     ) -> Result<()> {
+        self.switch_source_using(new_config, denoise, crate::build_backend)
+    }
+
+    fn switch_source_using(
+        &mut self,
+        new_config: StreamConfig,
+        denoise: Option<bool>,
+        build: impl FnOnce(&StreamConfig) -> Result<Box<dyn CaptureBackend>>,
+    ) -> Result<()> {
         if let Some(error) = self.terminal_error() {
             return Err(error);
         }
@@ -300,7 +310,7 @@ impl Stream {
         validate_chunk_ms(new_config.chunk_ms)?;
         // Build the new source backend (on failure, return early with the old source untouched).
         crate::validate_exclude_pids(&new_config)?;
-        let backend = match crate::build_backend(&new_config) {
+        let backend = match build(&new_config) {
             Ok(backend) => backend,
             Err(error) => {
                 if is_terminal_kind(&error) {
@@ -330,11 +340,19 @@ impl Stream {
             exclude_self: new_config.exclude_self,
             silence_probe: new_config.silence_probe,
             exclude_pids: new_config.exclude_pids,
+            mix_mic_device_id: new_config.mix_mic_device_id,
+            mix_system_device_id: new_config.mix_system_device_id,
+            mix_mic_gain: new_config.mix_mic_gain,
+            mix_system_gain: new_config.mix_system_gain,
             ..self.config.clone()
         };
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "source_tests.rs"]
+mod tests;
 
 /// Failed startup still drains all diagnostics after its producer has been stopped.
 fn drain_unpublished_capture(

@@ -5,7 +5,8 @@
 //! device-level events, separate from capture-stream-level [`Event`](crate::core::Event).
 //!
 //! OS backend differences are hidden behind the private `DeviceWatchBackend` trait:
-//! - Linux: `PwDeviceWatcher` persistently monitors the PipeWire registry (`flexaudio-os-linux`).
+//! - Linux: `PwDeviceWatcher` monitors PipeWire system outputs (`flexaudio-os-linux`).
+//!   Microphone changes are omitted because CPAL uses a different device ID space.
 //! - Other OSes: `NoopWatcher` always returns `None`.
 //!
 //! [`crate::watch_devices`] handles platform selection, boxes the appropriate
