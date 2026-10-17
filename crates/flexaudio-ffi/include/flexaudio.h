@@ -1252,9 +1252,8 @@ const struct FlexAttachedVadEvent *flexaudio_chunk_vad_events(const struct FlexC
 // the same output IDs as `devices()`. Microphone and default-microphone changes are
 // not reported: CPAL microphone IDs cannot be resolved from PipeWire nodes.
 // Windows, macOS and unsupported operating systems return a valid no-op handle.
-// Linux startup failure returns NULL
-// with `flexaudio_last_error` and typed `flexaudio_last_error_info_v2`, rather than
-// a no-op handle. Release it with
+// Linux startup failure returns NULL with `flexaudio_last_error` and typed
+// `flexaudio_last_error_info_v2`, rather than a no-op handle. Release it with
 // `flexaudio_watcher_free`.
 struct FlexWatcher *flexaudio_watch_devices(void);
 
