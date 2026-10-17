@@ -1,8 +1,40 @@
-// Shared failure policies; native callbacks cannot be injected without a daemon.
+// Shared capture failure policies and panic boundaries.
 use crate::owner::{push_backend_event, BackendEvents};
 use crate::readiness::Readiness;
 use flexaudio_core::{CaptureDiagnostics, Error, ErrorContext, Event, Operation};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::rc::Rc;
+
+#[derive(Clone)]
+pub(crate) struct CaptureCallbacks {
+    pub(crate) readiness: Rc<Readiness>,
+    pub(crate) events: BackendEvents,
+    quit: Rc<dyn Fn()>,
+}
+
+impl CaptureCallbacks {
+    pub(crate) fn new(
+        readiness: Rc<Readiness>,
+        events: BackendEvents,
+        quit: impl Fn() + 'static,
+    ) -> Self {
+        Self {
+            readiness,
+            events,
+            quit: Rc::new(quit),
+        }
+    }
+    pub(crate) fn quit(&self) {
+        (self.quit)();
+    }
+    pub(crate) fn run(&self, body: impl FnOnce()) {
+        run_capture_callback(&self.readiness, &self.events, || self.quit(), body);
+    }
+    pub(crate) fn fail(&self, error: Error) {
+        report_control_failure(&self.readiness, &self.events, error);
+        self.quit();
+    }
+}
 
 pub(crate) fn report_control_failure(readiness: &Readiness, events: &BackendEvents, error: Error) {
     push_backend_event(

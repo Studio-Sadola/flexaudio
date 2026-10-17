@@ -23,6 +23,8 @@ pub(crate) struct Readiness {
     sent: Cell<bool>,
     target_present: Cell<bool>,
     registry_complete: Cell<bool>,
+    control_pending: Cell<bool>,
+    format_ready: Cell<bool>,
 }
 
 impl Readiness {
@@ -32,22 +34,35 @@ impl Readiness {
             sent: Cell::new(false),
             target_present: Cell::new(!process_capture),
             registry_complete: Cell::new(!process_capture),
+            control_pending: Cell::new(false),
+            format_ready: Cell::new(false),
         }
     }
 
     pub(crate) fn set_target_present(&self, present: bool) {
         self.target_present.set(present);
+        self.try_report_ready();
     }
 
     pub(crate) fn registry_synchronized(&self) {
         self.registry_complete.set(true);
-        if !self.target_present.get() {
-            self.report_ready();
-        }
+        self.try_report_ready();
+    }
+
+    pub(crate) fn set_control_pending(&self, pending: bool) {
+        self.control_pending.set(pending);
+        self.try_report_ready();
     }
 
     pub(crate) fn report_ready(&self) {
-        if !self.sent.replace(true) {
+        self.format_ready.set(true);
+        self.try_report_ready();
+    }
+
+    fn try_report_ready(&self) {
+        let ready =
+            self.format_ready.get() || (self.registry_complete.get() && !self.target_present.get());
+        if ready && !self.control_pending.get() && !self.sent.replace(true) {
             let _ = self.tx.send(Ok(()));
         }
     }
@@ -63,7 +78,7 @@ impl Readiness {
     }
 
     pub(crate) fn requires_negotiation(&self) -> bool {
-        self.target_present.get() || !self.registry_complete.get()
+        self.control_pending.get() || self.target_present.get() || !self.registry_complete.get()
     }
 
     // Returns true when the capture loop must stop.
@@ -205,5 +220,42 @@ mod tests {
             assert_eq!(rx.recv(), Ok(Ok(())));
             assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
         }
+    }
+    #[test]
+    fn vanished_last_source_can_complete_startup_after_control_verification() {
+        let (tx, rx) = mpsc::channel();
+        let readiness = Readiness::new(tx, true);
+        readiness.set_target_present(true);
+        readiness.registry_synchronized();
+        readiness.set_control_pending(true);
+        readiness.set_target_present(false);
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        readiness.set_control_pending(false);
+        assert_eq!(rx.try_recv(), Ok(Ok(())));
+    }
+
+    #[test]
+    fn negotiated_format_cannot_bypass_a_pending_link_error_check() {
+        let (tx, rx) = mpsc::channel();
+        let readiness = Readiness::new(tx, true);
+        readiness.set_control_pending(true);
+        readiness.report_ready();
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        readiness.report_failure(Error::DeviceLost);
+        readiness.set_control_pending(false);
+        assert_eq!(rx.try_recv(), Ok(Err(Error::DeviceLost)));
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+    #[test]
+    fn replacement_source_still_requires_negotiation_after_a_pending_error() {
+        let (tx, rx) = mpsc::channel();
+        let readiness = Readiness::new(tx, true);
+        readiness.set_control_pending(true);
+        readiness.registry_synchronized();
+        readiness.set_target_present(true);
+        readiness.set_control_pending(false);
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        readiness.report_ready();
+        assert_eq!(rx.try_recv(), Ok(Ok(())));
     }
 }
