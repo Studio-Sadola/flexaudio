@@ -38,7 +38,11 @@ use flexaudio_core::clock::monotonic_now_ns;
 use flexaudio_core::types::{DeviceEvent, DeviceInfo, Error, ProcessMode, Result, SourceKind};
 use flexaudio_core::{ErrorContext, Event, Operation};
 
+mod capture_control;
+mod capture_error;
 mod capture_failures;
+mod capture_proxy;
+mod link_error;
 use capture_failures::{
     checked_buffer_region, replace_format, report_bind_failure, run_capture_callback,
 };
@@ -56,6 +60,7 @@ mod watcher_queue;
 use watcher_queue::{lock_events, transition_default, WatchEventQueue, WatchEvents};
 
 use pipewire as pw;
+use pw::proxy::ProxyT;
 use pw::spa;
 use pw::{properties::properties, stream::StreamFlags};
 use spa::param::format::{MediaSubtype, MediaType};
@@ -93,6 +98,7 @@ fn pw_init_once() {
 // Process enumeration shares PID resolution with process capture.
 mod processes;
 pub use processes::list_processes;
+mod proxy_release;
 
 /// [`CaptureBackend`] that captures system audio output (the sink monitor) through PipeWire.
 ///
@@ -610,7 +616,11 @@ fn run_pw_process_loop(
 // Bound Node proxies + their info listeners, keyed by registry global id.
 // Binding is what delivers `application.process.id`: the registry `global`
 // props omit it, a bound object's `info` carries it.
-type BoundNode = (pw::node::Node, pw::node::NodeListener);
+type CaptureLink = capture_proxy::CaptureProxy<pw::link::Link>;
+type BoundNode = (
+    pw::node::NodeListener,
+    capture_proxy::CaptureProxy<pw::node::Node>,
+);
 
 /// Resources held for the duration of process capture. Dropping them stops capture.
 ///
@@ -632,10 +642,10 @@ struct ProcessKeep {
     _listener: pw::stream::StreamListener<UserData>,
     _registry: pw::registry::RegistryRc,
     _registry_listener: pw::registry::Listener,
-    _links: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, Vec<pw::link::Link>>>>,
+    _links: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, Vec<CaptureLink>>>>,
     _core_listener: pw::core::Listener,
-    _core: pw::core::CoreRc,
     _bound_nodes: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, BoundNode>>>,
+    _core: pw::core::CoreRc,
 }
 
 /// PID and protocol provenance collected from a Client global.
@@ -985,6 +995,13 @@ fn setup_pw_process(
     let core = context
         .connect_rc(None)
         .map_err(|e| format!("connect to pipewire daemon failed (is PipeWire running?): {e}"))?;
+    let loop_for_callbacks = main_loop.clone();
+    let callbacks =
+        capture_failures::CaptureCallbacks::new(readiness.clone(), events.clone(), move || {
+            loop_for_callbacks.quit()
+        });
+    let proxy_lifecycle = capture_proxy::ProxyLifecycle::new(&core, callbacks.clone());
+    let control = capture_control::CaptureControl::new(proxy_lifecycle.clone(), callbacks);
     let registry = core
         .get_registry_rc()
         .map_err(|e| format!("get pipewire registry failed: {e}"))?;
@@ -1063,8 +1080,7 @@ fn setup_pw_process(
     // Keep them for the entire run because dropping them disconnects the links. Either mode may
     // have many entries (a process can own several output streams). Remove an entry to disconnect
     // one node or clear the map to disconnect all.
-    let linked: Rc<RefCell<HashMap<u32, Vec<pw::link::Link>>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+    let linked: Rc<RefCell<HashMap<u32, Vec<CaptureLink>>>> = Rc::new(RefCell::new(HashMap::new()));
     // Bound Node proxies + their info listeners, keyed by registry global id.
     // Binding is what delivers `application.process.id`: the registry `global`
     // props omit it, a bound object's `info` carries it.
@@ -1077,39 +1093,46 @@ fn setup_pw_process(
     #[allow(clippy::too_many_arguments)]
     fn try_link(
         core: &pw::core::CoreRc,
+        proxy_lifecycle: &Rc<capture_proxy::ProxyLifecycle>,
         stream: &pw::stream::StreamRc,
         select: &PidSelect,
         self_node_id: &Cell<Option<u32>>,
         nodes: &RefCell<HashMap<u32, NodeEntry>>,
         client_pid: &RefCell<HashMap<u32, ClientEntry>>,
         ports: &RefCell<HashMap<u32, PortEntry>>,
-        linked: &RefCell<HashMap<u32, Vec<pw::link::Link>>>,
+        linked: &RefCell<HashMap<u32, Vec<CaptureLink>>>,
         events: &BackendEvents,
         main_loop: &pw::main_loop::MainLoopRc,
         readiness: &Readiness,
         diagnostics: &flexaudio_core::CaptureDiagnostics,
     ) -> Result<()> {
-        // Eligibility is independent of port arrival: an eligible node with no complete
-        // link plan must still fail startup if negotiation never finishes.
-        readiness.set_target_present(
-            nodes
-                .borrow()
-                .values()
-                .any(|entry| select.selects_node(entry, &client_pid.borrow())),
-        );
+        // Unknown or active sources still require negotiation. Only a verified dormant
+        // source may wait silently without output ports. Visit every source so observed
+        // activity clears stale dormancy even when another source already needs negotiation.
+        readiness.set_target_present(nodes.borrow().iter().fold(false, |present, (id, entry)| {
+            let requires_negotiation = proxy_lifecycle.source_requires_negotiation(
+                *id,
+                ports
+                    .borrow()
+                    .values()
+                    .any(|port| port.node_id == *id && port.direction == "out"),
+            );
+            present || (select.selects_node(entry, &client_pid.borrow()) && requires_negotiation)
+        }));
         let result = (|| -> Result<()> {
-            {
+            let obsolete = {
                 let nodes = nodes.borrow();
-                let client_pid = client_pid.borrow();
-                let previous_count = linked.borrow().len();
-                linked.borrow_mut().retain(|id, _| {
+                let clients = client_pid.borrow();
+                proxy_release::take_unselected(linked, |id| {
                     nodes
-                        .get(id)
-                        .is_some_and(|entry| select.selects_node(entry, &client_pid))
-                });
-                if linked.borrow().len() != previous_count {
-                    diagnostics.mark_discontinuity();
-                }
+                        .get(&id)
+                        .is_some_and(|entry| select.selects_node(entry, &clients))
+                })
+            };
+            if !obsolete.is_empty() {
+                diagnostics.mark_discontinuity();
+                let routes = obsolete.iter().map(|(id, _)| *id).collect();
+                proxy_lifecycle.defer(obsolete, routes)?;
             }
             // Reread our node id from the stream (it may be unset just after connect).
             // When unset, this returns SPA_ID_INVALID (=ID_ANY=u32::MAX) or 0.
@@ -1132,7 +1155,7 @@ fn setup_pw_process(
                 nodes
                     .iter()
                     .filter(|(id, entry)| {
-                        if linked.contains_key(id) {
+                        if linked.contains_key(id) || proxy_lifecycle.is_deferred(**id) {
                             return false;
                         }
                         select.selects_node(entry, &client_pid)
@@ -1223,7 +1246,7 @@ fn setup_pw_process(
                 let want = pairs.len();
 
                 // Link each pair with link-factory.
-                let mut created: Vec<pw::link::Link> = Vec::with_capacity(want);
+                let mut created: Vec<CaptureLink> = Vec::with_capacity(want);
                 for (out_port_id, in_port_id) in pairs {
                     let link_props = properties! {
                         *pw::keys::LINK_OUTPUT_NODE => target_node_id.to_string(),
@@ -1231,13 +1254,28 @@ fn setup_pw_process(
                         *pw::keys::LINK_INPUT_NODE => self_nid.to_string(),
                         *pw::keys::LINK_INPUT_PORT => in_port_id.to_string(),
                     };
+                    // Native create_object and sync only enqueue protocol requests; neither
+                    // dispatches the loop. Record ownership before the next event iteration.
+                    let before = proxy_lifecycle.checkpoint()?;
                     let link = core
                         .create_object::<pw::link::Link>("link-factory", &link_props)
                         .map_err(|error| {
                             Error::Backend(format!("pipewire link creation failed: {error}"))
                                 .with_context(ErrorContext::new(Operation::Link))
                         })?;
-                    created.push(link);
+                    let after = proxy_lifecycle.checkpoint()?;
+                    let attempt = proxy_lifecycle.link_attempt(
+                        link.upcast_ref().id(),
+                        proxy_release::RequestWindow { before, after },
+                        target_node_id,
+                        out_port_id,
+                        self_nid,
+                        in_port_id,
+                    )?;
+                    created.push(
+                        capture_proxy::CaptureProxy::new(link, proxy_lifecycle)
+                            .with_attempt(attempt),
+                    );
                 }
 
                 // All pairs are linked. Keep the Link proxies grouped by node.
@@ -1249,9 +1287,12 @@ fn setup_pw_process(
             if !linked.borrow().is_empty() {
                 diagnostics.mark_discontinuity();
             }
-            linked.borrow_mut().clear();
+            // Capture is terminal: detach before notifying or destroying native proxies.
+            // No replacement routes will be created, so no release barrier is needed.
+            let obsolete = std::mem::take(&mut *linked.borrow_mut());
             capture_failures::report_control_failure(readiness, events, error.clone());
             main_loop.quit();
+            drop(obsolete);
         }
         result
     }
@@ -1267,9 +1308,11 @@ fn setup_pw_process(
     let readiness_for_remove = readiness.clone();
     let select_for_global = select.clone();
     let select_for_remove = select.clone();
+    let select_for_sync = select.clone();
     let events_for_global = events.clone();
     let loop_for_global = main_loop.clone();
     let core_for_global = core.clone();
+    let lifecycle_for_global = proxy_lifecycle.clone();
     let stream_for_global = stream.clone();
     let self_node_for_global = self_node_id.clone();
     let nodes_for_global = nodes.clone();
@@ -1283,6 +1326,7 @@ fn setup_pw_process(
     let events_for_remove = events.clone();
     let loop_for_remove = main_loop.clone();
     let core_for_remove = core.clone();
+    let lifecycle_for_remove = proxy_lifecycle.clone();
     let stream_for_remove = stream.clone();
     let self_node_for_remove = self_node_id.clone();
     let nodes_for_remove = nodes.clone();
@@ -1297,6 +1341,9 @@ fn setup_pw_process(
         .global(move |global| {
             // A panic crossing FFI is UB, so wrap the callback body in catch_unwind.
             run_capture_callback(&readiness_for_global, &events_for_global, || loop_for_global.quit(), || {
+                if matches!(global.type_, pw::types::ObjectType::Node | pw::types::ObjectType::Port) {
+                    lifecycle_for_global.observe(global.id);
+                }
                 let Some(props) = global.props else {
                     return;
                 };
@@ -1348,6 +1395,7 @@ fn setup_pw_process(
                             registry_for_global.bind(global);
                         match bound {
                         Ok(node) => {
+                            let node = capture_proxy::CaptureProxy::new(node, &lifecycle_for_global);
                             let node_id = global.id;
                             let events_for_info = events_for_global.clone();
                             let loop_for_info = loop_for_global.clone();
@@ -1357,6 +1405,7 @@ fn setup_pw_process(
                             let linked_for_info = linked_for_global.clone();
                             let self_node_for_info = self_node_for_global.clone();
                             let core_for_info = core_for_global.clone();
+                            let lifecycle_for_info = Rc::downgrade(&lifecycle_for_global);
                             let stream_for_info = stream_for_global.clone();
                             let readiness_for_info = readiness_for_global.clone();
                             let diagnostics_for_info = diagnostics_for_global.clone();
@@ -1365,6 +1414,7 @@ fn setup_pw_process(
                                 .add_listener_local()
                                 .info(move |info| {
                                     run_capture_callback(&readiness_for_info, &events_for_info, || loop_for_info.quit(), || {
+                                        let Some(lifecycle_for_info) = lifecycle_for_info.upgrade() else { return; };
                                         let props_changed = info
                                             .change_mask()
                                             .contains(pw::node::NodeChangeMask::PROPS);
@@ -1411,14 +1461,23 @@ fn setup_pw_process(
                                         // linked and now declares 2). Drop the links and rebuild
                                         // the plan against the new count; a plan that became
                                         // incomplete must be revisited.
-                                        if n_out_changed && linked_for_info.borrow_mut().remove(&node_id).is_some() {
+                                        let obsolete = if n_out_changed {
+                                            linked_for_info.borrow_mut().remove(&node_id)
+                                        } else { None };
+                                        if let Some(obsolete) = obsolete {
                                             diagnostics_for_info.mark_discontinuity();
+                                            if let Err(error) = lifecycle_for_info.defer(obsolete, vec![node_id]) {
+                                                capture_failures::report_control_failure(&readiness_for_info, &events_for_info, error);
+                                                loop_for_info.quit();
+                                                return;
+                                            }
                                         }
 
                                         // All state borrows have ended. Reconciliation also
                                         // unlinks a Pulse node whose app PID was invalidated.
                                         let _ = try_link(
                                             &core_for_info,
+                                            &lifecycle_for_info,
                                             &stream_for_info,
                                             &select_for_info,
                                             &self_node_for_info,
@@ -1436,7 +1495,7 @@ fn setup_pw_process(
                                 .register();
                             bound_for_global
                                 .borrow_mut()
-                                .insert(node_id, (node, listener));
+                                .insert(node_id, (listener, node));
                         }
                         Err(cause) => {
                             nodes_for_global.borrow_mut().remove(&global.id);
@@ -1462,6 +1521,7 @@ fn setup_pw_process(
                         if direction != "out" && direction != "in" {
                             return;
                         }
+                        if direction == "out" { lifecycle_for_global.source_port_available(node_id); }
                         let channel = props
                             .get(*pw::keys::AUDIO_CHANNEL)
                             .unwrap_or("")
@@ -1482,6 +1542,7 @@ fn setup_pw_process(
                 // We are on the loop thread, so it is safe to access the `!Send` core/stream.
                 let _ = try_link(
                     &core_for_global,
+                    &lifecycle_for_global,
                     &stream_for_global,
                     &select_for_global,
                     &self_node_for_global,
@@ -1499,6 +1560,7 @@ fn setup_pw_process(
         .global_remove(move |id| {
             // A panic crossing FFI is UB, so wrap the callback body in catch_unwind.
             run_capture_callback(&readiness_for_remove, &events_for_remove, || loop_for_remove.quit(), || {
+                lifecycle_for_remove.remove(id);
                 // Remove the id from the appropriate table and update links. To avoid borrow
                 // conflicts, use scoped borrows to determine actions as bool/owner values first,
                 // then update linked and call try_link.
@@ -1539,6 +1601,7 @@ fn setup_pw_process(
                 };
 
                 let previous_link_count = linked_for_remove.borrow().len();
+                let mut retired_links = Vec::new();
                 // If our node/input port or a target Client disappears, clear all links and
                 // reevaluate.
                 // - Our node/input port: the input side disappeared, invalidating all links.
@@ -1556,17 +1619,18 @@ fn setup_pw_process(
                     || was_self_in_port
                     || (was_target_client && matches!(select_for_remove, PidSelect::Include(_)))
                 {
-                    // Drop all held Links (disconnect them) and return to the unlinked state.
-                    linked_for_remove.borrow_mut().clear();
+                    // Remove routes now; release their proxies after the server has
+                    // finished this removal batch, including sibling channel links.
+                    retired_links.extend(linked_for_remove.borrow_mut().drain().map(|(_, links)| links));
                     relink_needed = true;
                 } else {
                     // Remove only the disappeared node (preserve other Exclude links).
                     if was_linked_node {
-                        linked_for_remove.borrow_mut().remove(&id);
+                        retired_links.extend(linked_for_remove.borrow_mut().remove(&id));
                         relink_needed = true;
                     }
                     if let Some(owner) = linked_out_owner {
-                        linked_for_remove.borrow_mut().remove(&owner);
+                        retired_links.extend(linked_for_remove.borrow_mut().remove(&owner));
                         relink_needed = true;
                     }
                 }
@@ -1587,12 +1651,22 @@ fn setup_pw_process(
                 nodes_for_remove.borrow_mut().remove(&id);
                 client_pid_for_remove.borrow_mut().remove(&id);
                 ports_for_remove.borrow_mut().remove(&id);
-                bound_for_remove.borrow_mut().remove(&id);
+                let retired_node = bound_for_remove.borrow_mut().remove(&id);
+                if !retired_links.is_empty() || retired_node.is_some() {
+                    let routes = retired_links.iter().flatten().filter_map(|link|
+                        link.attempt.as_ref().map(|attempt| attempt.output_node.id)).collect();
+                    if let Err(error) = lifecycle_for_remove.defer((retired_links, retired_node), routes) {
+                        capture_failures::report_control_failure(&readiness_for_remove, &events_for_remove, error);
+                        loop_for_remove.quit();
+                        return;
+                    }
+                }
 
                 // Once waiting again, immediately retry links if another target is already ready.
                 if relink_needed || !readiness_for_remove.is_reported() {
                     let _ = try_link(
                         &core_for_remove,
+                        &lifecycle_for_remove,
                         &stream_for_remove,
                         &select_for_remove,
                         &self_node_for_remove,
@@ -1622,38 +1696,65 @@ fn setup_pw_process(
     let readiness_for_sync = readiness.clone();
     let events_for_sync = events.clone();
     let loop_for_sync = main_loop.clone();
-    let loop_for_error = main_loop.clone();
-    let readiness_for_error = readiness.clone();
-    let events_for_error = events.clone();
+
+    let lifecycle_for_sync = proxy_lifecycle.clone();
+    let control_for_error = control.clone();
+    let stream_for_sync = stream.clone();
+    let self_node_for_sync = self_node_id.clone();
+    let nodes_for_sync = nodes.clone();
+    let clients_for_sync = client_pid.clone();
+    let ports_for_sync = ports.clone();
+    let linked_for_sync = linked.clone();
+    let diagnostics_for_sync = route_diagnostics;
     let _core_listener = core.add_listener_local()
         .done(move |id, seq| {
-            if id != pw::core::PW_ID_CORE || seq.seq() != pending.get() {
-                return;
-            }
-            if second_sync.replace(true) {
-                readiness_for_sync.registry_synchronized();
-                return;
-            }
-            let next = core_weak.upgrade().and_then(|core| core.sync(0).ok());
-            match next {
-                Some(next) => pending.set(next.seq()),
-                None => {
-                    report_capture_startup_failure(
-                        &readiness_for_sync,
-                        &events_for_sync,
-                        "PipeWire could not complete the capture target snapshot; restart the audio session and retry capture.",
-                    );
-                    loop_for_sync.quit();
+            run_capture_callback(&readiness_for_sync, &events_for_sync, || loop_for_sync.quit(), || {
+                if id != pw::core::PW_ID_CORE { return; }
+                if control.barrier(seq.seq(), |attempt| {
+                    // Retire only the failed link generation, never a replacement with reused ids.
+                    let owns_route = linked_for_sync.borrow().get(&attempt.output_node.id)
+                        .is_some_and(|links| links.iter().any(|link| link.matches(attempt)));
+                    let obsolete = if owns_route {
+                        linked_for_sync.borrow_mut().remove(&attempt.output_node.id)
+                    } else { None };
+                    if let Some(obsolete) = obsolete {
+                        diagnostics_for_sync.mark_discontinuity();
+                        lifecycle_for_sync.defer(obsolete, vec![attempt.output_node.id])?;
+                    }
+                    Ok(())
+                }, || {
+                    if let Some(core) = core_weak.upgrade() {
+                        try_link(
+                            &core, &lifecycle_for_sync, &stream_for_sync, &select_for_sync,
+                            &self_node_for_sync, &nodes_for_sync, &clients_for_sync,
+                            &ports_for_sync, &linked_for_sync, &events_for_sync,
+                            &loop_for_sync, &readiness_for_sync, &diagnostics_for_sync,
+                        )?;
+                    }
+                    Ok(())
+                }) { return; }
+                if seq.seq() != pending.get() { return; }
+                if second_sync.replace(true) {
+                    readiness_for_sync.registry_synchronized();
+                    return;
                 }
-            }
+                let next = core_weak.upgrade().and_then(|core| core.sync(0).ok());
+                match next {
+                    Some(next) => pending.set(next.seq()),
+                    None => {
+                        report_capture_startup_failure(
+                            &readiness_for_sync, &events_for_sync,
+                            "PipeWire could not complete the capture target snapshot; restart the audio session and retry capture.",
+                        );
+                        loop_for_sync.quit();
+                    }
+                }
+            });
         })
-        .error(move |_id, _seq, _res, _message| {
-            report_capture_startup_failure(
-                &readiness_for_error,
-                &events_for_error,
-                "PipeWire rejected capture setup; check audio-session access, restart the audio session and retry capture.",
-            );
-            loop_for_error.quit();
+        .error(move |id, seq, status, message| {
+            control_for_error.error(link_error::CoreFailure {
+                id, sequence: seq, status, message: message.to_owned(),
+            });
         })
         .register();
 
@@ -1666,8 +1767,8 @@ fn setup_pw_process(
             _registry_listener,
             _links: linked,
             _core_listener,
-            _core: core,
             _bound_nodes: bound_nodes,
+            _core: core,
         },
     ))
 }
@@ -1970,22 +2071,29 @@ fn arm_negotiation_deadline<'a>(
     let events_for_timer = events.clone();
     let loop_for_timeout = main_loop.clone();
     let timer = main_loop.loop_().add_timer(move |_expirations| {
-        if readiness_for_timer.is_reported() {
-            return;
-        }
-        // Store the typed error before the policy sends its channel failure. An absent
-        // target succeeds only after a complete registry snapshot and keeps watching.
-        if readiness_for_timer.requires_negotiation() {
-            push_backend_event(
-                &events_for_timer,
-                Event::TerminalError {
-                    error: negotiation_timeout_error(),
-                },
-            );
-        }
-        if readiness_for_timer.deadline_expired() {
-            loop_for_timeout.quit();
-        }
+        run_capture_callback(
+            &readiness_for_timer,
+            &events_for_timer,
+            || loop_for_timeout.quit(),
+            || {
+                if readiness_for_timer.is_reported() {
+                    return;
+                }
+                // Store the typed error before the policy sends its channel failure. An absent
+                // target succeeds only after a complete registry snapshot and keeps watching.
+                if readiness_for_timer.requires_negotiation() {
+                    push_backend_event(
+                        &events_for_timer,
+                        Event::TerminalError {
+                            error: negotiation_timeout_error(),
+                        },
+                    );
+                }
+                if readiness_for_timer.deadline_expired() {
+                    loop_for_timeout.quit();
+                }
+            },
+        );
     });
     if timer
         .update_timer(Some(NEGOTIATION_DEADLINE), None)

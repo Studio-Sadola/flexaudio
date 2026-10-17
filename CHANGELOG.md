@@ -12,6 +12,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Linux: a `system` capture with `excludeSelf` no longer fails with
+  "PipeWire rejected capture setup" when another application's playback
+  stream appears or disappears while the capture starts or runs. Two races
+  were treated as fatal: destroying a proxy the server had already removed
+  (`unknown resource N op:7`) and linking to an output port that vanished
+  before the link was created (`unknown output port N`). Proxy release is now
+  deferred to a server sync, and these errors are recoverable only when they
+  are attributed to this capture's own released proxy or to a link target
+  verified as gone. Permission errors, surviving targets and unrelated errors
+  still stop the capture. Startup succeeds when no playback stream remains.
+- Linux: errors that occur after a capture has started no longer use the
+  "capture setup" wording, and the native PipeWire error tuple is kept in
+  `diagnosticDetails`.
+
 ## [0.6.0] - 2026-10-15
 
 ### Breaking migration
