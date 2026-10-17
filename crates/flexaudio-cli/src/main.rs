@@ -99,9 +99,11 @@ enum SourceArg {
 /// How to handle the target PID for `--source process` (process only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ModeArg {
-    /// Capture only the target PID and its process tree (default).
+    /// Capture only the target (default): process tree on Windows; exact PID on Linux;
+    /// one Core Audio process object on macOS.
     Include,
-    /// Capture all system audio except the target PID and its process tree (`--process-id` required).
+    /// Capture all system audio except the target: process tree on Windows; exact PID on Linux;
+    /// one Core Audio process object on macOS (`--process-id` required).
     Exclude,
 }
 

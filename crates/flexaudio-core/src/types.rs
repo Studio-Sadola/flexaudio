@@ -63,9 +63,10 @@ pub struct AudioChunk {
     /// inserts wall-time silence: PTS and flags express the real-time gap. Within a
     /// VAD epoch, an event at t ms maps to its capture origin + t * 48.
     pub frame_index: u64,
-    /// Arrival-time label, re-anchored on each native callback. Callback jitter can
-    /// overlap chunks or leave gaps; no non-overlap or bounded-monotonic guarantee.
-    /// frame_index is authoritative; VAD maps epoch pts_ns + t_ms*1000000 exactly.
+    /// Arrival-time label (ns), assigned and re-anchored at facade ingest on every OS
+    /// for both microphone and loopback. Clamped non-decreasing, but chunks can overlap
+    /// or repeat timestamps. Not a media clock; frame_index is authoritative.
+    /// VAD maps epoch pts_ns + t_ms*1000000 exactly.
     pub pts_ns: i64,
     /// Monotonically increasing sequence number assigned by the stream layer.
     pub seq: u64,
@@ -103,10 +104,10 @@ pub struct SecondaryChunk {
     /// units. Same counting rule as AudioChunk::frame_index, but independent of the
     /// primary's buffering and drops; never use it to pair taps or anchor canonical VAD.
     pub frame_index: u64,
-    /// Presentation timestamp (ns) of the first sample, relative to recording start at 0.
-    /// Arrival-time label re-anchored on each native callback, using the primary recording clock.
-    /// Callback jitter may overlap chunks or leave gaps; no non-overlap or bounded-monotonic
-    /// guarantee. frame_index is authoritative; VAD uses its dedicated capture epoch.
+    /// Arrival-time label (ns), assigned and re-anchored at facade ingest with the same
+    /// origin as the primary tap. Clamped non-decreasing, but chunks can overlap or
+    /// repeat timestamps. Not a media clock; frame_index is authoritative.
+    /// VAD uses its dedicated capture epoch.
     pub pts_ns: i64,
     /// Monotonic sequence number for the secondary tap (separate counter from the primary tap).
     pub seq: u64,
@@ -279,20 +280,23 @@ pub enum SourceKind {
 
 /// How to handle the target PID for [`SourceKind::ProcessLoopback`] (process sources only).
 ///
-/// - [`Include`](ProcessMode::Include) (default): Capture only the target `target_pid` (its process
-///   tree).
-/// - [`Exclude`](ProcessMode::Exclude): Capture all system audio except the target `target_pid` (and its process tree)
-///   (`target_pid` is required).
+/// - [`Include`](ProcessMode::Include) (default): Capture only the target `target_pid`.
+/// - [`Exclude`](ProcessMode::Exclude): Capture all system audio except the target `target_pid`.
+///   `target_pid` is required for both modes.
+///
+/// Windows applies both modes to the target's process tree via WASAPI process loopback.
+/// Linux matches the exact PID only; macOS resolves that single PID to one Core Audio
+/// process object. Neither Linux nor macOS automatically includes descendants.
 ///
 /// Process sources use this `mode` and ignore [`StreamConfig::exclude_self`] and
 /// [`StreamConfig::exclude_pids`]. System sources use `exclude_self` and
 /// `exclude_pids` and ignore `mode`; microphone sources ignore all three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProcessMode {
-    /// Capture only the target `target_pid` (and its process tree; default).
+    /// Capture only the target (default), with the per-OS scope described above.
     #[default]
     Include,
-    /// Capture all system audio except the target `target_pid` (and its process tree).
+    /// Capture all system audio except the target, with the per-OS scope described above.
     /// `target_pid` is required (otherwise the facade returns [`Error::InvalidArg`]).
     Exclude,
 }

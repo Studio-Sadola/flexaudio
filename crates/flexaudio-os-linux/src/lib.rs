@@ -1971,10 +1971,8 @@ fn add_capture_listener(
                             scratch.push(v);
                         }
                     }
-                    // PTS: currently use the monotonic arrival time (`monotonic_now_ns`) as a
-                    // substitute. This monotonic approximation works because the downstream
-                    // ClockNormalizer establishes the initial origin. It can later be replaced
-                    // with the device clock from `pw_buffer.time`.
+                    // RawSink discards this monotonic arrival time; the facade assigns
+                    // a fresh arrival time at ingest. Device timestamps are not used.
                     user_data.sink.push(&scratch, monotonic_now_ns());
                 }
             }));

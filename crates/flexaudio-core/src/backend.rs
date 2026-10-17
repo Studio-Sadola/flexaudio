@@ -32,12 +32,12 @@ impl RawSink {
 
     /// Send raw interleaved f32 frames without blocking.
     ///
-    /// `pts_ns` is a device-provided presentation timestamp. Never block;
-    /// increment the internal overflow counter and drop data when full.
+    /// Built-in backends pass a monotonic arrival time as `pts_ns`, but this method
+    /// discards it: the raw ring carries samples only. Device timestamps are not used.
+    /// The facade assigns a fresh arrival time at ingest, where timestamp translation
+    /// and 20 ms chunking occur.
     ///
-    /// PTS normalization and 20 ms chunking belong to the ingest thread. This sends only raw frames;
-    /// the raw ring carries samples only, so the wiring layer handles `pts_ns` separately
-    /// (backends that can provide it should do so for future frame association).
+    /// Never block; increment the internal overflow counter and drop data when full.
     ///
     /// `push` is intended for backend RT callbacks. Custom backends must not allocate, lock, block,
     /// or make system calls along the path that calls push.
