@@ -493,7 +493,13 @@ export declare function processes(): Promise<Array<JsProcessInfo>>
  * in `chunk.secondary`. Avoid heavy synchronous work in callbacks.
  */
 export declare function openStream(options: OpenOptions, onChunk: (chunk: JsAudioChunk) => void, onEvent?: ((event: JsStreamEvent) => void) | undefined | null): FlexStream
-/** Watch device changes. Linux startup failure throws AudioException. RescanRequired invalidates incremental caches. */
+/**
+ * Watch Linux PipeWire system output additions, removals and default changes using
+ * the same output IDs as devices(). Microphone and default-microphone changes are
+ * not reported: CPAL microphone IDs cannot be resolved from PipeWire nodes.
+ * Windows/macOS use a no-op watcher. Linux startup failure throws AudioException.
+ * RescanRequired invalidates incremental caches.
+ */
 export declare function watchDevices(onEvent: (event: JsDeviceEvent) => void): DeviceWatcherHandle
 /**
  * Recording stream handle. Internally, the bridge thread owns and polls `flexaudio::Stream`

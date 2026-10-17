@@ -678,7 +678,12 @@ def devices() -> List[DeviceInfo]:
     ...
 def processes() -> List[ProcessInfo]: ...
 def watch_devices() -> DeviceWatcher:
-    """Start watching; Linux startup failure raises a typed exception."""
+    """Watch Linux PipeWire system output additions, removals and default changes.
+
+    Output IDs match devices(). Microphone and default-microphone changes are not
+    reported: CPAL microphone IDs cannot be resolved from PipeWire nodes.
+    Windows/macOS use a no-op watcher. Linux startup failure raises a typed exception.
+    """
     ...
 
 def open(

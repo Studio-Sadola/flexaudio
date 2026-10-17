@@ -141,8 +141,11 @@ struct Cli {
     #[arg(long)]
     list_processes: bool,
 
-    /// Monitor device hot-plug events and print them to stderr without recording
-    /// (`watch_devices()`; stop with Ctrl-C; independent of `--source`).
+    /// Monitor Linux PipeWire system output additions, removals and default changes
+    /// using the same output IDs as devices(), printing to stderr without recording.
+    /// Microphone and default-microphone changes are not reported: CPAL microphone
+    /// IDs cannot be resolved from PipeWire nodes. Windows/macOS use a no-op watcher.
+    /// (watch_devices(); stop with Ctrl-C; independent of --source).
     #[arg(long)]
     watch_devices: bool,
 

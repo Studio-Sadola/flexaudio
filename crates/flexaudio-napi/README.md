@@ -51,9 +51,10 @@ await stream.stop();
 It applies only the stream configuration: `options.denoise` and `options.vad`
 are ignored, and the existing denoise and VAD settings remain in effect.
 `options.gain` is also ignored; use `setGain()` to change gain.
-`watchDevices(cb)` reports hotplug (added / removed / defaultChanged) events
-on Linux via PipeWire. On Windows/macOS, it uses a no-op watcher and emits no
-device-change events.
+`watchDevices(cb)` reports Linux PipeWire system output additions, removals and
+default changes using the same output IDs as `devices()`. Microphone and
+default-microphone changes are not reported: CPAL microphone IDs cannot be resolved
+from PipeWire nodes. Windows/macOS use a no-op watcher.
 
 ## Microphone + system mix
 

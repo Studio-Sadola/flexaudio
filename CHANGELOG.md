@@ -12,6 +12,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Linux: device watching no longer reports PipeWire microphone nodes
+  (`Audio/Source`) or default-microphone changes. Their IDs are PipeWire node
+  names, which `devices()` never returns and the microphone path (CPAL/ALSA
+  device names) cannot open. The watcher now reports system output additions,
+  removals and default changes only, using the same IDs as `devices()`.
+- `config()` after a successful `switch_source` now returns the Mix device IDs
+  and gains that the new source actually uses, instead of the values from
+  before the switch.
+- Linux: process capture with target PID 0 now fails with `InvalidArg`, as on
+  Windows and macOS, instead of starting a capture that can never match.
+
+### Documentation
+
+- Windows: a runtime failure of the silent keepalive render stream terminates
+  capture with `Event::TerminalError`; the README previously described
+  stall/reopen recovery.
+- `ProcessMode` and the CLI `--mode` help now describe the per-platform scope:
+  a process tree on Windows, the exact PID on Linux and macOS.
+- `pts_ns` is documented as an arrival-time label assigned when samples are
+  ingested, with the same origin for microphone and loopback sources;
+  `frame_index` remains the authoritative timeline.
+- Node: `switchSource` keeps the existing denoise and VAD settings; `denoise`
+  and `vad` passed to it are ignored.
+- README: added a binding feature matrix (Rust, Node, Python, C, CLI).
+
 ## [0.6.1] - 2026-10-18
 
 ### Fixed

@@ -170,8 +170,11 @@ with flexaudio.watch_devices() as watcher:
         print(ev.type, ev.id, ev.device, ev.source_kind)
 ```
 
-Linux watcher startup failure raises a typed exception; unsupported operating
-systems retain the no-op watcher. `stop()` retains queued device events for draining.
+On Linux, `watch_devices()` reports PipeWire system output additions, removals and
+default changes using the same output IDs as `devices()`. Microphone and
+default-microphone changes are not reported: CPAL microphone IDs cannot be resolved
+from PipeWire nodes. Windows/macOS use a no-op watcher. Linux watcher startup
+failure raises a typed exception. `stop()` retains queued device events for draining.
 `defaultCleared` means no default device exists. `rescanRequired` carries a
 cumulative `dropped_events` count: discard the incremental inventory and call
 `devices()` again. A failed query cannot make stale inventory authoritative.

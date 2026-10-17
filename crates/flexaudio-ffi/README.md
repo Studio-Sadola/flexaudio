@@ -201,8 +201,11 @@ flexaudio_denoise_free(dn);
 
 ## Monitor Device Changes (Hotplug)
 
-Device connection, disconnection, and default-device changes are available through a pull-based
-API. Free `id` / `name` with `flexaudio_device_event_free`.
+The pull-based API reports Linux PipeWire system output additions, removals and
+default changes using the same output IDs as `devices()`. Microphone and
+default-microphone changes are not reported: CPAL microphone IDs cannot be resolved
+from PipeWire nodes. Windows/macOS use a no-op watcher.
+Free `id` / `name` with `flexaudio_device_event_free`.
 
 ```c
 FlexWatcher *w = flexaudio_watch_devices();     // Degrades to a no-op on unsupported systems

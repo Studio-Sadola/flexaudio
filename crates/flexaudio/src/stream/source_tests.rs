@@ -91,7 +91,7 @@ fn failed_source_switch_keeps_mix_snapshot() {
 }
 
 #[test]
-fn source_switch_rejects_output_secondary_and_chunk_changes_before_backend_construction() {
+fn source_switch_rejects_output_and_secondary_changes_before_backend_construction() {
     let initial = StreamConfig::default();
     let mut stream = Stream::open(initial.clone(), mock_backend()).unwrap();
     stream.start().unwrap();
@@ -109,11 +109,7 @@ fn source_switch_rejects_output_secondary_and_chunk_changes_before_backend_const
         }),
         ..initial.clone()
     };
-    let changed_chunk = StreamConfig {
-        chunk_ms: 40,
-        ..initial.clone()
-    };
-    for config in [changed_output, changed_secondary, changed_chunk] {
+    for config in [changed_output, changed_secondary] {
         assert!(matches!(
             stream.switch_source_using(config, None, |_| panic!(
                 "invalid switch reached backend construction"

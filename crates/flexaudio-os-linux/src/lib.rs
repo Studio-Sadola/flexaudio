@@ -2880,7 +2880,8 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                     match global.type_ {
                         pw::types::ObjectType::Node => {
                             // Same extraction logic as enumerate_pw.
-                            // Collect only nodes whose media.class is Audio/Sink or Audio/Source.
+                            // Classify Audio/Sink and Audio/Source nodes; WatchState discards
+                            // sources and reports only system outputs.
                             let media_class = props.get(*pw::keys::MEDIA_CLASS).unwrap_or("");
                             let Some(node_name) = discovery::node_identity(
                                 media_class,
