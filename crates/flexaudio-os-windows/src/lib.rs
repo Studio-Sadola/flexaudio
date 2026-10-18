@@ -34,6 +34,15 @@
 mod version;
 
 #[cfg(any(target_os = "windows", test))]
+mod capabilities;
+
+#[cfg(any(target_os = "windows", test))]
+mod exclusion;
+
+#[cfg(target_os = "windows")]
+pub use capabilities::capabilities;
+
+#[cfg(any(target_os = "windows", test))]
 mod lifecycle;
 
 #[cfg(any(target_os = "windows", test))]

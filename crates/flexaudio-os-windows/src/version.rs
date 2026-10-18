@@ -20,17 +20,18 @@ pub(crate) fn process_loopback_supported(build: u32) -> bool {
 #[cfg(target_os = "windows")]
 mod query {
     use flexaudio_core::types::{Error, Result};
+    use flexaudio_core::OsVersion;
     use windows::Wdk::System::SystemServices::RtlGetVersion;
     use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 
     use super::process_loopback_supported;
 
-    /// Get the running Windows build number with `RtlGetVersion`.
+    /// Get the running Windows version with `RtlGetVersion`.
     ///
     /// Do not use `GetVersionEx`, which can be affected by a compatibility-mode manifest.
     /// If the version cannot be read, return [`Error::Backend`] (the caller fails closed and
     /// treats process loopback as unavailable).
-    fn current_os_build() -> Result<u32> {
+    pub(crate) fn current_os_version() -> Result<OsVersion> {
         let mut info = OSVERSIONINFOW {
             dwOSVersionInfoSize: core::mem::size_of::<OSVERSIONINFOW>() as u32,
             ..Default::default()
@@ -45,7 +46,12 @@ mod query {
                 status.0
             )));
         }
-        Ok(info.dwBuildNumber)
+        Ok(OsVersion::new(
+            info.dwMajorVersion,
+            info.dwMinorVersion,
+            None,
+            Some(info.dwBuildNumber),
+        ))
     }
 
     /// Check whether process loopback is available on this OS. Return
@@ -53,7 +59,9 @@ mod query {
     /// build number cannot be read. Enumeration ([`list_processes`](crate::list_processes))
     /// and capture ([`WasapiProcessBackend`](crate::WasapiProcessBackend)) use this function.
     pub(crate) fn ensure_process_loopback_supported() -> Result<()> {
-        let build = current_os_build()?;
+        let build = current_os_version()?.build.ok_or_else(|| {
+            Error::Backend("RtlGetVersion returned no Windows build number".into())
+        })?;
         if process_loopback_supported(build) {
             Ok(())
         } else {
@@ -63,7 +71,7 @@ mod query {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) use query::ensure_process_loopback_supported;
+pub(crate) use query::{current_os_version, ensure_process_loopback_supported};
 
 #[cfg(test)]
 mod tests {

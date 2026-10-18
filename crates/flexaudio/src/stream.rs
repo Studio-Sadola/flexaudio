@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::OpenOptions;
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::chunk_ring::{chunk_ring, ChunkConsumer, ChunkProducer};
 use flexaudio_core::clock::{monotonic_now_ns, ClockNormalizer};
@@ -95,6 +96,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// blocking. [`stop`](Self::stop) joins all threads.
 pub struct Stream {
     config: StreamConfig,
+    open_options: OpenOptions,
 
     /// Shared backend, reopened by the intake/watchdog threads.
     shared: Arc<SharedState>,
@@ -271,6 +273,14 @@ impl Stream {
     /// ring capacity. Configure [`Normalizer`] from the backend's
     /// [`native_format`](CaptureBackend::native_format).
     pub fn open(config: StreamConfig, backend: Box<dyn CaptureBackend>) -> Result<Stream> {
+        Self::open_with_backend_options(config, backend, OpenOptions::default())
+    }
+
+    pub(crate) fn open_with_backend_options(
+        config: StreamConfig,
+        backend: Box<dyn CaptureBackend>,
+        options: OpenOptions,
+    ) -> Result<Stream> {
         validate_chunk_ms(config.chunk_ms)?;
         if config.ring_capacity_chunks == 0 {
             return Err(Error::InvalidArg("ring_capacity_chunks must be > 0".into()));
@@ -344,6 +354,7 @@ impl Stream {
 
         Ok(Stream {
             config,
+            open_options: options,
             shared,
             chunk_consumer,
             pending_primary: None,
@@ -357,6 +368,14 @@ impl Stream {
             started: false,
             shutdown: None,
         })
+    }
+
+    /// Return the options retained for the current source.
+    ///
+    /// Plain source switches retain these options; an explicit options switch
+    /// replaces them only after the new backend starts successfully.
+    pub fn open_options(&self) -> &OpenOptions {
+        &self.open_options
     }
 
     /// Enable the canonical 48 kHz stereo branch before starting capture.

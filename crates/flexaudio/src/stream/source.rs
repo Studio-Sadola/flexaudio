@@ -253,6 +253,8 @@ impl Stream {
     /// Reject changes to `output` / `secondary_output` / `chunk_ms` and keep
     /// `ring_capacity_chunks` unchanged. Ignore `new_config.gain` too (gain is stream state and does
     /// not change on source switch; change it with [`set_gain`](Self::set_gain)).
+    /// Retain the current [`OpenOptions`]; use [`Self::switch_source_with_options`]
+    /// to replace them together with the source.
     ///
     /// # Errors
     /// - Not started → [`Error::InvalidState`].
@@ -262,31 +264,59 @@ impl Stream {
     /// - New backend start fails → [`switch_backend`](Self::switch_backend) restores the old source
     ///   and returns the error.
     pub fn switch_source(&mut self, new_config: StreamConfig) -> Result<()> {
-        self.switch_source_inner(new_config, None)
+        self.switch_source_inner(new_config, None, None)
+    }
+
+    /// Switch source and retain new options only after the backend switch succeeds.
+    ///
+    /// On construction or startup failure, the previous options remain in effect.
+    /// The source and output-format rules are the same as [`Self::switch_source`].
+    pub fn switch_source_with_options(
+        &mut self,
+        config: StreamConfig,
+        options: OpenOptions,
+    ) -> Result<()> {
+        self.switch_source_inner(config, None, Some(options))
+    }
+
+    /// Switch source, options, and denoise atomically with the new capture generation.
+    ///
+    /// Construction or startup failure retains the previous options and denoise state.
+    /// The source and output-format rules are the same as [`Self::switch_source`].
+    pub fn switch_source_with_options_and_denoise(
+        &mut self,
+        config: StreamConfig,
+        options: OpenOptions,
+        denoise: bool,
+    ) -> Result<()> {
+        self.switch_source_inner(config, Some(denoise), Some(options))
     }
 
     /// Switch source and apply denoise atomically with the new capture generation.
+    /// Retains the current [`OpenOptions`].
     pub fn switch_source_with_denoise(
         &mut self,
         new_config: StreamConfig,
         denoise: bool,
     ) -> Result<()> {
-        self.switch_source_inner(new_config, Some(denoise))
+        self.switch_source_inner(new_config, Some(denoise), None)
     }
 
     fn switch_source_inner(
         &mut self,
         new_config: StreamConfig,
         denoise: Option<bool>,
+        options: Option<OpenOptions>,
     ) -> Result<()> {
-        self.switch_source_using(new_config, denoise, crate::build_backend)
+        self.switch_source_using(new_config, denoise, options, crate::build_backend)
     }
 
     fn switch_source_using(
         &mut self,
         new_config: StreamConfig,
         denoise: Option<bool>,
-        build: impl FnOnce(&StreamConfig) -> Result<Box<dyn CaptureBackend>>,
+        options: Option<OpenOptions>,
+        build: impl FnOnce(&StreamConfig, &OpenOptions) -> Result<Box<dyn CaptureBackend>>,
     ) -> Result<()> {
         if let Some(error) = self.terminal_error() {
             return Err(error);
@@ -310,7 +340,8 @@ impl Stream {
         validate_chunk_ms(new_config.chunk_ms)?;
         // Build the new source backend (on failure, return early with the old source untouched).
         crate::validate_exclude_pids(&new_config)?;
-        let backend = match build(&new_config) {
+        let options = options.unwrap_or_else(|| self.open_options.clone());
+        let backend = match build(&new_config, &options) {
             Ok(backend) => backend,
             Err(error) => {
                 if is_terminal_kind(&error) {
@@ -346,6 +377,7 @@ impl Stream {
             mix_system_gain: new_config.mix_system_gain,
             ..self.config.clone()
         };
+        self.open_options = options;
         Ok(())
     }
 }
@@ -374,5 +406,90 @@ fn drain_unpublished_capture(
             Ok(loss) => shared.push_event(Event::AudioLoss { loss }),
             Err(error) => shared.record_cleanup(error),
         }
+    }
+}
+
+#[cfg(test)]
+#[path = "open_options_tests.rs"]
+mod open_options_tests;
+
+#[cfg(test)]
+mod combined_open_options_tests {
+    use super::*;
+
+    #[test]
+    fn combined_open_options_and_denoise_validation_is_atomic() {
+        let mut stream = Stream::open(StreamConfig::default(), Box::new(Idle(false))).unwrap();
+        stream.start().unwrap();
+        let config = StreamConfig {
+            output: OutputFormat {
+                sample_rate: 16_000,
+                channels: 1,
+            },
+            ..stream.config().clone()
+        };
+        assert!(stream
+            .switch_source_with_options_and_denoise(
+                config,
+                OpenOptions::new().windows_classic_loopback_keepalive(false),
+                true,
+            )
+            .is_err());
+        assert_eq!(stream.open_options(), &OpenOptions::default());
+        assert!(!stream.shared.denoise_enabled.load(Ordering::SeqCst));
+        stream.stop_checked().unwrap();
+    }
+
+    #[test]
+    fn combined_open_options_and_denoise_commit_and_rollback_together() {
+        let initial = StreamConfig::default();
+        let mut stream = Stream::open(initial.clone(), Box::new(Idle(false))).unwrap();
+        stream.start().unwrap();
+        stream
+            .switch_source_using(
+                initial.clone(),
+                Some(true),
+                Some(OpenOptions::new().windows_classic_loopback_keepalive(false)),
+                |_, options| {
+                    assert!(!options.windows_classic_loopback_keepalive);
+                    Ok(Box::new(Idle(false)))
+                },
+            )
+            .unwrap();
+        assert!(!stream.open_options().windows_classic_loopback_keepalive);
+        assert!(stream.shared.denoise_enabled.load(Ordering::SeqCst));
+        for fail_start in [false, true] {
+            let result = stream.switch_source_using(
+                initial.clone(),
+                Some(false),
+                Some(OpenOptions::default()),
+                |_, _| {
+                    if fail_start {
+                        Ok(Box::new(Idle(true)))
+                    } else {
+                        Err(Error::DeviceNotFound)
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert!(!stream.open_options().windows_classic_loopback_keepalive);
+            assert!(stream.shared.denoise_enabled.load(Ordering::SeqCst));
+        }
+        stream.stop_checked().unwrap();
+    }
+
+    struct Idle(bool);
+    impl CaptureBackend for Idle {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 2)
+        }
+        fn start(&mut self, _sink: RawSink) -> Result<()> {
+            if self.0 {
+                Err(Error::DeviceNotFound)
+            } else {
+                Ok(())
+            }
+        }
+        fn stop(&mut self) {}
     }
 }

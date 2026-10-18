@@ -58,6 +58,60 @@ stream.stop();
 - Output is normalized interleaved `f32` at a sample rate / channel count you
   choose (two-stage resampling internally).
 
+## Capability discovery
+
+`capabilities()` returns a read-only snapshot of source backends and availability,
+OS version when known, PID/exclusion scopes and limits, output-device selection
+semantics, watcher support, and optional rendering side effects. It opens no
+capture or render streams, enumerates no microphones, requests no recording
+permission, and plays no audio.
+
+```rust
+let support = flexaudio::capabilities();
+println!("{:?}", support.sources.system.availability);
+println!("{:?}", support.system_exclusions);
+```
+
+`Availability::Supported` describes backend prerequisites, not permission or a
+usable device. `Availability::Unknown { error }` retains a typed prerequisite
+query failure; do not assume support or confirmed unavailability. On Linux,
+missing PipeWire sockets are unavailable; failed socket inspection, connection
+or server sync is unknown. The bounded query can wait for the audio service;
+run it on a worker thread in GUI applications.
+
+## Capture open options
+
+Use `open_with_options` to select optional backend behavior without changing
+`StreamConfig`. Existing `open` calls keep the default behavior.
+
+```rust
+use flexaudio::{open_with_options, OpenOptions, SourceKind, StreamConfig};
+
+let config = StreamConfig {
+    kind: SourceKind::SystemLoopback,
+    exclude_self: false,
+    ..Default::default()
+};
+let mut stream = open_with_options(
+    config.clone(),
+    OpenOptions::new().windows_classic_loopback_keepalive(false),
+)?;
+stream.start()?;
+stream.switch_source_with_options(config, OpenOptions::new())?;
+stream.stop();
+# Ok::<(), flexaudio::Error>(())
+```
+
+Windows classic loopback keepalive is enabled by default and renders silence to
+keep idle system capture delivering packets. It also applies to the system lane
+of Mix without PID exclusions. Other platforms and process/exclusion paths ignore
+it. Disabling it means idle classic loopback delivers no packets: the 2 s watchdog
+reports `Event::StreamStalled` and reopens repeatedly until audio plays.
+
+`Stream::open_options()` reads the current settings. `switch_source_with_options`
+replaces them together with the source; ordinary `switch_source` retains them.
+Construction/startup failures retain the previous settings.
+
 ## Install
 
 ```sh

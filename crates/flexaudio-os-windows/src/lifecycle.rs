@@ -8,6 +8,18 @@ pub(crate) fn keepalive_error(error: Error) -> Error {
     error.with_context(ErrorContext::new(Operation::Start))
 }
 
+/// Construct render resources only when classic-loopback keepalive is enabled.
+pub(crate) fn create_keepalive<K>(
+    enabled: bool,
+    create: impl FnOnce() -> Result<K>,
+) -> Result<Option<K>> {
+    if enabled {
+        create().map(Some).map_err(keepalive_error)
+    } else {
+        Ok(None)
+    }
+}
+
 /// Operations used by the owner thread; implementations own their OS resources.
 pub(crate) trait StreamClient {
     fn start(&mut self) -> Result<()>;
@@ -271,6 +283,41 @@ mod tests {
         .unwrap();
         drop(session);
         assert_eq!(*trace.borrow(), ["capture.start", "capture.stop"]);
+    }
+
+    #[test]
+    fn disabled_classic_keepalive_never_constructs_or_services_render() {
+        let trace = Trace::default();
+        let keepalive = create_keepalive::<FakeClient>(false, || {
+            panic!("disabled keepalive must not construct a render client")
+        })
+        .unwrap();
+        let mut session =
+            Session::start_and_report(client("capture", &trace, None), keepalive, |result| {
+                result.unwrap();
+                true
+            })
+            .unwrap();
+        session.service_keepalive().unwrap();
+        drop(session);
+        assert_eq!(*trace.borrow(), ["capture.start", "capture.stop"]);
+    }
+
+    #[test]
+    fn enabled_classic_keepalive_constructs_once_and_retains_startup_context() {
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            create_keepalive(true, || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            }),
+            Ok(Some(()))
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            create_keepalive::<()>(true, || Err(Error::DeviceNotFound)),
+            Err(keepalive_error(Error::DeviceNotFound))
+        );
     }
 
     #[test]

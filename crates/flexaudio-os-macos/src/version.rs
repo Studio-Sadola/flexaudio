@@ -13,23 +13,29 @@
 //! major/minor/patch) in the layout-matched local mirror [`NSOperatingSystemVersion`], which
 //! implements `Encode`/`RefEncode` for the struct return value.
 
+#[cfg(target_os = "macos")]
 use objc2::encode::{Encode, Encoding, RefEncode};
+#[cfg(target_os = "macos")]
 use objc2::ffi::NSInteger;
+#[cfg(target_os = "macos")]
 use objc2::runtime::AnyObject;
+#[cfg(target_os = "macos")]
 use objc2::{class, msg_send};
 
+#[cfg(target_os = "macos")]
 use flexaudio_core::types::{Error, Result};
 
 /// Minimum required macOS major version for Process Tap.
-const MIN_MAJOR: i64 = 14;
+pub(crate) const MIN_MAJOR: u32 = 14;
 /// Minimum required macOS minor version for Process Tap (14.4).
-const MIN_MINOR: i64 = 4;
+pub(crate) const MIN_MINOR: u32 = 4;
 
 /// Local mirror with the same layout as Foundation's `NSOperatingSystemVersion`.
 ///
 /// A `#[repr(C)]` struct of three `NSInteger` values (`i64` on 64-bit targets). Implements
 /// `Encode`/`RefEncode` to receive the struct return from `operatingSystemVersion` via `msg_send!`
 /// (encoded as an anonymous struct, like Foundation's `NSOperatingSystemVersion`).
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NSOperatingSystemVersion {
@@ -40,6 +46,7 @@ struct NSOperatingSystemVersion {
 
 // SAFETY: This `#[repr(C)]` struct has three NSInteger values and the same layout as Foundation's
 // `NSOperatingSystemVersion`. It is also encoded as an anonymous struct ("?").
+#[cfg(target_os = "macos")]
 unsafe impl Encode for NSOperatingSystemVersion {
     const ENCODING: Encoding = Encoding::Struct(
         "?",
@@ -52,6 +59,7 @@ unsafe impl Encode for NSOperatingSystemVersion {
 }
 
 // SAFETY: This is a reference encoding for the type with the `Encode` implementation above.
+#[cfg(target_os = "macos")]
 unsafe impl RefEncode for NSOperatingSystemVersion {
     const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
 }
@@ -60,15 +68,16 @@ unsafe impl RefEncode for NSOperatingSystemVersion {
 ///
 /// Ignores the patch version (Apple announced the feature for 14.4, so all 14.4.x versions qualify).
 /// Kept as a pure function separate from OS calls so it can be tested.
-fn meets_min_version(major: i64, minor: i64) -> bool {
+pub(crate) fn meets_min_version(major: u32, minor: u32) -> bool {
     major > MIN_MAJOR || (major == MIN_MAJOR && minor >= MIN_MINOR)
 }
 
-/// Get the running macOS version as `(major, minor)`.
+/// Get the running macOS version without requesting capture permission.
 ///
 /// Reads `[[NSProcessInfo processInfo] operatingSystemVersion]` directly. Foundation is always
 /// linked, so the `NSProcessInfo` class is always present at runtime.
-fn current_os_version() -> (i64, i64) {
+#[cfg(target_os = "macos")]
+pub(crate) fn current_os_version() -> Result<flexaudio_core::OsVersion> {
     // SAFETY: The `NSProcessInfo` class is always available in Foundation. `processInfo` returns an
     // autoreleased singleton, but we only send `operatingSystemVersion` immediately, so retaining it
     // is unnecessary. `operatingSystemVersion` is a zero-argument selector returning
@@ -77,7 +86,13 @@ fn current_os_version() -> (i64, i64) {
         let cls = class!(NSProcessInfo);
         let process_info: *mut AnyObject = msg_send![cls, processInfo];
         let version: NSOperatingSystemVersion = msg_send![process_info, operatingSystemVersion];
-        (version.major as i64, version.minor as i64)
+        let invalid_version = |_| Error::Backend("invalid operating system version".into());
+        Ok(flexaudio_core::OsVersion::new(
+            u32::try_from(version.major).map_err(invalid_version)?,
+            u32::try_from(version.minor).map_err(invalid_version)?,
+            Some(u32::try_from(version.patch).map_err(invalid_version)?),
+            None,
+        ))
     }
 }
 
@@ -86,9 +101,10 @@ fn current_os_version() -> (i64, i64) {
 ///
 /// Each backend calls this before creating a tap (a CoreAudio call). This makes failures on older
 /// OS versions return the typed `UnsupportedOsVersion` instead of raw `OSStatus` → `Error::Backend`.
+#[cfg(target_os = "macos")]
 pub(crate) fn ensure_process_tap_supported() -> Result<()> {
-    let (major, minor) = current_os_version();
-    if meets_min_version(major, minor) {
+    let version = current_os_version()?;
+    if meets_min_version(version.major, version.minor) {
         Ok(())
     } else {
         Err(Error::UnsupportedOsVersion)
@@ -130,10 +146,11 @@ mod tests {
 
     /// The running OS version lookup does not panic and returns a plausible value (major >= 10).
     /// CI and real hardware running macOS are version 10 or later, so the major is at least 10.
+    #[cfg(target_os = "macos")]
     #[test]
     fn current_os_version_is_sane() {
-        let (major, minor) = current_os_version();
-        assert!(major >= 10, "unexpected macOS major version: {major}");
-        assert!(minor >= 0, "unexpected macOS minor version: {minor}");
+        let version = current_os_version().expect("valid native OS version");
+        assert!(version.major >= 10, "unexpected macOS version: {version:?}");
+        assert!(version.patch.is_some());
     }
 }
