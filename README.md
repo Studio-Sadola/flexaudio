@@ -74,16 +74,44 @@ which output carries its events. — = not exposed.
 | Feature | Rust | Node | Python | C | CLI |
 |---|---|---|---|---|---|
 | Delivery model | Poll | Callbacks over internal polling | Poll | Poll | Internal polling → stdout/WAV |
-| Secondary output tap | Yes | Yes (`chunk.secondary`) | — | — | — |
-| Attached VAD (primary/secondary) | Canonical capture via `VadTap` | Primary or secondary carrier | Primary only | Primary only (v2) | — |
-| Denoise | Canonical 48 kHz; any output rate | Requires 48 kHz output | Requires 48 kHz output | Requires 48 kHz output | — |
+| Secondary output tap | Yes | Yes (`chunk.secondary`) | Yes (`poll_secondary`, f32/s16) | Yes (v3, f32/s16) | — |
+| Attached VAD (primary/secondary) | Canonical capture via `VadTap` | Primary or secondary carrier | Primary or secondary carrier | Primary (v2/v3) or secondary (v3) carrier | — |
+| Denoise | Canonical 48 kHz; any output rate | Requires 48 kHz output | Requires 48 kHz output | v1/v2: 48 kHz output; v3: any output rate | — |
 | Ring capacity | Configurable; default 50 chunks | 50 chunks | 50 chunks | 50 chunks | 50 chunks |
 | Source switching | `switch_source` | `switchSource`; retains add-on settings | `switch_source` | `flexaudio_switch_source` | `--sources` schedule |
 | Event detail | Typed events/errors/loss | Typed events/errors/loss | Typed events/errors/loss | v1 flattened; v2 detailed | stderr diagnostics/loss summaries |
 | Silence probe control | `silence_probe` | `silenceProbe` | `silence_probe` | `silence_probe`: 0/1 on, 2 off | `--no-silence-probe` |
+| Capability snapshot | `capabilities()` | `await capabilities()` | `capabilities()` | `flexaudio_capabilities_v1` | `--capabilities` (JSON) |
+| Windows classic loopback keepalive | `OpenOptions` | `windowsClassicLoopbackKeepalive` | `windows_classic_loopback_keepalive` | v3 `windows_classic_loopback_keepalive` | `--no-classic-loopback-keepalive` |
 | Gain 0 | Mute | Mute | Mute | Config gains: unity (1.0); runtime `flexaudio_set_gain(s, 0)`: mute | Mute |
 
 The optional silence diagnosis probe is macOS-only and enabled by default.
+
+---
+
+## Capability discovery
+
+`capabilities()` reports source backends and availability, OS version when known,
+PID/exclusion scope and limits, output-device selection behavior, watcher support,
+and optional rendering side effects. It opens no capture or render streams,
+plays no audio, and requests no recording permission.
+
+```rust
+use flexaudio::capabilities;
+
+let support = capabilities();
+println!("{:?}", support.sources.system.availability);
+println!("{:?}", support.system_exclusions);
+println!("{:?}", support.side_effects);
+```
+
+`Supported` describes platform prerequisites, not permission or a usable device.
+`Unknown { error }` means a prerequisite query failed or could not finish; inspect
+its typed error rather than treating it as supported or confirmed unavailable.
+On Linux, a missing PipeWire socket is `Unavailable`; failed socket inspection,
+connection or server sync is `Unknown`. The bounded probe may wait for the audio
+service, so use a worker thread in GUI applications. Node and CLI JSON spell the
+statuses `supported`, `unavailable`, and `unknown`; Python uses the same tags.
 
 ---
 
@@ -469,6 +497,21 @@ Failure to create or start this silent stream fails capture start; a runtime
 failure terminates capture with a typed `Event::TerminalError` and stops both
 streams. It does not enter stall/reopen recovery; open a new stream to retry.
 Process loopback, including system capture with exclusions, does not use it.
+
+Keepalive is enabled by default. Disable it in Rust with
+`open_with_options(config, OpenOptions::new().windows_classic_loopback_keepalive(false))`.
+`Stream::switch_source_with_options(config, options)` replaces it with the source;
+ordinary `switch_source` retains it, and failed switches retain the previous options.
+Node uses `windowsClassicLoopbackKeepalive: false`, Python
+`windows_classic_loopback_keepalive=False`, C uses the v3 envelope field
+`windows_classic_loopback_keepalive = 2` (0 default/retain, 1 enabled), and the CLI
+uses `--no-classic-loopback-keepalive`. Node/Python switches retain it when omitted;
+C switches retain it with 0. The option also applies to the system lane of Mix,
+and is ignored on other platforms and process/exclusion paths.
+
+With keepalive disabled, idle classic loopback delivers no packets. The unchanged
+2 s watchdog reports `Event::StreamStalled` and reopens repeatedly until audio
+plays. Silent rendering and its Windows Mixer session are absent on this path.
 
 The capturing process can appear as an audio session in Windows Volume Mixer
 while capturing, and possibly briefly afterward. The silent render stream creates
