@@ -742,6 +742,7 @@ dependencies = [
  "flexaudio-mic",
  "flexaudio-os-linux",
  "hound",
+ "serde_json",
 ]
 
 [[package]]

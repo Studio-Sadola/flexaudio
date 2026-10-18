@@ -75,6 +75,7 @@ use clap::{Parser, ValueEnum};
 use flexaudio::core::{AudioChunk, Error, OutputFormat, SourceKind, StreamConfig};
 use flexaudio::{ProcessMode, Stream};
 
+mod capabilities_json;
 mod capture_events;
 mod device_events;
 use capture_events::drain_capture_events;
@@ -129,6 +130,16 @@ enum EncodingArg {
 #[derive(Debug, Parser)]
 #[command(name = "flexaudio-cli", about = "flexaudio capture CLI")]
 struct Cli {
+    /// Print the capability snapshot as pretty JSON and exit without opening capture.
+    #[arg(long)]
+    capabilities: bool,
+
+    /// Disable the silent-render keepalive for Windows classic system loopback only.
+    /// An idle endpoint then delivers no packets and may repeatedly report stalls.
+    /// Ignored on other platforms and process/exclusion capture paths.
+    #[arg(long)]
+    no_classic_loopback_keepalive: bool,
+
     /// List available audio devices and exit without recording
     /// (unified `devices()` enumeration; independent of `--source` and related options).
     #[arg(long)]
@@ -268,6 +279,11 @@ impl Cli {
         self.out == Path::new("-")
     }
 
+    fn open_options(&self) -> flexaudio::OpenOptions {
+        flexaudio::OpenOptions::new()
+            .windows_classic_loopback_keepalive(!self.no_classic_loopback_keepalive)
+    }
+
     /// Build [`OutputFormat`] from CLI arguments.
     fn output_format(&self) -> OutputFormat {
         OutputFormat {
@@ -401,7 +417,7 @@ fn validate_exclusion_sources(cli: &Cli, segments: Option<&[Segment]>) -> Result
 /// Hot-swap scheduler for `--sources`.
 ///
 /// The first segment is the initial source (already opened and started). At each later segment
-/// boundary (cumulative seconds), `stream.switch_source()` selects the next source. The caller
+/// boundary (cumulative seconds), `stream.switch_source_with_options()` selects the next source. The caller
 /// keeps one output (file/pipe), so switches are transparent in the continuous chunk stream
 /// (`Stream` guarantees continuous seq/PTS).
 ///
@@ -417,6 +433,7 @@ struct SwitchScheduler {
     configs: Vec<StreamConfig>,
     /// Display label (`labels[i]` is the kind label for `configs[i]`).
     labels: Vec<&'static str>,
+    open_options: flexaudio::OpenOptions,
 }
 
 impl SwitchScheduler {
@@ -443,6 +460,7 @@ impl SwitchScheduler {
             deadlines,
             configs,
             labels,
+            open_options: cli.open_options(),
         }
     }
 
@@ -457,7 +475,7 @@ impl SwitchScheduler {
         while self.next < self.deadlines.len() && now >= self.deadlines[self.next] {
             let label = self.labels[self.next];
             let config = self.configs[self.next].clone();
-            match stream.switch_source(config) {
+            match stream.switch_source_with_options(config, self.open_options.clone()) {
                 Ok(()) => {
                     eprintln!("[switch] -> {label}");
                 }
@@ -488,6 +506,16 @@ fn main() -> ExitCode {
 
 /// Main operation. Returns failures as human-readable `String` messages.
 fn run(cli: &Cli) -> std::result::Result<(), String> {
+    if cli.capabilities {
+        let snapshot = capabilities_json::project(&flexaudio::capabilities());
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        serde_json::to_writer_pretty(&mut output, &snapshot)
+            .map_err(|error| format!("Failed to write capabilities JSON: {error}"))?;
+        return writeln!(output)
+            .map_err(|error| format!("Failed to write capabilities JSON: {error}"));
+    }
+
     // Enforce the resource guard before any device access, including enumeration modes.
     if cli.exclude_pids.len() > 4096 {
         return Err(describe_error(Error::InvalidArg(
@@ -675,10 +703,11 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         )));
     }
 
-    // Open the stream. `open` selects a `Box<dyn CaptureBackend>` internally based on config.kind.
+    // Open the stream. `open_with_options` selects a `Box<dyn CaptureBackend>` internally based on config.kind.
     // Do not start it yet (two-stage flow). Read native_format from the opened Stream.
     let config = config_for_kind(cli, kind);
-    let mut stream = flexaudio::open(config).map_err(describe_error)?;
+    let mut stream =
+        flexaudio::open_with_options(config, cli.open_options()).map_err(describe_error)?;
 
     // --- Show native format ---
     let (native_rate, native_ch) = stream.native_format();
@@ -2789,5 +2818,48 @@ mod wav_failure_tests {
             }
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod capability_argument_tests {
+    use super::*;
+
+    #[test]
+    fn new_flags_default_to_existing_capture_behavior() {
+        let cli = Cli::try_parse_from(["flexaudio-cli"]).unwrap();
+        assert!(!cli.capabilities);
+        assert!(!cli.no_classic_loopback_keepalive);
+        assert!(cli.open_options().windows_classic_loopback_keepalive);
+    }
+
+    #[test]
+    fn capability_and_keepalive_flags_parse_with_existing_flags() {
+        let cli = Cli::try_parse_from([
+            "flexaudio-cli",
+            "--capabilities",
+            "--no-classic-loopback-keepalive",
+            "--sources",
+            "mic:1,system:1",
+            "--out",
+            "-",
+        ])
+        .unwrap();
+        assert!(cli.capabilities);
+        assert!(!cli.open_options().windows_classic_loopback_keepalive);
+        let segments = parse_sources(cli.sources.as_deref().unwrap()).unwrap();
+        let scheduler = SwitchScheduler::new(&cli, &segments, Instant::now());
+        assert_eq!(scheduler.open_options, cli.open_options());
+        assert!(!scheduler.open_options.windows_classic_loopback_keepalive);
+    }
+
+    #[test]
+    fn new_boolean_flags_reject_values() {
+        for flag in [
+            "--capabilities=false",
+            "--no-classic-loopback-keepalive=false",
+        ] {
+            assert!(Cli::try_parse_from(["flexaudio-cli", flag]).is_err());
+        }
     }
 }

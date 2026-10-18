@@ -24,6 +24,8 @@ clap = { version = "4", features = ["derive"] }
 # Ctrl-C (SIGINT) handler for clean shutdown of infinite streaming (--seconds 0).
 # Pure Rust and OS signal API only; no runtime network access (permissive MIT/Apache-2.0 licenses).
 ctrlc = "3"
+# Capability JSON projection; already present in the workspace lockfile.
+serde_json = "1"
 
 # System audio (PipeWire) backend for --source system (Linux only).
 [target.'cfg(target_os = "linux")'.dependencies]
