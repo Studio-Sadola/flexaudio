@@ -1,0 +1,8 @@
+[
+  {
+    "file": "bindings/flexaudio-py/flexaudio.pyi",
+    "name": "StreamVadOptions.tap",
+    "baseline": "v0.6.2",
+    "reason": "The 0.6.2 constructor already accepted 'secondary'; the property stub under-reported the values it can return."
+  }
+]
