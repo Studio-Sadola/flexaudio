@@ -409,6 +409,14 @@ export interface OpenOptions {
   /** Enable the macOS silence diagnostic probe. Default true; ignored on other systems. */
   silenceProbe?: boolean
   /**
+   * Render silence to keep Windows classic system loopback delivering idle packets.
+   * Omitted on openStream defaults to true; omitted on switchSource keeps the current value.
+   * Applies to system capture and the system lane of mix without PID exclusions.
+   * Ignored on other platforms and process/exclusion paths. When disabled, idle endpoints
+   * deliver no packets; the existing 2 s watchdog reports stalled and reopens until audio plays.
+   */
+  windowsClassicLoopbackKeepalive?: boolean
+  /**
    * true enables recording-time noise suppression. **Only available with 48000 Hz output**
    * (RNNoise is fixed at 48kHz). Applied once to the internal 48kHz/stereo canonical form;
    * both primary and secondary taps receive denoised audio (+10ms fixed latency). Setting true
@@ -421,6 +429,84 @@ export interface OpenOptions {
    */
   secondaryOutput?: SecondaryOutputOptions
 }
+/** Numeric OS version. Null components were not reported by the OS. */
+export interface OsVersion {
+  major: number
+  minor: number
+  patch: number | null
+  build: number | null
+}
+export type BackendKind = 'cpal' | 'pipeWire' | 'wasapiLoopback' | 'wasapiProcessLoopback' | 'coreAudioProcessTap' | 'composite' | 'unsupported' | 'other'
+export type CapabilityUnavailableReason =
+  | { kind: 'unsupportedOs' }
+  | { kind: 'osVersionTooOld'; required: OsVersion; actual: OsVersion }
+  | { kind: 'pipeWireUnavailable' }
+  | { kind: 'notApplicable' }
+  | { kind: 'other'; code: string }
+export type CapabilityAvailability =
+  | { status: 'supported' }
+  | { status: 'unavailable'; reason: CapabilityUnavailableReason }
+  | { status: 'unknown'; error: AudioError }
+export type PidScope = 'exactPid' | 'processTree' | 'notApplicable' | 'other'
+export type DeviceSelectionBehavior = 'honored' | 'ignored' | 'notApplicable' | 'other'
+export type WatcherMode = 'native' | 'noop' | 'other'
+export type WatchScope = 'systemOutputs' | 'defaultSystemOutput' | 'other'
+export type SideEffectCondition = 'silentActiveSystemAudio' | 'classicLoopbackWithoutExclusions' | 'other'
+export interface SourceCapability {
+  backend: BackendKind
+  availability: CapabilityAvailability
+}
+export interface SourceCapabilities {
+  mic: SourceCapability
+  system: SourceCapability
+  process: SourceCapability
+  mix: SourceCapability
+}
+export interface SystemExclusionCapabilities {
+  availability: CapabilityAvailability
+  backend: BackendKind
+  scope: PidScope
+  /** Distinct PID limit including implicit self; null means no count limit. */
+  maxDistinctPids: number | null
+  deviceSelection: DeviceSelectionBehavior
+}
+export interface ProcessCapabilities {
+  includeScope: PidScope
+  excludeScope: PidScope
+}
+export interface DeviceWatcherCapabilities {
+  availability: CapabilityAvailability
+  mode: WatcherMode
+  scopes: WatchScope[]
+}
+export interface SideEffectCapability {
+  availability: CapabilityAvailability
+  enabledByDefault: boolean
+  sources: Array<'mic' | 'system' | 'process' | 'mix' | 'other'>
+  condition: SideEffectCondition
+}
+export interface SideEffectCapabilities {
+  silenceProbe: SideEffectCapability
+  classicLoopbackKeepalive: SideEffectCapability
+}
+/** Platform support snapshot; support is independent of device availability and permission. */
+export interface Capabilities {
+  osVersion: OsVersion | null
+  sources: SourceCapabilities
+  systemExclusions: SystemExclusionCapabilities
+  process: ProcessCapabilities
+  deviceWatcher: DeviceWatcherCapabilities
+  sideEffects: SideEffectCapabilities
+}
+/**
+ * Query backend support and optional side effects without enumerating microphones,
+ * opening streams, playing audio or requesting recording permission. The bounded
+ * prerequisite probe runs on the libuv thread pool, keeping the JS thread free.
+ * Probe failures resolve as unknown availability containing a structured AudioError.
+ * Supported describes platform prerequisites, not device availability or permission.
+ * Unknown future enum values use other; an unknown unavailable reason includes code.
+ */
+export declare function capabilities(): Promise<Capabilities>
 /** Enumerate the complete inventory. Discovery failure throws AudioException.
  * On macOS, enumeration never prompts. With undecided microphone consent it
  * throws a typed Backend error before any HAL/device/format query. Grant the
@@ -535,7 +621,8 @@ export declare class FlexStream {
    * Requesting a change makes `switch_source` return InvalidArg, thrown here as an exception. Chunk
    * `seq` stays continuous across switches; the first chunk afterward has the DISCONTINUITY flag.
    * `options.gain` is ignored (gain is stream state; use `setGain` to change it).
-   * Only the stream configuration is applied. `options.denoise` and `options.vad` are ignored;
+   * An explicit `options.windowsClassicLoopbackKeepalive` replaces the current value;
+   * omission retains it. `options.denoise` and `options.vad` are ignored;
    * the existing denoise and VAD settings remain in effect.
    *
    * Throws if `stop()` has already completed (the bridge thread has stopped).

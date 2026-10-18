@@ -56,6 +56,49 @@ default changes using the same output IDs as `devices()`. Microphone and
 default-microphone changes are not reported: CPAL microphone IDs cannot be resolved
 from PipeWire nodes. Windows/macOS use a no-op watcher.
 
+## Capability discovery
+
+`await capabilities()` returns a read-only platform support snapshot. Its bounded
+prerequisite probe runs on the libuv thread pool. It does not enumerate microphones,
+request recording permission, open streams, or play audio. Supported means platform
+prerequisites are met; it does not promise permission or a usable device.
+
+```js
+const { capabilities } = require('@studio-sadola/flexaudio');
+const support = await capabilities();
+console.log(support.sources.system.backend, support.sources.system.availability);
+console.log(support.systemExclusions, support.process, support.deviceWatcher);
+console.log(support.sideEffects.classicLoopbackKeepalive);
+```
+
+The snapshot contains `osVersion`, the four `sources` (`mic`, `system`, `process`,
+`mix`), `systemExclusions`, process PID scopes, watcher mode/scopes, and
+`sideEffects.silenceProbe` / `sideEffects.classicLoopbackKeepalive`. Fields use
+camelCase. Missing OS versions/components and an unlimited `maxDistinctPids` are
+`null`. Availability is a discriminated union: `{ status: 'supported' }`,
+`{ status: 'unavailable', reason }`, or `{ status: 'unknown', error }`.
+Probe failures retain the existing structured `AudioError` in `error`, including
+contexts and related errors. Unknown future enum values use `other`; an unknown
+unavailable reason also carries a `code` string. See the exported `Capabilities`
+type for every field and tag.
+
+On Linux, a missing PipeWire socket means unavailable. Failed socket inspection,
+connection or server sync means unknown, with the structured query error retained.
+
+## Windows classic loopback keepalive
+
+`openStream({ kind: 'system', windowsClassicLoopbackKeepalive: false }, onChunk)`
+disables silent rendering used to keep classic loopback delivering idle packets.
+Omitting the option on open defaults to `true`. It also applies to the system lane
+of `mix`, without PID exclusions. Other platforms and process/exclusion capture
+paths ignore it.
+
+`stream.switchSource({ kind: 'system', windowsClassicLoopbackKeepalive: true })`
+updates the option with the source only after a successful switch. Omitting it
+from `switchSource` keeps the current value. When disabled, an idle endpoint sends
+no packets; the existing 2 s watchdog reports `stalled` and reopens repeatedly until
+audio plays.
+
 ## Microphone + system mix
 
 Use `kind: 'mix'` to combine microphone and system audio in one stream.
