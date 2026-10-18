@@ -10,14 +10,25 @@
 
 pub use flexaudio_core as core;
 
+mod capabilities;
+pub use capabilities::capabilities;
+pub use flexaudio_core::capabilities::{
+    Availability, BackendKind, Capabilities, DeviceSelectionBehavior, DeviceWatcherCapabilities,
+    OsVersion, PidScope, ProcessCapabilities, SideEffectCapabilities, SideEffectCapability,
+    SideEffectCondition, SourceCapabilities, SourceCapability, SystemExclusionCapabilities,
+    UnavailableReason, WatchScope, WatcherMode,
+};
+
 pub mod device_watcher;
 mod mix;
 pub mod mock;
+mod open_options;
 mod processes;
 pub mod stream;
 
 pub use device_watcher::DeviceWatcher;
 pub use mock::MockBackend;
+pub use open_options::OpenOptions;
 pub use processes::processes;
 pub use stream::Stream;
 
@@ -177,16 +188,24 @@ pub fn watch_devices() -> Result<DeviceWatcher> {
 /// Pull PCM does not require an event poll. Startup notices enter the ordinary FIFO
 /// event queue before the affected generation's first chunk is published.
 pub fn open(config: StreamConfig) -> Result<Stream> {
+    open_with_options(config, OpenOptions::default())
+}
+
+/// Open a not-yet-started capture stream with explicit backend options.
+///
+/// Uses the same validation and source selection as [`open`]. Options that do
+/// not apply to the selected operating system or source are ignored.
+pub fn open_with_options(config: StreamConfig, options: OpenOptions) -> Result<Stream> {
     stream::validate_chunk_ms(config.chunk_ms)?;
     // Validate the output format early. Stream::open also checks it, but errors should be
     // returned before constructing the backend.
     config.output.validate()?;
     validate_exclude_pids(&config)?;
 
-    let backend = build_backend(&config)?;
+    let backend = build_backend(&config, &options)?;
 
     // Delegate to the low-level entry point (which configures the Normalizer and threads).
-    Stream::open(config, backend)
+    Stream::open_with_backend_options(config, backend, options)
 }
 
 /// Shared preflight used by the Mix branch of open's backend construction.
@@ -241,7 +260,10 @@ pub(crate) fn validate_exclude_pids(config: &StreamConfig) -> Result<()> {
 ///   ([`build_system_backend`], `config.exclude_self` + `config.mix_system_device_id`).
 ///   `mix_mic_gain` / `mix_system_gain` must be finite and nonnegative or return
 ///   [`Error::InvalidArg`]. Return [`Error::Unsupported`] if system capture is unavailable.
-pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBackend>> {
+pub(crate) fn build_backend(
+    config: &StreamConfig,
+    options: &OpenOptions,
+) -> Result<Box<dyn CaptureBackend>> {
     // Error is used by multiple branches (missing PID -> InvalidArg, unsupported OS -> Unsupported),
     // so import it at the top of the function.
     use flexaudio_core::types::Error;
@@ -263,6 +285,7 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
             config.exclude_pids.clone(),
             config.device_id.clone(),
             config.silence_probe,
+            options,
         )?,
 
         // Per-process output loopback is supported on Linux / Windows / macOS and requires target_pid.
@@ -314,6 +337,7 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
                 config.exclude_pids.clone(),
                 config.mix_system_device_id.clone(),
                 config.silence_probe,
+                options,
             )?;
             Box::new(mix::CompositeBackend::new(
                 mic,
@@ -340,9 +364,12 @@ fn build_system_backend(
     exclude_pids: Vec<u32>,
     device_id: Option<String>,
     silence_probe: bool,
+    options: &OpenOptions,
 ) -> Result<Box<dyn CaptureBackend>> {
     #[cfg(not(target_os = "macos"))]
     let _ = silence_probe;
+    #[cfg(not(target_os = "windows"))]
+    let _ = options;
     #[cfg(target_os = "linux")]
     {
         Ok(Box::new(
@@ -354,7 +381,8 @@ fn build_system_backend(
     {
         Ok(Box::new(
             flexaudio_os_windows::WasapiSystemBackend::new(exclude_self, device_id)
-                .with_exclude_pids(exclude_pids),
+                .with_exclude_pids(exclude_pids)
+                .with_classic_loopback_keepalive(options.windows_classic_loopback_keepalive),
         ))
     }
     #[cfg(target_os = "macos")]

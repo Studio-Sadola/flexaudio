@@ -38,7 +38,10 @@ use flexaudio_core::clock::monotonic_now_ns;
 use flexaudio_core::types::{DeviceEvent, DeviceInfo, Error, ProcessMode, Result, SourceKind};
 use flexaudio_core::{ErrorContext, Event, Operation};
 
+mod capabilities;
+mod capability_probe;
 mod capture_control;
+pub use capabilities::capabilities;
 mod capture_error;
 mod capture_failures;
 mod capture_proxy;

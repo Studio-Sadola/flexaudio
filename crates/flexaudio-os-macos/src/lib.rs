@@ -37,6 +37,8 @@
 
 #[cfg(target_os = "macos")]
 mod activity;
+#[cfg(any(target_os = "macos", test))]
+mod capabilities;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod capture_health;
 #[cfg(target_os = "macos")]
@@ -61,9 +63,11 @@ mod system;
 mod tap;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod terminal;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 mod version;
 
+#[cfg(target_os = "macos")]
+pub use capabilities::capabilities;
 #[cfg(target_os = "macos")]
 pub use devices::list_output_devices;
 #[cfg(target_os = "macos")]

@@ -30,6 +30,13 @@ mod addon_error;
 pub use addon_error::AddonErrorKind;
 
 pub mod backend;
+pub mod capabilities;
+pub use capabilities::{
+    Availability, BackendKind, Capabilities, DeviceSelectionBehavior, DeviceWatcherCapabilities,
+    OsVersion, PidScope, ProcessCapabilities, SideEffectCapabilities, SideEffectCapability,
+    SideEffectCondition, SourceCapabilities, SourceCapability, SystemExclusionCapabilities,
+    UnavailableReason, WatchScope, WatcherMode,
+};
 pub mod chunk_ring;
 pub mod clock;
 pub mod diagnostics;

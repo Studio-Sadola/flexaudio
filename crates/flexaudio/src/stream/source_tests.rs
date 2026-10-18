@@ -39,7 +39,7 @@ fn switch_source_snapshot_matches_mix_backend_and_survives_reopen() {
     let mut stream = Stream::open(initial.clone(), mock_backend()).unwrap();
     stream.start().unwrap();
     stream
-        .switch_source_using(replacement.clone(), None, |config| {
+        .switch_source_using(replacement.clone(), None, None, |config, _| {
             assert_eq!(config, &replacement);
             Ok(mock_backend())
         })
@@ -83,7 +83,7 @@ fn failed_source_switch_keeps_mix_snapshot() {
     };
     let failure = Error::DeviceNotFound;
     assert_eq!(
-        stream.switch_source_using(replacement, None, |_| Err(failure.clone())),
+        stream.switch_source_using(replacement, None, None, |_, _| Err(failure.clone())),
         Err(failure)
     );
     assert_eq!(stream.config(), &initial);
@@ -111,7 +111,7 @@ fn source_switch_rejects_output_and_secondary_changes_before_backend_constructio
     };
     for config in [changed_output, changed_secondary] {
         assert!(matches!(
-            stream.switch_source_using(config, None, |_| panic!(
+            stream.switch_source_using(config, None, None, |_, _| panic!(
                 "invalid switch reached backend construction"
             )),
             Err(Error::InvalidArg(_))

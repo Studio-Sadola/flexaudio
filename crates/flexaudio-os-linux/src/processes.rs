@@ -37,7 +37,7 @@ use crate::{
 };
 
 /// Deadline for connection + registry round trip; incomplete queries return `Err`.
-const LIST_DEADLINE: Duration = Duration::from_millis(2_000);
+pub(crate) const LIST_DEADLINE: Duration = Duration::from_millis(2_000);
 
 /// `media.class` for application output nodes targeted by process capture.
 const OUTPUT_STREAM_CLASS: &str = "Stream/Output/Audio";

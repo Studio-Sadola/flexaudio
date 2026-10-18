@@ -22,6 +22,7 @@
 //! pid or pid 0 is rejected with [`Error::InvalidArg`] before capture starts
 //! (see [`WasapiSystemBackend::with_exclude_pids`]).
 
+use crate::exclusion::validate_exclusion;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -47,6 +48,8 @@ use crate::common::{
 };
 use crate::format::{native_format_from_source, retain_format_query, verify_format};
 use crate::keepalive::SilentRender;
+use crate::lifecycle::create_keepalive;
+#[cfg(test)]
 use crate::lifecycle::keepalive_error;
 
 /// Safe fallback `(48000, 2)` returned by [`native_format`] when the default
@@ -87,6 +90,8 @@ pub struct WasapiSystemBackend {
     /// `Some(id)` selects the eRender endpoint whose name or native endpoint ID matches `id`.
     /// Unused when `exclude_self == true`.
     device_id: Option<String>,
+    /// Whether classic loopback owns a silent render client. Ignored for exclusions.
+    classic_loopback_keepalive: bool,
     /// Running flag (guards duplicate starts, signals stop, and supports drop checks). `Send`.
     stop_flag: Arc<AtomicBool>,
     /// Handle for the thread that owns COM and capture (`Some` after start).
@@ -119,6 +124,7 @@ impl WasapiSystemBackend {
             exclude_self,
             exclude_pids: Vec::new(),
             device_id,
+            classic_loopback_keepalive: true,
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
             pending_error: None,
@@ -132,6 +138,16 @@ impl WasapiSystemBackend {
         };
         backend.native_format();
         backend
+    }
+
+    /// Enable or disable silent rendering for classic system loopback (default: enabled).
+    ///
+    /// Ignored for process-exclusion capture. With keepalive disabled, an idle
+    /// endpoint delivers no packets, so the 2 s stall watchdog reports
+    /// `StreamStalled` and reopens repeatedly until audio plays.
+    pub fn with_classic_loopback_keepalive(mut self, enabled: bool) -> Self {
+        self.classic_loopback_keepalive = enabled;
+        self
     }
 
     /// Request exclusion of a process tree. WASAPI process loopback takes one
@@ -167,32 +183,6 @@ impl WasapiSystemBackend {
     pub fn exclude_root(&self) -> Result<Option<u32>> {
         validate_exclusion(self.exclude_self, std::process::id(), &self.exclude_pids)
     }
-}
-
-/// Validate WASAPI's single-tree exclusion without COM or process-tree guesses.
-fn validate_exclusion(exclude_self: bool, self_pid: u32, pids: &[u32]) -> Result<Option<u32>> {
-    let root = if exclude_self {
-        Some(self_pid)
-    } else {
-        pids.first().copied()
-    };
-    let Some(root) = root else {
-        return Ok(None);
-    };
-
-    for &pid in pids {
-        if pid == 0 {
-            return Err(Error::InvalidArg(
-                "exclude_pids: pid 0 is not a valid process id".into(),
-            ));
-        }
-        if pid != root {
-            return Err(Error::InvalidArg(format!(
-                "exclude_pids: pid {pid} is outside the single process tree WASAPI can exclude (root {root}); Windows supports excluding one process tree per capture"
-            )));
-        }
-    }
-    Ok(Some(root))
 }
 
 impl Default for WasapiSystemBackend {
@@ -439,6 +429,7 @@ impl CaptureBackend for WasapiSystemBackend {
 
         let stop_flag = self.stop_flag.clone();
         let device_id = self.device_id.clone();
+        let classic_loopback_keepalive = self.classic_loopback_keepalive;
         // Channel for synchronously returning setup status (COM init through successful Start).
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let (event_tx, event_rx) = mpsc::channel();
@@ -446,7 +437,15 @@ impl CaptureBackend for WasapiSystemBackend {
         let handle = thread::Builder::new()
             .name("flexaudio-wasapi-system".into())
             .spawn(move || {
-                run_system_thread(exclude_root, device_id, sink, stop_flag, ready_tx, event_tx)
+                run_system_thread(
+                    exclude_root,
+                    device_id,
+                    classic_loopback_keepalive,
+                    sink,
+                    stop_flag,
+                    ready_tx,
+                    event_tx,
+                )
             })
             .map_err(|error| {
                 self.stop_flag.store(true, Ordering::SeqCst);
@@ -516,11 +515,12 @@ impl Drop for WasapiSystemBackend {
 ///   (and its tree) with [`ProcessMode::Exclude`] to
 ///   [`crate::process::setup_process_loopback`]. `device_id` is unused.
 ///
-/// Classic loopback also owns a silent render client. Process exclusion never
+/// Classic loopback optionally owns a silent render client. Process exclusion never
 /// creates a render client. Both use the shared [`capture_loop`].
 fn run_system_thread(
     exclude_root: Option<u32>,
     device_id: Option<String>,
+    classic_loopback_keepalive: bool,
     sink: RawSink,
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<()>>,
@@ -544,7 +544,7 @@ fn run_system_thread(
             .map(CaptureSetup::process)
     } else {
         // Classic loopback on the render endpoint selected by device_id (None uses default).
-        unsafe { setup_system_loopback(device_id.as_deref(), &sink) }
+        unsafe { setup_system_loopback(device_id.as_deref(), &sink, classic_loopback_keepalive) }
     };
     let setup = match setup {
         Ok(t) => t,
@@ -567,7 +567,11 @@ fn run_system_thread(
 ///
 /// # Safety
 /// COM must be initialized on the calling thread.
-unsafe fn setup_system_loopback(device_id: Option<&str>, sink: &RawSink) -> Result<CaptureSetup> {
+unsafe fn setup_system_loopback(
+    device_id: Option<&str>,
+    sink: &RawSink,
+    classic_loopback_keepalive: bool,
+) -> Result<CaptureSetup> {
     let enumerator: IMMDeviceEnumerator =
         CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
             .map_err(|e| map_hr("CoCreateInstance(MMDeviceEnumerator)", e))?;
@@ -588,14 +592,16 @@ unsafe fn setup_system_loopback(device_id: Option<&str>, sink: &RawSink) -> Resu
     let setup = (|| {
         let format = parse_mix_format(pwfx)?;
         verify_format(format, (sink.native_rate(), sink.native_channels()))?;
-        let keepalive = SilentRender::new(&device, pwfx).map_err(keepalive_error)?;
+        let keepalive = create_keepalive(classic_loopback_keepalive, || {
+            SilentRender::new(&device, pwfx)
+        })?;
         let (capture, event) = init_loopback_capture(&client, pwfx, 0)?;
         Ok(CaptureSetup {
             client,
             capture,
             event: EventHandle(event),
             channels: format.1,
-            keepalive: Some(keepalive),
+            keepalive,
         })
     })();
     CoTaskMemFree(Some(pwfx as *const _));
@@ -606,6 +612,17 @@ unsafe fn setup_system_loopback(device_id: Option<&str>, sink: &RawSink) -> Resu
 mod tests {
     use super::*;
     use flexaudio_core::raw_ring;
+
+    #[test]
+    fn keepalive_defaults_to_enabled_and_can_be_disabled_without_changing_exclusions() {
+        // Exclusion construction does not query or activate an audio endpoint.
+        let backend = WasapiSystemBackend::new(true, None);
+        assert!(backend.classic_loopback_keepalive);
+        let backend = backend.with_classic_loopback_keepalive(false);
+        assert!(!backend.classic_loopback_keepalive);
+        assert_eq!(backend.exclude_root(), Ok(Some(std::process::id())));
+        assert_eq!(backend.native_format(), PROCESS_LOOPBACK_FORMAT);
+    }
 
     #[test]
     fn checked_stop_after_capture_failure_keeps_primary_and_cleanup() {
@@ -713,66 +730,6 @@ mod tests {
             .with_exclude_pids(vec![]);
         assert!(matches!(cleared.exclude_root(), Ok(None)));
         assert!(cleared.exclude_pids.is_empty());
-    }
-
-    #[test]
-    fn validate_exclusion_accepts_root_only() {
-        assert!(matches!(
-            validate_exclusion(false, 100, &[42]),
-            Ok(Some(42))
-        ));
-    }
-
-    #[test]
-    fn validate_exclusion_accepts_duplicate_root() {
-        assert!(matches!(
-            validate_exclusion(false, 100, &[42, 42]),
-            Ok(Some(42))
-        ));
-    }
-
-    #[test]
-    fn validate_exclusion_accepts_self_pid() {
-        assert!(matches!(
-            validate_exclusion(true, 100, &[100]),
-            Ok(Some(100))
-        ));
-        assert!(matches!(validate_exclusion(true, 100, &[]), Ok(Some(100))));
-    }
-
-    #[test]
-    fn validate_exclusion_rejects_foreign_pid_with_exclude_self() {
-        assert!(matches!(
-            validate_exclusion(true, 100, &[100, 42]),
-            Err(Error::InvalidArg(message))
-                if message.starts_with("exclude_pids: pid 42 ")
-                    && message.contains("root 100")
-        ));
-    }
-
-    #[test]
-    fn validate_exclusion_rejects_second_tree() {
-        assert!(matches!(
-            validate_exclusion(false, 100, &[42, 99]),
-            Err(Error::InvalidArg(message))
-                if message.starts_with("exclude_pids: pid 99 ")
-                    && message.contains("root 42")
-        ));
-    }
-
-    #[test]
-    fn validate_exclusion_rejects_pid_zero() {
-        for (exclude_self, pids) in [(false, vec![0]), (false, vec![42, 0]), (true, vec![0])] {
-            assert!(matches!(
-                validate_exclusion(exclude_self, 100, &pids),
-                Err(Error::InvalidArg(message)) if message.starts_with("exclude_pids: pid 0 ")
-            ));
-        }
-    }
-
-    #[test]
-    fn validate_exclusion_empty_list_has_no_root() {
-        assert!(matches!(validate_exclusion(false, 100, &[]), Ok(None)));
     }
 
     #[test]
