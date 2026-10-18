@@ -12,6 +12,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Capability snapshots in Rust (`capabilities()`), Node (`await capabilities()`),
+  Python (`capabilities()`), C (`flexaudio_capabilities_v1` and accessors), and
+  CLI (`--capabilities`, JSON). They report source backends and availability,
+  OS version when known, PID/exclusion semantics and limits, device selection,
+  watcher support, and optional rendering side effects. They open no capture or
+  render streams, play no audio, and request no recording permission. Linux uses
+  a bounded PipeWire socket/connection check: a missing socket is `unavailable`;
+  failed socket inspection, connection or server sync is `unknown` with a typed
+  error. Support is not a guarantee of permission or a usable device.
+- Rust `OpenOptions`, `open_with_options`, and `Stream::switch_source_with_options`,
+  with a Windows classic loopback keepalive option, enabled by default. Node
+  exposes `windowsClassicLoopbackKeepalive`, Python
+  `windows_classic_loopback_keepalive`, C the v3 envelope's
+  `windows_classic_loopback_keepalive` (0 default/retain, 1 enabled, 2 disabled),
+  and CLI `--no-classic-loopback-keepalive`. The option applies to system capture
+  and the system lane of Mix without exclusions; other platforms and
+  process/exclusion capture ignore it. Disabling it means idle classic loopback
+  delivers no packets: the 2 s stall watchdog reports `StreamStalled` and reopens
+  repeatedly until audio plays. Source switches retain the current option unless
+  explicitly replaced; failed switches retain the previous value.
+- Python and C secondary output with `f32` or `s16` encoding, independent polling,
+  sequence/frame counters and drop accounting, and attached VAD events on the
+  secondary tap. Secondary VAD requires secondary output; VAD still processes
+  shared canonical capture. Output format and encoding are fixed at open and
+  retained on source switches; meters describe floats before integer quantization.
+- C v3 open/switch envelopes (`FlexStreamConfigV3`, `FlexSwitchConfigV3`,
+  `flexaudio_open_v3`, `flexaudio_switch_source_v3`) support exclusion PIDs
+  together with attached VAD, secondary output and keepalive control. Switching
+  retains the VAD attachment and output settings. Existing v1/v2 layouts,
+  signatures and symbols are unchanged.
+
+### Changed
+
+- Python and C stream denoise now always runs in the capture worker on canonical
+  48 kHz stereo before downmix, output conversion and output gain/clipping, feeding both
+  taps. Streams with attached VAD already used this path in 0.6.2; the following
+  differences concern denoise without attached VAD:
+  - Mono output and non-unity gain can produce different samples and meters.
+    Clipping flags now describe gain applied after denoise, rather than clipping
+    before denoise. Stereo at unity gain can also differ at lifecycle boundaries
+    or after dropped output; there is no blanket sample-identity guarantee.
+  - Stop flushes the 480-frame denoise tail through the facade and zero-pads the
+    final output to a full 20 ms chunk, with `PADDED` when padding is added,
+    instead of returning a separate unpadded 10 ms tail. Padding occurs after
+    denoise, so partial final input can also produce different samples. For
+    example, 9600 input frames at 48 kHz without loss now yield 11040 output
+    frames/channel after stop, rather than 10080. Even a started stream with no
+    input can yield a padded silent chunk on stop. Drain after stopping to retain
+    the final output. Tail chunks now use the facade's normal sequence/frame
+    indices, arrival-time PTS, flags and bounded queue/drop accounting rather
+    than binding-synthesized tail metadata.
+  - Denoise continues through paused capture and retains its history on resume,
+    instead of resetting on the first resumed `DISCONTINUITY` chunk. It also runs
+    before output queue drops, so dropped output no longer resets or skips
+    denoise history. A `DISCONTINUITY` flag alone no longer resets it; capture-worker
+    generation/loss rebuilds own resets. Starts, source switches and reopens create
+    fresh denoisers; established
+    generations discard their buffered remainder on replacement. Python no
+    longer flushes a separate local denoise tail before attempting a source switch.
+  - Processing no longer waits for PCM polling. The fixed algorithmic delay
+    remains 480 frames/channel (10 ms at 48 kHz); output chunks remain 20 ms.
+    Python and legacy C opens still require 48 kHz primary output for denoise;
+    C v3 can convert the denoised signal to other output rates.
+
 ## [0.6.2] - 2026-10-18
 
 ### Fixed

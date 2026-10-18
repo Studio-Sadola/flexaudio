@@ -71,16 +71,44 @@ stream.stop();
 | 機能 | Rust | Node | Python | C | CLI |
 |---|---|---|---|---|---|
 | 配信方式 | ポーリング | 内部ポーリングからコールバック | ポーリング | ポーリング | 内部ポーリング → stdout/WAV |
-| 副出力タップ | あり | あり（`chunk.secondary`） | — | — | — |
-| 接続 VAD（主／副） | `VadTap` で内部標準形式のキャプチャを処理 | 主または副のチャンクにイベントを付与 | 主のみ | 主のみ（v2） | — |
-| ノイズ抑制 | 内部の 48 kHz で処理、出力レートは任意 | 48 kHz 出力が必要 | 48 kHz 出力が必要 | 48 kHz 出力が必要 | — |
+| 副出力タップ | あり | あり（`chunk.secondary`） | あり（`poll_secondary`、f32/s16） | あり（v3、f32/s16） | — |
+| 接続 VAD（主／副） | `VadTap` で内部標準形式のキャプチャを処理 | 主または副のチャンクにイベントを付与 | 主または副のチャンクにイベントを付与 | 主（v2/v3）または副（v3）のチャンクにイベントを付与 | — |
+| ノイズ抑制 | 内部の 48 kHz で処理、出力レートは任意 | 48 kHz 出力が必要 | 48 kHz 出力が必要 | v1/v2: 48 kHz 出力、v3: 出力レートは任意 | — |
 | リング容量 | 設定可能、既定は 50 チャンク | 50 チャンク | 50 チャンク | 50 チャンク | 50 チャンク |
 | ソース切替 | `switch_source` | `switchSource`、アドオン設定を維持 | `switch_source` | `flexaudio_switch_source` | `--sources` のスケジュール |
 | イベントの詳細 | 型付きイベント／エラー／損失 | 型付きイベント／エラー／損失 | 型付きイベント／エラー／損失 | v1 は平坦化、v2 は詳細情報 | stderr に診断／損失の要約 |
 | 無音診断プローブの制御 | `silence_probe` | `silenceProbe` | `silence_probe` | `silence_probe`: 0/1 で有効、2 で無効 | `--no-silence-probe` |
+| 機能対応状況の取得 | `capabilities()` | `await capabilities()` | `capabilities()` | `flexaudio_capabilities_v1` | `--capabilities`（JSON） |
+| Windows 従来型ループバックのキープアライブ | `OpenOptions` | `windowsClassicLoopbackKeepalive` | `windows_classic_loopback_keepalive` | v3 の `windows_classic_loopback_keepalive` | `--no-classic-loopback-keepalive` |
 | ゲイン 0 | ミュート | ミュート | ミュート | 設定のゲイン: 等倍（1.0）、実行時の `flexaudio_set_gain(s, 0)`: ミュート | ミュート |
 
 任意の無音診断プローブは macOS 専用で、既定では有効です。
+
+---
+
+## 機能対応状況の取得
+
+`capabilities()` は、ソースのバックエンドと利用可否、取得できた OS バージョン、
+PID／除外の対象範囲と件数制限、出力デバイス選択の扱い、ウォッチャーの対応状況、
+任意の音声再生による副作用を返します。キャプチャや再生のストリームを開かず、
+音声を再生せず、録音の許可も要求しません。
+
+```rust
+use flexaudio::capabilities;
+
+let support = capabilities();
+println!("{:?}", support.sources.system.availability);
+println!("{:?}", support.system_exclusions);
+println!("{:?}", support.side_effects);
+```
+
+`Supported` はプラットフォームの前提条件を満たすことを示し、権限や利用可能なデバイスを保証しません。
+`Unknown { error }` は、前提条件の問い合わせが失敗したか、完了できなかったことを示します。
+対応済みや利用不可と決めつけず、型付きエラーを確認してください。
+Linux では PipeWire のソケットがなければ `Unavailable`、ソケットの調査、接続、
+サーバー同期の失敗は `Unknown` になります。時間制限付きの確認でも音声サービスを
+待つ場合があるため、GUI アプリではワーカースレッドを使ってください。Node と CLI の JSON は
+状態を `supported`、`unavailable`、`unknown` と表し、Python も同じタグを使います。
 
 ---
 
@@ -447,6 +475,21 @@ Windows のシステムキャプチャでは、`exclude_self` / `exclude_pids` �
 実行中に失敗すると、型付きの `Event::TerminalError` でキャプチャを終了し、両方のストリームを停止します。
 停止検知・再オープンによる復旧は行いません。再試行するには新しいストリームを開いてください。
 除外を指定したシステムキャプチャを含むプロセスループバックでは、この仕組みを使いません。
+
+キープアライブは既定で有効です。Rust では
+`open_with_options(config, OpenOptions::new().windows_classic_loopback_keepalive(false))`
+で無効にできます。`Stream::switch_source_with_options(config, options)` はソースとともに
+設定を置き換えます。通常の `switch_source` は設定を維持し、切替に失敗した場合は以前の設定を維持します。
+Node は `windowsClassicLoopbackKeepalive: false`、Python は
+`windows_classic_loopback_keepalive=False`、C は v3 エンベロープの
+`windows_classic_loopback_keepalive = 2`（0 は既定／維持、1 は有効）、CLI は
+`--no-classic-loopback-keepalive` を使います。Node／Python の切替では省略時に維持し、
+C の切替では 0 で維持します。Mix のシステム側にも適用し、
+他のプラットフォームやプロセス／除外キャプチャでは無視します。
+
+キープアライブを無効にすると、無音時の従来型ループバックはパケットを配信しません。
+既存の 2 秒の監視機構が `Event::StreamStalled` を報告し、音声が再生されるまで再オープンを
+繰り返します。この経路では無音の再生も、それに伴う Windows ミキサーのセッションも作りません。
 
 キャプチャしているプロセスは、キャプチャ中や終了後の短い間、Windows の音量ミキサーに
 オーディオセッションとして表示される場合があります。無音の再生ストリームがアクティブな
