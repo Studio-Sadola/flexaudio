@@ -146,7 +146,7 @@ pub(crate) fn process_info_to_py(info: ProcessInfo) -> PyProcessInfo {
 #[pyclass(module = "flexaudio", name = "AudioChunk", frozen)]
 pub struct PyAudioChunk {
     // Interleaved f32 samples. The `data` getter converts them to little-endian bytes.
-    // When integrated denoise is enabled, poll replaces these with the denoised samples.
+    // Integrated denoise is applied by the facade before output conversion.
     samples: Vec<f32>,
     // Events finalized by integrated VAD (start/end and absolute sample position). The getter
     // converts them to PyVadEvent. Empty when disabled.
@@ -217,31 +217,13 @@ impl PyAudioChunk {
         self.vad_events = Some(events);
     }
 
+    #[cfg(test)]
     pub(crate) fn has_audio_or_vad(&self) -> bool {
         !self.samples.is_empty()
             || self
                 .vad_events
                 .as_ref()
                 .is_some_and(|events| !events.is_empty())
-    }
-
-    /// Update metrics from the final delivered float PCM.
-    pub(crate) fn update_metrics(&mut self) {
-        self.peak = self
-            .samples
-            .iter()
-            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
-        self.rms = if self.samples.is_empty() {
-            0.0
-        } else {
-            (self
-                .samples
-                .iter()
-                .map(|&sample| f64::from(sample).powi(2))
-                .sum::<f64>()
-                / self.samples.len() as f64)
-                .sqrt() as f32
-        };
     }
 
     /// Sample reference for VAD to read (used during poll).

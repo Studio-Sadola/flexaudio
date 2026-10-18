@@ -312,7 +312,7 @@ fn speech_segments(
     ))
 }
 
-/// Immutable primary-tap options; secondary is explicitly unsupported by this binding.
+/// Immutable attachment options; tap selects the carrier for canonical VAD events.
 #[pyclass(module = "flexaudio", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct StreamVadOptions {
@@ -333,11 +333,11 @@ impl StreamVadOptions {
         provisional: bool,
         tap: &str,
     ) -> PyResult<Self> {
-        if tap != "primary" {
+        if !matches!(tap, "primary" | "secondary") {
             return Err(boundary_error(
                 py,
                 "UnsupportedTap",
-                "only primary is supported",
+                "tap must be primary or secondary",
             ));
         }
         Ok(Self {

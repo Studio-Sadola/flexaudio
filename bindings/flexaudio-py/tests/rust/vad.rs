@@ -182,7 +182,8 @@ fn attached_epoch_origin_is_readonly_and_preserves_u64() {
         );
         assert!(event.setattr("capture_sample", 0).is_err());
         StreamVadOptions::new(py, None, false, "primary").unwrap();
-        assert!(StreamVadOptions::new(py, None, false, "secondary").is_err());
+        StreamVadOptions::new(py, None, false, "secondary").unwrap();
+        assert!(StreamVadOptions::new(py, None, false, "other").is_err());
     });
 }
 
