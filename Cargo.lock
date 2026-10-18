@@ -722,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "flexaudio"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "flexaudio-core",
  "flexaudio-denoise",
@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "flexaudio-cli"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "ctrlc",
@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "flexaudio-core"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "bitflags 2.13.0",
  "ringbuf",
@@ -758,14 +758,14 @@ dependencies = [
 
 [[package]]
 name = "flexaudio-denoise"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "nnnoiseless",
 ]
 
 [[package]]
 name = "flexaudio-encode"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "claxon",
  "flacenc",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "flexaudio-ffi"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "flexaudio",
  "flexaudio-denoise",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "flexaudio-mic"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "block2",
  "cpal",
@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "flexaudio-napi"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "flexaudio",
  "flexaudio-denoise",
@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "flexaudio-os-linux"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "flexaudio-core",
  "pipewire",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "flexaudio-os-macos"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "block2",
  "flexaudio-core",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "flexaudio-os-windows"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "flexaudio-core",
  "windows",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "flexaudio-py"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "flexaudio",
  "flexaudio-denoise",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "flexaudio-vad"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "flate2",
  "flexaudio-core",
