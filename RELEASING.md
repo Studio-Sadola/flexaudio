@@ -27,6 +27,12 @@ Intel Mac Rust users still build from source via crates.io.
 
 ## Version gate and dry runs
 
+CI checks published Rust APIs against their latest crates.io releases on native OS runners.
+Node/Python declarations and the generated C header are checked against the latest release tag.
+Equal versions and patch bumps reject removed or changed declarations; pure additions are allowed.
+These declaration checks do not prove runtime behavior or binary ABI compatibility.
+Breaking changes require a minor bump for 0.x releases and prior maintainer approval.
+
 All three release workflows validate versions before any artifact upload or
 registry publish. Tags must match `^v[0-9]+\.[0-9]+\.[0-9]+$` exactly; for
 example, `v0.3.1` is accepted, while `v0.3.1-rc.1` is rejected. The tag's

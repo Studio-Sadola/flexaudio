@@ -49,6 +49,56 @@ jobs:
       - name: Test release version validation
         run: python3 -m unittest discover -s .github/scripts -p "test_*.py" -v
 
+  binding-api-compatibility:
+    name: Binding API compatibility (Node, Python, C)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The baseline is the latest numeric release tag, including on PRs.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check declarations against the latest release tag
+        run: python3 .github/scripts/check-api-compatibility.py
+
+  rust-api-compatibility:
+    name: Rust API compatibility (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            # All published crates except the native Windows/macOS backends.
+            # The CLI and bindings are not published to crates.io.
+            packages: >-
+              --workspace --exclude flexaudio-cli --exclude flexaudio-ffi
+              --exclude flexaudio-napi --exclude flexaudio-py
+              --exclude flexaudio-os-windows --exclude flexaudio-os-macos
+          # These APIs compile away on Linux; check them and the facade's
+          # platform-specific re-exports on their native OS instead.
+          - os: windows-latest
+            packages: -p flexaudio-os-windows -p flexaudio
+          - os: macos-latest
+            packages: -p flexaudio-os-macos -p flexaudio
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
+      # 0.51.0 requires Rust 1.93+ and supports this toolchain's rustdoc JSON v60.
+      - name: Install pinned cargo-semver-checks
+        run: cargo install cargo-semver-checks --locked --version 0.51.0
+      # With no baseline override, each crate uses its latest crates.io release.
+      # Infer the permitted changes from workspace.package.version; equal versions
+      # are patch-checked, while a 0.x minor bump permits breaking API changes.
+      - name: Check public Rust APIs against crates.io
+        run: cargo semver-checks ${{ matrix.packages }} --default-features
+
   lint-test-linux:
     name: Lint & Test (Linux / PipeWire)
     runs-on: ubuntu-latest
