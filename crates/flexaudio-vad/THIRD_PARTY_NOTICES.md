@@ -1798,8 +1798,8 @@ SOFTWARE.
 
 Used by:
 
-- [flexaudio-core 0.6.2](https://crates.io/crates/flexaudio-core/0.6.2)
-- [flexaudio-vad 0.6.2](https://crates.io/crates/flexaudio-vad/0.6.2)
+- [flexaudio-core 0.7.0](https://crates.io/crates/flexaudio-core/0.7.0)
+- [flexaudio-vad 0.7.0](https://crates.io/crates/flexaudio-vad/0.7.0)
 
 ````text
 MIT License
