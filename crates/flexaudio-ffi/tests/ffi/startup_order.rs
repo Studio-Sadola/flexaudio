@@ -43,16 +43,15 @@ fn startup_stream(attach_vad_tap: bool) -> FlexStream {
 fn binding_stream(inner: flexaudio::Stream, vad_tap: Option<flexaudio_vad::VadTap>) -> FlexStream {
     FlexStream {
         inner,
+        secondary: None,
         shutdown: None,
         shutdown_event_index: 0,
-        last_output: None,
         vad_tap,
         vad_events: Vec::new(),
         vad_origin: (0, 0),
         vad_error: None,
         vad_cleanup: Vec::new(),
         ready_chunks: Default::default(),
-        denoiser: None,
     }
 }
 

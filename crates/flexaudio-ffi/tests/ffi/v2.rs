@@ -623,18 +623,18 @@ fn stream(
         }),
     )
     .unwrap();
+    inner.set_denoise(denoise);
     let mut stream = FlexStream {
         inner,
+        secondary: None,
         shutdown: None,
         shutdown_event_index: 0,
-        last_output: None,
         vad_tap: None,
         vad_events: Vec::new(),
         vad_origin: (0, 0),
         vad_error: None,
         vad_cleanup: Vec::new(),
         ready_chunks: VecDeque::new(),
-        denoiser: denoise.then(|| flexaudio_denoise::Denoiser::new(1).unwrap()),
     };
     assert_eq!(unsafe { crate::flexaudio_start(&mut stream) }, 0);
     (stream, state, stops)
@@ -805,7 +805,7 @@ fn v2_capture_primary_suppresses_denoise_tail_and_preserves_cleanup() {
 }
 
 #[test]
-fn v2_repeated_stop_delivers_one_denoise_tail_and_spent_stream_keeps_addon() {
+fn v2_repeated_stop_delivers_one_canonical_denoise_tail_and_rejects_restart() {
     let (mut stream, state, _) = stream(None, true);
     release(push_and_poll(&mut stream, &state));
     assert_eq!(unsafe { crate::flexaudio_stop(&mut stream) }, 0);
@@ -816,9 +816,13 @@ fn v2_repeated_stop_delivers_one_denoise_tail_and_spent_stream_keeps_addon() {
         1
     );
     let tail = unsafe { output.assume_init() };
-    assert_eq!(tail.len, 480);
+    assert_eq!(tail.len, 960);
     let data = unsafe { std::slice::from_raw_parts(tail.data, tail.len) };
-    let (peak, rms) = crate::integration::peak_rms(data);
+    let peak = data
+        .iter()
+        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    let rms =
+        (data.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / data.len() as f64).sqrt() as f32;
     assert_eq!((tail.peak, tail.rms), (peak, rms));
     release(tail);
     assert_eq!(unsafe { crate::flexaudio_stop(&mut stream) }, 0);
@@ -844,7 +848,6 @@ fn v2_repeated_stop_delivers_one_denoise_tail_and_spent_stream_keeps_addon() {
         message.contains("already stopped") || message.contains("spent"),
         "restart must explain the spent stream: {message}"
     );
-    assert!(stream.denoiser.is_some());
     assert_eq!(unsafe { crate::flexaudio_stop(&mut stream) }, 0);
     assert_eq!(
         unsafe { crate::flexaudio_poll_chunk(&mut stream, empty.as_mut_ptr()) },

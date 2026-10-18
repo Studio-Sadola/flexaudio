@@ -1,0 +1,163 @@
+//! Legacy opens and both primary poll APIs share the facade denoise path.
+use super::*;
+use std::{
+    mem, ptr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+type Sink = Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>;
+struct Input(Sink);
+impl flexaudio::CaptureBackend for Input {
+    fn native_format(&self) -> (u32, u16) {
+        (48_000, 2)
+    }
+    fn start(&mut self, sink: flexaudio::core::backend::RawSink) -> flexaudio::Result<()> {
+        *self.0.lock().unwrap() = Some(sink);
+        Ok(())
+    }
+    fn stop(&mut self) {
+        self.0.lock().unwrap().take();
+    }
+}
+
+unsafe fn poll(stream: *mut FlexStream, v2: bool, samples: &mut Vec<f32>) -> bool {
+    if v2 {
+        let mut chunk = mem::zeroed();
+        let status = vad_integration::flexaudio_poll_chunk_v2(stream, &mut chunk);
+        assert!(status >= 0);
+        if status == 0 {
+            return false;
+        }
+        samples.extend_from_slice(std::slice::from_raw_parts(
+            chunk.chunk.data,
+            chunk.chunk.len,
+        ));
+        vad_integration::flexaudio_chunk_free_v2(&mut chunk);
+    } else {
+        let mut chunk = mem::zeroed();
+        let status = flexaudio_poll_chunk(stream, &mut chunk);
+        assert!(status >= 0);
+        if status == 0 {
+            return false;
+        }
+        samples.extend_from_slice(std::slice::from_raw_parts(chunk.data, chunk.len));
+        flexaudio_chunk_free(&mut chunk);
+    }
+    true
+}
+
+#[test]
+fn legacy_stream_denoise_matches_facade_before_downmix_and_gain() {
+    let input: Vec<f32> = (0..9600)
+        .flat_map(|i| {
+            let t = i as f32 / 48_000.0;
+            [
+                0.3 * (std::f32::consts::TAU * 440.0 * t).sin(),
+                0.15 * (std::f32::consts::TAU * 750.0 * t).sin(),
+            ]
+        })
+        .collect();
+    for channels in [1, 2] {
+        for gain in [1.0, 0.5] {
+            for v2 in [false, true] {
+                unsafe {
+                    let config = FlexConfig {
+                        output_rate: 48_000,
+                        output_channels: channels,
+                        gain,
+                        denoise: 1,
+                        ..mem::zeroed()
+                    };
+                    let sink = Sink::default();
+                    let handle = open_with_exclude_pids_using(&config, ptr::null(), 0, |config| {
+                        flexaudio::Stream::open(config, Box::new(Input(sink.clone())))
+                    });
+                    assert!(!handle.is_null());
+                    assert_eq!(flexaudio_start(handle), 0);
+                    let facade_sink = Sink::default();
+                    let mut facade = flexaudio::Stream::open(
+                        convert::build_config(&config, Vec::new()).unwrap(),
+                        Box::new(Input(facade_sink.clone())),
+                    )
+                    .unwrap();
+                    facade.set_denoise(true);
+                    facade.start().unwrap();
+                    for sink in [&sink, &facade_sink] {
+                        assert_eq!(
+                            sink.lock().unwrap().as_mut().unwrap().push(&input, 0),
+                            input.len()
+                        );
+                    }
+                    let mut expected = Vec::new();
+                    let mut actual = Vec::new();
+                    let samples = 9600 * usize::from(channels);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while expected.len() < samples || actual.len() < samples {
+                        if let Some(chunk) = facade.poll_chunk() {
+                            expected.extend(chunk.data);
+                        }
+                        poll(handle, v2, &mut actual);
+                        assert!(Instant::now() < deadline, "denoise output timed out");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    facade.stop_checked().unwrap();
+                    assert_eq!(flexaudio_stop(handle), 0);
+                    while let Some(chunk) = facade.poll_chunk() {
+                        expected.extend(chunk.data);
+                    }
+                    while poll(handle, v2, &mut actual) {}
+                    flexaudio_free(handle);
+                    assert_eq!(
+                        actual.len(),
+                        (9600_usize + 480).div_ceil(960) * 960 * usize::from(channels)
+                    );
+                    assert!(actual.iter().any(|s| s.abs() > 1e-6));
+                    assert_eq!(
+                        actual, expected,
+                        "channels={channels}, gain={gain}, v2={v2}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_denoise_rate_rejection_preserves_results_and_message() {
+    for rate in [16_000, 44_100] {
+        unsafe {
+            let config = FlexConfig {
+                output_rate: rate,
+                denoise: 1,
+                ..mem::zeroed()
+            };
+            assert!(flexaudio_open(&config).is_null());
+            assert_eq!(
+                std::ffi::CStr::from_ptr(flexaudio_last_error())
+                    .to_str()
+                    .unwrap(),
+                "denoise requires output_rate 48000"
+            );
+            assert!(error::last_audio_error().is_none());
+            let envelope = vad_integration::FlexStreamConfigV2 {
+                size: u32::try_from(mem::size_of::<vad_integration::FlexStreamConfigV2>()).unwrap(),
+                version: 2,
+                config: &config,
+                vad: ptr::null(),
+            };
+            let mut out = ptr::dangling_mut();
+            assert_eq!(
+                vad_integration::flexaudio_open_v2(&envelope, &mut out),
+                code::FLEX_FAILURE
+            );
+            assert!(out.is_null());
+            assert_eq!(
+                std::ffi::CStr::from_ptr(flexaudio_last_error())
+                    .to_str()
+                    .unwrap(),
+                "denoise requires output_rate 48000"
+            );
+        }
+    }
+}

@@ -17,6 +17,66 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#define FLEX_CAP_OTHER 4294967295
+
+#define FLEX_CAP_SUPPORTED 1
+
+#define FLEX_CAP_UNAVAILABLE 2
+
+#define FLEX_CAP_UNKNOWN 3
+
+#define FLEX_CAP_REASON_NONE 0
+
+#define FLEX_CAP_UNSUPPORTED_OS 1
+
+#define FLEX_CAP_OS_VERSION_TOO_OLD 2
+
+#define FLEX_CAP_PIPEWIRE_UNAVAILABLE 3
+
+#define FLEX_CAP_NOT_APPLICABLE 4
+
+#define FLEX_BACKEND_CPAL 1
+
+#define FLEX_BACKEND_PIPEWIRE 2
+
+#define FLEX_BACKEND_WASAPI_LOOPBACK 3
+
+#define FLEX_BACKEND_WASAPI_PROCESS_LOOPBACK 4
+
+#define FLEX_BACKEND_CORE_AUDIO_PROCESS_TAP 5
+
+#define FLEX_BACKEND_COMPOSITE 6
+
+#define FLEX_BACKEND_UNSUPPORTED 7
+
+#define FLEX_PID_EXACT 1
+
+#define FLEX_PID_PROCESS_TREE 2
+
+#define FLEX_PID_NOT_APPLICABLE 3
+
+#define FLEX_DEVICE_SELECTION_HONORED 1
+
+#define FLEX_DEVICE_SELECTION_IGNORED 2
+
+#define FLEX_DEVICE_SELECTION_NOT_APPLICABLE 3
+
+#define FLEX_WATCHER_NATIVE 1
+
+#define FLEX_WATCHER_NOOP 2
+
+#define FLEX_WATCH_SYSTEM_OUTPUTS 1
+
+#define FLEX_WATCH_DEFAULT_SYSTEM_OUTPUT 2
+
+#define FLEX_SIDE_EFFECT_SILENCE_PROBE 1
+
+#define FLEX_SIDE_EFFECT_CLASSIC_LOOPBACK_KEEPALIVE 2
+
+#define FLEX_CONDITION_SILENT_ACTIVE_SYSTEM_AUDIO 1
+
+#define FLEX_CONDITION_CLASSIC_LOOPBACK_WITHOUT_EXCLUSIONS 2
+
 // Device lookup completed without a match.
 #define FLEX_DEVICE_NOT_FOUND -5
 
@@ -133,6 +193,18 @@
 // Device monitoring terminated; the v2 error accessor returns the retained failure.
 #define FLEX_DEVICE_EVENT_KIND_TERMINAL_ERROR 6
 
+#define FLEX_STREAM_VERSION_3 3
+
+#define FLEX_SECONDARY_F32 1
+
+#define FLEX_SECONDARY_S16 2
+
+#define FLEX_KEEPALIVE_DEFAULT 0
+
+#define FLEX_KEEPALIVE_ON 1
+
+#define FLEX_KEEPALIVE_OFF 2
+
 #define FLEX_STREAM_VERSION_2 2
 
 #define FLEX_VAD_PRIMARY 1
@@ -165,6 +237,9 @@
 
 #define FLEX_VAD_LIMIT 5
 
+// Owned immutable platform snapshot. Accessor views and errors live until capabilities_free_v1.
+typedef struct FlexCapabilitiesV1 FlexCapabilitiesV1;
+
 // Opaque noise suppression handle containing [`flexaudio_denoise::Denoiser`].
 // Create it with `flexaudio_denoise_new` and release it with `flexaudio_denoise_free`.
 typedef struct FlexDenoiser FlexDenoiser;
@@ -182,6 +257,10 @@ typedef struct FlexEventV2 FlexEventV2;
 // `flexaudio_flac_write`, finalize with `flexaudio_flac_finalize`, and release with `flexaudio_flac_free`.
 typedef struct FlexFlac FlexFlac;
 
+// Immutable secondary chunk owner. PCM, metadata and events live until chunk_free_v3.
+// Borrowed arrays must never be freed separately. Release each owner exactly once.
+typedef struct FlexSecondaryChunkV3 FlexSecondaryChunkV3;
+
 // Owned completed shutdown report; all child pointers are borrowed.
 typedef struct FlexShutdownReportV2 FlexShutdownReportV2;
 
@@ -189,7 +268,7 @@ typedef struct FlexShutdownReportV2 FlexShutdownReportV2;
 // addons (denoise / VAD); C code holds only a pointer. Create with `flexaudio_open` and
 // release with `flexaudio_free`.
 //
-// Keep addons here as part of the stream state. VAD consumes canonical capture before
+// The facade owns denoise. VAD consumes canonical capture before
 // output conversion. `flexaudio_switch_source` replaces only the source;
 // addons retain their configuration from open (same as gain).
 typedef struct FlexStream FlexStream;
@@ -241,9 +320,10 @@ typedef struct FlexConfig {
     float mix_mic_gain;
     // Pre-mix linear gain for the system side of mix (mix only). 0 selects 1.0 (default).
     float mix_system_gain;
-    // Whether to apply noise suppression (RNNoise) to the stream. Enabled when `true`. The output rate must be
-    // 48000 or `flexaudio_open` fails (NULL + last_error). denoise
-    // processes data in place just before `poll_chunk` returns (before VAD).
+    // Whether to apply noise suppression (RNNoise) to the stream. Enabled when `true`.
+    // Runs once in the library on canonical 48 kHz stereo capture before downmix and gain,
+    // feeding output conversion and attached VAD before polling. v1/v2 require a 48000 Hz
+    // primary output rate; v3 permits other primary output rates.
     // Boolean integer: only 0 and 1 are valid.
     uint8_t denoise;
     // Silence diagnosis probe: 0 = default (enabled), 1 = enabled, 2 = disabled.
@@ -339,6 +419,142 @@ typedef struct FlexProcessInfo {
     int32_t output_activity;
 } FlexProcessInfo;
 
+// Optional version components are present only when their has_* word equals 1.
+typedef struct FlexOsVersionV1 {
+    uint32_t major;
+    uint32_t minor;
+    uint32_t has_patch;
+    uint32_t patch;
+    uint32_t has_build;
+    uint32_t build;
+} FlexOsVersionV1;
+
+// Availability with optional OS prerequisite and borrowed structured query error.
+typedef struct FlexAvailabilityV1 {
+    uint32_t status;
+    uint32_t reason;
+    // 1 only for OS_VERSION_TOO_OLD, otherwise required/actual are absent.
+    uint32_t has_os_versions;
+    struct FlexOsVersionV1 required;
+    struct FlexOsVersionV1 actual;
+    // Borrowed until capabilities_free_v1. Never free this error separately.
+    const struct FlexErrorInfoV2 *unknown;
+} FlexAvailabilityV1;
+
+typedef struct FlexSourceCapabilityV1 {
+    uint32_t backend;
+    struct FlexAvailabilityV1 availability;
+} FlexSourceCapabilityV1;
+
+typedef struct FlexSystemExclusionCapabilitiesV1 {
+    uint32_t backend;
+    struct FlexAvailabilityV1 availability;
+    uint32_t scope;
+    // 0 means no distinct PID count limit; 1 means max_distinct_pids is present.
+    uint32_t has_max_distinct_pids;
+    uint32_t max_distinct_pids;
+    uint32_t device_selection;
+} FlexSystemExclusionCapabilitiesV1;
+
+typedef struct FlexProcessCapabilitiesV1 {
+    uint32_t include_scope;
+    uint32_t exclude_scope;
+} FlexProcessCapabilitiesV1;
+
+typedef struct FlexDeviceWatcherCapabilitiesV1 {
+    struct FlexAvailabilityV1 availability;
+    uint32_t mode;
+    // Read individual scopes with capabilities_watcher_scope_v1.
+    size_t scopes_len;
+} FlexDeviceWatcherCapabilitiesV1;
+
+typedef struct FlexSideEffectCapabilityV1 {
+    struct FlexAvailabilityV1 availability;
+    // Only 1 means enabled; unknown future conditions fail closed.
+    uint32_t enabled_by_default;
+    // Read individual kinds with capabilities_side_effect_source_v1.
+    size_t sources_len;
+    uint32_t condition;
+} FlexSideEffectCapabilityV1;
+
+// Secondary metadata; meters describe float samples before integer quantization.
+typedef struct FlexSecondaryMetadataV3 {
+    uint32_t size;
+    uint32_t version;
+    uint32_t rate;
+    uint16_t channels;
+    uint32_t encoding;
+    uint32_t frames;
+    uint64_t frame_index;
+    int64_t pts_ns;
+    uint64_t seq;
+    uint32_t flags;
+    uint32_t dropped_before;
+    float peak;
+    float rms;
+} FlexSecondaryMetadataV3;
+
+// Half-open final interval on the 10 ms grid; its end may exceed physical EOF.
+typedef struct FlexSpeechSegment {
+    uint64_t start_ms;
+    uint64_t end_ms;
+} FlexSpeechSegment;
+
+typedef struct FlexVadSpeechStart {
+    uint64_t at_ms;
+} FlexVadSpeechStart;
+
+typedef struct FlexVadSpeechEnd {
+    uint64_t at_ms;
+    uint32_t reason;
+} FlexVadSpeechEnd;
+
+typedef struct FlexVadCut {
+    uint64_t start_ms;
+    uint64_t end_ms;
+    uint32_t reason;
+} FlexVadCut;
+
+typedef struct FlexVadEpochEnd {
+    uint32_t reason;
+} FlexVadEpochEnd;
+
+// Read only the payload selected by the event's type tag.
+typedef union FlexVadPayload {
+    struct FlexSpeechSegment segment;
+    struct FlexVadSpeechStart speech_start;
+    struct FlexVadSpeechEnd speech_end;
+    struct FlexVadCut cut;
+    struct FlexVadEpochEnd epoch_end;
+} FlexVadPayload;
+
+typedef struct FlexVadEpochStart {
+    // 48 kHz frames on the dedicated capture timeline, independent of primary/secondary
+    // format and tap. capture_sample + t_ms*48 is exact. Equal to primary frame_index
+    // for the same sample only when primary is 48 kHz. Other rates share units but not
+    // the origin (resampler group delay); unreconciled startup-release padding can
+    // grow the offset by up to one primary chunk per boundary. Neither index is an offset into concatenated
+    // delivered PCM; pause and queue drops advance indices without delivering.
+    uint64_t capture_sample;
+    int64_t pts_ns;
+} FlexVadEpochStart;
+
+// Attached union is distinct from the standalone event union.
+typedef union FlexAttachedVadPayload {
+    union FlexVadPayload vad;
+    struct FlexVadEpochStart epoch_start;
+} FlexAttachedVadPayload;
+
+// Versioned attached event. Epoch start is sequence 0 before all VAD payloads.
+typedef struct FlexAttachedVadEvent {
+    uint32_t size;
+    uint32_t version;
+    uint32_t type;
+    uint32_t epoch;
+    uint64_t seq;
+    union FlexAttachedVadPayload data;
+} FlexAttachedVadEvent;
+
 typedef struct FlexAudioLossV2 {
     // 0 capture, 1 Mix FIFO, 2 output.
     uint32_t path;
@@ -392,44 +608,56 @@ typedef struct FlexVadOptions {
     int32_t speech_pad_ms;
 } FlexVadOptions;
 
+// Fixed-width stream VAD attachment settings. v1/v2 support only the primary tap;
+// v3 also supports the secondary tap when secondary output is configured.
+typedef struct FlexStreamVadOptions {
+    struct FlexVadOptions params;
+    // 0 or 1, never a default sentinel.
+    uint8_t provisional;
+    // FLEX_VAD_PRIMARY or FLEX_VAD_SECONDARY.
+    uint32_t tap;
+} FlexStreamVadOptions;
+
+// Secondary format, fixed for the stream lifetime. Rate/channels are literal, not sentinels.
+typedef struct FlexSecondaryOutputV3 {
+    uint32_t size;
+    uint32_t version;
+    uint32_t rate;
+    uint16_t channels;
+    // FLEX_SECONDARY_F32 or FLEX_SECONDARY_S16. Unknown values are rejected.
+    uint32_t encoding;
+} FlexSecondaryOutputV3;
+
+// Borrowed open envelope. Initialize size to sizeof(FlexStreamConfigV3) and version to 3.
+typedef struct FlexStreamConfigV3 {
+    uint32_t size;
+    uint32_t version;
+    const struct FlexConfig *config;
+    // NULL disables attached VAD.
+    const struct FlexStreamVadOptions *vad;
+    const uint32_t *exclude_pids;
+    size_t exclude_pids_len;
+    // NULL disables secondary output.
+    const struct FlexSecondaryOutputV3 *secondary_output;
+    // 0 default (enabled), 1 enabled, 2 disabled.
+    uint32_t windows_classic_loopback_keepalive;
+} FlexStreamConfigV3;
+
+// Borrowed source switch envelope. Output formats, gain and denoise stay fixed at open.
+typedef struct FlexSwitchConfigV3 {
+    uint32_t size;
+    uint32_t version;
+    const struct FlexConfig *config;
+    const uint32_t *exclude_pids;
+    size_t exclude_pids_len;
+    // 0 retain current setting, 1 enabled, 2 disabled.
+    uint32_t windows_classic_loopback_keepalive;
+} FlexSwitchConfigV3;
+
 // Preview policy. provisional must be 0 (disabled) or 1 (enabled).
 typedef struct FlexVadRuntimeOptions {
     uint8_t provisional;
 } FlexVadRuntimeOptions;
-
-// Half-open final interval on the 10 ms grid; its end may exceed physical EOF.
-typedef struct FlexSpeechSegment {
-    uint64_t start_ms;
-    uint64_t end_ms;
-} FlexSpeechSegment;
-
-typedef struct FlexVadSpeechStart {
-    uint64_t at_ms;
-} FlexVadSpeechStart;
-
-typedef struct FlexVadSpeechEnd {
-    uint64_t at_ms;
-    uint32_t reason;
-} FlexVadSpeechEnd;
-
-typedef struct FlexVadCut {
-    uint64_t start_ms;
-    uint64_t end_ms;
-    uint32_t reason;
-} FlexVadCut;
-
-typedef struct FlexVadEpochEnd {
-    uint32_t reason;
-} FlexVadEpochEnd;
-
-// Read only the payload selected by the event's type tag.
-typedef union FlexVadPayload {
-    struct FlexSpeechSegment segment;
-    struct FlexVadSpeechStart speech_start;
-    struct FlexVadSpeechEnd speech_end;
-    struct FlexVadCut cut;
-    struct FlexVadEpochEnd epoch_end;
-} FlexVadPayload;
 
 // Standalone ordered event. All times are epoch-relative integer milliseconds.
 typedef struct FlexVadEvent {
@@ -439,15 +667,6 @@ typedef struct FlexVadEvent {
     union FlexVadPayload data;
 } FlexVadEvent;
 
-// Fixed-width new-mode attachment settings. Only primary is supported by this binding.
-typedef struct FlexStreamVadOptions {
-    struct FlexVadOptions params;
-    // 0 or 1, never a default sentinel.
-    uint8_t provisional;
-    // FLEX_VAD_PRIMARY or FLEX_VAD_SECONDARY.
-    uint32_t tap;
-} FlexStreamVadOptions;
-
 // Versioned envelope around the frozen v1 configuration. All pointers are borrowed during open.
 typedef struct FlexStreamConfigV2 {
     uint32_t size;
@@ -456,33 +675,6 @@ typedef struct FlexStreamConfigV2 {
     // NULL disables vad_tap attachment.
     const struct FlexStreamVadOptions *vad;
 } FlexStreamConfigV2;
-
-typedef struct FlexVadEpochStart {
-    // 48 kHz frames on the dedicated capture timeline, independent of primary/secondary
-    // format and tap. capture_sample + t_ms*48 is exact. Equal to primary frame_index
-    // for the same sample only when primary is 48 kHz. Other rates share units but not
-    // the origin (resampler group delay); unreconciled startup-release padding can
-    // grow the offset by up to one primary chunk per boundary. Neither index is an offset into concatenated
-    // delivered PCM; pause and queue drops advance indices without delivering.
-    uint64_t capture_sample;
-    int64_t pts_ns;
-} FlexVadEpochStart;
-
-// Attached union is distinct from the standalone event union.
-typedef union FlexAttachedVadPayload {
-    union FlexVadPayload vad;
-    struct FlexVadEpochStart epoch_start;
-} FlexAttachedVadPayload;
-
-// Versioned attached event. Epoch start is sequence 0 before all VAD payloads.
-typedef struct FlexAttachedVadEvent {
-    uint32_t size;
-    uint32_t version;
-    uint32_t type;
-    uint32_t epoch;
-    uint64_t seq;
-    union FlexAttachedVadPayload data;
-} FlexAttachedVadEvent;
 
 // Owns v1 PCM/events and attached events until flexaudio_chunk_free_v2.
 typedef struct FlexChunkV2 {
@@ -806,6 +998,75 @@ const char *flexaudio_last_error(void);
 // `device` must point to a live FlexDeviceInfo returned by flexaudio_devices.
 bool flexaudio_device_format_available_v2(const struct FlexDeviceInfo *device);
 
+// Probe capture support without opening capture, enumerating microphones or playing audio.
+// Returns FLEX_OK and an owned snapshot, including structured unknown query failures.
+// The bounded platform probe can block; GUI hosts should use a worker thread.
+// # Safety
+// out must be writable and aligned. Release the owner with capabilities_free_v1.
+int32_t flexaudio_capabilities_v1(struct FlexCapabilitiesV1 **out);
+
+// Free an owned snapshot and invalidate all borrowed views. NULL is safe.
+// # Safety
+// value must be a live library owner or NULL; release exactly once.
+void flexaudio_capabilities_free_v1(struct FlexCapabilitiesV1 *value);
+
+// Copy the running OS version: 1 present, 0 unknown, negative invalid argument.
+// All record accessors leave out untouched when absent. Unknown codes never imply support.
+// # Safety
+// value must be a live snapshot; out must be writable and aligned.
+int32_t flexaudio_capabilities_os_version_v1(const struct FlexCapabilitiesV1 *value,
+                                             struct FlexOsVersionV1 *out);
+
+// Copy one source's backend and complete availability. kind uses FLEX_SOURCE_KIND_*.
+// Returns 1 or a negative typed error. Borrowed unknown error lives until snapshot free.
+// # Safety
+// value must be a live snapshot; out must be writable and aligned.
+int32_t flexaudio_capabilities_source_v1(const struct FlexCapabilitiesV1 *value,
+                                         int32_t kind,
+                                         struct FlexSourceCapabilityV1 *out);
+
+// Copy system exclusion availability, backend, PID semantics, limit and device selection.
+// Returns 1 or a negative typed error; all error pointers are borrowed until snapshot free.
+// # Safety
+// value must be a live snapshot; out must be writable and aligned.
+int32_t flexaudio_capabilities_system_exclusions_v1(const struct FlexCapabilitiesV1 *value,
+                                                    struct FlexSystemExclusionCapabilitiesV1 *out);
+
+// Copy include/exclude process PID scopes. Returns 1 or a negative typed error.
+// # Safety
+// value must be a live snapshot; out must be writable and aligned.
+int32_t flexaudio_capabilities_process_v1(const struct FlexCapabilitiesV1 *value,
+                                          struct FlexProcessCapabilitiesV1 *out);
+
+// Copy watcher availability, mode and scope count. Returns 1 or a negative typed error.
+// # Safety
+// value must be a live snapshot; out must be writable and aligned.
+int32_t flexaudio_capabilities_watcher_v1(const struct FlexCapabilitiesV1 *value,
+                                          struct FlexDeviceWatcherCapabilitiesV1 *out);
+
+// Read an indexed watcher scope. Returns 1 or a negative typed error (including out of range).
+// # Safety
+// value must be a live snapshot; out must be writable and aligned.
+int32_t flexaudio_capabilities_watcher_scope_v1(const struct FlexCapabilitiesV1 *value,
+                                                size_t index,
+                                                uint32_t *out);
+
+// Copy side effect availability, default state, source count and triggering condition.
+// kind uses FLEX_SIDE_EFFECT_*. Returns 1 or a negative typed error.
+// # Safety
+// value must be a live snapshot; out must be writable and aligned.
+int32_t flexaudio_capabilities_side_effect_v1(const struct FlexCapabilitiesV1 *value,
+                                              uint32_t kind,
+                                              struct FlexSideEffectCapabilityV1 *out);
+
+// Read a side effect source as FLEX_SOURCE_KIND_*. Invalid kind/index returns InvalidArg.
+// # Safety
+// value must be a live snapshot; out must be writable and aligned.
+int32_t flexaudio_capabilities_side_effect_source_v1(const struct FlexCapabilitiesV1 *value,
+                                                     uint32_t kind,
+                                                     size_t index,
+                                                     int32_t *out);
+
 // Creates a denoiser for the given channel count (1 = mono, 2 = interleaved stereo).
 //
 // Returns NULL and sets last_error if `channels` is outside 1..=2. Release the returned
@@ -899,6 +1160,44 @@ int32_t flexaudio_flac_finalize(struct FlexFlac *f);
 // `f` must be a handle returned by `flexaudio_flac_create` (or NULL).
 // Do not use `f` after release.
 void flexaudio_flac_free(struct FlexFlac *f);
+
+// Independently poll one secondary chunk: 1 available, 0 absent, negative error.
+// Output initializes to NULL. Stop drains both taps; final chunks remain pollable.
+// Free any previously returned owner before reusing out.
+// # Safety
+// Stream must be live and exclusively borrowed; out must be writable and aligned.
+int32_t flexaudio_poll_secondary_chunk_v3(struct FlexStream *stream,
+                                          struct FlexSecondaryChunkV3 **out);
+
+// Copy immutable metadata. Returns 1, or a negative typed error.
+// # Safety
+// Chunk must be a live owner; out must be writable and aligned.
+int32_t flexaudio_secondary_metadata_v3(const struct FlexSecondaryChunkV3 *chunk,
+                                        struct FlexSecondaryMetadataV3 *out);
+
+// Borrow native float PCM until chunk_free_v3. Wrong encoding returns NULL and
+// sets a typed InvalidArg. A valid len initializes to zero on errors.
+// # Safety
+// Chunk must be live; len must be writable and aligned.
+const float *flexaudio_secondary_f32_v3(const struct FlexSecondaryChunkV3 *chunk, size_t *len);
+
+// Borrow native int16_t PCM until chunk_free_v3. Wrong encoding returns NULL and
+// sets a typed InvalidArg. A valid len initializes to zero on errors.
+// # Safety
+// Chunk must be live; len must be writable and aligned.
+const int16_t *flexaudio_secondary_s16_v3(const struct FlexSecondaryChunkV3 *chunk, size_t *len);
+
+// Borrow canonical attached VAD events carried by the secondary tap, until chunk_free_v3.
+// NULL/0 means no events. Events retain their dedicated capture timeline.
+// # Safety
+// Chunk must be live; len must be writable and aligned.
+const struct FlexAttachedVadEvent *flexaudio_secondary_vad_events_v3(const struct FlexSecondaryChunkV3 *chunk,
+                                                                     size_t *len);
+
+// Release one owned chunk and all its borrowed views. NULL is safe.
+// # Safety
+// Chunk must be a live library owner or NULL. Release each owner exactly once.
+void flexaudio_secondary_chunk_free_v3(struct FlexSecondaryChunkV3 *chunk);
 
 // Poll one owned event. Valid out initializes to NULL before the queue is touched.
 // # Safety
@@ -1126,6 +1425,23 @@ int32_t flexaudio_error_diagnostic_count_v2(const struct FlexErrorInfoV2 *value,
 int32_t flexaudio_error_diagnostic_detail_v2(const struct FlexErrorInfoV2 *value,
                                              uint32_t index,
                                              const char **out);
+
+// Open an unstarted stream with optional VAD, PID exclusions and secondary output.
+// Denoise runs once on canonical capture, before both output formats and VAD.
+// Valid out initializes to NULL, including on errors. All options are copied.
+// # Safety
+// Config has at least its size/version words, and complete readable storage when
+// they match. Borrowed fields must be readable for the call; out must be writable.
+int32_t flexaudio_open_v3(const struct FlexStreamConfigV3 *config, struct FlexStream **out);
+
+// Switch source and optionally replace keepalive. Zero retains the current option.
+// Output formats, attached VAD, gain and denoise retain their open-time settings.
+// Failure retains the old options. No model is created by this operation.
+// # Safety
+// Stream must be live and exclusively borrowed. Config's header and, on a match,
+// complete envelope and borrowed fields must be readable during this call.
+int32_t flexaudio_switch_source_v3(struct FlexStream *stream,
+                                   const struct FlexSwitchConfigV3 *config);
 
 // Five pinned defaults. Supplied structs use literal fields, including zero.
 struct FlexVadOptions flexaudio_vad_default_options(void);

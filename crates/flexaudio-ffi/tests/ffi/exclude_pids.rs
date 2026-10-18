@@ -90,9 +90,9 @@ fn mock_handle() -> Handle {
     )
     .expect("mock stream opens");
     Handle(Box::into_raw(Box::new(FlexStream {
+        secondary: None,
         shutdown: None,
         shutdown_event_index: 0,
-        last_output: None,
         vad_tap: None,
         vad_events: Vec::new(),
         vad_origin: (0, 0),
@@ -100,7 +100,6 @@ fn mock_handle() -> Handle {
         vad_cleanup: Vec::new(),
         ready_chunks: std::collections::VecDeque::new(),
         inner,
-        denoiser: None,
     })))
 }
 

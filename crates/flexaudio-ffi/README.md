@@ -146,12 +146,115 @@ Windows requires every listed PID to equal one process tree root (the current pr
 Linux matches exact PIDs without descendants. macOS honors the selected device alongside
 exclusion; Linux and Windows ignore device selection while exclusion is active.
 
+## Capabilities and Version 3 Capture
+
+`flexaudio_capabilities_v1(&snapshot)` returns an owned, read-only
+`FlexCapabilitiesV1`. It queries backend prerequisites without opening capture,
+enumerating microphones, requesting recording permission or playing audio.
+Run the bounded query on a worker thread in GUI applications. Supported means an
+implemented backend with satisfied prerequisites; device availability and permission
+are checked separately when opening capture.
+
+On Linux, a missing PipeWire socket means unavailable. Failed socket inspection,
+connection or server sync means unknown, with the structured query error retained.
+
+The `flexaudio_capabilities_*_v1` accessors copy records for each source kind,
+system exclusions, process scopes, watcher, side effect and running OS version.
+Watcher scopes and side effect sources have indexed accessors. Records expose every
+Rust snapshot field, including OS version prerequisites, optional PID limits and
+device selection semantics. Optional version components use explicit `has_*` words.
+Record accessors return 1 when present, 0 when absent, or a negative typed error.
+An absent result leaves the output untouched. Numeric tags use the header's
+`FLEX_CAP_*`, `FLEX_BACKEND_*`, `FLEX_PID_*`, `FLEX_WATCH_*`,
+`FLEX_WATCHER_*`, `FLEX_SIDE_EFFECT_*`, `FLEX_CONDITION_*` and
+`FLEX_DEVICE_SELECTION_*` defines. Accept only known codes; `FLEX_CAP_OTHER`
+and any future code never imply support.
+
+An availability with `FLEX_CAP_UNKNOWN` carries a borrowed `FlexErrorInfoV2`
+in `unknown`, readable using the existing structured error accessors. This error
+is independent of thread-local last_error and lives until
+`flexaudio_capabilities_free_v1(snapshot)`. Never free a borrowed error separately.
+
+Use `FlexStreamConfigV3` to combine attached VAD, exclusion PIDs and secondary
+output. All versioned envelopes require their exact `sizeof` and version 3;
+NULL nested options disable the corresponding feature. PID rules match the
+existing exclusion entry points, including the 4096-entry bound.
+
+```c
+FlexConfig base = {0};
+base.kind = FLEX_SOURCE_KIND_SYSTEM;
+uint32_t excluded[] = {12345};
+FlexSecondaryOutputV3 secondary = {
+    .size = sizeof secondary, .version = FLEX_STREAM_VERSION_3,
+    .rate = 16000, .channels = 1, .encoding = FLEX_SECONDARY_S16
+};
+FlexStreamVadOptions vad = {
+    .params = flexaudio_vad_default_options(),
+    .provisional = 1, .tap = FLEX_VAD_SECONDARY
+};
+FlexStreamConfigV3 options = {
+    .size = sizeof options, .version = FLEX_STREAM_VERSION_3,
+    .config = &base, .vad = &vad,
+    .exclude_pids = excluded, .exclude_pids_len = 1,
+    .secondary_output = &secondary,
+    .windows_classic_loopback_keepalive = FLEX_KEEPALIVE_OFF
+};
+FlexStream *stream = NULL;
+int result = flexaudio_open_v3(&options, &stream);
+/* On success, start with flexaudio_start and release with flexaudio_free. */
+(void)result;
+```
+
+Keepalive accepts 0 (default enabled at open; retain current value on switch),
+1 (enabled), or 2 (disabled). Other values are InvalidArg. The option applies to
+Windows classic system loopback without exclusions, including the system lane of
+mix. Other platforms and process/exclusion paths ignore it. Use
+`FlexSwitchConfigV3` with `flexaudio_switch_source_v3` to change it together with
+the source. The switch retains output formats, encoding, attached VAD, gain and
+denoise from open; failed switches retain the previous options. With keepalive
+disabled, idle classic loopback delivers no packets; the 2 s watchdog reports
+`StreamStalled` (C stream event kind 1) and reopens repeatedly until audio plays.
+
+Poll primary PCM with the existing APIs (`flexaudio_poll_chunk_v2` for attached
+VAD). Independently poll secondary PCM with
+`flexaudio_poll_secondary_chunk_v3(stream, &chunk)`: 1 means one owned chunk,
+0 means none, and a negative result is an error. Read its metadata using
+`flexaudio_secondary_metadata_v3`, then borrow native `float` or `int16_t`
+samples with `flexaudio_secondary_f32_v3` or `flexaudio_secondary_s16_v3`.
+Using the wrong accessor returns NULL/0 and a typed InvalidArg. The format and
+encoding remain fixed throughout the stream. Rates/channels in secondary options
+are literal; no zero defaults apply.
+
+Secondary meters describe processed float PCM before integer quantization; s16
+uses the shared saturating quantizer. Each tap has independent sequence numbers,
+frame indices and drops. PTS labels can help compare arrival times; they are not
+an exact media clock. Attached VAD always uses the dedicated canonical capture
+timeline. Selecting `FLEX_VAD_SECONDARY` carries its events only on secondary
+chunks via `flexaudio_secondary_vad_events_v3`, and requires secondary output.
+
+Version 3 denoise runs once on canonical 48 kHz stereo capture before both taps
+are converted, including when the delivered output rates differ from 48 kHz.
+`flexaudio_stop` drains both taps and the denoiser tail. `flexaudio_flush_vad`
+drains pending primary/secondary chunks before closing the current VAD epoch.
+Continue polling both taps after stop/flush to collect their final chunks and
+zero-frame event carriers. Secondary chunks own all their arrays and remain
+valid after stream release. Free each exactly once with
+`flexaudio_secondary_chunk_free_v3`; never free its borrowed arrays separately.
+All v1/v2 layouts, signatures and symbols remain unchanged.
+
 ## Noise Suppression and Attached VAD
 
-Set `FlexConfig.denoise=1` to enable RNNoise on 48000 Hz output. With attached
-VAD, noise suppression runs on the shared capture branch before segmentation
-and output conversion. Otherwise it processes delivered chunks during polling.
-It introduces a 480-sample delay per channel; stop and poll to retain its tail.
+Set `FlexConfig.denoise=1` to enable RNNoise. v1/v2 require 48000 Hz primary output;
+v3 permits other primary output rates. Noise suppression runs once in the library
+on canonical 48 kHz stereo capture before downmix and gain, feeding both
+output taps and attached VAD.
+It introduces a 480-sample delay per channel. Stop queues its tail through the
+facade and zero-pads the final output to a full 20 ms chunk (`flags` bit 8 when
+padding is added); continue polling to retain it. Denoise runs before output
+polling and queue drops, continues processing while paused, and keeps its history
+on resume. Source switches/reopens start fresh history and normally discard the
+previous generation's buffered remainder. These rules also apply to legacy opens;
+C v3 additionally permits denoise with primary output rates other than 48000 Hz.
 See the generic VAD section below for canonical capture attachment.
 
 `FlexConfig.silence_probe` accepts 0 (default enabled), 1 (enabled), or 2
@@ -302,7 +405,8 @@ There are no audio-copying or timestamp-map APIs.
 `FlexStreamConfigV2`, `FlexChunkV2`, `flexaudio_open_v2`,
 `flexaudio_poll_chunk_v2`, and `flexaudio_chunk_free_v2` provide versioned
 configuration and chunks. Initialize the versioned config's size to `sizeof` and
-version to `FLEX_STREAM_VERSION_2`; its config pointer references `FlexConfig`. A NULL `vad` selects ordinary capture. Secondary taps are rejected with a dedicated VAD status code. Primary attachment
+version to `FLEX_STREAM_VERSION_2`; its config pointer references `FlexConfig`. A NULL `vad` selects ordinary capture. v1/v2 reject secondary taps with a dedicated VAD status code;
+v3 accepts them when secondary output is configured. Primary attachment
 uses producer-assigned canonical capture indices and valid tail lengths; attached
 events use a separate versioned union, including EPOCH_START=6 and its u64
 capture/i64 PTS origin. `flexaudio_flush_vad` is a no-op when disabled.

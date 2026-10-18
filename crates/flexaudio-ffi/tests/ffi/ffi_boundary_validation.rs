@@ -2,7 +2,6 @@
 use crate::error::{clear_last_error, code};
 use crate::types::{FlexChunk, FlexConfig, FlexProcessMode, FlexSourceKind, FlexStream};
 use flexaudio as fa;
-use flexaudio_denoise::Denoiser;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,12 +23,13 @@ fn stream(denoise: bool) -> (FlexStream, Arc<Mutex<Option<fa::core::backend::Raw
     let mut config = fa::StreamConfig::default();
     config.output.channels = 1;
     let mut inner = fa::Stream::open(config, Box::new(PushBackend(sink.clone()))).unwrap();
+    inner.set_denoise(denoise);
     inner.start().unwrap();
     (
         FlexStream {
+            secondary: None,
             shutdown: None,
             shutdown_event_index: 0,
-            last_output: None,
             vad_tap: None,
             vad_events: Vec::new(),
             vad_origin: (0, 0),
@@ -37,7 +37,6 @@ fn stream(denoise: bool) -> (FlexStream, Arc<Mutex<Option<fa::core::backend::Raw
             vad_cleanup: Vec::new(),
             ready_chunks: std::collections::VecDeque::new(),
             inner,
-            denoiser: denoise.then(|| Denoiser::new(1).unwrap()),
         },
         sink,
     )
@@ -81,8 +80,8 @@ fn stop_denoise_tail() {
     }
     assert_eq!(
         delivered,
-        960 + 480,
-        "stop must return the denoiser's delayed 480-sample tail"
+        960 + 960,
+        "stop must retain the canonical denoise tail padded to a 20 ms chunk"
     );
 }
 #[test]
@@ -96,28 +95,42 @@ fn stop_no_addons_control() {
     assert!(stream.poll_processed().unwrap().is_none());
 }
 #[test]
-fn resume_resets_denoise() {
-    let (mut stream, sink) = stream(true);
+fn resume_denoise_matches_facade_history() {
+    let (mut binding, binding_sink) = stream(true);
+    let (mut reference, reference_sink) = stream(true);
     let prior: Vec<f32> = (0..960).map(|i| (i as f32 * 0.1).sin() * 0.5).collect();
-    push(&sink, &prior);
-    free(chunk(&mut stream));
-    stream.inner.pause();
-    stream.inner.resume().unwrap();
-    push(&sink, &[0.0; 960]);
-    let next = chunk(&mut stream);
-    assert_ne!(next.flags & fa::ChunkFlags::DISCONTINUITY.bits(), 0);
-    let peak = samples(&next)[..480]
-        .iter()
-        .copied()
-        .map(f32::abs)
-        .fold(0.0, f32::max);
-    free(next);
-    stream.inner.stop();
-    assert_eq!(
-        peak, 0.0,
-        "discontinuous silence retained audio from before resume"
-    );
+    for sink in [&binding_sink, &reference_sink] {
+        push(sink, &prior);
+    }
+    free(chunk(&mut binding));
+    let facade_chunk = |inner: &mut fa::Stream| {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(chunk) = inner.poll_chunk() {
+                return chunk;
+            }
+            assert!(Instant::now() < deadline, "facade chunk timeout");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    facade_chunk(&mut reference.inner);
+    for inner in [&binding.inner, &reference.inner] {
+        inner.pause();
+        inner.resume().unwrap();
+    }
+    for sink in [&binding_sink, &reference_sink] {
+        push(sink, &[0.0; 960]);
+    }
+    let actual = chunk(&mut binding);
+    let expected = facade_chunk(&mut reference.inner);
+    assert_ne!(actual.flags & fa::ChunkFlags::DISCONTINUITY.bits(), 0);
+    assert!(expected.flags.contains(fa::ChunkFlags::DISCONTINUITY));
+    assert_eq!(samples(&actual), expected.data);
+    free(actual);
+    binding.inner.stop();
+    reference.inner.stop();
 }
+
 #[test]
 fn resume_fresh_denoise_control() {
     let (mut stream, sink) = stream(true);
