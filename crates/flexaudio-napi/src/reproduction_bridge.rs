@@ -88,9 +88,149 @@ fn register_test_exports() {
     );
     napi::bindgen_prelude::register_module_export(
         None,
+        "__bindingContractCapabilities\0",
+        export_capabilities,
+    );
+    napi::bindgen_prelude::register_module_export(
+        None,
+        "__bindingContractOpenOptions\0",
+        export_open_options,
+    );
+    napi::bindgen_prelude::register_module_export(
+        None,
         "__bindingContractAsyncError\0",
         export_async_error,
     );
+}
+
+unsafe fn export_open_options(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
+    let env = Env::from_raw(raw_env);
+    let function = env.create_function_from_closure("__bindingContractOpenOptions", |ctx| {
+        let options = ctx.get::<OpenOptions>(0)?;
+        let current = if ctx.length <= 1 {
+            None
+        } else {
+            ctx.get::<Option<bool>>(1)?
+        };
+        let resolved = match current {
+            None => capture_open_options(&options),
+            Some(current) => switch_open_options(
+                &flexaudio::OpenOptions::default().windows_classic_loopback_keepalive(current),
+                options.windows_classic_loopback_keepalive,
+            ),
+        };
+        Ok(resolved.windows_classic_loopback_keepalive)
+    })?;
+    Ok(function.raw())
+}
+
+unsafe fn export_capabilities(raw_env: sys::napi_env) -> napi::Result<sys::napi_value> {
+    let env = Env::from_raw(raw_env);
+    let function = env.create_function_from_closure("__bindingContractCapabilities", |_| {
+        use flexaudio::core::{
+            Availability, BackendKind, Capabilities, DeviceSelectionBehavior,
+            DeviceWatcherCapabilities, OsVersion, PidScope, ProcessCapabilities,
+            SideEffectCapabilities, SideEffectCapability, SideEffectCondition, SourceCapabilities,
+            SourceCapability, SystemExclusionCapabilities, UnavailableReason, WatchScope,
+            WatcherMode,
+        };
+        let backends = [
+            BackendKind::Cpal,
+            BackendKind::PipeWire,
+            BackendKind::WasapiLoopback,
+            BackendKind::WasapiProcessLoopback,
+            BackendKind::CoreAudioProcessTap,
+            BackendKind::Composite,
+            BackendKind::Unsupported,
+        ];
+        let scopes = [
+            PidScope::ExactPid,
+            PidScope::ProcessTree,
+            PidScope::NotApplicable,
+        ];
+        let devices = [
+            DeviceSelectionBehavior::Honored,
+            DeviceSelectionBehavior::Ignored,
+            DeviceSelectionBehavior::NotApplicable,
+        ];
+        let availability = [
+            Availability::Supported,
+            Availability::Unavailable {
+                reason: UnavailableReason::UnsupportedOs,
+            },
+            Availability::Unavailable {
+                reason: UnavailableReason::OsVersionTooOld {
+                    required: OsVersion::new(14, 4, None, None),
+                    actual: OsVersion::new(14, 3, Some(1), Some(42)),
+                },
+            },
+            Availability::Unavailable {
+                reason: UnavailableReason::PipeWireUnavailable,
+            },
+            Availability::Unavailable {
+                reason: UnavailableReason::NotApplicable,
+            },
+            Availability::Unknown {
+                error: boundary::fixture_error("wrapped"),
+            },
+        ];
+        Ok(backends
+            .into_iter()
+            .enumerate()
+            .map(|(index, backend)| {
+                let source =
+                    || SourceCapability::new(backend.clone(), availability[index % 6].clone());
+                capabilities::snapshot(Capabilities::new(
+                    (index != 0).then(|| OsVersion::new(14, 4, None, Some(42))),
+                    SourceCapabilities::new(source(), source(), source(), source()),
+                    SystemExclusionCapabilities::new(
+                        availability[index % 6].clone(),
+                        backend.clone(),
+                        scopes[index % 3].clone(),
+                        (index != 0).then_some(1),
+                        devices[index % 3].clone(),
+                    ),
+                    ProcessCapabilities::new(
+                        scopes[index % 3].clone(),
+                        scopes[(index + 1) % 3].clone(),
+                    ),
+                    DeviceWatcherCapabilities::new(
+                        availability[index % 6].clone(),
+                        if index == 0 {
+                            WatcherMode::Noop
+                        } else {
+                            WatcherMode::Native
+                        },
+                        if index == 0 {
+                            vec![]
+                        } else {
+                            vec![WatchScope::SystemOutputs, WatchScope::DefaultSystemOutput]
+                        },
+                    ),
+                    SideEffectCapabilities::new(
+                        SideEffectCapability::new(
+                            availability[index % 6].clone(),
+                            false,
+                            vec![
+                                SourceKind::Mic,
+                                SourceKind::SystemLoopback,
+                                SourceKind::ProcessLoopback,
+                                SourceKind::Mix,
+                            ],
+                            SideEffectCondition::SilentActiveSystemAudio,
+                        ),
+                        SideEffectCapability::new(
+                            availability[index % 6].clone(),
+                            true,
+                            vec![SourceKind::SystemLoopback, SourceKind::Mix],
+                            SideEffectCondition::ClassicLoopbackWithoutExclusions,
+                        ),
+                    ),
+                ))
+            })
+            .collect::<Vec<_>>())
+    })?;
+    Ok(function.raw())
 }
 
 struct ErrorTask(flexaudio::Error);

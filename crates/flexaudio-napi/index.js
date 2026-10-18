@@ -316,12 +316,13 @@ if (!nativeBinding) {
   throw error
 }
 
-const { FlexStream, DeviceWatcherHandle, devices, processes, openStream, watchDevices, Vad, FlacEncoder, Denoiser } = nativeBinding
+const { FlexStream, DeviceWatcherHandle, devices, processes, capabilities, openStream, watchDevices, Vad, FlacEncoder, Denoiser } = nativeBinding
 
 module.exports.FlexStream = FlexStream
 module.exports.DeviceWatcherHandle = DeviceWatcherHandle
 module.exports.devices = devices
 module.exports.processes = processes
+module.exports.capabilities = capabilities
 module.exports.openStream = openStream
 module.exports.watchDevices = watchDevices
 module.exports.Vad = Vad

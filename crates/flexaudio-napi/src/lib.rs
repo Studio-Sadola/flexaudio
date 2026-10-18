@@ -17,7 +17,9 @@
 
 mod boundary;
 mod bridge_drain;
+mod capabilities;
 use bridge_drain::start_bridge_stream;
+pub use capabilities::capabilities;
 mod flac_encoder;
 mod shutdown;
 use boundary::{device_event_to_js, event_to_js, to_napi_err, JsAudioError, JsAudioLoss};
@@ -886,6 +888,10 @@ pub struct OpenOptions {
     pub denoise: Option<bool>,
     /// Enable the macOS silence diagnostic probe. Default true.
     pub silence_probe: Option<bool>,
+    /// Keep Windows classic system loopback active by rendering silence. Omitted on
+    /// open defaults to true; omitted on switchSource retains the current value.
+    /// Ignored on other platforms and process/exclusion capture paths.
+    pub windows_classic_loopback_keepalive: Option<bool>,
     /// Secondary output tap. When specified, returns paired chunks in another format simultaneously
     /// (`primary.secondary` in `onChunk`). Omission means no secondary tap, preserving previous behavior.
     pub secondary_output: Option<SecondaryOutputOptions>,
@@ -894,6 +900,25 @@ pub struct OpenOptions {
 // ---------------------------------------------------------------------------
 // Conversion helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve open defaults once at the binding boundary.
+fn capture_open_options(options: &OpenOptions) -> flexaudio::OpenOptions {
+    switch_open_options(
+        &flexaudio::OpenOptions::default(),
+        options.windows_classic_loopback_keepalive,
+    )
+}
+
+/// An omitted switch option retains the current facade-owned value.
+fn switch_open_options(
+    current: &flexaudio::OpenOptions,
+    keepalive: Option<bool>,
+) -> flexaudio::OpenOptions {
+    match keepalive {
+        Some(enabled) => current.clone().windows_classic_loopback_keepalive(enabled),
+        None => current.clone(),
+    }
+}
 
 fn source_kind_str(k: SourceKind) -> String {
     match k {
@@ -1080,6 +1105,7 @@ fn build_config(options: &OpenOptions) -> napi::Result<StreamConfig> {
 /// result through `result_tx` (JS expects a synchronous return).
 struct SwitchCmd {
     config: StreamConfig,
+    windows_classic_loopback_keepalive: Option<bool>,
     mock_source: bool,
     result_tx: mpsc::Sender<flexaudio::core::Result<()>>,
 }
@@ -1421,7 +1447,11 @@ impl FlexStream {
                                         48_000, 2, 0.0,
                                     )))
                                 } else {
-                                    stream.switch_source(sw.config)
+                                    let options = switch_open_options(
+                                        stream.open_options(),
+                                        sw.windows_classic_loopback_keepalive,
+                                    );
+                                    stream.switch_source_with_options(sw.config, options)
                                 };
                                 // Ignore a dropped receiver (switch_source caller).
                                 let _ = sw.result_tx.send(r);
@@ -1712,7 +1742,8 @@ impl FlexStream {
     /// `outputChannels`) cannot change during a switch (it would change frames in a continuous stream).
     /// Requesting a change makes `switch_source` return InvalidArg, thrown here as an exception. Chunk
     /// `seq` stays continuous across switches; the first chunk afterward has the DISCONTINUITY flag.
-    /// Only the stream configuration is applied. `options.denoise` and `options.vad` are ignored;
+    /// An explicit `options.windowsClassicLoopbackKeepalive` replaces the current value;
+    /// omission retains it. `options.denoise` and `options.vad` are ignored;
     /// the existing denoise and VAD settings remain in effect.
     /// `options.gain` is ignored (gain is stream state; use `setGain` to change it).
     ///
@@ -1760,6 +1791,7 @@ impl FlexStream {
         cmd_tx
             .send(BridgeCmd::Switch(SwitchCmd {
                 config,
+                windows_classic_loopback_keepalive: options.windows_classic_loopback_keepalive,
                 mock_source,
                 result_tx,
             }))
@@ -2137,7 +2169,8 @@ pub fn open_stream(
         }),
         None => None,
     };
-    let mut stream = flexaudio::open(config).map_err(|error| boundary::throw_error(&env, error))?;
+    let mut stream = flexaudio::open_with_options(config, capture_open_options(&options))
+        .map_err(|error| boundary::throw_error(&env, error))?;
     if denoise_enabled {
         stream.set_denoise(true);
     }
@@ -2591,8 +2624,32 @@ mod tests {
             system_gain: None,
             vad: None,
             silence_probe: None,
+            windows_classic_loopback_keepalive: None,
             denoise: None,
             secondary_output: None,
+        }
+    }
+
+    #[test]
+    fn capture_keepalive_open_and_switch_defaults() {
+        let mut options = options_with_kind("system");
+        assert!(capture_open_options(&options).windows_classic_loopback_keepalive);
+        for current in [true, false] {
+            options.windows_classic_loopback_keepalive = Some(current);
+            assert_eq!(
+                capture_open_options(&options).windows_classic_loopback_keepalive,
+                current
+            );
+            let retained =
+                flexaudio::OpenOptions::default().windows_classic_loopback_keepalive(current);
+            assert_eq!(switch_open_options(&retained, None), retained);
+            for replacement in [true, false] {
+                assert_eq!(
+                    switch_open_options(&retained, Some(replacement))
+                        .windows_classic_loopback_keepalive,
+                    replacement
+                );
+            }
         }
     }
 
@@ -2712,6 +2769,7 @@ mod tests {
             denoise: None,
             vad: None,
             silence_probe: None,
+            windows_classic_loopback_keepalive: None,
             secondary_output: None,
         };
         let cfg = build_config(&opts).unwrap();

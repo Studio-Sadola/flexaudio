@@ -397,3 +397,92 @@ for (const scenario of ['startup-flush', 'startup-stop-prologue']) {
     assert.deepEqual(stream.shutdownReport().cleanupErrors, []);
   });
 }
+
+test('capability snapshots preserve every field, tag and structured query error', () => {
+  const snapshots = native.__bindingContractCapabilities();
+  const backends = ['cpal', 'pipeWire', 'wasapiLoopback', 'wasapiProcessLoopback',
+    'coreAudioProcessTap', 'composite', 'unsupported'];
+  assert.equal(snapshots.length, backends.length);
+  for (const [index, snapshot] of snapshots.entries()) {
+    assert.deepEqual(Object.keys(snapshot).sort(), ['osVersion', 'sources', 'systemExclusions',
+      'process', 'deviceWatcher', 'sideEffects'].sort());
+    assert.deepEqual(snapshot.osVersion, index === 0 ? null : { major: 14, minor: 4, patch: null, build: 42 });
+    assert.deepEqual(Object.keys(snapshot.sources).sort(), ['mic', 'system', 'process', 'mix'].sort());
+    for (const source of Object.values(snapshot.sources)) {
+      assert.deepEqual(Object.keys(source).sort(), ['availability', 'backend']);
+      assert.equal(source.backend, backends[index]);
+    }
+    const availability = snapshot.sources.mic.availability;
+    assert.deepEqual(snapshot.systemExclusions, { availability, backend: backends[index],
+      scope: ['exactPid', 'processTree', 'notApplicable'][index % 3],
+      maxDistinctPids: index === 0 ? null : 1,
+      deviceSelection: ['honored', 'ignored', 'notApplicable'][index % 3] });
+    assert.deepEqual(snapshot.process, {
+      includeScope: ['exactPid', 'processTree', 'notApplicable'][index % 3],
+      excludeScope: ['exactPid', 'processTree', 'notApplicable'][(index + 1) % 3],
+    });
+    assert.deepEqual(snapshot.deviceWatcher, { availability, mode: index === 0 ? 'noop' : 'native',
+      scopes: index === 0 ? [] : ['systemOutputs', 'defaultSystemOutput'] });
+    assert.deepEqual(snapshot.sideEffects, {
+      silenceProbe: { availability, enabledByDefault: false, sources: ['mic', 'system', 'process', 'mix'],
+        condition: 'silentActiveSystemAudio' },
+      classicLoopbackKeepalive: { availability, enabledByDefault: true, sources: ['system', 'mix'],
+        condition: 'classicLoopbackWithoutExclusions' },
+    });
+  }
+  const availability = snapshots.map(snapshot => snapshot.sources.mic.availability);
+  assert.deepEqual(availability[0], { status: 'supported' });
+  assert.deepEqual(availability[1], { status: 'unavailable', reason: { kind: 'unsupportedOs' } });
+  assert.deepEqual(availability[2], { status: 'unavailable', reason: { kind: 'osVersionTooOld',
+    required: { major: 14, minor: 4, patch: null, build: null },
+    actual: { major: 14, minor: 3, patch: 1, build: 42 } } });
+  assert.deepEqual(availability[3], { status: 'unavailable', reason: { kind: 'pipeWireUnavailable' } });
+  assert.deepEqual(availability[4], { status: 'unavailable', reason: { kind: 'notApplicable' } });
+  assert.equal(availability[5].status, 'unknown');
+  assert.throws(() => native.__bindingContractError('wrapped'), error => {
+    assert.deepEqual(availability[5].error, error.audioError);
+    return true;
+  });
+});
+
+test('capabilities returns a Promise with a platform snapshot', async () => {
+  const pending = native.capabilities();
+  assert.ok(pending instanceof Promise);
+  const snapshot = await pending;
+  assert.equal(typeof snapshot.sources.mic.backend, 'string');
+  assert.ok(['supported', 'unavailable', 'unknown'].includes(snapshot.sources.system.availability.status));
+  assert.equal(typeof snapshot.sideEffects.classicLoopbackKeepalive.enabledByDefault, 'boolean');
+});
+
+test('keepalive defaults on open and preserves or replaces the current value on switch', () => {
+  const resolve = native.__bindingContractOpenOptions;
+  assert.equal(resolve({ kind: 'system' }), true);
+  for (const enabled of [true, false]) {
+    assert.equal(resolve({ kind: 'system', windowsClassicLoopbackKeepalive: enabled }), enabled);
+    assert.equal(resolve({ kind: 'system' }, enabled), enabled);
+    for (const replacement of [true, false]) {
+      assert.equal(resolve({ kind: 'system', windowsClassicLoopbackKeepalive: replacement }, enabled), replacement);
+    }
+  }
+  for (const invalid of [0, 1, 'true', {}, []]) {
+    assert.throws(() => resolve({ kind: 'system', windowsClassicLoopbackKeepalive: invalid }));
+    assert.throws(() => resolve({ kind: 'system', windowsClassicLoopbackKeepalive: invalid }, false));
+  }
+});
+
+test('stream entry points validate keepalive booleans and mock switches accept the option', async () => {
+  const stream = native.__openMockStream(48000, 2, 0, () => {});
+  try {
+    stream.switchSource({ kind: 'mock' });
+    for (const enabled of [false, true]) {
+      stream.switchSource({ kind: 'mock', windowsClassicLoopbackKeepalive: enabled });
+    }
+    for (const invalid of [0, 1, 'false', {}, []]) {
+      assert.throws(() => stream.switchSource({ kind: 'mock', windowsClassicLoopbackKeepalive: invalid }));
+      // N-API rejects the type before openStream can acquire an audio device.
+      assert.throws(() => native.openStream({ kind: 'mic', windowsClassicLoopbackKeepalive: invalid }, () => {}));
+    }
+  } finally {
+    await stream.stop();
+  }
+});

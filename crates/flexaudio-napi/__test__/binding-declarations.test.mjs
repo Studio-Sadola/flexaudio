@@ -73,5 +73,48 @@ test('release declarations and loader exclude test controls', () => {
     assert.ok(!source.includes('__openMockStream'));
     assert.ok(!source.includes('__vadTestFaults'));
     assert.ok(!source.includes('TestFaultsUnavailable'));
+    assert.ok(!source.includes('__bindingContractCapabilities'));
+    assert.ok(!source.includes('__bindingContractOpenOptions'));
   }
+});
+
+test('capabilities declare the complete snapshot and closed availability payloads', () => {
+  assert.match(declarations, /export declare function capabilities\(\): Promise<Capabilities>/);
+  for (const [field, type] of Object.entries({ osVersion: 'OsVersion | null',
+    sources: 'SourceCapabilities', systemExclusions: 'SystemExclusionCapabilities',
+    process: 'ProcessCapabilities', deviceWatcher: 'DeviceWatcherCapabilities',
+    sideEffects: 'SideEffectCapabilities' })) {
+    assert.ok(body('Capabilities').includes(`${field}: ${type}`));
+  }
+  assert.deepEqual([...alias('CapabilityAvailability').matchAll(/status: '([^']+)'/g)].map(match => match[1]),
+    ['supported', 'unavailable', 'unknown']);
+  assert.ok(!alias('CapabilityAvailability').includes('status: string'));
+  assert.deepEqual([...alias('CapabilityUnavailableReason').matchAll(/kind: '([^']+)'/g)].map(match => match[1]),
+    ['unsupportedOs', 'osVersionTooOld', 'pipeWireUnavailable', 'notApplicable', 'other']);
+  assert.match(alias('CapabilityAvailability'), /status: 'unavailable'; reason: CapabilityUnavailableReason/);
+  assert.match(alias('CapabilityAvailability'), /status: 'unknown'; error: AudioError/);
+  assert.match(alias('CapabilityUnavailableReason'), /kind: 'other'; code: string/);
+  assert.match(alias('CapabilityUnavailableReason'), /kind: 'osVersionTooOld'; required: OsVersion; actual: OsVersion/);
+  for (const [name, tags] of Object.entries({
+    BackendKind: ['cpal', 'pipeWire', 'wasapiLoopback', 'wasapiProcessLoopback', 'coreAudioProcessTap', 'composite', 'unsupported', 'other'],
+    PidScope: ['exactPid', 'processTree', 'notApplicable', 'other'],
+    DeviceSelectionBehavior: ['honored', 'ignored', 'notApplicable', 'other'],
+    WatcherMode: ['native', 'noop', 'other'], WatchScope: ['systemOutputs', 'defaultSystemOutput', 'other'],
+    SideEffectCondition: ['silentActiveSystemAudio', 'classicLoopbackWithoutExclusions', 'other'],
+  })) {
+    assert.deepEqual([...alias(name).matchAll(/'([^']+)'/g)].map(match => match[1]), tags);
+  }
+  assert.match(body('OsVersion'), /patch: number \| null/);
+  assert.match(body('OsVersion'), /build: number \| null/);
+  assert.match(body('SystemExclusionCapabilities'), /maxDistinctPids: number \| null/);
+  assert.match(body('SourceCapabilities'), /mic: SourceCapability\s+system: SourceCapability\s+process: SourceCapability\s+mix: SourceCapability/);
+  assert.match(body('SideEffectCapability'), /sources: Array<'mic' \| 'system' \| 'process' \| 'mix' \| 'other'>/);
+  const loader = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  assert.match(loader, /module\.exports\.capabilities = capabilities/);
+});
+
+test('keepalive is an optional boolean with distinct open and switch defaults', () => {
+  assert.match(body('OpenOptions'), /windowsClassicLoopbackKeepalive\?: boolean/);
+  assert.match(declarations, /Omitted on openStream defaults to true; omitted on switchSource keeps the current value/);
+  assert.match(declarations, /options\.windowsClassicLoopbackKeepalive.*replaces the current value/);
 });
