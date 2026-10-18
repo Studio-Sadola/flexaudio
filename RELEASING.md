@@ -33,6 +33,34 @@ Equal versions and patch bumps reject removed or changed declarations; pure addi
 These declaration checks do not prove runtime behavior or binary ABI compatibility.
 Breaking changes require a minor bump for 0.x releases and prior maintainer approval.
 
+TypeScript and C declarations are compared as whole signatures. Python functions may
+extend an older signature on a patch release when every existing caller stays valid:
+
+- Decorators, the return annotation, and existing `*args` / `**kwargs` stay the same.
+- Existing positional parameters keep their names, order, annotations, defaults, and
+  whether each one is positional-only or positional-or-keyword.
+- Existing keyword-only parameters keep their names, annotations, defaults, and
+  relative order.
+- New positional parameters are allowed only after the existing ones, and each new
+  one must have a default.
+- New keyword-only parameters must have defaults. They may be added before, between,
+  or after the existing keyword-only parameters.
+- Adding `*args` or `**kwargs` where the old signature had none is allowed.
+
+Any other edit is rejected. That includes removing, renaming, or reordering a
+parameter; changing an annotation or a default; adding a required parameter;
+removing `*args` or `**kwargs`; changing the return annotation; and changing a
+decorator.
+
+A reviewed exception is listed in `.github/api-compatibility-exceptions.json`.
+Each entry has exactly four fields: `file`, `name` (the qualified name the gate
+prints, such as `StreamVadOptions.tap`), `baseline` (a tag such as `v0.6.2`), and
+`reason`. An entry suppresses one reported difference only when the gate's baseline
+tag is exactly that `baseline`, so the entry stops applying once a newer release
+tag is the baseline. The gate rejects unknown fields, missing or empty fields, a
+baseline that is not `vMAJOR.MINOR.PATCH`, duplicate entries, and an entry for the
+current baseline that does not match a reported difference.
+
 All three release workflows validate versions before any artifact upload or
 registry publish. Tags must match `^v[0-9]+\.[0-9]+\.[0-9]+$` exactly; for
 example, `v0.3.1` is accepted, while `v0.3.1-rc.1` is rejected. The tag's

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import runpy
 import subprocess
@@ -230,6 +231,158 @@ class ApiCompatibilityTests(unittest.TestCase):
             with self.subTest(tag=tag):
                 result = self.run_gate("--baseline-tag", tag)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_python_compatible_extensions(self) -> None:
+        cases = (
+            ("def stop(self) -> None: ...", "def stop(self, timeout: int = 0) -> None: ...", "positional"),
+            ("def devices(kind: Optional[str] = None) -> list[str]: ...",
+             "def devices(kind: Optional[str] = None, *, flag: bool = False) -> list[str]: ...", "keyword"),
+            ("def stop(self) -> None: ...", "def stop(self, *args: object) -> None: ...", "varargs"),
+            ("def stop(self) -> None: ...", "def stop(self, **kwargs: object) -> None: ...", "kwargs"),
+        )
+        for old, new, name in cases:
+            with self.subTest(name=name):
+                self.write(FILES[1], DECLARATIONS[1].replace(old, new))
+                self.assert_pass()
+
+    def test_python_keyword_only_parameter_may_be_inserted(self) -> None:
+        original = DECLARATIONS[1].replace(
+            "    def stop(self) -> None: ...",
+            "    def stop(self, *, timeout: int = 0) -> None: ...")
+        self.write(FILES[1], original)
+        self.commit_baseline()
+        self.write(FILES[1], original.replace(
+            "*, timeout: int = 0", "*, force: bool = False, timeout: int = 0"))
+        self.assert_pass()
+
+    def test_python_incompatible_signature_changes(self) -> None:
+        cases = (
+            ("def devices(kind: Optional[str] = None) -> list[str]: ...",
+             "def devices() -> list[str]: ...", "removed parameter"),
+            ("kind: Optional[str] = None", "source: Optional[str] = None", "renamed parameter"),
+            ("kind: Optional[str] = None", "kind: Optional[int] = None", "changed annotation"),
+            ("rate: int = 48000", "rate: int = 16000", "changed default"),
+            ("def stop(self) -> None: ...", "def stop(self, timeout: int) -> None: ...", "required positional"),
+            ("def stop(self) -> None: ...", "def stop(self, *, timeout: int) -> None: ...", "required keyword"),
+            ("def stop(self) -> None: ...", "def stop(self) -> bool: ...", "changed return"),
+            ("@property", "@classmethod", "changed decorator"),
+            ("def stop(self) -> None: ...", "def stop(self, /) -> None: ...", "positional kind"),
+        )
+        for old, new, name in cases:
+            with self.subTest(name=name):
+                self.write(FILES[1], DECLARATIONS[1].replace(old, new, 1))
+                self.assert_failure("removed or changed ")
+
+    def test_python_reordered_parameter_fails(self) -> None:
+        original = DECLARATIONS[1].replace(
+            "def devices(kind: Optional[str] = None) -> list[str]: ...",
+            "def devices(kind: Optional[str] = None, limit: int = 1) -> list[str]: ...")
+        self.write(FILES[1], original)
+        self.commit_baseline()
+        self.write(FILES[1], original.replace(
+            "kind: Optional[str] = None, limit: int = 1",
+            "limit: int = 1, kind: Optional[str] = None"))
+        self.assert_failure("removed or changed devices")
+
+    def test_python_removed_varargs_fails(self) -> None:
+        original = DECLARATIONS[1].replace(
+            "    def stop(self) -> None: ...",
+            "    def stop(self, *args: object) -> None: ...")
+        self.write(FILES[1], original)
+        self.commit_baseline()
+        self.write(FILES[1], DECLARATIONS[1])
+        self.assert_failure("removed or changed Stream.stop")
+
+    def test_python_removed_kwargs_fails(self) -> None:
+        original = DECLARATIONS[1].replace(
+            "    def stop(self) -> None: ...",
+            "    def stop(self, **kwargs: object) -> None: ...")
+        self.write(FILES[1], original)
+        self.commit_baseline()
+        self.write(FILES[1], DECLARATIONS[1])
+        self.assert_failure("removed or changed Stream.stop")
+
+    def write_exceptions(self, entries: object) -> None:
+        self.write(".github/api-compatibility-exceptions.json", json.dumps(entries))
+
+    def test_exception_applies_on_matching_baseline(self) -> None:
+        self.write(FILES[1], DECLARATIONS[1].replace("def rate(self) -> int: ...", "def rate(self) -> str: ..."))
+        self.write_exceptions([{
+            "file": FILES[1],
+            "name": "Stream.rate",
+            "baseline": "v0.6.2",
+            "reason": "Reviewed return change.",
+        }])
+        self.assert_pass()
+
+    def test_exception_ignored_on_another_baseline(self) -> None:
+        self.write(FILES[1], DECLARATIONS[1].replace("def rate(self) -> int: ...", "def rate(self) -> str: ..."))
+        self.write_exceptions([{
+            "file": FILES[1],
+            "name": "Stream.rate",
+            "baseline": "v0.6.1",
+            "reason": "Reviewed return change.",
+        }])
+        result = self.run_gate()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("removed or changed Stream.rate", result.stderr)
+        self.assertNotIn("Stale API compatibility exception", result.stderr)
+
+    def test_stale_exception_fails(self) -> None:
+        self.write_exceptions([{
+            "file": FILES[1],
+            "name": "Stream.rate",
+            "baseline": "v0.6.2",
+            "reason": "No remaining difference.",
+        }])
+        self.assert_failure("Stale API compatibility exception: " + FILES[1] + " Stream.rate")
+
+    def test_malformed_exception_fails(self) -> None:
+        valid = {
+            "file": FILES[1],
+            "name": "Stream.rate",
+            "baseline": "v0.6.2",
+            "reason": "Reviewed.",
+        }
+        cases: list[tuple[str, object]] = [
+            ("missing field", {key: value for key, value in valid.items() if key != "reason"}),
+            ("empty field", {**valid, "reason": ""}),
+            ("blank field", {**valid, "name": "   "}),
+            ("non-string field", {**valid, "reason": 1}),
+            ("bad baseline", {**valid, "baseline": "0.6.2"}),
+            ("short baseline", {**valid, "baseline": "v0.6"}),
+            ("prerelease baseline", {**valid, "baseline": "v0.6.2-rc.1"}),
+            ("padded baseline", {**valid, "baseline": "v00.6.2"}),
+            ("not a list", valid),
+            ("entry is a string", ["Stream.rate"]),
+        ]
+        for name, entries in cases:
+            with self.subTest(name=name):
+                self.write_exceptions(entries)
+                self.assert_failure("Malformed API compatibility exception")
+        with self.subTest(name="invalid json"):
+            self.write(".github/api-compatibility-exceptions.json", "{")
+            self.assert_failure("Malformed API compatibility exceptions")
+
+    def test_unknown_exception_key_fails(self) -> None:
+        self.write_exceptions([{
+            "file": FILES[1],
+            "name": "Stream.rate",
+            "baseline": "v0.6.2",
+            "reason": "Reviewed.",
+            "note": "extra",
+        }])
+        self.assert_failure("Unknown API compatibility exception field")
+
+    def test_duplicate_exception_fails(self) -> None:
+        entry = {
+            "file": FILES[1],
+            "name": "Stream.rate",
+            "baseline": "v0.6.2",
+            "reason": "Reviewed.",
+        }
+        self.write_exceptions([entry, {**entry, "reason": "Again."}])
+        self.assert_failure("Duplicate API compatibility exception")
 
     def test_actual_checked_in_declarations_parse(self) -> None:
         root = SCRIPT.resolve().parents[2]
