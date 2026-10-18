@@ -97,6 +97,10 @@ jobs:
           -p flexaudio-os-linux -p flexaudio-vad -p flexaudio-napi
           -p flexaudio-encode -p flexaudio-denoise
           -p flexaudio-ffi
+      - name: Test live adapter contracts (device-free)
+        run: |
+          python3 tests/adapter_contracts/run.py linux
+          python3 tests/adapter_contracts/run.py mic
       - name: Test VAD fault isolation (device-free)
         run: cargo test -p flexaudio-vad --features test-faults
       # Do not enable extension-module: Rust test executables need to link libpython.
