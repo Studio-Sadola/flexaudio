@@ -8,8 +8,8 @@
 //!   (like napi `open_stream`, open also starts the stream).
 //! - Polling APIs (`poll_chunk` / `poll_event`) are fast and non-blocking, so they do not release the GIL.
 //!   Since pyclass methods run with the GIL held, concurrent access to the internal `flexaudio::Stream`
-//!   does not occur (there is no bridge thread as in napi). Integrated VAD / denoise processing
-//!   also runs when poll_chunk is called, while the GIL is held.
+//!   does not occur (there is no bridge thread as in napi). Integrated VAD processing runs
+//!   when poll_chunk is called under the GIL; denoise runs in the facade intake thread.
 //! - Chunk `data` contains interleaved `f32` as raw little-endian bytes (`bytes`).
 //!   numpy users can read it with `np.frombuffer(chunk.data, dtype=np.float32)`.
 //!
@@ -35,12 +35,14 @@ use pyo3::prelude::*;
 use ::flexaudio as fa;
 use fa::{ProcessMode, SourceKind};
 
+mod capabilities;
 mod config;
 mod denoise;
 mod encode;
 mod errors;
 mod marshal;
 mod pcm_buffer;
+mod secondary;
 mod stream;
 mod vad;
 mod vad_marshal;
@@ -71,12 +73,14 @@ pub(crate) fn encode_err_to_py(err: flexaudio_encode::EncodeError) -> PyErr {
 // ---------------------------------------------------------------------------
 
 /// Convert [`SourceKind`] to a Python string ("mic"|"system"|"process"|"mix").
+#[allow(unreachable_patterns)]
 pub(crate) fn source_kind_str(k: SourceKind) -> &'static str {
     match k {
         SourceKind::Mic => "mic",
         SourceKind::SystemLoopback => "system",
         SourceKind::ProcessLoopback => "process",
         SourceKind::Mix => "mix",
+        _ => "other",
     }
 }
 
@@ -149,6 +153,7 @@ fn processes(py: Python<'_>) -> PyResult<Vec<marshal::PyProcessInfo>> {
 fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     errors::register(m)?;
     // Functions.
+    m.add_function(wrap_pyfunction!(capabilities::capabilities, m)?)?;
     m.add_function(wrap_pyfunction!(devices, m)?)?;
     m.add_function(wrap_pyfunction!(processes, m)?)?;
     m.add_function(wrap_pyfunction!(stream::open, m)?)?;
@@ -156,6 +161,8 @@ fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Stream and its returned data types.
     m.add_class::<stream::Stream>()?;
+    m.add_class::<secondary::SecondaryOutputOptions>()?;
+    m.add_class::<secondary::PySecondaryChunk>()?;
     m.add_class::<marshal::PyAudioChunk>()?;
     m.add_class::<marshal::PyStreamEvent>()?;
     m.add_class::<marshal::PyDeviceInfo>()?;

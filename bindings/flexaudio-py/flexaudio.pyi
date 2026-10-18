@@ -85,6 +85,77 @@ class AmbiguousDeviceNameErrorDict(_AudioErrorFields):
     kind: Literal["ambiguousDeviceName"]
 AudioErrorDict = Union[InvalidArgumentErrorDict, InvalidStateErrorDict, DeviceNotFoundErrorDict, RecordingPermissionErrorDict, UnsupportedOsVersionErrorDict, DeviceLostErrorDict, BackendErrorDict, UnsupportedFormatErrorDict, NativeFormatChangedErrorDict, UnsupportedErrorDict, AmbiguousDeviceNameErrorDict]
 
+CapabilityBackend = Literal["cpal", "pipeWire", "wasapiLoopback", "wasapiProcessLoopback", "coreAudioProcessTap", "composite", "unsupported", "other"]
+PidScope = Literal["exactPid", "processTree", "notApplicable", "other"]
+class OsVersionDict(TypedDict):
+    major: int
+    minor: int
+    patch: Optional[int]
+    build: Optional[int]
+class SimpleUnavailableReason(TypedDict):
+    kind: Literal["unsupportedOs", "pipeWireUnavailable", "notApplicable"]
+class OsVersionTooOldReason(TypedDict):
+    kind: Literal["osVersionTooOld"]
+    required: OsVersionDict
+    actual: OsVersionDict
+class OtherUnavailableReason(TypedDict):
+    kind: Literal["other"]
+    code: str
+UnavailableReason = Union[SimpleUnavailableReason, OsVersionTooOldReason, OtherUnavailableReason]
+class SupportedAvailability(TypedDict):
+    status: Literal["supported"]
+class UnavailableAvailability(TypedDict):
+    status: Literal["unavailable"]
+    reason: UnavailableReason
+class UnknownAvailability(TypedDict):
+    status: Literal["unknown"]
+    error: AudioErrorDict
+Availability = Union[SupportedAvailability, UnavailableAvailability, UnknownAvailability]
+class SourceCapabilityDict(TypedDict):
+    backend: CapabilityBackend
+    availability: Availability
+class SourceCapabilitiesDict(TypedDict):
+    mic: SourceCapabilityDict
+    system: SourceCapabilityDict
+    process: SourceCapabilityDict
+    mix: SourceCapabilityDict
+class SystemExclusionCapabilitiesDict(TypedDict):
+    availability: Availability
+    backend: CapabilityBackend
+    scope: PidScope
+    max_distinct_pids: Optional[int]
+    device_selection: Literal["honored", "ignored", "notApplicable", "other"]
+class ProcessCapabilitiesDict(TypedDict):
+    include_scope: PidScope
+    exclude_scope: PidScope
+class DeviceWatcherCapabilitiesDict(TypedDict):
+    availability: Availability
+    mode: Literal["native", "noop", "other"]
+    scopes: List[Literal["systemOutputs", "defaultSystemOutput", "other"]]
+class SideEffectCapabilityDict(TypedDict):
+    availability: Availability
+    enabled_by_default: bool
+    sources: List[Literal["mic", "system", "process", "mix", "other"]]
+    condition: Literal["silentActiveSystemAudio", "classicLoopbackWithoutExclusions", "other"]
+class SideEffectCapabilitiesDict(TypedDict):
+    silence_probe: SideEffectCapabilityDict
+    classic_loopback_keepalive: SideEffectCapabilityDict
+class Capabilities(TypedDict):
+    os_version: Optional[OsVersionDict]
+    sources: SourceCapabilitiesDict
+    system_exclusions: SystemExclusionCapabilitiesDict
+    process: ProcessCapabilitiesDict
+    device_watcher: DeviceWatcherCapabilitiesDict
+    side_effects: SideEffectCapabilitiesDict
+
+def capabilities() -> Capabilities:
+    """Probe backend support without capture or consent; releases the GIL.
+
+    Supported describes prerequisites, not recording permission or device availability.
+    Query failures retain structured error details under availability.error.
+    """
+    ...
+
 class NativeFormat:
     @property
     def sample_rate(self) -> int: ...
@@ -430,6 +501,40 @@ class DeviceEvent:
     def error(self) -> Optional[AudioError]: ...
     def to_dict(self) -> DeviceEventDict: ...
 
+class SecondaryOutputOptions:
+    def __init__(self, *, rate: int, channels: int, encoding: Literal["f32", "s16"] = "f32") -> None: ...
+    @property
+    def rate(self) -> int: ...
+    @property
+    def channels(self) -> int: ...
+    @property
+    def encoding(self) -> Literal["f32", "s16"]: ...
+
+class SecondaryChunk:
+    """Independent tap counters; little-endian PCM and float meters before encoding."""
+    @property
+    def data(self) -> bytes: ...
+    @property
+    def encoding(self) -> Literal["f32", "s16"]: ...
+    @property
+    def frame_index(self) -> int: ...
+    @property
+    def frames(self) -> int: ...
+    @property
+    def pts_ns(self) -> int: ...
+    @property
+    def seq(self) -> int: ...
+    @property
+    def flags(self) -> int: ...
+    @property
+    def dropped_before(self) -> int: ...
+    @property
+    def peak(self) -> float: ...
+    @property
+    def rms(self) -> float: ...
+    @property
+    def vad_events(self) -> Optional[List[AttachedVadEvent]]: ...
+
 class Stream:
     def stop(self) -> None:
         """Stop once and retain the outcome; open a new stream to capture again."""
@@ -444,8 +549,9 @@ class Stream:
     def native_format(self) -> Tuple[int, int]: ...
     def dropped_chunks(self) -> int: ...
     def poll_chunk(self) -> Optional[AudioChunk]:
-        """Switch sources while retaining attached VAD epoch closure and capture anchors."""
+        """Poll the next primary audio chunk, or None when none is queued."""
         ...
+    def poll_secondary(self) -> Optional[SecondaryChunk]: ...
     def poll_event(self) -> Optional[StreamEvent]:
         """Poll the ordinary FIFO event queue; PCM polling remains independent.
 
@@ -467,7 +573,8 @@ class Stream:
         output_channels: int = 2, chunk_ms: int = 20, gain: float = 1.0,
         mic_device_id: Optional[str] = None, system_device_id: Optional[str] = None,
         mic_gain: float = 1.0, system_gain: float = 1.0,
-        denoise: bool = False, silence_probe: bool = True
+        denoise: bool = False, silence_probe: bool = True,
+        windows_classic_loopback_keepalive: Optional[bool] = None
     ) -> None:
         """Every successful switch creates a generation with DISCONTINUITY; epoch
         transition waits for new PCM. Return means backend replaced, not delivered.
@@ -637,7 +744,7 @@ class StreamVadOptions:
     @property
     def provisional(self) -> bool: ...
     @property
-    def tap(self) -> Literal["primary"]: ...
+    def tap(self) -> Literal["primary", "secondary"]: ...
 
 def speech_segments(samples: Union[Sequence[float], memoryview],
                             params: Optional[VadOptions] = None) -> List[SpeechSegment]: ...
@@ -694,7 +801,9 @@ def open(
     mic_device_id: Optional[str] = None, system_device_id: Optional[str] = None,
     mic_gain: float = 1.0, system_gain: float = 1.0,
     denoise: bool = False, silence_probe: bool = True,
-    vad: Optional[StreamVadOptions] = None
+    vad: Optional[StreamVadOptions] = None,
+    windows_classic_loopback_keepalive: bool = True,
+    secondary_output: Optional[SecondaryOutputOptions] = None
 ) -> Stream:
     """Open capture synchronously; macOS microphone consent must be decided.
 

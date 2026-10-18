@@ -79,6 +79,10 @@ impl Stream {
         if self.vad_events.is_empty() {
             return;
         }
+        if self.vad_secondary {
+            self.secondary_vad_carrier();
+            return;
+        }
         let mut chunk = chunk_to_py(fa::AudioChunk {
             data: Vec::new(),
             frames: 0,
@@ -104,6 +108,7 @@ impl Stream {
             };
             self.ready_chunks.push_back(chunk);
         }
+        self.drain_secondary();
         Ok(())
     }
 }
@@ -247,7 +252,6 @@ mod tests {
                 .unwrap(),
                 shutdown: None,
                 local_events: Default::default(),
-                output_end: None,
                 vad_tap: Some(
                     flexaudio_vad::VadTap::new(Default::default(), Default::default()).unwrap(),
                 ),
@@ -255,10 +259,11 @@ mod tests {
                 vad_origin: (0, 0),
                 vad_error: None,
                 vad_cleanup: Vec::new(),
+                secondary: None,
+                ready_secondary: Default::default(),
+                vad_secondary: false,
+                secondary_metadata: (0, 0, 0, 0),
                 ready_chunks: Default::default(),
-                denoiser: None,
-                output_rate: 48_000,
-                output_channels: 2,
             };
             for (error, expected) in [
                 (VadTapError::Conversion, "Conversion"),
@@ -347,7 +352,6 @@ mod tests {
             inner,
             shutdown: None,
             local_events: Default::default(),
-            output_end: None,
             vad_tap: Some(
                 flexaudio_vad::VadTap::new(Default::default(), Default::default()).unwrap(),
             ),
@@ -355,10 +359,11 @@ mod tests {
             vad_origin: (0, 0),
             vad_error: None,
             vad_cleanup: Vec::new(),
+            secondary: None,
+            ready_secondary: Default::default(),
+            vad_secondary: false,
+            secondary_metadata: (0, 0, 0, 0),
             ready_chunks: Default::default(),
-            denoiser: None,
-            output_rate: 48_000,
-            output_channels: 2,
         }
     }
 
@@ -675,16 +680,16 @@ mod tests {
                 inner,
                 shutdown: None,
                 local_events: Default::default(),
-                output_end: None,
                 vad_tap: Some(vad_tap),
                 vad_events: Vec::new(),
                 vad_origin: (0, 0),
                 vad_error: None,
                 vad_cleanup: Vec::new(),
+                secondary: None,
+                ready_secondary: Default::default(),
+                vad_secondary: false,
+                secondary_metadata: (0, 0, 0, 0),
                 ready_chunks: Default::default(),
-                denoiser: None,
-                output_rate: 48_000,
-                output_channels: 2,
             };
             for expected in [0, 960] {
                 sink.lock().unwrap().as_mut().unwrap().push(&[0.0; 1920], 0);

@@ -128,10 +128,14 @@ Platform behavior:
 
 ### Noise suppression and attached VAD
 
-`denoise=True` enables RNNoise. Without VAD it processes delivered PCM during
-polling; with VAD it processes the shared capture branch before VAD and output
-conversion. It requires 48000 Hz output and introduces 480 samples/channel of delay.
-Graceful stop queues the denoiser tail; continue polling to receive final output.
+`denoise=True` enables RNNoise on the canonical 48 kHz stereo capture signal
+before downmix and gain, feeding both output taps and attached VAD.
+It requires 48000 Hz output and introduces 480 samples/channel of delay.
+Graceful stop queues the denoiser tail and zero-pads the final output to a full
+20 ms chunk (`flags` bit 8 when padding is added); continue polling to receive it.
+Denoise runs before output polling and queue drops, continues processing while
+paused, and keeps its history on resume. Source switches/reopens start fresh
+history and normally discard the previous generation's buffered remainder.
 
 Attach the same generic VAD engine with
 `vad=flexaudio.StreamVadOptions(provisional=True)`. Each chunk's `vad_events`
@@ -280,7 +284,9 @@ and uses the same streaming process/finish path with preview disabled.
 
 The capture option is `open(...,
 vad=StreamVadOptions(params=..., provisional=True, tap='primary'))`.
-Secondary taps are rejected with `UnsupportedTap`. The producer's shared 48 kHz stereo branch supplies valid PCM
+Use `tap='secondary'` to deliver events on secondary chunks; this requires
+`secondary_output`. The tap selects the event carrier; VAD still reads canonical
+capture before conversion or integer encoding. The producer's shared 48 kHz stereo branch supplies valid PCM
 and authoritative frame indices before output conversion. Attached chunks carry
 `vad_events`; each epoch begins with its saved `capture_sample` and `pts_ns`
 origin. `AudioChunk.frame_index` is a producer-owned 48 kHz timeline position.
@@ -293,3 +299,45 @@ retains the cause in `cleanup_errors` with `vad_code`, and `primary` remains
 capture-only. The next discontinuity (or a successful `flush_vad()`)
 reinitializes the session so its next frame starts a new anchored epoch.
 Disabled attachment has `AudioChunk.vad_events=None` and flush is a no-op.
+
+
+### Capability snapshot and optional output
+
+`capabilities()` returns a dictionary with `os_version`, `sources`,
+`system_exclusions`, `process`, `device_watcher`, and `side_effects`.
+Keys use snake_case and tag values match the other bindings. Availability has
+`status='supported'`, `status='unavailable'` with a `reason`, or
+`status='unknown'` with the same structured error dictionary as
+`error.audio_error.to_dict()`. The bounded probe releases the GIL and never
+opens capture, requests recording consent, or plays audio. Support describes
+platform prerequisites rather than permission or device availability.
+
+On Linux, a missing PipeWire socket means unavailable. Failed socket inspection,
+connection or server sync means unknown, with the structured query error retained.
+
+`open(..., windows_classic_loopback_keepalive=True)` enables the Windows
+classic loopback silent keepalive. Set it to `False` to disable it.
+`switch_source(..., windows_classic_loopback_keepalive=None)` retains the
+current setting; an explicit boolean replaces it only on successful switching.
+The option applies to system capture and the system lane of Mix without PID
+exclusions. Other platforms and process/exclusion capture ignore it. With it
+disabled, idle classic loopback delivers no packets; the 2 s stall watchdog reports
+`stalled` (`Event::StreamStalled` in Rust) and reopens repeatedly until audio plays.
+
+```python
+secondary = flexaudio.SecondaryOutputOptions(rate=16000, channels=1, encoding='s16')
+with flexaudio.open('mic', secondary_output=secondary,
+                    vad=flexaudio.StreamVadOptions(tap='secondary')) as stream:
+    primary = stream.poll_chunk()
+    secondary_chunk = stream.poll_secondary()
+```
+
+`poll_secondary()` returns `None` when disabled or empty. Its format is fixed at
+open and retained across source switches. Encoding defaults to `f32`; `s16`
+uses the shared signed 16-bit quantizer. Both encodings return little-endian
+`bytes`; NumPy dtypes are `<f4` and `<i2`. `peak` and `rms` always describe the
+float samples before integer quantization. Each chunk also exposes `encoding`,
+`frames`, `frame_index`, `pts_ns`, `seq`, `flags`, `dropped_before`, and
+`vad_events`. The two polls do not consume each other's PCM. Counters and drops
+are independent; align taps by time rather than sequence number. Stop and VAD
+flush retain queued output from both taps; drain both polls after stopping.

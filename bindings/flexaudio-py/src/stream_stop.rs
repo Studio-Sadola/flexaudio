@@ -32,11 +32,10 @@ impl Stream {
                 });
                 cleanup.push(cause.with_context(fa::ErrorContext::new(fa::Operation::Flush)));
             }
-            if let Err(error) = self.finish_addon_gap() {
-                cleanup.push(error);
-            }
         } else {
             self.ready_chunks.retain(|chunk| chunk.samples().is_empty());
+            self.ready_secondary
+                .retain(|chunk| chunk.chunk.samples.is_empty());
         }
         if let Some(vad_tap) = self.vad_tap.as_mut() {
             let result = vad_tap.stop();
@@ -55,45 +54,8 @@ impl Stream {
         self.shutdown = Some(report);
         result
     }
-
-    pub(super) fn finish_addon_gap(&mut self) -> fa::Result<()> {
-        let samples = if self.output_end.is_some() {
-            self.denoiser
-                .as_mut()
-                .map(CoreDenoiser::flush)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let tail = self.final_chunk(samples);
-        if tail.has_audio_or_vad() {
-            self.ready_chunks.push_back(tail);
-        }
-        Ok(())
-    }
-
-    fn final_chunk(&self, samples: Vec<f32>) -> PyAudioChunk {
-        let (frame_index, pts_ns, next_seq, dropped_before) =
-            self.output_end.unwrap_or((0, 0, 0, 0));
-        let mut chunk = chunk_to_py(fa::AudioChunk {
-            seq: if samples.is_empty() {
-                next_seq.saturating_sub(1)
-            } else {
-                next_seq
-            },
-            frames: samples.len() / usize::from(self.output_channels),
-            data: samples,
-            frame_index,
-            pts_ns,
-            dropped_before,
-            flags: fa::ChunkFlags::empty(),
-            peak: 0.0,
-            rms: 0.0,
-        });
-        chunk.update_metrics();
-        chunk
-    }
 }
+
 impl Drop for Stream {
     fn drop(&mut self) {
         let _ = self.finish_shutdown();
@@ -127,16 +89,16 @@ mod tests {
             inner,
             shutdown: None,
             local_events: Default::default(),
-            output_end: None,
             vad_tap: None,
             vad_events: Vec::new(),
             vad_origin: (0, 0),
             vad_error: None,
             vad_cleanup: Vec::new(),
+            secondary: None,
+            ready_secondary: Default::default(),
+            vad_secondary: false,
+            secondary_metadata: (0, 0, 0, 0),
             ready_chunks: Default::default(),
-            denoiser: None,
-            output_rate: 48_000,
-            output_channels: 2,
         }
     }
     #[test]
