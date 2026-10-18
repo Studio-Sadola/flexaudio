@@ -15,7 +15,8 @@ pub const FLEX_VAD_UNSUPPORTED_TAP: i32 = -100;
 pub const FLEX_VAD_UNSUPPORTED_CONVERSION_CLOCK: i32 = -101;
 pub const FLEX_VAD_EPOCH_START: u32 = 6;
 
-/// Fixed-width new-mode attachment settings. Only primary is supported by this binding.
+/// Fixed-width stream VAD attachment settings. v1/v2 support only the primary tap;
+/// v3 also supports the secondary tap when secondary output is configured.
 #[repr(C)]
 pub struct FlexStreamVadOptions {
     pub params: FlexVadOptions,
@@ -124,7 +125,7 @@ fn reject(status: i32, message: &str) -> i32 {
     status
 }
 
-fn reject_tap(error: flexaudio_vad::VadTapError) -> i32 {
+pub(crate) fn reject_tap(error: flexaudio_vad::VadTapError) -> i32 {
     reject_audio(tap_status(&error), error.audio_error())
 }
 
@@ -162,16 +163,31 @@ unsafe fn validate<'a>(config: *const FlexStreamConfigV2) -> Result<ValidatedCon
     }
     let base = &*config.config;
     crate::convert::validate_config(base).map_err(|()| code::FLEX_INVALID_ARG)?;
-    let vad = if !config.vad.is_null() {
-        if !config.vad.is_aligned() {
+    let vad = validate_vad(config.vad, false)?.map(|(params, runtime, _)| (params, runtime));
+    Ok(ValidatedConfig { base, vad })
+}
+
+pub(crate) type ValidatedVad = (
+    flexaudio_vad::VadOptions,
+    flexaudio_vad::VadRuntimeOptions,
+    bool,
+);
+
+pub(crate) unsafe fn validate_vad(
+    options: *const FlexStreamVadOptions,
+    secondary_exists: bool,
+) -> Result<Option<ValidatedVad>, i32> {
+    let vad = if !options.is_null() {
+        if !options.is_aligned() {
             return Err(reject(
                 code::FLEX_INVALID_ARG,
                 "InvalidArgument: misaligned VAD options",
             ));
         }
-        let options = &*config.vad;
+        let options = &*options;
         match options.tap {
             FLEX_VAD_PRIMARY => {}
+            FLEX_VAD_SECONDARY if secondary_exists => {}
             FLEX_VAD_SECONDARY => {
                 return Err(reject(
                     FLEX_VAD_UNSUPPORTED_TAP,
@@ -198,11 +214,12 @@ unsafe fn validate<'a>(config: *const FlexStreamConfigV2) -> Result<ValidatedCon
             flexaudio_vad::VadRuntimeOptions {
                 provisional: options.provisional != 0,
             },
+            options.tap == FLEX_VAD_SECONDARY,
         ))
     } else {
         None
     };
-    Ok(ValidatedConfig { base, vad })
+    Ok(vad)
 }
 
 /// Open a versioned primary stream, returning a typed result code and last_error.
@@ -248,8 +265,6 @@ pub unsafe extern "C" fn flexaudio_open_v2(
                     crate::error::set_audio_error(error);
                     return code::FLEX_FAILURE;
                 }
-                (*stream).inner.set_denoise(config.denoise != 0);
-                (*stream).denoiser = None;
             }
             (*stream).vad_tap = vad_tap;
             out.write(stream);
@@ -452,10 +467,16 @@ impl FlexStream {
         }
     }
     pub(crate) fn versioned_chunk(&mut self, chunk: FlexChunk) -> FlexChunkV2 {
-        let events: Box<[_]> = mem::take(&mut self.vad_events)
-            .into_iter()
-            .map(attached_to_c)
-            .collect();
+        let events = if self
+            .secondary
+            .as_ref()
+            .is_some_and(|state| state.vad_secondary)
+        {
+            Vec::new()
+        } else {
+            mem::take(&mut self.vad_events)
+        };
+        let events: Box<[_]> = events.into_iter().map(attached_to_c).collect();
         let len = events.len();
         let data = if len == 0 {
             ptr::null_mut()
@@ -476,7 +497,12 @@ impl FlexStream {
         let chunk = self.poll_processed()?;
         match chunk {
             Some(chunk) => Ok(Some(self.versioned_chunk(chunk))),
-            None if !self.vad_events.is_empty() => {
+            None if !self.vad_events.is_empty()
+                && !self
+                    .secondary
+                    .as_ref()
+                    .is_some_and(|state| state.vad_secondary) =>
+            {
                 let chunk = crate::convert::chunk_to_c(empty_carrier(self.vad_origin));
                 Ok(Some(self.versioned_chunk(chunk)))
             }
@@ -488,11 +514,20 @@ impl FlexStream {
         while let Some(chunk) = self.next_vad_tap_chunk()? {
             self.ready_chunks.push_back(chunk);
         }
+        self.queue_secondary_input();
         Ok(())
     }
 
     fn queue_vad_carrier(&mut self) {
         if self.vad_events.is_empty() {
+            return;
+        }
+        if self
+            .secondary
+            .as_ref()
+            .is_some_and(|state| state.vad_secondary)
+        {
+            self.queue_secondary_carrier();
             return;
         }
         let chunk = crate::convert::chunk_to_c(empty_carrier(self.vad_origin));
@@ -568,9 +603,9 @@ mod tests {
         let mut inner = flexaudio::Stream::open(Default::default(), Box::new(Denied)).unwrap();
         assert!(inner.start().is_err());
         let mut stream = FlexStream {
+            secondary: None,
             shutdown: None,
             shutdown_event_index: 0,
-            last_output: None,
             inner,
             vad_tap: None,
             vad_events: Vec::new(),
@@ -578,7 +613,6 @@ mod tests {
             vad_error: None,
             vad_cleanup: Vec::new(),
             ready_chunks: Default::default(),
-            denoiser: None,
         };
         let mut chunk = empty_carrier((0, 0));
         chunk.frames = 960;
@@ -646,9 +680,9 @@ mod tests {
             .unwrap();
             inner.start().unwrap();
             let mut stream = FlexStream {
+                secondary: None,
                 shutdown: None,
                 shutdown_event_index: 0,
-                last_output: None,
                 inner,
                 vad_tap: Some(vad_tap),
                 vad_events: Vec::new(),
@@ -656,7 +690,6 @@ mod tests {
                 vad_error: None,
                 vad_cleanup: Vec::new(),
                 ready_chunks: Default::default(),
-                denoiser: None,
             };
             for expected in [0, 960] {
                 sink.lock().unwrap().as_mut().unwrap().push(&[0.0; 1920], 0);

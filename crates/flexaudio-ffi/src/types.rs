@@ -5,8 +5,6 @@
 
 use std::os::raw::c_char;
 
-use flexaudio_denoise::Denoiser;
-
 /// Audio source kind to record (corresponds to [`flexaudio::SourceKind`]).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,9 +67,10 @@ pub struct FlexConfig {
     pub mix_mic_gain: f32,
     /// Pre-mix linear gain for the system side of mix (mix only). 0 selects 1.0 (default).
     pub mix_system_gain: f32,
-    /// Whether to apply noise suppression (RNNoise) to the stream. Enabled when `true`. The output rate must be
-    /// 48000 or `flexaudio_open` fails (NULL + last_error). denoise
-    /// processes data in place just before `poll_chunk` returns (before VAD).
+    /// Whether to apply noise suppression (RNNoise) to the stream. Enabled when `true`.
+    /// Runs once in the library on canonical 48 kHz stereo capture before downmix and gain,
+    /// feeding output conversion and attached VAD before polling. v1/v2 require a 48000 Hz
+    /// primary output rate; v3 permits other primary output rates.
     /// Boolean integer: only 0 and 1 are valid.
     pub denoise: u8,
     /// Silence diagnosis probe: 0 = default (enabled), 1 = enabled, 2 = disabled.
@@ -220,22 +219,20 @@ pub struct FlexProcessInfo {
 /// addons (denoise / VAD); C code holds only a pointer. Create with `flexaudio_open` and
 /// release with `flexaudio_free`.
 ///
-/// Keep addons here as part of the stream state. VAD consumes canonical capture before
+/// The facade owns denoise. VAD consumes canonical capture before
 /// output conversion. `flexaudio_switch_source` replaces only the source;
 /// addons retain their configuration from open (same as gain).
 pub struct FlexStream {
+    pub(crate) secondary: Option<crate::secondary::SecondaryState>,
     pub(crate) inner: flexaudio::Stream,
     pub(crate) shutdown: Option<flexaudio::ShutdownReport>,
     pub(crate) shutdown_event_index: usize,
-    pub(crate) last_output: Option<(u64, i64, u64)>,
     pub(crate) vad_tap: Option<flexaudio_vad::VadTap>,
     pub(crate) vad_events: Vec<flexaudio_vad::AttachedVadEvent>,
     pub(crate) vad_origin: (u64, i64),
     pub(crate) vad_error: Option<flexaudio_vad::VadTapError>,
     pub(crate) vad_cleanup: Vec<flexaudio::Error>,
     pub(crate) ready_chunks: std::collections::VecDeque<crate::vad_integration::FlexChunkV2>,
-    /// Noise suppressor when enabled (requires 48 kHz; constructed at open). `None` when disabled.
-    pub(crate) denoiser: Option<Denoiser>,
 }
 
 impl Drop for FlexStream {

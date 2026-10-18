@@ -19,6 +19,10 @@
 //!
 //! Regenerate the `include/flexaudio.h` header with cbindgen (using `cbindgen.toml`).
 
+mod boundary;
+mod capabilities;
+mod capability_records;
+mod capability_storage;
 mod chunk_storage;
 mod convert;
 mod denoise;
@@ -27,11 +31,15 @@ mod flac;
 mod integration;
 mod legacy_codes;
 pub use legacy_codes::*;
+mod secondary;
 mod shutdown;
 mod types;
 mod v2;
 mod v2_records;
 mod v2_storage;
+mod v3;
+mod v3_types;
+mod v3_validation;
 mod vad;
 mod vad_integration;
 mod vad_types;
@@ -182,6 +190,15 @@ unsafe fn open_with_exclude_pids(
     exclude_pids: *const u32,
     exclude_pids_len: usize,
 ) -> *mut FlexStream {
+    open_with_exclude_pids_using(config, exclude_pids, exclude_pids_len, flexaudio::open)
+}
+
+unsafe fn open_with_exclude_pids_using(
+    config: *const FlexConfig,
+    exclude_pids: *const u32,
+    exclude_pids_len: usize,
+    open: impl FnOnce(flexaudio::StreamConfig) -> flexaudio::Result<flexaudio::Stream>,
+) -> *mut FlexStream {
     guard_ptr(|| {
         clear_last_error();
         if !config.is_null() && !config.is_aligned() {
@@ -204,26 +221,26 @@ unsafe fn open_with_exclude_pids(
             // build_config has already set last_error.
             Err(()) => return std::ptr::null_mut(),
         };
-        // Build add-ons (denoise / VAD) first. Reject a 48 kHz constraint violation or model
-        // loading failure here (build_addons has set last_error). Return before touching devices.
-        let denoiser = match integration::build_addons(config) {
-            Ok(pair) => pair,
-            Err(()) => return std::ptr::null_mut(),
-        };
-        match flexaudio::open(stream_config) {
-            Ok(inner) => Box::into_raw(Box::new(FlexStream {
-                shutdown: None,
-                shutdown_event_index: 0,
-                last_output: None,
-                vad_tap: None,
-                vad_events: Vec::new(),
-                vad_origin: (0, 0),
-                vad_error: None,
-                vad_cleanup: Vec::new(),
-                ready_chunks: std::collections::VecDeque::new(),
-                inner,
-                denoiser,
-            })),
+        // Preserve the public 48 kHz constraint before acquiring a device.
+        if integration::validate_denoise(config).is_err() {
+            return std::ptr::null_mut();
+        }
+        match open(stream_config) {
+            Ok(inner) => {
+                inner.set_denoise(config.denoise != 0);
+                Box::into_raw(Box::new(FlexStream {
+                    secondary: None,
+                    shutdown: None,
+                    shutdown_event_index: 0,
+                    vad_tap: None,
+                    vad_events: Vec::new(),
+                    vad_origin: (0, 0),
+                    vad_error: None,
+                    vad_cleanup: Vec::new(),
+                    ready_chunks: std::collections::VecDeque::new(),
+                    inner,
+                }))
+            }
             Err(e) => {
                 #[cfg(test)]
                 error::record_open_failure(e.clone());
@@ -283,7 +300,6 @@ pub unsafe extern "C" fn flexaudio_start(s: *mut FlexStream) -> i32 {
                 }
                 stream.shutdown = None;
                 stream.shutdown_event_index = 0;
-                stream.last_output = None;
                 code::FLEX_OK
             }
             Err(flexaudio::Error::InvalidState(_)) if stream.shutdown.is_some() => {
@@ -954,9 +970,9 @@ mod permission_tests {
     #[test]
     fn terminal_poll_failure_keeps_code_reason_and_event_after_stop() {
         let mut stream = FlexStream {
+            secondary: None,
             shutdown: None,
             shutdown_event_index: 0,
-            last_output: None,
             vad_tap: None,
             vad_events: Vec::new(),
             vad_origin: (0, 0),
@@ -964,7 +980,6 @@ mod permission_tests {
             vad_cleanup: Vec::new(),
             ready_chunks: std::collections::VecDeque::new(),
             inner: denied_stream(),
-            denoiser: None,
         };
         let mut chunk = std::mem::MaybeUninit::<FlexChunk>::uninit();
         // SAFETY: stream is live and all output pointers reference writable local destinations.
@@ -994,9 +1009,9 @@ mod permission_tests {
         )
         .expect("open mock");
         let stream = FlexStream {
+            secondary: None,
             shutdown: None,
             shutdown_event_index: 0,
-            last_output: None,
             vad_tap: None,
             vad_events: Vec::new(),
             vad_origin: (0, 0),
@@ -1004,7 +1019,6 @@ mod permission_tests {
             vad_cleanup: Vec::new(),
             ready_chunks: std::collections::VecDeque::new(),
             inner,
-            denoiser: None,
         };
         // SAFETY: a valid local stream handle and explicitly permitted NULL are supplied.
         unsafe {
@@ -1099,3 +1113,7 @@ mod inventory_policy_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/ffi/stream_denoise.rs"]
+mod stream_denoise_tests;

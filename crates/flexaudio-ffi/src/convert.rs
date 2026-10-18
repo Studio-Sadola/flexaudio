@@ -70,8 +70,7 @@ pub(crate) unsafe fn copy_exclude_pids(
 
 /// Resolve output format in `FlexConfig`, including sentinel values (0 → default).
 ///
-/// Small helper so `build_config` (StreamConfig construction) and `build_addons` (denoise
-/// 48k validation and Denoiser channel count) share the same resolved values.
+/// Resolve output defaults for stream construction and denoise rate validation.
 pub(crate) fn resolve_output(config: &FlexConfig) -> OutputFormat {
     OutputFormat {
         sample_rate: if config.output_rate == 0 {

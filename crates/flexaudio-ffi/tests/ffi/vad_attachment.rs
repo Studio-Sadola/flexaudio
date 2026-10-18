@@ -19,16 +19,15 @@ impl flexaudio::CaptureBackend for IdleBackend {
 fn fixture() -> FlexStream {
     FlexStream {
         inner: flexaudio::Stream::open(Default::default(), Box::new(IdleBackend)).unwrap(),
+        secondary: None,
         shutdown: None,
         shutdown_event_index: 0,
-        last_output: None,
         vad_tap: Some(flexaudio_vad::VadTap::new(Default::default(), Default::default()).unwrap()),
         vad_events: Vec::new(),
         vad_origin: (0, 0),
         vad_error: None,
         vad_cleanup: Vec::new(),
         ready_chunks: Default::default(),
-        denoiser: None,
     }
 }
 fn terminal() -> AttachedVadEvent {
@@ -149,16 +148,15 @@ fn capture_stream(sink: &Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>) 
     inner.start().unwrap();
     FlexStream {
         inner,
+        secondary: None,
         shutdown: None,
         shutdown_event_index: 0,
-        last_output: None,
         vad_tap: Some(flexaudio_vad::VadTap::new(Default::default(), Default::default()).unwrap()),
         vad_events: Vec::new(),
         vad_origin: (0, 0),
         vad_error: None,
         vad_cleanup: Vec::new(),
         ready_chunks: Default::default(),
-        denoiser: None,
     }
 }
 

@@ -1,6 +1,6 @@
 //! One checked binding teardown, shared by explicit stop and free.
 use crate::types::FlexStream;
-use flexaudio::{AudioChunk, ChunkFlags, ErrorContext, Operation, ShutdownReport};
+use flexaudio::{ErrorContext, Operation, ShutdownReport};
 
 impl FlexStream {
     pub(crate) fn poll_binding_event(&mut self) -> Option<flexaudio::Event> {
@@ -48,30 +48,6 @@ impl FlexStream {
                         }
                     }
                 }
-                let output = self.inner.config().output;
-                let tail = self
-                    .denoiser
-                    .as_mut()
-                    .filter(|_| self.last_output.is_some())
-                    .map(flexaudio_denoise::Denoiser::flush)
-                    .unwrap_or_default();
-                if !tail.is_empty() {
-                    let (frame_index, pts_ns, seq) = self.last_output.unwrap_or((0, 0, 0));
-                    let (peak, rms) = crate::integration::peak_rms(&tail);
-                    let chunk = AudioChunk {
-                        frames: tail.len() / usize::from(output.channels),
-                        data: tail,
-                        frame_index,
-                        pts_ns,
-                        seq,
-                        flags: ChunkFlags::empty(),
-                        dropped_before: 0,
-                        peak,
-                        rms,
-                    };
-                    let chunk = crate::convert::chunk_to_c(chunk);
-                    chunks.push(chunk);
-                }
                 for chunk in chunks {
                     let chunk = self.versioned_chunk(chunk);
                     self.ready_chunks.push_back(chunk);
@@ -79,11 +55,9 @@ impl FlexStream {
             }
         } else {
             // Capture primary suppresses PCM while closing attached event epochs.
-            if let Some(d) = self.denoiser.as_mut() {
-                d.reset();
-            }
             self.stop_vad_tap();
         }
+        self.queue_secondary_input();
         cleanup.extend(self.vad_cleanup.iter().cloned());
         let report = ShutdownReport::new(core.primary().cloned(), cleanup);
         let result = report.result();
