@@ -6,12 +6,35 @@ use std::sync::{mpsc, atomic::{AtomicBool, Ordering}};
 use std::rc::Rc;
 use flexaudio_core::types::ProcessMode;
 use flexaudio_core::{ErrorContext, Event, Operation, ErrorKind, DefaultDeviceKind, AudioPath, LossReason};
-mod owner { include!(concat!(env!("PWD"), "/crates/flexaudio-os-linux/src/owner.rs")); }
+mod owner { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/owner.rs")); }
 use owner::{finish_worker, poll_backend_event, push_backend_event, rollback_worker, BackendEvents};
-mod watcher_queue { include!(concat!(env!("PWD"), "/crates/flexaudio-os-linux/src/watcher_queue.rs")); }
+mod watcher_queue { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/watcher_queue.rs")); }
 use watcher_queue::{lock_events, transition_default, WatchEventQueue, WatchEvents};
-mod discovery { include!(concat!(env!("PWD"), "/crates/flexaudio-os-linux/src/discovery.rs")); }
+mod discovery { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/discovery.rs")); }
 use discovery::EnumerationFailure;
+
+mod readiness { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/readiness.rs")); }
+use readiness::{Readiness, negotiation_timeout_error, NEGOTIATION_DEADLINE};
+mod capture_failures {
+    use crate::pw as pipewire;
+    include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/capture_failures.rs"));
+}
+use capture_failures::{checked_buffer_region, replace_format, run_capture_callback};
+mod capture_error { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/capture_error.rs")); }
+mod capture_control { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/capture_control.rs")); }
+mod proxy_release { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/proxy_release.rs")); }
+mod link_error { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/link_error.rs")); }
+mod capture_proxy {
+    use crate::pw as pipewire;
+    include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/capture_proxy.rs"));
+}
+type CaptureLink = capture_proxy::CaptureProxy<pw::link::Link>;
+use pw::proxy::ProxyT;
+mod watcher_failures { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/watcher_failures.rs")); }
+use watcher_failures::run_watcher_callback;
+// LIVE_WATCHER_STATE
+use watcher_state::WatchState;
+
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use flexaudio_core::backend::RawSink;
 use flexaudio_core::clock::monotonic_now_ns;
@@ -113,9 +136,34 @@ mod pw {
         pub const LINK_INPUT_NODE: &str = "in_node";
         pub const LINK_INPUT_PORT: &str = "in_port";
     }
-    pub mod link { #[derive(Default)] pub struct Link; }
+    pub mod proxy {
+        pub struct Proxy { pub id: u32 }
+        pub trait ProxyT { fn upcast_ref(&self) -> &Proxy; }
+        impl Proxy {
+            pub fn id(&self) -> u32 { self.id }
+            pub fn add_listener_local(&self) -> ProxyListener { ProxyListener }
+        }
+        pub struct ProxyListener;
+        impl ProxyListener {
+            pub fn removed(self, _: impl Fn() + 'static) -> Self { self }
+            pub fn register(self) -> Self { self }
+        }
+    }
+    pub mod link {
+        pub struct Link(pub super::proxy::Proxy);
+        impl Default for Link {
+            fn default() -> Self {
+                thread_local! { static NEXT: std::cell::Cell<u32> = const { std::cell::Cell::new(2000) }; }
+                Self(super::proxy::Proxy { id: NEXT.with(|next| { let id = next.get(); next.set(id + 1); id }) })
+            }
+        }
+        impl super::proxy::ProxyT for Link {
+            fn upcast_ref(&self) -> &super::proxy::Proxy { &self.0 }
+        }
+    }
     // Mirror of `pipewire::loop_` (only the timeout enum used by the enumeration wait is needed).
     pub mod loop_ {
+        pub type TimerSource<'a> = crate::FakeTimer<'a>;
         #[derive(Debug, Clone)]
         pub enum Timeout { None, Infinite, Finite(std::time::Duration) }
     }
@@ -123,7 +171,15 @@ mod pw {
         pub const PW_ID_CORE: u32 = 0;
         use std::cell::{Cell, RefCell};
         pub struct CoreRc { pub fail: Cell<bool>, pub calls: Cell<usize>, pub failures: Cell<usize> }
+        pub struct WeakCore;
+        impl WeakCore {
+            pub fn upgrade(&self) -> Option<CoreRc> {
+                Some(CoreRc { fail: Cell::new(false), calls: Cell::new(0), failures: Cell::new(0) })
+            }
+        }
         impl CoreRc {
+            pub fn downgrade(&self) -> WeakCore { WeakCore }
+            pub fn sync(&self, _: u32) -> std::result::Result<crate::Sequence, &'static str> { Ok(crate::Sequence(1)) }
             pub fn create_object<T: Default>(&self, _: &str, _: &Vec<String>) -> std::result::Result<T, &'static str> {
                 self.calls.set(self.calls.get() + 1);
                 if self.fail.get() {
@@ -194,32 +250,26 @@ struct ClientEntry;
 struct PortEntry { node_id: u32, direction: String, channel: String }
 enum PidSelect { Include(u32), Exclude(HashSet<u32>) }
 impl PidSelect {
+    // LIVE_PID_PROCESS
     fn selects_node(&self, entry: &NodeEntry, _: &HashMap<u32, ClientEntry>) -> bool {
         match self { Self::Include(pid) => entry.pid == *pid, Self::Exclude(pids) => !pids.contains(&entry.pid) }
     }
 }
-struct UserData { format: spa::param::audio::AudioInfoRaw, sink: RawSink, scratch: Rc<RefCell<Vec<f32>>>, events: BackendEvents, readiness: Option<Rc<Readiness>> }
+// LIVE_USER_DATA
 // LIVE_PAIRING
 // LIVE_LINKING
 // LIVE_CAPTURE
-fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
-    if ENUM_FAILURE.get() { Err("injected registry query failure".into()) } else { scan_result(SCAN_MODE.get()).0.map(|()| Vec::new()) }
+fn enumerate_pw() -> Result<Vec<DeviceInfo>> {
+    if ENUM_FAILURE.get() { Err(Error::Backend("injected registry query failure".into())) } else { scan_result(SCAN_MODE.get()).0.map(|()| Vec::new()) }
 }
 // LIVE_LIST_DEVICES
 // LIVE_ENQUEUE
 // LIVE_JSON_NAME
 
-// Mirror of the production `Readiness` handle: a single-shot report back to the caller.
-struct Readiness { tx: mpsc::Sender<std::result::Result<(), String>>, sent: Cell<bool> }
-impl Readiness {
-    fn report_ready(&self) { if !self.sent.replace(true) { let _ = self.tx.send(Ok(())); } }
-    fn report_failure(&self, msg: String) { if !self.sent.replace(true) { let _ = self.tx.send(Err(msg)); } }
-    fn is_reported(&self) -> bool { self.sent.get() }
-}
 // Mirror of TimerSource: new timers are inactive and failed updates do not arm them.
 struct TimerState { callback: Box<dyn Fn(u64)>, active: Cell<bool> }
-struct FakeTimer(Rc<TimerState>);
-impl FakeTimer {
+struct FakeTimer<'a>(Rc<TimerState>, std::marker::PhantomData<&'a FakeLoop>);
+impl FakeTimer<'_> {
     fn update_timer(&self, value: Option<std::time::Duration>, _interval: Option<std::time::Duration>) -> spa::utils::result::SpaResult {
         if TIMER_FAILURE.get() { return spa::utils::result::SpaResult::from_c(-1); }
         self.0.active.set(value.is_some_and(|v| !v.is_zero()));
@@ -229,7 +279,7 @@ impl FakeTimer {
 #[derive(Clone)]
 struct FakeLoop;
 thread_local! {
-    static READY_RX: RefCell<Option<mpsc::Receiver<std::result::Result<(), String>>>> = const { RefCell::new(None) };
+    static READY_RX: RefCell<Option<mpsc::Receiver<Result<()>>>> = const { RefCell::new(None) };
     static READY_EARLY: Cell<bool> = const { Cell::new(false) };
     static SYNC_FAILURE: Cell<bool> = const { Cell::new(false) };
     static WEAK_FAILURE: Cell<bool> = const { Cell::new(false) };
@@ -245,10 +295,10 @@ impl FakeLoop {
     fn loop_(&self) -> &Self { self }
     fn quit(&self) { LOOP_QUIT.set(true); }
     // Mirror of `Loop::add_timer`: register a callback the loop fires when the timer expires.
-    fn add_timer<F>(&self, callback: F) -> FakeTimer where F: Fn(u64) + 'static {
+    fn add_timer<F>(&self, callback: F) -> FakeTimer<'_> where F: Fn(u64) + 'static {
         let timer = Rc::new(TimerState { callback: Box::new(callback), active: Cell::new(false) });
         LOOP_TIMERS.with(|t| t.borrow_mut().push(Rc::downgrade(&timer)));
-        FakeTimer(timer)
+        FakeTimer(timer, std::marker::PhantomData)
     }
     fn run(&self) {
         LOOP_RAN.set(true);
@@ -287,7 +337,7 @@ fn setup_pw(_: Option<String>, sink: RawSink, readiness: Rc<Readiness>, events: 
     LOOP_TIMERS.with(|t| t.borrow_mut().clear());
     let stream = Rc::new(pw::stream::StreamRc { id: 99, queued: RefCell::new(None) });
     let listener = Rc::new(RefCell::new(add_capture_listener(&stream, UserData {
-        format: spa::param::audio::AudioInfoRaw::new(), sink, scratch: Default::default(), events, readiness: Some(readiness),
+        format: spa::param::audio::AudioInfoRaw::new(), sink, scratch: Default::default(), events, readiness,
     }, &FakeLoop)?));
     LOOP_CAPTURE.with(|c| *c.borrow_mut() = Some((Rc::downgrade(&stream), Rc::downgrade(&listener))));
     Ok((FakeLoop, stream, listener))
@@ -302,7 +352,7 @@ fn pipewire_early_readiness() {
 }
 #[test]
 fn pipewire_early_readiness_control() {
-    // A departed caller causes the production loop to skip run/negotiation.
+    // A departed caller must not make readiness observable before negotiation.
     READY_EARLY.set(false);
     let (tx, rx) = mpsc::channel(); drop(rx);
     let (_, stop) = pw::channel::channel(); let (producer, _) = flexaudio_core::raw_ring(16);
@@ -332,7 +382,7 @@ struct ProcessOwner {
     running: Arc<AtomicBool>, target_pid: u32, mode: ProcessMode,
     stop_tx: Option<pw::channel::Sender<Terminate>>, handle: Option<thread::JoinHandle<()>>,
 }
-fn run_pw_process_loop(_: PidSelect, sink: RawSink, stop: pw::channel::Receiver<Terminate>, ready: &mpsc::Sender<std::result::Result<(), String>>, events: BackendEvents) {
+fn run_pw_process_loop(_: PidSelect, sink: RawSink, stop: pw::channel::Receiver<Terminate>, ready: &mpsc::Sender<Result<()>>, events: BackendEvents) {
     // Exercise the live owner's start/error/join handshake with the monitor loop under test.
     if MONITOR_START.get() { run_pw_loop(None, sink, stop, ready, events); } else { ready.send(Ok(())).unwrap(); }
 }
@@ -399,34 +449,39 @@ fn pipewire_poisoned_queue() {
 fn pipewire_poisoned_queue_control() {
     assert_eq!(watcher(false).poll_event(), Some(DeviceEvent::Removed { id: "mic".into() }));
 }
-struct WatchState { default_sink: Option<String>, default_source: Option<String>, initial_scan_done: bool }
 fn typed_default(callback: impl Fn(u32, Option<&str>, Option<&str>, Option<&str>) -> i32) -> impl Fn(u32, Option<&str>, Option<&str>, Option<&str>) -> i32 { callback }
 fn default_change(key: Option<&str>, value: Option<&str>) -> (Option<String>, Vec<DeviceEvent>) {
-    let state_for_meta = Rc::new(RefCell::new(WatchState { default_sink: Some("old".into()), default_source: Some("old".into()), initial_scan_done: true }));
+    let state_for_meta = Rc::new(RefCell::new(WatchState::default()));
+    state_for_meta.borrow_mut().initial_scan_done = true;
+    state_for_meta.borrow_mut().default_sink = Some("old".into());
+    let loop_for_meta = FakeLoop;
     let events_for_meta = Arc::new(Mutex::new(WatchEvents::default()));
     let inspect_state = state_for_meta.clone(); let inspect_events = events_for_meta.clone();
     let callback = typed_default( // LIVE_DEFAULT_CALLBACK
     );
     callback(0u32, key, None::<&str>, value);
-    let state = if key == Some("default.audio.sink") { inspect_state.borrow().default_sink.clone() } else { inspect_state.borrow().default_source.clone() };
+    let state = inspect_state.borrow().default_sink.clone();
     let mut out = Vec::new();
     while let Some(event) = lock_events(&inspect_events).poll() { out.push(event); }
     (state, out)
 }
 #[test]
 fn pipewire_default_clear() {
-    for (key, kind) in [("default.audio.sink", DefaultDeviceKind::SystemAudio), ("default.audio.source", DefaultDeviceKind::Microphone)] {
-        for value in [None, Some("{}"), Some(r#"{"name":""}"#)] {
-            let (state, events) = default_change(Some(key), value);
-            assert!(state.is_none());
-            assert_eq!(events, vec![DeviceEvent::DefaultCleared { kind }]);
-        }
+    // ab58caf / 0.6.2: watcher defaults cover selectable system outputs only.
+    for value in [None, Some("{}"), Some(r#"{"name":""}"#)] {
+        let (state, events) = default_change(Some("default.audio.sink"), value);
+        assert!(state.is_none());
+        assert_eq!(events, vec![DeviceEvent::DefaultCleared { kind: DefaultDeviceKind::SystemAudio }]);
     }
 }
 #[test]
 fn pipewire_default_clear_control() {
-    for (key, kind) in [("default.audio.sink", DefaultDeviceKind::SystemAudio), ("default.audio.source", DefaultDeviceKind::Microphone)] {
-        assert_eq!(default_change(Some(key), Some(r#"{"name":"new"}"#)), (Some("new".into()), vec![DeviceEvent::DefaultChanged { kind, id: "new".into() }]));
+    assert_eq!(default_change(Some("default.audio.sink"), Some(r#"{"name":"new"}"#)), (Some("new".into()), vec![DeviceEvent::DefaultChanged { kind: DefaultDeviceKind::SystemAudio, id: "new".into() }]));
+}
+#[test]
+fn pipewire_microphone_defaults_are_ignored() {
+    for value in [None, Some("{}"), Some(r#"{"name":""}"#), Some(r#"{"name":"new"}"#)] {
+        assert_eq!(default_change(Some("default.audio.source"), value), (Some("old".into()), vec![]));
     }
 }
 #[derive(Clone, Copy)] struct Sequence(i32);
@@ -440,7 +495,7 @@ fn scan_sync(fail: bool) -> bool {
     SYNC_FAILURE.set(fail);
     let done_for_cb = Rc::new(Cell::new(false)); let inspect = done_for_cb.clone();
     let aborted_for_cb = Rc::new(Cell::new(false));
-    let failure_for_cb = Rc::new(Cell::new(None));
+    let failure_for_cb = Rc::new(RefCell::new(None));
     let stage_for_cb = Rc::new(Cell::new(0)); let pending1_for_cb = Rc::new(Cell::new(1));
     let loop_for_cb = FakeLoop; let core_weak = WeakSync;
     let callback = typed_sync( // LIVE_SYNC_CALLBACK
@@ -456,8 +511,6 @@ fn pipewire_failed_sync_completion() {
 #[test]
 fn pipewire_failed_sync_completion_control() { assert!(scan_sync(false)); }
 const ENUMERATE_DEADLINE_MS: u128 = 2_000;
-// Mirror of the production negotiation deadline used by run_pw_loop's readiness timer.
-const NEGOTIATE_DEADLINE_MS: u128 = 2_000;
 struct BlockingLoop { release: mpsc::Receiver<()>, done: Rc<Cell<bool>> }
 impl BlockingLoop {
     fn loop_(&self) -> &Self { self }
@@ -485,8 +538,8 @@ fn scan_deadline(block: bool) -> bool {
         let done = Rc::new(Cell::new(!block));
         let aborted = Rc::new(Cell::new(false));
         let main_loop = BlockingLoop { release: release_rx, done: done.clone() };
-        let failure = Rc::new(Cell::new(None));
-        let _result: std::result::Result<(), String> = (|| {
+        let failure = Rc::new(RefCell::new(None));
+        let _result: Result<()> = (|| {
             // LIVE_DEADLINE
             Ok(())
         })();
@@ -520,6 +573,9 @@ fn pipewire_mic_identity_control() {
     assert_eq!(mic.id, "alsa_input.card0");
 }
 fn remove_port(f: &LinkFixture, id: u32) {
+    let lifecycle_for_remove = &f.lifecycle;
+    let readiness_for_remove = &f.readiness;
+    let diagnostics_for_remove = &f.diagnostics;
     let linked_for_remove = &f.linked; let nodes_for_remove = &f.nodes;
     let ports_for_remove = &f.ports; let client_pid_for_remove = &f.clients;
     let core_for_remove = &f.core; let stream_for_remove = &f.stream;
@@ -537,6 +593,11 @@ fn pipewire_relink_gap_attempt() {
     let f = LinkFixture::new(1, false); f.link().unwrap();
     remove_port(&f, 1001); assert!(f.linked.borrow().is_empty());
     f.ports.borrow_mut().insert(1001, PortEntry { node_id: 99, direction: "in".into(), channel: "FR".into() });
+    f.lifecycle.observe(1001);
+    // f2c0ade / 0.6.1: replacement routes wait for the old proxies' sync barrier.
+    f.link().unwrap(); assert!(f.linked.borrow().is_empty());
+    let barrier = f.sequence.get();
+    assert!(f.lifecycle.acknowledge(barrier));
     f.link().unwrap(); assert_eq!(f.linked.borrow().get(&1).unwrap().len(), 2);
     // Fake link creation is synchronous: this cannot establish actual lost PCM
     // or the gap duration between native unlink/relink completion.
@@ -548,6 +609,10 @@ fn pipewire_relink_gap_attempt_control() {
 }
 
 struct LinkFixture {
+    lifecycle: Rc<capture_proxy::ProxyLifecycle>,
+    readiness: Rc<Readiness>,
+    diagnostics: flexaudio_core::CaptureDiagnostics,
+    sequence: Rc<Cell<i32>>,
     events: BackendEvents,
     core: pw::core::CoreRc,
     stream: pw::stream::StreamRc,
@@ -555,7 +620,7 @@ struct LinkFixture {
     nodes: RefCell<HashMap<u32, NodeEntry>>,
     clients: RefCell<HashMap<u32, ClientEntry>>,
     ports: RefCell<HashMap<u32, PortEntry>>,
-    linked: RefCell<HashMap<u32, Vec<pw::link::Link>>>,
+    linked: RefCell<HashMap<u32, Vec<CaptureLink>>>,
 }
 impl LinkFixture {
     fn new(count: u32, fail: bool) -> Self {
@@ -570,13 +635,23 @@ impl LinkFixture {
         for (channel, id) in [("FL", 1000), ("FR", 1001)] {
             ports.insert(id, PortEntry { node_id: 99, direction: "in".into(), channel: channel.into() });
         }
-        Self { events: Arc::new(Mutex::new(VecDeque::new())), core: pw::core::CoreRc { fail: Cell::new(fail), calls: Cell::new(0), failures: Cell::new(0) },
+        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let readiness = Rc::new(Readiness::new(mpsc::channel().0, true));
+        let sequence = Rc::new(Cell::new(0));
+        let next = sequence.clone();
+        let callbacks = capture_failures::CaptureCallbacks::new(readiness.clone(), events.clone(), || FakeLoop.quit());
+        let lifecycle = capture_proxy::ProxyLifecycle::with_checkpoint(callbacks, move || {
+            let seq = next.get() + 2; next.set(seq); Ok(seq)
+        });
+        for id in nodes.keys().chain(ports.keys()).copied().chain([99]) { lifecycle.observe(id); }
+        Self { events, lifecycle, readiness, sequence, diagnostics: flexaudio_core::CaptureDiagnostics::new(48_000, 2), core: pw::core::CoreRc { fail: Cell::new(fail), calls: Cell::new(0), failures: Cell::new(0) },
             stream: pw::stream::StreamRc { id: 99, queued: RefCell::new(None) }, own: Cell::new(None),
             nodes: RefCell::new(nodes), clients: RefCell::new(HashMap::new()), ports: RefCell::new(ports), linked: RefCell::new(HashMap::new()) }
     }
     fn link(&self) -> Result<()> {
-        try_link(&self.core, &self.stream, &PidSelect::Include(42), &self.own,
-                 &self.nodes, &self.clients, &self.ports, &self.linked, &self.events, &FakeLoop)
+        try_link(&self.core, &self.lifecycle, &self.stream, &PidSelect::Include(42), &self.own,
+                 &self.nodes, &self.clients, &self.ports, &self.linked, &self.events, &FakeLoop,
+                 &self.readiness, &self.diagnostics)
     }
 }
 #[test]
@@ -650,7 +725,7 @@ fn process_fixture(bytes: Vec<u8>, stride: i32, flags: i32) -> (pw::stream::Stre
     let (producer, consumer) = flexaudio_core::raw_ring(16);
     let mut format = spa::param::audio::AudioInfoRaw::new();
     format.set_format(spa::param::audio::AudioFormat::F32LE); format.set_rate(48_000); format.set_channels(2);
-    let listener = add_capture_listener(&stream, UserData { format, sink: RawSink::new(producer, 48_000, 2), scratch: Default::default(), events: Arc::new(Mutex::new(VecDeque::new())), readiness: None }, &FakeLoop).unwrap();
+    let listener = add_capture_listener(&stream, UserData { format, sink: RawSink::new(producer, 48_000, 2), scratch: Default::default(), events: Arc::new(Mutex::new(VecDeque::new())), readiness: Rc::new(Readiness::new(mpsc::channel().0, false)) }, &FakeLoop).unwrap();
     (stream, listener, consumer)
 }
 #[test]
@@ -730,7 +805,7 @@ fn monitor_start_result(timer_fails: bool, param: Option<spa::pod::Pod>) -> Resu
 #[test]
 fn pipewire_timer_arming_failure() {
     let error = monitor_start_result(true, Some(spa::pod::Pod::negotiated())).unwrap_err();
-    assert!(matches!(error.root(), Error::Backend(message) if message.contains("arm pipewire negotiation deadline failed")));
+    assert!(matches!(error.root(), Error::Backend(message) if message.contains("could not arm the capture startup deadline")));
 }
 #[test]
 fn pipewire_timer_arming_failure_control() {
@@ -813,11 +888,11 @@ fn pipewire_negotiated_invalid_format() {
 fn pipewire_negotiated_invalid_format_control() {
     assert!(monitor_start_result(false, Some(spa::pod::Pod::negotiated())).is_ok());
 }
-fn readiness_after_param(param: Option<&spa::pod::Pod>) -> (bool, std::result::Result<std::result::Result<(), String>, mpsc::TryRecvError>) {
+fn readiness_after_param(param: Option<&spa::pod::Pod>) -> (bool, std::result::Result<Result<()>, mpsc::TryRecvError>) {
     let (tx, rx) = mpsc::channel();
-    let readiness = Rc::new(Readiness { tx, sent: Cell::new(false) });
+    let readiness = Rc::new(Readiness::new(tx, false));
     let (stream, mut listener, _) = process_fixture(Vec::new(), 8, 0);
-    listener.user_data.readiness = Some(readiness.clone());
+    listener.user_data.readiness = readiness.clone();
     listener.negotiate(&stream, param);
     (readiness.is_reported(), rx.try_recv())
 }
@@ -826,7 +901,7 @@ fn pipewire_format_none_not_ready() {
     let (reported, result) = readiness_after_param(None);
     assert!(!reported); assert_eq!(result, Err(mpsc::TryRecvError::Empty));
     let error = monitor_start_result(false, None).unwrap_err();
-    assert!(matches!(error.root(), Error::Backend(message) if message.contains("format negotiation timed out")));
+    assert_eq!(error, negotiation_timeout_error());
 }
 #[test]
 fn pipewire_format_none_not_ready_control() {
@@ -834,15 +909,33 @@ fn pipewire_format_none_not_ready_control() {
     assert!(reported); assert_eq!(result, Ok(Ok(())));
 }
 #[test]
-fn pipewire_failed_parse_preserves_format() {
-    let (stream, mut listener, _) = process_fixture(Vec::new(), 8, 0);
+fn pipewire_failed_parse_invalidates_format() {
+    let (stream, mut listener, mut consumer) = process_fixture([0.25f32.to_le_bytes(), (-0.25f32).to_le_bytes()].concat(), 8, 0);
+    listener.user_data.readiness.report_ready();
     listener.negotiate(&stream, Some(&spa::pod::Pod { channels: 1, rate: 123, parse_fails: true, ..spa::pod::Pod::negotiated() }));
-    assert_eq!(listener.user_data.format.channels(), 2);
-    assert_eq!(listener.user_data.format.rate(), 48_000);
-    assert_eq!(listener.user_data.format.format(), spa::param::audio::AudioFormat::F32LE);
+    // d0a1585 / 0.5.4: rejected renegotiation clears stale decoder state.
+    assert_eq!(listener.user_data.format.channels(), 0);
+    assert_eq!(listener.user_data.format.rate(), 0);
+    assert_eq!(listener.user_data.format.format(), spa::param::audio::AudioFormat::Unknown);
+    let diagnostics = listener.user_data.sink.diagnostics();
+    assert_eq!(diagnostics.drain().unwrap()[0].reason(), LossReason::MalformedBuffer);
+    assert!(diagnostics.take_discontinuity());
+    listener.fire(&stream);
+    assert_eq!(consumer.pop_slice(&mut [0.0; 2]), 0, "rejected negotiation must not decode with a stale format");
+    assert_eq!(diagnostics.drain().unwrap()[0].reason(), LossReason::MalformedBuffer);
+    assert!(poll_backend_event(&listener.user_data.events).is_none());
+    listener.negotiate(&stream, Some(&spa::pod::Pod::negotiated()));
+    stream.queued.replace(Some(pw::stream::Buffer { datas: vec![pw::stream::Data {
+        chunk: pw::stream::Chunk::new(8, 0, 8, 0), bytes: [0.5f32.to_le_bytes(), (-0.5f32).to_le_bytes()].concat(),
+    }] }));
+    listener.fire(&stream);
+    let mut out = [0.0; 2];
+    assert_eq!(consumer.pop_slice(&mut out), 2);
+    assert_eq!(out, [0.5, -0.5]);
+    assert!(diagnostics.drain().unwrap().is_empty());
 }
 #[test]
-fn pipewire_failed_parse_preserves_format_control() {
+fn pipewire_failed_parse_invalidates_format_control() {
     let (stream, mut listener, _) = process_fixture(Vec::new(), 8, 0);
     listener.negotiate(&stream, Some(&spa::pod::Pod { rate: 44_100, ..spa::pod::Pod::negotiated() }));
     assert_eq!(listener.user_data.format.rate(), 44_100);
@@ -853,10 +946,10 @@ impl<F: FnMut(pw::loop_::Timeout) -> i32> DispatchLoop<F> {
     fn iterate(&self, timeout: pw::loop_::Timeout) -> i32 { (self.dispatch.borrow_mut())(timeout) }
 }
 #[derive(Clone, Copy)] enum ScanMode { Complete, SyncFailure, CoreGone, IterateFailure, Timeout }
-fn scan_result(mode: ScanMode) -> (std::result::Result<(), String>, bool, bool, usize, std::time::Duration) {
+fn scan_result(mode: ScanMode) -> (Result<()>, bool, bool, usize, std::time::Duration) {
     SYNC_FAILURE.set(matches!(mode, ScanMode::SyncFailure)); WEAK_FAILURE.set(matches!(mode, ScanMode::CoreGone));
     let done = Rc::new(Cell::new(false)); let aborted = Rc::new(Cell::new(false));
-    let failure = Rc::new(Cell::new(None));
+    let failure = Rc::new(RefCell::new(None));
     let failure_for_cb = failure.clone();
     let done_for_cb = done.clone(); let aborted_for_cb = aborted.clone();
     let stage_for_cb = Rc::new(Cell::new(0)); let pending1_for_cb = Rc::new(Cell::new(1));
@@ -878,7 +971,7 @@ fn scan_result(mode: ScanMode) -> (std::result::Result<(), String>, bool, bool, 
         }
     }) };
     let started = std::time::Instant::now();
-    let result: std::result::Result<(), String> = (|| {
+    let result: Result<()> = (|| {
         // LIVE_DEADLINE
         Ok(())
     })();
@@ -975,7 +1068,6 @@ fn pipewire_negotiated_multichannel_is_unsupported() {
 fn pipewire_default_bulk_clear() {
     assert_eq!(default_change(None, None).1, vec![
         DeviceEvent::DefaultCleared { kind: DefaultDeviceKind::SystemAudio },
-        DeviceEvent::DefaultCleared { kind: DefaultDeviceKind::Microphone },
     ]);
 }
 #[test]

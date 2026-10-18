@@ -83,7 +83,7 @@ mod cpal {
 // Include the live callback mailbox; run.py compiles from the repo root.
 mod callback_mailbox {
     use crate::cpal;
-    include!(concat!(env!("PWD"), "/crates/flexaudio-mic/src/callback_mailbox.rs"));
+    include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-mic/src/callback_mailbox.rs"));
 }
 mod input_config { // LIVE_INPUT_CONFIG
 }
