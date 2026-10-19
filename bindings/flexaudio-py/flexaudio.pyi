@@ -32,6 +32,52 @@ VadErrorCode = Literal["InvalidParameter", "InvalidProbability", "InvalidPcm", "
 
 MixLane = Literal["microphone", "systemAudio"]
 
+SettingKey = Literal[
+    "kind", "deviceId", "targetPid", "mode", "chunkMs", "ringCapacityChunks",
+    "excludeSelf", "excludePids", "output", "secondaryOutput", "secondaryEncoding",
+    "gain", "mixMicDeviceId", "mixSystemDeviceId", "mixMicGain", "mixSystemGain",
+    "silenceProbe", "windowsClassicLoopbackKeepalive", "denoise", "vad"
+]
+IgnoreReason = Literal["wrongSourceKind", "unsupportedPlatform", "exclusionDeviceUnscoped", "processLoopbackPath", "fixedAtOpen"]
+AdjustmentReason = Literal["exclusionSetNormalized", "legacySentinel"]
+SettingValue = Union[None, bool, int, float, str, List[int], Tuple[int, int]]
+class SettingOutcome(TypedDict):
+    status: Literal["notRequested", "applied", "ignored", "adjusted"]
+    reason: Optional[Union[IgnoreReason, AdjustmentReason]]
+class SettingResolution(TypedDict):
+    setting: SettingKey
+    requested: SettingValue
+    effective: SettingValue
+    outcome: SettingOutcome
+class SettingsReport(TypedDict):
+    revision: int
+    entries: List[SettingResolution]
+class IgnoredSettingsError(ValueError):
+    @property
+    def report(self) -> SettingsReport: ...
+
+HelperStopReason = Literal[
+    "signalObserved", "permissionDenied", "inconclusive", "timedOut",
+    "streamStopped", "sourceSwitched", "recovery", "startupFailed",
+    "runtimeFailed", "cancelled", "unknown"
+]
+class LifecycleEvent:
+    @property
+    def type(self) -> Literal["silenceProbeStarted", "silenceProbeStopped", "classicLoopbackKeepaliveStarted", "classicLoopbackKeepaliveStopped", "unknown"]: ...
+    @property
+    def reason(self) -> Optional[HelperStopReason]: ...
+    @property
+    def message(self) -> Optional[str]: ...
+
+DeviceIdNamespace = Literal["cpalDeviceName", "pipeWireNodeName", "wasapiOutputSelector", "coreAudioOutputSelector", "unknown"]
+class NamespacedDevice:
+    @property
+    def device(self) -> "DeviceInfo": ...
+    @property
+    def id_namespace(self) -> DeviceIdNamespace: ...
+
+def devices_with_namespaces() -> List[NamespacedDevice]: ...
+
 class NativeFormatDict(TypedDict):
     sample_rate: int
     channels: int
@@ -424,6 +470,13 @@ class AudioChunk:
     @property
     def pts_ns(self) -> int: ...
     @property
+    def arrival_ns(self) -> int:
+        """Arrival-time label, exactly equal to pts_ns; frame_index is authoritative.
+
+        pts_ns is deprecated in 0.8 and retained throughout 0.9.
+        """
+        ...
+    @property
     def seq(self) -> int: ...
     @property
     def flags(self) -> int: ...
@@ -511,7 +564,11 @@ class SecondaryOutputOptions:
     def encoding(self) -> Literal["f32", "s16"]: ...
 
 class SecondaryChunk:
-    """Independent tap counters; little-endian PCM and float meters before encoding."""
+    """Independent tap counters; little-endian PCM and float meters before encoding.
+
+    pts_ns is deprecated in 0.8; arrival_ns is identical. Retained throughout 0.9.
+    frame_index is authoritative.
+    """
     @property
     def data(self) -> bytes: ...
     @property
@@ -522,6 +579,8 @@ class SecondaryChunk:
     def frames(self) -> int: ...
     @property
     def pts_ns(self) -> int: ...
+    @property
+    def arrival_ns(self) -> int: ...
     @property
     def seq(self) -> int: ...
     @property
@@ -536,6 +595,10 @@ class SecondaryChunk:
     def vad_events(self) -> Optional[List[AttachedVadEvent]]: ...
 
 class Stream:
+    def effective_settings(self) -> SettingsReport: ...
+    def poll_lifecycle_event(self) -> Optional[LifecycleEvent]:
+        """Consume only helper lifecycle notifications, including after stop."""
+        ...
     def stop(self) -> None:
         """Stop once and retain the outcome; open a new stream to capture again."""
         ...
@@ -574,7 +637,9 @@ class Stream:
         mic_device_id: Optional[str] = None, system_device_id: Optional[str] = None,
         mic_gain: float = 1.0, system_gain: float = 1.0,
         denoise: bool = False, silence_probe: bool = True,
-        windows_classic_loopback_keepalive: Optional[bool] = None
+        windows_classic_loopback_keepalive: Optional[bool] = None,
+        strict: Optional[bool] = None,
+        ring_capacity_chunks: Optional[int] = None
     ) -> None:
         """Every successful switch creates a generation with DISCONTINUITY; epoch
         transition waits for new PCM. Return means backend replaced, not delivered.
@@ -803,7 +868,9 @@ def open(
     denoise: bool = False, silence_probe: bool = True,
     vad: Optional[StreamVadOptions] = None,
     windows_classic_loopback_keepalive: bool = True,
-    secondary_output: Optional[SecondaryOutputOptions] = None
+    secondary_output: Optional[SecondaryOutputOptions] = None,
+    strict: Optional[bool] = None,
+    ring_capacity_chunks: Optional[int] = None
 ) -> Stream:
     """Open capture synchronously; macOS microphone consent must be decided.
 

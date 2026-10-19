@@ -6,6 +6,8 @@
 
 #[path = "stream_secondary.rs"]
 mod secondary_delivery;
+#[path = "stream_settings.rs"]
+mod settings_capture;
 #[path = "stream_stop.rs"]
 mod shutdown;
 #[path = "stream_vad.rs"]
@@ -15,7 +17,7 @@ use pyo3::prelude::*;
 
 use ::flexaudio as fa;
 
-use crate::config::{build_config, parse_exclude_pids, validate_denoise};
+use crate::config::{build_config, parse_exclude_pids, parse_ring_capacity, validate_denoise};
 use crate::marshal::{chunk_to_py, event_to_py, PyAudioChunk, PyStreamEvent};
 use crate::to_py_err;
 
@@ -42,6 +44,9 @@ pub struct Stream {
     secondary_metadata: (u64, i64, u64, u32),
     shutdown: Option<fa::ShutdownReport>,
     local_events: std::collections::VecDeque<fa::Event>,
+    capture_events: std::collections::VecDeque<fa::Event>,
+    lifecycle_events: std::collections::VecDeque<crate::lifecycle::LifecycleEvent>,
+    settings: crate::settings::SettingsState,
     vad_tap: Option<flexaudio_vad::VadTap>,
     vad_events: Vec<flexaudio_vad::AttachedVadEvent>,
     vad_origin: (u64, i64),
@@ -51,6 +56,16 @@ pub struct Stream {
 }
 
 impl Stream {
+    fn route_events(&mut self) {
+        while let Some(event) = self.inner.poll_event() {
+            if let Some(event) = crate::lifecycle::from_event(&event) {
+                self.lifecycle_events.push_back(event);
+            } else {
+                self.capture_events.push_back(event);
+            }
+        }
+    }
+
     fn poll_processed_chunk(&mut self) -> PyResult<Option<PyAudioChunk>> {
         self.drain_capture();
         if let Some(error) = self.inner.terminal_error() {
@@ -190,10 +205,30 @@ impl Stream {
 
     /// Return an event if one is available. Otherwise return `None` (non-blocking).
     fn poll_event(&mut self) -> Option<PyStreamEvent> {
-        self.inner
-            .poll_event()
+        self.route_events();
+        self.capture_events
+            .pop_front()
             .or_else(|| self.local_events.pop_front())
             .map(event_to_py)
+    }
+
+    /// Consume only helper lifecycle notifications, including after stop.
+    fn poll_lifecycle_event(&mut self) -> Option<crate::lifecycle::LifecycleEvent> {
+        self.route_events();
+        self.lifecycle_events.pop_front()
+    }
+
+    /// Return a fresh snapshot of the last successful open or source switch.
+    fn effective_settings<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let report = self.settings.report.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "custom backend has no capture settings report",
+            )
+        })?;
+        crate::settings::to_py(py, report)
     }
 
     /// Hot-swap the input source (mic/system/process/mix) without stopping recording.
@@ -230,6 +265,8 @@ impl Stream {
         denoise = false,
         silence_probe = true,
         windows_classic_loopback_keepalive = None,
+        strict = None,
+        ring_capacity_chunks = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn switch_source(
@@ -251,6 +288,8 @@ impl Stream {
         denoise: bool,
         silence_probe: bool,
         windows_classic_loopback_keepalive: Option<bool>,
+        strict: Option<bool>,
+        ring_capacity_chunks: Option<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         if let Some(error) = self.inner.terminal_error() {
             return Err(to_py_err(error));
@@ -275,6 +314,7 @@ impl Stream {
         )?;
 
         config.silence_probe = silence_probe;
+        config.ring_capacity_chunks = parse_ring_capacity(ring_capacity_chunks.as_ref())?;
         config.secondary_output = self.inner.config().secondary_output;
         let options = self.inner.open_options().clone();
         let options = match windows_classic_loopback_keepalive {
@@ -282,10 +322,13 @@ impl Stream {
             None => options,
         };
 
-        validate_denoise(denoise, self.inner.config().output.sample_rate)?;
-        self.inner
-            .switch_source_with_options_and_denoise(config, options, denoise)
-            .map_err(to_py_err)
+        self.switch_with(
+            config,
+            denoise,
+            windows_classic_loopback_keepalive,
+            strict,
+            |inner, config| inner.switch_source_with_options_and_denoise(config, options, denoise),
+        )
     }
 
     /// Context manager support. Use as `with flexaudio.open("mic") as s:`.
@@ -348,6 +391,8 @@ impl Stream {
     vad = None,
     windows_classic_loopback_keepalive = true,
     secondary_output = None,
+    strict = None,
+    ring_capacity_chunks = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn open(
@@ -370,6 +415,8 @@ pub fn open(
     vad: Option<&crate::vad::StreamVadOptions>,
     windows_classic_loopback_keepalive: bool,
     secondary_output: Option<&crate::secondary::SecondaryOutputOptions>,
+    strict: Option<bool>,
+    ring_capacity_chunks: Option<Bound<'_, PyAny>>,
 ) -> PyResult<Stream> {
     let exclude_pids = parse_exclude_pids(exclude_pids.as_ref())?;
     let mut config = build_config(
@@ -389,6 +436,7 @@ pub fn open(
         system_gain,
     )?;
     config.silence_probe = silence_probe;
+    config.ring_capacity_chunks = parse_ring_capacity(ring_capacity_chunks.as_ref())?;
     config.secondary_output = secondary_output.map(|options| options.format);
     if vad.is_some_and(|options| options.tap == "secondary") && secondary_output.is_none() {
         return Err(Python::attach(|py| {
@@ -399,6 +447,23 @@ pub fn open(
             )
         }));
     }
+    validate_denoise(denoise, output_rate)?;
+    if denoise && !(1..=2).contains(&output_channels) {
+        return Err(crate::denoise_err_to_py(
+            flexaudio_denoise::DenoiseError::InvalidChannels(output_channels),
+        ));
+    }
+    crate::settings::validate(&config, true).map_err(to_py_err)?;
+    let strict = strict.unwrap_or(false);
+    let report = crate::settings::Request {
+        config: &config,
+        keepalive: Some(windows_classic_loopback_keepalive),
+        denoise,
+        vad: vad.is_some(),
+        secondary: secondary_output,
+    }
+    .resolve(None, strict)
+    .map_err(to_py_err)?;
     let vad_tap = vad
         .map(|options| {
             flexaudio_vad::VadTap::new(
@@ -410,15 +475,6 @@ pub fn open(
         })
         .transpose()
         .map_err(crate::vad::tap_error)?;
-
-    // Validate and build addons before acquiring a device. Reject denoise unless the output rate is 48 kHz, and reject
-    // invalid VAD settings, before acquiring a device.
-    validate_denoise(denoise, output_rate)?;
-    if denoise && !(1..=2).contains(&output_channels) {
-        return Err(crate::denoise_err_to_py(
-            flexaudio_denoise::DenoiseError::InvalidChannels(output_channels),
-        ));
-    }
 
     let stream = fa::open_with_options(
         config,
@@ -441,6 +497,12 @@ pub fn open(
         inner: stream,
         shutdown: None,
         local_events: Default::default(),
+        lifecycle_events: Default::default(),
+        capture_events: Default::default(),
+        settings: crate::settings::SettingsState {
+            report: Some(report),
+            strict,
+        },
     })
 }
 
@@ -457,6 +519,10 @@ fn start_capture(mut stream: fa::Stream, denoise: bool, capture_tap: bool) -> Py
 #[cfg(test)]
 #[path = "stream_denoise_tests.rs"]
 mod denoise_tests;
+
+#[cfg(test)]
+#[path = "stream_settings_tests.rs"]
+mod settings_tests;
 
 #[cfg(test)]
 mod tests {
@@ -518,6 +584,9 @@ mod tests {
                 inner: denied_stream(),
                 shutdown: None,
                 local_events: Default::default(),
+                lifecycle_events: Default::default(),
+                capture_events: Default::default(),
+                settings: Default::default(),
             };
             stream.ready_chunks.push_back(chunk_to_py(fa::AudioChunk {
                 data: vec![0.25; 1920],
@@ -591,6 +660,9 @@ else:
                     inner,
                     shutdown: None,
                     local_events: Default::default(),
+                    lifecycle_events: Default::default(),
+                    capture_events: Default::default(),
+                    settings: Default::default(),
                 },
             )
             .expect("create Python stream");
@@ -693,6 +765,9 @@ mod repro_tests {
                 inner,
                 shutdown: None,
                 local_events: Default::default(),
+                lifecycle_events: Default::default(),
+                capture_events: Default::default(),
+                settings: Default::default(),
             },
             sink,
         )

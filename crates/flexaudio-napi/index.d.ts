@@ -72,7 +72,10 @@ export interface JsAudioChunk {
    * overlap or leave gaps by callback jitter; no non-overlap or bounded-monotonic guarantee.
    * frameIndex is authoritative (gaps are loss). VAD uses epochStart.ptsNs + tMs*1e6,
    * or epochStart.captureSample + tMs*48 for the exact sample-clock mapping. */
+  /** @deprecated Since 0.8; use arrivalNs. Retained throughout 0.9. */
   ptsNs: number
+  /** Arrival-time label; frameIndex remains the authoritative media clock. */
+  readonly arrivalNs?: number
   seq: bigint
   flags: number
   droppedBefore: number
@@ -111,7 +114,10 @@ export interface JsSecondaryChunk {
    * overlap or leave gaps by callback jitter; no non-overlap or bounded-monotonic guarantee.
    * frameIndex is authoritative (gaps are loss). VAD uses epochStart.ptsNs + tMs*1e6,
    * or epochStart.captureSample + tMs*48 for the exact sample-clock mapping. */
+  /** @deprecated Since 0.8; use arrivalNs. Retained throughout 0.9. */
   ptsNs: number
+  /** Exact alias of ptsNs on library-created chunks. */
+  readonly arrivalNs?: number
   seq: bigint
   flags: number
   droppedBefore: number
@@ -348,6 +354,12 @@ export interface SecondaryOutputOptions {
 }
 /** Options for openStream. */
 export interface OpenOptions {
+  /** Reject non-default settings that would be ignored. Retained on switch when omitted. */
+  strict?: boolean
+  /** Positive safe integer queue capacity. Default 50; fixed at open. */
+  ringCapacityChunks?: number
+  /** Separate ordered helper lifecycle channel. Omission on switch retains the handler. */
+  onLifecycleEvent?: (event: LifecycleEvent) => void
   /** "mic" | "system" | "process" | "mix" */
   kind: string
   deviceId?: string
@@ -517,6 +529,53 @@ export declare function capabilities(): Promise<Capabilities>
  * Windows enumeration does not preflight microphone permission; native enumeration
  * proceeds. Microphone capture retains its separate existing permission preflight. */
 export declare function devices(): Array<JsDeviceInfo>
+export type DeviceIdNamespace =
+  'cpalDeviceName' | 'pipeWireNodeName' | 'wasapiOutputSelector' |
+  'coreAudioOutputSelector' | 'unknown'
+export interface NamespacedDevice {
+  device: JsDeviceInfo
+  idNamespace: DeviceIdNamespace
+}
+/** Enumerate the same selectable IDs with provenance supplied by their providers. */
+export declare function devicesWithNamespaces(): Promise<NamespacedDevice[]>
+
+export type SettingKey =
+  'kind' | 'deviceId' | 'targetPid' | 'mode' | 'chunkMs' | 'ringCapacityChunks' |
+  'excludeSelf' | 'excludePids' | 'output' | 'secondaryOutput' | 'secondaryEncoding' |
+  'gain' | 'mixMicDeviceId' | 'mixSystemDeviceId' | 'mixMicGain' | 'mixSystemGain' |
+  'silenceProbe' | 'windowsClassicLoopbackKeepalive' | 'denoise' | 'vad'
+export type IgnoreReason =
+  'wrongSourceKind' | 'unsupportedPlatform' | 'exclusionDeviceUnscoped' |
+  'processLoopbackPath' | 'fixedAtOpen'
+export type AdjustmentReason = 'exclusionSetNormalized' | 'legacySentinel'
+export type SettingValue =
+  null | boolean | bigint | number | string | readonly number[] | JsNativeFormat
+export type SettingOutcome =
+  | { status: 'notRequested' | 'applied' }
+  | { status: 'ignored'; reason: IgnoreReason }
+  | { status: 'adjusted'; reason: AdjustmentReason }
+export interface SettingResolution {
+  setting: SettingKey
+  requested: SettingValue
+  effective: SettingValue
+  outcome: SettingOutcome
+}
+export interface SettingsReport {
+  revision: bigint
+  entries: readonly SettingResolution[]
+}
+export interface IgnoredSettingsException extends Error {
+  code: 'FLEX_IGNORED_SETTINGS'
+  report: SettingsReport
+}
+export type HelperStopReason =
+  'signalObserved' | 'permissionDenied' | 'inconclusive' | 'timedOut' |
+  'streamStopped' | 'sourceSwitched' | 'recovery' | 'startupFailed' |
+  'runtimeFailed' | 'cancelled' | 'unknown'
+export type LifecycleEvent =
+  | { type: 'silenceProbeStarted' | 'classicLoopbackKeepaliveStarted' }
+  | { type: 'silenceProbeStopped' | 'classicLoopbackKeepaliveStopped'; reason: HelperStopReason }
+  | { type: 'unknown'; message: string }
 /**
  * Enumerate processes with audio output sessions (streams) that can be targeted by per-process
  * capture (`openStream({ kind: 'process', processId })`). Excludes the calling process itself.
@@ -592,9 +651,12 @@ export declare function watchDevices(onEvent: (event: JsDeviceEvent) => void): D
  * and sends chunks/events to JS through TSFN.
  */
 export declare class FlexStream {
+  /** Snapshot at successful open/switch commit; available after stop. */
+  effectiveSettings(): SettingsReport
   /**
    * Stop recording. When the Promise resolves, all `onChunk` calls queued on the TSFN before
    * stop (the last PCM and `frames:0` terminator) have been delivered to JS.
+   * Queued lifecycle callbacks have also completed.
    * Repeated calls return the same retained success or failure after completion. Calling
    * inside `onChunk` does not freeze JS because joining happens off the JS thread.
    * An attached VAD-only failure resolves and remains in shutdownReport().cleanupErrors with its

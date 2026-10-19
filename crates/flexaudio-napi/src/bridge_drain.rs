@@ -19,7 +19,13 @@ impl PairingBridge {
         terminal: &Mutex<Option<StreamTerminal>>,
     ) {
         loop {
-            forward_stream_events(stream, callback, &self.on_chunk, terminal);
+            forward_stream_events(
+                stream,
+                callback,
+                &self.on_chunk,
+                terminal,
+                self.lifecycle.as_deref(),
+            );
             self.suppress_failed_pcm(stream);
             self.drain_capture(stream);
             while let Some(chunk) = stream.poll_chunk_ordered() {
@@ -31,7 +37,13 @@ impl PairingBridge {
             self.drain_pairs();
             // A startup notice can be published after the first event drain and
             // gate this pass. Queue that notice, then retry before flush/stop.
-            if !forward_stream_events(stream, callback, &self.on_chunk, terminal) {
+            if !forward_stream_events(
+                stream,
+                callback,
+                &self.on_chunk,
+                terminal,
+                self.lifecycle.as_deref(),
+            ) {
                 break;
             }
         }

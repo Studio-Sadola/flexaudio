@@ -517,6 +517,7 @@ pub fn binding_contract_bridge(
         terminal.clone(),
         report.clone(),
         event_callback.clone(),
+        None,
     )?;
     let settle = make_settle_tsfn(
         &env,
@@ -543,6 +544,9 @@ pub fn binding_contract_bridge(
         }
     }
     let mut bridge = PairingBridge {
+        settings: None,
+        lifecycle: None,
+        strict: false,
         attachment: None,
         on_chunk: chunk.as_ref().clone(),
         stop_phase: phase.clone(),
@@ -789,6 +793,8 @@ pub fn binding_contract_bridge(
     )
     .map_err(|error| boundary::throw_error(&env, error))?;
     Ok(FlexStream {
+        settings: Arc::new(Mutex::new(None)),
+        lifecycle: None,
         stop_flag: Arc::new(AtomicBool::new(false)),
         inner: Arc::new(Mutex::new(StreamInner {
             handle: Some(handle),

@@ -20,7 +20,7 @@ impl fa::CaptureBackend for Input {
     }
 }
 
-fn binding(inner: fa::Stream) -> Stream {
+pub(super) fn binding(inner: fa::Stream) -> Stream {
     Stream {
         secondary: inner.config().secondary_output.map(|format| {
             crate::secondary::SecondaryOutputOptions {
@@ -34,6 +34,9 @@ fn binding(inner: fa::Stream) -> Stream {
         secondary_metadata: (0, 0, 0, 0),
         shutdown: None,
         local_events: Default::default(),
+        lifecycle_events: Default::default(),
+        capture_events: Default::default(),
+        settings: Default::default(),
         vad_tap: None,
         vad_events: Vec::new(),
         vad_origin: (0, 0),

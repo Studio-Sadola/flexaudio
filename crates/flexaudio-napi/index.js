@@ -321,6 +321,7 @@ const { FlexStream, DeviceWatcherHandle, devices, processes, capabilities, openS
 module.exports.FlexStream = FlexStream
 module.exports.DeviceWatcherHandle = DeviceWatcherHandle
 module.exports.devices = devices
+module.exports.devicesWithNamespaces = nativeBinding.devicesWithNamespaces
 module.exports.processes = processes
 module.exports.capabilities = capabilities
 module.exports.openStream = openStream

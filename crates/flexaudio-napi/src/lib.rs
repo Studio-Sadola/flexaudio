@@ -18,9 +18,13 @@
 mod boundary;
 mod bridge_drain;
 mod capabilities;
+mod devices;
 use bridge_drain::start_bridge_stream;
 pub use capabilities::capabilities;
+pub use devices::devices_with_namespaces;
 mod flac_encoder;
+mod lifecycle;
+mod settings;
 mod shutdown;
 use boundary::{device_event_to_js, event_to_js, to_napi_err, JsAudioError, JsAudioLoss};
 mod attachment;
@@ -276,12 +280,19 @@ fn forward_stream_events(
     callback: Option<&EventTsfn>,
     chunk_queue: &ChunkTsfn,
     terminal: &Mutex<Option<StreamTerminal>>,
+    lifecycle: Option<&lifecycle::LifecycleDelivery>,
 ) -> bool {
     let mut released_startup = false;
     if let Some(error) = stream.terminal_error() {
         *terminal.lock().unwrap_or_else(lock_poisoned) = Some(StreamTerminal(error));
     }
     while let Some(event) = stream.poll_event() {
+        if lifecycle::is_lifecycle(&event) {
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.emit(event);
+            }
+            continue;
+        }
         if let Event::PermissionDenied { permission, detail } = &event {
             *terminal.lock().unwrap_or_else(lock_poisoned) =
                 Some(StreamTerminal(flexaudio::Error::PermissionDenied {
@@ -476,6 +487,7 @@ fn call_ordered_event(
 /// TSFN that calls the user's `onChunk`. Chunks go to the user; `StopFlushed` resolves the
 /// deferred in the same queue (without calling the user's onChunk). The pump function is a no-op.
 /// After resolving, unref the chunk TSFN and release onChunk's `napi_ref`.
+#[allow(clippy::too_many_arguments)]
 fn make_chunk_tsfn(
     env: &Env,
     stop_phase: Arc<Mutex<StopPhase>>,
@@ -484,6 +496,7 @@ fn make_chunk_tsfn(
     terminal: TerminalError,
     report: FinalReport,
     on_event: Option<Arc<UserCallback>>,
+    lifecycle: Option<Arc<lifecycle::LifecycleDelivery>>,
 ) -> napi::Result<Arc<ChunkTsfn>> {
     let pump =
         env.create_function_from_closure("flexaudioChunkPump", |ctx| ctx.env.get_undefined())?;
@@ -547,6 +560,12 @@ fn make_chunk_tsfn(
                 }
 
                 ChunkEmit::StopFlushed => {
+                    if let Some(lifecycle) = &lifecycle {
+                        if lifecycle.defer_stop() {
+                            return Ok(Vec::<Unknown>::new());
+                        }
+                        lifecycle.finish();
+                    }
                     for deferred in take_stop_waiters(&stop_phase) {
                         settle_stop(ctx.env.raw(), deferred, &report);
                     }
@@ -723,6 +742,7 @@ pub struct JsAudioChunk {
     pub frame_index: BigInt,
     pub frames: u32,
     pub pts_ns: i64,
+    pub arrival_ns: i64,
     pub seq: BigInt,
     pub flags: u32,
     pub dropped_before: u32,
@@ -752,6 +772,7 @@ pub struct JsSecondaryChunk {
     pub frame_index: BigInt,
     pub frames: u32,
     pub pts_ns: i64,
+    pub arrival_ns: i64,
     pub seq: BigInt,
     pub flags: u32,
     pub dropped_before: u32,
@@ -831,6 +852,10 @@ pub struct SecondaryOutputOptions {
 /// Options for openStream.
 #[napi(object)]
 pub struct OpenOptions {
+    pub strict: Option<bool>,
+    pub ring_capacity_chunks: Option<f64>,
+    #[napi(ts_type = "(event: LifecycleEvent) => void")]
+    pub on_lifecycle_event: Option<napi::JsFunction>,
     /// "mic" | "system" | "process" | "mix"
     pub kind: String,
     pub device_id: Option<String>,
@@ -907,6 +932,7 @@ fn capture_open_options(options: &OpenOptions) -> flexaudio::OpenOptions {
         &flexaudio::OpenOptions::default(),
         options.windows_classic_loopback_keepalive,
     )
+    .strict(options.strict.unwrap_or(false))
 }
 
 /// An omitted switch option retains the current facade-owned value.
@@ -986,6 +1012,7 @@ fn chunk_to_js(chunk: AudioChunk) -> JsAudioChunk {
         data: Float32Array::new(chunk.data),
         frames,
         pts_ns: chunk.pts_ns,
+        arrival_ns: chunk.pts_ns,
         seq: BigInt::from(chunk.seq),
         flags: chunk.flags.bits(),
         dropped_before: chunk.dropped_before,
@@ -1091,7 +1118,32 @@ fn build_config(options: &OpenOptions) -> napi::Result<StreamConfig> {
         }
         config.chunk_ms = 20;
     }
+    if let Some(capacity) = options.ring_capacity_chunks {
+        if !capacity.is_finite()
+            || capacity.fract() != 0.0
+            || !(1.0..=9_007_199_254_740_991.0).contains(&capacity)
+            || capacity > usize::MAX as f64
+        {
+            return Err(to_napi_err(flexaudio::Error::InvalidArg(
+                "ringCapacityChunks must be a positive safe integer fitting native capacity".into(),
+            )));
+        }
+        config.ring_capacity_chunks = capacity as usize;
+    }
     Ok(config)
+}
+
+fn config_at_boundary(env: &Env, options: &OpenOptions) -> napi::Result<StreamConfig> {
+    build_config(options).map_err(|error| {
+        if options.chunk_ms.is_some_and(|ms| ms != 20.0) {
+            boundary::throw_error(
+                env,
+                flexaudio::core::chunk_ms_error(flexaudio::core::ChunkMsOption::JavaScript),
+            )
+        } else {
+            error
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,10 +1156,10 @@ fn build_config(options: &OpenOptions) -> napi::Result<StreamConfig> {
 /// switch requests to the bridge thread through this command and synchronously receive the
 /// result through `result_tx` (JS expects a synchronous return).
 struct SwitchCmd {
-    config: StreamConfig,
-    windows_classic_loopback_keepalive: Option<bool>,
     mock_source: bool,
     result_tx: mpsc::Sender<flexaudio::core::Result<()>>,
+    request: settings::Request,
+    lifecycle_handler: Option<Arc<UserCallback>>,
 }
 
 /// Command requesting current stream values from the bridge thread.
@@ -1132,7 +1184,7 @@ struct StreamSnapshot {
 /// operations are requested through this channel.
 enum BridgeCmd {
     /// Hot-swap the input source (return the result synchronously).
-    Switch(SwitchCmd),
+    Switch(Box<SwitchCmd>),
     /// Pause delivery.
     Pause,
     /// Resume delivery.
@@ -1154,6 +1206,9 @@ struct SecondaryTapCfg {
 /// One capture owner supplies VAD events; tap selection changes only their carrier.
 /// Denoising runs in core before canonical capture and output conversion.
 struct PairingBridge {
+    settings: Option<flexaudio::SettingsReport>,
+    lifecycle: Option<Arc<lifecycle::LifecycleDelivery>>,
+    strict: bool,
     on_chunk: ChunkTsfn,
     attachment: Option<attachment::VadBridge>,
     stop_phase: Arc<Mutex<StopPhase>>,
@@ -1204,6 +1259,7 @@ fn secondary_event_carrier(
         encoding: encoding.into(),
         frames: 0,
         pts_ns: pts,
+        arrival_ns: pts,
         seq,
         flags: 0,
         dropped_before,
@@ -1224,6 +1280,7 @@ impl PairingBridge {
             data: Float32Array::new(Vec::new()),
             frames: 0,
             pts_ns: self.last_emitted_primary_pts,
+            arrival_ns: self.last_emitted_primary_pts,
             seq: BigInt::from(self.last_primary_seq),
             flags: 0,
             dropped_before: self.last_primary_dropped,
@@ -1291,6 +1348,7 @@ impl PairingBridge {
             encoding,
             frames,
             pts_ns,
+            arrival_ns: pts_ns,
             seq,
             flags,
             dropped_before,
@@ -1318,6 +1376,7 @@ impl PairingBridge {
             frames: 0,
             frame_index: BigInt::from(self.last_primary_frame_index),
             pts_ns: secondary.pts_ns.max(self.last_emitted_primary_pts),
+            arrival_ns: secondary.pts_ns.max(self.last_emitted_primary_pts),
             seq: BigInt::from(self.last_primary_seq),
             flags: 0,
             dropped_before: self.last_primary_dropped,
@@ -1391,6 +1450,8 @@ impl PairingBridge {
 /// and sends chunks/events to JS through TSFN.
 #[napi]
 pub struct FlexStream {
+    settings: Arc<Mutex<Option<flexaudio::SettingsReport>>>,
+    lifecycle: Option<Arc<lifecycle::LifecycleDelivery>>,
     stop_flag: Arc<AtomicBool>,
     inner: Arc<Mutex<StreamInner>>,
     stop_phase: Arc<Mutex<StopPhase>>,
@@ -1417,6 +1478,9 @@ impl FlexStream {
         mock_source: bool,
     ) -> napi::Result<Self> {
         let report = bridge.report.clone();
+        let settings = Arc::new(Mutex::new(bridge.settings.clone()));
+        let thread_settings = settings.clone();
+        let lifecycle = bridge.lifecycle.clone();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_stop = stop_flag.clone();
         let thread_terminal = terminal.clone();
@@ -1442,17 +1506,59 @@ impl FlexStream {
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
                             BridgeCmd::Switch(sw) => {
-                                let r = if sw.mock_source {
-                                    stream.switch_backend(Box::new(flexaudio::MockBackend::new(
-                                        48_000, 2, 0.0,
-                                    )))
-                                } else {
-                                    let options = switch_open_options(
-                                        stream.open_options(),
-                                        sw.windows_classic_loopback_keepalive,
+                                let mut sw = *sw;
+                                sw.request.retained_keepalive =
+                                    Some(stream.open_options().windows_classic_loopback_keepalive);
+                                let strict = sw.request.strict.unwrap_or(bridge.strict);
+                                let mut previous = bridge.settings.clone();
+                                if let Some(entry) = previous.as_mut().and_then(|r| {
+                                    r.entries
+                                        .iter_mut()
+                                        .find(|entry| entry.setting == flexaudio::SettingKey::Gain)
+                                }) {
+                                    entry.effective = flexaudio::SettingValue::Float(stream.gain());
+                                }
+                                let candidate = sw.request.resolve(previous.as_ref(), strict);
+                                let r = candidate.and_then(|candidate| {
+                                    // Pending notifications belong to the currently registered
+                                    // handler; replacements take effect only at commit.
+                                    forward_stream_events(
+                                        &mut stream,
+                                        on_event.as_ref(),
+                                        &bridge.on_chunk,
+                                        &thread_terminal,
+                                        bridge.lifecycle.as_deref(),
                                     );
-                                    stream.switch_source_with_options(sw.config, options)
-                                };
+                                    let r = if sw.mock_source {
+                                        stream.switch_backend(lifecycle::mock_backend())
+                                    } else {
+                                        let options = switch_open_options(
+                                            stream.open_options(),
+                                            sw.request.keepalive,
+                                        );
+                                        // Node has already preflighted the complete binding report.
+                                        stream.switch_source_with_options(
+                                            sw.request.config,
+                                            options.strict(false),
+                                        )
+                                    };
+                                    if r.is_ok() {
+                                        bridge.strict = strict;
+                                        bridge.settings = Some(candidate.clone());
+                                        *thread_settings.lock().unwrap_or_else(lock_poisoned) =
+                                            Some(candidate);
+                                    }
+                                    r
+                                });
+                                if let Some(handler) = sw.lifecycle_handler {
+                                    if let Some(delivery) = &bridge.lifecycle {
+                                        if r.is_ok() {
+                                            delivery.replace(handler);
+                                        } else {
+                                            delivery.release(handler);
+                                        }
+                                    }
+                                }
                                 // Ignore a dropped receiver (switch_source caller).
                                 let _ = sw.result_tx.send(r);
                             }
@@ -1575,6 +1681,8 @@ impl FlexStream {
             terminal,
             report,
             mock_source,
+            settings,
+            lifecycle,
         })
     }
 
@@ -1662,6 +1770,20 @@ impl FlexStream {
 
 #[napi]
 impl FlexStream {
+    /// Snapshot of the last successfully committed capture configuration.
+    #[napi(ts_return_type = "SettingsReport")]
+    pub fn effective_settings(&self, env: Env) -> napi::Result<JsObject> {
+        let report = self.settings.lock().unwrap_or_else(lock_poisoned);
+        settings::to_js(
+            &env,
+            report.as_ref().ok_or_else(|| {
+                NapiError::new(
+                    Status::GenericFailure,
+                    "settings are unavailable for this custom backend",
+                )
+            })?,
+        )
+    }
     /// Stop recording. When the Promise resolves, all `onChunk` calls queued on the TSFN before
     /// stop (the last PCM and `frames:0` terminator) have been delivered to JS.
     /// Repeated calls await the same completion, or resolve immediately if already complete. Calling
@@ -1769,16 +1891,7 @@ impl FlexStream {
         if mock_source {
             options.kind = "mic".into();
         }
-        let config = build_config(&options).map_err(|error| {
-            if options.chunk_ms.is_some_and(|ms| ms != 20.0) {
-                boundary::throw_error(
-                    &env,
-                    flexaudio::core::chunk_ms_error(flexaudio::core::ChunkMsOption::JavaScript),
-                )
-            } else {
-                error
-            }
-        })?;
+        let config = config_at_boundary(&env, &options)?;
 
         // Send a command to the bridge thread and synchronously receive the result.
         let cmd_tx = {
@@ -1788,13 +1901,23 @@ impl FlexStream {
             })?
         };
         let (result_tx, result_rx) = mpsc::channel();
+        let request = settings::Request::new(&options, config)?;
+        let lifecycle_handler = if self.lifecycle.is_some() {
+            options
+                .on_lifecycle_event
+                .as_ref()
+                .map(|handler| lifecycle::retain(&env, handler))
+                .transpose()?
+        } else {
+            None
+        };
         cmd_tx
-            .send(BridgeCmd::Switch(SwitchCmd {
-                config,
-                windows_classic_loopback_keepalive: options.windows_classic_loopback_keepalive,
+            .send(BridgeCmd::Switch(Box::new(SwitchCmd {
                 mock_source,
                 result_tx,
-            }))
+                request,
+                lifecycle_handler,
+            })))
             .map_err(|_| {
                 NapiError::new(
                     Status::GenericFailure,
@@ -2122,7 +2245,7 @@ pub fn processes() -> AsyncTask<ProcessesTask> {
 #[napi]
 pub fn open_stream(
     env: Env,
-    options: OpenOptions,
+    mut options: OpenOptions,
     #[napi(ts_arg_type = "(chunk: JsAudioChunk) => void")] on_chunk: Function<
         JsAudioChunk,
         Unknown,
@@ -2131,6 +2254,18 @@ pub fn open_stream(
         Function<JsStreamEvent, Unknown>,
     >,
 ) -> napi::Result<FlexStream> {
+    let mock_source = cfg!(feature = "test-faults") && options.kind == "mock";
+    if mock_source {
+        options.kind = "mic".into();
+    }
+    let config = config_at_boundary(&env, &options)?;
+    let request = settings::Request::new(&options, config.clone())?;
+    let settings = request
+        .resolve(None, options.strict.unwrap_or(false))
+        .map_err(|error| boundary::throw_error(&env, error))?;
+    let output_rate = config.output.sample_rate;
+    let denoise_enabled = options.denoise.unwrap_or(false);
+    check_denoise_rate(denoise_enabled, output_rate)?;
     let attachment_options = options
         .vad
         .as_ref()
@@ -2145,23 +2280,6 @@ pub fn open_stream(
         .map(|(params, options, tap)| attachment::VadBridge::new(params, options, tap))
         .transpose()
         .map_err(|error| attachment::throw_error(&env, error))?;
-    let config = build_config(&options).map_err(|error| {
-        if options.chunk_ms.is_some_and(|ms| ms != 20.0) {
-            boundary::throw_error(
-                &env,
-                flexaudio::core::chunk_ms_error(flexaudio::core::ChunkMsOption::JavaScript),
-            )
-        } else {
-            error
-        }
-    })?;
-    let output_rate = config.output.sample_rate;
-
-    // Integrated denoise: first validate the public contract's 48kHz requirement (unchanged). Delegate to core
-    // if enabled (facade set_denoise; denoise applies to the internal 48k/stereo canonical form).
-    let denoise_enabled = options.denoise.unwrap_or(false);
-    check_denoise_rate(denoise_enabled, output_rate)?;
-
     // Parse secondary tap encoding / VAD tap.
     let secondary = match &options.secondary_output {
         Some(s) => Some(SecondaryTapCfg {
@@ -2169,8 +2287,12 @@ pub fn open_stream(
         }),
         None => None,
     };
-    let mut stream = flexaudio::open_with_options(config, capture_open_options(&options))
-        .map_err(|error| boundary::throw_error(&env, error))?;
+    let mut stream = if mock_source {
+        flexaudio::Stream::open(config, lifecycle::mock_backend())
+    } else {
+        flexaudio::open_with_options(config, capture_open_options(&options).strict(false))
+    }
+    .map_err(|error| boundary::throw_error(&env, error))?;
     if denoise_enabled {
         stream.set_denoise(true);
     }
@@ -2187,6 +2309,11 @@ pub fn open_stream(
     let user = make_user_chunk_cb(&env, &on_chunk)?;
     let (on_event, event_callback) = make_stream_event_callbacks(&env, on_event)?;
     let chunk_weak: ChunkTsfnWeakCell = Arc::new(OnceLock::new());
+    let lifecycle = lifecycle::LifecycleDelivery::new(
+        &env,
+        options.on_lifecycle_event.as_ref(),
+        chunk_weak.clone(),
+    )?;
     let on_chunk = make_chunk_tsfn(
         &env,
         stop_phase.clone(),
@@ -2195,6 +2322,7 @@ pub fn open_stream(
         terminal.clone(),
         report.clone(),
         event_callback.clone(),
+        Some(lifecycle.clone()),
     )?;
     let settle_tsfn = make_settle_tsfn(
         &env,
@@ -2205,6 +2333,9 @@ pub fn open_stream(
         event_callback,
     )?;
     let bridge = PairingBridge {
+        settings: Some(settings),
+        lifecycle: Some(lifecycle),
+        strict: options.strict.unwrap_or(false),
         attachment,
         on_chunk: on_chunk.as_ref().clone(),
         stop_phase,
@@ -2226,7 +2357,7 @@ pub fn open_stream(
         on_chunk,
         settle_tsfn,
         terminal,
-        false,
+        mock_source,
     )
 }
 
@@ -2392,6 +2523,7 @@ pub fn open_mock_stream(
         terminal.clone(),
         report.clone(),
         event_callback.clone(),
+        None,
     )?;
     let settle_tsfn = make_settle_tsfn(
         &env,
@@ -2402,6 +2534,9 @@ pub fn open_mock_stream(
         event_callback,
     )?;
     let bridge = PairingBridge {
+        settings: None,
+        lifecycle: None,
+        strict: false,
         attachment,
         on_chunk: on_chunk.as_ref().clone(),
         stop_phase,
@@ -2608,6 +2743,9 @@ mod tests {
     /// Helper creating OpenOptions with all fields omitted (except kind).
     fn options_with_kind(kind: &str) -> OpenOptions {
         OpenOptions {
+            strict: None,
+            ring_capacity_chunks: None,
+            on_lifecycle_event: None,
             kind: kind.to_string(),
             device_id: None,
             process_id: None,
@@ -2752,6 +2890,9 @@ mod tests {
     #[test]
     fn build_config_reflects_all_fields() {
         let opts = OpenOptions {
+            strict: None,
+            ring_capacity_chunks: None,
+            on_lifecycle_event: None,
             kind: "process".to_string(),
             device_id: Some("dev-x".to_string()),
             process_id: Some(9999.0),
