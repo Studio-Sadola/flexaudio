@@ -3,7 +3,7 @@
 
 /* Public declarations maintained to match the strict binding boundary contract. */
 
-/** JS DeviceInfo. `sourceKind` is a string ("mic"|"system"|"process").
+/** JS device information (`JsDeviceInfo`). `sourceKind` is a string ("mic"|"system"|"process").
  * Unreadable mandatory formats use sampleRate=0, channels=0 and formatAvailable=false.
  * Unknown device display names are empty strings. Windows/macOS use a selectable
  * native endpoint ID/UID when the name is unreadable. IDs may change between queries:
@@ -24,7 +24,7 @@ export interface JsDeviceInfo {
   isDefault: boolean
 }
 /**
- * JS ProcessInfo (an element of `processes()`). A candidate for per-process capture.
+ * JS process information (`JsProcessInfo`, an element of `processes()`). A candidate for per-process capture.
  *
  * Pass `pid` to `openStream({ kind: 'process', processId: pid })` to record that process.
  * `name` / `executable` / `bundleId` are for display (including self-reported app values);
@@ -48,8 +48,8 @@ export interface JsProcessInfo {
   isOutputActive?: boolean
 }
 /**
- * JS AudioChunk. `data` is interleaved f32 (len = frames * channels).
- * `seq` (u64) uses BigInt to avoid precision loss. `flags` contains ChunkFlags bits (u32).
+ * JS audio chunk (`JsAudioChunk`). `data` is interleaved f32 (len = frames * channels).
+ * `seq` (u64) uses BigInt to avoid precision loss. `flags` is an unsigned 32-bit bitmask.
  *
  * Delivery shape: `onChunk` in `openStream(options, onChunk)` receives **one argument**
  * (this primary chunk). Secondary tap (`secondaryOutput`) chunks arrive in the primary chunk's
@@ -659,7 +659,7 @@ export declare function openStream(options: OpenOptions, onChunk: (chunk: JsAudi
  */
 export declare function watchDevices(onEvent: (event: JsDeviceEvent) => void): DeviceWatcherHandle
 /**
- * Recording stream handle. Internally, the bridge thread owns and polls `flexaudio::Stream`
+ * Recording stream handle (`FlexStream`). Internally, the bridge thread polls captured audio
  * and sends chunks/events to JS through TSFN.
  */
 export declare class FlexStream {
@@ -691,10 +691,10 @@ export declare class FlexStream {
    * the first new-generation primary chunk; use primary DISCONTINUITY as the boundary.
    * Hot-swap the input source (mic/system/process) without stopping recording.
    *
-   * Request a switch to the `StreamConfig` built from `options` on the bridge thread and return
-   * the result synchronously (`Ok` on success, exception on failure). The output format (`outputRate`/
+   * Request a switch using `OpenOptions` on the bridge thread and return
+   * synchronously (`undefined` on success, exception on failure). The output format (`outputRate`/
    * `outputChannels`) cannot change during a switch (it would change frames in a continuous stream).
-   * Requesting a change makes `switch_source` return InvalidArg, thrown here as an exception. Chunk
+   * Requesting a format change makes `switchSource` throw InvalidArg. Chunk
    * `seq` stays continuous across switches; the first chunk afterward has the DISCONTINUITY flag.
    * `options.gain` is ignored (gain is stream state; use `setGain` to change it).
    * An explicit `options.windowsClassicLoopbackKeepalive` replaces the current value;
@@ -736,7 +736,7 @@ export declare class FlexStream {
    */
   droppedChunks(): bigint
 }
-/** Device attachment/removal watcher handle. The bridge thread polls `DeviceWatcher`. */
+/** Device attachment/removal watcher handle (`DeviceWatcherHandle`). */
 export declare class DeviceWatcherHandle {
   /** Stop watching and join the bridge thread. Safe to call repeatedly. */
   stop(): void
@@ -767,8 +767,8 @@ export declare class FlacEncoder {
   writeChunk(samples: Float32Array): void
   /**
    * Write out the remainder, finalize the header, and close the open file. Safe to call repeatedly
-   * (subsequent calls are no-ops). Dropping without calling this still closes through `FlacWriter`'s
-   * best-effort Drop, but call this to detect write errors.
+   * (subsequent calls are no-ops). Releasing `FlacEncoder` without calling this still makes a
+   * best-effort attempt to close the file, but call `finalize()` to detect write errors.
    */
   finalize(): void
 }
@@ -776,9 +776,9 @@ export declare class FlacEncoder {
  * Offline noise suppressor (RNNoise via nnnoiseless, embedded weights). **Requires 48kHz**;
  * intended to reduce steady noise in microphone recordings (fans, air conditioning, typing, etc.).
  *
- * Fixed latency of [`FRAME_SIZE`](flexaudio_denoise::FRAME_SIZE) (10ms at 48kHz). Output is
+ * Fixed latency of 480 samples per channel (10ms at 48kHz). Output is
  * the input delayed by one frame. The first frame is silence padding;
- * retrieve the remaining trailing frame with [`Denoiser::flush`].
+ * retrieve the remaining trailing frame with `Denoiser.flush()`.
  */
 export declare class Denoiser {
   /**

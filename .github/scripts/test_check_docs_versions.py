@@ -74,6 +74,100 @@ class DocumentationVersionTests(unittest.TestCase):
         ]))
         check_documentation(self.root, "0.8.1")
 
+    def test_node_package_manager_aliases_check_all_pins(self) -> None:
+        for manager in ("npm install", "npm i", "npm add", "yarn add", "yarn install", "pnpm add", "pnpm install"):
+            for package in ("flexaudio", "flexaudio-linux-x64-gnu"):
+                with self.subTest(manager=manager, package=package):
+                    command = f"{manager} @studio-sadola/{package}@0.6"
+                    self.assertEqual(len(check_document("README.md", command, "0.8.1")), 1)
+                    self.assertEqual(check_document("README.md", command.replace("@0.6", "@0.8.1"), "0.8.1"), [])
+
+    def test_shell_continuations_preserve_original_pin_lines(self) -> None:
+        for manager, action, package in (
+            ("cargo", "add", "flexaudio-vad@"),
+            ("npm", "i", "@studio-sadola/flexaudio@"),
+            ("yarn", "add", "@studio-sadola/flexaudio-linux-x64-gnu@"),
+            ("pnpm", "add", "@studio-sadola/flexaudio@"),
+            ("pip", "install", "flexaudio=="),
+        ):
+            for newline in ("\n", "\r\n"):
+                with self.subTest(manager=manager, newline=repr(newline)):
+                    content = newline.join([
+                        "# Install", manager + " \\", action + " \\",
+                        package + "0.8.1 \\", package + "0.6", "",
+                    ])
+                    findings = check_document("README.md", content, "0.8.1")
+                    self.assertEqual([finding.line for finding in findings], [5])
+                    self.assertEqual(findings[0].text, package + "0.6")
+
+    def test_install_advice_is_not_exempt_by_line_markers(self) -> None:
+        commands = (
+            'cargo add flexaudio@0.6', 'npm install @studio-sadola/flexaudio@0.6',
+            'npm i @studio-sadola/flexaudio@0.6', 'yarn add @studio-sadola/flexaudio@0.6',
+            'pnpm install @studio-sadola/flexaudio@0.6', 'pip install flexaudio==0.6',
+            'flexaudio = "0.6"', 'flexaudio-vad = { version = "0.6" }',
+            'flexaudio-vad = {\n  version = "0.6" # Since 0.6\n}',
+        )
+        for command in commands:
+            for marker in ("since it provides audio capture.", "Since 0.6", "History:", "Previously:", "Migration from 0.6:"):
+                with self.subTest(command=command, marker=marker):
+                    content = f"Install {command} {marker}"
+                    self.assertEqual(len(check_document("README.md", content, "0.8.1")), 1)
+                    for heading in ("## History", "## Migration ##", "## HISTORY"):
+                        self.assertEqual(check_document("README.md", heading + "\n### Example\n" + content, "0.8.1"), [])
+                    self.assertEqual(len(check_document("README.md", "## Migration guide\n" + content, "0.8.1")), 1)
+
+    def test_continuations_join_tokens_without_inserting_spaces(self) -> None:
+        for command in (
+            'cargo ad\\\nd flexaudio-va\\\nd@0.6',
+            'npm i @studio-sadola/flexaudio@\\\n0.6',
+            'yarn a\\\ndd @studio-sadola/flexaudio@0.6',
+            'pnpm add @studio-sadola/flexaudio-\\\nlinux-x64-gnu@0.6',
+            'pip install flexaud\\\nio==0.6',
+        ):
+            with self.subTest(command=command):
+                findings = check_document("README.md", command, "0.8.1")
+                self.assertEqual([finding.line for finding in findings], [command.count('\n') + 1])
+
+    def test_history_heading_closing_hashes_require_whitespace(self) -> None:
+        self.assertEqual(len(check_document("README.md", '## History###\ncargo add flexaudio@0.6', "0.8.1")), 1)
+
+    def test_changelog_policy_is_checked_outside_release_sections(self) -> None:
+        content = '\n'.join([
+            '# Changelog', '> Pin to', '> `0.6` for compatible updates.',
+            'cargo add flexaudio@0.6', '## [0.6.0] - 2026-01-01',
+            '### Fixed', 'cargo add flexaudio@0.6', '## Policy',
+            'pip install flexaudio==0.6', '## [Unreleased]', 'flexaudio = "0.6"',
+        ])
+        for path in ("CHANGELOG.md", "docs/CHANGELOG.md"):
+            with self.subTest(path=path):
+                self.assertEqual([finding.line for finding in check_document(path, content, "0.8.1")], [3, 4, 9, 11])
+
+    def test_all_registry_repository_urls_require_the_release_tag(self) -> None:
+        for target in (
+            'https://github.com/Studio-Sadola/flexaudio',
+            'https://github.com/Studio-Sadola/flexaudio/',
+            'https://github.com/Studio-Sadola/flexaudio#readme',
+            'https://github.com/Studio-Sadola/flexaudio/issues',
+            'https://github.com/Studio-Sadola/flexaudio/raw/main/README.md',
+            'https://github.com/Studio-Sadola/flexaudio/blob/main/README.md',
+            'https://raw.githubusercontent.com/Studio-Sadola/flexaudio/main/README.md',
+            'https://raw.githubusercontent.com/Studio-Sadola/flexaudio/v0.8.0/README.md',
+        ):
+            for prefix in ("", "## History\nPreviously: "):
+                with self.subTest(target=target, prefix=prefix):
+                    self.assertEqual(len(check_document("crates/flexaudio/README.md", prefix + target, "0.8.1")), 1)
+        for target in (
+            'https://github.com/Studio-Sadola/flexaudio/tree/v0.8.1',
+            'https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md',
+            'https://github.com/Studio-Sadola/flexaudio/releases/tag/v0.8.1',
+            'https://raw.githubusercontent.com/Studio-Sadola/flexaudio/v0.8.1/README.md',
+            'https://github.com/Studio-Sadola/flexaudio-other',
+            'https://github.com/other/flexaudio',
+        ):
+            with self.subTest(target=target):
+                self.assertEqual(check_document("crates/flexaudio/README.md", target, "0.8.1"), [])
+
     def test_pins_across_every_documentation_location(self) -> None:
         paths = [
             "README.md", "README.ja.md", "docs/guide.md", "docs/nested/guide.md",
@@ -89,13 +183,13 @@ class DocumentationVersionTests(unittest.TestCase):
             self.assertIn(f"{path}:2:", str(failure.exception))
 
     def test_historical_exemptions_are_explicit(self) -> None:
-        self.write("CHANGELOG.md", 'flexaudio = "0.1"\n')
-        self.write("docs/CHANGELOG.md", 'cargo add flexaudio@0.1\n')
+        self.write("CHANGELOG.md", '## [0.1.0] - 2026-01-01\nflexaudio = "0.1"\n')
+        self.write("docs/CHANGELOG.md", '## [v0.1.0]\ncargo add flexaudio@0.1\n')
         self.write("docs/history.md", '\n'.join([
-            'History: cargo add flexaudio@0.1',
-            'Since 0.1: flexaudio = "0.1"',
-            'Previously: npm install @studio-sadola/flexaudio@0.1',
-            'Migration from: pip install flexaudio==0.1',
+            'History: Version 0.1.0 was the first release.',
+            'Version 0.1.0 has been available since 0.1.',
+            'Previously: Version 0.1.0 was recommended.',
+            'Version 0.1.0: migration from 0.1.',
             '## History',
             'flexaudio = "0.1"',
             '### Earlier releases',
@@ -145,7 +239,7 @@ class DocumentationVersionTests(unittest.TestCase):
                             self.assertEqual(findings[0].line, 2)
                             self.assertEqual(findings[0].text, content)
         historical = 'Previously: [guide](https://github.com/Studio-Sadola/flexaudio/blob/v0.1.0/README.md)'
-        self.assertEqual(check_document("crates/flexaudio/README.md", historical, "0.8.1"), [])
+        self.assertEqual(len(check_document("crates/flexaudio/README.md", historical, "0.8.1")), 1)
 
     def test_multiline_cargo_dependency_reports_version_line(self) -> None:
         content = 'flexaudio-vad = {\n  version = "0.6",\n  features = []\n}\n'
