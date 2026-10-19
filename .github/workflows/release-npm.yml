@@ -248,6 +248,64 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
 
+  registry-completion:
+    name: Verify registry completion
+    needs: [version-gate, publish]
+    if: >-
+      always() && github.event_name == 'push' &&
+      needs.version-gate.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 115
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Wait for the other tag-push publish workflows
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ needs.version-gate.outputs.sha }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const tag = process.env.RELEASE_TAG;
+            const sha = process.env.RELEASE_SHA;
+            if (!/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag) || !/^[0-9a-f]{40}$/.test(sha)) {
+              throw new Error('Invalid release tag or commit');
+            }
+            const pending = new Set(['release-crates.yml', 'release-pypi.yml']);
+            const deadline = Date.now() + 90 * 60 * 1000;
+            while (pending.size) {
+              for (const workflow_id of [...pending]) {
+                const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                  owner, repo, workflow_id, event: 'push', head_sha: sha, per_page: 100
+                });
+                const matches = runs.filter(run => run.head_sha === sha && run.head_branch === tag);
+                matches.sort((a, b) => b.id - a.id);
+                if (matches[0]?.status === 'completed') {
+                  core.info(`${workflow_id}: ${matches[0].conclusion}`);
+                  pending.delete(workflow_id);
+                }
+              }
+              if (!pending.size) break;
+              if (Date.now() >= deadline) {
+                throw new Error(`Publish workflow completion timed out: ${[...pending].join(', ')}`);
+              }
+              await new Promise(resolve => setTimeout(resolve, 30000));
+            }
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version-gate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check every public registry artifact
+        working-directory: .
+        env:
+          RELEASE_VERSION: ${{ needs.version-gate.outputs.version }}
+        run: python3 .github/scripts/check_registry_completion.py --version "$RELEASE_VERSION"
+
   publish:
     name: Publish to npm
     needs: [version-gate, build, manifest]
