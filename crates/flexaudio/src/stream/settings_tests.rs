@@ -214,3 +214,78 @@ fn omitted_options_report_defaults_while_retaining_backend_options() {
     assert_eq!(entry.outcome, SettingOutcome::NotRequested);
     stream.stop_checked().unwrap();
 }
+
+#[test]
+fn attachment_switch_preflight_matches_public_report_and_commits_only_on_success() {
+    let config = StreamConfig {
+        secondary_output: Some(crate::OutputFormat {
+            sample_rate: 16_000,
+            channels: 1,
+        }),
+        ..Default::default()
+    };
+    let attachments = crate::SettingsAttachments::new()
+        .denoise(true)
+        .vad(true)
+        .secondary_encoding("s16")
+        .fixed_at_open([SettingKey::Denoise]);
+    let mut stream = crate::open_using(
+        config.clone(),
+        OpenOptions::new().settings_attachments(attachments.clone()),
+        |_, _| Ok(Box::new(Backend::new(false))),
+    )
+    .unwrap();
+    stream.set_denoise(true);
+    stream.start().unwrap();
+    let previous = stream.effective_settings().unwrap().clone();
+    let options = OpenOptions::new()
+        .strict(true)
+        .settings_attachments(attachments);
+    let expected = crate::resolve_settings(
+        &crate::SettingsRequest::new(config.clone())
+            .open_options(&options)
+            .previous(&previous),
+    )
+    .unwrap();
+    let error = stream
+        .switch_source_using(config.clone(), None, Some(options), |_, _| {
+            panic!("strict attachment rejection must precede native construction")
+        })
+        .unwrap_err();
+    assert_eq!(error.ignored_settings(), Some(&expected));
+    assert_eq!(stream.effective_settings(), Some(&previous));
+
+    let options = OpenOptions::new().settings_attachments(
+        crate::SettingsAttachments::new()
+            .denoise(false)
+            .omitted_on_switch([
+                SettingKey::Vad,
+                SettingKey::SecondaryOutput,
+                SettingKey::SecondaryEncoding,
+            ]),
+    );
+    let expected = crate::resolve_settings(
+        &crate::SettingsRequest::new(config.clone())
+            .open_options(&options)
+            .previous(&previous),
+    )
+    .unwrap();
+    stream
+        .switch_source_using(config, Some(false), Some(options), |_, _| {
+            Ok(Box::new(Backend::new(false)))
+        })
+        .unwrap();
+    assert_eq!(stream.effective_settings(), Some(&expected));
+    assert_eq!(
+        expected.get(SettingKey::Vad).unwrap().effective,
+        SettingValue::Bool(true)
+    );
+    assert_eq!(
+        expected
+            .get(SettingKey::SecondaryEncoding)
+            .unwrap()
+            .effective,
+        SettingValue::Text("s16".into())
+    );
+    stream.stop_checked().unwrap();
+}

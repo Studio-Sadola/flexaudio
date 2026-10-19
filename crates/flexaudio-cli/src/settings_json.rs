@@ -101,10 +101,18 @@ mod tests {
             value(&SettingValue::Format(flexaudio::OutputFormat::default())),
             json!({"sampleRate":48000,"channels":2})
         );
+        let report = flexaudio::resolve_settings(
+            &flexaudio::SettingsRequest::new(flexaudio::StreamConfig {
+                gain: 2.0,
+                ..Default::default()
+            })
+            .attachments(
+                flexaudio::SettingsAttachments::new().legacy_sentinels([SettingKey::Gain]),
+            ),
+        )
+        .unwrap();
         assert_eq!(
-            outcome(&SettingOutcome::Adjusted(
-                flexaudio::AdjustmentReason::LegacySentinel
-            )),
+            outcome(&report.get(SettingKey::Gain).unwrap().outcome),
             json!({"status":"adjusted","reason":"legacySentinel"})
         );
     }

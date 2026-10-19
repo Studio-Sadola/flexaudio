@@ -223,7 +223,7 @@ impl Stream {
         &self,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let report = self.settings.report.as_ref().ok_or_else(|| {
+        let report = self.capture_settings().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "custom backend has no capture settings report",
             )
@@ -321,6 +321,18 @@ impl Stream {
             Some(enabled) => options.windows_classic_loopback_keepalive(enabled),
             None => options,
         };
+        let options = options
+            .strict(strict.unwrap_or(self.settings.strict))
+            .settings_attachments(
+                crate::settings::Request {
+                    config: &config,
+                    keepalive: windows_classic_loopback_keepalive,
+                    denoise,
+                    vad: self.vad_tap.is_some(),
+                    secondary: self.secondary.as_ref(),
+                }
+                .attachments(true),
+            );
 
         self.switch_with(
             config,
@@ -453,17 +465,17 @@ pub fn open(
             flexaudio_denoise::DenoiseError::InvalidChannels(output_channels),
         ));
     }
-    crate::settings::validate(&config, true).map_err(to_py_err)?;
+    crate::settings_validation::validate(&config, true).map_err(to_py_err)?;
     let strict = strict.unwrap_or(false);
-    let report = crate::settings::Request {
+    let request = crate::settings::Request {
         config: &config,
         keepalive: Some(windows_classic_loopback_keepalive),
         denoise,
         vad: vad.is_some(),
         secondary: secondary_output,
-    }
-    .resolve(None, strict)
-    .map_err(to_py_err)?;
+    };
+    request.resolve(None, strict).map_err(to_py_err)?;
+    let attachments = request.attachments(false);
     let vad_tap = vad
         .map(|options| {
             flexaudio_vad::VadTap::new(
@@ -479,6 +491,8 @@ pub fn open(
     let stream = fa::open_with_options(
         config,
         fa::OpenOptions::new()
+            .strict(strict)
+            .settings_attachments(attachments)
             .windows_classic_loopback_keepalive(windows_classic_loopback_keepalive),
     )
     .map_err(to_py_err)?;
@@ -500,7 +514,8 @@ pub fn open(
         lifecycle_events: Default::default(),
         capture_events: Default::default(),
         settings: crate::settings::SettingsState {
-            report: Some(report),
+            #[cfg(test)]
+            report: None,
             strict,
         },
     })

@@ -1,7 +1,8 @@
 //! Facade settings preflight, before constructing any native backend.
 
-use crate::settings_resolver::{resolve_settings, SettingsPlatform, SettingsRequest};
-use crate::{Error, OpenOptions, Result, SettingsReport, StreamConfig};
+use crate::{
+    resolve_settings, Error, OpenOptions, Result, SettingsReport, SettingsRequest, StreamConfig,
+};
 
 pub(crate) fn preflight(
     config: &StreamConfig,
@@ -10,27 +11,21 @@ pub(crate) fn preflight(
     previous: Option<&SettingsReport>,
     retain_options: bool,
 ) -> Result<SettingsReport> {
-    let mut request = SettingsRequest::new(config.clone());
-    request.windows_classic_loopback_keepalive = options.windows_classic_loopback_keepalive;
+    let mut request = SettingsRequest::new(config.clone()).open_options(options);
     if retain_options {
-        request.retained_windows_classic_loopback_keepalive =
-            Some(options.windows_classic_loopback_keepalive);
+        request.keepalive = None;
+        request.attachments.denoise = None;
+        request.attachments.vad = None;
+        request.attachments.secondary_encoding = None;
+        request.attachments.legacy_sentinels.clear();
     }
-    request.denoise = denoise.unwrap_or(false);
-    if denoise.is_none() {
-        request.retained_denoise = previous
-            .and_then(|report| report.get(crate::SettingKey::Denoise))
-            .and_then(|entry| match entry.effective {
-                crate::SettingValue::Bool(value) => Some(value),
-                _ => None,
-            });
+    if let Some(enabled) = denoise {
+        request.attachments.denoise = Some(enabled);
     }
-    let report = resolve_settings(
-        &request,
-        SettingsPlatform::current(),
-        std::process::id(),
-        previous,
-    )?;
+    if let Some(previous) = previous {
+        request = request.previous(previous);
+    }
+    let report = resolve_settings(&request)?;
     if options.strict && report.has_ignored() {
         Err(Error::IgnoredSettings { report })
     } else {

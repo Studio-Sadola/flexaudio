@@ -46,6 +46,7 @@ mod marshal;
 mod pcm_buffer;
 mod secondary;
 mod settings;
+mod settings_validation;
 mod stream;
 mod vad;
 mod vad_marshal;
