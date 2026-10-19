@@ -15,8 +15,8 @@ pub const FLEX_VAD_UNSUPPORTED_TAP: i32 = -100;
 pub const FLEX_VAD_UNSUPPORTED_CONVERSION_CLOCK: i32 = -101;
 pub const FLEX_VAD_EPOCH_START: u32 = 6;
 
-/// Fixed-width stream VAD attachment settings. v1/v2 support only the primary tap;
-/// v3 also supports the secondary tap when secondary output is configured.
+/// Fixed-width stream VAD attachment settings. v1 has no attached VAD; v2 supports
+/// the primary tap. v3/v4 also support the secondary tap when secondary output is configured.
 #[repr(C)]
 pub struct FlexStreamVadOptions {
     pub params: FlexVadOptions,

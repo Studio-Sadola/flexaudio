@@ -879,7 +879,7 @@ pub unsafe extern "C" fn flexaudio_devices_free(arr: *mut FlexDeviceInfo, count:
 /// Return 0 on success. If there are no candidates, an empty result (`out_array=NULL` /
 /// `out_count=0`) is still successful: per-process capture is available, but there are no
 /// matching processes now. Free the allocated array **once only** with
-/// `flexaudio_processes_free`. Return `FLEX_FAILURE` (with the reason in `flexaudio_last_error`)
+/// `flexaudio_processes_free`. Return a typed negative result code (with the reason in `flexaudio_last_error`)
 /// if per-process capture is unavailable in this environment (PipeWire is unreachable on
 /// Linux; macOS is earlier than 14.4; Windows is older than build 20348 (Windows 11 / Windows
 /// Server 2022 or later is required); the OS is unsupported; or access is denied), if the OS does

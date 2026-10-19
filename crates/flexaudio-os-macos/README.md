@@ -6,8 +6,9 @@ Process Taps via [objc2-core-audio](https://crates.io/crates/objc2-core-audio).
 Provides two `CaptureBackend` implementations:
 
 - **`MacSystemBackend`** — records the full system audio output mix via a Core
-  Audio process tap with an EXCLUDE-self configuration (captures everything playing
-  on the system). The macOS equivalent of WASAPI loopback on Windows.
+  Audio process tap with an empty exclusion set by default (captures everything
+  playing on the system). `exclude_self` opts into excluding the calling process.
+  The macOS equivalent of WASAPI loopback on Windows.
 - **`MacProcessBackend`** — records audio from a specific process (INCLUDE tap),
   or everything except that process (EXCLUDE tap), using `CATapDescription` →
   process tap → private aggregate device → `IOProc` callback.
@@ -35,8 +36,8 @@ restrict eligibility; query failures, missing delivery, dropped samples, negativ
 zero, nonzero samples, and unknown routing reset the observation window.
 
 The probe renders a roughly 300 ms, phase-coded 1 kHz signal at amplitude `1e-5`
-on the default output, designed to be inaudible, and captures only our own process
-through a separate private tap. Recognizing the signal suppresses the warning.
+on the default output. This low-level signal is not guaranteed inaudible. A separate
+private tap captures only our own process. Recognizing the signal suppresses the warning.
 Proven rendering with continuously exact-zero diagnostic capture produces terminal
 `Event::PermissionDenied { permission: Permission::SystemAudio, detail }` with
 System Audio Recording privacy-setting and restart/retry guidance. Setup failures,

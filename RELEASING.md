@@ -1,23 +1,21 @@
 # Releasing flexaudio
 
-Releases are cut by pushing a version tag (e.g. `v0.3.1`), which triggers the
+Releases are cut by pushing a version tag (`v<version>`), which triggers the
 three workflows in `.github/workflows/release-*.yml`.
 
 ```bash
-git tag v0.3.1
-git push origin v0.3.1
+git tag v<version>
+git push origin v<version>
 ```
 
-## Registry status — 0.3.0
+## Before tagging
 
-Verified on 2026-10-07: version 0.3.0 is published on all three registries.
-The next release is 0.4.0, which includes breaking API changes.
-
-| Registry | Status | Notes |
-|---|---|---|
-| **crates.io** | ✅ published | All nine crates. |
-| **PyPI** | ✅ published | Wheels (Linux x64/arm64, macOS arm64, Windows x64) + sdist. |
-| **npm** | ✅ published | Main package + all five platform packages, all with npm provenance. |
+- Run `python3 .github/scripts/check-release-versions.py --workspace`; the
+  manifest and documentation version checks must pass for the intended tag.
+- Have two independent reviewers audit every documentation file against the
+  code: versions, names, behavior, missing features on each registry page, and
+  Japanese/English agreement. Fix every finding before continuing.
+- Complete the release checks below, then create and push the version tag.
 
 There are **five npm platforms**: Linux x64/arm64, macOS arm64 (Apple Silicon),
 and Windows x64/arm64. There are **four wheel platforms**: Linux x64/arm64,
@@ -69,6 +67,20 @@ version in `bindings/flexaudio-py/pyproject.toml`, the main npm package version,
 every npm platform package version, and all main npm `optionalDependencies`
 versions. Missing or malformed version fields fail the gate.
 
+The same gate checks tracked READMEs, Markdown under `docs/`, and Node, Python,
+and C declaration comments. Installation requirements and "Pin to" advice must
+use the release's minor or exact version; pip ranges may use the next minor as
+an exclusive upper bound. Registry README repository links must use the exact
+`v<version>` tag, and relative links must stay inside the package directory.
+CI uses `--workspace` to read the version from `Cargo.toml`; release workflows
+use the tag version, including for resolved-tag publication retries.
+
+Only `CHANGELOG.md`, sections under an exact `History` or `Migration` heading,
+and lines containing the whole word `history`, `since`, `previously`, or the
+phrase `migration from` (case insensitive) exempt historical version references.
+An exemption ends at the next heading of the same or higher level. Historical
+sections do not exempt broken relative registry links.
+
 Platform manifests under `crates/flexaudio-napi/npm/` are generated during the
 npm release; a source checkout may have none. After generation the workflow
 runs the same gate again with `--require-platforms`, which also requires the
@@ -80,7 +92,8 @@ before publishing or running packaging validation.
 Check a checkout locally with Python 3.11 or newer:
 
 ```bash
-python3 .github/scripts/check-release-versions.py --version 0.3.1
+python3 .github/scripts/check-release-versions.py --workspace
+python3 .github/scripts/check-release-versions.py --version <version>
 python3 -m unittest discover -s .github/scripts -p test_check_release_versions.py -v
 ```
 
@@ -154,8 +167,8 @@ responses. Each request has a bounded timeout; the final inspection can add
 at most one short request per remaining artifact beyond the propagation wait.
 
 ```bash
-python3 .github/scripts/check_registry_completion.py --version 0.7.0
-python3 .github/scripts/check_registry_completion.py --version 0.7.0 --wait-seconds 0
+python3 .github/scripts/check_registry_completion.py --version <version>
+python3 .github/scripts/check_registry_completion.py --version <version> --wait-seconds 0
 ```
 
 Use `--wait-seconds` and `--interval-seconds` to adjust propagation polling.

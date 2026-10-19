@@ -1,10 +1,10 @@
 # flexaudio
 
-Version 0.6.0 replaces the two earlier VAD APIs with one generic `Vad`.
-See the [0.6.0 migration table](CHANGELOG.md#060---2026-10-15).
-The 0.5.x series is deprecated.
+See the [changelog](CHANGELOG.md) for release changes and migration guidance.
+Historical VAD migration: the [0.6.0 migration table](CHANGELOG.md#060---2026-10-15)
+documents the replacement of the deprecated 0.5.x VAD APIs with one generic `Vad`.
 
-Rust capture migration from 0.4: `AudioChunk` and `SecondaryChunk` struct literals must
+Historical Rust capture migration from 0.4 to 0.5: `AudioChunk` and `SecondaryChunk` struct literals must
 include the new public `frame_index: u64` field. It is the first frame's index
 on the tap's canonical 48 kHz timeline, continues across reopen, and exposes
 queue drops as gaps. Set it from the producing timeline when constructing
@@ -59,7 +59,7 @@ Three capture sources × three operating systems. ✅ = implemented and verified
   `Error::Unsupported`.
 - Per-process capture requires a `target_pid` in `StreamConfig`.
 - `SourceKind::Mix` combines microphone and system capture on all three platforms.
-- **0.6 VAD:** one generic `Vad` provides streaming segmentation, frame
+- **VAD:** one generic `Vad` provides streaming segmentation, frame
   probabilities, provisional hints and an attached capture tap in Rust, Node.js,
   Python and C. Its embedded Silero model runs offline.
 - **Typed diagnostics:** inspect loss, clipping, permission and recoverable/fatal
@@ -301,19 +301,19 @@ statuses `supported`, `unavailable`, and `unknown`; Python uses the same tags.
 
 ```toml
 [dependencies]
-flexaudio = "0.6"
+flexaudio = "0.8"
 ```
 
 or:
 
 ```sh
-cargo add flexaudio@0.6
+cargo add flexaudio@0.8
 ```
 
 The Voice Activity Detection add-on is a separate crate:
 
 ```sh
-cargo add flexaudio-vad@0.6
+cargo add flexaudio-vad@0.8
 ```
 
 ---
@@ -434,7 +434,8 @@ To preserve identical segmentation, migrate with
 `maxSpeechMs = trunc(seconds) * 1000` (for example, 30.9 seconds becomes 30000 ms).
 
 Standalone Node.js `process(samples, inputSampleRate?, inputChannels?)` defaults
-to 16000 Hz and one channel. Python uses `input_sample_rate` and `input_channels`
+to 16000 Hz and one channel. Standalone conversion accepts 8000–192000 Hz and
+positive channel counts. Python uses `input_sample_rate` and `input_channels`
 with the same defaults. Rust uses `process_pcm(samples,
 input_sample_rate, input_channels)` for converted input and `process(samples)` for
 16 kHz mono. Accepted input formats are converted internally; event times remain
@@ -517,7 +518,7 @@ Neither index is an offset into concatenated delivered PCM: pause and queue drop
 advance indices without delivering samples.
 
 An arrival gap without reopen emits no event or `DISCONTINUITY`: `frameIndex`
-remains contiguous, only primary `ptsNs` jumps, and attached Vad keeps its
+remains contiguous, primary and secondary arrival labels can jump, and attached Vad keeps its
 epoch open. A stall (at least 2 s without consumed samples, checked every 250 ms)
 emits `stalled` and attempts to reopen. Each failed reopen attempt emits
 `recoverableError` and backs off from 250 ms to 5 s. After a successful reopen,
@@ -553,9 +554,10 @@ model/conversion causes remain ordered related errors rather than replacing the
 primary. Rust `InferenceError::Multiple`, `VadError::Cause` and
 `VadTapError::Cause` arms retain those typed causes.
 
-VAD failures preserve typed model, converter and session causes. Attached source
-switches close the old epoch through the shared gap lifecycle before replacing
-the attachment. Event-only carriers deliver closure without inventing PCM.
+VAD failures preserve typed model, converter and session causes. The VAD attachment
+persists across source switches; the next discontinuous capture chunk closes the
+old epoch through the shared gap lifecycle and starts a new one. Event-only
+carriers deliver closure without inventing PCM.
 
 An inconclusive macOS self-probe preserves its native reason and emits an existing
 `RecoverableError` alongside the silence advisory; capture remains usable.
@@ -585,8 +587,8 @@ a safe explanation. Handle `AudioLoss`, `Clipped`, `RecoverableError`,
 subsequent output `DISCONTINUITY`; `PADDED=8` and `CLIPPED=16` describe output
 integrity. Peak/RMS reflect delivered samples after denoise/gain in every binding.
 
-For Node.js, use bigint arithmetic for u64 counters (including VAD `seq`,
-chunk-drop and loss counts); PTS stays number. Chunk interfaces require
+For Node.js, use bigint arithmetic for chunk `seq`, VAD `captureSample`,
+chunk-drop and loss counts. VAD event `seq` and `epoch`, and PTS, use number. Chunk interfaces require
 `frameIndex`, and event types are closed discriminated unions. Lifecycle getters
 `terminalError()` / `shutdownReport()` return `undefined` when absent. Callback
 exceptions surface as `uncaughtException`.
@@ -834,10 +836,11 @@ rejects `stop()` on capture or cleanup failure; provide `onEvent` for immediate
 notifications and inspect `shutdownReport()`. Python `poll_chunk()` raises a typed
 `RuntimeError` subclass on terminal failure; `terminal_error()` returns the
 stored `AudioError` without consuming events. C v1 `flexaudio_poll_chunk()` returns
-`FLEX_FAILURE` (-2) for a terminal capture error. C v2 `flexaudio_poll_chunk_v2()`
-and `flexaudio_terminal_error()` return the primary root result code (for example,
-`FLEX_PERMISSION_DENIED` (-7) or `FLEX_FAILURE` (-2) for a backend failure), with
-the safe explanation in `flexaudio_last_error()`. Permission event kind remains 3 in C. N-API/Python
+`FLEX_FAILURE` (-2) for a terminal capture error, as do `flexaudio_terminal_error()`
+and C v2 `flexaudio_poll_chunk_v2()`. The safe explanation is in `flexaudio_last_error()`.
+To inspect the typed root code, obtain an owned error with
+`flexaudio_terminal_error_info_v2()`, read `flexaudio_error_kind_v2()`, and release it
+with `flexaudio_error_info_free_v2()`. Permission event kind remains 3 in C. N-API/Python
 permission events keep type `permissionDenied` and add `permission`
 (`microphone` or `systemAudio`) and `message`.
 
@@ -880,7 +883,7 @@ permission events keep type `permissionDenied` and add `permission`
   capture generation. Zero samples plus output activity alone cannot distinguish
   missing recording permission from genuine digital silence.
 - The self-probe renders a roughly 300 ms, phase-coded 1 kHz signal at amplitude
-  `1e-5` on the default output, designed to be inaudible. A separate private tap
+  `1e-5` on the default output. This low-level signal is not guaranteed inaudible. A separate private tap
   captures only our own process to check for that diagnostic signal. Recognizing
   the signal suppresses the silence warning. If native output callbacks prove
   the signal was submitted while the diagnostic tap continuously captures only

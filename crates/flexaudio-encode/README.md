@@ -7,8 +7,8 @@ to a half of that, bit-exact at 16-bit. Encoding is pure Rust ([flacenc]), runs
 **fully offline**, and memory usage stays constant no matter how long the
 recording gets.
 
-This crate is independent of `flexaudio-core`: it consumes a plain `&[f32]`
-sample stream, so you can pair it with any audio source.
+This crate uses `flexaudio-core` for sample quantization, but needs no capture
+stream: it consumes plain `&[f32]` samples from any audio source.
 
 ## Example
 

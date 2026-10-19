@@ -10,7 +10,7 @@ Provides two `CaptureBackend` implementations:
   audio flowing to the default render endpoint).
 - **`WasapiProcessBackend`** — process-tree loopback via
   `ActivateAudioInterfaceAsync` + `AUDIOCLIENT_ACTIVATION_PARAMS`, which captures
-  audio from a specific PID (and its child processes). Setting `exclude_self`
+  audio from a specific PID (and its child processes). Setting `ProcessMode::Exclude`
   inverts the filter to capture all system audio except that process tree.
 
 Because WASAPI COM interfaces are `!Send`, all COM initialization, capture, and

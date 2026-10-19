@@ -112,10 +112,34 @@ reports `Event::StreamStalled` and reopens repeatedly until audio plays.
 replaces them together with the source; ordinary `switch_source` retains them.
 Construction/startup failures retain the previous settings.
 
+## Settings and metadata in 0.8
+
+- `OpenOptions::new().strict(true)` rejects non-default settings that would be ignored
+  before native access. `Stream::effective_settings()` exposes the last successful
+  facade open/switch report, including after stop; custom-backend streams return
+  `None`. Failed switches retain the previous report.
+- `resolve_settings(&SettingsRequest)` resolves settings without device access or
+  model loading. `SettingsAttachments` describes processing attachments and switch
+  policy; it does not install those attachments. The resolver reports applicability
+  but does not validate capture arguments or enforce strictness itself.
+- `Stream::poll_event()` carries `Event::SilenceProbeStarted`,
+  `Event::SilenceProbeStopped`, `Event::ClassicLoopbackKeepaliveStarted`, and
+  `Event::ClassicLoopbackKeepaliveStopped`. Every emitted Started has exactly one
+  Stopped with a reason. Stopped ends helper ownership after teardown attempts;
+  it does not guarantee native cleanup succeeded.
+- `AudioChunk::arrival_ns()` and `SecondaryChunk::arrival_ns()` alias `pts_ns`
+  exactly. These arrival labels are clamped non-decreasing; use `frame_index`
+  for audio continuity. The old naming is documentation-only deprecated since
+  0.8 and retained throughout 0.9.
+- `devices_with_namespaces()` preserves selectable device IDs and adds provider
+  provenance; namespace tags do not promise persistent hardware identity.
+- `StreamConfig::ring_capacity_chunks` sets the queue capacity at open; the default
+  is 50 chunks.
+
 ## Install
 
 ```sh
-cargo add flexaudio@0.4
+cargo add flexaudio@0.8
 ```
 
 ## Permissions
@@ -123,7 +147,7 @@ cargo add flexaudio@0.4
 Audio capture requires user consent: macOS TCC (`kTCCServiceAudioCapture`, add
 `NSAudioCaptureUsageDescription` to `Info.plist`), the Windows Microphone privacy
 setting, and a running PipeWire session on Linux for system/process capture. See
-the [workspace README](https://github.com/Studio-Sadola/flexaudio#os-specific-permission-requirements).
+the [workspace README](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#os-specific-permission-requirements).
 
 On macOS, system/process loopback (Core Audio process taps) requires macOS 14.4
 or later.
@@ -135,4 +159,4 @@ Rust **1.85**.
 ## License
 
 [MIT](LICENSE) © 2026 tubome / Studio Sadola. Third-party notices:
-[`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md).
+[`THIRD_PARTY_NOTICES.md`](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/THIRD_PARTY_NOTICES.md).

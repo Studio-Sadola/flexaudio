@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > changes; **patch** bumps (`0.2.0 → 0.2.1`) remain backward-compatible. Pin to
 > `0.8` to receive only compatible updates.
 
+## [0.8.1] - 2026-10-20
+
+### Fixed
+
+- Documentation: refresh installation pins and release-neutral introductions;
+  correct capture, exclusion, arrival-label, VAD, error-code, and denoise examples
+  against the current implementation.
+- Documentation: cover Rust settings and metadata APIs, use release-tagged links
+  on registry pages, and describe CLI diagnostics through public capture flags.
+
 ## [0.8.0] - 2026-10-20
 
 ### Added
@@ -1006,7 +1016,8 @@ The first Rust workspace release — a ground-up Rust rewrite of the earlier pro
   publication and interactive approval of new packages in scopes
   requiring 2FA. (1840fbb)
 
-[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/Studio-Sadola/flexaudio/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/Studio-Sadola/flexaudio/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Studio-Sadola/flexaudio/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/Studio-Sadola/flexaudio/compare/v0.6.1...v0.6.2

@@ -36,15 +36,15 @@ assert_eq!(tail.len(), FRAME_SIZE);
 
 ## With flexaudio
 
-`flexaudio` delivers 48 kHz interleaved f32 chunks, which is exactly what
-`Denoiser` consumes — denoise the microphone stream before encoding or
-transcription:
+`flexaudio` defaults to 48 kHz stereo interleaved f32 chunks; its output rate is
+configurable, but `Denoiser` requires 48 kHz. With a stream configured for
+48 kHz stereo, denoise the microphone stream before encoding or transcription:
 
 ```rust,ignore
 let mut dn = flexaudio_denoise::Denoiser::new(2).unwrap();
-while let Some(mut chunk) = capture.next_chunk() {
-    dn.process(&mut chunk).unwrap();
-    sink.write(&chunk);
+while let Some(mut chunk) = stream.poll_chunk() {
+    dn.process(&mut chunk.data).unwrap();
+    sink.write(&chunk.data);
 }
 sink.write(&dn.flush());
 ```

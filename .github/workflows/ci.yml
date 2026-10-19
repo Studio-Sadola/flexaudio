@@ -48,6 +48,8 @@ jobs:
           python-version: '3.12'
       - name: Test release version validation
         run: python3 -m unittest discover -s .github/scripts -p "test_*.py" -v
+      - name: Check workspace release versions and documentation
+        run: python3 .github/scripts/check-release-versions.py --workspace
 
   binding-capability-matrix:
     name: Binding capability matrix

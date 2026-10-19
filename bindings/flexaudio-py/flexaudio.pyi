@@ -452,10 +452,10 @@ class ProcessInfo:
     def is_output_active(self) -> Optional[bool]: ...
 
 class AudioChunk:
-    """pts_ns is an arrival-time label re-anchored on every native callback.
+    """pts_ns is an arrival-time label assigned at facade ingest and clamped non-decreasing.
 
-    Callback jitter may overlap chunks or leave gaps; no non-overlap or bounded-monotonic
-    guarantee. frame_index is authoritative (gaps are loss). Exact VAD mapping uses
+    Callback jitter may cause overlapping ranges, repeated labels or gaps; this is not
+    a media clock. frame_index is authoritative (gaps are loss). Exact VAD mapping uses
     epoch_start.pts_ns + t_ms*1_000_000, or epoch_start.capture_sample + t_ms*48.
     """
     @property
@@ -501,7 +501,7 @@ class StreamEvent:
     generation's first chunk. Event-first callers drain the ordinary FIFO event
     queue before PCM to observe the notice first. PCM polling does not wait for event polling.
     Arrival gaps without reopen emit no event/DISCONTINUITY: frame_index stays
-    contiguous, only primary pts_ns jumps, and attached Vad keeps its epoch open.
+    contiguous, primary and secondary arrival labels can jump, and attached Vad keeps its epoch open.
     Stall: >=2 s without consumed samples, checked every 250 ms; stalled, reopen,
     each failed reopen attempt emits recoverableError and backs off 250 ms..5 s.
     On success, recovered is emitted when new PCM arrives. First new-generation primary
@@ -511,9 +511,10 @@ class StreamEvent:
     macOS microphone capture requires decided consent before each start; it does
     not continuously monitor authorization changes or permission revocation.
 
-    On macOS, system/process capture can confirm SystemAudio denial with an active
-    self-probe after sustained exact zeros and eligible external output activity.
-    Its separate private tap captures our own diagnostic output; this signal may
+    On macOS, system/process capture, including the system lane of Mix, can confirm
+    SystemAudio denial with a once-per-generation self-probe after five continuous
+    seconds of exact zeros and eligible external output activity. Its low-level signal
+    is not guaranteed inaudible. Its separate private tap captures our own diagnostic output; this signal may
     also enter user capture if our process is included. An inconclusive probe is
     advisory only. Stopping cancels the probe without a late event.
     """
@@ -783,7 +784,7 @@ class VadRuntimeError(RuntimeError):
 class Vad:
     """Accepts float sequences or contiguous 1-D native float32 buffers.
 
-    Input defaults to mono16k. Other positive rates/channel counts are converted internally;
+    Input defaults to mono16k. Rates of 8000–192000 Hz and positive channel counts are converted internally;
     event milliseconds use the input timeline with converter group delay compensated.
     After raw input validation, finite resampler overshoot is clipped internally to [-1, 1].
     max_speech_ms=0 or values above 100000000 use the effectively unbounded
@@ -844,9 +845,9 @@ def devices() -> List[DeviceInfo]:
     """Collection/count failure raises a typed exception; per-entry metadata stays unknown.
 
     On macOS, enumeration never prompts. With undecided microphone consent it
-    raises a typed Backend error before any HAL/device/format query. Grant the
+    raises BackendError before any HAL/device/format query. Grant the
     responsible host access or use the bounded capture-open consent flow, then retry.
-    Denied/restricted consent raises PermissionDenied. Unreadable mandatory formats
+    Denied/restricted consent raises RecordingPermissionError. Unreadable mandatory formats
     use format_available=False and 0/0; other entries stay usable. Collection/count
     failures raise; entries without readable selectable identity may be omitted.
     Windows enumeration does not preflight microphone permission; native enumeration

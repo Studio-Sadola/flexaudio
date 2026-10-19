@@ -20,6 +20,7 @@ class ReleaseVersionTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        subprocess.run(["git", "init", "--quiet", str(self.root)], check=True, capture_output=True)
         self.write("Cargo.toml", '[workspace.package]\nversion = "0.3.0"\n')
         self.write("bindings/flexaudio-py/pyproject.toml", '[project]\nversion = "0.3.0"\n')
         self.write_json("crates/flexaudio-napi/package.json", {
@@ -53,11 +54,21 @@ class ReleaseVersionTests(unittest.TestCase):
 
     def test_matching_version_and_tag(self) -> None:
         for arguments in (("--version", VERSION), ("--tag", "v0.3.0"),
+                          ("--workspace",),
                           ("--version", VERSION, "--require-platforms")):
             with self.subTest(arguments=arguments):
                 result = self.run_gate(*arguments)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("Release versions match 0.3.0", result.stdout)
+
+    def test_documentation_is_required_for_every_version_source(self) -> None:
+        self.write("README.md", '# Install\nflexaudio = "0.2"\n')
+        subprocess.run(["git", "-C", str(self.root), "add", "README.md"], check=True, capture_output=True)
+        for arguments in (("--version", VERSION), ("--tag", "v0.3.0"), ("--workspace",)):
+            with self.subTest(arguments=arguments):
+                result = self.run_gate(*arguments)
+                self.assert_failure(result, 'README.md:2:')
+                self.assertIn('flexaudio = "0.2"', result.stderr)
 
     def test_invalid_tags_and_versions(self) -> None:
         for tag in ("0.3.0", "v0.3", "v0.3.0-rc.1", "v0.3.0\n", "v０.3.0", "v0.3.0;echo bad"):

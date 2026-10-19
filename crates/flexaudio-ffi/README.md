@@ -22,11 +22,12 @@ the `flexaudio_watch_devices` family.
 Use `flexaudio_processes` to list candidates for per-process capture: processes with audio
 output sessions / streams, excluding the current process. Processes whose audio sessions are
 stopped or idle are also included. Free it **exactly once** with `flexaudio_processes_free`
-(each entry is a `FlexProcessInfo`). Pass `pid` to `FlexConfig::process_id`. If unavailable,
+(each entry is a `FlexProcessInfo`). Pass `pid` to `FlexConfig.process_id`. If unavailable,
 `executable` / `bundle_id` are NULL; `output_activity` is one of
 `FLEX_OUTPUT_ACTIVITY_UNKNOWN|INACTIVE|ACTIVE`.
 An empty result is successful (the feature is available, but there are no candidates right
-now). The call returns `FLEX_FAILURE` if per-process capture is unavailable in the current
+now). The call returns a typed negative result code, with the reason in
+`flexaudio_last_error()`, if per-process capture is unavailable in the current
 environment (PipeWire is unreachable on Linux; macOS is earlier than 14.4; Windows is older than
 build 20348 (Windows 11 / Windows Server 2022 or later is required); the OS is unsupported; or
 access is denied), if the OS does not respond within 3 seconds, or if the previous query is still
@@ -263,16 +264,20 @@ C v3 additionally permits denoise with primary output rates other than 48000 Hz.
 See the generic VAD section below for canonical capture attachment.
 
 `FlexConfig.silence_probe` accepts 0 (default enabled), 1 (enabled), or 2
-(disabled); other values are rejected. The macOS silence diagnosis probe plays
-a 1 kHz, 300 ms tone at amplitude 1e-5 after five seconds of exact-zero system
-capture. Set 2 to disable this optional diagnostic.
+(disabled); other values are rejected. On macOS, system/process capture and the
+system lane of Mix probe once per capture generation after five continuous
+seconds of bit-exact zero native samples while an eligible external captured
+process has active output (honoring exclusions and device selection). The probe
+plays a roughly 300 ms, 1 kHz signal at amplitude 1e-5. This low-level signal is
+not guaranteed inaudible and may enter capture when the host is included.
+Set 2 to disable this optional diagnostic.
 
 ## Standalone Handles (Without a Stream)
 
 ### VAD
 
 The generic VAD section below describes standalone sessions and capture
-attachment. Standalone input accepts arbitrary positive rates/channel counts,
+attachment. Standalone input accepts rates of 8000–192000 Hz and positive channel counts,
 converts internally to mono16k, and reports integer milliseconds on the input
 timeline with converter group delay compensated. After raw input validation,
 finite resampler overshoot is clipped internally to [-1, 1].
@@ -304,6 +309,13 @@ duration (streaming latency).
 ```c
 FlexDenoiser *dn = flexaudio_denoise_new(1);    // 1 = mono / 2 = stereo
 flexaudio_denoise_process(dn, samples, len);    // In-place (requires 48 kHz)
+// Write the processed samples to your sink, then retain the delayed tail.
+float *tail = NULL;
+size_t tail_len = 0;
+if (flexaudio_denoise_flush(dn, &tail, &tail_len) == FLEX_OK) {
+    // Write tail[0..tail_len] to the same sink before freeing it.
+    flexaudio_denoise_samples_free(tail, tail_len);
+}
 flexaudio_denoise_free(dn);
 ```
 
@@ -410,8 +422,9 @@ There are no audio-copying or timestamp-map APIs.
 `FlexStreamConfigV2`, `FlexChunkV2`, `flexaudio_open_v2`,
 `flexaudio_poll_chunk_v2`, and `flexaudio_chunk_free_v2` provide versioned
 configuration and chunks. Initialize the versioned config's size to `sizeof` and
-version to `FLEX_STREAM_VERSION_2`; its config pointer references `FlexConfig`. A NULL `vad` selects ordinary capture. v1/v2 reject secondary taps with a dedicated VAD status code;
-v3 accepts them when secondary output is configured. Primary attachment
+version to `FLEX_STREAM_VERSION_2`; its config pointer references `FlexConfig`. A NULL `vad` selects ordinary capture.
+v1 has no attached VAD. Primary attachment starts at v2; v2 rejects secondary VAD
+attachment with a dedicated VAD status code. v3/v4 accept it when secondary output is configured. Primary attachment
 uses producer-assigned canonical capture indices and valid tail lengths; attached
 events use a separate versioned union, including EPOCH_START=6 and its u64
 capture/i64 PTS origin. `flexaudio_flush_vad` is a no-op when disabled.
@@ -448,8 +461,8 @@ non-default effective values; existing C sentinels are decoded before comparison
 For example, a supplied capacity of 50 is not requested and retains switch
 capacity; another value is ignored with `fixedAtOpen`. Gain is also fixed at open,
 as is `config.denoise` on source switch. Use `flexaudio_set_gain` for runtime gain.
-See the root README's [ignored-setting table](../../README.md#strict-mode-and-effective-settings)
-and [complete C example](../../README.md#strict-mode-and-effective-settings).
+See the root README's [ignored-setting table](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#strict-mode-and-effective-settings)
+and [complete C example](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#strict-mode-and-effective-settings).
 Strict requests that would be ignored return `FLEX_IGNORED_SETTINGS` (-13)
 before device access, model loading, or stopping the current source. Obtain an
 owned error with `flexaudio_last_error_info_v2`, then borrow its complete candidate
@@ -483,7 +496,7 @@ Every emitted Started has exactly one Stopped: macOS Started means entry into
 a diagnostic attempt; Windows Started follows successful keepalive render start.
 Stopped ends ownership after teardown attempts, without guaranteeing native
 cleanup succeeded. Lifecycle ordering relative to PCM or ordinary events is not
-guaranteed. See [helper behavior and controls](../../README.md#optional-playback-helpers-and-lifecycle).
+guaranteed. See [helper behavior and controls](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#optional-playback-helpers-and-lifecycle).
 
 Use `flexaudio_chunk_arrival_ns_v4` and `flexaudio_secondary_arrival_ns_v4` for
 arrival time. They return the existing `pts_ns` value exactly. The old naming is
