@@ -4,7 +4,7 @@ use crate::ProcessMode;
 use crate::{
     AdjustmentReason, IgnoreReason, SettingKey, SettingOutcome, SettingValue, SettingsReport,
 };
-use crate::{Error, Result, SourceKind, StreamConfig};
+use crate::{Error, Result, SettingsRequest, SourceKind, StreamConfig};
 
 /// Platform used for static setting applicability, independent of the build target.
 #[non_exhaustive]
@@ -34,60 +34,28 @@ impl SettingsPlatform {
     }
 }
 
-/// Decoded candidate settings. Controls such as strictness are deliberately excluded.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct SettingsRequest {
-    /// Source, formats, queue capacity, and gains.
-    pub(crate) config: StreamConfig,
-    /// Windows silent-render option, default true.
-    pub(crate) windows_classic_loopback_keepalive: bool,
-    /// Effective inherited keepalive for an omitted switch option. Its request
-    /// value is still the documented default, true.
-    pub(crate) retained_windows_classic_loopback_keepalive: Option<bool>,
-    /// Canonical capture noise suppression, default false.
-    pub(crate) denoise: bool,
-    /// Effective inherited denoise for an omitted switch option. Its request
-    /// value is still the documented default, false.
-    pub(crate) retained_denoise: Option<bool>,
-    /// Attached VAD presence, default false; no model paths are recorded.
-    pub(crate) vad: bool,
-    /// Secondary encoding, default `f32`.
-    pub(crate) secondary_encoding: String,
-    /// Bindings whose processing attachments are fixed at open opt in here.
-    /// Rust explicit denoise switches leave this false.
-    pub(crate) processing_fixed_at_open: bool,
-    /// Settings decoded using an existing legacy sentinel.
-    pub(crate) legacy_sentinels: Vec<SettingKey>,
-}
-impl SettingsRequest {
-    /// A Rust capture request with the documented option defaults.
-    pub(crate) fn new(config: StreamConfig) -> Self {
-        Self {
-            config,
-            windows_classic_loopback_keepalive: true,
-            retained_windows_classic_loopback_keepalive: None,
-            denoise: false,
-            retained_denoise: None,
-            vad: false,
-            secondary_encoding: "f32".into(),
-            processing_fixed_at_open: false,
-            legacy_sentinels: Vec::new(),
-        }
-    }
-}
-
 /// Resolve every setting without native access, allocation of models, or capture mutation.
 ///
-/// `previous` selects switch semantics and supplies retained fixed-at-open values.
-/// `self_pid` is supplied by the caller so exclusion normalization remains pure.
-/// Switch request values are always compared with documented defaults.
-pub(crate) fn resolve_settings(
+/// The platform and current process ID are selected internally. Switch request values
+/// are compared with documented defaults, never with retained values. The returned
+/// report includes every [`SettingKey`], including processing attachments.
+///
+/// This does not validate capture arguments or enforce strictness. After existing
+/// argument validation, callers may reject [`SettingsReport::has_ignored`] before
+/// loading models or touching native resources.
+///
+/// # Errors
+/// Returns [`Error::InvalidState`] if the previous revision cannot be incremented.
+pub fn resolve_settings(request: &SettingsRequest) -> Result<SettingsReport> {
+    resolve_for_platform(request, SettingsPlatform::current(), std::process::id())
+}
+
+pub(crate) fn resolve_for_platform(
     request: &SettingsRequest,
     platform: SettingsPlatform,
     self_pid: u32,
-    previous: Option<&SettingsReport>,
 ) -> Result<SettingsReport> {
+    let previous = request.previous.as_ref();
     let revision = match previous {
         Some(report) => report
             .revision
@@ -121,15 +89,32 @@ pub(crate) fn resolve_settings(
         SettingKey::Denoise,
         SettingKey::Vad,
     ] {
-        let requested = value(key, c, request)?;
         let default = value(key, &d, &defaults)?;
+        let omitted_on_switch =
+            previous.is_some() && request.attachments.omitted_on_switch.contains(&key);
+        let requested = if omitted_on_switch {
+            default.clone()
+        } else {
+            value(key, c, request)?
+        };
         let reason = ignored_reason(
             key,
             c,
             platform,
             previous.is_some(),
-            request.processing_fixed_at_open,
+            &request.attachments.fixed_at_open,
         );
+        let omitted = match key {
+            SettingKey::WindowsClassicLoopbackKeepalive => request.keepalive.is_none(),
+            SettingKey::Denoise => request.attachments.denoise.is_none(),
+            SettingKey::Vad => request.attachments.vad.is_none(),
+            SettingKey::SecondaryEncoding => request.attachments.secondary_encoding.is_none(),
+            _ => false,
+        };
+        let retain_effective = previous.is_some()
+            && (omitted
+                || omitted_on_switch
+                || request.attachments.retained_on_switch.contains(&key));
         let mut effective = requested.clone();
         if reason.is_some() {
             effective = if reason == Some(IgnoreReason::FixedAtOpen) {
@@ -140,16 +125,9 @@ pub(crate) fn resolve_settings(
             } else {
                 SettingValue::Absent
             };
-        } else if previous.is_some() {
-            let retained = match key {
-                SettingKey::WindowsClassicLoopbackKeepalive => {
-                    request.retained_windows_classic_loopback_keepalive
-                }
-                SettingKey::Denoise => request.retained_denoise,
-                _ => None,
-            };
-            if let Some(retained) = retained {
-                effective = SettingValue::Bool(retained);
+        } else if retain_effective {
+            if let Some(entry) = previous.and_then(|report| report.get(key)) {
+                effective = entry.effective.clone();
             }
         }
         let mut outcome = if requested == default {
@@ -159,7 +137,7 @@ pub(crate) fn resolve_settings(
         } else {
             SettingOutcome::Applied
         };
-        if key == SettingKey::ExcludePids && reason.is_none() {
+        if key == SettingKey::ExcludePids && reason.is_none() && !retain_effective {
             let mut pids = c.exclude_pids.clone();
             if c.exclude_self {
                 pids.push(self_pid);
@@ -172,7 +150,9 @@ pub(crate) fn resolve_settings(
                 outcome = SettingOutcome::Adjusted(AdjustmentReason::ExclusionSetNormalized);
             }
         }
-        if matches!(outcome, SettingOutcome::Applied) && request.legacy_sentinels.contains(&key) {
+        if matches!(outcome, SettingOutcome::Applied)
+            && request.attachments.legacy_sentinels.contains(&key)
+        {
             outcome = SettingOutcome::Adjusted(AdjustmentReason::LegacySentinel);
         }
         entries.push((key, requested, effective, outcome));
@@ -185,7 +165,7 @@ fn ignored_reason(
     c: &StreamConfig,
     platform: SettingsPlatform,
     switch: bool,
-    fixed_processing: bool,
+    fixed_at_open: &[SettingKey],
 ) -> Option<IgnoreReason> {
     use IgnoreReason::*;
     use SettingKey::*;
@@ -193,7 +173,7 @@ fn ignored_reason(
     let exclusions = c.exclude_self || !c.exclude_pids.is_empty();
     match key {
         Gain | RingCapacityChunks if switch => Some(FixedAtOpen),
-        Denoise | Vad if switch && fixed_processing => Some(FixedAtOpen),
+        key if switch && fixed_at_open.contains(&key) => Some(FixedAtOpen),
         DeviceId if matches!(c.kind, SourceKind::ProcessLoopback | SourceKind::Mix) => {
             Some(WrongSourceKind)
         }
@@ -273,20 +253,22 @@ fn value(key: SettingKey, c: &StreamConfig, r: &SettingsRequest) -> Result<Setti
             .secondary_output
             .map(SettingValue::Format)
             .unwrap_or(SettingValue::Absent),
-        SecondaryEncoding => SettingValue::Text(r.secondary_encoding.clone()),
+        SecondaryEncoding => SettingValue::Text(
+            r.attachments
+                .secondary_encoding
+                .clone()
+                .unwrap_or_else(|| "f32".into()),
+        ),
         Gain => SettingValue::Float(c.gain),
         MixMicDeviceId => text(&c.mix_mic_device_id),
         MixSystemDeviceId => text(&c.mix_system_device_id),
         MixMicGain => SettingValue::Float(c.mix_mic_gain),
         MixSystemGain => SettingValue::Float(c.mix_system_gain),
         SilenceProbe => SettingValue::Bool(c.silence_probe),
-        WindowsClassicLoopbackKeepalive => SettingValue::Bool(
-            r.retained_windows_classic_loopback_keepalive.is_some()
-                || r.windows_classic_loopback_keepalive,
-        ),
-        Denoise => SettingValue::Bool(r.retained_denoise.is_none() && r.denoise),
+        WindowsClassicLoopbackKeepalive => SettingValue::Bool(r.keepalive.unwrap_or(true)),
+        Denoise => SettingValue::Bool(r.attachments.denoise.unwrap_or(false)),
         Vad => {
-            if r.vad {
+            if r.attachments.vad.unwrap_or(false) {
                 SettingValue::Bool(true)
             } else {
                 SettingValue::Absent

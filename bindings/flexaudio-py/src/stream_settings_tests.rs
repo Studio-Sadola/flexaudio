@@ -131,10 +131,11 @@ fn switch_commits_revision_retains_fixed_values_and_rolls_back_failures() {
             report.get(fa::SettingKey::Denoise).unwrap().outcome,
             fa::SettingOutcome::Applied
         );
-        assert_eq!(
-            report.get(fa::SettingKey::Gain).unwrap().outcome,
-            fa::SettingOutcome::Ignored(fa::IgnoreReason::FixedAtOpen)
-        );
+        let fa::SettingOutcome::Ignored(reason) = report.get(fa::SettingKey::Gain).unwrap().outcome
+        else {
+            panic!("gain switch must be ignored");
+        };
+        assert_eq!(reason.as_str(), "fixedAtOpen");
         stream.stop().unwrap();
     });
 }

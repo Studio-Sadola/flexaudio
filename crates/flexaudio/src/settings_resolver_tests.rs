@@ -4,6 +4,17 @@ use crate::settings_resolver::*;
 use crate::ProcessMode;
 use crate::*;
 
+fn resolve_settings(
+    request: &SettingsRequest,
+    platform: SettingsPlatform,
+    self_pid: u32,
+    previous: Option<&SettingsReport>,
+) -> Result<SettingsReport> {
+    let mut request = request.clone();
+    request.previous = previous.cloned();
+    resolve_for_platform(&request, platform, self_pid)
+}
+
 fn requested(r: &mut SettingsRequest, key: SettingKey) {
     match key {
         SettingKey::DeviceId => r.config.device_id = Some("selector".into()),
@@ -16,11 +27,11 @@ fn requested(r: &mut SettingsRequest, key: SettingKey) {
         SettingKey::MixMicGain => r.config.mix_mic_gain = 2.0,
         SettingKey::MixSystemGain => r.config.mix_system_gain = 2.0,
         SettingKey::SilenceProbe => r.config.silence_probe = false,
-        SettingKey::WindowsClassicLoopbackKeepalive => r.windows_classic_loopback_keepalive = false,
+        SettingKey::WindowsClassicLoopbackKeepalive => r.keepalive = Some(false),
         SettingKey::Gain => r.config.gain = 2.0,
         SettingKey::RingCapacityChunks => r.config.ring_capacity_chunks = 7,
-        SettingKey::Denoise => r.denoise = true,
-        SettingKey::Vad => r.vad = true,
+        SettingKey::Denoise => r.attachments.denoise = Some(true),
+        SettingKey::Vad => r.attachments.vad = Some(true),
         _ => panic!("matrix key must have a non-default test value"),
     }
 }
@@ -102,7 +113,7 @@ fn every_ignored_matrix_cell_and_its_default_value() {
             kind,
             ..Default::default()
         });
-        r.processing_fixed_at_open = true;
+        r.attachments.fixed_at_open = vec![Denoise, Vad];
         if exclusions {
             r.config.exclude_pids = vec![99];
         }
@@ -171,7 +182,7 @@ fn defaults_applied_values_and_normalization() {
         SettingValue::Pids(vec![100])
     );
     r.config.gain = 2.0;
-    r.legacy_sentinels = vec![SettingKey::Gain];
+    r.attachments.legacy_sentinels = vec![SettingKey::Gain];
     let report = resolve_settings(&r, SettingsPlatform::MacOs, 100, None).unwrap();
     assert_eq!(
         report.get(SettingKey::Gain).unwrap().outcome,
@@ -201,7 +212,7 @@ fn switch_defaults_compare_with_defaults_and_retain_fixed_values() {
     );
     r.config.gain = 1.0;
     r.config.ring_capacity_chunks = 50;
-    r.denoise = true;
+    r.attachments.denoise = Some(true);
     let report = resolve_settings(&r, SettingsPlatform::Linux, 100, Some(&initial)).unwrap();
     for key in [SettingKey::Gain, SettingKey::RingCapacityChunks] {
         assert_eq!(
@@ -333,7 +344,7 @@ fn applicable_platform_rows_apply_without_discovery() {
             SettingOutcome::Applied
         );
         if kind != SourceKind::ProcessLoopback {
-            request.windows_classic_loopback_keepalive = false;
+            request.keepalive = Some(false);
             let report = resolve_settings(&request, SettingsPlatform::Windows, 100, None).unwrap();
             assert_eq!(
                 report
@@ -375,11 +386,11 @@ fn omitted_switch_options_use_default_requests_and_inherit_effective_values() {
             kind: SourceKind::SystemLoopback,
             ..Default::default()
         });
-        request.windows_classic_loopback_keepalive = false;
-        request.denoise = true;
+        request.keepalive = Some(false);
+        request.attachments.denoise = Some(true);
         let initial = resolve_settings(&request, platform, 100, None).unwrap();
-        request.retained_windows_classic_loopback_keepalive = Some(false);
-        request.retained_denoise = Some(true);
+        request.keepalive = None;
+        request.attachments.denoise = None;
         let report = resolve_settings(&request, platform, 100, Some(&initial)).unwrap();
         let keepalive = report
             .get(SettingKey::WindowsClassicLoopbackKeepalive)

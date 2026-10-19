@@ -4,6 +4,7 @@
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenOptions {
+    pub(crate) settings_attachments: crate::SettingsAttachments,
     /// Reject non-default capture settings that would be ignored, before native access.
     /// Defaults to false; plain source switches retain the current value.
     pub strict: bool,
@@ -22,6 +23,7 @@ pub struct OpenOptions {
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
+            settings_attachments: crate::SettingsAttachments::default(),
             strict: false,
             windows_classic_loopback_keepalive: true,
         }
@@ -29,6 +31,12 @@ impl Default for OpenOptions {
 }
 
 impl OpenOptions {
+    /// Include binding-owned attachments and switch policy in the stream's report.
+    /// This describes attachments; their owner remains responsible for installing them.
+    pub fn settings_attachments(mut self, attachments: crate::SettingsAttachments) -> Self {
+        self.settings_attachments = attachments;
+        self
+    }
     /// Enable or disable strict applicability validation.
     pub fn strict(mut self, enabled: bool) -> Self {
         self.strict = enabled;
@@ -42,6 +50,7 @@ impl OpenOptions {
     /// Enable or disable Windows classic loopback's silent-render keepalive.
     pub fn windows_classic_loopback_keepalive(mut self, enabled: bool) -> Self {
         self.windows_classic_loopback_keepalive = enabled;
+        self.settings_attachments.keepalive = None;
         self
     }
 }

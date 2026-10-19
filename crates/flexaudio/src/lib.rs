@@ -25,11 +25,19 @@ pub mod mock;
 mod open_options;
 mod processes;
 mod settings;
+#[cfg(test)]
+mod settings_guard_tests;
+mod settings_request;
+#[cfg(test)]
+mod settings_request_tests;
 mod settings_resolver;
 #[cfg(test)]
 mod settings_resolver_tests;
 #[cfg(test)]
 mod settings_tests;
+
+pub use settings_request::{SettingsAttachments, SettingsRequest};
+pub use settings_resolver::resolve_settings;
 pub mod stream;
 mod validation;
 

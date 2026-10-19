@@ -2,6 +2,13 @@
 use super::*;
 
 impl Stream {
+    pub(super) fn capture_settings(&self) -> Option<&fa::SettingsReport> {
+        let report = self.inner.effective_settings();
+        #[cfg(test)]
+        let report = report.or(self.settings.report.as_ref());
+        report
+    }
+
     pub(super) fn switch_with(
         &mut self,
         config: fa::StreamConfig,
@@ -21,9 +28,9 @@ impl Stream {
                 "output format cannot change during switch_source".into(),
             )));
         }
-        crate::settings::validate(&config, false).map_err(to_py_err)?;
+        crate::settings_validation::validate(&config, false).map_err(to_py_err)?;
         let strict = strict.unwrap_or(self.settings.strict);
-        let mut previous = self.settings.report.clone();
+        let mut previous = self.capture_settings().cloned();
         if let Some(entry) = previous.as_mut().and_then(|report| {
             report
                 .entries
@@ -43,9 +50,15 @@ impl Stream {
         .map_err(to_py_err)?;
         commit(&mut self.inner, config).map_err(to_py_err)?;
         self.settings = crate::settings::SettingsState {
-            report: Some(report),
+            #[cfg(test)]
+            report: self
+                .inner
+                .effective_settings()
+                .is_none()
+                .then_some(report.clone()),
             strict,
         };
+        let _ = report;
         Ok(())
     }
 }

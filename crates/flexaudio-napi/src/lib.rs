@@ -25,6 +25,8 @@ pub use devices::devices_with_namespaces;
 mod flac_encoder;
 mod lifecycle;
 mod settings;
+mod settings_owner;
+mod settings_validation;
 mod shutdown;
 use boundary::{device_event_to_js, event_to_js, to_napi_err, JsAudioError, JsAudioLoss};
 mod attachment;
@@ -1183,6 +1185,8 @@ struct StreamSnapshot {
 /// Commands sent to the bridge thread. Only that thread accesses Stream, so all JS
 /// operations are requested through this channel.
 enum BridgeCmd {
+    /// Read the facade-owned snapshot; the binding stores it only after shutdown.
+    Settings(mpsc::Sender<Option<flexaudio::SettingsReport>>),
     /// Hot-swap the input source (return the result synchronously).
     Switch(Box<SwitchCmd>),
     /// Pause delivery.
@@ -1206,6 +1210,7 @@ struct SecondaryTapCfg {
 /// One capture owner supplies VAD events; tap selection changes only their carrier.
 /// Denoising runs in core before canonical capture and output conversion.
 struct PairingBridge {
+    // Only custom test backends need a binding snapshot; native streams own theirs.
     settings: Option<flexaudio::SettingsReport>,
     lifecycle: Option<Arc<lifecycle::LifecycleDelivery>>,
     strict: bool,
@@ -1450,6 +1455,7 @@ impl PairingBridge {
 /// and sends chunks/events to JS through TSFN.
 #[napi]
 pub struct FlexStream {
+    // Native reports are queried from Stream while running and retained here at shutdown.
     settings: Arc<Mutex<Option<flexaudio::SettingsReport>>>,
     lifecycle: Option<Arc<lifecycle::LifecycleDelivery>>,
     stop_flag: Arc<AtomicBool>,
@@ -1470,7 +1476,7 @@ impl FlexStream {
     fn spawn(
         env: &Env,
         stream: flexaudio::Stream,
-        bridge: PairingBridge,
+        mut bridge: PairingBridge,
         on_event: Option<EventTsfn>,
         chunk_tsfn: Arc<ChunkTsfn>,
         settle_tsfn: SettleTsfn,
@@ -1478,7 +1484,7 @@ impl FlexStream {
         mock_source: bool,
     ) -> napi::Result<Self> {
         let report = bridge.report.clone();
-        let settings = Arc::new(Mutex::new(bridge.settings.clone()));
+        let settings = Arc::new(Mutex::new(bridge.settings.take()));
         let thread_settings = settings.clone();
         let lifecycle = bridge.lifecycle.clone();
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1496,21 +1502,30 @@ impl FlexStream {
             report.clone(),
             terminal.clone(),
             move || {
-                let (mut stream, mut bridge, on_event) = resources
+                let (stream, mut bridge, on_event) = resources
                     .lock()
                     .unwrap_or_else(lock_poisoned)
                     .take()
                     .expect("bridge owns acquired resources");
+                let mut stream =
+                    settings_owner::SettingsOwner::new(stream, thread_settings.clone());
                 loop {
                     // Process commands together in the same iteration as polling.
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
+                            BridgeCmd::Settings(result_tx) => {
+                                let report = stream.effective_settings().cloned().or_else(|| {
+                                    thread_settings.lock().unwrap_or_else(lock_poisoned).clone()
+                                });
+                                let _ = result_tx.send(report);
+                            }
                             BridgeCmd::Switch(sw) => {
-                                let mut sw = *sw;
-                                sw.request.retained_keepalive =
-                                    Some(stream.open_options().windows_classic_loopback_keepalive);
+                                let sw = *sw;
                                 let strict = sw.request.strict.unwrap_or(bridge.strict);
-                                let mut previous = bridge.settings.clone();
+                                let mut previous =
+                                    stream.effective_settings().cloned().or_else(|| {
+                                        thread_settings.lock().unwrap_or_else(lock_poisoned).clone()
+                                    });
                                 if let Some(entry) = previous.as_mut().and_then(|r| {
                                     r.entries
                                         .iter_mut()
@@ -1532,21 +1547,22 @@ impl FlexStream {
                                     let r = if sw.mock_source {
                                         stream.switch_backend(lifecycle::mock_backend())
                                     } else {
-                                        let options = switch_open_options(
-                                            stream.open_options(),
-                                            sw.request.keepalive,
-                                        );
-                                        // Node has already preflighted the complete binding report.
-                                        stream.switch_source_with_options(
-                                            sw.request.config,
-                                            options.strict(false),
-                                        )
+                                        let options = sw
+                                            .request
+                                            .open_options(switch_open_options(
+                                                stream.open_options(),
+                                                sw.request.keepalive,
+                                            ))
+                                            .strict(strict);
+                                        stream
+                                            .switch_source_with_options(sw.request.config, options)
                                     };
                                     if r.is_ok() {
                                         bridge.strict = strict;
-                                        bridge.settings = Some(candidate.clone());
-                                        *thread_settings.lock().unwrap_or_else(lock_poisoned) =
-                                            Some(candidate);
+                                        if sw.mock_source {
+                                            *thread_settings.lock().unwrap_or_else(lock_poisoned) =
+                                                Some(candidate);
+                                        }
                                     }
                                     r
                                 });
@@ -1773,6 +1789,20 @@ impl FlexStream {
     /// Snapshot of the last successfully committed capture configuration.
     #[napi(ts_return_type = "SettingsReport")]
     pub fn effective_settings(&self, env: Env) -> napi::Result<JsObject> {
+        let sender = self
+            .inner
+            .lock()
+            .unwrap_or_else(lock_poisoned)
+            .cmd_tx
+            .clone();
+        if let Some(sender) = sender {
+            let (result_tx, result_rx) = mpsc::channel();
+            if sender.send(BridgeCmd::Settings(result_tx)).is_ok() {
+                if let Ok(Some(report)) = result_rx.recv() {
+                    return settings::to_js(&env, &report);
+                }
+            }
+        }
         let report = self.settings.lock().unwrap_or_else(lock_poisoned);
         settings::to_js(
             &env,
@@ -2290,7 +2320,7 @@ pub fn open_stream(
     let mut stream = if mock_source {
         flexaudio::Stream::open(config, lifecycle::mock_backend())
     } else {
-        flexaudio::open_with_options(config, capture_open_options(&options).strict(false))
+        flexaudio::open_with_options(config, request.open_options(capture_open_options(&options)))
     }
     .map_err(|error| boundary::throw_error(&env, error))?;
     if denoise_enabled {
@@ -2333,7 +2363,7 @@ pub fn open_stream(
         event_callback,
     )?;
     let bridge = PairingBridge {
-        settings: Some(settings),
+        settings: mock_source.then_some(settings),
         lifecycle: Some(lifecycle),
         strict: options.strict.unwrap_or(false),
         attachment,
