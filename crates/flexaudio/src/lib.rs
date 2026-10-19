@@ -50,7 +50,7 @@ pub use flexaudio_core::{
     SettingKey, SettingOutcome, SettingResolution, SettingValue, SettingsPlatform, SettingsReport,
     SettingsRequest,
 };
-pub use flexaudio_core::{AddonErrorKind, StartupDropReason};
+pub use flexaudio_core::{AddonErrorKind, HelperStopReason, StartupDropReason};
 
 /// Return audio devices for all sources in one list.
 ///

@@ -50,7 +50,11 @@ impl Stream {
                 }
                 // Failed acquisition still owns anything the backend may have started.
                 // Quiesce it before draining its rejected-buffer summaries.
-                shared.stop_backend_owned(&mut be, None);
+                shared.stop_backend_owned(
+                    &mut be,
+                    None,
+                    flexaudio_core::HelperStopReason::StartupFailed,
+                );
                 drain_unpublished_capture(shared, &consumer, &diagnostics, (rate, channels));
                 return Err(error);
             }
@@ -195,7 +199,10 @@ impl Stream {
                     );
                 }
                 Err(e) => {
+                    new_backend
+                        .set_helper_stop_reason(flexaudio_core::HelperStopReason::StartupFailed);
                     let replacement_cleanup = stop_backend_catching(&mut new_backend).err();
+                    control::drain_replacement_lifecycle(&self.shared, &mut new_backend);
                     if let Some(error) = replacement_cleanup.clone() {
                         self.shared.record_cleanup(error);
                     }
@@ -389,7 +396,11 @@ impl Stream {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     self.shared.fail_terminal(error.clone());
-                    self.shared.stop_backend_owned(&mut be, None);
+                    self.shared.stop_backend_owned(
+                        &mut be,
+                        None,
+                        flexaudio_core::HelperStopReason::RuntimeFailed,
+                    );
                 }
                 return Err(error);
             }

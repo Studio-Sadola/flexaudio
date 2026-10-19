@@ -45,6 +45,9 @@ fn control() -> (ProbeControl, Arc<FakeClock>) {
             cancellation: Arc::new(AtomicBool::new(false)),
             clock: clock.clone(),
             cleanup: Arc::new(ProbeCleanup::default()),
+            events: None,
+            stop_reason: Arc::new(Mutex::new(HelperStopReason::StreamStopped)),
+            running: AtomicBool::new(false),
         },
         clock,
     )
@@ -442,4 +445,168 @@ fn late_native_failure_survives_the_timeout_advisory() {
     };
     assert_eq!(group.primary(), &cause);
     assert_eq!(group.secondary().collect::<Vec<_>>(), [&timeout_error()]);
+}
+
+fn lifecycle_control() -> (ProbeControl, std::sync::mpsc::Receiver<Event>) {
+    let (mut control, _) = control();
+    let (tx, rx) = std::sync::mpsc::channel();
+    control.events = Some(tx);
+    (control, rx)
+}
+
+fn assert_pair(events: std::sync::mpsc::Receiver<Event>, reason: HelperStopReason) {
+    assert_eq!(
+        events.try_iter().collect::<Vec<_>>(),
+        [
+            Event::SilenceProbeStarted,
+            Event::SilenceProbeStopped { reason },
+        ]
+    );
+}
+
+#[test]
+fn lifecycle_pairs_every_diagnostic_outcome_once() {
+    for (outcome, reason) in [
+        (ProbeOutcome::Present, HelperStopReason::SignalObserved),
+        (
+            ProbeOutcome::Denied {
+                detail: "verified zero capture".into(),
+            },
+            HelperStopReason::PermissionDenied,
+        ),
+        (
+            ProbeOutcome::Inconclusive {
+                error: Error::Backend("ambiguous evidence".into()),
+            },
+            HelperStopReason::Inconclusive,
+        ),
+        (
+            ProbeOutcome::Failed {
+                error: Error::Backend("setup failed".into()),
+            },
+            HelperStopReason::StartupFailed,
+        ),
+        (ProbeOutcome::TimedOut, HelperStopReason::TimedOut),
+        (ProbeOutcome::Cancelled, HelperStopReason::Cancelled),
+    ] {
+        let (control, events) = lifecycle_control();
+        let mut generation = GenerationProbe::default();
+        let mut probe = fake(outcome);
+        generation.on_silence(&mut probe, &control);
+        generation.on_silence(&mut probe, &control);
+        assert_eq!(probe.calls, 1);
+        assert_pair(events, reason);
+    }
+}
+
+#[test]
+fn lifecycle_cancellation_retains_shutdown_reason_without_diagnostic_events() {
+    for reason in [
+        HelperStopReason::StreamStopped,
+        HelperStopReason::SourceSwitched,
+        HelperStopReason::Recovery,
+        HelperStopReason::Cancelled,
+    ] {
+        let (control, events) = lifecycle_control();
+        *control.stop_reason.lock().unwrap() = reason;
+        let mut probe = fake(ProbeOutcome::Denied {
+            detail: "suppressed evidence".into(),
+        });
+        probe.cancel = true;
+        assert_eq!(
+            GenerationProbe::default().on_silence(&mut probe, &control),
+            None
+        );
+        assert_pair(events, reason);
+    }
+}
+
+#[test]
+fn lifecycle_pre_cancelled_attempt_has_no_events() {
+    let (control, events) = lifecycle_control();
+    control.cancellation.store(true, Ordering::Release);
+    let mut probe = fake(ProbeOutcome::Present);
+    assert_eq!(
+        GenerationProbe::default().on_silence(&mut probe, &control),
+        None
+    );
+    assert_eq!(probe.calls, 0);
+    assert!(events.try_recv().is_err());
+}
+
+#[test]
+fn lifecycle_timeout_covers_entry_and_late_evidence() {
+    for late in [false, true] {
+        let (mut control, clock) = control();
+        let (tx, rx) = std::sync::mpsc::channel();
+        control.events = Some(tx);
+        let mut probe = fake(ProbeOutcome::Present);
+        if late {
+            probe.advance = Some(clock);
+        } else {
+            *clock.0.lock().unwrap() = control.deadline();
+        }
+        GenerationProbe::default().on_silence(&mut probe, &control);
+        assert_eq!(probe.calls, usize::from(late));
+        assert_pair(rx, HelperStopReason::TimedOut);
+    }
+}
+
+#[test]
+fn lifecycle_runtime_and_teardown_failures_keep_typed_advisories() {
+    for cleanup in [false, true] {
+        let (control, events) = lifecycle_control();
+        control.mark_running();
+        let mut probe = if cleanup {
+            control.cleanup.record_native("IOProc stop", -50);
+            fake(ProbeOutcome::Present)
+        } else {
+            fake(ProbeOutcome::Failed {
+                error: Error::Backend("runtime failed".into()),
+            })
+        };
+        assert!(matches!(
+            GenerationProbe::default().on_silence(&mut probe, &control),
+            Some(ProbeDecision::Advisory { error: Some(_), .. })
+        ));
+        assert_pair(events, HelperStopReason::RuntimeFailed);
+    }
+}
+
+#[test]
+fn lifecycle_panic_reports_after_native_owner_unwinds() {
+    struct NativeOwner(Arc<AtomicBool>);
+    impl Drop for NativeOwner {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    struct PanickingProbe(Arc<AtomicBool>, bool);
+    impl Probe for PanickingProbe {
+        fn run(&mut self, control: &ProbeControl) -> ProbeOutcome {
+            let _owner = NativeOwner(self.0.clone());
+            if self.1 {
+                control.mark_running();
+            }
+            panic!("injected native adapter panic");
+        }
+    }
+    for running in [false, true] {
+        let (control, events) = lifecycle_control();
+        let released = Arc::new(AtomicBool::new(false));
+        let mut probe = PanickingProbe(released.clone(), running);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            GenerationProbe::default().on_silence(&mut probe, &control);
+        }))
+        .is_err());
+        assert!(released.load(Ordering::Acquire));
+        assert_pair(
+            events,
+            if running {
+                HelperStopReason::RuntimeFailed
+            } else {
+                HelperStopReason::StartupFailed
+            },
+        );
+    }
 }

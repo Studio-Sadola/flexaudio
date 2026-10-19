@@ -209,8 +209,10 @@ impl SharedState {
         &self,
         be: &mut Box<dyn CaptureBackend>,
         delivery: Option<&MutexGuard<'_, ()>>,
+        helper_reason: flexaudio_core::HelperStopReason,
     ) {
         if !self.backend_stopped.swap(true, Ordering::SeqCst) {
+            be.set_helper_stop_reason(helper_reason);
             // Runtime terminal handling has already closed delivery. Keep its
             // delivery lock free during the owner's join, so polling and resume
             // can observe the latched failure without waiting for native stop.

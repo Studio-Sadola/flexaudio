@@ -82,6 +82,7 @@ impl NativeProbe {
             control,
         )?;
         check(control)?;
+        control.mark_running();
         output.state.enabled.store(true, Ordering::Release);
         let mut output_active = false;
         loop {
@@ -158,7 +159,7 @@ impl NativeProbe {
         Ok(match identified {
             SignalEvidence::Matched => ProbeOutcome::Present,
             SignalEvidence::ExactZeros => ProbeOutcome::Denied { detail: "The private self-probe captured continuous exact-zero samples covering at least 95% of the verified default-output diagnostic signal and its complete 500 ms capture-latency window; System Audio Recording access was not granted".into() },
-            SignalEvidence::Inconclusive => ProbeOutcome::Failed { error: flexaudio_core::Error::Backend("The private self-probe did not obtain an unambiguous matching signal or continuous overlapping zero capture with verified rendering; retry capture".into()) },
+            SignalEvidence::Inconclusive => ProbeOutcome::Inconclusive { error: flexaudio_core::Error::Backend("The private self-probe did not obtain an unambiguous matching signal or continuous overlapping zero capture with verified rendering; retry capture".into()) },
         })
     }
 }

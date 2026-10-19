@@ -123,11 +123,21 @@ impl Stream {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .drain(..old_cleanup_count);
-            self.events
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+            let lifecycle: Vec<_> = events
                 .drain(..old_event_count)
-                .for_each(|event| self.shared.retire_event(&event));
+                .filter_map(|event| {
+                    if is_helper_lifecycle(&event) {
+                        Some(event)
+                    } else {
+                        self.shared.retire_event(&event);
+                        None
+                    }
+                })
+                .collect();
+            for event in lifecycle.into_iter().rev() {
+                events.push_front(event);
+            }
         }
         self.started = true;
         self.shutdown = None;
@@ -156,7 +166,16 @@ impl Stream {
                 .backend
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            stop_backend_reconciling(&self.shared, &mut be, true);
+            if self.started {
+                stop_backend_reconciling(&self.shared, &mut be, true);
+            } else {
+                control::stop_backend_reconciling_with_reason(
+                    &self.shared,
+                    &mut be,
+                    true,
+                    flexaudio_core::HelperStopReason::StartupFailed,
+                );
+            }
         }
         for handle in [self.worker.take(), self.watchdog.take()]
             .into_iter()

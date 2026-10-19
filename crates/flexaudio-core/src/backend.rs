@@ -92,6 +92,11 @@ pub trait CaptureBackend: Send {
     /// Stop capture.
     fn stop(&mut self);
 
+    /// Supply the reason for the next helper teardown before stopping capture.
+    /// Existing custom backends need not implement helper lifecycle reporting.
+    #[doc(hidden)]
+    fn set_helper_stop_reason(&mut self, _reason: crate::HelperStopReason) {}
+
     /// Checked stop. External backends retain compatibility, but must override this
     /// to expose hidden owner failures.
     fn stop_checked(&mut self) -> Result<()> {

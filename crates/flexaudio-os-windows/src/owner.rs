@@ -43,12 +43,31 @@ pub(crate) struct OwnerShutdown {
     report: Option<ShutdownReport>,
     events: VecDeque<Event>,
     capture_events: Option<mpsc::Receiver<Event>>,
+    pending_capture: VecDeque<Event>,
 }
 
 impl OwnerShutdown {
     pub(crate) fn reset(&mut self, capture_events: mpsc::Receiver<Event>) {
         self.report = None;
         self.events.clear();
+        self.retain_capture_events(capture_events);
+        // Successful acquisition retains the new lifecycle guarantee while
+        // keeping the existing reset behavior for ordinary notifications.
+        self.pending_capture.retain(|event| {
+            matches!(
+                event,
+                Event::ClassicLoopbackKeepaliveStarted
+                    | Event::ClassicLoopbackKeepaliveStopped { .. }
+            )
+        });
+    }
+
+    /// Failed acquisition must not lose a renderer's completed lifecycle, or
+    /// erase the previous checked shutdown outcome.
+    pub(crate) fn retain_capture_events(&mut self, capture_events: mpsc::Receiver<Event>) {
+        if let Some(previous) = self.capture_events.take() {
+            self.pending_capture.extend(previous.try_iter());
+        }
         self.capture_events = Some(capture_events);
     }
 
@@ -73,9 +92,13 @@ impl OwnerShutdown {
     }
 
     pub(crate) fn poll_event(&mut self) -> Option<Event> {
-        self.capture_events
-            .as_ref()
-            .and_then(|events| events.try_recv().ok())
+        self.pending_capture
+            .pop_front()
+            .or_else(|| {
+                self.capture_events
+                    .as_ref()
+                    .and_then(|events| events.try_recv().ok())
+            })
             .or_else(|| self.events.pop_front())
     }
 }
@@ -85,6 +108,52 @@ mod tests {
     use super::*;
     use flexaudio_core::{ErrorKind, Permission};
     use std::thread;
+
+    #[test]
+    fn replacing_failed_start_mailbox_preserves_the_unread_stopped_before_new_start() {
+        let mut shutdown = OwnerShutdown::default();
+        let (first_tx, first_rx) = mpsc::channel();
+        shutdown.retain_capture_events(first_rx);
+        first_tx
+            .send(Event::ClassicLoopbackKeepaliveStarted)
+            .unwrap();
+        let stopped = Event::ClassicLoopbackKeepaliveStopped {
+            reason: flexaudio_core::HelperStopReason::StartupFailed,
+        };
+        first_tx.send(stopped.clone()).unwrap();
+        assert_eq!(
+            shutdown.poll_event(),
+            Some(Event::ClassicLoopbackKeepaliveStarted)
+        );
+        let (next_tx, next_rx) = mpsc::channel();
+        next_tx
+            .send(Event::ClassicLoopbackKeepaliveStarted)
+            .unwrap();
+        shutdown.reset(next_rx);
+        assert_eq!(shutdown.poll_event(), Some(stopped));
+        assert_eq!(
+            shutdown.poll_event(),
+            Some(Event::ClassicLoopbackKeepaliveStarted)
+        );
+        assert!(shutdown.poll_event().is_none());
+    }
+
+    #[test]
+    fn failed_acquisition_retains_previous_ordinary_notifications_and_report() {
+        let mut shutdown = OwnerShutdown::default();
+        let (first_tx, first_rx) = mpsc::channel();
+        shutdown.reset(first_rx);
+        let terminal = Event::TerminalError {
+            error: Error::DeviceLost,
+        };
+        first_tx.send(terminal.clone()).unwrap();
+        assert!(shutdown.finish(None).is_ok());
+        let previous = shutdown.report.clone();
+        let (_next_tx, next_rx) = mpsc::channel();
+        shutdown.retain_capture_events(next_rx);
+        assert_eq!(shutdown.report, previous);
+        assert_eq!(shutdown.poll_event(), Some(terminal));
+    }
 
     #[test]
     fn capture_failure_publishes_before_cleanup_and_retains_both_outcomes() {

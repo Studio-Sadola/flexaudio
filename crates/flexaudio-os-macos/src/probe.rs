@@ -1,11 +1,14 @@
 //! Device-free policy for one controlled self-probe per capture generation.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::capture_health::ADVISORY_DETAIL;
-use flexaudio_core::{Error, ErrorContext, ErrorGroup, NativeStatus, Operation};
+use flexaudio_core::{
+    Error, ErrorContext, ErrorGroup, Event, HelperStopReason, NativeStatus, Operation,
+};
 
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -15,6 +18,7 @@ pub(crate) enum ProbeOutcome {
     Present,
     Denied { detail: String },
     Failed { error: Error },
+    Inconclusive { error: Error },
     TimedOut,
     Cancelled,
 }
@@ -86,6 +90,9 @@ pub(crate) struct ProbeControl {
     cancellation: Arc<AtomicBool>,
     clock: Arc<dyn Clock>,
     cleanup: Arc<ProbeCleanup>,
+    events: Option<mpsc::Sender<Event>>,
+    stop_reason: Arc<Mutex<HelperStopReason>>,
+    running: AtomicBool,
 }
 
 impl ProbeControl {
@@ -95,7 +102,32 @@ impl ProbeControl {
             cancellation,
             clock: Arc::new(SystemClock),
             cleanup: Arc::new(ProbeCleanup::default()),
+            events: None,
+            stop_reason: Arc::new(Mutex::new(HelperStopReason::StreamStopped)),
+            running: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn with_lifecycle(
+        mut self,
+        events: mpsc::Sender<Event>,
+        stop_reason: Arc<Mutex<HelperStopReason>>,
+    ) -> Self {
+        self.events = Some(events);
+        self.stop_reason = stop_reason;
+        self
+    }
+
+    /// Native setup has completed; subsequent adapter failures are runtime failures.
+    pub(crate) fn mark_running(&self) {
+        self.running.store(true, Ordering::Release);
+    }
+
+    fn cancellation_reason(&self) -> HelperStopReason {
+        *self
+            .stop_reason
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     pub(crate) fn cleanup_diagnostics(&self) -> Arc<ProbeCleanup> {
@@ -125,8 +157,16 @@ impl ProbeControl {
 
 /// Linearizes stop against publishing a completed probe result. Only control
 /// threads use this lock; the native callbacks read the cancellation atomic.
-#[derive(Default)]
-pub(crate) struct PublicationGate(Mutex<()>);
+pub(crate) struct PublicationGate(Mutex<()>, Arc<Mutex<HelperStopReason>>);
+
+impl Default for PublicationGate {
+    fn default() -> Self {
+        Self(
+            Mutex::new(()),
+            Arc::new(Mutex::new(HelperStopReason::StreamStopped)),
+        )
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PublicationError {
@@ -134,6 +174,13 @@ pub(crate) enum PublicationError {
 }
 
 impl PublicationGate {
+    pub(crate) fn set_stop_reason(&self, reason: HelperStopReason) {
+        *self.1.lock().unwrap_or_else(|error| error.into_inner()) = reason;
+    }
+
+    pub(crate) fn stop_reason(&self) -> Arc<Mutex<HelperStopReason>> {
+        self.1.clone()
+    }
     pub(crate) fn cancel(&self, cancellation: &AtomicBool) -> Result<(), PublicationError> {
         match self.0.lock() {
             Ok(_guard) => {
@@ -202,6 +249,41 @@ pub(crate) struct GenerationProbe {
     attempted: bool,
 }
 
+/// Native owners unwind before this guard. The unbounded mailbox never needs
+/// a consumer lock, and lifecycle publication is independent of diagnostic suppression.
+struct ProbeLifecycle<'a> {
+    events: Option<&'a mpsc::Sender<Event>>,
+    running: &'a AtomicBool,
+    reason: HelperStopReason,
+}
+
+impl<'a> ProbeLifecycle<'a> {
+    fn start(control: &'a ProbeControl) -> Self {
+        let guard = Self {
+            events: control.events.as_ref(),
+            running: &control.running,
+            reason: HelperStopReason::RuntimeFailed,
+        };
+        if let Some(events) = guard.events {
+            let _ = events.send(Event::SilenceProbeStarted);
+        }
+        guard
+    }
+}
+
+impl Drop for ProbeLifecycle<'_> {
+    fn drop(&mut self) {
+        if let Some(events) = self.events {
+            let reason = if std::thread::panicking() && !self.running.load(Ordering::Acquire) {
+                HelperStopReason::StartupFailed
+            } else {
+                self.reason
+            };
+            let _ = events.send(Event::SilenceProbeStopped { reason });
+        }
+    }
+}
+
 impl GenerationProbe {
     pub(crate) fn on_silence(
         &mut self,
@@ -215,6 +297,7 @@ impl GenerationProbe {
         if control.cancelled() {
             return None;
         }
+        let mut lifecycle = ProbeLifecycle::start(control);
         let outcome = if control.timed_out() {
             ProbeOutcome::TimedOut
         } else {
@@ -222,13 +305,35 @@ impl GenerationProbe {
         };
         // Stop wins even when requested during native teardown after collecting a result.
         if control.cancelled() {
+            lifecycle.reason = control.cancellation_reason();
             return None;
         }
         if matches!(outcome, ProbeOutcome::Cancelled) {
+            lifecycle.reason = HelperStopReason::Cancelled;
             return None;
         }
         let mut errors = control.cleanup.take();
-        if let ProbeOutcome::Failed { error } = &outcome {
+        lifecycle.reason = if !errors.is_empty() {
+            HelperStopReason::RuntimeFailed
+        } else if control.timed_out() || matches!(outcome, ProbeOutcome::TimedOut) {
+            HelperStopReason::TimedOut
+        } else {
+            match &outcome {
+                ProbeOutcome::Present => HelperStopReason::SignalObserved,
+                ProbeOutcome::Denied { .. } => HelperStopReason::PermissionDenied,
+                ProbeOutcome::Inconclusive { .. } => HelperStopReason::Inconclusive,
+                ProbeOutcome::Failed { error } if error.permission().is_some() => {
+                    HelperStopReason::PermissionDenied
+                }
+                ProbeOutcome::Failed { .. } if control.running.load(Ordering::Acquire) => {
+                    HelperStopReason::RuntimeFailed
+                }
+                ProbeOutcome::Failed { .. } => HelperStopReason::StartupFailed,
+                ProbeOutcome::TimedOut => HelperStopReason::TimedOut,
+                ProbeOutcome::Cancelled => HelperStopReason::Cancelled,
+            }
+        };
+        if let ProbeOutcome::Failed { error } | ProbeOutcome::Inconclusive { error } = &outcome {
             errors.insert(0, error.clone());
         }
         if control.timed_out() || matches!(outcome, ProbeOutcome::TimedOut) {
@@ -242,7 +347,9 @@ impl GenerationProbe {
         match outcome {
             ProbeOutcome::Present | ProbeOutcome::Cancelled => None,
             ProbeOutcome::Denied { detail } => Some(ProbeDecision::Denied { detail }),
-            ProbeOutcome::Failed { .. } | ProbeOutcome::TimedOut => Some(advisory()),
+            ProbeOutcome::Failed { .. }
+            | ProbeOutcome::Inconclusive { .. }
+            | ProbeOutcome::TimedOut => Some(advisory()),
         }
     }
 }

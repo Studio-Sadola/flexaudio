@@ -134,7 +134,11 @@ fn drain_backend_events_locked(
                 } else {
                     shared.deny_permission(permission, detail);
                 }
-                shared.stop_backend_owned(be, delivery);
+                shared.stop_backend_owned(
+                    be,
+                    delivery,
+                    flexaudio_core::HelperStopReason::RuntimeFailed,
+                );
                 return MailboxDrain::Terminal;
             }
             Some(Event::Error(_)) => {
@@ -149,7 +153,11 @@ fn drain_backend_events_locked(
                 } else {
                     shared.fail_terminal(error);
                 }
-                shared.stop_backend_owned(be, delivery);
+                shared.stop_backend_owned(
+                    be,
+                    delivery,
+                    flexaudio_core::HelperStopReason::RuntimeFailed,
+                );
                 return MailboxDrain::Terminal;
             }
             Some(Event::RecoverableError { error }) if is_terminal_kind(&error) => {
@@ -159,7 +167,11 @@ fn drain_backend_events_locked(
                 } else {
                     shared.fail_terminal(error);
                 }
-                shared.stop_backend_owned(be, delivery);
+                shared.stop_backend_owned(
+                    be,
+                    delivery,
+                    flexaudio_core::HelperStopReason::RuntimeFailed,
+                );
                 return MailboxDrain::Terminal;
             }
             Some(Event::TerminalError { error }) => {
@@ -169,7 +181,11 @@ fn drain_backend_events_locked(
                     let delivery = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
                     shared.fail_terminal_locked(error, &delivery);
                 }
-                shared.stop_backend_owned(be, delivery);
+                shared.stop_backend_owned(
+                    be,
+                    delivery,
+                    flexaudio_core::HelperStopReason::RuntimeFailed,
+                );
                 return MailboxDrain::Terminal;
             }
             Some(Event::ShutdownError { error }) => shared.record_backend_cleanup(error),
@@ -206,7 +222,11 @@ pub(super) fn drain_final_backend_events(
         Error::Backend("backend event mailbox could not be reconciled; capture terminated before delivering buffered audio".into()),
         delivery,
     );
-    shared.stop_backend_owned(be, Some(delivery));
+    shared.stop_backend_owned(
+        be,
+        Some(delivery),
+        flexaudio_core::HelperStopReason::RuntimeFailed,
+    );
 }
 
 /// One shutdown path for explicit stop, source replacement, and recovery.
@@ -217,10 +237,68 @@ pub(super) fn stop_backend_reconciling(
     be: &mut Box<dyn CaptureBackend>,
     stop_intake: bool,
 ) {
+    let reason = if stop_intake {
+        flexaudio_core::HelperStopReason::StreamStopped
+    } else if shared.switching.load(Ordering::SeqCst) {
+        flexaudio_core::HelperStopReason::SourceSwitched
+    } else {
+        flexaudio_core::HelperStopReason::Recovery
+    };
+    stop_backend_reconciling_with_reason(shared, be, stop_intake, reason);
+}
+
+pub(super) fn stop_backend_reconciling_with_reason(
+    shared: &SharedState,
+    be: &mut Box<dyn CaptureBackend>,
+    stop_intake: bool,
+    reason: flexaudio_core::HelperStopReason,
+) {
     let delivery = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
     drain_final_backend_events(shared, be, &delivery);
-    shared.stop_backend_owned(be, Some(&delivery));
+    let reason = if shared.terminal.is_failed()
+        && reason != flexaudio_core::HelperStopReason::StartupFailed
+    {
+        flexaudio_core::HelperStopReason::RuntimeFailed
+    } else {
+        reason
+    };
+    shared.stop_backend_owned(be, Some(&delivery), reason);
     if stop_intake {
         shared.begin_stopping(&delivery);
     }
 }
+
+/// Preserve only the additive helper notices of a rejected replacement. Its
+/// ordinary errors still follow the existing startup/rollback result path.
+pub(super) fn drain_replacement_lifecycle(shared: &SharedState, be: &mut Box<dyn CaptureBackend>) {
+    for _ in 0..MAX_BACKEND_EVENTS_PER_TICK * MAX_FINAL_EVENT_BATCHES {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| be.poll_event())) {
+            Ok(Some(event)) if is_helper_lifecycle(&event) => shared.push_event(event),
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(_) => {
+                shared.record_cleanup(Error::Backend(
+                    "replacement backend panicked during final event drain".into(),
+                ));
+                return;
+            }
+        }
+    }
+    shared.record_cleanup(Error::Backend(
+        "replacement backend event mailbox could not be reconciled".into(),
+    ));
+}
+
+pub(crate) fn is_helper_lifecycle(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::SilenceProbeStarted
+            | Event::SilenceProbeStopped { .. }
+            | Event::ClassicLoopbackKeepaliveStarted
+            | Event::ClassicLoopbackKeepaliveStopped { .. }
+    )
+}
+
+#[cfg(test)]
+#[path = "helper_lifecycle_tests.rs"]
+mod helper_lifecycle_tests;

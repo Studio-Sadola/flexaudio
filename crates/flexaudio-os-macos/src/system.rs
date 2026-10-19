@@ -235,6 +235,8 @@ impl CaptureBackend for MacSystemBackend {
         crate::version::ensure_process_tap_supported()?;
 
         self.stop_flag.store(false, Ordering::SeqCst);
+        self.publication
+            .set_stop_reason(flexaudio_core::HelperStopReason::StreamStopped);
 
         let stop_flag = self.stop_flag.clone();
         let silence_probe = self.silence_probe;
@@ -310,6 +312,7 @@ impl CaptureBackend for MacSystemBackend {
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.handle = Some(handle);
+                self.shutdown.retain_lifecycle(self.events.as_ref());
                 self.shutdown.reset();
                 self.events = Some(event_rx);
                 Ok(())
@@ -339,6 +342,10 @@ impl CaptureBackend for MacSystemBackend {
         let _ = self.stop_checked();
     }
 
+    fn set_helper_stop_reason(&mut self, reason: flexaudio_core::HelperStopReason) {
+        self.publication.set_stop_reason(reason);
+    }
+
     fn stop_checked(&mut self) -> Result<()> {
         self.shutdown.finish(
             &self.publication,
@@ -349,9 +356,13 @@ impl CaptureBackend for MacSystemBackend {
     }
 
     fn poll_event(&mut self) -> Option<Event> {
-        self.events
-            .as_ref()
-            .and_then(|events| events.try_recv().ok())
+        self.shutdown
+            .poll_lifecycle()
+            .or_else(|| {
+                self.events
+                    .as_ref()
+                    .and_then(|events| events.try_recv().ok())
+            })
             .or_else(|| self.shutdown.poll_event())
     }
 }
@@ -437,7 +448,8 @@ pub(crate) fn run_tap_thread(
             // Its output may reach a user tap when the host has not been excluded.
             detector = None;
             let control =
-                ProbeControl::new(std::time::Instant::now() + PROBE_TIMEOUT, stop_flag.clone());
+                ProbeControl::new(std::time::Instant::now() + PROBE_TIMEOUT, stop_flag.clone())
+                    .with_lifecycle(event_tx.clone(), publication.stop_reason());
             let decision = generation_probe.on_silence(&mut NativeProbe::new(), &control);
             let mut terminal = false;
             if let Some(decision) = decision {

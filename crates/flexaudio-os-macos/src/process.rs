@@ -120,6 +120,8 @@ impl CaptureBackend for MacProcessBackend {
         crate::version::ensure_process_tap_supported()?;
 
         self.stop_flag.store(false, Ordering::SeqCst);
+        self.publication
+            .set_stop_reason(flexaudio_core::HelperStopReason::StreamStopped);
 
         let stop_flag = self.stop_flag.clone();
         let silence_probe = self.silence_probe;
@@ -172,6 +174,7 @@ impl CaptureBackend for MacProcessBackend {
         match ready_rx.recv() {
             Ok(Ok(())) => {
                 self.handle = Some(handle);
+                self.shutdown.retain_lifecycle(self.events.as_ref());
                 self.shutdown.reset();
                 self.events = Some(event_rx);
                 Ok(())
@@ -201,6 +204,10 @@ impl CaptureBackend for MacProcessBackend {
         let _ = self.stop_checked();
     }
 
+    fn set_helper_stop_reason(&mut self, reason: flexaudio_core::HelperStopReason) {
+        self.publication.set_stop_reason(reason);
+    }
+
     fn stop_checked(&mut self) -> Result<()> {
         self.shutdown.finish(
             &self.publication,
@@ -211,9 +218,13 @@ impl CaptureBackend for MacProcessBackend {
     }
 
     fn poll_event(&mut self) -> Option<Event> {
-        self.events
-            .as_ref()
-            .and_then(|events| events.try_recv().ok())
+        self.shutdown
+            .poll_lifecycle()
+            .or_else(|| {
+                self.events
+                    .as_ref()
+                    .and_then(|events| events.try_recv().ok())
+            })
             .or_else(|| self.shutdown.poll_event())
     }
 }

@@ -220,6 +220,7 @@ pub(super) fn start_child(
         .unwrap_or_else(|_| Err(Error::Backend("mix child panicked during start".into())))
         .map_err(|error| lane_error(error, Operation::Start, lane));
     if result.is_err() {
+        child.set_helper_stop_reason(flexaudio_core::HelperStopReason::StartupFailed);
         if let Err(error) = stop_child(child, lane) {
             state.notices.cleanup(error);
         }

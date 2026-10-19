@@ -11,10 +11,13 @@ use windows::Win32::System::Threading::CreateEventW;
 
 use crate::common::{map_hr, map_hr_at, EventHandle};
 use crate::lifecycle::{keepalive_error, StreamClient};
+use flexaudio_core::HelperStopReason;
 use flexaudio_core::Operation;
+use std::sync::{Arc, Mutex};
 
 /// COM objects and the render event stay on the capture owner thread.
 pub(crate) struct SilentRender {
+    pub(crate) stop_reason: Arc<Mutex<HelperStopReason>>,
     client: IAudioClient,
     render: IAudioRenderClient,
     pub(crate) event: EventHandle,
@@ -26,7 +29,11 @@ impl SilentRender {
     ///
     /// # Safety
     /// COM must be initialized here and `format` must be a valid mix format.
-    pub(crate) unsafe fn new(device: &IMMDevice, format: *const WAVEFORMATEX) -> Result<Self> {
+    pub(crate) unsafe fn new(
+        device: &IMMDevice,
+        format: *const WAVEFORMATEX,
+        stop_reason: Arc<Mutex<HelperStopReason>>,
+    ) -> Result<Self> {
         // Microsoft, Loopback Recording:
         // "In loopback mode, a client of WASAPI can capture the audio stream
         // that is being played by a rendering endpoint device."
@@ -68,6 +75,7 @@ impl SilentRender {
             ));
         }
         Ok(Self {
+            stop_reason,
             client,
             render,
             event,

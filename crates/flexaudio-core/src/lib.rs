@@ -45,6 +45,8 @@ pub mod clock;
 pub mod diagnostics;
 pub mod error_context;
 mod error_equality;
+mod helper_stop_reason;
+pub use helper_stop_reason::HelperStopReason;
 mod errors;
 mod spawn_error;
 pub use spawn_error::spawn_error;

@@ -168,7 +168,11 @@ impl Stream {
             .backend
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        self.shared.stop_backend_owned(&mut backend, None);
+        self.shared.stop_backend_owned(
+            &mut backend,
+            None,
+            flexaudio_core::HelperStopReason::RuntimeFailed,
+        );
         self.shared.terminal.error()
     }
 

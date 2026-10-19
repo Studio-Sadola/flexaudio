@@ -26,7 +26,7 @@ use crate::exclusion::validate_exclusion;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use flexaudio_core::backend::{CaptureBackend, RawSink};
@@ -80,6 +80,7 @@ const PROCESS_LOOPBACK_FORMAT: (u32, u16) = (48_000, 2);
 /// `exclude_self`, and a cached format. `!Send` COM interfaces stay on the
 /// dedicated thread.
 pub struct WasapiSystemBackend {
+    helper_stop_reason: Arc<Mutex<flexaudio_core::HelperStopReason>>,
     /// Host-exclusion flag. `true` selects process loopback EXCLUDE; `false`
     /// selects classic loopback.
     exclude_self: bool,
@@ -121,6 +122,9 @@ impl WasapiSystemBackend {
     /// tied to an endpoint.
     pub fn new(exclude_self: bool, device_id: Option<String>) -> Self {
         let backend = Self {
+            helper_stop_reason: Arc::new(Mutex::new(
+                flexaudio_core::HelperStopReason::StreamStopped,
+            )),
             exclude_self,
             exclude_pids: Vec::new(),
             device_id,
@@ -438,7 +442,15 @@ impl CaptureBackend for WasapiSystemBackend {
 
         let stop_flag = self.stop_flag.clone();
         let device_id = self.device_id.clone();
-        let classic_loopback_keepalive = self.classic_loopback_keepalive;
+        let helper_stop_reason = self.helper_stop_reason.clone();
+        *helper_stop_reason
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            flexaudio_core::HelperStopReason::StreamStopped;
+        let keepalive = KeepaliveConfig {
+            enabled: self.classic_loopback_keepalive,
+            stop_reason: helper_stop_reason,
+        };
         // Channel for synchronously returning setup status (COM init through successful Start).
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let (event_tx, event_rx) = mpsc::channel();
@@ -449,7 +461,7 @@ impl CaptureBackend for WasapiSystemBackend {
                 run_system_thread(
                     exclude_root,
                     device_id,
-                    classic_loopback_keepalive,
+                    keepalive,
                     sink,
                     stop_flag,
                     ready_tx,
@@ -468,11 +480,13 @@ impl CaptureBackend for WasapiSystemBackend {
                 Ok(())
             }
             Ok(Err(e)) => {
+                self.shutdown.retain_capture_events(event_rx);
                 // Setup failed. Join because the thread exits just after sending ready.
                 self.stop_flag.store(true, Ordering::SeqCst);
                 ShutdownReport::new(Some(e), join_owner(handle).cleanup().to_vec()).result()
             }
             Err(_) => {
+                self.shutdown.retain_capture_events(event_rx);
                 self.stop_flag.store(true, Ordering::SeqCst);
                 ShutdownReport::new(
                     Some(
@@ -488,6 +502,13 @@ impl CaptureBackend for WasapiSystemBackend {
 
     fn stop(&mut self) {
         let _ = self.stop_checked();
+    }
+
+    fn set_helper_stop_reason(&mut self, reason: flexaudio_core::HelperStopReason) {
+        *self
+            .helper_stop_reason
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = reason;
     }
 
     fn stop_checked(&mut self) -> Result<()> {
@@ -512,6 +533,11 @@ impl Drop for WasapiSystemBackend {
     }
 }
 
+struct KeepaliveConfig {
+    enabled: bool,
+    stop_reason: Arc<Mutex<flexaudio_core::HelperStopReason>>,
+}
+
 /// Thread body. Initialize COM, configure loopback based on `exclude_root`, and
 /// run the capture loop. Report setup status to [`WasapiSystemBackend::start`]
 /// through `ready_tx`. The COM guard (`_com`) is scoped to this function, so
@@ -529,7 +555,7 @@ impl Drop for WasapiSystemBackend {
 fn run_system_thread(
     exclude_root: Option<u32>,
     device_id: Option<String>,
-    classic_loopback_keepalive: bool,
+    keepalive: KeepaliveConfig,
     sink: RawSink,
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<()>>,
@@ -553,7 +579,14 @@ fn run_system_thread(
             .map(CaptureSetup::process)
     } else {
         // Classic loopback on the render endpoint selected by device_id (None uses default).
-        unsafe { setup_system_loopback(device_id.as_deref(), &sink, classic_loopback_keepalive) }
+        unsafe {
+            setup_system_loopback(
+                device_id.as_deref(),
+                &sink,
+                keepalive.enabled,
+                keepalive.stop_reason,
+            )
+        }
     };
     let setup = match setup {
         Ok(t) => t,
@@ -580,6 +613,7 @@ unsafe fn setup_system_loopback(
     device_id: Option<&str>,
     sink: &RawSink,
     classic_loopback_keepalive: bool,
+    helper_stop_reason: Arc<Mutex<flexaudio_core::HelperStopReason>>,
 ) -> Result<CaptureSetup> {
     let enumerator: IMMDeviceEnumerator =
         CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
@@ -602,7 +636,7 @@ unsafe fn setup_system_loopback(
         let format = parse_mix_format(pwfx)?;
         verify_format(format, (sink.native_rate(), sink.native_channels()))?;
         let keepalive = create_keepalive(classic_loopback_keepalive, || {
-            SilentRender::new(&device, pwfx)
+            SilentRender::new(&device, pwfx, helper_stop_reason)
         })?;
         let (capture, event) = init_loopback_capture(&client, pwfx, 0)?;
         Ok(CaptureSetup {
