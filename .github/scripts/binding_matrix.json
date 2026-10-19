@@ -222,14 +222,14 @@
       "Node": {"status": "supported", "symbols": ["openStream", "JsStreamEvent"], "note": "onEvent callback."},
       "Python": {"status": "supported", "symbols": ["Stream.poll_event", "StreamEvent"]},
       "C": {"status": "supported", "symbols": ["flexaudio_poll_event_v2"], "note": "v1 events are flattened."},
-      "CLI": {"status": "supported", "symbols": ["capture_events::drain_capture_events"], "note": "stderr diagnostics and loss summaries."}
+      "CLI": {"status": "supported", "symbols": ["--source"], "note": "Capture prints event diagnostics and loss summaries to stderr; no separate event flag is required."}
     }},
     {"feature": "Shutdown report", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::stop_checked", "flexaudio::Stream::shutdown_report"]},
       "Node": {"status": "supported", "symbols": ["FlexStream.shutdownReport"]},
       "Python": {"status": "supported", "symbols": ["Stream.shutdown_report"]},
       "C": {"status": "supported", "symbols": ["flexaudio_shutdown_report_v2"]},
-      "CLI": {"status": "supported", "symbols": ["capture_events::drain_capture_events"], "note": "Checks the retained report and reports failures on stderr/exit status."}
+      "CLI": {"status": "supported", "symbols": ["--source"], "note": "Capture checks the retained shutdown report and reports failures on stderr and through exit status."}
     }},
     {"feature": "Pause/resume delivery", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::pause", "flexaudio::Stream::resume"]},
@@ -243,7 +243,7 @@
       "Node": {"status": "supported", "symbols": ["JsStreamEvent"], "note": "Automatic watchdog; stalled/recovered events."},
       "Python": {"status": "supported", "symbols": ["Stream.poll_event", "StreamEvent.type"], "note": "Automatic watchdog; stalled/recovered events."},
       "C": {"status": "supported", "symbols": ["flexaudio_poll_event_v2", "FLEX_EVENT_KIND_STALLED", "FLEX_EVENT_KIND_RECOVERED"], "note": "Automatic watchdog."},
-      "CLI": {"status": "supported", "symbols": ["capture_events::drain_capture_events"], "note": "Automatic watchdog; stderr stall/recovery diagnostics."}
+      "CLI": {"status": "supported", "symbols": ["--source"], "note": "Capture automatically attempts stall recovery and prints stall/recovery diagnostics to stderr."}
     }},
     {"feature": "Silence probe option", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::StreamConfig::silence_probe"]},

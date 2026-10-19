@@ -1,10 +1,10 @@
 # flexaudio
 
-0.6.0 では、従来の 2 つの VAD API を 1 つの汎用 `Vad` に統合しました。
-[0.6.0 の移行表](CHANGELOG.md#060---2026-10-15)を参照してください。
-0.5.x 系は非推奨です。
+各リリースの変更と移行方法は、[変更履歴](CHANGELOG.md)を参照してください。
+過去の VAD 移行: [0.6.0 の移行表](CHANGELOG.md#060---2026-10-15)には、
+非推奨の 0.5.x の VAD API を 1 つの汎用 `Vad` に統合した変更を記載しています。
 
-Rust の 0.5 への移行: `AudioChunk` と `SecondaryChunk` の構造体リテラルには、
+過去の Rust キャプチャの 0.4 から 0.5 への移行: `AudioChunk` と `SecondaryChunk` の構造体リテラルには、
 新しい公開フィールド `frame_index: u64` が必要です。各タップの基準となる 48 kHz
 タイムライン上で、チャンクの最初のフレームを指します。再オープン後も連続し、
 キューで音声が失われると飛びが現れます。生成元のタイムラインから設定してください。
@@ -57,7 +57,7 @@ stream.stop();
   その OS でサポートされていないソースを指定すると、`Error::Unsupported` が返ります。
 - プロセス単位のキャプチャには、`StreamConfig` の `target_pid` が必要です。
 - `SourceKind::Mix` は、3 つのプラットフォームすべてでマイクとシステム出力を組み合わせます。
-- **0.6 の VAD:** 1 つの汎用 `Vad` が区間分割、フレーム確率、暫定通知、キャプチャへの
+- **VAD:** 1 つの汎用 `Vad` が区間分割、フレーム確率、暫定通知、キャプチャへの
   接続を Rust、Node.js、Python、C に提供します。埋め込んだ Silero モデルでオフライン動作します。
 - **型付き診断:** 音声損失、クリッピング、権限、一時的／終端のエラーのイベントと、
   保持されたキャプチャ／後片付けの失敗を確認できます。
@@ -291,19 +291,19 @@ Linux では PipeWire のソケットがなければ `Unavailable`、ソケッ�
 
 ```toml
 [dependencies]
-flexaudio = "0.6"
+flexaudio = "0.8"
 ```
 
 または、次のコマンドを使います。
 
 ```sh
-cargo add flexaudio@0.6
+cargo add flexaudio@0.8
 ```
 
 音声区間検出（VAD）のアドオンは、別のクレートです。
 
 ```sh
-cargo add flexaudio-vad@0.6
+cargo add flexaudio-vad@0.8
 ```
 
 ---
@@ -403,20 +403,20 @@ let final_events = vad.finish()?;
 `speech_pad_ms: 30`、`max_speech_ms: 0`（無制限）です。`VadRuntimeOptions.provisional` は
 既定で false です。単独処理と接続処理の既定値は同じで、製品ごとの上限は呼び出し側から明示します。
 
-`maxSpeechMs` (`max_speech_ms`) is integer milliseconds. Omitted, zero, or values above
-100,000,000 ms use the effectively unbounded legacy `INT_MAX/2`-sample sentinel
-(1,073,741,823 samples). Other nonzero values use the exact 16 kHz split budget
-`16 * maxSpeechMs - 512 - 32 * speechPadMs`, including subsecond values.
-Negative budgets are rejected with `InvalidParameter`; zero budgets are valid
-(for example, 1000 ms with 484 ms padding). Merging can reunite splits, so this
-does not bound final segment duration or delivery latency.
+`maxSpeechMs`（`max_speech_ms`）は整数のミリ秒です。省略、0、100,000,000 ms を超える値は、
+実質無制限の従来の `INT_MAX/2` サンプルの番兵値（1,073,741,823 サンプル）を使います。
+その他の 0 以外の値には、1 秒未満も含め、16 kHz での正確な分割予算
+`16 * maxSpeechMs - 512 - 32 * speechPadMs` を使います。負の予算は `InvalidParameter` で
+拒否し、0 は有効です（例: 1000 ms と 484 ms のパディング）。分割後の区間が結合される場合が
+あるため、最終区間の長さや配信の遅延の上限にはなりません。
 
-In 0.5.x, fractional `maxSpeechDurationS` values were truncated to whole seconds.
-To preserve identical segmentation, migrate with
-`maxSpeechMs = trunc(seconds) * 1000` (for example, 30.9 seconds becomes 30000 ms).
+0.5.x では、小数の `maxSpeechDurationS` は整数の秒に切り捨てられていました。
+同じ区間分割を維持するには `maxSpeechMs = trunc(seconds) * 1000` で移行してください
+（例: 30.9 秒は 30000 ms になります）。
 
 Node.js の単独 `process(samples, inputSampleRate?, inputChannels?)` は既定で
-16000 Hz、1 チャンネルです。Python は同じ既定値で `input_sample_rate` と `input_channels` を
+16000 Hz、1 チャンネルです。単体での変換は 8000–192000 Hz と正のチャンネル数を受け付けます。
+Python は同じ既定値で `input_sample_rate` と `input_channels` を
 使います。Rust は変換入力に `process_pcm(samples, input_sample_rate,
 input_channels)`、16 kHz モノラルには `process(samples)` を使います。内部で形式を変換し、
 イベント時刻は変換器の群遅延を補償した入力時間軸上のミリ秒です。リサンプリングで生じる有限な
@@ -490,7 +490,7 @@ macOS では kAudioHardwareBadObjectError（`!obj`、0x216f626a）、ESRCH（3�
 オフセットではありません。一時停止やキューの破棄でも、PCM を配信せずに番号は進みます。
 
 再オープンを伴わない到着間隔の空きでは、イベントや `DISCONTINUITY` は発生しません。
-`frameIndex` は連続し、主タップの `ptsNs` だけが飛び、接続された Vad のエポックは開いたままです。
+`frameIndex` は連続し、主／副タップの到着時刻ラベルは飛ぶ場合があり、接続された Vad のエポックは開いたままです。
 消費サンプルが 2 秒以上途絶えた停止は 250 ms ごとに検知し、`stalled`、再オープン、
 再オープンの各失敗時に `recoverableError` と 250 ms〜5 秒の再試行間隔が発生します。
 成功後、新しい PCM が来ると `recovered` を通知します。
@@ -527,9 +527,9 @@ last_error を設定します。`RescanRequired` は一覧の無効化を表し�
 Rust に追加した `InferenceError::Multiple`、`VadError::Cause`、
 `VadTapError::Cause` が型付きの原因を保持します。
 
-VAD の失敗では、モデル・変換器・セッションの型付き原因を保持します。ソースの切り替えは共有の
-ギャップ処理で古いエポックを閉じてから接続を交換します。イベント専用のチャンクで PCM を作らずに
-終了を届けます。
+VAD の失敗では、モデル・変換器・セッションの型付き原因を保持します。VAD の接続はソースの
+切り替え後も維持され、次の不連続なキャプチャチャンクが共有のギャップ処理で古いエポックを閉じ、
+新しいエポックを始めます。イベント専用のチャンクで PCM を作らずに終了を届けます。
 
 macOS の自己プローブが判定不能になった場合、ネイティブの原因を保持し、無音の注意通知と
 既存の `RecoverableError` を配信します。キャプチャは継続できます。
@@ -559,8 +559,8 @@ Mix の片側で致命的なエラーが起きると両側を停止し、どち�
 `DISCONTINUITY` が付き、`PADDED=8` と `CLIPPED=16` が出力の状態を示します。
 すべてのバインディングで peak／RMS はノイズ除去とゲイン適用後の配信サンプルから計測します。
 
-Node.js では u64 カウンター（VAD の `seq`、チャンク損失数、音声損失数を含む）を
-bigint で計算してください。PTS は number のままです。チャンクの型には `frameIndex` が
+Node.js ではチャンクの `seq`、VAD の `captureSample`、チャンク損失数、音声損失数を
+bigint で計算してください。VAD イベントの `seq` と `epoch`、PTS は number です。チャンクの型には `frameIndex` が
 必須となり、イベントの型は判別可能な閉じた union になりました。
 `terminalError()`／`shutdownReport()` は値がない場合 `undefined` を返します。
 コールバックの例外は `uncaughtException` として通知されます。
@@ -803,9 +803,10 @@ Rust では `Stream::terminal_error()`、N-API では `terminalError()` を提�
 `shutdownReport()` で停止結果を確認してください。Python の `poll_chunk()` は終端の失敗で
 `RuntimeError` の型付きサブクラスを送出し、`terminal_error()` はイベントを消費せずに
 保持された `AudioError` を返します。C v1 の `flexaudio_poll_chunk()` は、キャプチャの終端エラーで
-`FLEX_FAILURE` (-2) を返します。C v2 の `flexaudio_poll_chunk_v2()` と `flexaudio_terminal_error()` は
-主因の結果コード（例: `FLEX_PERMISSION_DENIED` (-7)、バックエンドの失敗は `FLEX_FAILURE` (-2)）を
-返し、安全な説明は `flexaudio_last_error()` で取得できます。
+`FLEX_FAILURE` (-2) を返します。`flexaudio_terminal_error()` と C v2 の `flexaudio_poll_chunk_v2()` も
+同じ値を返します。安全な説明は `flexaudio_last_error()` で取得できます。型付きの根本コードを調べるには、
+`flexaudio_terminal_error_info_v2()` で所有権を持つエラーを取得し、`flexaudio_error_kind_v2()` で読み、
+`flexaudio_error_info_free_v2()` で解放してください。
 C の権限イベント種別は引き続き 3 です。N-API/Python の権限イベントの type は
 `permissionDenied` のままで、`permission`（`microphone` または `systemAudio`）と `message` が追加されます。
 
@@ -842,7 +843,7 @@ C の権限イベント種別は引き続き 3 です。N-API/Python の権限�
   flexaudio はキャプチャ世代ごとに 1 回、能動的な自己検査を行います。除外とデバイスの選択条件を反映します。
   ゼロのサンプルと出力の動作状態だけでは、録音権限の不足と実際のデジタル無音を区別できません。
 - 自己検査は、位相符号化した 1 kHz、振幅 `1e-5` の信号を約 300 ms、デフォルトの出力へ送ります。
-  この信号は聞こえないように設計されています。独立した非公開の tap が自分自身のプロセスだけをキャプチャし、
+  この信号は低レベルですが、聞こえない保証はありません。独立した非公開の tap が自分自身のプロセスだけをキャプチャし、
   この診断信号を確認します。信号を識別できた場合は無音の警告を抑止します。ネイティブの出力コールバックが
   信号の送信を証明している間に、診断用 tap が完全なゼロだけを連続してキャプチャした場合は、
   `SystemAudio` の `Event::PermissionDenied` を発行し、Mix の両方の入力も含めてキャプチャを終了します。

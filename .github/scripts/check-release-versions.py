@@ -10,6 +10,8 @@ import re
 import sys
 import tomllib
 
+from check_docs_versions import DocumentationCheckError, check_documentation
+
 
 VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 PACKAGE_PATTERN = re.compile(r"@studio-sadola/flexaudio-[a-z0-9-]+")
@@ -58,6 +60,16 @@ def require_version(value: object, expected: str, label: str) -> None:
         raise VersionCheckError(f"{label}: expected {expected}, found {value}")
 
 
+def workspace_version(repo_root: Path) -> str:
+    cargo = load_manifest(repo_root / "Cargo.toml")
+    workspace = mapping(cargo.get("workspace"), "Cargo.toml workspace")
+    package = mapping(workspace.get("package"), "Cargo.toml workspace.package")
+    version = package.get("version")
+    if not isinstance(version, str) or VERSION_PATTERN.fullmatch(version) is None:
+        raise VersionCheckError("Cargo.toml workspace.package.version must be a numeric MAJOR.MINOR.PATCH version")
+    return version
+
+
 def check_versions(repo_root: Path, version: str, *, require_platforms: bool = False) -> None:
     if VERSION_PATTERN.fullmatch(version) is None:
         raise VersionCheckError("Release version must match [0-9]+.[0-9]+.[0-9]+ exactly")
@@ -65,6 +77,7 @@ def check_versions(repo_root: Path, version: str, *, require_platforms: bool = F
     workspace = mapping(cargo.get("workspace"), "Cargo.toml workspace")
     package = mapping(workspace.get("package"), "Cargo.toml workspace.package")
     require_version(package.get("version"), version, "Cargo.toml workspace.package.version")
+    check_documentation(repo_root, version)
 
     pyproject = load_manifest(repo_root / "bindings/flexaudio-py/pyproject.toml")
     project = mapping(pyproject.get("project"), "pyproject.toml project")
@@ -109,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--version", help="Explicit workflow_dispatch version (without v)")
     source.add_argument("--tag", help="Release tag, exactly vMAJOR.MINOR.PATCH")
+    source.add_argument("--workspace", action="store_true", help="Check against Cargo.toml workspace.package.version (CI)")
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--require-platforms", action="store_true")
     args = parser.parse_args(argv)
@@ -118,14 +132,16 @@ def main(argv: list[str] | None = None) -> int:
             if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", args.tag) is None:
                 raise VersionCheckError("Release tag must match ^v[0-9]+\\.[0-9]+\\.[0-9]+$ exactly")
             version = args.tag[1:]
+        elif args.workspace:
+            version = workspace_version(args.repo_root)
         else:
             version = args.version
         check_versions(args.repo_root, version, require_platforms=args.require_platforms)
-    except VersionCheckError as error:
+    except (VersionCheckError, DocumentationCheckError) as error:
         print(f"Release version check failed: {error}", file=sys.stderr)
         return 1
     except OSError as error:
-        print(f"Release version check failed: cannot inspect manifests ({type(error).__name__})", file=sys.stderr)
+        print(f"Release version check failed: cannot inspect release files ({type(error).__name__})", file=sys.stderr)
         return 1
     print(f"Release versions match {version}")
     return 0

@@ -224,7 +224,7 @@ unsafe fn stream_result(
     status
 }
 
-/// Feed normalized interleaved PCM at the specified positive rate and channel count.
+/// Feed normalized interleaved PCM at 8000–192000 Hz and a positive channel count.
 /// Input is converted to mono16k internally; event times use the input timeline,
 /// compensated for converter group delay. After raw input validation, finite resampler
 /// overshoot is clipped internally to [-1, 1]. Use 16000/1 for direct mono16k input.

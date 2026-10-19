@@ -91,9 +91,9 @@ pub struct FlexChunk {
     pub frames: u32,
     /// Deprecated naming since 0.8; use flexaudio_chunk_arrival_ns_v4. This frozen
     /// field remains permanently in the C layout (other bindings retain it through 0.9).
-    /// Arrival-time label re-anchored on every native callback. Primary/secondary chunks
-    /// may overlap or leave gaps by callback jitter; no non-overlap or bounded-monotonic
-    /// guarantee. flexaudio_chunk_frame_index is authoritative (gaps are loss). Exact VAD mapping uses
+    /// Arrival-time label assigned at facade ingest and clamped non-decreasing. Primary/secondary
+    /// ranges may overlap, repeat labels or leave gaps by callback jitter; this is not a media clock.
+    /// flexaudio_chunk_frame_index is authoritative (gaps are loss). Exact VAD mapping uses
     /// epoch_start.pts_ns + t_ms*1000000 or epoch_start.capture_sample + t_ms*48.
     pub pts_ns: i64,
     /// Monotonically increasing sequence number assigned by the stream layer.
@@ -102,9 +102,9 @@ pub struct FlexChunk {
     pub flags: u32,
     /// Number of chunks dropped before this chunk arrived.
     pub dropped_before: u32,
-    /// Maximum absolute delivered sample value after denoise (linear amplitude).
+    /// Maximum absolute delivered sample value after denoise and gain (linear amplitude).
     pub peak: f32,
-    /// Root-mean-square of delivered samples after denoise (linear).
+    /// Root-mean-square of delivered samples after denoise and gain (linear).
     pub rms: f32,
 }
 

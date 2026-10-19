@@ -1,13 +1,13 @@
 # flexaudio (Python)
 
-Python bindings for [flexaudio](https://github.com/Studio-Sadola/flexaudio), a
+Python bindings for [flexaudio](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md), a
 cross-platform audio capture library (microphone, system loopback, and
 per-process loopback) written in Rust. Built with PyO3 and maturin.
 
 ## Install
 
 ```sh
-pip install "flexaudio>=0.6,<0.7"
+pip install "flexaudio>=0.8,<0.9"
 ```
 
 ## Usage
@@ -81,9 +81,9 @@ an unsupported OS, or a permission denial), the OS did not answer within 3
 seconds, or a previous enumeration is still in progress. On Windows, listing
 and capturing both need Windows build 20348 or later (Windows 11 / Windows
 Server 2022). `executable`, `bundle_id` (macOS only), and `is_output_active`
-are `None` when the OS does not expose them. On Linux, `executable` is
-`/proc/<pid>/exe` and falls back to `/proc/<pid>/comm` when `exe` is
-unreadable.
+are `None` when the OS does not expose them. `executable` is a basename, not a
+path. On Linux it comes from the `/proc/<pid>/exe` target's basename, falling
+back to `/proc/<pid>/comm` when `exe` is unreadable.
 
 Optional keyword arguments: `device_id`, `output_rate` (default 48000),
 `output_channels` (default 2), `chunk_ms` (only 20 is supported; other values
@@ -144,15 +144,19 @@ The fixed 20 ms chunk size preserves canonical capture conversion and ordering;
 other chunk durations are rejected before opening a device.
 
 On macOS, `silence_probe=False` disables the silence diagnosis tone. The default
-is enabled: after five seconds of exact-zero system capture, a 1 kHz tone at
-amplitude 1e-5 plays for 300 ms to help distinguish permission failure from silence.
+is enabled for system/process capture and the system lane of Mix. After five
+continuous seconds of bit-exact zero native samples while an eligible external
+captured process has active output (honoring exclusions and device selection),
+it probes once per capture generation. A 1 kHz signal at amplitude 1e-5 plays for
+roughly 300 ms to help distinguish permission failure from silence. This low-level
+signal is not guaranteed inaudible and may enter capture when the host is included.
 
 ### Standalone add-ons
 
 The same building blocks are available as independent classes.
 
 ```python
-# Voice activity detection over arbitrary-format PCM (mono/stereo, any rate).
+# Voice activity detection over PCM (mono/stereo, 8000–192000 Hz).
 vad = flexaudio.Vad(threshold=0.5, min_silence_ms=100)
 for ev in vad.process(samples, input_sample_rate=48000, input_channels=2):
     print(ev.type)
@@ -234,8 +238,8 @@ their models/tables and require no runtime files or network access:
 
 `Vad` runs embedded Silero v6 on normalized float32, with
 segmentation matching whisper.cpp pin `85a69493a601d4ff5a834064f7b7bac250bd8739`.
-`process(samples, input_sample_rate=16000, input_channels=1)` accepts arbitrary
-positive input rates/channel counts and converts to mono16k internally. Event
+`process(samples, input_sample_rate=16000, input_channels=1)` accepts input rates
+of 8000–192000 Hz and positive channel counts, and converts to mono16k internally. Event
 times use the input timeline, compensated for converter group delay. After raw
 input validation, finite resampler overshoot is clipped internally to [-1, 1]. It accepts
 a sequence or a contiguous one-dimensional native float32 buffer;
@@ -318,7 +322,7 @@ raising `IgnoredSettingsError` with its complete candidate `.report`.
 `strict=None` means false on open and retention on switch. Gain and ring capacity
 stay fixed at open; non-default switch requests are ignored with `fixedAtOpen`.
 Use `set_gain()` for runtime gain changes. Python switch denoise remains applied.
-See the root README's [ignored-setting table](../../README.md#strict-mode-and-effective-settings).
+See the root README's [ignored-setting table](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#strict-mode-and-effective-settings).
 
 `stream.poll_lifecycle_event()` consumes a separate ordered helper-event FIFO;
 `poll_event()` never returns lifecycle notifications, even as unknown events.
@@ -329,7 +333,7 @@ overflow. Every emitted Started has exactly one Stopped with a reason. macOS
 Started means entry into a diagnostic attempt; Windows Started means successful
 keepalive render start. Stopped ends ownership after teardown attempts; typed cleanup
 errors remain authoritative. There is no ordering guarantee relative to PCM or
-ordinary events. See [helper behavior and controls](../../README.md#optional-playback-helpers-and-lifecycle).
+ordinary events. See [helper behavior and controls](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#optional-playback-helpers-and-lifecycle).
 
 Both chunk types expose `arrival_ns`, exactly equal to `pts_ns`. The old chunk
 name is documentation-only deprecated since 0.8 and retained throughout 0.9.

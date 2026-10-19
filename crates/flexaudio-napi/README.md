@@ -1,7 +1,7 @@
 # @studio-sadola/flexaudio
 
 Native **N-API** bindings that let Node.js / TypeScript / Electron capture audio
-through the [flexaudio](https://github.com/Studio-Sadola/flexaudio) Rust library:
+through the [flexaudio](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md) Rust library:
 microphone, system output (loopback), per-process capture, and mic + system mix on **Linux**,
 **Windows**, and **macOS**.
 
@@ -18,7 +18,7 @@ offline — no model files to ship, no network at runtime.
 ## Install
 
 ```sh
-npm install @studio-sadola/flexaudio@0.6
+npm install @studio-sadola/flexaudio@0.8
 ```
 
 The correct prebuilt native binary for your platform is pulled in automatically
@@ -181,9 +181,9 @@ stream relayed through `pipewire-pulse` is not captured until its
 `application.process.id` is known.
 
 On **macOS** each pid is resolved to a Core Audio process object once, when the
-capture starts. A helper that has not yet rendered any audio has no such object
-and is therefore not excluded: this is a start-time snapshot. A failed PID
-lookup fails the open unless the process is gone. Open the capture while the
+capture starts. An unresolved live process, including a helper that has not yet
+rendered audio, fails startup. Only a non-host process confirmed gone is omitted;
+unresolved host exclusion always fails startup. This is a start-time snapshot. Open the capture while the
 app is already playing, or reopen it when a new helper appears.
 
 macOS honors `deviceId` (or `systemDeviceId` for mix) together with exclusion.
@@ -208,7 +208,7 @@ the old source. Failed switches keep the previous report and controls.
 Gain, ring capacity, denoise and VAD cannot be replaced by `switchSource`:
 non-default requests are `ignored` with `fixedAtOpen` (strict rejects them).
 Use `setGain()` for runtime gain changes. See the root README's
-[ignored-setting table](../../README.md#strict-mode-and-effective-settings)
+[ignored-setting table](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#strict-mode-and-effective-settings)
 for all reasons and the default-value rule.
 
 Register `onLifecycleEvent` inside `OpenOptions` for a separate ordered helper
@@ -226,7 +226,7 @@ Every emitted helper Started has exactly one Stopped with a reason. On macOS,
 Started means a diagnostic attempt; on Windows it means successful silent-render
 start. Stopped ends ownership after teardown attempts; cleanup errors remain
 authoritative. Ordering against PCM and ordinary events is not guaranteed.
-See [helper behavior and controls](../../README.md#optional-playback-helpers-and-lifecycle).
+See [helper behavior and controls](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#optional-playback-helpers-and-lifecycle).
 
 Library-created primary and secondary chunks always expose `arrivalNs`, identical
 to `ptsNs`. The declaration is optional to preserve consumer-created objects.
@@ -269,8 +269,10 @@ const stream = openStream(
 
 Compare primary and secondary arrival labels with `arrivalNs`, never `seq`:
 each tap counts its own sequence. Arrival labels can overlap or repeat and are
-not an exact media clock or an exact pairing key. Relative timing depends on
-the output formats and buffering; there is no fixed delay between taps.
+not an exact media clock or an exact pairing key. Delay depends on the secondary
+format and buffering; a 48 kHz stereo tap bypasses secondary conversion and has
+no conversion delay. Node expands the primary chunk's 20 ms interval by 30 ms on
+each side (60 ms pairing tolerance). There is no fixed delay between taps.
 
 `stream` also exposes `pause()` / `resume()`, `setGain(x)`, and the read-only
 `isPaused()`, `gain()`, `nativeFormat()` (`{ sampleRate, channels }`) and
@@ -291,7 +293,7 @@ VAD / noise suppression can also be wired into a live `openStream`.
 ```js
 const { Vad, Denoiser, FlacEncoder, openStream } = require('@studio-sadola/flexaudio');
 
-// VAD: feed any format; it resamples internally to the VAD rate (16 kHz).
+// VAD: feed 8000–192000 Hz PCM; it resamples internally to the VAD rate (16 kHz).
 const vad = new Vad({ threshold: 0.5, minSilenceMs: 100 });
 for (const ev of [...vad.process(samples, 48000, 2), ...vad.finish()]) {
   if (ev.type === 'segment') console.log(ev.startMs, ev.endMs);
@@ -388,13 +390,6 @@ reinitialization keeps the session failed without repeating the event, until
 `flushVad()` succeeds. Missing capture audio never becomes padding, and a
 capture index gap closes the intact prefix instead of failing it.
 
-Standalone tests do not open audio devices. After building/copying the addon as
-in `__test__/run-smoke.sh`, run
-`node __test__/vad.test.mjs` from this crate. The script uses `node:test`
-and reports each available case. Failure-isolation cases require a test addon built
-with `--features test-faults` and the test-only loader. Release JavaScript,
-declarations and native exports omit all mock/fault controls. The release workflows do not enable this feature.
-
 ## Building the loader (`index.js` / `index.d.ts`)
 
 The JavaScript loader (`index.js`) and TypeScript declarations (`index.d.ts`)
@@ -418,7 +413,7 @@ Audio capture requires OS-level consent: macOS TCC
 (`kTCCServiceAudioCapture`; add `NSAudioCaptureUsageDescription` to your app's
 `Info.plist`), the Windows microphone privacy setting, and a running PipeWire
 session on Linux for system / per-process capture. See the
-[workspace README](https://github.com/Studio-Sadola/flexaudio#os-specific-permission-requirements).
+[workspace README](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#os-specific-permission-requirements).
 
 On macOS, system / per-process loopback (Core Audio process taps) requires
 macOS 14.4 or later.
@@ -431,4 +426,8 @@ pure-Rust tract inference crates, and RNNoise via nnnoiseless with embedded
 weights (noise suppression).
 See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
-The macOS silence diagnostic probe is enabled by default. Set `silenceProbe: false` in `openStream` to disable its short diagnostic signal after sustained exact-zero capture. Other platforms ignore the option.
+The macOS silence diagnostic probe is enabled by default for system/process capture
+and the system lane of Mix. It runs once per generation after five continuous
+seconds of bit-exact zero native samples with eligible external output activity,
+honoring exclusions and device selection. Its low-level signal is not guaranteed
+inaudible. Set `silenceProbe: false` in `openStream` to disable it. Other platforms ignore the option.

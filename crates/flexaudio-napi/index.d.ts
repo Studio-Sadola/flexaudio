@@ -1,7 +1,7 @@
 /* tslint:disable */
 /* eslint-disable */
 
-/* Public declarations maintained to match the strict 0.6 boundary contract. */
+/* Public declarations maintained to match the strict binding boundary contract. */
 
 /** JS DeviceInfo. `sourceKind` is a string ("mic"|"system"|"process").
  * Unreadable mandatory formats use sampleRate=0, channels=0 and formatAvailable=false.
@@ -51,7 +51,7 @@ export interface JsProcessInfo {
  * JS AudioChunk. `data` is interleaved f32 (len = frames * channels).
  * `seq` (u64) uses BigInt to avoid precision loss. `flags` contains ChunkFlags bits (u32).
  *
- * Delivery shape (0.3.0): `onChunk` in `openStream(options, onChunk)` receives **one argument**
+ * Delivery shape: `onChunk` in `openStream(options, onChunk)` receives **one argument**
  * (this primary chunk). Secondary tap (`secondaryOutput`) chunks arrive in the primary chunk's
  * `secondary` property, rather than a second argument. Finalized VAD events also arrive on
  * the selected `vad.tap` chunk's `vadEvents`, rather than a separate callback
@@ -68,8 +68,8 @@ export interface JsAudioChunk {
    * Secondary uses its own tap timeline. */
   frameIndex: bigint
   frames: number
-  /** Arrival-time label re-anchored on every native callback. Consecutive chunks may
-   * overlap or leave gaps by callback jitter; no non-overlap or bounded-monotonic guarantee.
+  /** Arrival-time label assigned at facade ingest and clamped non-decreasing.
+   * Callback jitter may cause overlapping ranges, repeated labels or gaps; this is not a media clock.
    * frameIndex is authoritative (gaps are loss). VAD uses epochStart.ptsNs + tMs*1e6,
    * or epochStart.captureSample + tMs*48 for the exact sample-clock mapping. */
   /** @deprecated Since 0.8; use arrivalNs. Retained throughout 0.9. */
@@ -87,8 +87,11 @@ export interface JsAudioChunk {
   /**
    * Timestamp-matched secondary tap chunk (only with `secondaryOutput`). Delivered as a pair in
    * the same callback (`primary.secondary` in `onChunk(primary)`, not a second argument). It is
-   * `undefined` when the secondary has not arrived. Match primary↔secondary by `ptsNs` (time);
-   * `seq` is independent for each tap.
+   * `undefined` when no secondary is available in the pairing window.
+   * Delay depends on the secondary format and buffering; a 48 kHz stereo tap
+   * bypasses secondary conversion and has no conversion delay. Node expands the
+   * primary chunk's 20 ms interval by 30 ms on each side (60 ms pairing tolerance).
+   * Arrival labels are not an exact pairing key; each tap has its own `seq`.
    */
   secondary?: JsSecondaryChunk
 }
@@ -98,7 +101,10 @@ export interface JsAudioChunk {
  * `data` is a typed array matching `encoding` (`Int16Array` for `'s16'`,
  * `Float32Array` for `'f32'`). Sample values use host native endianness. Serialization to s16le
  * wire format is the receiver's (consumer's) responsibility. `ptsNs` uses the same recording-zero
- * clock as the primary but is independent, trailing by 20–60ms due to secondary Stage2 resampler group delay.
+ * clock as the primary but is independent. Delay depends on the secondary format and
+ * buffering; a 48 kHz stereo tap bypasses secondary conversion and has no conversion delay.
+ * Node expands the primary chunk's 20 ms interval by 30 ms on each side
+ * (60 ms pairing tolerance). Arrival labels are not an exact pairing key.
  */
 export interface JsSecondaryChunk {
   data: Int16Array | Float32Array
@@ -110,8 +116,8 @@ export interface JsSecondaryChunk {
    * Secondary uses its own tap timeline. */
   frameIndex: bigint
   frames: number
-  /** Arrival-time label re-anchored on every native callback. Consecutive chunks may
-   * overlap or leave gaps by callback jitter; no non-overlap or bounded-monotonic guarantee.
+  /** Arrival-time label assigned at facade ingest and clamped non-decreasing.
+   * Callback jitter may cause overlapping ranges, repeated labels or gaps; this is not a media clock.
    * frameIndex is authoritative (gaps are loss). VAD uses epochStart.ptsNs + tMs*1e6,
    * or epochStart.captureSample + tMs*48 for the exact sample-clock mapping. */
   /** @deprecated Since 0.8; use arrivalNs. Retained throughout 0.9. */
@@ -199,7 +205,7 @@ export interface VadError extends Error {
 export declare class Vad {
   constructor(params?: VadOptions)
   /** Normalized [-1,1] interleaved float32 PCM; defaults to 16000 Hz, mono.
-   * Other rates/channels are converted internally. Events use the input timeline in
+   * Rates of 8000–192000 Hz and positive channel counts are converted internally. Events use the input timeline in
    * milliseconds, compensated for converter group delay. Finite converter overshoot
    * is clipped to [-1,1]; invalid source PCM and nonfinite converter output are rejected.
    * Input is not retained. */
@@ -291,7 +297,7 @@ export interface ShutdownReport {
 }
 
 /** Arrival gaps without reopen emit no event/DISCONTINUITY: frameIndex stays contiguous,
- * only primary ptsNs jumps, and attached Vad keeps its epoch open.
+ * primary and secondary arrival labels can jump, and attached Vad keeps its epoch open.
  * Stall: >=2 s without consumed samples, checked every 250 ms; stalled, reopen,
  * each failed reopen attempt emits recoverableError and backs off 250 ms..5 s.
  * On success, recovered is emitted when new PCM arrives. First new-generation primary
@@ -395,8 +401,8 @@ export interface OpenOptions {
    * (1..=2147483647), or capture fails.
    * Duplicates are allowed. Ignored by mic/process after validation.
    * Linux and macOS exclude every listed PID. macOS resolves audio objects
-   * at capture start: a PID without one is not excluded; a failed lookup
-   * fails the open unless the process is gone.
+   * at capture start: an unresolved live process fails startup; only a non-host
+   * process confirmed gone is omitted. Unresolved host exclusion always fails startup.
    * On Linux, while exclusion is active, a pipewire-pulse-relayed stream
    * without a known application.process.id is not captured.
    * Windows can exclude only one process tree. For Electron, use
@@ -627,9 +633,9 @@ export declare function processes(): Promise<Array<JsProcessInfo>>
  * before or after the startup notice; they have no ordering guarantee relative to it.
  * Windows checks Microphone privacy, including Let desktop apps access your microphone.
  *
- * macOS system/process capture runs a once-per-generation self-probe after 5 s of
+ * macOS system/process capture, including the system lane of Mix, runs a once-per-generation self-probe after 5 s of
  * exact-zero samples with eligible external output active. It renders a roughly
- * 300 ms diagnostic signal on the default output and captures only our own process
+ * 300 ms low-level diagnostic signal, not guaranteed inaudible, on the default output and captures only our own process
  * in a separate private tap. A confirmed failure emits terminal permissionDenied
  * with permission systemAudio; an inconclusive result emits silenceWhileSourceActive
  * and continues. The signal may enter capture when our own process is included

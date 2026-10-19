@@ -383,9 +383,9 @@ typedef struct FlexChunk {
     uint32_t frames;
     // Deprecated naming since 0.8; use flexaudio_chunk_arrival_ns_v4. This frozen
     // field remains permanently in the C layout (other bindings retain it through 0.9).
-    // Arrival-time label re-anchored on every native callback. Primary/secondary chunks
-    // may overlap or leave gaps by callback jitter; no non-overlap or bounded-monotonic
-    // guarantee. flexaudio_chunk_frame_index is authoritative (gaps are loss). Exact VAD mapping uses
+    // Arrival-time label assigned at facade ingest and clamped non-decreasing. Primary/secondary
+    // ranges may overlap, repeat labels or leave gaps by callback jitter; this is not a media clock.
+    // flexaudio_chunk_frame_index is authoritative (gaps are loss). Exact VAD mapping uses
     // epoch_start.pts_ns + t_ms*1000000 or epoch_start.capture_sample + t_ms*48.
     int64_t pts_ns;
     // Monotonically increasing sequence number assigned by the stream layer.
@@ -394,9 +394,9 @@ typedef struct FlexChunk {
     uint32_t flags;
     // Number of chunks dropped before this chunk arrived.
     uint32_t dropped_before;
-    // Maximum absolute delivered sample value after denoise (linear amplitude).
+    // Maximum absolute delivered sample value after denoise and gain (linear amplitude).
     float peak;
-    // Root-mean-square of delivered samples after denoise (linear).
+    // Root-mean-square of delivered samples after denoise and gain (linear).
     float rms;
 } FlexChunk;
 
@@ -693,8 +693,8 @@ typedef struct FlexVadOptions {
     int32_t speech_pad_ms;
 } FlexVadOptions;
 
-// Fixed-width stream VAD attachment settings. v1/v2 support only the primary tap;
-// v3 also supports the secondary tap when secondary output is configured.
+// Fixed-width stream VAD attachment settings. v1 has no attached VAD; v2 supports
+// the primary tap. v3/v4 also support the secondary tap when secondary output is configured.
 typedef struct FlexStreamVadOptions {
     struct FlexVadOptions params;
     // 0 or 1, never a default sentinel.
@@ -1069,7 +1069,7 @@ void flexaudio_devices_free(struct FlexDeviceInfo *arr, size_t count);
 // Return 0 on success. If there are no candidates, an empty result (`out_array=NULL` /
 // `out_count=0`) is still successful: per-process capture is available, but there are no
 // matching processes now. Free the allocated array **once only** with
-// `flexaudio_processes_free`. Return `FLEX_FAILURE` (with the reason in `flexaudio_last_error`)
+// `flexaudio_processes_free`. Return a typed negative result code (with the reason in `flexaudio_last_error`)
 // if per-process capture is unavailable in this environment (PipeWire is unreachable on
 // Linux; macOS is earlier than 14.4; Windows is older than build 20348 (Windows 11 / Windows
 // Server 2022 or later is required); the OS is unsupported; or access is denied), if the OS does
@@ -1077,7 +1077,8 @@ void flexaudio_devices_free(struct FlexDeviceInfo *arr, size_t count);
 //
 // # Safety
 // `out_array` / `out_count` must be valid output pointers (NULL is InvalidArg).
-int32_t flexaudio_processes(struct FlexProcessInfo **out_array, size_t *out_count);
+int32_t flexaudio_processes(struct FlexProcessInfo **out_array,
+                            size_t *out_count);
 
 // Free the array allocated by `flexaudio_processes` and each string. NULL-safe.
 // Call **once only**; calling twice with the same pointer causes a double-free and undefined
@@ -1665,7 +1666,7 @@ struct FlexVadOptions flexaudio_vad_default_options(void);
 struct FlexVad *flexaudio_vad_new(const struct FlexVadOptions *params,
                                   const struct FlexVadRuntimeOptions *options);
 
-// Feed normalized interleaved PCM at the specified positive rate and channel count.
+// Feed normalized interleaved PCM at 8000–192000 Hz and a positive channel count.
 // Input is converted to mono16k internally; event times use the input timeline,
 // compensated for converter group delay. After raw input validation, finite resampler
 // overshoot is clipped internally to [-1, 1]. Use 16000/1 for direct mono16k input.
