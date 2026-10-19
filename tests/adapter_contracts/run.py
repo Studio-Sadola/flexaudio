@@ -62,12 +62,11 @@ def mic_source():
     config = clean(config_source[:marker_index(config_source, "#[cfg(test)]")] + between(
         config_source, "/// Materialize a query failure", "#[cfg(test)]\nmod diagnostic_tests"))
     devices = between(FACADE.read_text(), "pub fn devices()", "/// Start a [`DeviceWatcher`]")
-    device_info = between(LINUX.read_text(), "    for n in &state.nodes {", "    Ok(out)\n}")
     linux_devices = between(LINUX.read_text(), "pub fn list_devices()", "/// PipeWire registry enumeration implementation")
     result = (HERE / "mic_fixture.rs").read_text()
     for marker, code in {
         "// LIVE_INPUT_CONFIG": config, "// LIVE_ADAPTER": clean(source),
-        "// LIVE_FACADE_DEVICES": devices, "// LIVE_PIPEWIRE_DEVICE_INFO": device_info,
+        "// LIVE_FACADE_DEVICES": devices,
         "// LIVE_PIPEWIRE_LIST_DEVICES": linux_devices,
     }.items():
         result = splice(result, marker, code)
@@ -91,7 +90,6 @@ def linux_source():
         "// LIVE_SYSTEM_STOP": between(source, "    fn stop(&mut self)", "}\n\nimpl Drop for PwSystemBackend"),
         "// LIVE_POLL": between(source[marker_index(source, "impl PwDeviceWatcher {"):], "    pub fn poll_event(", "    /// Stop watching"),
         "// LIVE_DEADLINE": between(source, "    let deadline = std::time::Instant::now();", "    // Build DeviceInfo values"),
-        "// LIVE_DEVICE_INFO": between(source, "    for n in &state.nodes {", "    Ok(out)\n}"),
         "// LIVE_REMOVE_CALLBACK": callback_expression(source, ".global_remove(move |id| {", "        .register();"),
     }
     # Callback expressions are kept byte-for-byte, including catch_unwind.

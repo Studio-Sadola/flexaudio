@@ -51,6 +51,8 @@ use capture_failures::{
 };
 mod discovery;
 use discovery::EnumerationFailure;
+mod device_info;
+use device_info::{namespaced_devices, EnumState, NodeRecord};
 mod owner;
 mod readiness;
 use owner::{
@@ -2230,34 +2232,6 @@ const PROC_SCRATCH_CAP: usize = (NATIVE_RATE as usize) * (NATIVE_CHANNELS as usi
 // Device enumeration (Linux/PipeWire implementation of `devices()`)
 // ============================================================================
 
-/// Raw information for one node collected from PipeWire registry global events during enumeration.
-///
-/// Callbacks write to local `!Send` state, so store owned `String`s here and build [`DeviceInfo`]
-/// after the enumeration loop ends.
-struct NodeRecord {
-    /// `node.name` used as a stable, persistent ID.
-    node_name: String,
-    /// Display name: `node.description`, or empty for unknown.
-    description: String,
-    /// `media.class` (`"Audio/Sink"` / `"Audio/Source"`, etc.).
-    media_class: String,
-    /// Rate (Hz) if `audio.rate` could be read.
-    rate: Option<u32>,
-    /// Channel count if `audio.channels` could be read.
-    channels: Option<u16>,
-}
-
-/// Collector shared across the enumeration loop (`!Send`, confined to the loop thread).
-#[derive(Default)]
-struct EnumState {
-    /// Collected Audio/Sink and Audio/Source nodes.
-    nodes: Vec<NodeRecord>,
-    /// Default sink `node.name` (from `default.audio.sink` metadata).
-    default_sink: Option<String>,
-    /// Default source `node.name` (from `default.audio.source` metadata).
-    default_source: Option<String>,
-}
-
 /// Only nodes and metadata participate in inventory; missing properties give no selectable entry.
 fn enumeration_properties<'a>(
     object_type: &pw::types::ObjectType,
@@ -2546,42 +2520,6 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
     // Build DeviceInfo values from the collected raw nodes.
     let devices = namespaced_devices(&state.borrow());
     Ok(devices)
-}
-
-fn namespaced_devices(state: &EnumState) -> Vec<flexaudio_core::NamespacedDevice> {
-    let mut out = Vec::with_capacity(state.nodes.len());
-    for n in &state.nodes {
-        let is_loopback = n.media_class == "Audio/Sink";
-        let source_kind = if is_loopback {
-            SourceKind::SystemLoopback
-        } else {
-            SourceKind::Mic
-        };
-        let is_default = if is_loopback {
-            state.default_sink.as_deref() == Some(n.node_name.as_str())
-        } else {
-            state.default_source.as_deref() == Some(n.node_name.as_str())
-        };
-        let (sample_rate, channels, format_available) =
-            flexaudio_core::inventory::device_format(Ok((
-                n.rate.unwrap_or(NATIVE_RATE),
-                n.channels.unwrap_or(NATIVE_CHANNELS),
-            )));
-        out.push(flexaudio_core::NamespacedDevice::new(
-            DeviceInfo {
-                id: n.node_name.clone(),
-                name: n.description.clone(),
-                source_kind,
-                sample_rate,
-                channels,
-                format_available,
-                is_loopback,
-                is_default,
-            },
-            flexaudio_core::DeviceIdNamespace::PipeWireNodeName,
-        ));
-    }
-    out
 }
 
 /// Extract `name` from PipeWire `default.audio.{sink,source}` metadata (JSON `{"name":"..."}`).

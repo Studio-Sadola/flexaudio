@@ -406,14 +406,18 @@ jobs:
   msrv-1_91:
     name: MSRV 1.91 (tract-dependent add-ons)
     runs-on: ubuntu-latest
+    env:
+      # Use the interpreter whose libpython is installed by python3-dev below.
+      # PyO3 otherwise prefers `python` on PATH, which may be a different Python
+      # installation from the runner's system development library.
+      PYO3_PYTHON: /usr/bin/python3
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
         # python3-dev is needed for PyO3 (flexaudio-py). Without `extension-module`,
-        # `cargo build` links to libpython, so the shared library and headers are required
-        # (whether CI actually has everything needed is unverified; see below).
+        # `cargo build` links to libpython, so use the matching system interpreter.
         run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev python3-dev
       # This job also skips Clippy for the same reason as the MSRV job.
       - name: Build at MSRV 1.91 (ffi / napi / py / vad)
