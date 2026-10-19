@@ -16,6 +16,8 @@ use std::ptr;
 /// Only `poll_*` uses positive 1 for “available” and 0 for “none”; errors remain negative.
 /// The C header uses names such as `FLEX_OK` to avoid collisions in the C namespace.
 pub mod code {
+    /// Strict validation rejected ignored capture settings.
+    pub const FLEX_IGNORED_SETTINGS: i32 = -13;
     /// Device lookup completed without a match.
     pub const FLEX_DEVICE_NOT_FOUND: i32 = -5;
     /// Active device lost.
@@ -114,6 +116,7 @@ pub(crate) fn root_code(error: &flexaudio::Error) -> i32 {
         ErrorKind::UnsupportedFormat => code::FLEX_UNSUPPORTED_FORMAT,
         ErrorKind::NativeFormatChanged => code::FLEX_NATIVE_FORMAT_CHANGED,
         ErrorKind::AmbiguousDeviceName => code::FLEX_AMBIGUOUS_DEVICE_NAME,
+        ErrorKind::IgnoredSettings => code::FLEX_IGNORED_SETTINGS,
         ErrorKind::Backend => code::FLEX_FAILURE,
         _ => code::FLEX_FAILURE,
     }

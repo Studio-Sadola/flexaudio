@@ -31,7 +31,12 @@ mod flac;
 mod integration;
 mod legacy_codes;
 pub use legacy_codes::*;
+mod discovery_v4;
+mod lifecycle_v4;
+pub use lifecycle_v4::FLEX_LIFECYCLE_UNKNOWN;
 mod secondary;
+mod settings_request;
+mod settings_v4;
 mod shutdown;
 mod types;
 mod v2;
@@ -40,6 +45,8 @@ mod v2_storage;
 mod v3;
 mod v3_types;
 mod v3_validation;
+mod v4;
+mod v4_types;
 mod vad;
 mod vad_integration;
 mod vad_types;
@@ -190,7 +197,11 @@ unsafe fn open_with_exclude_pids(
     exclude_pids: *const u32,
     exclude_pids_len: usize,
 ) -> *mut FlexStream {
-    open_with_exclude_pids_using(config, exclude_pids, exclude_pids_len, flexaudio::open)
+    open_with_exclude_pids_using(config, exclude_pids, exclude_pids_len, |decoded| {
+        let options = flexaudio::OpenOptions::default()
+            .settings_attachments(settings_request::attachments(&*config, 0).vad(false));
+        flexaudio::open_with_options(decoded, options)
+    })
 }
 
 unsafe fn open_with_exclude_pids_using(
@@ -229,6 +240,7 @@ unsafe fn open_with_exclude_pids_using(
             Ok(inner) => {
                 inner.set_denoise(config.denoise != 0);
                 Box::into_raw(Box::new(FlexStream {
+                    events: Default::default(),
                     secondary: None,
                     shutdown: None,
                     shutdown_event_index: 0,
@@ -726,7 +738,17 @@ unsafe fn switch_source_with_exclude_pids(
             Ok(c) => c,
             Err(()) => return code::FLEX_INVALID_ARG,
         };
-        match stream.inner.switch_source(stream_config) {
+        let options = stream.inner.open_options().clone().settings_attachments(
+            settings_request::attachments(config, 0).omitted_on_switch([
+                flexaudio::SettingKey::Vad,
+                flexaudio::SettingKey::SecondaryEncoding,
+                flexaudio::SettingKey::SecondaryOutput,
+            ]),
+        );
+        match stream
+            .inner
+            .switch_source_with_options(stream_config, options)
+        {
             Ok(()) => code::FLEX_OK,
             Err(e @ flexaudio::Error::InvalidArg(_)) => {
                 error::set_audio_error(e);
@@ -970,6 +992,7 @@ mod permission_tests {
     #[test]
     fn terminal_poll_failure_keeps_code_reason_and_event_after_stop() {
         let mut stream = FlexStream {
+            events: Default::default(),
             secondary: None,
             shutdown: None,
             shutdown_event_index: 0,
@@ -1009,6 +1032,7 @@ mod permission_tests {
         )
         .expect("open mock");
         let stream = FlexStream {
+            events: Default::default(),
             secondary: None,
             shutdown: None,
             shutdown_event_index: 0,

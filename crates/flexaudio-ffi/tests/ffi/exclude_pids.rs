@@ -90,6 +90,7 @@ fn mock_handle() -> Handle {
     )
     .expect("mock stream opens");
     Handle(Box::into_raw(Box::new(FlexStream {
+        events: Default::default(),
         secondary: None,
         shutdown: None,
         shutdown_event_index: 0,

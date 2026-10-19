@@ -27,6 +27,7 @@ fn stream(denoise: bool) -> (FlexStream, Arc<Mutex<Option<fa::core::backend::Raw
     inner.start().unwrap();
     (
         FlexStream {
+            events: Default::default(),
             secondary: None,
             shutdown: None,
             shutdown_event_index: 0,

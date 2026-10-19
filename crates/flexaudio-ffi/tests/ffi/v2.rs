@@ -625,6 +625,7 @@ fn stream(
     .unwrap();
     inner.set_denoise(denoise);
     let mut stream = FlexStream {
+        events: Default::default(),
         inner,
         secondary: None,
         shutdown: None,

@@ -139,3 +139,52 @@ fn existing_v2_envelopes_and_records_keep_their_layouts() {
         operation = 0 => u32, lane = 4 => u32, native_code_kind = 8 => u32,
         native_code = 16 => i64, native_call = 24 => *const c_char);
 }
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn standalone_vad_records_and_unions_keep_their_layouts() {
+    use crate::{vad_integration::FlexAttachedVadPayload, vad_types::*};
+    assert_layout!(FlexVadOptions, 20, 4;
+        threshold = 0 => f32, min_speech_ms = 4 => i32, min_silence_ms = 8 => i32,
+        max_speech_ms = 12 => u32, speech_pad_ms = 16 => i32);
+    assert_layout!(FlexVadRuntimeOptions, 1, 1; provisional = 0 => u8);
+    assert_layout!(FlexSpeechSegment, 16, 8; start_ms = 0 => u64, end_ms = 8 => u64);
+    assert_layout!(FlexVadSpeechStart, 8, 8; at_ms = 0 => u64);
+    assert_layout!(FlexVadSpeechEnd, 16, 8; at_ms = 0 => u64, reason = 8 => u32);
+    assert_layout!(FlexVadCut, 24, 8; start_ms = 0 => u64, end_ms = 8 => u64, reason = 16 => u32);
+    assert_layout!(FlexVadEpochEnd, 4, 4; reason = 0 => u32);
+    assert_layout!(FlexVadPayload, 24, 8;
+        segment = 0 => FlexSpeechSegment, speech_start = 0 => FlexVadSpeechStart,
+        speech_end = 0 => FlexVadSpeechEnd, cut = 0 => FlexVadCut, epoch_end = 0 => FlexVadEpochEnd);
+    assert_layout!(FlexVadEvent, 40, 8;
+        r#type = 0 => u32, epoch = 4 => u32, seq = 8 => u64, data = 16 => FlexVadPayload);
+    assert_layout!(FlexAttachedVadPayload, 24, 8;
+        vad = 0 => FlexVadPayload, epoch_start = 0 => crate::vad_integration::FlexVadEpochStart);
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn additive_v4_layouts_match_the_contract() {
+    use crate::v4_types::*;
+    assert_eq!(size_of::<FlexValueKindV4>(), 4);
+    assert_eq!(align_of::<FlexValueKindV4>(), 4);
+    assert_layout!(FlexOptionsV4, 24, 8;
+        size = 0 => u32, version = 4 => u32, strict = 8 => u32, ring_capacity_chunks = 16 => *const u64);
+    assert_layout!(FlexStreamConfigV4, 24, 8;
+        size = 0 => u32, version = 4 => u32, base = 8 => *const crate::v3_types::FlexStreamConfigV3,
+        options = 16 => *const FlexOptionsV4);
+    assert_layout!(FlexSwitchConfigV4, 24, 8;
+        size = 0 => u32, version = 4 => u32, base = 8 => *const crate::v3_types::FlexSwitchConfigV3,
+        options = 16 => *const FlexOptionsV4);
+    assert_layout!(FlexPidsV4, 16, 8; data = 0 => *const u32, len = 8 => usize);
+    assert_layout!(FlexFormatV4, 8, 4; sample_rate = 0 => u32, channels = 4 => u16);
+    assert_layout!(FlexValuePayloadV4, 16, 8;
+        boolean = 0 => bool, unsigned_value = 0 => u64, float_value = 0 => f32,
+        text = 0 => *const c_char, pids = 0 => FlexPidsV4, format = 0 => FlexFormatV4);
+    assert_layout!(FlexValueV4, 24, 8; kind = 0 => FlexValueKindV4, value = 8 => FlexValuePayloadV4);
+    assert_layout!(FlexSettingResolutionV4, 72, 8;
+        setting = 0 => *const c_char, status = 8 => u32, reason = 16 => *const c_char,
+        requested = 24 => FlexValueV4, effective = 48 => FlexValueV4);
+    assert_layout!(FlexNamespacedDeviceV4, 40, 8;
+        device = 0 => FlexDeviceInfo, id_namespace = 32 => *const c_char);
+}

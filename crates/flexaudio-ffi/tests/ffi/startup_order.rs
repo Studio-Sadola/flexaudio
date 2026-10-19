@@ -42,6 +42,7 @@ fn startup_stream(attach_vad_tap: bool) -> FlexStream {
 
 fn binding_stream(inner: flexaudio::Stream, vad_tap: Option<flexaudio_vad::VadTap>) -> FlexStream {
     FlexStream {
+        events: Default::default(),
         inner,
         secondary: None,
         shutdown: None,

@@ -1,5 +1,27 @@
 //! Check that the checked-in header is exactly the repository cbindgen projection.
 #[test]
+fn c_header_layouts_and_v4_signatures_compile() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = std::process::Command::new("cc")
+        .args([
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-fsyntax-only",
+            "-I",
+        ])
+        .arg(root.join("include"))
+        .arg(root.join("tests/ffi/abi.c"))
+        .output()
+        .expect("C compiler required for ABI verification");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+#[test]
 fn generated_header_matches_cbindgen() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let output = std::env::temp_dir().join(format!("flexaudio-header-{}.h", std::process::id()));
