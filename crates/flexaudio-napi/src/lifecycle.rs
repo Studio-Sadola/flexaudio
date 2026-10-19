@@ -66,9 +66,7 @@ pub(super) struct LifecycleDelivery {
 }
 
 pub(super) fn retain(env: &Env, function: &napi::JsFunction) -> napi::Result<Arc<UserCallback>> {
-    let mut refer = ptr::null_mut();
-    check_status!(unsafe { sys::napi_create_reference(env.raw(), function.raw(), 1, &mut refer) })?;
-    Ok(UserCallback::new(env.raw(), refer))
+    UserCallback::retain(env, function)
 }
 
 impl LifecycleDelivery {

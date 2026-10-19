@@ -17,9 +17,11 @@
 
 mod boundary;
 mod bridge_drain;
+mod callback;
 mod capabilities;
 mod devices;
 use bridge_drain::start_bridge_stream;
+use callback::UserCallback;
 pub use capabilities::capabilities;
 pub use devices::devices_with_namespaces;
 mod flac_encoder;
@@ -33,9 +35,8 @@ mod attachment;
 mod vad;
 
 use std::collections::VecDeque;
-use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
@@ -126,47 +127,6 @@ enum StopPhase {
 struct StreamInner {
     handle: Option<JoinHandle<()>>,
     cmd_tx: Option<mpsc::Sender<BridgeCmd>>,
-}
-
-/// Keep JS onChunk alive for the TSFN lifetime. `FunctionRef<JsAudioChunk, _>` may not
-/// implement Send because of PhantomData, so use a raw `napi_ref`.
-///
-/// `napi_delete_reference` is restricted to the JS thread. Explicitly release it in StopFlushed /
-/// the settlement callback (both TSFN callbacks on the JS thread); Drop during TSFN finalization
-/// is then a no-op. This releases the onChunk closure after `stop()` even if the TSFN remains alive.
-struct UserCallback {
-    env: sys::napi_env,
-    refer: AtomicPtr<c_void>,
-}
-
-unsafe impl Send for UserCallback {}
-unsafe impl Sync for UserCallback {}
-
-impl UserCallback {
-    fn new(env: sys::napi_env, refer: sys::napi_ref) -> Arc<Self> {
-        Arc::new(Self {
-            env,
-            refer: AtomicPtr::new(refer.cast()),
-        })
-    }
-
-    fn refer(&self) -> sys::napi_ref {
-        self.refer.load(Ordering::SeqCst).cast()
-    }
-
-    /// JS thread only. Subsequent calls are no-ops.
-    fn release(&self) {
-        let refer: sys::napi_ref = self.refer.swap(ptr::null_mut(), Ordering::SeqCst).cast();
-        if !self.env.is_null() && !refer.is_null() {
-            let _ = unsafe { sys::napi_delete_reference(self.env, refer) };
-        }
-    }
-}
-
-impl Drop for UserCallback {
-    fn drop(&mut self) {
-        self.release();
-    }
 }
 
 fn lock_poisoned<T>(
@@ -438,9 +398,7 @@ fn make_user_chunk_cb(
     env: &Env,
     on_chunk: &Function<JsAudioChunk, Unknown>,
 ) -> napi::Result<Arc<UserCallback>> {
-    let mut refer = ptr::null_mut();
-    check_status!(unsafe { sys::napi_create_reference(env.raw(), on_chunk.raw(), 1, &mut refer) })?;
-    Ok(UserCallback::new(env.raw(), refer))
+    UserCallback::retain(env, on_chunk)
 }
 
 /// Retain the original event callback for ordered VAD delivery. Core notifications
@@ -452,9 +410,7 @@ fn make_stream_event_callbacks(
     let Some(callback) = callback else {
         return Ok((None, None));
     };
-    let mut refer = ptr::null_mut();
-    check_status!(unsafe { sys::napi_create_reference(env.raw(), callback.raw(), 1, &mut refer) })?;
-    let retained = UserCallback::new(env.raw(), refer);
+    let retained = UserCallback::retain(env, &callback)?;
     let function = unsafe { napi::JsFunction::from_napi_value(env.raw(), callback.raw())? };
     let mut tsfn = function
         .create_threadsafe_function::<JsStreamEvent, JsStreamEvent, _, ErrorStrategy::Fatal>(
@@ -1902,9 +1858,17 @@ impl FlexStream {
     /// A streaming VAD failure does not block a source switch: the switch closes
     /// the old epoch and the next capture frame reinitializes the VAD session.
     ///
-    /// Throws if `stop()` has already completed (the bridge thread has stopped).
+    /// Throws once `stop()` has been requested, including while shutdown is pending.
     #[napi]
     pub fn switch_source(&self, env: Env, options: OpenOptions) -> napi::Result<()> {
+        // Reject before retaining a handler or queueing work. stop() can leave the
+        // bridge in teardown while its command receiver is still alive.
+        if self.stop_flag.load(Ordering::SeqCst) {
+            return Err(NapiError::new(
+                Status::GenericFailure,
+                "stream already stopped",
+            ));
+        }
         if let Some(StreamTerminal(error)) =
             self.terminal.lock().unwrap_or_else(lock_poisoned).clone()
         {

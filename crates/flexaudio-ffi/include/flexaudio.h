@@ -298,7 +298,7 @@ typedef struct FlexLifecycleEventV4 FlexLifecycleEventV4;
 typedef struct FlexSecondaryChunkV3 FlexSecondaryChunkV3;
 
 // Immutable snapshot owner. Item strings and arrays borrow from this object.
-// Standalone snapshots must be freed exactly once; error-owned views must not be freed.
+// Standalone snapshots must be freed exactly once; freeing an error-owned view is a no-op.
 typedef struct FlexSettingsV4 FlexSettingsV4;
 
 // Owned completed shutdown report; all child pointers are borrowed.
@@ -1295,8 +1295,12 @@ int32_t flexaudio_secondary_arrival_ns_v4(const struct FlexSecondaryChunkV3 *chu
 
 // Poll the lifecycle FIFO independently of ordinary polls, including after stop.
 // Return 1 with an owned event, 0 empty, or a negative error; out is NULL on absence/error.
+// The FIFO retains at most 256 events, dropping the oldest on overflow. Started/Stopped
+// pairing is guaranteed only while the caller drains it fast enough to avoid overflow.
 // # Safety
-// stream is live and exclusively borrowed, out is writable.
+// stream is live and exclusively borrowed, out is writable. Use a stream from one
+// thread at a time or externally serialize its calls, including lifecycle polling.
+// Internal event-queue locking does not make other stream operations thread-safe.
 int32_t flexaudio_poll_lifecycle_event_v4(struct FlexStream *stream,
                                           struct FlexLifecycleEventV4 **out);
 
@@ -1379,15 +1383,17 @@ int32_t flexaudio_settings_item_v4(const struct FlexSettingsV4 *settings,
                                    size_t index,
                                    struct FlexSettingResolutionV4 *out);
 
-// Free a standalone settings snapshot; NULL-safe. Never free an error-owned view.
+// Free a standalone settings snapshot; NULL and live error-owned views are no-ops.
 // # Safety
-// settings is NULL or an unfreed standalone snapshot from settings_v4.
+// settings is NULL, an unfreed standalone snapshot from settings_v4, or a borrowed
+// view from error_settings_v4 whose error owner is still live.
 void flexaudio_settings_free_v4(struct FlexSettingsV4 *settings);
 
 // Borrow the candidate report from an error: 1 present, 0 absent, negative on error.
 // The view and its items live until the error owner is freed. out is NULL on absence/error.
+// Passing this live borrowed view to settings_free_v4 is a no-op.
 // # Safety
-// error is a live error owner and out is writable. Do not free the borrowed view.
+// error is a live error owner and out is writable.
 int32_t flexaudio_error_settings_v4(const struct FlexErrorInfoV2 *value,
                                     const struct FlexSettingsV4 **out);
 

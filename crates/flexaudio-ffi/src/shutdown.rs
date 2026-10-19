@@ -3,18 +3,20 @@ use crate::types::FlexStream;
 use flexaudio::{ErrorContext, Operation, ShutdownReport};
 
 impl FlexStream {
-    pub(crate) fn poll_binding_event(&mut self) -> Option<flexaudio::Event> {
-        self.drain_binding_events();
-        if let Some(event) = self.events.ordinary.pop_front() {
+    /// stream must be live; non-event operations must not overlap this call.
+    pub(crate) unsafe fn poll_binding_event(stream: *mut Self) -> Option<flexaudio::Event> {
+        let mut queues = (*stream).events.lock().unwrap_or_else(|e| e.into_inner());
+        Self::drain_binding_events(stream, &mut queues);
+        if let Some(event) = queues.ordinary.pop_front() {
             return Some(event);
         }
-        let error = self
+        let error = (*stream)
             .shutdown
             .as_ref()?
             .cleanup()
-            .get(self.shutdown_event_index)?
+            .get((*stream).shutdown_event_index)?
             .clone();
-        self.shutdown_event_index += 1;
+        (*stream).shutdown_event_index += 1;
         Some(flexaudio::Event::ShutdownError { error })
     }
 

@@ -225,7 +225,7 @@ pub struct FlexProcessInfo {
 /// output conversion. `flexaudio_switch_source` replaces only the source;
 /// addons retain their configuration from open (same as gain).
 pub struct FlexStream {
-    pub(crate) events: crate::lifecycle_v4::EventQueues,
+    pub(crate) events: std::sync::Mutex<crate::lifecycle_v4::EventQueues>,
     pub(crate) secondary: Option<crate::secondary::SecondaryState>,
     pub(crate) inner: flexaudio::Stream,
     pub(crate) shutdown: Option<flexaudio::ShutdownReport>,

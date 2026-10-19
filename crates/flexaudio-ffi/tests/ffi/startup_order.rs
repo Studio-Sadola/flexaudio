@@ -69,17 +69,17 @@ fn c_pcm_does_not_require_startup_event_poll() {
     free(chunk);
     assert!(stream.poll_processed().expect("remaining PCM").is_none());
     assert!(matches!(
-        stream.poll_binding_event(),
+        unsafe { FlexStream::poll_binding_event(&mut stream) },
         Some(flexaudio::Event::StartupSamplesDropped { frames: 480, .. })
     ));
-    assert!(stream.poll_binding_event().is_none());
+    assert!(unsafe { FlexStream::poll_binding_event(&mut stream) }.is_none());
 }
 
 #[test]
 fn c_startup_notice_is_queued_before_first_pcm_poll() {
     let mut stream = startup_stream(false);
     assert!(matches!(
-        stream.poll_binding_event(),
+        unsafe { FlexStream::poll_binding_event(&mut stream) },
         Some(flexaudio::Event::StartupSamplesDropped { frames: 480, .. })
     ));
     let chunk = stream
@@ -105,10 +105,10 @@ fn c_vad_tap_epoch_does_not_require_startup_event_poll() {
     stream.drain_vad_capture();
     assert_eq!(stream.vad_events.len(), count);
     assert!(matches!(
-        stream.poll_binding_event(),
+        unsafe { FlexStream::poll_binding_event(&mut stream) },
         Some(flexaudio::Event::StartupSamplesDropped { frames: 480, .. })
     ));
-    assert!(stream.poll_binding_event().is_none());
+    assert!(unsafe { FlexStream::poll_binding_event(&mut stream) }.is_none());
 }
 
 #[test]
@@ -126,7 +126,7 @@ fn startup_notice_does_not_erase_c_stop_pcm() {
     assert_eq!(chunk.pts_ns, 10_000_000);
     free(chunk);
     assert!(matches!(
-        stream.poll_binding_event(),
+        unsafe { FlexStream::poll_binding_event(&mut stream) },
         Some(flexaudio::Event::StartupSamplesDropped { frames: 480, .. })
     ));
     stream.stop_binding().expect("repeated C shutdown");
@@ -161,10 +161,10 @@ fn startup_notice_does_not_close_c_vad_tap_before_pending_capture() {
     }
     stream.stop_binding().expect("repeated attached C shutdown");
     assert!(matches!(
-        stream.poll_binding_event(),
+        unsafe { FlexStream::poll_binding_event(&mut stream) },
         Some(flexaudio::Event::StartupSamplesDropped { frames: 480, .. })
     ));
-    assert!(stream.poll_binding_event().is_none());
+    assert!(unsafe { FlexStream::poll_binding_event(&mut stream) }.is_none());
 }
 
 #[test]
@@ -195,10 +195,10 @@ fn startup_notice_does_not_make_c_flush_skip_pending_capture() {
         .stop_binding()
         .expect("shutdown after explicit flush");
     assert!(matches!(
-        stream.poll_binding_event(),
+        unsafe { FlexStream::poll_binding_event(&mut stream) },
         Some(flexaudio::Event::StartupSamplesDropped { frames: 480, .. })
     ));
-    assert!(stream.poll_binding_event().is_none());
+    assert!(unsafe { FlexStream::poll_binding_event(&mut stream) }.is_none());
 }
 
 #[test]
@@ -263,7 +263,7 @@ fn c_v1_terminal_carrier_and_error_do_not_require_startup_event_poll() {
         assert_eq!(crate::error::last_audio_error(), Some(error));
         assert!(stream.ready_chunks.is_empty());
         assert!(matches!(
-            stream.poll_binding_event(),
+            FlexStream::poll_binding_event(&mut stream),
             Some(flexaudio::Event::StartupSamplesDropped { frames: 480, .. })
         ));
     }

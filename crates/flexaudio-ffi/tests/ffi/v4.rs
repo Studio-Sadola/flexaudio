@@ -296,6 +296,39 @@ struct Events {
     events: VecDeque<flexaudio::Event>,
     stops: Arc<AtomicUsize>,
 }
+
+#[test]
+fn freeing_borrowed_settings_is_a_noop_until_error_owner_is_freed() {
+    unsafe {
+        let report =
+            flexaudio::resolve_settings(&SettingsRequest::new(StreamConfig::default())).unwrap();
+        let error = Box::into_raw(Box::new(FlexErrorInfoV2::new(
+            flexaudio::Error::IgnoredSettings { report },
+        )));
+        let mut view = ptr::null();
+        assert_eq!(flexaudio_error_settings_v4(error, &mut view), 1);
+        assert!(!view.is_null());
+        for _ in 0..2 {
+            // The free operation reads ownership only; it must not mutate a borrowed view.
+            flexaudio_settings_free_v4(view.cast_mut());
+            let mut revision = u64::MAX;
+            let mut count = 0;
+            assert_eq!(
+                flexaudio_settings_count_v4(view, &mut revision, &mut count),
+                0
+            );
+            assert_eq!((revision, count), (0, 20));
+            let mut item = mem::MaybeUninit::uninit();
+            assert_eq!(flexaudio_settings_item_v4(view, 0, item.as_mut_ptr()), 0);
+            assert!(!item.assume_init().setting.is_null());
+            let mut same_view = ptr::null();
+            assert_eq!(flexaudio_error_settings_v4(error, &mut same_view), 1);
+            assert_eq!(same_view, view);
+        }
+        flexaudio_error_info_free_v2(error);
+    }
+}
+
 impl flexaudio::CaptureBackend for Events {
     fn native_format(&self) -> (u32, u16) {
         (48000, 2)
@@ -315,6 +348,139 @@ impl flexaudio::CaptureBackend for Events {
         self.events.pop_front()
     }
 }
+
+unsafe fn stopped_event_stream(
+    events: VecDeque<flexaudio::Event>,
+) -> *mut crate::types::FlexStream {
+    let base = base();
+    let base3 = v3(&base);
+    let config = v4(&base3, ptr::null());
+    let mut stream = ptr::null_mut();
+    assert_eq!(
+        open_with(&config, &mut stream, |config, _options| {
+            flexaudio::Stream::open(
+                config,
+                Box::new(Events {
+                    events,
+                    stops: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+        }),
+        0
+    );
+    assert_eq!(crate::flexaudio_start(stream), 0);
+    assert_eq!(crate::flexaudio_stop(stream), 0);
+    stream
+}
+
+#[test]
+fn ordinary_only_polling_bounds_the_lifecycle_backlog() {
+    unsafe {
+        let mut events = VecDeque::from([flexaudio::Event::SilenceProbeStarted]);
+        events.extend((0..512).map(|_| flexaudio::Event::ClassicLoopbackKeepaliveStarted));
+        events.push_back(flexaudio::Event::StreamStalled);
+        let stream = stopped_event_stream(events);
+        let mut ordinary = mem::MaybeUninit::uninit();
+        assert_eq!(
+            crate::flexaudio_poll_event(stream, ordinary.as_mut_ptr()),
+            1
+        );
+        assert_eq!(ordinary.assume_init_ref().kind, 1);
+        assert_eq!(
+            crate::flexaudio_poll_event(stream, ordinary.as_mut_ptr()),
+            0
+        );
+        let mut event = ptr::null_mut();
+        for index in 0..256 {
+            assert_eq!(flexaudio_poll_lifecycle_event_v4(stream, &mut event), 1);
+            let mut kind = 0;
+            assert_eq!(flexaudio_lifecycle_event_kind_v4(event, &mut kind), 0);
+            assert_eq!(kind, if index == 255 { 4 } else { 3 });
+            flexaudio_lifecycle_event_free_v4(event);
+        }
+        assert_eq!(flexaudio_poll_lifecycle_event_v4(stream, &mut event), 0);
+        assert!(event.is_null());
+        crate::flexaudio_free(stream);
+    }
+}
+
+#[test]
+fn event_polls_defensively_serialize_drain_and_both_queues() {
+    unsafe {
+        let mut events = VecDeque::new();
+        for _ in 0..64 {
+            events.extend([
+                flexaudio::Event::SilenceProbeStarted,
+                flexaudio::Event::StreamStalled,
+                flexaudio::Event::SilenceProbeStopped {
+                    reason: flexaudio::HelperStopReason::Recovery,
+                },
+            ]);
+        }
+        let stream = stopped_event_stream(events);
+        let shared = std::sync::atomic::AtomicPtr::new(stream);
+        let barrier = std::sync::Barrier::new(3);
+        // Exercise the defensive locking with no PCM, stop, switch, or free overlapping.
+        // AtomicPtr shares the address without creating aliased references to FlexStream.
+        std::thread::scope(|scope| {
+            let ordinary = scope.spawn(|| {
+                barrier.wait();
+                let mut count = 0;
+                let mut out = mem::MaybeUninit::uninit();
+                loop {
+                    match crate::flexaudio_poll_event(
+                        shared.load(Ordering::Relaxed),
+                        out.as_mut_ptr(),
+                    ) {
+                        1 => {
+                            assert_eq!(out.assume_init_ref().kind, 1);
+                            count += 1;
+                        }
+                        0 => return count,
+                        status => panic!("ordinary poll failed: {status}"),
+                    }
+                }
+            });
+            let versioned = scope.spawn(|| {
+                barrier.wait();
+                let mut count = 0;
+                let mut out = ptr::null_mut();
+                loop {
+                    match flexaudio_poll_event_v2(shared.load(Ordering::Relaxed), &mut out) {
+                        1 => {
+                            flexaudio_event_free_v2(out);
+                            count += 1;
+                        }
+                        0 => return count,
+                        status => panic!("versioned poll failed: {status}"),
+                    }
+                }
+            });
+            let lifecycle = scope.spawn(|| {
+                barrier.wait();
+                let mut out = ptr::null_mut();
+                for index in 0..129 {
+                    assert_eq!(
+                        flexaudio_poll_lifecycle_event_v4(shared.load(Ordering::Relaxed), &mut out),
+                        1
+                    );
+                    let mut kind = 0;
+                    assert_eq!(flexaudio_lifecycle_event_kind_v4(out, &mut kind), 0);
+                    assert_eq!(kind, if index == 128 { 4 } else { 1 + index % 2 });
+                    flexaudio_lifecycle_event_free_v4(out);
+                }
+                assert_eq!(
+                    flexaudio_poll_lifecycle_event_v4(shared.load(Ordering::Relaxed), &mut out),
+                    0
+                );
+            });
+            assert_eq!(ordinary.join().unwrap() + versioned.join().unwrap(), 64);
+            lifecycle.join().unwrap();
+        });
+        crate::flexaudio_free(stream);
+    }
+}
+
 #[test]
 fn lifecycle_is_independent_of_old_polls_and_survives_stream_destruction() {
     unsafe {

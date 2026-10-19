@@ -215,6 +215,13 @@ Register `onLifecycleEvent` inside `OpenOptions` for a separate ordered helper
 callback channel. Ordinary `onEvent` never receives these events, even as unknown.
 Omitting the handler on switch retains it; supplying one replaces it only after
 successful commit. `stop()` settles after queued lifecycle callbacks complete.
+The handler must not synchronously wait for `stop()` to settle (for example,
+with a blocking loop or `Atomics.wait`): settlement requires the handler to
+return so the JS thread can deliver the remaining callbacks. To request shutdown
+inside the handler, use `void stream.stop().catch(handleError)` and return;
+await completion outside the handler. Returned promises are not awaited by the
+binding. `switchSource()` throws `stream already stopped` as soon as `stop()`
+is requested, including while its promise is pending.
 Every emitted helper Started has exactly one Stopped with a reason. On macOS,
 Started means a diagnostic attempt; on Windows it means successful silent-render
 start. Stopped ends ownership after teardown attempts; cleanup errors remain

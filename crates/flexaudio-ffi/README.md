@@ -5,6 +5,11 @@ to use flexaudio in-process (the first is the CLI pipe; the second is the N-API 
 The caller periodically invokes `flexaudio_poll_chunk` / `flexaudio_poll_event` to retrieve
 chunks and events.
 
+Use each `FlexStream` from one thread at a time, or externally serialize all calls
+on that handle, including ordinary, PCM, and lifecycle polls, stop, switch, and free.
+The event queues synchronize draining and consumption internally; this does not
+make other stream operations thread-safe.
+
 In addition to core capture, this exposes three add-ons to C:
 
 - **VAD** (voice activity detection; Silero VAD / ONNX) — `flexaudio_vad_*`
@@ -449,7 +454,9 @@ Strict requests that would be ignored return `FLEX_IGNORED_SETTINGS` (-13)
 before device access, model loading, or stopping the current source. Obtain an
 owned error with `flexaudio_last_error_info_v2`, then borrow its complete candidate
 report using `flexaudio_error_settings_v4` (1 present, 0 absent). The report and
-its item pointers belong to the error; never free this borrowed report separately.
+its item pointers belong to the error. Passing a live borrowed report to
+`flexaudio_settings_free_v4` is a no-op; freeing the error releases the report.
+The borrowed report must not be used after its error owner is freed.
 
 `flexaudio_settings_v4` returns an independent snapshot of the last successful
 open/switch. `flexaudio_settings_count_v4` supplies revision and entry count;
@@ -461,6 +468,11 @@ strings and PID arrays remain valid until their snapshot owner is freed.
 `flexaudio_poll_lifecycle_event_v4` consumes a separate ordered helper-event
 queue (1 available, 0 empty). Ordinary v1/v2 event polls never return helper
 lifecycle events. Both queues can be drained independently after stop. Each
+stream retains at most 256 queued lifecycle events, dropping the oldest on
+overflow, including when only ordinary events are polled. Started/Stopped pairing
+is guaranteed only while the caller drains lifecycle events fast enough to avoid
+overflow. Use the same serialized stream access described above for lifecycle
+polling. Each
 returned immutable event survives stream destruction and is freed with
 `flexaudio_lifecycle_event_free_v4`. Kind access returns zero on success;
 reason/message access returns 1 when present or 0 without changing the output.

@@ -99,29 +99,126 @@ fn strict_candidate_report_has_complete_shared_json_shape() {
 }
 
 #[test]
-fn strict_scheduled_switch_rejects_before_backend_access() {
+fn strict_schedules_retain_open_gain_and_capacity() {
+    for extra in [
+        vec!["--gain", "2"],
+        vec!["--ring-capacity-chunks", "100"],
+        vec!["--gain", "2", "--ring-capacity-chunks", "100"],
+    ] {
+        let mut args = vec!["flexaudio-cli", "--strict", "--sources", "mic:2,system:2"];
+        args.extend(extra);
+        let cli = Cli::try_parse_from(args).unwrap();
+        let reports = schedule_reports(&cli);
+        for (key, expected) in [
+            (
+                flexaudio::SettingKey::Gain,
+                flexaudio::SettingValue::Float(cli.gain),
+            ),
+            (
+                flexaudio::SettingKey::RingCapacityChunks,
+                flexaudio::SettingValue::Unsigned(cli.ring_capacity_chunks as u64),
+            ),
+        ] {
+            let entry = reports[1]
+                .entries
+                .iter()
+                .find(|entry| entry.setting == key)
+                .unwrap();
+            assert_eq!(entry.outcome, flexaudio::SettingOutcome::NotRequested);
+            assert_eq!(entry.effective, expected);
+        }
+    }
+}
+
+/// Exercise the same open/switch settings resolution without native audio devices.
+fn schedule_reports(cli: &Cli) -> Vec<flexaudio::SettingsReport> {
+    assert!(cli.strict);
+    let segments = parse_sources(cli.sources.as_ref().unwrap()).unwrap();
+    let scheduler = SwitchScheduler::new(cli, &segments, Instant::now());
+    let mut reports = Vec::new();
+    for config in std::iter::once(config_for_kind(cli, segments[0].kind)).chain(scheduler.configs) {
+        let mut request = flexaudio::SettingsRequest::new(config).open_options(&cli.open_options());
+        if let Some(previous) = reports.last() {
+            request = request.previous(previous);
+        }
+        let report = flexaudio::resolve_settings(&request).unwrap();
+        assert!(
+            !report.has_ignored(),
+            "strict schedule must accept: {report:?}"
+        );
+        reports.push(report);
+    }
+    reports
+}
+
+#[test]
+fn strict_schedule_routes_mode_and_pid_only_to_process_segments() {
+    let cli = Cli::try_parse_from([
+        "flexaudio-cli",
+        "--strict",
+        "--mode",
+        "exclude",
+        "--sources",
+        "mic:2,process:2,system:2",
+        "--process-id",
+        "123",
+    ])
+    .unwrap();
+    schedule_reports(&cli);
+    let scheduler = SwitchScheduler::new(
+        &cli,
+        &parse_sources(cli.sources.as_ref().unwrap()).unwrap(),
+        Instant::now(),
+    );
+    let mic = config_for_kind(&cli, SourceKind::Mic);
+    assert_eq!(mic.mode, ProcessMode::Include);
+    assert_eq!(mic.target_pid, None);
+    assert_eq!(scheduler.configs[0].mode, ProcessMode::Exclude);
+    assert_eq!(scheduler.configs[0].target_pid, Some(123));
+    assert_eq!(scheduler.configs[1].mode, ProcessMode::Include);
+    assert_eq!(scheduler.configs[1].target_pid, None);
+}
+
+#[test]
+fn strict_schedule_routes_device_and_exclusions_only_to_applicable_segments() {
     let cli = Cli::try_parse_from([
         "flexaudio-cli",
         "--strict",
         "--sources",
-        "mic:1,mic:1",
-        "--gain",
-        "2",
+        "mic:2,process:2,mic:2",
+        "--process-id",
+        "123",
+        "--device-id",
+        "selected-device",
     ])
     .unwrap();
-    let config = config_for_kind(&cli, SourceKind::Mic);
-    let mut stream = Stream::open(
-        config,
-        Box::new(flexaudio::MockBackend::new(48000, 2, 440.0)),
-    )
+    schedule_reports(&cli);
+    let scheduler = SwitchScheduler::new(
+        &cli,
+        &parse_sources(cli.sources.as_ref().unwrap()).unwrap(),
+        Instant::now(),
+    );
+    assert_eq!(
+        config_for_kind(&cli, SourceKind::Mic).device_id.as_deref(),
+        Some("selected-device")
+    );
+    assert_eq!(scheduler.configs[0].device_id, None);
+    assert_eq!(
+        scheduler.configs[1].device_id.as_deref(),
+        Some("selected-device")
+    );
+
+    let cli = Cli::try_parse_from([
+        "flexaudio-cli",
+        "--strict",
+        "--sources",
+        "mic:2,system:2,process:2",
+        "--process-id",
+        "123",
+        "--exclude-self",
+        "--exclude-pid",
+        "456",
+    ])
     .unwrap();
-    stream.start().unwrap();
-    let start = Instant::now();
-    let segments = parse_sources(cli.sources.as_ref().unwrap()).unwrap();
-    let mut scheduler = SwitchScheduler::new(&cli, &segments, start);
-    let error = scheduler
-        .tick(&mut stream, start + Duration::from_secs(1))
-        .unwrap_err();
-    assert_eq!(error.kind(), flexaudio::ErrorKind::IgnoredSettings);
-    assert!(error.ignored_settings().unwrap().has_ignored());
+    schedule_reports(&cli);
 }

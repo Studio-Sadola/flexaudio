@@ -105,7 +105,7 @@ impl FlexErrorInfoV2 {
         Self {
             settings: error
                 .ignored_settings()
-                .map(crate::settings_v4::FlexSettingsV4::new),
+                .map(crate::settings_v4::FlexSettingsV4::borrowed),
             addon_kind: error.addon_kind().map(|kind| cstring(kind.as_str())),
             addon_message: match error.root() {
                 Error::Addon { message, .. } => Some(cstring(message.clone())),

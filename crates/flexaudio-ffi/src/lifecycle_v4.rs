@@ -13,6 +13,7 @@ pub const FLEX_LIFECYCLE_SILENCE_PROBE_STARTED: u32 = 1;
 pub const FLEX_LIFECYCLE_SILENCE_PROBE_STOPPED: u32 = 2;
 pub const FLEX_LIFECYCLE_CLASSIC_LOOPBACK_KEEPALIVE_STARTED: u32 = 3;
 pub const FLEX_LIFECYCLE_CLASSIC_LOOPBACK_KEEPALIVE_STOPPED: u32 = 4;
+const LIFECYCLE_QUEUE_CAPACITY: usize = 256;
 
 /// Owned immutable lifecycle notification, independent of stream lifetime.
 pub struct FlexLifecycleEventV4 {
@@ -67,6 +68,9 @@ pub(crate) struct EventQueues {
 impl EventQueues {
     pub(crate) fn route(&mut self, event: Event) {
         if let Some(event) = FlexLifecycleEventV4::from_event(&event) {
+            if self.lifecycle.len() == LIFECYCLE_QUEUE_CAPACITY {
+                self.lifecycle.pop_front();
+            }
             self.lifecycle.push_back(event);
         } else {
             self.ordinary.push_back(event);
@@ -74,16 +78,22 @@ impl EventQueues {
     }
 }
 impl FlexStream {
-    pub(crate) fn drain_binding_events(&mut self) {
-        while let Some(event) = self.inner.poll_event() {
-            self.events.route(event);
+    /// The caller holds stream.events for the entire drain and subsequent pop.
+    /// No reference to the whole stream may overlap another event poll.
+    pub(crate) unsafe fn drain_binding_events(stream: *mut Self, queues: &mut EventQueues) {
+        while let Some(event) = (*stream).inner.poll_event() {
+            queues.route(event);
         }
     }
 }
 /// Poll the lifecycle FIFO independently of ordinary polls, including after stop.
 /// Return 1 with an owned event, 0 empty, or a negative error; out is NULL on absence/error.
+/// The FIFO retains at most 256 events, dropping the oldest on overflow. Started/Stopped
+/// pairing is guaranteed only while the caller drains it fast enough to avoid overflow.
 /// # Safety
-/// stream is live and exclusively borrowed, out is writable.
+/// stream is live and exclusively borrowed, out is writable. Use a stream from one
+/// thread at a time or externally serialize its calls, including lifecycle polling.
+/// Internal event-queue locking does not make other stream operations thread-safe.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_poll_lifecycle_event_v4(
     stream: *mut FlexStream,
@@ -97,8 +107,9 @@ pub unsafe extern "C" fn flexaudio_poll_lifecycle_event_v4(
         if !valid_pointer(stream) {
             return invalid("invalid stream handle");
         }
-        (*stream).drain_binding_events();
-        match (*stream).events.lifecycle.pop_front() {
+        let mut queues = (*stream).events.lock().unwrap_or_else(|e| e.into_inner());
+        FlexStream::drain_binding_events(stream, &mut queues);
+        match queues.lifecycle.pop_front() {
             Some(event) => {
                 out.write(Box::into_raw(Box::new(event)));
                 1
@@ -188,6 +199,36 @@ pub unsafe extern "C" fn flexaudio_lifecycle_event_free_v4(event: *mut FlexLifec
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lifecycle_fifo_drops_oldest_and_keeps_latest_events_in_order() {
+        let mut queues = EventQueues::default();
+        queues.route(Event::SilenceProbeStarted);
+        for _ in 0..4096 {
+            queues.route(Event::ClassicLoopbackKeepaliveStarted);
+            assert!(queues.lifecycle.len() <= LIFECYCLE_QUEUE_CAPACITY);
+        }
+        queues.route(Event::StreamStalled);
+        queues.route(Event::SilenceProbeStopped {
+            reason: HelperStopReason::Recovery,
+        });
+        assert_eq!(queues.lifecycle.len(), LIFECYCLE_QUEUE_CAPACITY);
+        for _ in 0..LIFECYCLE_QUEUE_CAPACITY - 1 {
+            assert_eq!(
+                queues.lifecycle.pop_front().unwrap().kind,
+                FLEX_LIFECYCLE_CLASSIC_LOOPBACK_KEEPALIVE_STARTED
+            );
+        }
+        let latest = queues.lifecycle.pop_front().unwrap();
+        assert_eq!(latest.kind, FLEX_LIFECYCLE_SILENCE_PROBE_STOPPED);
+        assert_eq!(latest.reason, Some(7));
+        assert!(queues.lifecycle.is_empty());
+        assert!(matches!(
+            queues.ordinary.pop_front(),
+            Some(Event::StreamStalled)
+        ));
+        assert!(queues.ordinary.is_empty());
+    }
+
     #[test]
     fn all_stop_reason_codes_follow_enum_order() {
         for (index, reason) in [

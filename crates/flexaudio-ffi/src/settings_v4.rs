@@ -73,14 +73,16 @@ struct Entry {
     effective: Value,
 }
 /// Immutable snapshot owner. Item strings and arrays borrow from this object.
-/// Standalone snapshots must be freed exactly once; error-owned views must not be freed.
+/// Standalone snapshots must be freed exactly once; freeing an error-owned view is a no-op.
 pub struct FlexSettingsV4 {
+    error_owned: bool,
     revision: u64,
     entries: Vec<Entry>,
 }
 impl FlexSettingsV4 {
     pub(crate) fn new(report: &SettingsReport) -> Self {
         Self {
+            error_owned: false,
             revision: report.revision,
             entries: report
                 .entries
@@ -106,6 +108,13 @@ impl FlexSettingsV4 {
                     }
                 })
                 .collect(),
+        }
+    }
+
+    pub(crate) fn borrowed(report: &SettingsReport) -> Self {
+        Self {
+            error_owned: true,
+            ..Self::new(report)
         }
     }
 }
@@ -189,9 +198,10 @@ pub unsafe extern "C" fn flexaudio_settings_item_v4(
         0
     })
 }
-/// Free a standalone settings snapshot; NULL-safe. Never free an error-owned view.
+/// Free a standalone settings snapshot; NULL and live error-owned views are no-ops.
 /// # Safety
-/// settings is NULL or an unfreed standalone snapshot from settings_v4.
+/// settings is NULL, an unfreed standalone snapshot from settings_v4, or a borrowed
+/// view from error_settings_v4 whose error owner is still live.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_settings_free_v4(settings: *mut FlexSettingsV4) {
     guard_i32(|| {
@@ -201,14 +211,18 @@ pub unsafe extern "C" fn flexaudio_settings_free_v4(settings: *mut FlexSettingsV
         if !valid_pointer(settings) {
             return invalid("invalid settings owner");
         }
+        if (*settings).error_owned {
+            return 0;
+        }
         drop(Box::from_raw(settings));
         0
     });
 }
 /// Borrow the candidate report from an error: 1 present, 0 absent, negative on error.
 /// The view and its items live until the error owner is freed. out is NULL on absence/error.
+/// Passing this live borrowed view to settings_free_v4 is a no-op.
 /// # Safety
-/// error is a live error owner and out is writable. Do not free the borrowed view.
+/// error is a live error owner and out is writable.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_error_settings_v4(
     value: *const FlexErrorInfoV2,
