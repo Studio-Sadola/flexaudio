@@ -358,7 +358,13 @@ export interface OpenOptions {
   strict?: boolean
   /** Positive safe integer queue capacity. Default 50; fixed at open. */
   ringCapacityChunks?: number
-  /** Separate ordered helper lifecycle channel. Omission on switch retains the handler. */
+  /**
+   * Separate ordered helper lifecycle channel. Omission on switch retains the handler.
+   * The handler must return without synchronously waiting for stop(): stop settles
+   * only after queued lifecycle handlers return. Start asynchronous shutdown with
+   * `void stream.stop().catch(handleError)` or await it outside the callback.
+   * Returned promises are not awaited by the binding.
+   */
   onLifecycleEvent?: (event: LifecycleEvent) => void
   /** "mic" | "system" | "process" | "mix" */
   kind: string
@@ -657,6 +663,8 @@ export declare class FlexStream {
    * Stop recording. When the Promise resolves, all `onChunk` calls queued on the TSFN before
    * stop (the last PCM and `frames:0` terminator) have been delivered to JS.
    * Queued lifecycle callbacks have also completed.
+   * Never synchronously wait for this Promise inside onLifecycleEvent: settlement
+   * needs that handler to return. Start shutdown asynchronously or await outside it.
    * Repeated calls return the same retained success or failure after completion. Calling
    * inside `onChunk` does not freeze JS because joining happens off the JS thread.
    * An attached VAD-only failure resolves and remains in shutdownReport().cleanupErrors with its
@@ -687,7 +695,7 @@ export declare class FlexStream {
    * omission retains it. `options.denoise` and `options.vad` are ignored;
    * the existing denoise and VAD settings remain in effect.
    *
-   * Throws if `stop()` has already completed (the bridge thread has stopped).
+   * Throws once `stop()` has been requested, including while shutdown is pending.
    */
   switchSource(options: OpenOptions): void
   /**

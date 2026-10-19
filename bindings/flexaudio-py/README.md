@@ -323,9 +323,11 @@ See the root README's [ignored-setting table](../../README.md#strict-mode-and-ef
 `stream.poll_lifecycle_event()` consumes a separate ordered helper-event FIFO;
 `poll_event()` never returns lifecycle notifications, even as unknown events.
 The FIFO remains drainable after stop, independently of ordinary event polling.
-Every emitted Started has exactly one Stopped with a reason. macOS Started means
-entry into a diagnostic attempt; Windows Started means successful keepalive
-render start. Stopped ends ownership after teardown attempts; typed cleanup
+It retains at most 256 events, dropping the oldest on overflow. Started/Stopped
+pairing is guaranteed only while the caller drains it frequently enough to avoid
+overflow. Every emitted Started has exactly one Stopped with a reason. macOS
+Started means entry into a diagnostic attempt; Windows Started means successful
+keepalive render start. Stopped ends ownership after teardown attempts; typed cleanup
 errors remain authoritative. There is no ordering guarantee relative to PCM or
 ordinary events. See [helper behavior and controls](../../README.md#optional-playback-helpers-and-lifecycle).
 

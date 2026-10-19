@@ -597,7 +597,12 @@ class SecondaryChunk:
 class Stream:
     def effective_settings(self) -> SettingsReport: ...
     def poll_lifecycle_event(self) -> Optional[LifecycleEvent]:
-        """Consume only helper lifecycle notifications, including after stop."""
+        """Consume only helper lifecycle notifications, including after stop.
+
+        The FIFO retains at most 256 events, dropping the oldest on overflow.
+        Started/Stopped pairing is guaranteed only while the caller drains it
+        frequently enough to avoid overflow.
+        """
         ...
     def stop(self) -> None:
         """Stop once and retain the outcome; open a new stream to capture again."""

@@ -631,15 +631,15 @@ pub unsafe extern "C" fn flexaudio_poll_event(s: *mut FlexStream, out: *mut Flex
         if !s.is_null() && !s.is_aligned() {
             return v2::invalid();
         }
-        let Some(stream) = s.as_mut() else {
+        if s.is_null() {
             set_last_error("flexaudio_poll_event: stream pointer is null");
             return code::FLEX_INVALID_ARG;
-        };
+        }
         if out.is_null() || !out.is_aligned() {
             set_last_error("flexaudio_poll_event: out pointer is null");
             return code::FLEX_INVALID_ARG;
         }
-        match stream.poll_binding_event() {
+        match FlexStream::poll_binding_event(s) {
             // event_to_c stores Error/Unknown messages in last_error.
             Some(ev) => {
                 out.write(convert::event_to_c(ev));

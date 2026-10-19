@@ -412,3 +412,141 @@ fn omitted_switch_options_use_default_requests_and_inherit_effective_values() {
         assert!(!report.has_ignored());
     }
 }
+
+#[test]
+fn omitted_keepalive_switch_uses_configured_control_after_inapplicable_source() {
+    let key = SettingKey::WindowsClassicLoopbackKeepalive;
+    for kind in [SourceKind::Mic, SourceKind::ProcessLoopback] {
+        for enabled in [true, false] {
+            let options = OpenOptions::new().windows_classic_loopback_keepalive(enabled);
+            let initial = resolve_for_platform(
+                &SettingsRequest::new(StreamConfig {
+                    kind,
+                    ..Default::default()
+                })
+                .open_options(&options),
+                SettingsPlatform::Windows,
+                100,
+            )
+            .unwrap();
+            assert_eq!(initial.get(key).unwrap().effective, SettingValue::Absent);
+
+            let request = SettingsRequest::new(StreamConfig {
+                kind: SourceKind::SystemLoopback,
+                ..Default::default()
+            })
+            .open_options(&options)
+            .windows_classic_loopback_keepalive(None)
+            .previous(&initial);
+            let report = resolve_for_platform(&request, SettingsPlatform::Windows, 100).unwrap();
+            let entry = report.get(key).unwrap();
+            assert_eq!(entry.requested, SettingValue::Bool(true));
+            assert_eq!(entry.effective, SettingValue::Bool(enabled));
+            assert_eq!(entry.outcome, SettingOutcome::NotRequested);
+            assert_eq!(report.revision, 1);
+        }
+    }
+}
+
+#[test]
+fn omitted_keepalive_switch_restores_false_after_inapplicable_round_trip() {
+    let key = SettingKey::WindowsClassicLoopbackKeepalive;
+    let options = OpenOptions::new().windows_classic_loopback_keepalive(false);
+    let initial = resolve_for_platform(
+        &SettingsRequest::new(StreamConfig {
+            kind: SourceKind::SystemLoopback,
+            ..Default::default()
+        })
+        .open_options(&options),
+        SettingsPlatform::Windows,
+        100,
+    )
+    .unwrap();
+    assert_eq!(
+        initial.get(key).unwrap().effective,
+        SettingValue::Bool(false)
+    );
+    for (kind, exclude_self) in [
+        (SourceKind::Mic, false),
+        (SourceKind::ProcessLoopback, false),
+        (SourceKind::SystemLoopback, true),
+    ] {
+        let mut previous = initial.clone();
+        for (revision, kind, exclude_self, effective) in [
+            (1, kind, exclude_self, SettingValue::Absent),
+            (
+                2,
+                SourceKind::SystemLoopback,
+                false,
+                SettingValue::Bool(false),
+            ),
+        ] {
+            let request = SettingsRequest::new(StreamConfig {
+                kind,
+                exclude_self,
+                ..Default::default()
+            })
+            .open_options(&options)
+            .windows_classic_loopback_keepalive(None)
+            .previous(&previous);
+            let report = resolve_for_platform(&request, SettingsPlatform::Windows, 100).unwrap();
+            let entry = report.get(key).unwrap();
+            assert_eq!(entry.requested, SettingValue::Bool(true));
+            assert_eq!(entry.effective, effective);
+            assert_eq!(entry.outcome, SettingOutcome::NotRequested);
+            assert_eq!(report.revision, revision);
+            previous = report;
+        }
+    }
+}
+
+#[test]
+fn omitted_attachments_retain_configured_values_across_source_round_trip() {
+    let initial_request = SettingsRequest::new(StreamConfig {
+        kind: SourceKind::SystemLoopback,
+        ..Default::default()
+    })
+    .attachments(
+        SettingsAttachments::new()
+            .denoise(true)
+            .vad(true)
+            .secondary_encoding("s16"),
+    );
+    let mut previous =
+        resolve_for_platform(&initial_request, SettingsPlatform::Windows, 100).unwrap();
+    for kind in [SourceKind::Mic, SourceKind::SystemLoopback] {
+        let report = resolve_for_platform(
+            &SettingsRequest::new(StreamConfig {
+                kind,
+                ..Default::default()
+            })
+            .previous(&previous),
+            SettingsPlatform::Windows,
+            100,
+        )
+        .unwrap();
+        for (key, requested, effective) in [
+            (
+                SettingKey::Denoise,
+                SettingValue::Bool(false),
+                SettingValue::Bool(true),
+            ),
+            (
+                SettingKey::Vad,
+                SettingValue::Absent,
+                SettingValue::Bool(true),
+            ),
+            (
+                SettingKey::SecondaryEncoding,
+                SettingValue::Text("f32".into()),
+                SettingValue::Text("s16".into()),
+            ),
+        ] {
+            let entry = report.get(key).unwrap();
+            assert_eq!(entry.requested, requested);
+            assert_eq!(entry.effective, effective);
+            assert_eq!(entry.outcome, SettingOutcome::NotRequested);
+        }
+        previous = report;
+    }
+}

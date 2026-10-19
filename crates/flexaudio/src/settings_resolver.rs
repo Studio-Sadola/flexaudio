@@ -126,7 +126,12 @@ pub(crate) fn resolve_for_platform(
                 SettingValue::Absent
             };
         } else if retain_effective {
-            if let Some(entry) = previous.and_then(|report| report.get(key)) {
+            if let Some(enabled) = request
+                .configured_keepalive
+                .filter(|_| key == SettingKey::WindowsClassicLoopbackKeepalive)
+            {
+                effective = SettingValue::Bool(enabled);
+            } else if let Some(entry) = previous.and_then(|report| report.get(key)) {
                 effective = entry.effective.clone();
             }
         }

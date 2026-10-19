@@ -56,7 +56,7 @@ pub unsafe extern "C" fn flexaudio_poll_event_v2(
         if !valid(stream) {
             return invalid();
         }
-        match (*stream).poll_binding_event() {
+        match FlexStream::poll_binding_event(stream) {
             Some(event) => {
                 out.write(Box::into_raw(Box::new(FlexEventV2::new(event))));
                 1

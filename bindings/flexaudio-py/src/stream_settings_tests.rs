@@ -221,6 +221,62 @@ assert stream.poll_lifecycle_event() is None
 }
 
 #[test]
+fn lifecycle_fifo_drops_oldest_events_on_overflow() {
+    Python::initialize();
+    Python::attach(|py| {
+        let mut events = (0..1025)
+            .map(|index| match index % 3 {
+                0 => fa::Event::SilenceProbeStarted,
+                1 => fa::Event::SilenceProbeStopped {
+                    reason: fa::HelperStopReason::Recovery,
+                },
+                _ => fa::Event::ClassicLoopbackKeepaliveStarted,
+            })
+            .collect::<std::collections::VecDeque<_>>();
+        events.push_back(fa::Event::StreamRecovered);
+        let mut inner = fa::Stream::open(
+            fa::StreamConfig::default(),
+            Box::new(LifecycleBackend(events)),
+        )
+        .unwrap();
+        inner.start().unwrap();
+        let mut stream = denoise_tests::binding(inner);
+        // Simulate a caller that never polls lifecycle events, including during shutdown.
+        stream.stop().unwrap();
+        assert_eq!(stream.lifecycle_events.len(), 256);
+        let locals = PyDict::new(py);
+        locals
+            .set_item("stream", Py::new(py, stream).unwrap())
+            .unwrap();
+        py.run(
+            pyo3::ffi::c_str!(
+                r#"
+assert stream.poll_event().type == 'recovered'
+assert stream.poll_event() is None
+cycle = [
+    ('silenceProbeStarted', None),
+    ('silenceProbeStopped', 'recovery'),
+    ('classicLoopbackKeepaliveStarted', None),
+]
+expected = [cycle[index % 3] for index in range(771, 1025)] + [
+    ('silenceProbeStopped', 'streamStopped'),
+    ('classicLoopbackKeepaliveStopped', 'streamStopped'),
+]
+actual = []
+while (event := stream.poll_lifecycle_event()) is not None:
+    actual.append((event.type, event.reason))
+assert actual == expected, actual
+assert stream.poll_lifecycle_event() is None
+"#
+            ),
+            Some(&locals),
+            Some(&locals),
+        )
+        .unwrap();
+    });
+}
+
+#[test]
 fn switch_boundary_validates_capacity_and_retains_strictness() {
     Python::initialize();
     Python::attach(|py| {

@@ -137,6 +137,38 @@ test('lifecycle notifications are discarded when no handler is registered', asyn
   assert.deepEqual(ordinary, []);
 });
 
+test('stop immediately rejects lifecycle handler switches without crashing', async () => {
+  let rejectedCalls = 0;
+  for (let iteration = 0; iteration < 100; iteration++) {
+    const stream = native.openStream({ kind: 'mock', onLifecycleEvent: () => {} }, () => {});
+    const stopped = stream.stop();
+    // Keep the JS thread occupied while the bridge exits its command loop and
+    // tears down capture. Every request must fail before retaining its handler.
+    for (let attempt = 0; attempt < 20; attempt++) {
+      assert.throws(() => stream.switchSource({ kind: 'mock',
+        onLifecycleEvent: () => { rejectedCalls++; } }), /stream already stopped/);
+    }
+    await stopped;
+    assert.throws(() => stream.switchSource({ kind: 'mock',
+      onLifecycleEvent: () => { rejectedCalls++; } }), /stream already stopped/);
+  }
+  assert.equal(rejectedCalls, 0);
+});
+
+test('lifecycle handlers can request stop asynchronously and return', async () => {
+  const events = [];
+  let stopped;
+  const stream = native.openStream({ kind: 'mock', onLifecycleEvent: event => {
+    events.push(event);
+    stopped ??= stream.stop();
+  } }, () => {});
+  // Delivery is asynchronous, so stream is initialized before the first handler.
+  await new Promise(resolve => setImmediate(resolve));
+  await (stopped ?? stream.stop());
+  assert.deepEqual(events.map(event => event.type), ['silenceProbeStarted',
+    'classicLoopbackKeepaliveStarted', 'silenceProbeStopped', 'classicLoopbackKeepaliveStopped']);
+});
+
 test('namespaced discovery is asynchronous and retains typed discovery errors', async () => {
   assert.equal(typeof native.devicesWithNamespaces, 'function');
   const promise = native.devicesWithNamespaces();

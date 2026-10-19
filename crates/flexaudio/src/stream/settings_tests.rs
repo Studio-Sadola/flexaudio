@@ -216,6 +216,62 @@ fn omitted_options_report_defaults_while_retaining_backend_options() {
 }
 
 #[test]
+fn omitted_options_keep_controls_and_attachment_reports_across_source_round_trip() {
+    let config = |kind| StreamConfig {
+        kind,
+        target_pid: (kind == crate::SourceKind::ProcessLoopback).then_some(42),
+        ..Default::default()
+    };
+    for initial_kind in [
+        crate::SourceKind::Mic,
+        crate::SourceKind::ProcessLoopback,
+        crate::SourceKind::SystemLoopback,
+    ] {
+        for enabled in [true, false] {
+            let options = OpenOptions::new()
+                .windows_classic_loopback_keepalive(enabled)
+                .settings_attachments(crate::SettingsAttachments::new().secondary_encoding("s16"));
+            let mut stream = crate::open_using(config(initial_kind), options, |_, _| {
+                Ok(Box::new(Backend::new(false)))
+            })
+            .unwrap();
+            stream.start().unwrap();
+            for kind in [
+                crate::SourceKind::SystemLoopback,
+                crate::SourceKind::Mic,
+                crate::SourceKind::SystemLoopback,
+            ] {
+                stream
+                    .switch_source_using(config(kind), None, None, |_, options| {
+                        assert_eq!(options.windows_classic_loopback_keepalive, enabled);
+                        Ok(Box::new(Backend::new(false)))
+                    })
+                    .unwrap();
+                let report = stream.effective_settings().unwrap();
+                let keepalive = report
+                    .get(SettingKey::WindowsClassicLoopbackKeepalive)
+                    .unwrap();
+                assert_eq!(keepalive.requested, SettingValue::Bool(true));
+                assert_eq!(keepalive.outcome, SettingOutcome::NotRequested);
+                assert_eq!(
+                    keepalive.effective,
+                    if cfg!(target_os = "windows") && kind == crate::SourceKind::SystemLoopback {
+                        SettingValue::Bool(enabled)
+                    } else {
+                        SettingValue::Absent
+                    }
+                );
+                let encoding = report.get(SettingKey::SecondaryEncoding).unwrap();
+                assert_eq!(encoding.requested, SettingValue::Text("f32".into()));
+                assert_eq!(encoding.effective, SettingValue::Text("s16".into()));
+                assert_eq!(encoding.outcome, SettingOutcome::NotRequested);
+            }
+            stream.stop_checked().unwrap();
+        }
+    }
+}
+
+#[test]
 fn attachment_switch_preflight_matches_public_report_and_commits_only_on_success() {
     let config = StreamConfig {
         secondary_output: Some(crate::OutputFormat {

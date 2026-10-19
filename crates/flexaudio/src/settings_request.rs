@@ -100,6 +100,10 @@ impl SettingsAttachments {
 pub struct SettingsRequest {
     pub(crate) config: StreamConfig,
     pub(crate) keepalive: Option<bool>,
+    // The backend control survives source switches even when the report's
+    // source-filtered effective value is absent. Keep it separate from the
+    // decoded request, which may be omitted while this value remains false.
+    pub(crate) configured_keepalive: Option<bool>,
     pub(crate) attachments: SettingsAttachments,
     pub(crate) previous: Option<SettingsReport>,
 }
@@ -110,6 +114,7 @@ impl SettingsRequest {
         Self {
             config,
             keepalive: None,
+            configured_keepalive: None,
             attachments: SettingsAttachments::default(),
             previous: None,
         }
@@ -127,6 +132,7 @@ impl SettingsRequest {
     /// Use the attachment description and keepalive value supplied to native open.
     /// Strictness is enforced by the caller after inspecting the resolved report.
     pub fn open_options(mut self, options: &OpenOptions) -> Self {
+        self.configured_keepalive = Some(options.windows_classic_loopback_keepalive);
         self.keepalive = options
             .settings_attachments
             .keepalive
@@ -143,6 +149,8 @@ impl SettingsRequest {
     }
 
     /// Select switch semantics using the last committed settings snapshot.
+    /// Supply retained native controls with [`Self::open_options`]: a report's
+    /// inapplicable effective values do not preserve those configured controls.
     /// The next revision is checked for overflow during resolution.
     pub fn previous(mut self, report: &SettingsReport) -> Self {
         self.previous = Some(report.clone());

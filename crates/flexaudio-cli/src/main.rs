@@ -216,8 +216,8 @@ struct Cli {
     /// is the sum of all `secs`). If `process` is included, `--process-id` is required.
     /// Prints `[switch] -> <kind>` to stderr at each boundary. If a switch fails, a warning is
     /// printed and recording continues with the previous source. For WAV output, each `secs` must
-    /// be at least 1. `--mode` / `--exclude-self` / `--exclude-pid` are passed to every segment;
-    /// `--mode` applies only to process segments, and exclusions only to system segments.
+    /// be at least 1. `--mode` / `--process-id` apply only to process segments, exclusions only
+    /// to system segments, and `--device-id` only to mic/system segments.
     #[arg(long)]
     sources: Option<String>,
 
@@ -428,21 +428,15 @@ fn parse_sources(spec: &str) -> std::result::Result<Vec<Segment>, String> {
 /// Build [`StreamConfig`] from the given [`SourceKind`] and shared CLI settings
 /// (output / pid / exclusions). Used for initial capture and every `--sources` segment.
 fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
-    StreamConfig {
+    let mut config = StreamConfig {
         kind,
         silence_probe: !cli.no_silence_probe,
         output: cli.output_format(),
         target_pid: cli.process_id,
-        // `mode` applies only to process segments (the facade ignores it for mic/system).
         mode: cli.mode.into(),
-        // Exclusions apply to system capture and the system side of mix (ignored for mic/process).
         exclude_self: cli.exclude_self,
         exclude_pids: cli.exclude_pids.clone(),
-        // `device_id` applies to mic (input) and system (output endpoint); the facade ignores it
-        // for process. Set it on every segment so the relevant segment can use it.
         device_id: cli.device_id.clone(),
-        // Gain does not change on a source switch (core ignores it), but keep it aligned with the
-        // initial config.
         gain: cli.gain,
         ring_capacity_chunks: cli.ring_capacity_chunks,
         // Mix-only settings (the facade ignores them for other segment types).
@@ -451,7 +445,23 @@ fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
         mix_mic_gain: cli.mic_gain,
         mix_system_gain: cli.system_gain,
         ..Default::default()
+    };
+    // A schedule shares arguments across sources. Only request routing settings on segments
+    // that can use them; standalone commands still expose mistakes to strict validation.
+    if cli.sources.is_some() {
+        if kind != SourceKind::ProcessLoopback {
+            config.target_pid = None;
+            config.mode = ProcessMode::Include;
+        }
+        if !matches!(kind, SourceKind::SystemLoopback | SourceKind::Mix) {
+            config.exclude_self = false;
+            config.exclude_pids.clear();
+        }
+        if !matches!(kind, SourceKind::Mic | SourceKind::SystemLoopback) {
+            config.device_id = None;
+        }
     }
+    config
 }
 
 /// Reject exclusions when the effective source plan has no system capture.
@@ -510,7 +520,12 @@ impl SwitchScheduler {
             if i + 1 < segments.len() {
                 deadlines.push(start + Duration::from_secs(cumulative));
                 let next_seg = segments[i + 1];
-                configs.push(config_for_kind(cli, next_seg.kind));
+                let mut config = config_for_kind(cli, next_seg.kind);
+                // Default-valued switch requests retain the values fixed at open.
+                let defaults = StreamConfig::default();
+                config.gain = defaults.gain;
+                config.ring_capacity_chunks = defaults.ring_capacity_chunks;
+                configs.push(config);
                 labels.push(source_kind_label(next_seg.kind));
             }
         }
@@ -1252,6 +1267,7 @@ fn run_stdout_stream(
         if let Some(sch) = scheduler.as_mut() {
             if let Err(error) = sch.tick(stream, Instant::now()) {
                 stream.stop();
+                drain_capture_events(stream, cli.lifecycle_events)?;
                 return Err(describe_error(error));
             }
         }
@@ -1729,6 +1745,8 @@ mod tests {
     #[test]
     fn exclusions_reach_shared_builder_and_scheduled_configs() {
         let cli = cli_from(&[
+            "--sources",
+            "mic:1,system:1,process:1",
             "--exclude-pid",
             "123",
             "--exclude-pid",
@@ -1742,15 +1760,23 @@ mod tests {
             SourceKind::Mix,
         ] {
             let config = config_for_kind(&cli, kind);
-            assert_eq!(config.exclude_pids, vec![123, 123]);
-            assert!(config.exclude_self);
+            let applicable = matches!(kind, SourceKind::SystemLoopback | SourceKind::Mix);
+            assert_eq!(
+                config.exclude_pids,
+                if applicable { vec![123, 123] } else { vec![] }
+            );
+            assert_eq!(config.exclude_self, applicable);
         }
         let segments = parse_sources("mic:1,system:1,process:1").expect("valid schedule");
         let scheduler = SwitchScheduler::new(&cli, &segments, Instant::now());
         assert_eq!(scheduler.configs.len(), 2);
         for config in &scheduler.configs {
-            assert_eq!(config.exclude_pids, vec![123, 123]);
-            assert!(config.exclude_self);
+            let applicable = config.kind == SourceKind::SystemLoopback;
+            assert_eq!(
+                config.exclude_pids,
+                if applicable { vec![123, 123] } else { vec![] }
+            );
+            assert_eq!(config.exclude_self, applicable);
         }
     }
 
@@ -2550,6 +2576,70 @@ mod reproduction_tests {
 
     fn repro_wav_capture(final_event: Option<flexaudio::Event>) -> std::result::Result<(), String> {
         repro_capture_events(Vec::new(), final_event.into_iter().collect(), None)
+    }
+
+    #[test]
+    fn stdout_switch_failure_drains_shutdown_lifecycle_lines() {
+        const CHILD: &str = "FLEXAUDIO_CLI_TEST_STDOUT_SWITCH_FAILURE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reproduction_tests::stdout_switch_failure_drains_shutdown_lifecycle_lines",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(output.status.success(), "{stderr}");
+            let lines: Vec<serde_json::Value> = stderr
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            assert_eq!(
+                lines,
+                vec![
+                    serde_json::json!({"type": "silenceProbeStarted"}),
+                    serde_json::json!({"type": "silenceProbeStopped", "reason": "streamStopped"}),
+                ]
+            );
+            return;
+        }
+
+        // A real inapplicable request forces strict rejection at the first switch, while a
+        // custom backend avoids native devices and emits its final lifecycle event on stop.
+        let cli = cli_from(&[
+            "--strict",
+            "--sources",
+            "mic:1,mic:1",
+            "--no-silence-probe",
+            "--lifecycle-events",
+            "--out",
+            "-",
+        ]);
+        let backend = ReproFinalEventBackend {
+            inner: flexaudio::MockBackend::new(48_000, 1, 0.0),
+            stopped: false,
+            running_events: vec![flexaudio::Event::SilenceProbeStarted].into(),
+            final_events: vec![flexaudio::Event::SilenceProbeStopped {
+                reason: flexaudio::HelperStopReason::StreamStopped,
+            }]
+            .into(),
+            cleanup_error: None,
+        };
+        let mut stream = Stream::open(StreamConfig::default(), Box::new(backend)).unwrap();
+        stream.start().unwrap();
+        let segments = parse_sources(cli.sources.as_ref().unwrap()).unwrap();
+        let error = run_stdout_stream(&cli, &mut stream, Some(&segments)).unwrap_err();
+        assert!(
+            error.contains("requested capture settings would be ignored"),
+            "{error}"
+        );
+        assert!(
+            stream.poll_event().is_none(),
+            "shutdown events must be drained"
+        );
     }
 
     fn repro_capture_events(

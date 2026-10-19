@@ -21,6 +21,8 @@ use crate::config::{build_config, parse_exclude_pids, parse_ring_capacity, valid
 use crate::marshal::{chunk_to_py, event_to_py, PyAudioChunk, PyStreamEvent};
 use crate::to_py_err;
 
+const LIFECYCLE_EVENT_CAPACITY: usize = 256;
+
 /// Recording stream handle. Polls the internal `flexaudio::Stream` directly.
 ///
 /// `open(...)` returns after calling `start()`. The caller periodically invokes `poll_chunk` /
@@ -59,6 +61,9 @@ impl Stream {
     fn route_events(&mut self) {
         while let Some(event) = self.inner.poll_event() {
             if let Some(event) = crate::lifecycle::from_event(&event) {
+                if self.lifecycle_events.len() == LIFECYCLE_EVENT_CAPACITY {
+                    self.lifecycle_events.pop_front();
+                }
                 self.lifecycle_events.push_back(event);
             } else {
                 self.capture_events.push_back(event);
