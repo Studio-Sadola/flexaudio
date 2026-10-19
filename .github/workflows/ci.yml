@@ -49,6 +49,21 @@ jobs:
       - name: Test release version validation
         run: python3 -m unittest discover -s .github/scripts -p "test_*.py" -v
 
+  binding-capability-matrix:
+    name: Binding capability matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check supported declarations and generated documentation
+        run: python3 .github/scripts/binding_matrix.py --check
+
   binding-api-compatibility:
     name: Binding API compatibility (Node, Python, C)
     runs-on: ubuntu-latest
