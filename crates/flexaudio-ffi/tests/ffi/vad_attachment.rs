@@ -18,6 +18,7 @@ impl flexaudio::CaptureBackend for IdleBackend {
 }
 fn fixture() -> FlexStream {
     FlexStream {
+        events: Default::default(),
         inner: flexaudio::Stream::open(Default::default(), Box::new(IdleBackend)).unwrap(),
         secondary: None,
         shutdown: None,
@@ -147,6 +148,7 @@ fn capture_stream(sink: &Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>) 
     inner.enable_capture_tap().unwrap();
     inner.start().unwrap();
     FlexStream {
+        events: Default::default(),
         inner,
         secondary: None,
         shutdown: None,

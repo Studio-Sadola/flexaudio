@@ -77,6 +77,9 @@
 
 #define FLEX_CONDITION_CLASSIC_LOOPBACK_WITHOUT_EXCLUSIONS 2
 
+// Strict validation rejected ignored capture settings.
+#define FLEX_IGNORED_SETTINGS -13
+
 // Device lookup completed without a match.
 #define FLEX_DEVICE_NOT_FOUND -5
 
@@ -160,6 +163,16 @@
 
 #define FLEX_DEVICE_EVENT_KIND_UNKNOWN 3
 
+#define FLEX_LIFECYCLE_UNKNOWN 0
+
+#define FLEX_LIFECYCLE_SILENCE_PROBE_STARTED 1
+
+#define FLEX_LIFECYCLE_SILENCE_PROBE_STOPPED 2
+
+#define FLEX_LIFECYCLE_CLASSIC_LOOPBACK_KEEPALIVE_STARTED 3
+
+#define FLEX_LIFECYCLE_CLASSIC_LOOPBACK_KEEPALIVE_STOPPED 4
+
 // Event kind 9 is reserved and must not be reused.
 // Validated interval sample loss.
 #define FLEX_EVENT_KIND_AUDIO_LOSS 10
@@ -205,6 +218,16 @@
 
 #define FLEX_KEEPALIVE_OFF 2
 
+#define FLEX_STREAM_VERSION_4 4
+
+#define FLEX_SETTING_NOT_REQUESTED 0
+
+#define FLEX_SETTING_APPLIED 1
+
+#define FLEX_SETTING_IGNORED 2
+
+#define FLEX_SETTING_ADJUSTED 3
+
 #define FLEX_STREAM_VERSION_2 2
 
 #define FLEX_VAD_PRIMARY 1
@@ -237,6 +260,16 @@
 
 #define FLEX_VAD_LIMIT 5
 
+typedef enum FlexValueKindV4 {
+    FLEX_VALUE_ABSENT = 0,
+    FLEX_VALUE_BOOL = 1,
+    FLEX_VALUE_UNSIGNED = 2,
+    FLEX_VALUE_FLOAT = 3,
+    FLEX_VALUE_TEXT = 4,
+    FLEX_VALUE_PIDS = 5,
+    FLEX_VALUE_FORMAT = 6,
+} FlexValueKindV4;
+
 // Owned immutable platform snapshot. Accessor views and errors live until capabilities_free_v1.
 typedef struct FlexCapabilitiesV1 FlexCapabilitiesV1;
 
@@ -257,9 +290,16 @@ typedef struct FlexEventV2 FlexEventV2;
 // `flexaudio_flac_write`, finalize with `flexaudio_flac_finalize`, and release with `flexaudio_flac_free`.
 typedef struct FlexFlac FlexFlac;
 
+// Owned immutable lifecycle notification, independent of stream lifetime.
+typedef struct FlexLifecycleEventV4 FlexLifecycleEventV4;
+
 // Immutable secondary chunk owner. PCM, metadata and events live until chunk_free_v3.
 // Borrowed arrays must never be freed separately. Release each owner exactly once.
 typedef struct FlexSecondaryChunkV3 FlexSecondaryChunkV3;
+
+// Immutable snapshot owner. Item strings and arrays borrow from this object.
+// Standalone snapshots must be freed exactly once; error-owned views must not be freed.
+typedef struct FlexSettingsV4 FlexSettingsV4;
 
 // Owned completed shutdown report; all child pointers are borrowed.
 typedef struct FlexShutdownReportV2 FlexShutdownReportV2;
@@ -341,6 +381,8 @@ typedef struct FlexChunk {
     size_t len;
     // Number of frames in the chunk.
     uint32_t frames;
+    // Deprecated naming since 0.8; use flexaudio_chunk_arrival_ns_v4. This frozen
+    // field remains permanently in the C layout (other bindings retain it through 0.9).
     // Arrival-time label re-anchored on every native callback. Primary/secondary chunks
     // may overlap or leave gaps by callback jitter; no non-overlap or bounded-monotonic
     // guarantee. flexaudio_chunk_frame_index is authoritative (gaps are loss). Exact VAD mapping uses
@@ -477,6 +519,12 @@ typedef struct FlexSideEffectCapabilityV1 {
     uint32_t condition;
 } FlexSideEffectCapabilityV1;
 
+// Owned device strings; namespace strings have static lifetime.
+typedef struct FlexNamespacedDeviceV4 {
+    struct FlexDeviceInfo device;
+    const char *id_namespace;
+} FlexNamespacedDeviceV4;
+
 // Secondary metadata; meters describe float samples before integer quantization.
 typedef struct FlexSecondaryMetadataV3 {
     uint32_t size;
@@ -486,6 +534,8 @@ typedef struct FlexSecondaryMetadataV3 {
     uint32_t encoding;
     uint32_t frames;
     uint64_t frame_index;
+    // Deprecated naming since 0.8; use flexaudio_secondary_arrival_ns_v4.
+    // This field remains permanently in the frozen C layout.
     int64_t pts_ns;
     uint64_t seq;
     uint32_t flags;
@@ -554,6 +604,41 @@ typedef struct FlexAttachedVadEvent {
     uint64_t seq;
     union FlexAttachedVadPayload data;
 } FlexAttachedVadEvent;
+
+typedef struct FlexPidsV4 {
+    const uint32_t *data;
+    size_t len;
+} FlexPidsV4;
+
+typedef struct FlexFormatV4 {
+    uint32_t sample_rate;
+    uint16_t channels;
+} FlexFormatV4;
+
+// Read only the union member selected by kind.
+typedef union FlexValuePayloadV4 {
+    bool boolean;
+    uint64_t unsigned_value;
+    float float_value;
+    const char *text;
+    struct FlexPidsV4 pids;
+    struct FlexFormatV4 format;
+} FlexValuePayloadV4;
+
+typedef struct FlexValueV4 {
+    enum FlexValueKindV4 kind;
+    union FlexValuePayloadV4 value;
+} FlexValueV4;
+
+// Borrowed views valid until their settings owner is freed. reason is NULL for
+// not-requested/applied, otherwise a shared reason tag. Never free item pointers.
+typedef struct FlexSettingResolutionV4 {
+    const char *setting;
+    uint32_t status;
+    const char *reason;
+    struct FlexValueV4 requested;
+    struct FlexValueV4 effective;
+} FlexSettingResolutionV4;
 
 typedef struct FlexAudioLossV2 {
     // 0 capture, 1 Mix FIFO, 2 output.
@@ -653,6 +738,31 @@ typedef struct FlexSwitchConfigV3 {
     // 0 retain current setting, 1 enabled, 2 disabled.
     uint32_t windows_classic_loopback_keepalive;
 } FlexSwitchConfigV3;
+
+// Borrowed controls. Strict: 0 default/retain, 1 strict, 2 permissive.
+// NULL ring capacity uses 50 on open and retains capacity on switch.
+typedef struct FlexOptionsV4 {
+    uint32_t size;
+    uint32_t version;
+    uint32_t strict;
+    const uint64_t *ring_capacity_chunks;
+} FlexOptionsV4;
+
+// Borrowed envelope; size/version must exactly match before other fields are read.
+typedef struct FlexStreamConfigV4 {
+    uint32_t size;
+    uint32_t version;
+    const struct FlexStreamConfigV3 *base;
+    const struct FlexOptionsV4 *options;
+} FlexStreamConfigV4;
+
+// Borrowed switch envelope. NULL options retains controls and capacity.
+typedef struct FlexSwitchConfigV4 {
+    uint32_t size;
+    uint32_t version;
+    const struct FlexSwitchConfigV3 *base;
+    const struct FlexOptionsV4 *options;
+} FlexSwitchConfigV4;
 
 // Preview policy. provisional must be 0 (disabled) or 1 (enabled).
 typedef struct FlexVadRuntimeOptions {
@@ -1161,6 +1271,57 @@ int32_t flexaudio_flac_finalize(struct FlexFlac *f);
 // Do not use `f` after release.
 void flexaudio_flac_free(struct FlexFlac *f);
 
+// Enumerate unchanged selectable devices with provider-assigned namespace tags.
+// The array owns device strings; namespace strings have static lifetime.
+// Both outputs initialize to empty on failure when their pointers are valid.
+// # Safety
+// out and len are writable; release the array using namespaced_devices_free_v4.
+int32_t flexaudio_devices_with_namespaces_v4(struct FlexNamespacedDeviceV4 **out, size_t *len);
+
+// Free the namespaced array and its device strings. NULL-safe.
+// # Safety
+// entries and len are exactly an unfreed result of devices_with_namespaces_v4, or NULL.
+void flexaudio_namespaced_devices_free_v4(struct FlexNamespacedDeviceV4 *entries, size_t len);
+
+// Return the exact arrival-time label. Also accepts &chunk_v2.chunk.
+// # Safety
+// chunk is a readable FlexChunk; out is writable.
+int32_t flexaudio_chunk_arrival_ns_v4(const struct FlexChunk *chunk, int64_t *out);
+
+// Return the secondary chunk's exact arrival-time label.
+// # Safety
+// chunk is a live secondary owner; out is writable.
+int32_t flexaudio_secondary_arrival_ns_v4(const struct FlexSecondaryChunkV3 *chunk, int64_t *out);
+
+// Poll the lifecycle FIFO independently of ordinary polls, including after stop.
+// Return 1 with an owned event, 0 empty, or a negative error; out is NULL on absence/error.
+// # Safety
+// stream is live and exclusively borrowed, out is writable.
+int32_t flexaudio_poll_lifecycle_event_v4(struct FlexStream *stream,
+                                          struct FlexLifecycleEventV4 **out);
+
+// Return the lifecycle kind, zero on success.
+// # Safety
+// event is live, out is writable.
+int32_t flexaudio_lifecycle_event_kind_v4(const struct FlexLifecycleEventV4 *event, uint32_t *out);
+
+// Return 1 and a stop-reason code (1-10, 0 unknown), or 0 without modifying out.
+// # Safety
+// event is live, out is writable.
+int32_t flexaudio_lifecycle_event_reason_v4(const struct FlexLifecycleEventV4 *event,
+                                            uint32_t *out);
+
+// Return 1 and a borrowed safe message, or 0 without modifying out.
+// # Safety
+// event is live, out is writable. The string borrows from event.
+int32_t flexaudio_lifecycle_event_message_v4(const struct FlexLifecycleEventV4 *event,
+                                             const char **out);
+
+// Free a lifecycle owner; NULL-safe.
+// # Safety
+// event is NULL or an unfreed owner returned by poll_lifecycle_event_v4.
+void flexaudio_lifecycle_event_free_v4(struct FlexLifecycleEventV4 *event);
+
 // Independently poll one secondary chunk: 1 available, 0 absent, negative error.
 // Output initializes to NULL. Stop drains both taps; final chunks remain pollable.
 // Free any previously returned owner before reusing out.
@@ -1198,6 +1359,37 @@ const struct FlexAttachedVadEvent *flexaudio_secondary_vad_events_v3(const struc
 // # Safety
 // Chunk must be a live library owner or NULL. Release each owner exactly once.
 void flexaudio_secondary_chunk_free_v3(struct FlexSecondaryChunkV3 *chunk);
+
+// Copy the last committed settings into an independent owner. out is NULL on failure.
+// # Safety
+// stream is a live handle; out is writable. Free the returned snapshot with settings_free_v4.
+int32_t flexaudio_settings_v4(const struct FlexStream *stream, struct FlexSettingsV4 **out);
+
+// Return revision and item count, with zero on success.
+// # Safety
+// settings is a live owner/view, and both outputs are writable.
+int32_t flexaudio_settings_count_v4(const struct FlexSettingsV4 *settings,
+                                    uint64_t *revision,
+                                    size_t *count);
+
+// Borrow an item from a snapshot; all pointers remain owned by the snapshot.
+// # Safety
+// settings is live and out is writable. index must be less than the reported count.
+int32_t flexaudio_settings_item_v4(const struct FlexSettingsV4 *settings,
+                                   size_t index,
+                                   struct FlexSettingResolutionV4 *out);
+
+// Free a standalone settings snapshot; NULL-safe. Never free an error-owned view.
+// # Safety
+// settings is NULL or an unfreed standalone snapshot from settings_v4.
+void flexaudio_settings_free_v4(struct FlexSettingsV4 *settings);
+
+// Borrow the candidate report from an error: 1 present, 0 absent, negative on error.
+// The view and its items live until the error owner is freed. out is NULL on absence/error.
+// # Safety
+// error is a live error owner and out is writable. Do not free the borrowed view.
+int32_t flexaudio_error_settings_v4(const struct FlexErrorInfoV2 *value,
+                                    const struct FlexSettingsV4 **out);
 
 // Poll one owned event. Valid out initializes to NULL before the queue is touched.
 // # Safety
@@ -1442,6 +1634,21 @@ int32_t flexaudio_open_v3(const struct FlexStreamConfigV3 *config, struct FlexSt
 // complete envelope and borrowed fields must be readable during this call.
 int32_t flexaudio_switch_source_v3(struct FlexStream *stream,
                                    const struct FlexSwitchConfigV3 *config);
+
+// Open using exact-size v4/v3 envelopes. Strict preflight precedes native/model work.
+// out is NULL on failure. Options and all borrowed configuration are copied.
+// # Safety
+// Envelopes have readable header words and full storage only when those match.
+// Their fields are readable for this call, and out is writable.
+int32_t flexaudio_open_v4(const struct FlexStreamConfigV4 *config, struct FlexStream **out);
+
+// Switch source with retained strictness unless explicitly replaced. Gain, capacity,
+// denoise, VAD and output formats retain their open-time configuration.
+// Failure preserves the previous source, options and settings report.
+// # Safety
+// stream is live/exclusively borrowed; envelopes and fields obey open_v4's requirements.
+int32_t flexaudio_switch_source_v4(struct FlexStream *stream,
+                                   const struct FlexSwitchConfigV4 *config);
 
 // Five pinned defaults. Supplied structs use literal fields, including zero.
 struct FlexVadOptions flexaudio_vad_default_options(void);

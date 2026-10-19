@@ -89,6 +89,8 @@ pub struct FlexChunk {
     pub len: usize,
     /// Number of frames in the chunk.
     pub frames: u32,
+    /// Deprecated naming since 0.8; use flexaudio_chunk_arrival_ns_v4. This frozen
+    /// field remains permanently in the C layout (other bindings retain it through 0.9).
     /// Arrival-time label re-anchored on every native callback. Primary/secondary chunks
     /// may overlap or leave gaps by callback jitter; no non-overlap or bounded-monotonic
     /// guarantee. flexaudio_chunk_frame_index is authoritative (gaps are loss). Exact VAD mapping uses
@@ -223,6 +225,7 @@ pub struct FlexProcessInfo {
 /// output conversion. `flexaudio_switch_source` replaces only the source;
 /// addons retain their configuration from open (same as gain).
 pub struct FlexStream {
+    pub(crate) events: crate::lifecycle_v4::EventQueues,
     pub(crate) secondary: Option<crate::secondary::SecondaryState>,
     pub(crate) inner: flexaudio::Stream,
     pub(crate) shutdown: Option<flexaudio::ShutdownReport>,

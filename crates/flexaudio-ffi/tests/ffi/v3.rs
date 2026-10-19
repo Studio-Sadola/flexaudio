@@ -304,6 +304,12 @@ fn secondary_encodings_own_samples_and_preserve_prequantization_meters() {
             let chunk = next_secondary(handle.0);
             let mut meta = FlexSecondaryMetadataV3::default();
             assert_eq!(flexaudio_secondary_metadata_v3(chunk, &mut meta), 1);
+            let mut arrival = 0;
+            assert_eq!(
+                crate::discovery_v4::flexaudio_secondary_arrival_ns_v4(chunk, &mut arrival),
+                0
+            );
+            assert_eq!(arrival, meta.pts_ns);
             assert_eq!(
                 (
                     meta.rate,

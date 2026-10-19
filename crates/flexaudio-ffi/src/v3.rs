@@ -51,6 +51,18 @@ unsafe fn open_with(
             let secondary = validation::secondary(envelope.secondary_output)?;
             config.secondary_output = secondary.map(|(format, _)| format);
             let vad = validate_vad(envelope.vad, secondary.is_some())?;
+            let encoding = match secondary {
+                Some((_, SecondaryEncoding::S16)) => "s16",
+                _ => "f32",
+            };
+            let options = options.settings_attachments(
+                crate::settings_request::attachments(
+                    &*envelope.config,
+                    envelope.windows_classic_loopback_keepalive,
+                )
+                .vad(vad.is_some())
+                .secondary_encoding(encoding),
+            );
             Ok::<_, i32>((
                 config,
                 options,
@@ -63,40 +75,77 @@ unsafe fn open_with(
             Ok(value) => value,
             Err(status) => return status,
         };
-        let vad_secondary = vad.as_ref().is_some_and(|(_, _, secondary)| *secondary);
-        // Every caller-controlled discriminator and count is checked before model loading.
-        let vad_tap = match vad
-            .map(|(params, runtime, _)| flexaudio_vad::VadTap::new(params, runtime))
-            .transpose()
-        {
-            Ok(value) => value,
-            Err(error) => return reject_tap(error),
-        };
-        let mut inner = match open(config, options) {
-            Ok(value) => value,
-            Err(error) => return error::set_audio_error(error),
-        };
-        inner.set_denoise(denoise);
-        if vad_tap.is_some() {
-            if let Err(error) = inner.enable_capture_tap() {
-                return error::set_audio_error(error);
-            }
-        }
-        out.write(Box::into_raw(Box::new(FlexStream {
-            secondary: secondary
-                .map(|(format, encoding)| SecondaryState::new(format, encoding, vad_secondary)),
-            inner,
-            shutdown: None,
-            shutdown_event_index: 0,
-            vad_tap,
-            vad_events: Vec::new(),
-            vad_origin: (0, 0),
-            vad_error: None,
-            vad_cleanup: Vec::new(),
-            ready_chunks: Default::default(),
-        })));
-        code::FLEX_OK
+        finish_open(
+            PreparedOpen {
+                config,
+                options,
+                secondary,
+                vad,
+                denoise,
+            },
+            out,
+            open,
+        )
     })
+}
+
+pub(crate) struct PreparedOpen {
+    pub config: flexaudio::StreamConfig,
+    pub options: flexaudio::OpenOptions,
+    pub secondary: Option<(flexaudio::OutputFormat, SecondaryEncoding)>,
+    pub vad: Option<crate::vad_integration::ValidatedVad>,
+    pub denoise: bool,
+}
+
+pub(crate) unsafe fn finish_open(
+    prepared: PreparedOpen,
+    out: *mut *mut FlexStream,
+    open: impl FnOnce(
+        flexaudio::StreamConfig,
+        flexaudio::OpenOptions,
+    ) -> flexaudio::Result<flexaudio::Stream>,
+) -> i32 {
+    let PreparedOpen {
+        config,
+        options,
+        secondary,
+        vad,
+        denoise,
+    } = prepared;
+    let vad_secondary = vad.as_ref().is_some_and(|(_, _, secondary)| *secondary);
+    // Every caller-controlled discriminator and count is checked before model loading.
+    let vad_tap = match vad
+        .map(|(params, runtime, _)| flexaudio_vad::VadTap::new(params, runtime))
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(error) => return reject_tap(error),
+    };
+    let mut inner = match open(config, options) {
+        Ok(value) => value,
+        Err(error) => return error::set_audio_error(error),
+    };
+    inner.set_denoise(denoise);
+    if vad_tap.is_some() {
+        if let Err(error) = inner.enable_capture_tap() {
+            return error::set_audio_error(error);
+        }
+    }
+    out.write(Box::into_raw(Box::new(FlexStream {
+        events: Default::default(),
+        secondary: secondary
+            .map(|(format, encoding)| SecondaryState::new(format, encoding, vad_secondary)),
+        inner,
+        shutdown: None,
+        shutdown_event_index: 0,
+        vad_tap,
+        vad_events: Vec::new(),
+        vad_origin: (0, 0),
+        vad_error: None,
+        vad_cleanup: Vec::new(),
+        ready_chunks: Default::default(),
+    })));
+    code::FLEX_OK
 }
 
 /// Switch source and optionally replace keepalive. Zero retains the current option.
@@ -128,6 +177,17 @@ pub unsafe extern "C" fn flexaudio_switch_source_v3(
                 envelope.windows_classic_loopback_keepalive,
                 stream.inner.open_options(),
             )?;
+            let options = options.settings_attachments(
+                crate::settings_request::attachments(
+                    &*envelope.config,
+                    envelope.windows_classic_loopback_keepalive,
+                )
+                .omitted_on_switch([
+                    flexaudio::SettingKey::Vad,
+                    flexaudio::SettingKey::SecondaryOutput,
+                    flexaudio::SettingKey::SecondaryEncoding,
+                ]),
+            );
             Ok::<_, i32>((config, options))
         })();
         let (config, options) = match prepared {

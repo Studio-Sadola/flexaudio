@@ -253,7 +253,12 @@ pub unsafe extern "C" fn flexaudio_open_v2(
             Err(error) => return reject_tap(error),
         };
         let config = validated.base;
-        let stream = crate::flexaudio_open(config);
+        let stream = crate::open_with_exclude_pids_using(config, ptr::null(), 0, |decoded| {
+            let options = flexaudio::OpenOptions::default().settings_attachments(
+                crate::settings_request::attachments(&*config, 0).vad(vad_tap.is_some()),
+            );
+            flexaudio::open_with_options(decoded, options)
+        });
         if stream.is_null() {
             crate::error::last_audio_error()
                 .as_ref()
@@ -603,6 +608,7 @@ mod tests {
         let mut inner = flexaudio::Stream::open(Default::default(), Box::new(Denied)).unwrap();
         assert!(inner.start().is_err());
         let mut stream = FlexStream {
+            events: Default::default(),
             secondary: None,
             shutdown: None,
             shutdown_event_index: 0,
@@ -680,6 +686,7 @@ mod tests {
             .unwrap();
             inner.start().unwrap();
             let mut stream = FlexStream {
+                events: Default::default(),
                 secondary: None,
                 shutdown: None,
                 shutdown_event_index: 0,

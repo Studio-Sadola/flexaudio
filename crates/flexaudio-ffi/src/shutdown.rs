@@ -4,7 +4,8 @@ use flexaudio::{ErrorContext, Operation, ShutdownReport};
 
 impl FlexStream {
     pub(crate) fn poll_binding_event(&mut self) -> Option<flexaudio::Event> {
-        if let Some(event) = self.inner.poll_event() {
+        self.drain_binding_events();
+        if let Some(event) = self.events.ordinary.pop_front() {
             return Some(event);
         }
         let error = self

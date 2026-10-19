@@ -73,6 +73,8 @@ pub struct FlexSecondaryMetadataV3 {
     pub encoding: u32,
     pub frames: u32,
     pub frame_index: u64,
+    /// Deprecated naming since 0.8; use flexaudio_secondary_arrival_ns_v4.
+    /// This field remains permanently in the frozen C layout.
     pub pts_ns: i64,
     pub seq: u64,
     pub flags: u32,

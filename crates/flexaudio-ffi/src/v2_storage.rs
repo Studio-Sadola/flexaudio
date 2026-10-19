@@ -69,6 +69,7 @@ impl Context {
 }
 /// Owned immutable error tree. Borrowed views live until this tree's explicit free.
 pub struct FlexErrorInfoV2 {
+    pub(crate) settings: Option<crate::settings_v4::FlexSettingsV4>,
     pub(crate) root: Error,
     pub(crate) message: CString,
     pub(crate) vad_code: Option<CString>,
@@ -102,6 +103,9 @@ impl FlexErrorInfoV2 {
         }
         collect(&error, &mut contexts, &mut secondary);
         Self {
+            settings: error
+                .ignored_settings()
+                .map(crate::settings_v4::FlexSettingsV4::new),
             addon_kind: error.addon_kind().map(|kind| cstring(kind.as_str())),
             addon_message: match error.root() {
                 Error::Addon { message, .. } => Some(cstring(message.clone())),

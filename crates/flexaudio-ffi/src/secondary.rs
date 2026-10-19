@@ -19,7 +19,7 @@ enum Samples {
 /// Immutable secondary chunk owner. PCM, metadata and events live until chunk_free_v3.
 /// Borrowed arrays must never be freed separately. Release each owner exactly once.
 pub struct FlexSecondaryChunkV3 {
-    metadata: FlexSecondaryMetadataV3,
+    pub(crate) metadata: FlexSecondaryMetadataV3,
     samples: Samples,
     events: Box<[FlexAttachedVadEvent]>,
 }

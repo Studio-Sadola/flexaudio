@@ -426,3 +426,48 @@ reinitializes the shared session before a new origin is published.
 and VAD events. Stop and drain first when final outputs are needed. Event kind 9
 is reserved; it is never reused. `permissionPending` remains for custom backends.
 VAD status codes occupy a distinct range starting at -100.
+
+## Version 4 settings and lifecycle
+
+`FlexStreamConfigV4` and `FlexSwitchConfigV4` wrap the unchanged version 3
+envelopes. Initialize every envelope's `size` to its `sizeof` and use its matching
+version constant. All sizes and versions must match exactly. NULL `options` uses
+defaults on open and retains controls on switch. `FlexOptionsV4.strict` accepts
+only 0 (default/retain), 1 (strict), or 2 (permissive). A NULL capacity pointer
+selects 50 on open and retains capacity on switch; a supplied capacity must be
+positive and fit `size_t`.
+
+Only decoded values differing from documented defaults count as requested.
+Strict requests that would be ignored return `FLEX_IGNORED_SETTINGS` (-13)
+before device access, model loading, or stopping the current source. Obtain an
+owned error with `flexaudio_last_error_info_v2`, then borrow its complete candidate
+report using `flexaudio_error_settings_v4` (1 present, 0 absent). The report and
+its item pointers belong to the error; never free this borrowed report separately.
+
+`flexaudio_settings_v4` returns an independent snapshot of the last successful
+open/switch. `flexaudio_settings_count_v4` supplies revision and entry count;
+`flexaudio_settings_item_v4` borrows one entry. These three functions return zero
+on success. Free standalone snapshots with `flexaudio_settings_free_v4`.
+Snapshot storage remains valid after switching or freeing the stream. Item
+strings and PID arrays remain valid until their snapshot owner is freed.
+
+`flexaudio_poll_lifecycle_event_v4` consumes a separate ordered helper-event
+queue (1 available, 0 empty). Ordinary v1/v2 event polls never return helper
+lifecycle events. Both queues can be drained independently after stop. Each
+returned immutable event survives stream destruction and is freed with
+`flexaudio_lifecycle_event_free_v4`. Kind access returns zero on success;
+reason/message access returns 1 when present or 0 without changing the output.
+Stop-reason codes are 1 signal observed, 2 permission denied, 3 inconclusive,
+4 timed out, 5 stream stopped, 6 source switched, 7 recovery, 8 startup failed,
+9 runtime failed, and 10 cancelled; 0 is unknown. Started events have no reason.
+
+Use `flexaudio_chunk_arrival_ns_v4` and `flexaudio_secondary_arrival_ns_v4` for
+arrival time. They return the existing `pts_ns` value exactly. The old naming is
+deprecated in 0.8 and retained through 0.9; frozen C layouts retain these fields
+permanently. `frame_index` remains authoritative for audio continuity.
+
+`flexaudio_devices_with_namespaces_v4` preserves selectable device IDs and adds
+provider provenance. Namespace tags describe selector domains, not persistent
+native IDs. Free the returned array and device strings with
+`flexaudio_namespaced_devices_free_v4`; namespace strings have static lifetime.
+All new owner-free functions are NULL-safe.
