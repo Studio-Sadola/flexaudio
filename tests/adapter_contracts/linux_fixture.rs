@@ -259,7 +259,7 @@ impl PidSelect {
 // LIVE_PAIRING
 // LIVE_LINKING
 // LIVE_CAPTURE
-fn enumerate_pw() -> Result<Vec<DeviceInfo>> {
+fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
     if ENUM_FAILURE.get() { Err(Error::Backend("injected registry query failure".into())) } else { scan_result(SCAN_MODE.get()).0.map(|()| Vec::new()) }
 }
 // LIVE_LIST_DEVICES
@@ -558,19 +558,49 @@ fn pipewire_scan_deadline() {
 }
 #[test]
 fn pipewire_scan_deadline_control() { assert!(scan_deadline(false)); }
-struct RawNode { media_class: String, node_name: String, description: String, rate: Option<u32>, channels: Option<u16> }
-struct DeviceState { nodes: Vec<RawNode>, default_sink: Option<String>, default_source: Option<String> }
+const NATIVE_RATE: u32 = 48_000;
+mod device_info {
+    include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/device_info.rs"));
+}
+use device_info::{namespaced_devices, EnumState, NodeRecord};
 fn advertised_mic() -> DeviceInfo {
-    let state = DeviceState { nodes: vec![RawNode { media_class: "Audio/Source".into(), node_name: "alsa_input.card0".into(), description: "USB microphone".into(), rate: Some(48_000), channels: Some(1) }], default_sink: None, default_source: None };
-    let mut out = Vec::new();
-    const NATIVE_RATE: u32 = 48_000;
-    // LIVE_DEVICE_INFO
-    out.pop().unwrap()
+    let state = EnumState { nodes: vec![NodeRecord { media_class: "Audio/Source".into(), node_name: "alsa_input.card0".into(), description: "USB microphone".into(), rate: Some(48_000), channels: Some(1) }], default_sink: None, default_source: None };
+    let entry = namespaced_devices(&state).pop().unwrap();
+    assert_eq!(entry.id_namespace, flexaudio_core::DeviceIdNamespace::PipeWireNodeName);
+    entry.device
 }
 #[test]
 fn pipewire_mic_identity_control() {
     let mic = advertised_mic(); assert_eq!(mic.source_kind, SourceKind::Mic);
     assert_eq!(mic.id, "alsa_input.card0");
+}
+#[test]
+fn pipewire_device_info_preserves_provenance_defaults_and_formats() {
+    for (rate, channels, expected) in [
+        (Some(44_100), Some(1), (44_100, 1, true)),
+        (None, None, (NATIVE_RATE, NATIVE_CHANNELS, true)),
+        (Some(0), Some(2), (0, 0, false)),
+        (Some(48_000), Some(0), (0, 0, false)),
+    ] {
+        let state = EnumState {
+            nodes: ["Audio/Source", "Audio/Sink"].into_iter().map(|media_class| NodeRecord {
+                media_class: media_class.into(), node_name: "same-selector".into(),
+                description: "same-name".into(), rate, channels,
+            }).collect(),
+            default_sink: Some("same-selector".into()), default_source: None,
+        };
+        let entries = namespaced_devices(&state);
+        assert_eq!(entries.len(), 2);
+        for (entry, loopback) in entries.iter().zip([false, true]) {
+            assert_eq!(entry.id_namespace, flexaudio_core::DeviceIdNamespace::PipeWireNodeName);
+            let device = &entry.device;
+            assert_eq!((&*device.id, &*device.name), ("same-selector", "same-name"));
+            assert_eq!((device.sample_rate, device.channels, device.format_available), expected);
+            assert_eq!(device.is_loopback, loopback);
+            assert_eq!(device.is_default, loopback);
+            assert_eq!(device.source_kind, if loopback { SourceKind::SystemLoopback } else { SourceKind::Mic });
+        }
+    }
 }
 fn remove_port(f: &LinkFixture, id: u32) {
     let lifecycle_for_remove = &f.lifecycle;

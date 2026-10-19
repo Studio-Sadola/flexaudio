@@ -106,26 +106,28 @@ mod capture_owner {
 // LIVE_ADAPTER
 
 // Exercise the live facade aggregation with silent providers. PipeWire DeviceInfo
-// construction and error wrapping are extracted from the Linux adapter unchanged.
+// construction includes the shared Linux module; error wrappers are extracted unchanged.
 mod facade {
-    use flexaudio_core::{DeviceInfo, Error, ErrorContext, Operation, Result, SourceKind};
+    use flexaudio_core::{DeviceInfo, Error, ErrorContext, NamespacedDevice, Operation, Result, SourceKind};
     mod flexaudio_mic {
         pub fn list_devices() -> flexaudio_core::Result<Vec<flexaudio_core::DeviceInfo>> {
             crate::list_devices()
+        }
+        pub fn list_devices_with_namespaces() -> flexaudio_core::Result<Vec<flexaudio_core::NamespacedDevice>> {
+            crate::list_devices_with_namespaces()
         }
     }
     pub mod flexaudio_os_linux {
         use super::*;
         use std::cell::Cell;
         thread_local! { pub static FAIL_QUERY: Cell<bool> = const { Cell::new(false) }; }
-        struct NodeRecord {
-            media_class: String, node_name: String, description: String,
-            rate: Option<u32>, channels: Option<u16>,
+        const NATIVE_RATE: u32 = 48_000;
+        const NATIVE_CHANNELS: u16 = 2;
+        mod device_info {
+            include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/device_info.rs"));
         }
-        struct EnumState {
-            nodes: Vec<NodeRecord>, default_sink: Option<String>, default_source: Option<String>,
-        }
-        fn enumerate_pw() -> Result<Vec<DeviceInfo>> {
+        use device_info::{namespaced_devices, EnumState, NodeRecord};
+        fn enumerate_pw() -> Result<Vec<NamespacedDevice>> {
             if FAIL_QUERY.get() { return Err(Error::Backend("PipeWire discovery could not connect to the daemon".into())); }
             let state = EnumState {
                 nodes: vec![
@@ -134,11 +136,7 @@ mod facade {
                 ],
                 default_sink: Some("alsa_output.card0".into()), default_source: Some("alsa_input.card0".into()),
             };
-            let mut out = Vec::new();
-            const NATIVE_RATE: u32 = 48_000;
-            const NATIVE_CHANNELS: u16 = 2;
-            // LIVE_PIPEWIRE_DEVICE_INFO
-            Ok(out)
+            Ok(namespaced_devices(&state))
         }
         // LIVE_PIPEWIRE_LIST_DEVICES
     }
@@ -354,6 +352,18 @@ fn microphone_pipewire_mic_identity() {
 fn microphone_pipewire_mic_identity_control() {
     host(vec![device(1, "USB microphone")], None);
     assert_eq!(resolve_input_device(&cpal::default_host(), Some("USB microphone")).unwrap().key, 1);
+}
+#[test]
+fn facade_device_provenance_survives_aggregation() {
+    host(vec![device(1, "USB microphone")], None);
+    facade::flexaudio_os_linux::FAIL_QUERY.set(false);
+    let entries = facade::devices_with_namespaces().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].id_namespace, flexaudio_core::DeviceIdNamespace::CpalDeviceName);
+    assert_eq!(entries[0].device.id, "USB microphone");
+    assert_eq!(entries[1].id_namespace, flexaudio_core::DeviceIdNamespace::PipeWireNodeName);
+    assert_eq!(entries[1].device.id, "alsa_output.card0");
+    assert_eq!(facade::devices().unwrap(), entries.into_iter().map(|entry| entry.device).collect::<Vec<_>>());
 }
 #[test]
 fn facade_discovery_failure_has_one_enumerate_context() {
