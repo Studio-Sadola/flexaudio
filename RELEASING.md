@@ -122,6 +122,49 @@ safely become a publish-only operation. For a PyPI publish-only failure, use
 **Re-run failed jobs** to retain the original successful wheel/sdist jobs.
 Its current dispatch still rebuilds wheels/sdist.
 
+## Deprecation policy
+
+A public name, field, option or function that is replaced is first marked
+deprecated: Rust `#[deprecated]`, TypeScript `@deprecated`, Python
+`DeprecationWarning`, or a C header comment. It keeps working for at least one
+minor release before removal. Removal is a breaking change and follows the
+version rules above, including prior maintainer approval. The CHANGELOG lists
+deprecations under `Deprecated`.
+
+## Registry completion and ownership
+
+A release is complete only when **Verify registry completion** is green.
+This final job in `release-npm.yml` runs after npm publication and waits for the
+tag-push crates.io and PyPI workflows for the same tag and commit to complete.
+Keeping it in the existing npm workflow avoids a separate privileged
+`workflow_run` trigger. The job has only `contents: read` and `actions: read`,
+uses no secrets, and runs even when publication fails so missing artifacts
+remain visible. Manual publication retries do not run this job; after retrying,
+run the checker below to confirm completion.
+
+The Python 3.11+ standard-library checker derives publishable crates from Cargo
+manifests (excluding `publish = false`), npm packages from the main manifest and
+its `optionalDependencies`, and the Python package from `pyproject.toml`.
+It queries HTTPS registry JSON directly, including registry.npmjs.org regardless
+of npm client configuration. Every crate and npm package must expose the version;
+PyPI must expose at least one wheel and one sdist. Yanked distributions do not
+count. The checker prints each artifact as found, missing or error, retries for
+up to 900 seconds by default, and fails on unresolved absence or unreadable
+responses. Each request has a bounded timeout; the final inspection can add
+at most one short request per remaining artifact beyond the propagation wait.
+
+```bash
+python3 .github/scripts/check_registry_completion.py --version 0.7.0
+python3 .github/scripts/check_registry_completion.py --version 0.7.0 --wait-seconds 0
+```
+
+Use `--wait-seconds` and `--interval-seconds` to adjust propagation polling.
+The workflow waits up to 90 minutes for the other publish workflows, then
+allows the default 15-minute registry propagation window.
+
+`.github/CODEOWNERS` records `@tsubome` as owner of all files and requests review.
+Enforcement requires branch protection, which is not enabled.
+
 ## Windows release reproducibility
 
 All release workflows pin Rust to CI's `1.98.1` and disable Cargo incremental
