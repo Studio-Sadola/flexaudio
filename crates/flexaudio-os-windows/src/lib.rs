@@ -66,7 +66,7 @@ pub use process::WasapiProcessBackend;
 #[cfg(target_os = "windows")]
 pub use processes::list_processes;
 #[cfg(target_os = "windows")]
-pub use system::{list_output_devices, WasapiSystemBackend};
+pub use system::{list_output_devices, list_output_devices_with_namespaces, WasapiSystemBackend};
 
 #[cfg(any(target_os = "windows", test))]
 mod native_outcomes;

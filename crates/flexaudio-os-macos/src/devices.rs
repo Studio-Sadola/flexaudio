@@ -260,6 +260,12 @@ fn device_uid(device: AudioObjectID) -> Result<String> {
 /// TCC permission is not needed. Collection failures are terminal. Omit devices
 /// with unreadable direction (cannot classify) or no selectable identity.
 pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
+    list_output_devices_with_namespaces()
+        .map(|devices| devices.into_iter().map(|entry| entry.device).collect())
+}
+
+/// Enumerate Core Audio output selectors with their provider provenance.
+pub fn list_output_devices_with_namespaces() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
     let default_id = default_output_device().unwrap_or(0);
     flexaudio_core::inventory::collect(all_device_ids(read_system_object_list), |id| {
         let Some((identity, name)) = output_device_identity(id) else {
@@ -269,16 +275,19 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
             device_sample_rate(id)
                 .and_then(|rate| device_channels(id).map(|channels| (rate, channels))),
         );
-        Ok(Some(DeviceInfo {
-            id: identity,
-            name,
-            source_kind: SourceKind::SystemLoopback,
-            sample_rate,
-            channels,
-            format_available,
-            is_loopback: true,
-            is_default: id == default_id && default_id != 0,
-        }))
+        Ok(Some(flexaudio_core::NamespacedDevice::new(
+            DeviceInfo {
+                id: identity,
+                name,
+                source_kind: SourceKind::SystemLoopback,
+                sample_rate,
+                channels,
+                format_available,
+                is_loopback: true,
+                is_default: id == default_id && default_id != 0,
+            },
+            flexaudio_core::DeviceIdNamespace::CoreAudioOutputSelector,
+        )))
     })
 }
 

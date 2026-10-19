@@ -1,0 +1,216 @@
+//! Commit, recovery, rollback, and side-effect-free source-switch preflight.
+
+use super::*;
+use crate::{IgnoreReason, SettingKey, SettingOutcome, SettingValue};
+use std::sync::atomic::AtomicUsize;
+
+struct Backend {
+    starts: Arc<AtomicUsize>,
+    stops: Arc<AtomicUsize>,
+    fail: bool,
+    sink: Option<RawSink>,
+}
+impl Backend {
+    fn new(fail: bool) -> Self {
+        Self {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+            fail,
+            sink: None,
+        }
+    }
+}
+impl CaptureBackend for Backend {
+    fn native_format(&self) -> (u32, u16) {
+        (48_000, 2)
+    }
+    fn start(&mut self, sink: RawSink) -> Result<()> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        self.sink = Some(sink);
+        if self.fail {
+            Err(Error::DeviceNotFound)
+        } else {
+            Ok(())
+        }
+    }
+    fn stop(&mut self) {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        self.sink = None;
+    }
+}
+
+fn open(config: StreamConfig, strict: bool, backend: Backend) -> Stream {
+    crate::open_using(config, OpenOptions::new().strict(strict), |_, _| {
+        Ok(Box::new(backend))
+    })
+    .unwrap()
+}
+
+#[test]
+fn successful_identical_switches_increment_recovery_does_not() {
+    let config = StreamConfig {
+        gain: 2.0,
+        ring_capacity_chunks: 7,
+        ..Default::default()
+    };
+    let mut stream = open(config, false, Backend::new(false));
+    stream.start().unwrap();
+    let initial = stream.effective_settings().unwrap().clone();
+    assert_eq!(initial.revision, 0);
+    Stream::open_backend_once(&stream.shared, GenerationChange::Recovery).unwrap();
+    assert_eq!(stream.effective_settings(), Some(&initial));
+    stream.set_gain(3.0).unwrap();
+    stream.set_denoise(true);
+    for revision in [1, 2] {
+        stream
+            .switch_source_using(StreamConfig::default(), None, None, |_, _| {
+                Ok(Box::new(Backend::new(false)))
+            })
+            .unwrap();
+        let report = stream.effective_settings().unwrap();
+        assert_eq!(report.revision, revision);
+        let gain = report.get(SettingKey::Gain).unwrap();
+        assert_eq!(gain.requested, SettingValue::Float(1.0));
+        assert_eq!(gain.effective, SettingValue::Float(3.0));
+        assert_eq!(gain.outcome, SettingOutcome::NotRequested);
+        assert_eq!(
+            report
+                .get(SettingKey::RingCapacityChunks)
+                .unwrap()
+                .effective,
+            SettingValue::Unsigned(7)
+        );
+        assert_eq!(
+            report.get(SettingKey::Denoise).unwrap().requested,
+            SettingValue::Bool(false)
+        );
+        assert_eq!(
+            report.get(SettingKey::Denoise).unwrap().effective,
+            SettingValue::Bool(true)
+        );
+    }
+    stream.stop_checked().unwrap();
+}
+
+#[test]
+fn construction_and_start_failures_keep_previous_report_options_and_config() {
+    let backend = Backend::new(false);
+    let starts = backend.starts.clone();
+    let mut stream = open(StreamConfig::default(), false, backend);
+    stream.start().unwrap();
+    let report = stream.effective_settings().unwrap().clone();
+    let config = stream.config().clone();
+    for fail_start in [false, true] {
+        let replacement = StreamConfig {
+            kind: crate::SourceKind::SystemLoopback,
+            ..Default::default()
+        };
+        let error = stream
+            .switch_source_using(
+                replacement,
+                Some(true),
+                Some(OpenOptions::new().strict(true)),
+                |_, _| {
+                    if fail_start {
+                        Ok(Box::new(Backend::new(true)))
+                    } else {
+                        Err(Error::DeviceNotFound)
+                    }
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DeviceNotFound);
+        assert_eq!(stream.effective_settings(), Some(&report));
+        assert_eq!(stream.config(), &config);
+        assert_eq!(stream.open_options(), &OpenOptions::default());
+        assert!(!stream.shared.denoise_enabled.load(Ordering::SeqCst));
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    stream.stop_checked().unwrap();
+}
+
+#[test]
+fn strict_switch_counts_zero_builds_and_old_source_stops_and_keeps_snapshot() {
+    let backend = Backend::new(false);
+    let stops = backend.stops.clone();
+    let starts = backend.starts.clone();
+    let mut stream = open(StreamConfig::default(), true, backend);
+    stream.start().unwrap();
+    let initial = stream.effective_settings().unwrap().clone();
+    let builds = AtomicUsize::new(0);
+    let requested = StreamConfig {
+        gain: 2.0,
+        ring_capacity_chunks: 7,
+        target_pid: Some(42),
+        ..Default::default()
+    };
+    let error = stream
+        .switch_source_using(requested, None, None, |_, _| {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Backend::new(false)))
+        })
+        .unwrap_err();
+    assert_eq!(builds.load(Ordering::SeqCst), 0);
+    assert_eq!(stops.load(Ordering::SeqCst), 0);
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(stream.effective_settings(), Some(&initial));
+    assert!(stream.open_options().strict);
+    let candidate = error.ignored_settings().unwrap();
+    assert_eq!(candidate.revision, 1);
+    for key in [SettingKey::Gain, SettingKey::RingCapacityChunks] {
+        assert_eq!(
+            candidate.get(key).unwrap().outcome,
+            SettingOutcome::Ignored(IgnoreReason::FixedAtOpen)
+        );
+    }
+    // Explicit permissive replacement is committed together with a successful source.
+    stream
+        .switch_source_using(
+            StreamConfig {
+                gain: 2.0,
+                ..Default::default()
+            },
+            Some(true),
+            Some(OpenOptions::new().strict(false)),
+            |_, _| Ok(Box::new(Backend::new(false))),
+        )
+        .unwrap();
+    assert!(!stream.open_options().strict);
+    assert_eq!(stream.effective_settings().unwrap().revision, 1);
+    assert_eq!(
+        stream
+            .effective_settings()
+            .unwrap()
+            .get(SettingKey::Denoise)
+            .unwrap()
+            .effective,
+        SettingValue::Bool(true)
+    );
+    stream.stop_checked().unwrap();
+}
+
+#[test]
+fn omitted_options_report_defaults_while_retaining_backend_options() {
+    let mut stream = crate::open_using(
+        StreamConfig::default(),
+        OpenOptions::new().windows_classic_loopback_keepalive(false),
+        |_, _| Ok(Box::new(Backend::new(false))),
+    )
+    .unwrap();
+    stream.start().unwrap();
+    stream
+        .switch_source_using(StreamConfig::default(), None, None, |_, options| {
+            assert!(!options.windows_classic_loopback_keepalive);
+            Ok(Box::new(Backend::new(false)))
+        })
+        .unwrap();
+    let entry = stream
+        .effective_settings()
+        .unwrap()
+        .get(SettingKey::WindowsClassicLoopbackKeepalive)
+        .unwrap();
+    assert_eq!(entry.requested, SettingValue::Bool(true));
+    assert_eq!(entry.effective, SettingValue::Absent);
+    assert_eq!(entry.outcome, SettingOutcome::NotRequested);
+    stream.stop_checked().unwrap();
+}

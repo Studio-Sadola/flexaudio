@@ -339,8 +339,46 @@ impl Stream {
         }
         validate_chunk_ms(new_config.chunk_ms)?;
         // Build the new source backend (on failure, return early with the old source untouched).
-        crate::validate_exclude_pids(&new_config)?;
+        crate::validation::source_config(&new_config)?;
+        let retain_options = options.is_none();
         let options = options.unwrap_or_else(|| self.open_options.clone());
+        // Use the actual retained gain at commit, including intervening set_gain calls.
+        // A custom-backend stream still preflights high-level routing, but never invents
+        // a public applicability snapshot for its original backend.
+        let mut previous = match self.settings_report.clone() {
+            Some(report) => report,
+            None => crate::settings::preflight(
+                &self.config,
+                &OpenOptions::default(),
+                None,
+                None,
+                false,
+            )?,
+        };
+        if let Some(entry) = previous
+            .entries
+            .iter_mut()
+            .find(|entry| entry.setting == crate::SettingKey::Gain)
+        {
+            entry.effective = crate::SettingValue::Float(f32::from_bits(
+                self.shared.gain_bits.load(Ordering::SeqCst),
+            ));
+        }
+        if let Some(entry) = previous
+            .entries
+            .iter_mut()
+            .find(|entry| entry.setting == crate::SettingKey::Denoise)
+        {
+            entry.effective =
+                crate::SettingValue::Bool(self.shared.denoise_enabled.load(Ordering::SeqCst));
+        }
+        let report = crate::settings::preflight(
+            &new_config,
+            &options,
+            denoise,
+            Some(&previous),
+            retain_options,
+        )?;
         let backend = match build(&new_config, &options) {
             Ok(backend) => backend,
             Err(error) => {
@@ -378,6 +416,9 @@ impl Stream {
             ..self.config.clone()
         };
         self.open_options = options;
+        if self.settings_report.is_some() {
+            self.settings_report = Some(report);
+        }
         Ok(())
     }
 }
@@ -412,6 +453,9 @@ fn drain_unpublished_capture(
 #[cfg(test)]
 #[path = "open_options_tests.rs"]
 mod open_options_tests;
+#[cfg(test)]
+#[path = "settings_tests.rs"]
+mod settings_tests;
 
 #[cfg(test)]
 mod combined_open_options_tests {

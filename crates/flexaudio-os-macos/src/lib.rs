@@ -69,7 +69,7 @@ mod version;
 #[cfg(target_os = "macos")]
 pub use capabilities::capabilities;
 #[cfg(target_os = "macos")]
-pub use devices::list_output_devices;
+pub use devices::{list_output_devices, list_output_devices_with_namespaces};
 #[cfg(target_os = "macos")]
 pub use process::MacProcessBackend;
 #[cfg(target_os = "macos")]

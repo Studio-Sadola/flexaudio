@@ -97,6 +97,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(5);
 pub struct Stream {
     config: StreamConfig,
     open_options: OpenOptions,
+    pub(crate) settings_report: Option<flexaudio_core::SettingsReport>,
 
     /// Shared backend, reopened by the intake/watchdog threads.
     shared: Arc<SharedState>,
@@ -281,24 +282,7 @@ impl Stream {
         backend: Box<dyn CaptureBackend>,
         options: OpenOptions,
     ) -> Result<Stream> {
-        validate_chunk_ms(config.chunk_ms)?;
-        if config.ring_capacity_chunks == 0 {
-            return Err(Error::InvalidArg("ring_capacity_chunks must be > 0".into()));
-        }
-        // Input gain must be finite and at least 0.0 (NaN, infinity, and negative values are InvalidArg).
-        if !config.gain.is_finite() || config.gain < 0.0 {
-            return Err(Error::InvalidArg(format!(
-                "gain must be finite and >= 0.0, got {}",
-                config.gain
-            )));
-        }
-        // Validate that the output format is supported (otherwise UnsupportedFormat).
-        config.output.validate()?;
-        crate::validate_exclude_pids(&config)?;
-        // Validate the secondary output format the same way, when configured.
-        if let Some(sec) = config.secondary_output {
-            sec.validate()?;
-        }
+        crate::validation::open_config(&config)?;
         let native_format = backend.native_format();
         if native_format.0 == 0 || native_format.1 == 0 {
             return Err(Error::InvalidArg(
@@ -355,6 +339,7 @@ impl Stream {
         Ok(Stream {
             config,
             open_options: options,
+            settings_report: None,
             shared,
             chunk_consumer,
             pending_primary: None,
@@ -376,6 +361,12 @@ impl Stream {
     /// replaces them only after the new backend starts successfully.
     pub fn open_options(&self) -> &OpenOptions {
         &self.open_options
+    }
+
+    /// Last successful facade open/source-switch snapshot. Recovery does not revise it.
+    /// Custom-backend opens return `None`, because their applicability is unknown.
+    pub fn effective_settings(&self) -> Option<&flexaudio_core::SettingsReport> {
+        self.settings_report.as_ref()
     }
 
     /// Enable the canonical 48 kHz stereo branch before starting capture.

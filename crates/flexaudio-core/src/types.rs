@@ -67,6 +67,7 @@ pub struct AudioChunk {
     /// for both microphone and loopback. Clamped non-decreasing, but chunks can overlap
     /// or repeat timestamps. Not a media clock; frame_index is authoritative.
     /// VAD maps epoch pts_ns + t_ms*1000000 exactly.
+    /// Deprecated in 0.8: use [`Self::arrival_ns`]. Retained throughout 0.9.
     pub pts_ns: i64,
     /// Monotonically increasing sequence number assigned by the stream layer.
     pub seq: u64,
@@ -108,6 +109,7 @@ pub struct SecondaryChunk {
     /// origin as the primary tap. Clamped non-decreasing, but chunks can overlap or
     /// repeat timestamps. Not a media clock; frame_index is authoritative.
     /// VAD uses its dedicated capture epoch.
+    /// Deprecated in 0.8: use [`Self::arrival_ns`]. Retained throughout 0.9.
     pub pts_ns: i64,
     /// Monotonic sequence number for the secondary tap (separate counter from the primary tap).
     pub seq: u64,

@@ -92,12 +92,14 @@ fn assert_chunk_flags(stream: &mut Stream, expected_recoveries: usize) {
     let mut primary = 0;
     let mut secondary = 0;
     while let Some(chunk) = stream.poll_chunk() {
+        assert_eq!(chunk.arrival_ns(), chunk.pts_ns);
         if chunk.flags.contains(ChunkFlags::RECOVERED) {
             assert!(chunk.flags.contains(ChunkFlags::DISCONTINUITY));
             primary += 1;
         }
     }
     while let Some(chunk) = stream.poll_secondary() {
+        assert_eq!(chunk.arrival_ns(), chunk.pts_ns);
         if chunk.flags.contains(ChunkFlags::RECOVERED) {
             assert!(chunk.flags.contains(ChunkFlags::DISCONTINUITY));
             secondary += 1;
