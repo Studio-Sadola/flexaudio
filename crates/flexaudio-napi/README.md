@@ -191,6 +191,44 @@ Linux and Windows do not use the requested system device while exclusion is
 active: Linux fan-in is not device-scoped, and WASAPI process loopback cannot
 target an output endpoint. Microphone selection is unaffected.
 
+## Settings reports, strict mode, and lifecycle
+
+`openStream({ kind: 'mic', strict: true, ringCapacityChunks: 100 }, onChunk)`
+opts into applicability checks and a 100-chunk output ring (default 50).
+`stream.effectiveSettings()` returns the last successful open/switch snapshot,
+with a `bigint` revision and requested/effective values and outcomes for every
+recognized capture setting. Effective values describe configuration, not proof
+of running hardware. Omitted `strict` retains strictness on source switches.
+
+Only decoded values differing from documented defaults count as requests;
+property presence makes no difference. Explicit defaults are `notRequested`.
+Strict rejection throws an error with `code === 'FLEX_IGNORED_SETTINGS'` and a
+complete candidate `.report`, before device access, model loading, or stopping
+the old source. Failed switches keep the previous report and controls.
+Gain, ring capacity, denoise and VAD cannot be replaced by `switchSource`:
+non-default requests are `ignored` with `fixedAtOpen` (strict rejects them).
+Use `setGain()` for runtime gain changes. See the root README's
+[ignored-setting table](../../README.md#strict-mode-and-effective-settings)
+for all reasons and the default-value rule.
+
+Register `onLifecycleEvent` inside `OpenOptions` for a separate ordered helper
+callback channel. Ordinary `onEvent` never receives these events, even as unknown.
+Omitting the handler on switch retains it; supplying one replaces it only after
+successful commit. `stop()` settles after queued lifecycle callbacks complete.
+Every emitted helper Started has exactly one Stopped with a reason. On macOS,
+Started means a diagnostic attempt; on Windows it means successful silent-render
+start. Stopped ends ownership after teardown attempts; cleanup errors remain
+authoritative. Ordering against PCM and ordinary events is not guaranteed.
+See [helper behavior and controls](../../README.md#optional-playback-helpers-and-lifecycle).
+
+Library-created primary and secondary chunks always expose `arrivalNs`, identical
+to `ptsNs`. The declaration is optional to preserve consumer-created objects.
+Old chunk `ptsNs` naming is documentation-only deprecated since 0.8 and retained
+throughout 0.9; `frameIndex` remains authoritative for audio continuity.
+`await devicesWithNamespaces()` returns `{ device, idNamespace }` entries with
+unchanged selectable IDs. Namespaces describe provider selector domains, not
+persistent hardware identities.
+
 ## Chunk delivery shape (primary, secondary, VAD)
 
 `onChunk` is called with **one** argument, the primary chunk. When
@@ -222,8 +260,9 @@ const stream = openStream(
 ```
 
 
-Pair primary and secondary chunks by `ptsNs` (a zero-based recording clock),
-never by `seq`: each tap counts its own sequence. Relative timing depends on
+Compare primary and secondary arrival labels with `arrivalNs`, never `seq`:
+each tap counts its own sequence. Arrival labels can overlap or repeat and are
+not an exact media clock or an exact pairing key. Relative timing depends on
 the output formats and buffering; there is no fixed delay between taps.
 
 `stream` also exposes `pause()` / `resume()`, `setGain(x)`, and the read-only

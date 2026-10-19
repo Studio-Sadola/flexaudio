@@ -301,6 +301,40 @@ reinitializes the session so its next frame starts a new anchored epoch.
 Disabled attachment has `AudioChunk.vad_events=None` and flush is a no-op.
 
 
+### Settings reports, strict mode, and lifecycle
+
+`flexaudio.open('mic', strict=True, ring_capacity_chunks=100)` selects strict
+applicability validation and a 100-chunk ring (default 50).
+`stream.effective_settings()` returns a dictionary containing `revision` and
+`entries` with shared lower-camel setting/reason tags, requested/effective values,
+and outcomes. It snapshots successful open/switch commits. Failed switches retain
+the previous report and options; recovery does not increment the revision.
+Effective values describe configuration, not proof of running hardware.
+
+Only decoded values differing from documented defaults are requests. Explicit
+defaults are `notRequested`, including on switch. Strict rejects all requested
+ignored settings before device access, model loading, or stopping the old source,
+raising `IgnoredSettingsError` with its complete candidate `.report`.
+`strict=None` means false on open and retention on switch. Gain and ring capacity
+stay fixed at open; non-default switch requests are ignored with `fixedAtOpen`.
+Use `set_gain()` for runtime gain changes. Python switch denoise remains applied.
+See the root README's [ignored-setting table](../../README.md#strict-mode-and-effective-settings).
+
+`stream.poll_lifecycle_event()` consumes a separate ordered helper-event FIFO;
+`poll_event()` never returns lifecycle notifications, even as unknown events.
+The FIFO remains drainable after stop, independently of ordinary event polling.
+Every emitted Started has exactly one Stopped with a reason. macOS Started means
+entry into a diagnostic attempt; Windows Started means successful keepalive
+render start. Stopped ends ownership after teardown attempts; typed cleanup
+errors remain authoritative. There is no ordering guarantee relative to PCM or
+ordinary events. See [helper behavior and controls](../../README.md#optional-playback-helpers-and-lifecycle).
+
+Both chunk types expose `arrival_ns`, exactly equal to `pts_ns`. The old chunk
+name is documentation-only deprecated since 0.8 and retained throughout 0.9.
+Use `frame_index` for audio continuity. `devices_with_namespaces()` returns
+entries with `.device` and `.id_namespace`, preserving selectable IDs. Namespace
+tags describe provider selector domains, not persistent hardware identities.
+
 ### Capability snapshot and optional output
 
 `capabilities()` returns a dictionary with `os_version`, `sources`,

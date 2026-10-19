@@ -79,10 +79,10 @@
     }},
     {"feature": "Configurable ring capacity", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::StreamConfig::ring_capacity_chunks"], "note": "Default 50 chunks."},
-      "Node": {"status": "missing", "reason": "Capture uses 50 chunks; no ring-capacity option is declared."},
-      "Python": {"status": "missing", "reason": "Capture uses 50 chunks; no ring-capacity argument is declared."},
-      "C": {"status": "missing", "reason": "Capture uses 50 chunks; no ring-capacity field is declared."},
-      "CLI": {"status": "missing", "reason": "Capture uses 50 chunks; no ring-capacity flag is declared."}
+      "Node": {"status": "supported", "symbols": ["OpenOptions.ringCapacityChunks"], "note": "Default 50; fixed at open."},
+      "Python": {"status": "supported", "symbols": ["open.ring_capacity_chunks"], "note": "Default 50; fixed at open."},
+      "C": {"status": "supported", "symbols": ["FlexOptionsV4.ring_capacity_chunks", "flexaudio_open_v4"], "note": "Default 50; fixed at open."},
+      "CLI": {"status": "supported", "symbols": ["--ring-capacity-chunks"], "note": "Default 50; fixed at open."}
     }},
     {"feature": "Chunk length", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::StreamConfig::chunk_ms"], "note": "Only 20 ms is accepted."},
@@ -110,7 +110,7 @@
       "Node": {"status": "supported", "symbols": ["OpenOptions.denoise"], "note": "Requires 48 kHz primary output."},
       "Python": {"status": "supported", "symbols": ["open.denoise"], "note": "Requires 48 kHz primary output."},
       "C": {"status": "supported", "symbols": ["flexaudio_open_v3", "FlexConfig.denoise"], "note": "v3 supports any output rate; v1/v2 require 48 kHz."},
-      "CLI": {"status": "missing", "reason": "No capture-denoise flag is exposed."}
+      "CLI": {"status": "supported", "symbols": ["--denoise"], "note": "Canonical 48 kHz processing supports any output rate."}
     }},
     {"feature": "Attached VAD: primary carrier", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::enable_capture_tap", "flexaudio::Stream::poll_capture", "flexaudio_vad::VadTap::process"], "note": "Caller feeds canonical capture to VadTap and carries its events."},
@@ -153,6 +153,41 @@
       "Python": {"status": "supported", "symbols": ["devices"]},
       "C": {"status": "supported", "symbols": ["flexaudio_devices"]},
       "CLI": {"status": "supported", "symbols": ["--list-devices"]}
+    }},
+    {"feature": "Namespaced device listing", "bindings": {
+      "Rust": {"status": "supported", "symbols": ["flexaudio::devices_with_namespaces"]},
+      "Node": {"status": "supported", "symbols": ["devicesWithNamespaces", "NamespacedDevice.idNamespace"]},
+      "Python": {"status": "supported", "symbols": ["devices_with_namespaces", "NamespacedDevice.id_namespace"]},
+      "C": {"status": "supported", "symbols": ["flexaudio_devices_with_namespaces_v4", "flexaudio_namespaced_devices_free_v4"]},
+      "CLI": {"status": "supported", "symbols": ["--list-devices-json"], "note": "Selector IDs remain unchanged; namespace describes provider provenance."}
+    }},
+    {"feature": "Effective settings report", "bindings": {
+      "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::effective_settings"], "note": "Facade open/switch snapshots; custom backends return None."},
+      "Node": {"status": "supported", "symbols": ["FlexStream.effectiveSettings", "IgnoredSettingsException.report"]},
+      "Python": {"status": "supported", "symbols": ["Stream.effective_settings", "IgnoredSettingsError.report"]},
+      "C": {"status": "supported", "symbols": ["flexaudio_settings_v4", "flexaudio_error_settings_v4", "flexaudio_settings_free_v4"]},
+      "CLI": {"status": "supported", "symbols": ["--settings-json"], "note": "stderr snapshots on successful open/switch or strict rejection."}
+    }},
+    {"feature": "Strict ignored-setting validation", "bindings": {
+      "Rust": {"status": "supported", "symbols": ["flexaudio::OpenOptions::strict"]},
+      "Node": {"status": "supported", "symbols": ["OpenOptions.strict"]},
+      "Python": {"status": "supported", "symbols": ["open.strict", "Stream.switch_source.strict"]},
+      "C": {"status": "supported", "symbols": ["FlexOptionsV4.strict", "flexaudio_open_v4", "FLEX_IGNORED_SETTINGS"]},
+      "CLI": {"status": "supported", "symbols": ["--strict"], "note": "Only decoded non-default requests can be rejected."}
+    }},
+    {"feature": "Helper lifecycle channel", "bindings": {
+      "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::poll_event"], "note": "Existing Event channel; exactly one Stopped per emitted Started."},
+      "Node": {"status": "supported", "symbols": ["OpenOptions.onLifecycleEvent", "LifecycleEvent"], "note": "Separate ordered callback channel."},
+      "Python": {"status": "supported", "symbols": ["Stream.poll_lifecycle_event", "LifecycleEvent"], "note": "Separate FIFO; drainable after stop."},
+      "C": {"status": "supported", "symbols": ["flexaudio_poll_lifecycle_event_v4", "flexaudio_lifecycle_event_free_v4"], "note": "Separate FIFO; owned events survive stream destruction."},
+      "CLI": {"status": "supported", "symbols": ["--lifecycle-events"], "note": "Ordered JSON lines on stderr, including shutdown."}
+    }},
+    {"feature": "Chunk arrival-time labels", "bindings": {
+      "Rust": {"status": "supported", "symbols": ["flexaudio::AudioChunk", "flexaudio::SecondaryChunk"], "note": "arrival_ns() aliases pts_ns exactly on both chunk types."},
+      "Node": {"status": "supported", "symbols": ["JsAudioChunk.arrivalNs", "JsSecondaryChunk.arrivalNs"], "note": "Always populated by the library; optional in consumer-created objects."},
+      "Python": {"status": "supported", "symbols": ["AudioChunk.arrival_ns", "SecondaryChunk.arrival_ns"]},
+      "C": {"status": "supported", "symbols": ["flexaudio_chunk_arrival_ns_v4", "flexaudio_secondary_arrival_ns_v4"]},
+      "CLI": {"status": "not-applicable", "reason": "Raw PCM/WAV output has no chunk metadata API."}
     }},
     {"feature": "Process listing", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::processes"]},
