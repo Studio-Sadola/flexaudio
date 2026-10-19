@@ -16,6 +16,8 @@ Rust `DeviceInfo` struct literals must also supply `format_available` (0.5.4).
 
 **General-purpose, flexible, cross-platform audio capture for Rust.**
 
+See the [design principles](docs/PRINCIPLES.md) for the maintainer's target state and promises.
+
 `flexaudio` provides one unified API for capturing audio from **microphones**,
 **system output (loopback)**, **individual processes**, and a **microphone + system mix** — across **Linux**,
 **Windows**, and **macOS**. It normalizes every source to an interleaved
