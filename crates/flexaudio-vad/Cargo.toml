@@ -20,7 +20,7 @@ documentation = "https://docs.rs/flexaudio-vad"
 test-faults = []
 
 [dependencies]
-flexaudio-core = { path = "../flexaudio-core", version = "0.7.0" }
+flexaudio-core = { path = "../flexaudio-core", version = "0.8.0" }
 # Run silero-VAD offline with the pure-Rust ONNX inference engine tract-onnx. No C/C++ runtime or
 # onnxruntime DLL is needed (a single self-contained binary). Optimize the plan once at startup with
 # `into_optimized` and reuse it for every frame.
