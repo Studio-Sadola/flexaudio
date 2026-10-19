@@ -374,10 +374,17 @@ class _FlacIoError(_AudioException, OSError): pass
 class NativeFormatChangedError(_AudioException, RuntimeError): pass
 class UnsupportedError(_AudioException, RuntimeError): pass
 class AmbiguousDeviceNameError(_AudioException, RuntimeError): pass
+class IgnoredSettingsError(ValueError):
+    def __init__(self, message, report):
+        super().__init__(message)
+        self._report = report
+    @property
+    def report(self):
+        return self._report
 for _exception in (InvalidArgumentError, UnsupportedFormatError, InvalidStateError,
                    DeviceNotFoundError, RecordingPermissionError, UnsupportedOsVersionError,
                    DeviceLostError, BackendError, NativeFormatChangedError, UnsupportedError,
-                   AmbiguousDeviceNameError):
+                   AmbiguousDeviceNameError, IgnoredSettingsError):
     _exception.__module__ = 'flexaudio'
 "#
             );
@@ -393,6 +400,15 @@ for _exception in (InvalidArgumentError, UnsupportedFormatError, InvalidStateErr
 }
 pub(crate) fn to_py_err(error: fa::Error) -> PyErr {
     Python::attach(|py| {
+        if let Some(report) = error.ignored_settings() {
+            return match exceptions(py).and_then(|m| {
+                m.getattr("IgnoredSettingsError")?
+                    .call1((error.to_string(), crate::settings::to_py(py, report)?))
+            }) {
+                Ok(value) => PyErr::from_value(value),
+                Err(error) => error,
+            };
+        }
         let name = if error.addon_kind() == Some(fa::AddonErrorKind::FlacIo) {
             "_FlacIoError"
         } else {
@@ -434,6 +450,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "NativeFormatChangedError",
         "UnsupportedError",
         "AmbiguousDeviceNameError",
+        "IgnoredSettingsError",
     ] {
         m.add(name, exceptions(m.py())?.getattr(name)?)?;
     }

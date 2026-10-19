@@ -19,6 +19,7 @@ pub(super) fn error_code(kind: ErrorKind) -> &'static str {
         ErrorKind::NativeFormatChanged => "FLEX_NATIVE_FORMAT_CHANGED",
         ErrorKind::Unsupported => "FLEX_UNSUPPORTED",
         ErrorKind::AmbiguousDeviceName => "FLEX_AMBIGUOUS_DEVICE_NAME",
+        ErrorKind::IgnoredSettings => "FLEX_IGNORED_SETTINGS",
         _ => "FLEX_FAILURE",
     }
 }
@@ -34,7 +35,11 @@ pub(super) fn to_napi_err(error: Error) -> NapiError {
 pub(super) fn js_error(env: &Env, error: &Error) -> napi::Result<JsObject> {
     let mut object = env.create_error(to_napi_err(error.clone()))?;
     object.set_named_property("code", error_code(error.kind()))?;
-    object.set_named_property("audioError", audio_error(error))?;
+    if let Some(report) = error.ignored_settings() {
+        object.set_named_property("report", settings::to_js(env, report)?)?;
+    } else {
+        object.set_named_property("audioError", audio_error(error))?;
+    }
     Ok(object)
 }
 

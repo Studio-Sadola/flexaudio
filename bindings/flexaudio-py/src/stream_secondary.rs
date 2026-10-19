@@ -97,6 +97,9 @@ mod tests {
                 secondary_metadata: (0, 0, 0, 0),
                 shutdown: None,
                 local_events: Default::default(),
+                lifecycle_events: Default::default(),
+                capture_events: Default::default(),
+                settings: Default::default(),
                 vad_tap: vad.then(|| {
                     flexaudio_vad::VadTap::new(Default::default(), Default::default()).unwrap()
                 }),

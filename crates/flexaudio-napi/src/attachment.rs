@@ -250,6 +250,7 @@ impl PairingBridge {
             frames: 0,
             frame_index: BigInt::from(attachment.last_frame_index),
             pts_ns: attachment.last_pts.max(self.last_emitted_primary_pts),
+            arrival_ns: attachment.last_pts.max(self.last_emitted_primary_pts),
             seq: BigInt::from(self.last_primary_seq),
             flags: 0,
             dropped_before: self.last_primary_dropped,

@@ -136,6 +136,8 @@ pub(crate) fn process_info_to_py(info: ProcessInfo) -> PyProcessInfo {
 
 /// One chunk of recorded audio. `data` is raw little-endian interleaved f32 bytes
 /// (len = frames * channels * 4). In numpy, use `np.frombuffer(chunk.data, dtype=np.float32)`.
+/// `pts_ns` is deprecated in 0.8; use the identical `arrival_ns` label instead.
+/// The old property remains available throughout 0.9. `frame_index` is authoritative.
 ///
 /// `vad_events` contains [`VadEvent`](PyVadEvent) events finalized for this chunk when integrated
 /// VAD (`open(..., vad=...)`) is enabled (empty when disabled or no events). When denoise is enabled,
@@ -171,6 +173,10 @@ pub struct PyAudioChunk {
 
 #[pymethods]
 impl PyAudioChunk {
+    #[getter]
+    fn arrival_ns(&self) -> i64 {
+        self.pts_ns
+    }
     /// Return interleaved f32 samples as raw little-endian bytes.
     #[getter]
     fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {

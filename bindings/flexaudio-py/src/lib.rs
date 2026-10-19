@@ -38,11 +38,14 @@ use fa::{ProcessMode, SourceKind};
 mod capabilities;
 mod config;
 mod denoise;
+mod device_namespace;
 mod encode;
 mod errors;
+mod lifecycle;
 mod marshal;
 mod pcm_buffer;
 mod secondary;
+mod settings;
 mod stream;
 mod vad;
 mod vad_marshal;
@@ -155,12 +158,18 @@ fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Functions.
     m.add_function(wrap_pyfunction!(capabilities::capabilities, m)?)?;
     m.add_function(wrap_pyfunction!(devices, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        device_namespace::devices_with_namespaces,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(processes, m)?)?;
     m.add_function(wrap_pyfunction!(stream::open, m)?)?;
     m.add_function(wrap_pyfunction!(watcher::watch_devices, m)?)?;
 
     // Stream and its returned data types.
     m.add_class::<stream::Stream>()?;
+    m.add_class::<device_namespace::NamespacedDevice>()?;
+    m.add_class::<lifecycle::LifecycleEvent>()?;
     m.add_class::<secondary::SecondaryOutputOptions>()?;
     m.add_class::<secondary::PySecondaryChunk>()?;
     m.add_class::<marshal::PyAudioChunk>()?;

@@ -12,6 +12,23 @@ use fa::{OutputFormat, StreamConfig};
 
 use crate::{parse_process_mode, parse_source_kind};
 
+pub(crate) fn parse_ring_capacity(value: Option<&Bound<'_, PyAny>>) -> PyResult<usize> {
+    let Some(value) = value.filter(|value| !value.is_none()) else {
+        return Ok(50);
+    };
+    if value.is_instance_of::<PyBool>() || !value.is_instance_of::<PyInt>() {
+        return Err(PyTypeError::new_err(
+            "ring_capacity_chunks must be an integer or None",
+        ));
+    }
+    match value.extract::<usize>() {
+        Ok(value) if value > 0 => Ok(value),
+        _ => Err(PyValueError::new_err(
+            "ring_capacity_chunks must be positive and fit native usize",
+        )),
+    }
+}
+
 /// Validate exclusion at the Python boundary before addons or device acquisition.
 /// Keep the sequence order and duplicates; integer extraction follows explicit type checks
 /// so bools and objects implementing only __index__ cannot become PIDs.

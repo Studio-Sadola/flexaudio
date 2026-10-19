@@ -7,6 +7,7 @@ impl Stream {
             return report.result();
         }
         let _ = self.inner.stop_checked();
+        self.route_events();
         let core_report = self.inner.shutdown_report();
         let primary = self.inner.terminal_error();
         let mut cleanup = core_report
@@ -89,6 +90,9 @@ mod tests {
             inner,
             shutdown: None,
             local_events: Default::default(),
+            lifecycle_events: Default::default(),
+            capture_events: Default::default(),
+            settings: Default::default(),
             vad_tap: None,
             vad_events: Vec::new(),
             vad_origin: (0, 0),

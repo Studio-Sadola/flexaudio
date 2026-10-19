@@ -72,6 +72,8 @@ impl SecondaryOutputOptions {
 }
 
 /// An independent secondary chunk. Meters describe float PCM before encoding.
+/// `pts_ns` is deprecated in 0.8 in favor of the identical `arrival_ns` label,
+/// and remains available throughout 0.9. `frame_index` is authoritative.
 #[pyclass(module = "flexaudio", name = "SecondaryChunk", frozen)]
 pub struct PySecondaryChunk {
     pub(crate) chunk: fa::SecondaryChunk,
@@ -108,6 +110,10 @@ impl PySecondaryChunk {
     #[getter]
     fn pts_ns(&self) -> i64 {
         self.chunk.pts_ns
+    }
+    #[getter]
+    fn arrival_ns(&self) -> i64 {
+        self.chunk.arrival_ns()
     }
     #[getter]
     fn seq(&self) -> u64 {
