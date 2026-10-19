@@ -146,6 +146,7 @@ tags!(error_kind, ErrorKind, {
     ErrorKind::NativeFormatChanged => "nativeFormatChanged",
     ErrorKind::Unsupported => "unsupported",
     ErrorKind::AmbiguousDeviceName => "ambiguousDeviceName",
+    ErrorKind::IgnoredSettings => "ignoredSettings",
 });
 
 #[cfg(test)]

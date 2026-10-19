@@ -14,6 +14,9 @@ struct LossSummary {
 
 impl CaptureEventReporter {
     fn report(&mut self, event: Event) -> Result<(), Error> {
+        if super::lifecycle_json::project(&event).is_some() {
+            return Ok(());
+        }
         match event {
             Event::TerminalError { error } | Event::ShutdownError { error } => Err(error),
             Event::Error(_) => Err(Error::Backend("legacy capture failure".into())),
@@ -145,7 +148,10 @@ pub(super) fn report_capture_event(event: Event) -> Result<(), Error> {
 }
 
 /// Drain diagnostics even after failure, then inspect the retained checked outcome.
-pub(super) fn drain_capture_events(stream: &mut Stream) -> Result<(), String> {
+pub(super) fn drain_capture_events(
+    stream: &mut Stream,
+    lifecycle_events: bool,
+) -> Result<(), String> {
     let mut reporter = CaptureEventReporter::default();
     let mut failure = None;
     loop {
@@ -160,6 +166,11 @@ pub(super) fn drain_capture_events(stream: &mut Stream) -> Result<(), String> {
             }
             break;
         };
+        if super::lifecycle_json::route(&event, lifecycle_events, &mut std::io::stderr().lock())
+            .map_err(|error| format!("Failed to write lifecycle JSON: {error}"))?
+        {
+            continue;
+        }
         if let Err(error) = reporter.report(event) {
             if failure.is_none() {
                 failure = Some(error);
