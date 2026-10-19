@@ -25,6 +25,9 @@ pub mod mock;
 mod open_options;
 mod processes;
 mod settings;
+mod settings_resolver;
+#[cfg(test)]
+mod settings_resolver_tests;
 #[cfg(test)]
 mod settings_tests;
 pub mod stream;
@@ -45,12 +48,11 @@ pub use flexaudio_core::types::{
     Operation, OutputFormat, OutputTap, Permission, ProcessInfo, ProcessMode, Result,
     SecondaryChunk, ShutdownReport, SourceKind, StreamConfig, VadErrorCode,
 };
-pub use flexaudio_core::{
-    resolve_settings, AdjustmentReason, DeviceIdNamespace, IgnoreReason, NamespacedDevice,
-    SettingKey, SettingOutcome, SettingResolution, SettingValue, SettingsPlatform, SettingsReport,
-    SettingsRequest,
-};
 pub use flexaudio_core::{AddonErrorKind, HelperStopReason, StartupDropReason};
+pub use flexaudio_core::{
+    AdjustmentReason, DeviceIdNamespace, IgnoreReason, NamespacedDevice, SettingKey,
+    SettingOutcome, SettingResolution, SettingValue, SettingsReport,
+};
 
 /// Return audio devices for all sources in one list.
 ///

@@ -38,6 +38,31 @@ tags!(AdjustmentReason, "Existing normalization applied to a requested value.", 
     ExclusionSetNormalized => "exclusionSetNormalized", LegacySentinel => "legacySentinel",
 });
 
+impl SettingKey {
+    const ALL: &'static [Self] = &[
+        Self::Kind,
+        Self::DeviceId,
+        Self::TargetPid,
+        Self::Mode,
+        Self::ChunkMs,
+        Self::RingCapacityChunks,
+        Self::ExcludeSelf,
+        Self::ExcludePids,
+        Self::Output,
+        Self::SecondaryOutput,
+        Self::SecondaryEncoding,
+        Self::Gain,
+        Self::MixMicDeviceId,
+        Self::MixSystemDeviceId,
+        Self::MixMicGain,
+        Self::MixSystemGain,
+        Self::SilenceProbe,
+        Self::WindowsClassicLoopbackKeepalive,
+        Self::Denoise,
+        Self::Vad,
+    ];
+}
+
 /// Decoded request or configured routing value. Inapplicable values are absent.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +81,70 @@ pub enum SettingValue {
     Pids(Vec<u32>),
     /// Sample rate and channel count.
     Format(OutputFormat),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries() -> Vec<(SettingKey, SettingValue, SettingValue, SettingOutcome)> {
+        SettingKey::ALL
+            .iter()
+            .map(|&key| {
+                (
+                    key,
+                    SettingValue::Absent,
+                    SettingValue::Absent,
+                    SettingOutcome::NotRequested,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn constructor_requires_every_key_exactly_once() {
+        assert_eq!(
+            SettingsReport::new(0, Vec::new()).unwrap_err().kind(),
+            crate::ErrorKind::InvalidArg
+        );
+        for index in 0..SettingKey::ALL.len() {
+            let mut missing = entries();
+            missing.remove(index);
+            assert_eq!(
+                SettingsReport::new(0, missing).unwrap_err().kind(),
+                crate::ErrorKind::InvalidArg
+            );
+            let mut duplicate = entries();
+            duplicate.push(duplicate[index].clone());
+            assert_eq!(
+                SettingsReport::new(0, duplicate).unwrap_err().kind(),
+                crate::ErrorKind::InvalidArg
+            );
+            let mut substituted = entries();
+            substituted[index] = substituted[(index + 1) % substituted.len()].clone();
+            assert!(SettingsReport::new(0, substituted).is_err());
+        }
+    }
+
+    #[test]
+    fn constructor_sorts_complete_entries_and_queries_outcomes() {
+        let mut input = entries();
+        input[0].3 = SettingOutcome::Ignored(IgnoreReason::WrongSourceKind);
+        input.reverse();
+        let report = SettingsReport::new(7, input).unwrap();
+        assert_eq!(report.revision, 7);
+        assert!(report
+            .entries
+            .iter()
+            .map(|entry| entry.setting)
+            .eq(SettingKey::ALL.iter().copied()));
+        assert!(report.has_ignored());
+        assert_eq!(
+            report.get(SettingKey::Kind).unwrap().outcome,
+            SettingOutcome::Ignored(IgnoreReason::WrongSourceKind)
+        );
+        assert!(!SettingsReport::new(0, entries()).unwrap().has_ignored());
+    }
 }
 
 /// Classification uses differences from documented defaults, never property presence.
@@ -97,19 +186,50 @@ pub struct SettingsReport {
 }
 
 impl SettingsReport {
-    /// Construct a snapshot from already resolved settings.
-    pub fn new(revision: u64, entries: Vec<SettingResolution>) -> Self {
-        Self { revision, entries }
+    /// Construct a complete snapshot from `(key, requested, effective, outcome)` entries.
+    ///
+    /// Entries are stored in stable key order. Returns [`crate::Error::InvalidArg`]
+    /// if any recognized key is missing or repeated. Tuple input permits construction
+    /// across crates while keeping [`SettingResolution`] non-exhaustive.
+    pub fn new(
+        revision: u64,
+        entries: Vec<(SettingKey, SettingValue, SettingValue, SettingOutcome)>,
+    ) -> crate::Result<Self> {
+        let mut entries: Vec<_> = entries
+            .into_iter()
+            .map(
+                |(setting, requested, effective, outcome)| SettingResolution {
+                    setting,
+                    requested,
+                    effective,
+                    outcome,
+                },
+            )
+            .collect();
+        entries.sort_by_key(|entry| entry.setting);
+        if !entries
+            .iter()
+            .map(|entry| entry.setting)
+            .eq(SettingKey::ALL.iter().copied())
+        {
+            return Err(crate::Error::InvalidArg(
+                "settings report must contain every setting exactly once".into(),
+            ));
+        }
+        Ok(Self { revision, entries })
     }
 
-    /// Whether strict validation must reject this candidate.
+    /// Whether any requested setting was ignored, requiring strict validation to reject it.
     pub fn has_ignored(&self) -> bool {
         self.entries
             .iter()
             .any(|entry| matches!(entry.outcome, SettingOutcome::Ignored(_)))
     }
 
-    /// Resolution for a recognized setting.
+    /// Look up a setting's decoded request, effective value, and outcome.
+    ///
+    /// A freshly constructed report contains every key; `None` is possible if a
+    /// caller has subsequently removed an entry from the public `entries` field.
     pub fn get(&self, setting: SettingKey) -> Option<&SettingResolution> {
         self.entries.iter().find(|entry| entry.setting == setting)
     }

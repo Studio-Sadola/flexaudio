@@ -2296,6 +2296,8 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
 }
 
 /// Enumerate PipeWire selectors with provenance captured by this provider.
+/// IDs and discovery failures follow [`list_devices`]; node names are selectors,
+/// not a promise of unique or persistent native identities.
 pub fn list_devices_with_namespaces() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
     enumerate_pw().map_err(|error| error.with_context(ErrorContext::new(Operation::Enumerate)))
 }
@@ -2542,7 +2544,11 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
     }
 
     // Build DeviceInfo values from the collected raw nodes.
-    let state = state.borrow();
+    let devices = namespaced_devices(&state.borrow());
+    Ok(devices)
+}
+
+fn namespaced_devices(state: &EnumState) -> Vec<flexaudio_core::NamespacedDevice> {
     let mut out = Vec::with_capacity(state.nodes.len());
     for n in &state.nodes {
         let is_loopback = n.media_class == "Audio/Sink";
@@ -2575,7 +2581,7 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
             flexaudio_core::DeviceIdNamespace::PipeWireNodeName,
         ));
     }
-    Ok(out)
+    out
 }
 
 /// Extract `name` from PipeWire `default.audio.{sink,source}` metadata (JSON `{"name":"..."}`).
@@ -3148,6 +3154,72 @@ fn enqueue_event(events: &WatchEventQueue, ev: DeviceEvent) {
 mod tests {
     use super::*;
     use flexaudio_core::raw_ring::raw_ring;
+
+    #[test]
+    fn pipewire_enumeration_assigns_node_namespace_to_each_collected_node() {
+        let mut state = EnumState {
+            default_sink: Some("sink.selector".into()),
+            ..Default::default()
+        };
+        for (node_name, media_class) in [
+            ("sink.selector", "Audio/Sink"),
+            ("source.selector", "Audio/Source"),
+        ] {
+            state.nodes.push(NodeRecord {
+                node_name: node_name.into(),
+                description: "duplicate name".into(),
+                media_class: media_class.into(),
+                rate: Some(48_000),
+                channels: Some(2),
+            });
+        }
+        let entries = namespaced_devices(&state);
+        assert_eq!(entries.len(), 2);
+        for (entry, node) in entries.iter().zip(&state.nodes) {
+            assert_eq!(
+                entry.id_namespace,
+                flexaudio_core::DeviceIdNamespace::PipeWireNodeName
+            );
+            assert_eq!(entry.device.id, node.node_name);
+            assert_eq!(entry.device.name, "duplicate name");
+        }
+        assert_eq!(entries[0].device.source_kind, SourceKind::SystemLoopback);
+        assert!(entries[0].device.is_default);
+        assert_eq!(entries[1].device.source_kind, SourceKind::Mic);
+        assert!(!entries[1].device.is_default);
+    }
+
+    #[test]
+    fn linux_system_event_path_without_helpers_preserves_events_through_worker_stop() {
+        let mut backend = PwSystemBackend::new(false, None);
+        let events = backend.events.clone();
+        // Exercise the real owner's mailbox and join without PipeWire or devices.
+        backend.handle = Some(std::thread::spawn(move || {
+            push_backend_event(&events, Event::StreamStalled);
+            push_backend_event(
+                &events,
+                Event::TerminalError {
+                    error: Error::DeviceLost,
+                },
+            );
+        }));
+        backend.stop_checked().unwrap();
+        let events: Vec<_> = std::iter::from_fn(|| backend.poll_event()).collect();
+        // Exact equality both confirms the mailbox was exercised and rejects any
+        // invented helper event before, between, or after the ordinary events.
+        assert_eq!(
+            events,
+            [
+                Event::StreamStalled,
+                Event::TerminalError {
+                    error: Error::DeviceLost
+                }
+            ]
+        );
+        assert!(backend.poll_event().is_none());
+        backend.stop_checked().unwrap();
+        assert!(backend.poll_event().is_none());
+    }
 
     #[test]
     fn enumeration_missing_properties_omit_unidentifiable_entries() {

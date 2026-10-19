@@ -270,23 +270,54 @@ pub(super) fn stop_backend_reconciling_with_reason(
 
 /// Preserve only the additive helper notices of a rejected replacement. Its
 /// ordinary errors still follow the existing startup/rollback result path.
+/// The caller has already stopped the backend. If its mailbox exceeds the
+/// bounded drain or panics, close every forwarded attempt with StartupFailed;
+/// the rejected backend is discarded, so no later native stop can be forwarded.
 pub(super) fn drain_replacement_lifecycle(shared: &SharedState, be: &mut Box<dyn CaptureBackend>) {
-    for _ in 0..MAX_BACKEND_EVENTS_PER_TICK * MAX_FINAL_EVENT_BATCHES {
+    let mut pending_probe = 0usize;
+    let mut pending_keepalive = 0usize;
+    let limit = MAX_BACKEND_EVENTS_PER_TICK * MAX_FINAL_EVENT_BATCHES;
+    for index in 0..limit {
         match std::panic::catch_unwind(AssertUnwindSafe(|| be.poll_event())) {
-            Ok(Some(event)) if is_helper_lifecycle(&event) => shared.push_event(event),
+            Ok(Some(event)) if is_helper_lifecycle(&event) => {
+                match event {
+                    Event::SilenceProbeStarted => pending_probe += 1,
+                    Event::SilenceProbeStopped { .. } => {
+                        pending_probe = pending_probe.saturating_sub(1)
+                    }
+                    Event::ClassicLoopbackKeepaliveStarted => pending_keepalive += 1,
+                    Event::ClassicLoopbackKeepaliveStopped { .. } => {
+                        pending_keepalive = pending_keepalive.saturating_sub(1)
+                    }
+                    _ => {}
+                }
+                shared.push_event(event);
+            }
             Ok(Some(_)) => {}
-            Ok(None) => return,
+            Ok(None) => break,
             Err(_) => {
                 shared.record_cleanup(Error::Backend(
                     "replacement backend panicked during final event drain".into(),
                 ));
-                return;
+                break;
             }
         }
+        if index + 1 == limit {
+            shared.record_cleanup(Error::Backend(
+                "replacement backend event mailbox could not be reconciled".into(),
+            ));
+        }
     }
-    shared.record_cleanup(Error::Backend(
-        "replacement backend event mailbox could not be reconciled".into(),
-    ));
+    for _ in 0..pending_probe {
+        shared.push_event(Event::SilenceProbeStopped {
+            reason: flexaudio_core::HelperStopReason::StartupFailed,
+        });
+    }
+    for _ in 0..pending_keepalive {
+        shared.push_event(Event::ClassicLoopbackKeepaliveStopped {
+            reason: flexaudio_core::HelperStopReason::StartupFailed,
+        });
+    }
 }
 
 pub(crate) fn is_helper_lifecycle(event: &Event) -> bool {

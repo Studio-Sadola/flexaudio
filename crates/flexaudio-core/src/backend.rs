@@ -94,7 +94,8 @@ pub trait CaptureBackend: Send {
 
     /// Supply the reason for the next helper teardown before stopping capture.
     /// Existing custom backends need not implement helper lifecycle reporting.
-    #[doc(hidden)]
+    /// This default implementation does nothing. Backends owning helpers should
+    /// use the supplied reason for each helper's final stopped event.
     fn set_helper_stop_reason(&mut self, _reason: crate::HelperStopReason) {}
 
     /// Checked stop. External backends retain compatibility, but must override this

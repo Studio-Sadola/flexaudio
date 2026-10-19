@@ -322,6 +322,8 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
 }
 
 /// Enumerate CPAL microphone name selectors with their provider provenance.
+/// IDs and discovery failures follow [`list_devices`]; the namespace describes
+/// the selector domain and does not guarantee unique or persistent IDs.
 pub fn list_devices_with_namespaces() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
     let host = cpal_default_host(permission::Purpose::Enumeration)?;
 
@@ -337,31 +339,64 @@ pub fn list_devices_with_namespaces() -> Result<Vec<flexaudio_core::NamespacedDe
     for device in devices {
         // CPAL exposes no separate ID; an unreadable identity cannot be selected.
         let Ok(name) = device.name() else { continue };
-        let (sample_rate, channels, format_available) =
-            flexaudio_core::inventory::device_format(input_config::discover(
-                || {
-                    device.default_input_config().map_err(|error| {
-                        input_config::query_failure("query microphone input configuration", error)
-                    })
-                },
-                |config| (config.sample_rate().0, config.channels()),
-            ));
-        let is_default = default_name.as_deref() == Some(name.as_str());
-        out.push(flexaudio_core::NamespacedDevice::new(
-            DeviceInfo {
-                id: name.clone(),
-                name,
-                source_kind: SourceKind::Mic,
-                sample_rate,
-                channels,
-                format_available,
-                is_loopback: false,
-                is_default,
+        let format = input_config::discover(
+            || {
+                device.default_input_config().map_err(|error| {
+                    input_config::query_failure("query microphone input configuration", error)
+                })
             },
-            flexaudio_core::DeviceIdNamespace::CpalDeviceName,
-        ));
+            |config| (config.sample_rate().0, config.channels()),
+        );
+        out.push(microphone_device(name, format, default_name.as_deref()));
     }
     Ok(out)
+}
+
+fn microphone_device(
+    name: String,
+    format: Result<(u32, u16)>,
+    default_name: Option<&str>,
+) -> flexaudio_core::NamespacedDevice {
+    let (sample_rate, channels, format_available) =
+        flexaudio_core::inventory::device_format(format);
+    let is_default = default_name == Some(name.as_str());
+    flexaudio_core::NamespacedDevice::new(
+        DeviceInfo {
+            id: name.clone(),
+            name,
+            source_kind: SourceKind::Mic,
+            sample_rate,
+            channels,
+            format_available,
+            is_loopback: false,
+            is_default,
+        },
+        flexaudio_core::DeviceIdNamespace::CpalDeviceName,
+    )
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    #[test]
+    fn microphone_enumeration_assigns_cpal_namespace_to_duplicate_names() {
+        let entries = [Ok((44_100, 1)), Err(Error::DeviceLost)].map(|format| {
+            microphone_device("duplicate input".into(), format, Some("duplicate input"))
+        });
+        for entry in &entries {
+            assert_eq!(
+                entry.id_namespace,
+                flexaudio_core::DeviceIdNamespace::CpalDeviceName
+            );
+            assert_eq!(entry.device.id, "duplicate input");
+            assert_eq!(entry.device.name, "duplicate input");
+            assert_eq!(entry.device.source_kind, SourceKind::Mic);
+            assert!(entry.device.is_default);
+        }
+        assert!(entries[0].device.format_available);
+        assert!(!entries[1].device.format_available);
+    }
 }
 
 impl CaptureBackend for CpalMicBackend {

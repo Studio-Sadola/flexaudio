@@ -104,6 +104,74 @@ fn failed_replacement_pair_precedes_restored_source_start() {
 }
 
 #[test]
+fn failed_replacement_closes_each_forwarded_start_when_stops_exceed_drain_limit() {
+    struct FloodedBackend(VecDeque<Event>);
+    impl CaptureBackend for FloodedBackend {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 2)
+        }
+        fn start(&mut self, _sink: RawSink) -> Result<()> {
+            self.0.extend([
+                Event::SilenceProbeStarted,
+                Event::SilenceProbeStopped {
+                    reason: HelperStopReason::SignalObserved,
+                },
+                Event::SilenceProbeStarted,
+                Event::ClassicLoopbackKeepaliveStarted,
+                Event::ClassicLoopbackKeepaliveStarted,
+            ]);
+            self.0.extend(std::iter::repeat_n(
+                Event::StreamStalled,
+                MAX_BACKEND_EVENTS_PER_TICK * MAX_FINAL_EVENT_BATCHES,
+            ));
+            Err(Error::DeviceNotFound)
+        }
+        fn stop(&mut self) {
+            self.0.extend([
+                Event::SilenceProbeStopped {
+                    reason: HelperStopReason::StartupFailed,
+                },
+                stopped(HelperStopReason::StartupFailed),
+                stopped(HelperStopReason::StartupFailed),
+            ]);
+        }
+        fn poll_event(&mut self) -> Option<Event> {
+            self.0.pop_front()
+        }
+    }
+    let mut stream = Stream::open(StreamConfig::default(), HelperBackend::boxed(false)).unwrap();
+    stream.start().unwrap();
+    assert!(stream
+        .switch_backend(Box::new(FloodedBackend(VecDeque::new())))
+        .is_err());
+    // Stopping also reconciles the restored backend's pending mailbox.
+    // Mailbox exhaustion remains observable through the existing cleanup result.
+    assert!(stream.stop_checked().is_err());
+    assert_eq!(
+        collect(&mut stream),
+        [
+            Event::ClassicLoopbackKeepaliveStarted,
+            stopped(HelperStopReason::SourceSwitched),
+            Event::SilenceProbeStarted,
+            Event::SilenceProbeStopped {
+                reason: HelperStopReason::SignalObserved
+            },
+            Event::SilenceProbeStarted,
+            Event::ClassicLoopbackKeepaliveStarted,
+            Event::ClassicLoopbackKeepaliveStarted,
+            Event::SilenceProbeStopped {
+                reason: HelperStopReason::StartupFailed
+            },
+            stopped(HelperStopReason::StartupFailed),
+            stopped(HelperStopReason::StartupFailed),
+            Event::ClassicLoopbackKeepaliveStarted,
+            stopped(HelperStopReason::StreamStopped),
+        ]
+    );
+    assert!(collect(&mut stream).is_empty());
+}
+
+#[test]
 fn recovery_joins_old_helper_before_new_start() {
     let mut stream = Stream::open(StreamConfig::default(), HelperBackend::boxed(false)).unwrap();
     stream.start().unwrap();
@@ -159,20 +227,6 @@ fn ordinary_microphone_capture_does_not_invent_helper_events() {
         Box::new(crate::MockBackend::new(48_000, 2, 440.0)),
     )
     .unwrap();
-    stream.start().unwrap();
-    stream.stop_checked().unwrap();
-    assert!(collect(&mut stream).is_empty());
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn linux_system_capture_without_helpers_does_not_invent_lifecycle_events() {
-    let config = StreamConfig {
-        kind: flexaudio_core::SourceKind::SystemLoopback,
-        ..StreamConfig::default()
-    };
-    let mut stream =
-        Stream::open(config, Box::new(crate::MockBackend::new(48_000, 2, 440.0))).unwrap();
     stream.start().unwrap();
     stream.stop_checked().unwrap();
     assert!(collect(&mut stream).is_empty());

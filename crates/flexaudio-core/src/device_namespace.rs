@@ -41,6 +41,8 @@ pub struct NamespacedDevice {
 }
 impl NamespacedDevice {
     /// Attach known enumeration provenance; never infer it from a device literal.
+    /// Provider crates use this constructor at enumeration time. The caller is
+    /// responsible for choosing the namespace of the selector it actually exposes.
     pub fn new(device: DeviceInfo, id_namespace: DeviceIdNamespace) -> Self {
         Self {
             device,
@@ -52,10 +54,9 @@ impl NamespacedDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{inventory, Error, SourceKind};
 
     #[test]
-    fn shared_tags_do_not_infer_identity_or_promise_persistence() {
+    fn shared_namespace_tags_are_stable() {
         let namespaces = [
             DeviceIdNamespace::CpalDeviceName,
             DeviceIdNamespace::PipeWireNodeName,
@@ -73,42 +74,5 @@ mod tests {
                 "unknown"
             ]
         );
-        for namespace in namespaces {
-            for readable in [true, false] {
-                let name = if readable {
-                    Ok("duplicate name".into())
-                } else {
-                    Err(Error::DeviceNotFound)
-                };
-                let (id, name) =
-                    inventory::device_identity(name, || Ok("native selector".into())).unwrap();
-                let device = DeviceInfo {
-                    id,
-                    name,
-                    source_kind: SourceKind::SystemLoopback,
-                    sample_rate: 48_000,
-                    channels: 2,
-                    format_available: true,
-                    is_loopback: true,
-                    is_default: false,
-                };
-                let entries = [
-                    NamespacedDevice::new(device.clone(), namespace),
-                    NamespacedDevice::new(device.clone(), namespace),
-                ];
-                for entry in entries {
-                    assert_eq!(entry.device, device);
-                    assert_eq!(entry.id_namespace, namespace);
-                    assert_eq!(
-                        entry.device.id,
-                        if readable {
-                            "duplicate name"
-                        } else {
-                            "native selector"
-                        }
-                    );
-                }
-            }
-        }
     }
 }

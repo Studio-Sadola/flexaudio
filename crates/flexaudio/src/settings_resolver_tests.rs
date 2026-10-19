@@ -1,6 +1,7 @@
 //! Exhaustive static applicability checks without platform/device dependencies.
 
-use crate::types::ProcessMode;
+use crate::settings_resolver::*;
+use crate::ProcessMode;
 use crate::*;
 
 fn requested(r: &mut SettingsRequest, key: SettingKey) {
@@ -216,7 +217,8 @@ fn switch_defaults_compare_with_defaults_and_retain_fixed_values() {
         report.get(SettingKey::Denoise).unwrap().outcome,
         SettingOutcome::Applied
     );
-    let exhausted = SettingsReport::new(u64::MAX, Vec::new());
+    let mut exhausted = initial.clone();
+    exhausted.revision = u64::MAX;
     assert_eq!(
         resolve_settings(&r, SettingsPlatform::Linux, 100, Some(&exhausted))
             .unwrap_err()

@@ -1,8 +1,7 @@
 //! Facade settings preflight, before constructing any native backend.
 
-use crate::{
-    Error, OpenOptions, Result, SettingsPlatform, SettingsReport, SettingsRequest, StreamConfig,
-};
+use crate::settings_resolver::{resolve_settings, SettingsPlatform, SettingsRequest};
+use crate::{Error, OpenOptions, Result, SettingsReport, StreamConfig};
 
 pub(crate) fn preflight(
     config: &StreamConfig,
@@ -26,7 +25,7 @@ pub(crate) fn preflight(
                 _ => None,
             });
     }
-    let report = crate::resolve_settings(
+    let report = resolve_settings(
         &request,
         SettingsPlatform::current(),
         std::process::id(),
