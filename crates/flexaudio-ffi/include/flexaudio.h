@@ -273,7 +273,7 @@ typedef enum FlexValueKindV4 {
 // Owned immutable platform snapshot. Accessor views and errors live until capabilities_free_v1.
 typedef struct FlexCapabilitiesV1 FlexCapabilitiesV1;
 
-// Opaque noise suppression handle containing [`flexaudio_denoise::Denoiser`].
+// Opaque noise suppression handle (`FlexDenoiser`).
 // Create it with `flexaudio_denoise_new` and release it with `flexaudio_denoise_free`.
 typedef struct FlexDenoiser FlexDenoiser;
 
@@ -304,7 +304,7 @@ typedef struct FlexSettingsV4 FlexSettingsV4;
 // Owned completed shutdown report; all child pointers are borrowed.
 typedef struct FlexShutdownReportV2 FlexShutdownReportV2;
 
-// Opaque handle for a recording stream. It contains [`flexaudio::Stream`] and any enabled
+// Opaque recording stream handle (`FlexStream`) with any enabled
 // addons (denoise / VAD); C code holds only a pointer. Create with `flexaudio_open` and
 // release with `flexaudio_free`.
 //
@@ -319,7 +319,7 @@ typedef struct FlexVad FlexVad;
 // Opaque probability-only segmentation owner.
 typedef struct FlexVadPostProcessor FlexVadPostProcessor;
 
-// Opaque device watcher handle containing [`flexaudio::DeviceWatcher`]. Create with
+// Opaque device watcher handle (`FlexWatcher`). Create with
 // `flexaudio_watch_devices` and release with `flexaudio_watcher_free`.
 typedef struct FlexWatcher FlexWatcher;
 
@@ -390,7 +390,7 @@ typedef struct FlexChunk {
     int64_t pts_ns;
     // Monotonically increasing sequence number assigned by the stream layer.
     uint64_t seq;
-    // Chunk state flags (ChunkFlags bits).
+    // Chunk state flags (unsigned 32-bit bitmask).
     uint32_t flags;
     // Number of chunks dropped before this chunk arrived.
     uint32_t dropped_before;
@@ -414,7 +414,7 @@ typedef struct FlexEvent {
     int64_t count;
 } FlexEvent;
 
-// Information for one enumerated device (corresponds to [`flexaudio::DeviceInfo`]).
+// Information for one enumerated device (`FlexDeviceInfo`).
 //
 // `id` / `name` are flexaudio-owned, NUL-terminated UTF-8 strings. Release the entire array with
 // `flexaudio_devices_free` (do not use C `free`). Unknown names are empty strings;
@@ -424,7 +424,7 @@ typedef struct FlexEvent {
 // name states. macOS omits unreadable output direction from discovery; the typed
 // direction cause is returned for the requested device. Explicit-output scans skip
 // vanished or unrelated unreadable devices. If the requested device's direction query
-// fails and neither its name nor UID is readable, open returns DeviceNotFound because
+// fails and neither its name nor UID is readable, open returns FLEX_DEVICE_NOT_FOUND because
 // it cannot be matched. Unreadable default queries leave is_default=false.
 typedef struct FlexDeviceInfo {
     // Selectable ID (released by `flexaudio_devices_free`).
@@ -443,9 +443,9 @@ typedef struct FlexDeviceInfo {
     bool is_default;
 } FlexDeviceInfo;
 
-// Information for one enumerated process (corresponds to [`flexaudio::ProcessInfo`]).
+// Information for one enumerated process (`FlexProcessInfo`).
 //
-// Pass `pid` to `FlexConfig::process_id` to capture that process. Strings are flexaudio-owned,
+// Pass `pid` to `FlexConfig.process_id` to capture that process. Strings are flexaudio-owned,
 // NUL-terminated UTF-8 and released with the entire array by `flexaudio_processes_free` (do not use C `free`).
 // `executable` / `bundle_id` are NULL when unavailable.
 typedef struct FlexProcessInfo {
@@ -808,7 +808,7 @@ typedef struct FlexChunkV2 {
 typedef struct FlexDeviceEvent {
     // Event kind.
     int32_t kind;
-    // Selectable ID (= DeviceInfo::id; valid for `Added`/`Removed`/`DefaultChanged`; release with
+    // Selectable ID (= FlexDeviceInfo.id; valid for `Added`/`Removed`/`DefaultChanged`; release with
     // `flexaudio_device_event_free`). NULL for `Unknown`.
     char *id;
     // Display name (`Added` only; release with `flexaudio_device_event_free`). NULL for other kinds.
@@ -1046,7 +1046,7 @@ int32_t flexaudio_terminal_error(const struct FlexStream *s);
 // On macOS, enumeration never prompts. With undecided microphone consent it returns
 // a typed Backend error before any HAL/device/format query. Grant the responsible
 // host access or use the bounded capture-open consent flow, then retry enumeration.
-// Denied/restricted consent returns a permission error. Unreadable mandatory DeviceInfo formats
+// Denied/restricted consent returns a permission error. Unreadable mandatory FlexDeviceInfo formats
 // use format_available=false and the 0/0 sentinel; other entries remain usable.
 // Windows enumeration does not preflight microphone permission; native enumeration
 // proceeds. Microphone capture retains its separate existing permission preflight.
@@ -1242,7 +1242,7 @@ struct FlexFlac *flexaudio_flac_create(const char *path,
 // Append interleaved f32 (length = frame count × channel count).
 //
 // `len` must be a multiple of the channel count (otherwise InvalidArg). `len=0` is a no-op.
-// Writing to a finalized handle returns [`FLEX_INVALID_STATE`](code::FLEX_INVALID_STATE).
+// Writing to a finalized handle returns `FLEX_INVALID_STATE`.
 // Returns 0 on success and a negative value on error.
 //
 // # Safety
@@ -1263,8 +1263,8 @@ int32_t flexaudio_flac_finalize(struct FlexFlac *f);
 
 // Release a FLAC handle. NULL-safe.
 //
-// If freed without finalize, the internal [`FlacWriter`] still makes a best-effort attempt to
-// write remaining data and finalize the header on drop (errors are swallowed; call
+// If freed without finalize, `FlexFlac` still makes a best-effort attempt to
+// write remaining data and finalize the header on release (errors are swallowed; call
 // `flexaudio_flac_finalize` first to detect them reliably).
 //
 // # Safety

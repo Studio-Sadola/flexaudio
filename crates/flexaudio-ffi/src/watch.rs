@@ -20,7 +20,7 @@ use crate::error::{clear_last_error, code, set_last_error};
 use crate::types::FlexSourceKind;
 use crate::{guard_i32, guard_ptr};
 
-/// Device connection event kind (corresponds to [`flexaudio::DeviceEvent`]).
+/// Device connection event kind (`FlexDeviceEventKind`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlexDeviceEventKind {
@@ -48,7 +48,7 @@ pub enum FlexDeviceEventKind {
 pub struct FlexDeviceEvent {
     /// Event kind.
     pub kind: i32,
-    /// Selectable ID (= DeviceInfo::id; valid for `Added`/`Removed`/`DefaultChanged`; release with
+    /// Selectable ID (= FlexDeviceInfo.id; valid for `Added`/`Removed`/`DefaultChanged`; release with
     /// `flexaudio_device_event_free`). NULL for `Unknown`.
     pub id: *mut c_char,
     /// Display name (`Added` only; release with `flexaudio_device_event_free`). NULL for other kinds.
@@ -129,7 +129,7 @@ fn device_event_to_c(ev: DeviceEvent) -> FlexDeviceEvent {
     }
 }
 
-/// Opaque device watcher handle containing [`flexaudio::DeviceWatcher`]. Create with
+/// Opaque device watcher handle (`FlexWatcher`). Create with
 /// `flexaudio_watch_devices` and release with `flexaudio_watcher_free`.
 pub struct FlexWatcher {
     pub(crate) inner: DeviceWatcher,

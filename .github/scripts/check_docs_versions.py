@@ -1,10 +1,14 @@
 """Check tracked installation examples and registry links using the standard library.
 
-Historical version references are allowed only in CHANGELOG.md, under an ATX
-heading named exactly History or Migration (including its subsections), or on a
-line containing the whole word history, since, previously, or the phrase
-migration from (case insensitive). Fenced examples do not create headings.
-Historical exemptions never excuse broken relative registry links.
+Historical install examples are allowed only under ATX headings whose entire
+title is History or Migration (case insensitive, optional whitespace-separated
+closing hashes),
+including subsections until an equal or higher heading, or in CHANGELOG.md
+release sections (level-two numeric [X.Y.Z] headings, optionally prefixed v).
+Other version prose may also use explicit historical line markers. Fenced
+examples do not create headings. Registry repository URLs always require the
+release tag, including homepage links: a tagged tree is the versioned homepage.
+Historical exemptions never excuse registry link failures.
 """
 
 from __future__ import annotations
@@ -35,24 +39,26 @@ class Finding:
 PACKAGE = r"flexaudio(?:-[a-z0-9-]+)?"
 PACKAGE_START = r"(?<![\w-])"
 VERSION = r"[0-9]+\.[0-9]+(?:\.[0-9]+)?"
-HISTORY = re.compile(r"\b(?:history|since|previously|migration\s+from)\b", re.I)
-HEADING = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
+HISTORY = re.compile(rf"\b(?:history:|since\s+v?{VERSION}\b|previously:|migration\s+from\s+v?{VERSION}\b)", re.I)
+HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$")
+RELEASE_HEADING = re.compile(r"\[v?[0-9]+\.[0-9]+\.[0-9]+\](?:\s+-\s+\S.*)?", re.I)
 VERSION_REFERENCES = (
     re.compile(rf"{PACKAGE_START}[\"']?{PACKAGE}[\"']?\s*=\s*[\"']([^\"']+)[\"']"),
     re.compile(rf"{PACKAGE_START}[\"']?{PACKAGE}[\"']?\s*=\s*\{{[^}}]*?\bversion\s*=\s*[\"']([^\"']+)[\"']", re.S),
-    re.compile(r"\bPin\s+to\s+`([^`]+)`", re.I),
+    re.compile(r"\bPin\s+to\s+(?:>\s*)?`([^`]+)`", re.I),
     re.compile(rf"^[ \t]*(?:[>*/#]+\s*)?(?:flexaudio\s+)?Version\s+v?({VERSION})\b", re.I | re.M),
 )
 PIP_COMMAND = re.compile(r"\bpip(?:3)?\s+install\b[^\n]*")
 PIP_PIN = re.compile(rf"{PACKAGE_START}flexaudio(?:\[[^\]]+\])?\s*((?:(?:===|==|~=|>=|<=|!=|>|<)\s*[^\s`\"',;]+\s*,?\s*)+)")
 INSTALL_COMMANDS = (
     (re.compile(r"\bcargo\s+add\b[^\n]*"), re.compile(rf"{PACKAGE_START}{PACKAGE}@([^\s`\"']+)")),
-    (re.compile(r"\bnpm\s+(?:install|i)\b[^\n]*"),
+    (re.compile(r"\b(?:npm|yarn|pnpm)\s+(?:install|add|i)\b[^\n]*"),
      re.compile(rf"@studio-sadola/{PACKAGE}@([^\s`\"']+)")),
     (PIP_COMMAND, PIP_PIN),
 )
-GITHUB_REF = re.compile(
-    r"https?://github\.com/Studio-Sadola/flexaudio/(?:blob|tree)/([^/\s)#?]+)", re.I
+REPOSITORY_URL = re.compile(
+    r"https?://(?:github\.com|raw\.githubusercontent\.com)/Studio-Sadola/flexaudio"
+    r"(?=$|[/#?\s)\]>\"'`])[^\s)\]>\"'`]*", re.I
 )
 # Inline/image links, reference definitions, autolinks, and HTML links/images.
 LINK = re.compile(
@@ -86,7 +92,7 @@ def tracked_documentation(repo_root: Path) -> list[str]:
                    if path and documentation_path(path)})
 
 
-def historical_lines(lines: list[str]) -> set[int]:
+def historical_lines(lines: list[str], *, changelog: bool = False) -> set[int]:
     result: set[int] = set()
     sections: list[tuple[int, bool]] = []
     fence: str | None = None
@@ -103,8 +109,10 @@ def historical_lines(lines: list[str]) -> set[int]:
             level = len(heading.group(1))
             while sections and sections[-1][0] >= level:
                 sections.pop()
-            sections.append((level, heading.group(2).casefold() in {"history", "migration"}))
-        if any(historical for _, historical in sections) or HISTORY.search(line):
+            title = heading.group(2)
+            sections.append((level, title.casefold() in {"history", "migration"}
+                             or (changelog and level == 2 and RELEASE_HEADING.fullmatch(title) is not None)))
+        if any(historical for _, historical in sections):
             result.add(number)
     return result
 
@@ -130,37 +138,62 @@ def current_requirement(requirement: str, version: str, *, pip: bool = False) ->
     return has_current
 
 
+def join_shell_lines(content: str) -> tuple[str, list[int]]:
+    """Remove shell continuations, mapping each retained character to its source."""
+    chunks: list[str] = []
+    offsets: list[int] = []
+    start = 0
+    for match in re.finditer(r"\\\r?\n", content):
+        chunks.append(content[start:match.start()])
+        offsets.extend(range(start, match.start()))
+        start = match.end()
+    chunks.append(content[start:])
+    offsets.extend(range(start, len(content)))
+    return "".join(chunks), offsets
+
+
 def check_document(path: str, content: str, version: str) -> list[Finding]:
     lines = content.splitlines()
-    historical = historical_lines(lines)
+    historical = historical_lines(lines, changelog=Path(path).name == "CHANGELOG.md")
+    logical, offsets = join_shell_lines(content)
     findings: list[Finding] = []
     seen: set[tuple[int, str]] = set()
-    changelog = Path(path).name == "CHANGELOG.md"
 
     def report(number: int, reason: str) -> None:
         if (number, reason) not in seen:
             seen.add((number, reason))
             findings.append(Finding(path, number, reason, lines[number - 1]))
 
-    def check_match(offset: int, requirement: str, *, pip: bool = False) -> None:
-        number = content.count("\n", 0, offset) + 1
-        if not changelog and number not in historical and not current_requirement(requirement, version, pip=pip):
+    def check_match(offset: int, requirement: str, *, pip: bool = False, install: bool = False) -> None:
+        number = content.count("\n", 0, offsets[offset]) + 1
+        exempt = number in historical or (not install and HISTORY.search(lines[number - 1]) is not None)
+        if not exempt and not current_requirement(requirement, version, pip=pip):
             report(number, f"version reference must match {version} or {version.rsplit('.', 1)[0]}")
 
-    for pattern in VERSION_REFERENCES:
-        for match in pattern.finditer(content):
-            check_match(match.start(1), match.group(1))
+    for index, pattern in enumerate(VERSION_REFERENCES):
+        for match in pattern.finditer(logical):
+            check_match(match.start(1), match.group(1), install=index < 2)
     for command_pattern, pin_pattern in INSTALL_COMMANDS:
-        for command in command_pattern.finditer(content):
+        for command in command_pattern.finditer(logical):
             for pin in pin_pattern.finditer(command.group()):
-                check_match(command.start() + pin.start(1), pin.group(1), pip=pin_pattern is PIP_PIN)
+                check_match(command.start() + pin.start(1), pin.group(1), pip=pin_pattern is PIP_PIN, install=True)
 
     parts = Path(path).parts
     registry = len(parts) == 3 and parts[0] in {"crates", "bindings"} and parts[2] in {"README.md", "README.ja.md"}
     if registry:
-        for match in GITHUB_REF.finditer(content):
+        for match in REPOSITORY_URL.finditer(content):
             number = content.count("\n", 0, match.start()) + 1
-            if number not in historical and match.group(1) != f"v{version}":
+            url = urlsplit(match.group())
+            path_parts = unquote(url.path).strip("/").split("/")[2:]
+            if url.netloc.casefold() == "raw.githubusercontent.com":
+                ref = path_parts[0] if path_parts else None
+            elif len(path_parts) >= 2 and path_parts[0] in {"blob", "tree", "raw"}:
+                ref = path_parts[1]
+            elif len(path_parts) >= 3 and path_parts[:2] == ["releases", "tag"]:
+                ref = path_parts[2]
+            else:
+                ref = None
+            if ref != f"v{version}":
                 report(number, f"repository link must use v{version}")
         package = "/".join(parts[:2])
         for match in LINK.finditer(content):

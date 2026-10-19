@@ -5,7 +5,7 @@
 
 use std::os::raw::c_char;
 
-/// Audio source kind to record (corresponds to [`flexaudio::SourceKind`]).
+/// Audio source kind to record (`FlexSourceKind`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlexSourceKind {
@@ -19,7 +19,7 @@ pub enum FlexSourceKind {
     Mix = 3,
 }
 
-/// Whether to include or exclude the target PID for process sources (corresponds to [`flexaudio::ProcessMode`]).
+/// Whether to include or exclude the target PID for process sources (`FlexProcessMode`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlexProcessMode {
@@ -98,7 +98,7 @@ pub struct FlexChunk {
     pub pts_ns: i64,
     /// Monotonically increasing sequence number assigned by the stream layer.
     pub seq: u64,
-    /// Chunk state flags (ChunkFlags bits).
+    /// Chunk state flags (unsigned 32-bit bitmask).
     pub flags: u32,
     /// Number of chunks dropped before this chunk arrived.
     pub dropped_before: u32,
@@ -108,11 +108,11 @@ pub struct FlexChunk {
     pub rms: f32,
 }
 
-/// Stream event kind (corresponds to [`flexaudio::Event`]).
+/// Stream event kind (`FlexEventKind`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlexEventKind {
-    /// Chunks were dropped because the chunk ring was full (count in `FlexEvent::count`).
+    /// Chunks were dropped because the chunk ring was full (count in `FlexEvent.count`).
     ChunkDropped = 0,
     /// Data stopped arriving and the stream stalled.
     Stalled = 1,
@@ -153,7 +153,7 @@ pub struct FlexEvent {
     pub count: i64,
 }
 
-/// Information for one enumerated device (corresponds to [`flexaudio::DeviceInfo`]).
+/// Information for one enumerated device (`FlexDeviceInfo`).
 ///
 /// `id` / `name` are flexaudio-owned, NUL-terminated UTF-8 strings. Release the entire array with
 /// `flexaudio_devices_free` (do not use C `free`). Unknown names are empty strings;
@@ -163,7 +163,7 @@ pub struct FlexEvent {
 /// name states. macOS omits unreadable output direction from discovery; the typed
 /// direction cause is returned for the requested device. Explicit-output scans skip
 /// vanished or unrelated unreadable devices. If the requested device's direction query
-/// fails and neither its name nor UID is readable, open returns DeviceNotFound because
+/// fails and neither its name nor UID is readable, open returns FLEX_DEVICE_NOT_FOUND because
 /// it cannot be matched. Unreadable default queries leave is_default=false.
 #[repr(C)]
 pub struct FlexDeviceInfo {
@@ -183,9 +183,9 @@ pub struct FlexDeviceInfo {
     pub is_default: bool,
 }
 
-/// Whether the process is currently outputting audio (corresponds to [`flexaudio::ProcessInfo::is_output_active`]).
+/// Whether the process is currently outputting audio (`FlexProcessInfo.output_activity`).
 ///
-/// `Unknown` when the OS does not expose this state (Rust `None`).
+/// `FLEX_OUTPUT_ACTIVITY_UNKNOWN` when the OS does not expose this state.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlexOutputActivity {
@@ -198,9 +198,9 @@ pub enum FlexOutputActivity {
     Active = 2,
 }
 
-/// Information for one enumerated process (corresponds to [`flexaudio::ProcessInfo`]).
+/// Information for one enumerated process (`FlexProcessInfo`).
 ///
-/// Pass `pid` to `FlexConfig::process_id` to capture that process. Strings are flexaudio-owned,
+/// Pass `pid` to `FlexConfig.process_id` to capture that process. Strings are flexaudio-owned,
 /// NUL-terminated UTF-8 and released with the entire array by `flexaudio_processes_free` (do not use C `free`).
 /// `executable` / `bundle_id` are NULL when unavailable.
 #[repr(C)]
@@ -217,7 +217,7 @@ pub struct FlexProcessInfo {
     pub output_activity: i32,
 }
 
-/// Opaque handle for a recording stream. It contains [`flexaudio::Stream`] and any enabled
+/// Opaque recording stream handle (`FlexStream`) with any enabled
 /// addons (denoise / VAD); C code holds only a pointer. Create with `flexaudio_open` and
 /// release with `flexaudio_free`.
 ///

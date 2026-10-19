@@ -18,7 +18,7 @@ use crate::convert::{valid_array, valid_pointer};
 use crate::error::{clear_last_error, code, set_audio_error};
 use crate::{guard_i32, guard_ptr};
 
-/// Opaque noise suppression handle containing [`flexaudio_denoise::Denoiser`].
+/// Opaque noise suppression handle (`FlexDenoiser`).
 /// Create it with `flexaudio_denoise_new` and release it with `flexaudio_denoise_free`.
 pub struct FlexDenoiser {
     pub(crate) inner: Denoiser,

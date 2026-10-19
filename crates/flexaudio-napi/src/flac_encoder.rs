@@ -197,8 +197,8 @@ impl RotatingFlacEncoder {
 
     /// Write out the remainder, finalize the header, and close the open file. Safe to call repeatedly
     /// after success (subsequent calls are no-ops); failures remain errors on every subsequent call.
-    /// Dropping without calling this still closes through `FlacWriter`'s
-    /// best-effort Drop, but call this to detect write errors.
+    /// Releasing `FlacEncoder` without calling this still makes a
+    /// best-effort attempt to close the file, but call `finalize()` to detect write errors.
     pub(super) fn finalize(&mut self) -> Result<()> {
         if matches!(self.state, FlacEncoderState::Finalized) {
             return Ok(());

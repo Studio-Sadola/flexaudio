@@ -650,7 +650,7 @@ fn encode_err(err: flac_encoder::EncoderError) -> NapiError {
 // JS data types (`#[napi(object)]` converts to/from plain JS objects)
 // ---------------------------------------------------------------------------
 
-/// JS DeviceInfo. `sourceKind` is a string ("mic"|"system"|"process").
+/// JS device information (`JsDeviceInfo`). `sourceKind` is a string ("mic"|"system"|"process").
 #[napi(object)]
 pub struct JsDeviceInfo {
     pub id: String,
@@ -663,7 +663,7 @@ pub struct JsDeviceInfo {
     pub is_default: bool,
 }
 
-/// JS ProcessInfo (an element of `processes()`). A candidate for per-process capture.
+/// JS process information (`JsProcessInfo`, an element of `processes()`). A candidate for per-process capture.
 ///
 /// Pass `pid` to `openStream({ kind: 'process', processId: pid })` to record that process.
 /// `name` / `executable` / `bundleId` are for display (including self-reported app values);
@@ -683,8 +683,8 @@ pub struct JsProcessInfo {
     pub is_output_active: Option<bool>,
 }
 
-/// JS AudioChunk. `data` is interleaved f32 (len = frames * channels).
-/// `seq` (u64) uses BigInt to avoid precision loss. `flags` contains ChunkFlags bits (u32).
+/// JS audio chunk (`JsAudioChunk`). `data` is interleaved f32 (len = frames * channels).
+/// `seq` (u64) uses BigInt to avoid precision loss. `flags` is an unsigned 32-bit bitmask.
 ///
 /// Delivery shape (0.3.0): `onChunk` in `openStream(options, onChunk)` receives **one argument**
 /// (this primary chunk). Secondary tap (`secondaryOutput`) chunks arrive in the primary chunk's
@@ -1407,7 +1407,7 @@ impl PairingBridge {
     }
 }
 
-/// Recording stream handle. Internally, the bridge thread owns and polls `flexaudio::Stream`
+/// Recording stream handle (`FlexStream`). Internally, the bridge thread polls captured audio
 /// and sends chunks/events to JS through TSFN.
 #[napi]
 pub struct FlexStream {
@@ -1845,10 +1845,10 @@ impl FlexStream {
 
     /// Hot-swap the input source (mic/system/process) without stopping recording.
     ///
-    /// Request a switch to the `StreamConfig` built from `options` on the bridge thread and return
-    /// the result synchronously (`Ok` on success, exception on failure). The output format (`outputRate`/
+    /// Request a switch using `OpenOptions` on the bridge thread and return
+    /// synchronously (`undefined` on success, exception on failure). The output format (`outputRate`/
     /// `outputChannels`) cannot change during a switch (it would change frames in a continuous stream).
-    /// Requesting a change makes `switch_source` return InvalidArg, thrown here as an exception. Chunk
+    /// Requesting a format change makes `switchSource` throw InvalidArg. Chunk
     /// `seq` stays continuous across switches; the first chunk afterward has the DISCONTINUITY flag.
     /// An explicit `options.windowsClassicLoopbackKeepalive` replaces the current value;
     /// omission retains it. `options.denoise` and `options.vad` are ignored;
@@ -2105,7 +2105,7 @@ impl Drop for FlexStream {
 // DeviceWatcherHandle (class)
 // ---------------------------------------------------------------------------
 
-/// Device attachment/removal watcher handle. The bridge thread polls `DeviceWatcher`.
+/// Device attachment/removal watcher handle (`DeviceWatcherHandle`).
 #[napi]
 pub struct DeviceWatcherHandle {
     stop_flag: Arc<AtomicBool>,
@@ -2615,9 +2615,9 @@ impl FlacEncoder {
 /// Offline noise suppressor (RNNoise via nnnoiseless, embedded weights). **Requires 48kHz**;
 /// intended to reduce steady noise in microphone recordings (fans, air conditioning, typing, etc.).
 ///
-/// Fixed latency of [`FRAME_SIZE`](flexaudio_denoise::FRAME_SIZE) (10ms at 48kHz). Output is
+/// Fixed latency of 480 samples per channel (10ms at 48kHz). Output is
 /// the input delayed by one frame. The first frame is silence padding;
-/// retrieve the remaining trailing frame with [`Denoiser::flush`].
+/// retrieve the remaining trailing frame with `Denoiser.flush()`.
 #[napi]
 pub struct Denoiser {
     inner: CoreDenoiser,

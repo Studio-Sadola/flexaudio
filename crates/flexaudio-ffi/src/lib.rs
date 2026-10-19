@@ -801,7 +801,7 @@ pub unsafe extern "C" fn flexaudio_terminal_error(s: *const FlexStream) -> i32 {
 /// On macOS, enumeration never prompts. With undecided microphone consent it returns
 /// a typed Backend error before any HAL/device/format query. Grant the responsible
 /// host access or use the bounded capture-open consent flow, then retry enumeration.
-/// Denied/restricted consent returns a permission error. Unreadable mandatory DeviceInfo formats
+/// Denied/restricted consent returns a permission error. Unreadable mandatory FlexDeviceInfo formats
 /// use format_available=false and the 0/0 sentinel; other entries remain usable.
 /// Windows enumeration does not preflight microphone permission; native enumeration
 /// proceeds. Microphone capture retains its separate existing permission preflight.

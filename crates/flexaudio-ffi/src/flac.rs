@@ -279,7 +279,7 @@ pub unsafe extern "C" fn flexaudio_flac_create(
 /// Append interleaved f32 (length = frame count × channel count).
 ///
 /// `len` must be a multiple of the channel count (otherwise InvalidArg). `len=0` is a no-op.
-/// Writing to a finalized handle returns [`FLEX_INVALID_STATE`](code::FLEX_INVALID_STATE).
+/// Writing to a finalized handle returns `FLEX_INVALID_STATE`.
 /// Returns 0 on success and a negative value on error.
 ///
 /// # Safety
@@ -349,8 +349,8 @@ pub unsafe extern "C" fn flexaudio_flac_finalize(f: *mut FlexFlac) -> i32 {
 
 /// Release a FLAC handle. NULL-safe.
 ///
-/// If freed without finalize, the internal [`FlacWriter`] still makes a best-effort attempt to
-/// write remaining data and finalize the header on drop (errors are swallowed; call
+/// If freed without finalize, `FlexFlac` still makes a best-effort attempt to
+/// write remaining data and finalize the header on release (errors are swallowed; call
 /// `flexaudio_flac_finalize` first to detect them reliably).
 ///
 /// # Safety
