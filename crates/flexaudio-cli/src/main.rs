@@ -13,7 +13,22 @@
 //! ```text
 //! flexaudio-cli --source mic --seconds 5 --out mic.wav
 //! flexaudio-cli --source system --output-rate 16000 --output-channels 1 --out 16k.wav --seconds 3
+//! flexaudio-cli --source mic --strict --settings-json --denoise --ring-capacity-chunks 100
+//! flexaudio-cli --source system --lifecycle-events --out - --seconds 0
+//! flexaudio-cli --list-devices-json
 //! ```
+//!
+//! `--settings-json` writes one compact report per successful open or scheduled switch to stderr.
+//! With `--strict`, ignored non-default settings instead emit the candidate report and fail.
+//! `--lifecycle-events` writes helper start/stop JSON lines to stderr, including shutdown events;
+//! without it helper lifecycle events are silent. JSON uses shared lower-camel tags and escaped
+//! strings. Device JSON is an array of `{device, idNamespace}` entries on stdout. Namespace tags
+//! identify the provider's selector domain and do not guarantee persistent device IDs.
+//! Ring capacity defaults to 50 and must be a positive native-sized integer. Denoise defaults to
+//! false and runs in the canonical capture format before output conversion. On source switches,
+//! non-default gain and ring-capacity requests are fixed-at-open settings and strict mode rejects
+//! them. Chunk arrival time is diagnostic; the frame index defines the audio timeline. WAV and
+//! raw PCM formats are unchanged.
 //!
 //! Select a device with `--device-id <ID>` (copy the ID from `--list-devices`). For mic, this
 //! selects an input device; for system, an output endpoint. Omit it to use the default (mic=default
@@ -78,6 +93,11 @@ use flexaudio::{ProcessMode, Stream};
 mod capabilities_json;
 mod capture_events;
 mod device_events;
+mod devices_json;
+mod lifecycle_json;
+#[cfg(test)]
+mod options_tests;
+mod settings_json;
 use capture_events::drain_capture_events;
 #[cfg(test)]
 use capture_events::report_capture_event;
@@ -133,6 +153,30 @@ struct Cli {
     /// Print the capability snapshot as pretty JSON and exit without opening capture.
     #[arg(long)]
     capabilities: bool,
+
+    /// Reject non-default capture settings that would be ignored (also on scheduled switches).
+    #[arg(long)]
+    strict: bool,
+
+    /// Emit settings JSON to stderr after open/switch, or on strict rejection (then fail).
+    #[arg(long)]
+    settings_json: bool,
+
+    /// Emit ordered helper lifecycle JSON lines to stderr, including events during shutdown.
+    #[arg(long)]
+    lifecycle_events: bool,
+
+    /// List devices as JSON including provider idNamespace, then exit without recording.
+    #[arg(long, conflicts_with = "list_devices")]
+    list_devices_json: bool,
+
+    /// Bounded output queue capacity in chunks; positive integer, fixed when opened.
+    #[arg(long, default_value = "50", value_parser = parse_ring_capacity)]
+    ring_capacity_chunks: usize,
+
+    /// Enable canonical capture noise suppression before capture starts.
+    #[arg(long)]
+    denoise: bool,
 
     /// Disable the silent-render keepalive for Windows classic system loopback only.
     /// An idle endpoint then delivers no packets and may repeatedly report stalls.
@@ -281,6 +325,7 @@ impl Cli {
 
     fn open_options(&self) -> flexaudio::OpenOptions {
         flexaudio::OpenOptions::new()
+            .strict(self.strict)
             .windows_classic_loopback_keepalive(!self.no_classic_loopback_keepalive)
     }
 
@@ -291,6 +336,17 @@ impl Cli {
             channels: self.output_channels,
         }
     }
+}
+
+fn parse_ring_capacity(value: &str) -> Result<usize, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("capacity must be a positive integer fitting usize".into());
+    }
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "capacity must be a positive integer fitting usize".into())
 }
 
 /// One `--sources` segment: the next source and its duration in seconds.
@@ -388,6 +444,7 @@ fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
         // Gain does not change on a source switch (core ignores it), but keep it aligned with the
         // initial config.
         gain: cli.gain,
+        ring_capacity_chunks: cli.ring_capacity_chunks,
         // Mix-only settings (the facade ignores them for other segment types).
         mix_mic_device_id: cli.mic_device_id.clone(),
         mix_system_device_id: cli.system_device_id.clone(),
@@ -419,7 +476,7 @@ fn validate_exclusion_sources(cli: &Cli, segments: Option<&[Segment]>) -> Result
 /// The first segment is the initial source (already opened and started). At each later segment
 /// boundary (cumulative seconds), `stream.switch_source_with_options()` selects the next source. The caller
 /// keeps one output (file/pipe), so switches are transparent in the continuous chunk stream
-/// (`Stream` guarantees continuous seq/PTS).
+/// (`Stream` guarantees continuous sequence numbers and nondecreasing arrival time).
 ///
 /// Call [`tick`](Self::tick) on each collection loop iteration to execute any switches whose
 /// boundaries have passed. A failed switch prints a warning with `eprintln!` and recording
@@ -434,6 +491,8 @@ struct SwitchScheduler {
     /// Display label (`labels[i]` is the kind label for `configs[i]`).
     labels: Vec<&'static str>,
     open_options: flexaudio::OpenOptions,
+    settings_json: bool,
+    denoise: bool,
 }
 
 impl SwitchScheduler {
@@ -461,6 +520,8 @@ impl SwitchScheduler {
             configs,
             labels,
             open_options: cli.open_options(),
+            settings_json: cli.settings_json,
+            denoise: cli.denoise,
         }
     }
 
@@ -475,9 +536,18 @@ impl SwitchScheduler {
         while self.next < self.deadlines.len() && now >= self.deadlines[self.next] {
             let label = self.labels[self.next];
             let config = self.configs[self.next].clone();
-            match stream.switch_source_with_options(config, self.open_options.clone()) {
+            match stream.switch_source_with_options_and_denoise(
+                config,
+                self.open_options.clone(),
+                self.denoise,
+            ) {
                 Ok(()) => {
+                    settings_json::emit_stream(stream, self.settings_json, self.denoise);
                     eprintln!("[switch] -> {label}");
+                }
+                Err(e) if e.ignored_settings().is_some() => {
+                    settings_json::emit_rejection(&e, self.settings_json, self.denoise);
+                    return Err(e);
                 }
                 Err(e) if e.permission().is_some() => return Err(e),
                 Err(e) => {
@@ -527,6 +597,9 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     // independently of `--source` and related options.
     if cli.list_devices {
         return list_devices();
+    }
+    if cli.list_devices_json {
+        return devices_json::list();
     }
 
     // Process listing mode (enumerate without recording, then exit), also independent of `--source`.
@@ -584,7 +657,9 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         }
     };
 
-    validate_exclusion_sources(cli, segments.as_deref()).map_err(describe_error)?;
+    if !cli.strict {
+        validate_exclusion_sources(cli, segments.as_deref()).map_err(describe_error)?;
+    }
 
     // Resolve SourceKind and its display label. The `flexaudio::open` facade builds and selects
     // the backend (internally choosing a `Box<dyn CaptureBackend>` and returning a Stream). The CLI
@@ -706,8 +781,12 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     // Open the stream. `open_with_options` selects a `Box<dyn CaptureBackend>` internally based on config.kind.
     // Do not start it yet (two-stage flow). Read native_format from the opened Stream.
     let config = config_for_kind(cli, kind);
-    let mut stream =
-        flexaudio::open_with_options(config, cli.open_options()).map_err(describe_error)?;
+    let mut stream = flexaudio::open_with_options(config, cli.open_options()).map_err(|error| {
+        settings_json::emit_rejection(&error, cli.settings_json, cli.denoise);
+        describe_error(error)
+    })?;
+    stream.set_denoise(cli.denoise);
+    settings_json::emit_stream(&stream, cli.settings_json, cli.denoise);
 
     // --- Show native format ---
     let (native_rate, native_ch) = stream.native_format();
@@ -768,15 +847,18 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     log!("");
 
     // --- Start capture (second stage: start the already-open Stream) ---
-    stream.start().map_err(describe_error)?;
-
-    log!("Capturing ...");
-
-    if stdout_stream {
-        run_stdout_stream(cli, &mut stream, segments.as_deref())
-    } else {
-        run_wav(cli, &mut stream, output, segments.as_deref())
-    }
+    let result = (|| {
+        stream.start().map_err(describe_error)?;
+        log!("Capturing ...");
+        if stdout_stream {
+            run_stdout_stream(cli, &mut stream, segments.as_deref())
+        } else {
+            run_wav(cli, &mut stream, output, segments.as_deref())
+        }
+    })();
+    stream.stop();
+    let completion = drain_capture_events(&mut stream, cli.lifecycle_events);
+    result.and(completion)
 }
 
 /// `--list-devices`: Get devices with `devices()` and display them in a table.
@@ -995,14 +1077,14 @@ fn run_wav(
                     .tick(stream, Instant::now())
                     .map_err(describe_error)?;
             }
-            drain_capture_events(stream)?;
+            drain_capture_events(stream, cli.lifecycle_events)?;
             let mut got_any = false;
             while let Some(chunk) = stream.poll_chunk() {
                 got_any = true;
                 chunk_count += 1;
                 write_wav_chunk(&mut writer, &chunk)?;
             }
-            drain_capture_events(stream)?;
+            drain_capture_events(stream, cli.lifecycle_events)?;
             if !got_any {
                 thread::sleep(Duration::from_millis(10));
             }
@@ -1012,7 +1094,7 @@ fn run_wav(
     // One teardown path checks both capture and file completion on every exit.
     stream.stop();
     let completion_result = (|| -> std::result::Result<(), String> {
-        drain_capture_events(stream)?;
+        drain_capture_events(stream, cli.lifecycle_events)?;
         while let Some(chunk) = stream.poll_chunk() {
             chunk_count += 1;
             write_wav_chunk(&mut writer, &chunk)?;
@@ -1174,7 +1256,7 @@ fn run_stdout_stream(
             }
         }
 
-        drain_capture_events(stream)?;
+        drain_capture_events(stream, cli.lifecycle_events)?;
         let mut got_any = false;
         while let Some(chunk) = stream.poll_chunk() {
             got_any = true;
@@ -1189,7 +1271,7 @@ fn run_stdout_stream(
             }
         }
 
-        drain_capture_events(stream)?;
+        drain_capture_events(stream, cli.lifecycle_events)?;
 
         if !got_any {
             // One chunk is about 20 ms. Sleep briefly to avoid spinning.
@@ -1199,7 +1281,7 @@ fn run_stdout_stream(
 
     let dropped = stream.dropped_chunks();
     stream.stop();
-    drain_capture_events(stream)?;
+    drain_capture_events(stream, cli.lifecycle_events)?;
 
     // Drain chunks remaining in the ring after stop (skip if the pipe is broken).
     if !broken_pipe {
