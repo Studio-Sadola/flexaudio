@@ -1,16 +1,15 @@
 //! Pure default comparison and static applicability; never queries native capabilities.
 
-use crate::settings::{
-    AdjustmentReason, IgnoreReason, SettingKey, SettingOutcome, SettingResolution, SettingValue,
-    SettingsReport,
+use crate::ProcessMode;
+use crate::{
+    AdjustmentReason, IgnoreReason, SettingKey, SettingOutcome, SettingValue, SettingsReport,
 };
-use crate::types::ProcessMode;
 use crate::{Error, Result, SourceKind, StreamConfig};
 
 /// Platform used for static setting applicability, independent of the build target.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsPlatform {
+pub(crate) enum SettingsPlatform {
     /// Linux PipeWire routing.
     Linux,
     /// Windows WASAPI routing.
@@ -22,7 +21,7 @@ pub enum SettingsPlatform {
 }
 impl SettingsPlatform {
     /// Build target, without OS queries or permission checks.
-    pub fn current() -> Self {
+    pub(crate) fn current() -> Self {
         if cfg!(target_os = "linux") {
             Self::Linux
         } else if cfg!(target_os = "windows") {
@@ -38,32 +37,32 @@ impl SettingsPlatform {
 /// Decoded candidate settings. Controls such as strictness are deliberately excluded.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
-pub struct SettingsRequest {
+pub(crate) struct SettingsRequest {
     /// Source, formats, queue capacity, and gains.
-    pub config: StreamConfig,
+    pub(crate) config: StreamConfig,
     /// Windows silent-render option, default true.
-    pub windows_classic_loopback_keepalive: bool,
+    pub(crate) windows_classic_loopback_keepalive: bool,
     /// Effective inherited keepalive for an omitted switch option. Its request
     /// value is still the documented default, true.
-    pub retained_windows_classic_loopback_keepalive: Option<bool>,
+    pub(crate) retained_windows_classic_loopback_keepalive: Option<bool>,
     /// Canonical capture noise suppression, default false.
-    pub denoise: bool,
+    pub(crate) denoise: bool,
     /// Effective inherited denoise for an omitted switch option. Its request
     /// value is still the documented default, false.
-    pub retained_denoise: Option<bool>,
+    pub(crate) retained_denoise: Option<bool>,
     /// Attached VAD presence, default false; no model paths are recorded.
-    pub vad: bool,
+    pub(crate) vad: bool,
     /// Secondary encoding, default `f32`.
-    pub secondary_encoding: String,
+    pub(crate) secondary_encoding: String,
     /// Bindings whose processing attachments are fixed at open opt in here.
     /// Rust explicit denoise switches leave this false.
-    pub processing_fixed_at_open: bool,
+    pub(crate) processing_fixed_at_open: bool,
     /// Settings decoded using an existing legacy sentinel.
-    pub legacy_sentinels: Vec<SettingKey>,
+    pub(crate) legacy_sentinels: Vec<SettingKey>,
 }
 impl SettingsRequest {
     /// A Rust capture request with the documented option defaults.
-    pub fn new(config: StreamConfig) -> Self {
+    pub(crate) fn new(config: StreamConfig) -> Self {
         Self {
             config,
             windows_classic_loopback_keepalive: true,
@@ -83,7 +82,7 @@ impl SettingsRequest {
 /// `previous` selects switch semantics and supplies retained fixed-at-open values.
 /// `self_pid` is supplied by the caller so exclusion normalization remains pure.
 /// Switch request values are always compared with documented defaults.
-pub fn resolve_settings(
+pub(crate) fn resolve_settings(
     request: &SettingsRequest,
     platform: SettingsPlatform,
     self_pid: u32,
@@ -122,8 +121,8 @@ pub fn resolve_settings(
         SettingKey::Denoise,
         SettingKey::Vad,
     ] {
-        let requested = value(key, c, request);
-        let default = value(key, &d, &defaults);
+        let requested = value(key, c, request)?;
+        let default = value(key, &d, &defaults)?;
         let reason = ignored_reason(
             key,
             c,
@@ -176,14 +175,9 @@ pub fn resolve_settings(
         if matches!(outcome, SettingOutcome::Applied) && request.legacy_sentinels.contains(&key) {
             outcome = SettingOutcome::Adjusted(AdjustmentReason::LegacySentinel);
         }
-        entries.push(SettingResolution {
-            setting: key,
-            requested,
-            effective,
-            outcome,
-        });
+        entries.push((key, requested, effective, outcome));
     }
-    Ok(SettingsReport { revision, entries })
+    SettingsReport::new(revision, entries)
 }
 
 fn ignored_reason(
@@ -241,14 +235,14 @@ fn ignored_reason(
     }
 }
 
-fn value(key: SettingKey, c: &StreamConfig, r: &SettingsRequest) -> SettingValue {
+fn value(key: SettingKey, c: &StreamConfig, r: &SettingsRequest) -> Result<SettingValue> {
     use SettingKey::*;
     let text = |s: &Option<String>| {
         s.clone()
             .map(SettingValue::Text)
             .unwrap_or(SettingValue::Absent)
     };
-    match key {
+    Ok(match key {
         Kind => SettingValue::Text(
             match c.kind {
                 SourceKind::Mic => "mic",
@@ -298,5 +292,6 @@ fn value(key: SettingKey, c: &StreamConfig, r: &SettingsRequest) -> SettingValue
                 SettingValue::Absent
             }
         }
-    }
+        _ => return Err(Error::InvalidArg("unrecognized setting key".into())),
+    })
 }

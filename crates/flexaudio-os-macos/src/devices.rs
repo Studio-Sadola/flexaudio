@@ -265,30 +265,85 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
 }
 
 /// Enumerate Core Audio output selectors with their provider provenance.
+/// IDs and discovery failures follow [`list_output_devices`]. Readable names
+/// and UID fallbacks share one namespace; IDs need not be persistent.
 pub fn list_output_devices_with_namespaces() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
     let default_id = default_output_device().unwrap_or(0);
     flexaudio_core::inventory::collect(all_device_ids(read_system_object_list), |id| {
         let Some((identity, name)) = output_device_identity(id) else {
             return Ok(None);
         };
-        let (sample_rate, channels, format_available) = flexaudio_core::inventory::device_format(
+        Ok(Some(namespaced_output_device(
+            identity,
+            name,
             device_sample_rate(id)
                 .and_then(|rate| device_channels(id).map(|channels| (rate, channels))),
-        );
-        Ok(Some(flexaudio_core::NamespacedDevice::new(
-            DeviceInfo {
-                id: identity,
-                name,
-                source_kind: SourceKind::SystemLoopback,
-                sample_rate,
-                channels,
-                format_available,
-                is_loopback: true,
-                is_default: id == default_id && default_id != 0,
-            },
-            flexaudio_core::DeviceIdNamespace::CoreAudioOutputSelector,
+            id == default_id && default_id != 0,
         )))
     })
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    #[test]
+    fn output_enumeration_tags_duplicate_names_and_native_fallbacks() {
+        let entries = flexaudio_core::inventory::collect(Ok([true, true, false]), |readable| {
+            let name = if readable {
+                Ok("duplicate output".into())
+            } else {
+                Err(Error::DeviceNotFound)
+            };
+            let (id, name) =
+                flexaudio_core::inventory::device_identity(name, || Ok("native selector".into()))
+                    .unwrap();
+            Ok(Some(namespaced_output_device(
+                id,
+                name,
+                Ok((48_000, 2)),
+                false,
+            )))
+        })
+        .unwrap();
+        assert_eq!(entries.len(), 3);
+        for entry in &entries {
+            assert_eq!(
+                entry.id_namespace,
+                flexaudio_core::DeviceIdNamespace::CoreAudioOutputSelector
+            );
+            assert_eq!(entry.device.source_kind, SourceKind::SystemLoopback);
+            assert!(entry.device.is_loopback);
+            assert!(entry.device.format_available);
+        }
+        assert_eq!(entries[0].device.id, "duplicate output");
+        assert_eq!(entries[1].device.id, entries[0].device.id);
+        assert_eq!(entries[2].device.id, "native selector");
+        assert!(entries[2].device.name.is_empty());
+    }
+}
+
+fn namespaced_output_device(
+    identity: String,
+    name: String,
+    format: Result<(u32, u16)>,
+    is_default: bool,
+) -> flexaudio_core::NamespacedDevice {
+    let (sample_rate, channels, format_available) =
+        flexaudio_core::inventory::device_format(format);
+    flexaudio_core::NamespacedDevice::new(
+        DeviceInfo {
+            id: identity,
+            name,
+            source_kind: SourceKind::SystemLoopback,
+            sample_rate,
+            channels,
+            format_available,
+            is_loopback: true,
+            is_default,
+        },
+        flexaudio_core::DeviceIdNamespace::CoreAudioOutputSelector,
+    )
 }
 
 /// One identity/classification path for both discovery and selected-device open.
