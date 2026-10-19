@@ -2291,6 +2291,12 @@ fn enumeration_properties<'a>(
 /// enumeration completion. Treat a missing PipeWire daemon, connection failure, or registry
 /// retrieval failure as an error. Only a completed empty inventory returns `Ok([])`.
 pub fn list_devices() -> Result<Vec<DeviceInfo>> {
+    list_devices_with_namespaces()
+        .map(|devices| devices.into_iter().map(|entry| entry.device).collect())
+}
+
+/// Enumerate PipeWire selectors with provenance captured by this provider.
+pub fn list_devices_with_namespaces() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
     enumerate_pw().map_err(|error| error.with_context(ErrorContext::new(Operation::Enumerate)))
 }
 
@@ -2299,7 +2305,7 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
 /// Creates, runs, and destroys `MainLoop`/`Context`/`Core`/`Registry` (all `!Send`) only inside
 /// this function. Enumeration uses a short-lived loop, so `list_devices` runs synchronously on
 /// the caller's thread without creating a dedicated thread.
-fn enumerate_pw() -> Result<Vec<DeviceInfo>> {
+fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -2555,16 +2561,19 @@ fn enumerate_pw() -> Result<Vec<DeviceInfo>> {
                 n.rate.unwrap_or(NATIVE_RATE),
                 n.channels.unwrap_or(NATIVE_CHANNELS),
             )));
-        out.push(DeviceInfo {
-            id: n.node_name.clone(),
-            name: n.description.clone(),
-            source_kind,
-            sample_rate,
-            channels,
-            format_available,
-            is_loopback,
-            is_default,
-        });
+        out.push(flexaudio_core::NamespacedDevice::new(
+            DeviceInfo {
+                id: n.node_name.clone(),
+                name: n.description.clone(),
+                source_kind,
+                sample_rate,
+                channels,
+                format_available,
+                is_loopback,
+                is_default,
+            },
+            flexaudio_core::DeviceIdNamespace::PipeWireNodeName,
+        ));
     }
     Ok(out)
 }

@@ -30,6 +30,8 @@ pub enum ErrorKind {
     Unsupported,
     /// Device selection is ambiguous.
     AmbiguousDeviceName,
+    /// Strict validation rejected requested settings that would be ignored.
+    IgnoredSettings,
 }
 
 /// Typed failure with library-authored explanations and redacted private fields.
@@ -38,7 +40,7 @@ pub enum ErrorKind {
 /// include OS error text, never device names, paths, or raw environment diagnostics.
 /// Display retains those explanations. Permission details and context call labels remain
 /// available only through structured access.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Error {
     /// Invalid argument with a safe validation explanation.
@@ -101,11 +103,17 @@ pub enum Error {
     },
     /// Primary with a nonempty list of related failures.
     Multiple(ErrorGroup),
+    /// Strict validation rejected the complete candidate settings snapshot.
+    IgnoredSettings {
+        /// All candidate settings, including every ignored request.
+        report: crate::SettingsReport,
+    },
 }
 impl Error {
     /// Root kind, recursively preserving the primary cause.
     pub fn kind(&self) -> ErrorKind {
         match self {
+            Self::IgnoredSettings { .. } => ErrorKind::IgnoredSettings,
             Self::InvalidArg(_) => ErrorKind::InvalidArg,
             Self::InvalidState(_) => ErrorKind::InvalidState,
             Self::DeviceNotFound => ErrorKind::DeviceNotFound,
@@ -165,6 +173,13 @@ impl Error {
             _ => None,
         }
     }
+    /// Candidate settings retained through primary context and diagnostic wrappers.
+    pub fn ignored_settings(&self) -> Option<&crate::SettingsReport> {
+        match self.root() {
+            Self::IgnoredSettings { report } => Some(report),
+            _ => None,
+        }
+    }
     /// Addon cause retained through primary context wrappers.
     pub fn addon_kind(&self) -> Option<crate::AddonErrorKind> {
         match self.root() {
@@ -183,6 +198,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::IgnoredSettings { .. } => f.write_str("requested capture settings would be ignored"),
             Self::InvalidArg(message) => write!(f, "invalid argument: {message}"),
             Self::InvalidState(message) => write!(f, "invalid state: {message}"),
             Self::DeviceNotFound => f.write_str("device not found"),

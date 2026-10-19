@@ -27,6 +27,9 @@
 #![warn(missing_docs)]
 
 mod addon_error;
+mod arrival;
+#[cfg(test)]
+mod settings_tests;
 pub use addon_error::AddonErrorKind;
 
 pub mod backend;
@@ -41,9 +44,11 @@ pub mod chunk_ring;
 pub mod clock;
 pub mod diagnostics;
 pub mod error_context;
+mod error_equality;
 mod errors;
 mod spawn_error;
 pub use spawn_error::spawn_error;
+mod device_namespace;
 pub mod inventory;
 mod loss;
 pub mod normalizer;
@@ -51,6 +56,14 @@ pub mod process_list;
 pub mod quant;
 pub mod raw_ring;
 pub mod secondary_ring;
+pub mod settings;
+pub mod settings_resolver;
+pub use device_namespace::{DeviceIdNamespace, NamespacedDevice};
+pub use settings::{
+    AdjustmentReason, IgnoreReason, SettingKey, SettingOutcome, SettingResolution, SettingValue,
+    SettingsReport,
+};
+pub use settings_resolver::{resolve_settings, SettingsPlatform, SettingsRequest};
 pub mod startup;
 pub mod types;
 mod vad_error;

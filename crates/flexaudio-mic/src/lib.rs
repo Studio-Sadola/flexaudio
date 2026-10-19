@@ -317,6 +317,12 @@ fn query_native_format(
 /// Windows enumeration does not consult microphone capture capability; discovery
 /// keeps its native query behavior independently of capture consent.
 pub fn list_devices() -> Result<Vec<DeviceInfo>> {
+    list_devices_with_namespaces()
+        .map(|devices| devices.into_iter().map(|entry| entry.device).collect())
+}
+
+/// Enumerate CPAL microphone name selectors with their provider provenance.
+pub fn list_devices_with_namespaces() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
     let host = cpal_default_host(permission::Purpose::Enumeration)?;
 
     let default_name = host
@@ -341,16 +347,19 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
                 |config| (config.sample_rate().0, config.channels()),
             ));
         let is_default = default_name.as_deref() == Some(name.as_str());
-        out.push(DeviceInfo {
-            id: name.clone(),
-            name,
-            source_kind: SourceKind::Mic,
-            sample_rate,
-            channels,
-            format_available,
-            is_loopback: false,
-            is_default,
-        });
+        out.push(flexaudio_core::NamespacedDevice::new(
+            DeviceInfo {
+                id: name.clone(),
+                name,
+                source_kind: SourceKind::Mic,
+                sample_rate,
+                channels,
+                format_available,
+                is_loopback: false,
+                is_default,
+            },
+            flexaudio_core::DeviceIdNamespace::CpalDeviceName,
+        ));
     }
     Ok(out)
 }

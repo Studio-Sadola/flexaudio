@@ -24,7 +24,11 @@ mod mix;
 pub mod mock;
 mod open_options;
 mod processes;
+mod settings;
+#[cfg(test)]
+mod settings_tests;
 pub mod stream;
+mod validation;
 
 pub use device_watcher::DeviceWatcher;
 pub use mock::MockBackend;
@@ -40,6 +44,11 @@ pub use flexaudio_core::types::{
     Error, ErrorContext, ErrorGroup, ErrorKind, Event, LossReason, MixLane, NativeStatus,
     Operation, OutputFormat, OutputTap, Permission, ProcessInfo, ProcessMode, Result,
     SecondaryChunk, ShutdownReport, SourceKind, StreamConfig, VadErrorCode,
+};
+pub use flexaudio_core::{
+    resolve_settings, AdjustmentReason, DeviceIdNamespace, IgnoreReason, NamespacedDevice,
+    SettingKey, SettingOutcome, SettingResolution, SettingValue, SettingsPlatform, SettingsReport,
+    SettingsRequest,
 };
 pub use flexaudio_core::{AddonErrorKind, StartupDropReason};
 
@@ -68,30 +77,36 @@ pub use flexaudio_core::{AddonErrorKind, StartupDropReason};
 /// Windows enumeration does not preflight microphone permission; native enumeration
 /// proceeds. Microphone capture retains its separate existing permission preflight.
 pub fn devices() -> Result<Vec<DeviceInfo>> {
+    devices_with_namespaces().map(|devices| devices.into_iter().map(|entry| entry.device).collect())
+}
+
+/// Enumerate selectable devices with provenance supplied by each provider.
+/// Device IDs and discovery errors are identical to [`devices`].
+pub fn devices_with_namespaces() -> Result<Vec<NamespacedDevice>> {
     // Microphone input (cpal) is common to all OSes. Linux extends this with PipeWire devices,
     // so mut is needed there; other OSes do not extend it. The allow handles this difference.
     #[allow(unused_mut)]
     // Each provider owns its Enumerate context; preserve native context without wrapping twice.
-    let mut all = flexaudio_mic::list_devices()?;
+    let mut all = flexaudio_mic::list_devices_with_namespaces()?;
 
     // System output endpoints are OS-specific.
     #[cfg(target_os = "linux")]
     {
-        let linux = flexaudio_os_linux::list_devices()?;
+        let linux = flexaudio_os_linux::list_devices_with_namespaces()?;
         all.extend(
             linux
                 .into_iter()
-                .filter(|device| device.source_kind == SourceKind::SystemLoopback),
+                .filter(|entry| entry.device.source_kind == SourceKind::SystemLoopback),
         );
     }
     #[cfg(target_os = "windows")]
     {
-        let win = flexaudio_os_windows::list_output_devices()?;
+        let win = flexaudio_os_windows::list_output_devices_with_namespaces()?;
         all.extend(win);
     }
     #[cfg(target_os = "macos")]
     {
-        let mac = flexaudio_os_macos::list_output_devices()?;
+        let mac = flexaudio_os_macos::list_output_devices_with_namespaces()?;
         all.extend(mac);
     }
 
@@ -194,18 +209,28 @@ pub fn open(config: StreamConfig) -> Result<Stream> {
 /// Open a not-yet-started capture stream with explicit backend options.
 ///
 /// Uses the same validation and source selection as [`open`]. Options that do
-/// not apply to the selected operating system or source are ignored.
+/// not apply to the selected operating system or source are ignored by default.
+/// With [`OpenOptions::strict`] enabled, non-default ignored settings return
+/// [`Error::IgnoredSettings`] before backend construction or native access.
 pub fn open_with_options(config: StreamConfig, options: OpenOptions) -> Result<Stream> {
-    stream::validate_chunk_ms(config.chunk_ms)?;
-    // Validate the output format early. Stream::open also checks it, but errors should be
-    // returned before constructing the backend.
-    config.output.validate()?;
-    validate_exclude_pids(&config)?;
+    open_using(config, options, build_backend)
+}
 
-    let backend = build_backend(&config, &options)?;
+fn open_using(
+    config: StreamConfig,
+    options: OpenOptions,
+    build: impl FnOnce(&StreamConfig, &OpenOptions) -> Result<Box<dyn CaptureBackend>>,
+) -> Result<Stream> {
+    // Share custom-open validation, but run it before any native construction.
+    validation::open_config(&config)?;
+    validation::source_config(&config)?;
+    let report = settings::preflight(&config, &options, None, None, false)?;
+    let backend = build(&config, &options)?;
 
     // Delegate to the low-level entry point (which configures the Normalizer and threads).
-    Stream::open_with_backend_options(config, backend, options)
+    let mut stream = Stream::open_with_backend_options(config, backend, options)?;
+    stream.settings_report = Some(report);
+    Ok(stream)
 }
 
 /// Shared preflight used by the Mix branch of open's backend construction.

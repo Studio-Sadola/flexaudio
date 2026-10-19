@@ -4,6 +4,9 @@
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenOptions {
+    /// Reject non-default capture settings that would be ignored, before native access.
+    /// Defaults to false; plain source switches retain the current value.
+    pub strict: bool,
     /// Keep Windows classic system loopback active by rendering silence.
     ///
     /// Enabled by default. Applies to system capture and the system lane of a mix
@@ -19,12 +22,18 @@ pub struct OpenOptions {
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
+            strict: false,
             windows_classic_loopback_keepalive: true,
         }
     }
 }
 
 impl OpenOptions {
+    /// Enable or disable strict applicability validation.
+    pub fn strict(mut self, enabled: bool) -> Self {
+        self.strict = enabled;
+        self
+    }
     /// Create the default options, including Windows classic loopback keepalive.
     pub fn new() -> Self {
         Self::default()

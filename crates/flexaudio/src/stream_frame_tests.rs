@@ -30,7 +30,9 @@ fn next_chunk(stream: &mut Stream) -> AudioChunk {
         chunk = stream.poll_chunk();
         chunk.is_some()
     });
-    chunk.unwrap()
+    let chunk = chunk.unwrap();
+    assert_eq!(chunk.arrival_ns(), chunk.pts_ns);
+    chunk
 }
 
 #[test]

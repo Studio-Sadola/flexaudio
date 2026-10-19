@@ -299,6 +299,12 @@ unsafe fn endpoint_identity(device: &IMMDevice) -> Option<(String, String)> {
 /// endpoint. An unreadable FriendlyName uses the native endpoint ID and an empty
 /// name (unknown); omit an entry only when neither identity is readable.
 pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
+    list_output_devices_with_namespaces()
+        .map(|devices| devices.into_iter().map(|entry| entry.device).collect())
+}
+
+/// Enumerate WASAPI output selectors with their provider provenance.
+pub fn list_output_devices_with_namespaces() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
     let _com = ComThread::new()?;
     // SAFETY: this scope owns COM initialization and uses interfaces on one thread.
     unsafe {
@@ -348,16 +354,19 @@ pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
             let (sample_rate, channels, format_available) =
                 flexaudio_core::inventory::device_format(endpoint_mix_format(&device));
             let is_default = default_id.as_deref() == Some(id.as_str());
-            Ok(Some(DeviceInfo {
-                id,
-                name,
-                source_kind: SourceKind::SystemLoopback,
-                sample_rate,
-                channels,
-                format_available,
-                is_loopback: true,
-                is_default,
-            }))
+            Ok(Some(flexaudio_core::NamespacedDevice::new(
+                DeviceInfo {
+                    id,
+                    name,
+                    source_kind: SourceKind::SystemLoopback,
+                    sample_rate,
+                    channels,
+                    format_available,
+                    is_loopback: true,
+                    is_default,
+                },
+                flexaudio_core::DeviceIdNamespace::WasapiOutputSelector,
+            )))
         })
     }
 }
