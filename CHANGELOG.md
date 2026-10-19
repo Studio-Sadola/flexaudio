@@ -12,6 +12,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Effective settings reports and opt-in strict validation in every binding.
+  Only decoded values differing from documented defaults count as requests;
+  explicit defaults never cause strict rejection, including on source switches.
+  Reports distinguish applied, not requested, ignored and adjusted settings.
+  Ignored reasons are `wrongSourceKind`, `unsupportedPlatform`,
+  `exclusionDeviceUnscoped`, `processLoopbackPath`, and `fixedAtOpen`.
+  Strict rejection includes the complete candidate report before device access,
+  permission requests, model loading, or stopping the current source.
+- Rust `resolve_settings`, `SettingsRequest`, and `SettingsAttachments` for
+  device-independent settings resolution shared by all front ends.
+- Helper lifecycle events with stop reasons. Rust uses its existing event channel;
+  Node uses `onLifecycleEvent`, Python `poll_lifecycle_event`, C
+  `flexaudio_poll_lifecycle_event_v4`, and CLI `--lifecycle-events` uses stderr JSON.
+  Binding lifecycle delivery is separate from ordinary events. Every emitted
+  Started has exactly one Stopped, including failure and cancellation paths.
+  macOS Started means a diagnostic attempt; Windows Started means successful
+  keepalive render start. Stopped ends ownership after teardown attempts, without
+  promising native cleanup succeeded.
+- `arrival_ns` / Node `arrivalNs` aliases for primary and secondary chunk arrival
+  labels, including C v4 accessors; values are identical to the existing PTS labels.
+- Namespaced device listing: Rust/Python `devices_with_namespaces`, Node
+  `devicesWithNamespaces`, C `flexaudio_devices_with_namespaces_v4`, and CLI
+  `--list-devices-json`. Selector IDs remain unchanged.
+- Configurable ring capacity in Node, Python, C v4, and CLI, joining Rust;
+  the default remains 50 chunks and capacity stays fixed at open.
+- CLI `--strict`, `--settings-json`, `--lifecycle-events`, `--list-devices-json`,
+  `--ring-capacity-chunks`, and `--denoise`. Settings JSON includes successful
+  open/switch snapshots or the candidate report on strict rejection.
+
+### Deprecated
+
+- Chunk `pts_ns` / `ptsNs` naming is documentation-only deprecated in favor of
+  `arrival_ns` / `arrivalNs`. Existing names keep working throughout 0.9 under
+  the policy in `RELEASING.md`; frozen C layout fields remain permanently.
+  Use frame indices for audio continuity rather than arrival labels.
+
 ## [0.7.0] - 2026-10-19
 
 ### Added
@@ -134,6 +172,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4 KB inside the plugin. Opening a microphone through cpal performs several
   such opens, so applications that reopen microphone streams very frequently
   see slow memory growth that is not caused by flexaudio.
+  Reuse an open microphone stream instead of reopening it in a loop, especially
+  in long-running processes. For system-only capture, prefer the native PipeWire
+  system source, which does not use the CPAL/ALSA microphone path. Mix still
+  opens a microphone lane and therefore does not avoid this plugin issue.
 
 ## [0.6.0] - 2026-10-15
 

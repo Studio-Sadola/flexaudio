@@ -76,8 +76,8 @@ which output carries its events. — = not exposed.
 | Delivery model | Poll | Callbacks over internal polling | Poll | Poll | Internal polling → stdout/WAV |
 | Secondary output tap | Yes | Yes (`chunk.secondary`) | Yes (`poll_secondary`, f32/s16) | Yes (v3, f32/s16) | — |
 | Attached VAD (primary/secondary) | Canonical capture via `VadTap` | Primary or secondary carrier | Primary or secondary carrier | Primary (v2/v3) or secondary (v3) carrier | — |
-| Denoise | Canonical 48 kHz; any output rate | Requires 48 kHz output | Requires 48 kHz output | v1/v2: 48 kHz output; v3: any output rate | — |
-| Ring capacity | Configurable; default 50 chunks | 50 chunks | 50 chunks | 50 chunks | 50 chunks |
+| Denoise | Canonical 48 kHz; any output rate | Requires 48 kHz output | Requires 48 kHz output | v1/v2: 48 kHz output; v3/v4: any output rate | `--denoise` |
+| Ring capacity (default 50 chunks) | `ring_capacity_chunks` | `ringCapacityChunks` | `ring_capacity_chunks` | v4 `ring_capacity_chunks` | `--ring-capacity-chunks` |
 | Source switching | `switch_source` | `switchSource`; retains add-on settings | `switch_source` | `flexaudio_switch_source` | `--sources` schedule |
 | Event detail | Typed events/errors/loss | Typed events/errors/loss | Typed events/errors/loss | v1 flattened; v2 detailed | stderr diagnostics/loss summaries |
 | Silence probe control | `silence_probe` | `silenceProbe` | `silence_probe` | `silence_probe`: 0/1 on, 2 off | `--no-silence-probe` |
@@ -88,6 +88,186 @@ which output carries its events. — = not exposed.
 The optional silence diagnosis probe is macOS-only and enabled by default.
 
 ---
+
+## Strict mode and effective settings
+
+Capture is permissive by default. A setting counts as **requested only when its
+decoded value differs from its documented default**, even when explicitly supplied
+or switching sources. For example, microphone `silenceProbe: false` is ignored
+and rejected in strict mode; `silenceProbe: true` is `notRequested`. On switch,
+`gain: 1.0` is `notRequested` and retains the current gain; `gain: 2.0` is ignored
+even if the current gain is already 2.0. C sentinels are decoded first.
+
+Strict mode rejects all requested ignored settings together before backend
+construction, permissions, device/format discovery, model loading, or stopping
+the old source. Existing invalid-input checks keep their typed errors.
+Adjustments are allowed: PID deduplication/implicit-self expansion uses
+`exclusionSetNormalized`, and legacy decoding uses `legacySentinel`.
+
+Reports contain `revision` and `entries`, each with `setting`, `requested`,
+`effective`, and `outcome` (`notRequested`, `applied`, `ignored`, or `adjusted`).
+Ignored/adjusted outcomes include a reason. Revisions start at zero and increment
+on every successful switch, including identical sources; recovery does not
+increment them. Failed switches preserve the previous report and options.
+Effective values describe configured routing, not proof of running hardware.
+Absent/default-device values use Rust `Absent` or binding null equivalents;
+VAD values describe attachment presence, not model paths. Rust custom-backend
+opens return no report.
+
+Defaults are microphone, absent device/PID, include mode, 20 ms chunks, 50 chunks
+of ring capacity, unity gain and Mix gains, no exclusions or Mix device IDs,
+48000 Hz stereo primary output, no secondary output, `f32` secondary encoding,
+enabled probe/keepalive, disabled denoise, and no VAD. Strictness and callback
+registration are controls outside the report. Strict defaults to false on open
+and is retained on switch unless explicitly replaced. Ring capacity and initial
+gain remain fixed at open; use runtime gain setters to change gain.
+
+Rust (the returned stream is not started until `start()`):
+
+```rust
+let mut stream = flexaudio::open_with_options(
+    flexaudio::StreamConfig::default(),
+    flexaudio::OpenOptions::new().strict(true),
+)?;
+println!("{:?}", stream.effective_settings());
+stream.start()?;
+stream.stop();
+```
+
+Node:
+
+```js
+const { openStream } = require('@studio-sadola/flexaudio');
+const stream = openStream({ kind: 'mic', strict: true, ringCapacityChunks: 100 }, () => {});
+console.log(stream.effectiveSettings());
+await stream.stop();
+```
+
+Python:
+
+```python
+import flexaudio
+with flexaudio.open('mic', strict=True, ring_capacity_chunks=100) as stream:
+    print(stream.effective_settings())
+```
+
+C (inside a function, with `flexaudio.h` included):
+
+```c
+FlexConfig config = {0}; /* zero source kind selects microphone */
+FlexStreamConfigV3 base = {0};
+base.size = sizeof base;
+base.version = FLEX_STREAM_VERSION_3;
+base.config = &config;
+uint64_t capacity = 100;
+FlexOptionsV4 options = {sizeof options, FLEX_STREAM_VERSION_4, 1, &capacity};
+FlexStreamConfigV4 request = {sizeof request, FLEX_STREAM_VERSION_4, &base, &options};
+FlexStream *stream = NULL;
+if (flexaudio_open_v4(&request, &stream) == FLEX_OK) {
+    FlexSettingsV4 *report = NULL;
+    if (flexaudio_settings_v4(stream, &report) == FLEX_OK) {
+        uint64_t revision = 0;
+        size_t count = 0;
+        flexaudio_settings_count_v4(report, &revision, &count);
+        /* Inspect entries with flexaudio_settings_item_v4. */
+        flexaudio_settings_free_v4(report);
+    }
+    flexaudio_free(stream);
+}
+```
+
+CLI (reports go to stderr):
+
+```sh
+flexaudio-cli --source mic --strict --settings-json --ring-capacity-chunks 100 --seconds 1 --out capture.wav
+```
+
+Strict rejection exposes the candidate through Rust `Error::ignored_settings()`,
+Node's `FLEX_IGNORED_SETTINGS` exception `.report`, Python
+`IgnoredSettingsError.report`, C `FLEX_IGNORED_SETTINGS` (-13) with
+`flexaudio_error_settings_v4`, or CLI `--settings-json`.
+Rust `resolve_settings(&SettingsRequest::new(config))` resolves settings without
+devices; `SettingsAttachments` describes attachment presence and front-end switch
+policy. Resolution does not validate capture arguments or install attachments.
+
+The exact ignored-setting rules below use shared report tags. Node `processId`
+maps to `targetPid`; its `micDeviceId`, `systemDeviceId`, `micGain`, and
+`systemGain` map to the four `mix*` tags. Each row applies only to non-default
+requests, on open and switch unless marked switch-only.
+
+| Setting | Condition | Reason |
+|---|---|---|
+| `deviceId` | Process or Mix | `wrongSourceKind` |
+| `targetPid`, `mode` | Non-process | `wrongSourceKind` |
+| `excludeSelf`, `excludePids` | Microphone or process | `wrongSourceKind` |
+| `mixMicDeviceId`, `mixSystemDeviceId`, `mixMicGain`, `mixSystemGain` | Non-Mix | `wrongSourceKind` |
+| `silenceProbe` | Microphone | `wrongSourceKind` |
+| `silenceProbe` | Other kinds outside macOS | `unsupportedPlatform` |
+| `windowsClassicLoopbackKeepalive` | Microphone or process | `wrongSourceKind` |
+| `windowsClassicLoopbackKeepalive` | System/Mix outside Windows | `unsupportedPlatform` |
+| `windowsClassicLoopbackKeepalive` | Windows system/Mix with exclusions | `processLoopbackPath` |
+| `deviceId` / `mixSystemDeviceId` | Linux/Windows system/Mix-system with exclusions | `exclusionDeviceUnscoped` |
+| `gain`, `ringCapacityChunks` | Switch-only | `fixedAtOpen` |
+| Node `denoise`, `vad` | Switch-only | `fixedAtOpen` |
+| C `config.denoise` | Switch-only | `fixedAtOpen` |
+
+Exclusions are active when `excludeSelf` is true or `excludePids` is nonempty.
+macOS supports exclusions together with explicit system-device selection.
+Python switch denoise and Rust's explicit denoise-switch methods remain applied.
+
+## Optional playback helpers and lifecycle
+
+Both helpers are enabled by default where applicable. They serve different
+purposes and are not used together on one OS.
+
+| OS | Silence probe | Classic loopback keepalive |
+|---|---|---|
+| macOS | System/process capture, including the system lane of Mix: after five continuous seconds of exact-zero native samples with eligible external output activity, at most once per capture generation. Plays a roughly 300 ms, 1 kHz coded signal at amplitude `1e-5` on the default output and checks it through a separate private self-tap. This is low-level audio, not guaranteed inaudible; other apps and user capture may receive it when the capturing process is included. Started marks entry into the diagnostic attempt, including attempts that fail during setup. | Not used. |
+| Windows | Not used. | Classic system loopback and the system lane of Mix **without exclusions**. Renders digital silence in shared mode on the selected capture output endpoint to keep idle capture device-clocked. It adds no audible signal or volume/mute changes, but other apps can observe its active rendering session and Windows Volume Mixer may show it. Started follows successful render start; earlier setup failures emit no pair. Process/exclusion loopback does not use it. |
+| Linux | Not used. | Not used. |
+
+Mix forwards the system lane's lifecycle events; microphone activity in the mixed
+output does not replace the macOS detector's native system-lane observations.
+The probe signal can enter that lane if self is included, and can also be picked
+up acoustically by a microphone. Windows Mix uses the same silence-only keepalive
+as system capture; it does not inject a diagnostic tone into the mix.
+
+Every emitted Started has exactly one Stopped with a reason, including source
+switches, recovery, cancellation, and failures. Stopped means helper ownership
+ended after teardown attempts; typed cleanup errors still report native cleanup
+failures. Windows capture-start failure after render start stops the helper with
+`startupFailed`. Lifecycle events are ordered among themselves, with no relative
+ordering guarantee against PCM or ordinary events.
+
+| Binding | Lifecycle delivery | Disable macOS probe | Disable Windows keepalive |
+|---|---|---|---|
+| Rust | Existing `Stream::poll_event()` (`Event` variants) | `StreamConfig.silence_probe = false` | `OpenOptions::new().windows_classic_loopback_keepalive(false)` |
+| Node | Separate `OpenOptions.onLifecycleEvent` callback | `silenceProbe: false` | `windowsClassicLoopbackKeepalive: false` |
+| Python | Separate `Stream.poll_lifecycle_event()` FIFO | `silence_probe=False` | `windows_classic_loopback_keepalive=False` |
+| C | Separate `flexaudio_poll_lifecycle_event_v4`; free events with `flexaudio_lifecycle_event_free_v4` | `FlexConfig.silence_probe = 2` | v3 base envelope `windows_classic_loopback_keepalive = 2` |
+| CLI | `--lifecycle-events` JSON lines on stderr | `--no-silence-probe` | `--no-classic-loopback-keepalive` |
+
+Ordinary Node/Python/C event channels never return lifecycle events, even as
+unknown events. Node retains an omitted handler across switches, replaces a
+supplied handler only on successful commit, and settles `stop()` after queued
+lifecycle callbacks. Python/C lifecycle queues remain independently drainable
+after stop. C events own their storage and survive stream destruction.
+
+## Arrival labels and device namespaces
+
+Use Rust/Python `arrival_ns`, Node `arrivalNs`, and C
+`flexaudio_chunk_arrival_ns_v4` / `flexaudio_secondary_arrival_ns_v4` for primary
+and secondary arrival labels. They equal the existing `pts_ns` / `ptsNs` values
+exactly. The old chunk names are documentation-only deprecated since 0.8 and
+remain supported throughout 0.9; frozen C fields remain permanently. Use frame
+indices for audio continuity; VAD epoch-origin PTS naming is unchanged.
+
+Rust/Python `devices_with_namespaces()`, Node `await devicesWithNamespaces()`, C
+`flexaudio_devices_with_namespaces_v4`, and CLI `--list-devices-json` add provider
+provenance without changing selectable IDs or discovery errors. Namespaces
+identify selector domains, not persistent hardware identities. Ring capacity is
+configurable in every binding (default 50 chunks); CLI `--denoise` enables
+canonical capture denoising before recording, supporting any output rate.
 
 ## Capability discovery
 
@@ -317,7 +497,7 @@ Windows native waits distinguish
 an actual timeout from a failed wait, and COM initialization reports unexpected
 HRESULT failures.
 
-Primary and secondary `ptsNs` (`pts_ns` in Rust/Python/C) are arrival-time labels
+Primary and secondary `arrivalNs` (`arrival_ns` in Rust/Python; C v4 accessors) are arrival-time labels
 assigned when samples are ingested and re-anchored per ingest. Microphone and
 loopback use the same timing origin on every OS; device timestamps are not used.
 Labels are clamped non-decreasing, but chunks can overlap or repeat timestamps;
@@ -742,6 +922,11 @@ permission events keep type `permissionDenied` and add `permission`
 
 ### Linux
 
+- With PipeWire's ALSA plugin, each `snd_pcm_open`/`snd_pcm_close` cycle can
+  retain about 4 KB in the plugin. CPAL microphone opens perform several such
+  cycles. Long-running applications should reuse an open microphone stream
+  rather than reopen it in a loop. Native PipeWire system-only capture avoids
+  this microphone path; Mix still opens its microphone lane.
 - Microphone capture goes through ALSA/PipeWire via `cpal`; the user must have
   access to the audio device (typically the `audio` group / a running PipeWire
   or PulseAudio session).

@@ -438,6 +438,13 @@ selects 50 on open and retains capacity on switch; a supplied capacity must be
 positive and fit `size_t`.
 
 Only decoded values differing from documented defaults count as requested.
+Explicit defaults are not requested, including on switch after retaining
+non-default effective values; existing C sentinels are decoded before comparison.
+For example, a supplied capacity of 50 is not requested and retains switch
+capacity; another value is ignored with `fixedAtOpen`. Gain is also fixed at open,
+as is `config.denoise` on source switch. Use `flexaudio_set_gain` for runtime gain.
+See the root README's [ignored-setting table](../../README.md#strict-mode-and-effective-settings)
+and [complete C example](../../README.md#strict-mode-and-effective-settings).
 Strict requests that would be ignored return `FLEX_IGNORED_SETTINGS` (-13)
 before device access, model loading, or stopping the current source. Obtain an
 owned error with `flexaudio_last_error_info_v2`, then borrow its complete candidate
@@ -460,10 +467,15 @@ reason/message access returns 1 when present or 0 without changing the output.
 Stop-reason codes are 1 signal observed, 2 permission denied, 3 inconclusive,
 4 timed out, 5 stream stopped, 6 source switched, 7 recovery, 8 startup failed,
 9 runtime failed, and 10 cancelled; 0 is unknown. Started events have no reason.
+Every emitted Started has exactly one Stopped: macOS Started means entry into
+a diagnostic attempt; Windows Started follows successful keepalive render start.
+Stopped ends ownership after teardown attempts, without guaranteeing native
+cleanup succeeded. Lifecycle ordering relative to PCM or ordinary events is not
+guaranteed. See [helper behavior and controls](../../README.md#optional-playback-helpers-and-lifecycle).
 
 Use `flexaudio_chunk_arrival_ns_v4` and `flexaudio_secondary_arrival_ns_v4` for
 arrival time. They return the existing `pts_ns` value exactly. The old naming is
-deprecated in 0.8 and retained through 0.9; frozen C layouts retain these fields
+documentation-only deprecated in 0.8 and retained through 0.9; frozen C layouts retain these fields
 permanently. `frame_index` remains authoritative for audio continuity.
 
 `flexaudio_devices_with_namespaces_v4` preserves selectable device IDs and adds

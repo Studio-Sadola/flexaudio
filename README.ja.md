@@ -73,8 +73,8 @@ stream.stop();
 | 配信方式 | ポーリング | 内部ポーリングからコールバック | ポーリング | ポーリング | 内部ポーリング → stdout/WAV |
 | 副出力タップ | あり | あり（`chunk.secondary`） | あり（`poll_secondary`、f32/s16） | あり（v3、f32/s16） | — |
 | 接続 VAD（主／副） | `VadTap` で内部標準形式のキャプチャを処理 | 主または副のチャンクにイベントを付与 | 主または副のチャンクにイベントを付与 | 主（v2/v3）または副（v3）のチャンクにイベントを付与 | — |
-| ノイズ抑制 | 内部の 48 kHz で処理、出力レートは任意 | 48 kHz 出力が必要 | 48 kHz 出力が必要 | v1/v2: 48 kHz 出力、v3: 出力レートは任意 | — |
-| リング容量 | 設定可能、既定は 50 チャンク | 50 チャンク | 50 チャンク | 50 チャンク | 50 チャンク |
+| ノイズ抑制 | 内部の 48 kHz で処理、出力レートは任意 | 48 kHz 出力が必要 | 48 kHz 出力が必要 | v1/v2: 48 kHz 出力、v3/v4: 出力レートは任意 | `--denoise` |
+| リング容量（既定は 50 チャンク） | `ring_capacity_chunks` | `ringCapacityChunks` | `ring_capacity_chunks` | v4 の `ring_capacity_chunks` | `--ring-capacity-chunks` |
 | ソース切替 | `switch_source` | `switchSource`、アドオン設定を維持 | `switch_source` | `flexaudio_switch_source` | `--sources` のスケジュール |
 | イベントの詳細 | 型付きイベント／エラー／損失 | 型付きイベント／エラー／損失 | 型付きイベント／エラー／損失 | v1 は平坦化、v2 は詳細情報 | stderr に診断／損失の要約 |
 | 無音診断プローブの制御 | `silence_probe` | `silenceProbe` | `silence_probe` | `silence_probe`: 0/1 で有効、2 で無効 | `--no-silence-probe` |
@@ -85,6 +85,179 @@ stream.stop();
 任意の無音診断プローブは macOS 専用で、既定では有効です。
 
 ---
+
+## strict モードと実効設定
+
+キャプチャは既定では寛容モードです。明示した値でもソース切替時でも、**デコード後の値が
+文書化された既定値と異なる場合だけ、要求された設定とみなします**。例えばマイクの
+`silenceProbe: false` は無視され、strict モードでは拒否されます。
+`silenceProbe: true` は `notRequested` です。切替時の `gain: 1.0` は
+`notRequested` となり現在のゲインを維持します。`gain: 2.0` は現在のゲインが
+既に 2.0 でも無視されます。C の特別な既定値指定は先にデコードします。
+
+strict モードは、バックエンドの構築、権限の要求、デバイス／形式の取得、モデルの読み込み、
+旧ソースの停止より前に、要求されても無視される設定をまとめて拒否します。
+既存の不正入力チェックでは引き続き型付きエラーを返します。
+調整は許可します。PID の重複除去／自プロセスの暗黙追加は `exclusionSetNormalized`、
+従来の特別な値のデコードは `legacySentinel` です。
+
+レポートには `revision` と `entries` があり、各項目は `setting`、`requested`、
+`effective`、`outcome`（`notRequested`、`applied`、`ignored`、`adjusted`）を持ちます。
+無視／調整には理由も付きます。リビジョンは 0 から始まり、同一ソースを含め成功した
+切替ごとに増えます。復旧では増えません。切替に失敗すると前のレポートとオプションを維持します。
+実効値は設定した経路を表し、ハードウェアの稼働を証明しません。
+未指定／既定デバイスは Rust の `Absent` または各言語の null 相当で表し、
+VAD の値はモデルのパスではなく接続の有無です。Rust の独自バックエンドによる
+オープンではレポートを返しません。
+
+既定値はマイク、デバイス／PID 未指定、include モード、20 ms チャンク、リング容量
+50 チャンク、ゲインと Mix ゲインは等倍、除外なし、Mix デバイス未指定、主出力
+48000 Hz ステレオ、副出力なし、副出力エンコーディング `f32`、プローブ／キープアライブ
+有効、ノイズ抑制無効、VAD なしです。strict とコールバック登録は制御項目で、レポートには
+含みません。strict はオープン時は既定で false、切替時は明示的に置き換えない限り維持します。
+リング容量と初期ゲインはオープン時に固定します。ゲイン変更には実行時の setter を使います。
+
+Rust（返されたストリームは `start()` まで開始しません）:
+
+```rust
+let mut stream = flexaudio::open_with_options(
+    flexaudio::StreamConfig::default(),
+    flexaudio::OpenOptions::new().strict(true),
+)?;
+println!("{:?}", stream.effective_settings());
+stream.start()?;
+stream.stop();
+```
+
+Node:
+
+```js
+const { openStream } = require('@studio-sadola/flexaudio');
+const stream = openStream({ kind: 'mic', strict: true, ringCapacityChunks: 100 }, () => {});
+console.log(stream.effectiveSettings());
+await stream.stop();
+```
+
+Python:
+
+```python
+import flexaudio
+with flexaudio.open('mic', strict=True, ring_capacity_chunks=100) as stream:
+    print(stream.effective_settings())
+```
+
+C（`flexaudio.h` を include した関数内）:
+
+```c
+FlexConfig config = {0}; /* ソース種別 0 はマイク */
+FlexStreamConfigV3 base = {0};
+base.size = sizeof base;
+base.version = FLEX_STREAM_VERSION_3;
+base.config = &config;
+uint64_t capacity = 100;
+FlexOptionsV4 options = {sizeof options, FLEX_STREAM_VERSION_4, 1, &capacity};
+FlexStreamConfigV4 request = {sizeof request, FLEX_STREAM_VERSION_4, &base, &options};
+FlexStream *stream = NULL;
+if (flexaudio_open_v4(&request, &stream) == FLEX_OK) {
+    FlexSettingsV4 *report = NULL;
+    if (flexaudio_settings_v4(stream, &report) == FLEX_OK) {
+        uint64_t revision = 0;
+        size_t count = 0;
+        flexaudio_settings_count_v4(report, &revision, &count);
+        /* flexaudio_settings_item_v4 で各項目を確認します。 */
+        flexaudio_settings_free_v4(report);
+    }
+    flexaudio_free(stream);
+}
+```
+
+CLI（レポートは stderr へ出力）:
+
+```sh
+flexaudio-cli --source mic --strict --settings-json --ring-capacity-chunks 100 --seconds 1 --out capture.wav
+```
+
+strict の拒否時は、Rust の `Error::ignored_settings()`、Node の
+`FLEX_IGNORED_SETTINGS` 例外の `.report`、Python の `IgnoredSettingsError.report`、
+C の `FLEX_IGNORED_SETTINGS`（-13）と `flexaudio_error_settings_v4`、
+CLI の `--settings-json` で候補レポートを取得できます。
+Rust の `resolve_settings(&SettingsRequest::new(config))` はデバイスなしで設定を解決し、
+`SettingsAttachments` は接続の有無と各フロントエンドの切替方針を記述します。
+この解決処理はキャプチャ引数の検証や接続自体の設定は行いません。
+
+以下は共有レポートのタグを使った、無視される設定の正確な規則です。Node の `processId`
+は `targetPid` に、`micDeviceId`、`systemDeviceId`、`micGain`、`systemGain` は
+対応する 4 つの `mix*` タグに対応します。各行は既定値と異なる要求だけに適用し、
+切替時のみと記した行を除き、オープン時と切替時の両方に適用します。
+
+| 設定 | 条件 | 理由 |
+|---|---|---|
+| `deviceId` | Process または Mix | `wrongSourceKind` |
+| `targetPid`, `mode` | Process 以外 | `wrongSourceKind` |
+| `excludeSelf`, `excludePids` | マイクまたは Process | `wrongSourceKind` |
+| `mixMicDeviceId`, `mixSystemDeviceId`, `mixMicGain`, `mixSystemGain` | Mix 以外 | `wrongSourceKind` |
+| `silenceProbe` | マイク | `wrongSourceKind` |
+| `silenceProbe` | macOS 以外のその他の種別 | `unsupportedPlatform` |
+| `windowsClassicLoopbackKeepalive` | マイクまたは Process | `wrongSourceKind` |
+| `windowsClassicLoopbackKeepalive` | Windows 以外の System/Mix | `unsupportedPlatform` |
+| `windowsClassicLoopbackKeepalive` | 除外ありの Windows System/Mix | `processLoopbackPath` |
+| `deviceId` / `mixSystemDeviceId` | 除外ありの Linux/Windows System/Mix のシステム側 | `exclusionDeviceUnscoped` |
+| `gain`, `ringCapacityChunks` | 切替時のみ | `fixedAtOpen` |
+| Node の `denoise`, `vad` | 切替時のみ | `fixedAtOpen` |
+| C の `config.denoise` | 切替時のみ | `fixedAtOpen` |
+
+`excludeSelf` が true、または `excludePids` が空でなければ除外は有効です。
+macOS は除外とシステムデバイスの明示選択を併用できます。
+Python の切替時のノイズ抑制と Rust の明示的なノイズ抑制切替メソッドは引き続き適用します。
+
+## 任意の再生ヘルパーとライフサイクル
+
+どちらも該当する環境では既定で有効です。目的は異なり、同じ OS で両方を使いません。
+
+| OS | 無音診断プローブ | 従来型ループバックのキープアライブ |
+|---|---|---|
+| macOS | Mix のシステム側を含む System/Process キャプチャで、適格な外部出力が動作中にネイティブサンプルが 5 秒間連続して厳密なゼロなら、キャプチャ世代ごとに最大 1 回実行します。既定出力へ約 300 ms、1 kHz、振幅 `1e-5` の符号化信号を再生し、別の非公開セルフタップで確認します。小さな音ですが、聞こえない保証はありません。キャプチャ元プロセスを含む場合、他アプリや利用者のキャプチャに入る可能性があります。Started は診断試行への移行を表し、準備中に失敗する試行も含みます。 | 使用しません。 |
+| Windows | 使用しません。 | **除外なし**の従来型 System ループバックと Mix のシステム側で使用します。キャプチャ対象の出力デバイスへ共有モードでデジタル無音を再生し、アイドル時もデバイスの時計でキャプチャを進めます。可聴信号を加えず、音量／ミュートも変更しませんが、他アプリは稼働中の再生セッションを検出でき、Windows の音量ミキサーに表示される場合があります。Started は再生開始の成功後に発生し、それ以前の準備失敗ではペアを出しません。Process／除外ループバックでは使用しません。 |
+| Linux | 使用しません。 | 使用しません。 |
+
+Mix はシステム側のライフサイクルイベントを転送します。ミックス後のマイク音声の有無は、
+macOS 検出器が見るネイティブのシステム側サンプルを置き換えません。
+自プロセスを含めると診断信号がシステム側へ入り、マイクが音響的に拾う場合もあります。
+Windows の Mix は System キャプチャと同じ無音キープアライブを使い、診断音を混ぜません。
+
+出力された Started ごとに、理由付きの Stopped が必ず 1 回だけ続きます。
+ソース切替、復旧、キャンセル、失敗時も同様です。Stopped は後片付けを試みた後に
+ヘルパーの所有が終了したことを表し、ネイティブの後片付け失敗は引き続き型付きエラーで報告します。
+Windows で再生開始後にキャプチャ開始に失敗した場合、理由 `startupFailed` で停止します。
+ライフサイクル同士の順序は保証しますが、PCM や通常イベントとの相対順序は保証しません。
+
+| バインディング | ライフサイクルの配信 | macOS プローブを無効化 | Windows キープアライブを無効化 |
+|---|---|---|---|
+| Rust | 既存の `Stream::poll_event()`（`Event` のバリアント） | `StreamConfig.silence_probe = false` | `OpenOptions::new().windows_classic_loopback_keepalive(false)` |
+| Node | 独立した `OpenOptions.onLifecycleEvent` コールバック | `silenceProbe: false` | `windowsClassicLoopbackKeepalive: false` |
+| Python | 独立した `Stream.poll_lifecycle_event()` FIFO | `silence_probe=False` | `windows_classic_loopback_keepalive=False` |
+| C | 独立した `flexaudio_poll_lifecycle_event_v4`。`flexaudio_lifecycle_event_free_v4` で解放 | `FlexConfig.silence_probe = 2` | v3 基底エンベロープの `windows_classic_loopback_keepalive = 2` |
+| CLI | `--lifecycle-events` で stderr に JSON 行 | `--no-silence-probe` | `--no-classic-loopback-keepalive` |
+
+Node/Python/C の通常イベント経路は、unknown としてもライフサイクルイベントを返しません。
+Node は切替時にハンドラーを省略すると維持し、指定した場合は切替の成功時だけ置き換えます。
+`stop()` は待機中のライフサイクルコールバック完了後に確定します。Python/C のキューは
+停止後も独立して読み出せます。C のイベントは記憶領域を所有し、ストリーム破棄後も有効です。
+
+## 到着時刻ラベルとデバイスの名前空間
+
+主／副チャンクの到着時刻ラベルには、Rust/Python の `arrival_ns`、Node の `arrivalNs`、
+C の `flexaudio_chunk_arrival_ns_v4` / `flexaudio_secondary_arrival_ns_v4` を使います。
+値は既存の `pts_ns` / `ptsNs` と完全に同じです。チャンクの旧名は 0.8 から文書上のみ
+非推奨で、0.9 の期間中もサポートします。固定された C フィールドは恒久的に残します。
+音声の連続性にはフレーム番号を使います。VAD のエポック起点の PTS 名は変わりません。
+
+Rust/Python の `devices_with_namespaces()`、Node の `await devicesWithNamespaces()`、
+C の `flexaudio_devices_with_namespaces_v4`、CLI の `--list-devices-json` は、
+選択用 ID と検出エラーを変えずに提供元の情報を加えます。名前空間は選択用 ID の領域を表し、
+永続的なハードウェア識別情報ではありません。リング容量は全バインディングで設定でき、
+既定は 50 チャンクです。CLI の `--denoise` は録音前に内部標準形式でのノイズ抑制を有効にし、
+出力レートは任意です。
 
 ## 機能対応状況の取得
 
@@ -300,7 +473,7 @@ macOS では kAudioHardwareBadObjectError（`!obj`、0x216f626a）、ESRCH（3�
 その他のプロパティ／パス問い合わせエラーは任意メタデータ不明とします。Windows の待機は
 タイムアウトと待機自体の失敗を区別し、COM 初期化は想定外の HRESULT を報告します。
 
-主／副タップの `ptsNs`（Rust／Python／C は `pts_ns`）は、サンプルを取り込む際に付ける
+主／副タップの `arrivalNs`（Rust／Python は `arrival_ns`、C は v4 アクセサー）は、サンプルを取り込む際に付ける
 到着時刻のラベルで、取り込みごとに基点を取り直します。どの OS でもマイクとループバックは
 同じ時刻の基準を使い、デバイスのタイムスタンプは使いません。ラベルは前の値を下回らないよう
 補正しますが、チャンクの時間範囲が重なったり同じ時刻が繰り返されたりします。
@@ -705,6 +878,11 @@ C の権限イベント種別は引き続き 3 です。N-API/Python の権限�
 
 ### Linux
 
+- PipeWire の ALSA プラグインでは、`snd_pcm_open`/`snd_pcm_close` の 1 往復ごとに
+  約 4 KB がプラグイン内に残る場合があります。CPAL のマイクオープンはこの往復を数回行います。
+  長時間動作するアプリでは、ループで開き直すより開いたマイクストリームを再利用してください。
+  ネイティブ PipeWire のシステム専用キャプチャはこのマイク経路を通りませんが、
+  Mix はマイク側を開きます。
 - マイクのキャプチャは、`cpal` を介して ALSA/PipeWire で行います。
   ユーザーには音声デバイスへのアクセス権が必要です。通常は、`audio` グループへの所属、
   または実行中の PipeWire や PulseAudio セッションによって提供されます。
