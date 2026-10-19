@@ -321,11 +321,21 @@ pub(crate) unsafe fn capture_loop(
     } else {
         1
     };
-    let Some(mut session) =
-        Session::start_and_report(CaptureClient(&client), keepalive, |status| {
-            ready.send(status).is_ok()
-        })
-    else {
+    let helper_stop_reason = keepalive
+        .as_ref()
+        .map(|render| render.stop_reason.clone())
+        .unwrap_or_else(|| {
+            Arc::new(std::sync::Mutex::new(
+                flexaudio_core::HelperStopReason::StreamStopped,
+            ))
+        });
+    let Some(mut session) = Session::start_and_report_with_lifecycle(
+        CaptureClient(&client),
+        keepalive,
+        |status| ready.send(status).is_ok(),
+        Some(event_tx.clone()),
+        helper_stop_reason,
+    ) else {
         return ShutdownReport::new(None, Vec::new());
     };
 
@@ -394,6 +404,9 @@ pub(crate) unsafe fn capture_loop(
         Ok(())
     })();
     // Session drops before capture/event/COM, and render stops after capture.
+    if result.is_err() {
+        session.set_stop_reason(flexaudio_core::HelperStopReason::RuntimeFailed);
+    }
     finish_capture(result, || session.stop(), &event_tx)
 }
 

@@ -42,6 +42,7 @@ use flexaudio_core::CaptureDiagnostics;
 use std::num::NonZeroU64;
 
 mod control;
+pub(crate) use control::is_helper_lifecycle;
 mod delivery;
 mod intake;
 mod intake_generation;

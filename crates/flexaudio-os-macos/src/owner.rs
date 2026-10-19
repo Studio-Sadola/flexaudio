@@ -1,6 +1,7 @@
 //! Checked control-thread shutdown shared by the process and system adapters.
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use flexaudio_core::{Error, ErrorContext, Event, Operation, Result, ShutdownReport};
@@ -49,9 +50,25 @@ pub(crate) fn stop_owner(
 pub(crate) struct OwnerShutdown {
     report: Option<ShutdownReport>,
     events: VecDeque<Event>,
+    lifecycle: VecDeque<Event>,
 }
 
 impl OwnerShutdown {
+    /// Keep completed helper pairs when a new generation replaces its mailbox.
+    pub(crate) fn retain_lifecycle(&mut self, events: Option<&mpsc::Receiver<Event>>) {
+        if let Some(events) = events {
+            self.lifecycle.extend(events.try_iter().filter(|event| {
+                matches!(
+                    event,
+                    Event::SilenceProbeStarted | Event::SilenceProbeStopped { .. }
+                )
+            }));
+        }
+    }
+
+    pub(crate) fn poll_lifecycle(&mut self) -> Option<Event> {
+        self.lifecycle.pop_front()
+    }
     pub(crate) fn reset(&mut self) {
         self.report = None;
         self.events.clear();
@@ -82,5 +99,27 @@ impl OwnerShutdown {
 
     pub(crate) fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flexaudio_core::HelperStopReason;
+
+    #[test]
+    fn resetting_owner_preserves_unread_lifecycle_in_order() {
+        let mut shutdown = OwnerShutdown::default();
+        let (tx, rx) = mpsc::channel();
+        let stopped = Event::SilenceProbeStopped {
+            reason: HelperStopReason::StreamStopped,
+        };
+        tx.send(Event::SilenceProbeStarted).unwrap();
+        tx.send(stopped.clone()).unwrap();
+        assert_eq!(rx.try_recv(), Ok(Event::SilenceProbeStarted));
+        shutdown.retain_lifecycle(Some(&rx));
+        shutdown.reset();
+        assert_eq!(shutdown.poll_lifecycle(), Some(stopped));
+        assert!(shutdown.poll_lifecycle().is_none());
     }
 }

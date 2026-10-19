@@ -198,6 +198,9 @@ impl CaptureBackend for CompositeBackend {
         }
         let previous_report = self.shutdown.take();
         let previous_notices = std::mem::replace(&mut self.notices, Arc::new(Notices::default()));
+        for event in previous_notices.take_lifecycle() {
+            self.notices.queue_final(event);
+        }
         self.stopping = Arc::new(AtomicBool::new(false));
         let started = (|| {
             let mut mic = start_child(&mut self.mic, MixLane::Microphone, self.notices.clone())?;
@@ -207,6 +210,9 @@ impl CaptureBackend for CompositeBackend {
                     Ok(system) => system,
                     Err(error) => {
                         self.notices.retain_primary(error.clone());
+                        self.set_helper_stop_reason(
+                            flexaudio_core::HelperStopReason::StartupFailed,
+                        );
                         self.stop_producers();
                         if let Err(error) = mic.losses() {
                             self.notices.cleanup(error);
@@ -238,6 +244,7 @@ impl CaptureBackend for CompositeBackend {
                     let error = Error::Backend(format!("spawn mix thread: {error}"))
                         .with_context(ErrorContext::new(Operation::Start));
                     self.notices.retain_primary(error.clone());
+                    self.set_helper_stop_reason(flexaudio_core::HelperStopReason::StartupFailed);
                     self.stop_producers();
                     if let Some((mut mic, mut system)) =
                         lanes.lock().unwrap_or_else(|e| e.into_inner()).take()
@@ -256,9 +263,13 @@ impl CaptureBackend for CompositeBackend {
         })();
         if let Err(error) = started {
             self.notices.retain_primary(error);
+            self.set_helper_stop_reason(flexaudio_core::HelperStopReason::StartupFailed);
             let result = self.stop_checked();
             if previous_report.is_some() {
                 self.shutdown = previous_report;
+                for event in self.notices.take_lifecycle() {
+                    previous_notices.queue_final(event);
+                }
                 self.notices = previous_notices;
             }
             return result;
@@ -268,6 +279,11 @@ impl CaptureBackend for CompositeBackend {
 
     fn stop(&mut self) {
         let _ = self.stop_checked();
+    }
+
+    fn set_helper_stop_reason(&mut self, reason: flexaudio_core::HelperStopReason) {
+        self.system.set_helper_stop_reason(reason);
+        self.mic.set_helper_stop_reason(reason);
     }
 
     fn stop_checked(&mut self) -> Result<()> {
@@ -295,6 +311,10 @@ impl CaptureBackend for CompositeBackend {
     }
 
     fn poll_event(&mut self) -> Option<Event> {
+        // Old-generation final notices precede a new child's lifecycle mailbox.
+        if let Some(event) = self.notices.poll_lifecycle() {
+            return Some(event);
+        }
         if let Some(event) = self.notices.take_terminal() {
             return Some(event);
         }

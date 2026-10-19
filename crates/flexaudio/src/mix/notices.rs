@@ -51,6 +51,22 @@ impl State {
 }
 
 impl Notices {
+    pub(super) fn poll_lifecycle(&self) -> Option<Event> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let index = state
+            .events
+            .iter()
+            .position(crate::stream::is_helper_lifecycle)?;
+        state.events.remove(index)
+    }
+
+    pub(super) fn take_lifecycle(&self) -> Vec<Event> {
+        let mut events = Vec::new();
+        while let Some(event) = self.poll_lifecycle() {
+            events.push(event);
+        }
+        events
+    }
     pub(super) fn failed(&self) -> bool {
         self.failed.load(Ordering::SeqCst)
     }

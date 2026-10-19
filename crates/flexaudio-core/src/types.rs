@@ -562,6 +562,20 @@ impl std::fmt::Display for Permission {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
+    /// Entry into a silence diagnostic attempt, including native setup.
+    SilenceProbeStarted,
+    /// The diagnostic owner finished its teardown attempts.
+    SilenceProbeStopped {
+        /// Why helper ownership ended.
+        reason: crate::HelperStopReason,
+    },
+    /// The classic-loopback silent render client started successfully.
+    ClassicLoopbackKeepaliveStarted,
+    /// The silent render owner finished its teardown attempts.
+    ClassicLoopbackKeepaliveStopped {
+        /// Why helper ownership ended.
+        reason: crate::HelperStopReason,
+    },
     /// Leading invalid microphone frames suppressed once per capture generation.
     StartupSamplesDropped {
         /// Suppressed frames at the microphone's native rate.
