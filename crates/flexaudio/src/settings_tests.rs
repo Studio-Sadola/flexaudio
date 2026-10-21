@@ -6,14 +6,12 @@ use std::cell::Cell;
 #[test]
 fn strict_preflight_precedes_all_backend_construction_and_device_access() {
     let calls = Cell::new(0);
-    let config = StreamConfig {
-        device_id: Some("unused selector".into()),
-        target_pid: Some(42),
-        exclude_self: true,
-        mix_mic_gain: 2.0,
-        silence_probe: false,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.device_id = Some("unused selector".into());
+    config.target_pid = Some(42);
+    config.exclude_self = true;
+    config.mix_mic_gain = 2.0;
+    config.silence_probe = false;
     let error = crate::open_using(config.clone(), OpenOptions::new().strict(true), |_, _| {
         // Any permission/format/device query or model load is below this boundary.
         calls.set(calls.get() + 1);
@@ -70,26 +68,28 @@ fn explicit_defaults_pass_strict_and_facade_streams_have_reports() {
 #[test]
 fn invalid_input_kinds_survive_strict_preflight() {
     let configs = [
-        StreamConfig {
-            gain: f32::NAN,
-            target_pid: Some(42),
-            ..Default::default()
+        {
+            let mut config_value = StreamConfig::default();
+            config_value.gain = f32::NAN;
+            config_value.target_pid = Some(42);
+            config_value
         },
-        StreamConfig {
-            ring_capacity_chunks: 0,
-            target_pid: Some(42),
-            ..Default::default()
+        {
+            let mut config_value = StreamConfig::default();
+            config_value.ring_capacity_chunks = 0;
+            config_value.target_pid = Some(42);
+            config_value
         },
-        StreamConfig {
-            kind: SourceKind::ProcessLoopback,
-            device_id: Some("ignored".into()),
-            ..Default::default()
+        {
+            let mut config_value = StreamConfig::new(SourceKind::ProcessLoopback);
+            config_value.device_id = Some("ignored".into());
+            config_value
         },
-        StreamConfig {
-            kind: SourceKind::Mix,
-            mix_mic_gain: -1.0,
-            device_id: Some("ignored".into()),
-            ..Default::default()
+        {
+            let mut config_value = StreamConfig::new(SourceKind::Mix);
+            config_value.mix_mic_gain = -1.0;
+            config_value.device_id = Some("ignored".into());
+            config_value
         },
     ];
     for config in configs {
@@ -105,12 +105,9 @@ fn invalid_input_kinds_survive_strict_preflight() {
 #[test]
 fn strict_allows_existing_exclusion_normalization() {
     let self_pid = std::process::id();
-    let config = StreamConfig {
-        kind: SourceKind::SystemLoopback,
-        exclude_self: true,
-        exclude_pids: vec![self_pid, self_pid],
-        ..Default::default()
-    };
+    let mut config = StreamConfig::new(SourceKind::SystemLoopback);
+    config.exclude_self = true;
+    config.exclude_pids = vec![self_pid, self_pid];
     let stream = crate::open_using(config, OpenOptions::new().strict(true), |_, _| {
         Ok(Box::new(MockBackend::new(48_000, 2, 0.0)))
     })

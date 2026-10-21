@@ -79,10 +79,8 @@ mod tests {
     ) -> (Stream, Arc<Mutex<Option<fa::core::backend::RawSink>>>) {
         let sink = Arc::new(Mutex::new(None));
         let format = fa::OutputFormat::default();
-        let config = fa::StreamConfig {
-            secondary_output: Some(format),
-            ..Default::default()
-        };
+        let mut config = fa::StreamConfig::default();
+        config.secondary_output = Some(format);
         let mut inner = fa::Stream::open(config, Box::new(Input(sink.clone()))).unwrap();
         if vad {
             inner.enable_capture_tap().unwrap();

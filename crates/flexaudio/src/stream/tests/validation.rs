@@ -6,11 +6,8 @@ use super::*;
 #[test]
 fn open_validates_exclusion_pids_for_system_capture() {
     for kind in [SourceKind::SystemLoopback, SourceKind::Mix] {
-        let config = StreamConfig {
-            kind,
-            exclude_pids: vec![0],
-            ..Default::default()
-        };
+        let mut config = StreamConfig::new(kind);
+        config.exclude_pids = vec![0];
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         assert!(matches!(
             Stream::open(config, backend),
@@ -19,21 +16,15 @@ fn open_validates_exclusion_pids_for_system_capture() {
         ));
 
         for exclude_pids in [vec![], vec![42]] {
-            let config = StreamConfig {
-                kind,
-                exclude_pids,
-                ..Default::default()
-            };
+            let mut config = StreamConfig::new(kind);
+            config.exclude_pids = exclude_pids;
             let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
             assert!(Stream::open(config, backend).is_ok());
         }
     }
     for kind in [SourceKind::Mic, SourceKind::ProcessLoopback] {
-        let config = StreamConfig {
-            kind,
-            exclude_pids: vec![0],
-            ..Default::default()
-        };
+        let mut config = StreamConfig::new(kind);
+        config.exclude_pids = vec![0];
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         assert!(Stream::open(config, backend).is_ok());
     }
@@ -46,11 +37,8 @@ fn switch_source_rejects_zero_exclusion_pid_before_replacing_backend() {
     stream.start().expect("start mock capture");
 
     for kind in [SourceKind::SystemLoopback, SourceKind::Mix] {
-        let new_config = StreamConfig {
-            kind,
-            exclude_pids: vec![42, 0],
-            ..Default::default()
-        };
+        let mut new_config = StreamConfig::new(kind);
+        new_config.exclude_pids = vec![42, 0];
         assert!(matches!(
             stream.switch_source(new_config),
             Err(Error::InvalidArg(message))
@@ -66,10 +54,8 @@ fn switch_source_rejects_zero_exclusion_pid_before_replacing_backend() {
 #[test]
 fn open_rejects_zero_ring_capacity() {
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
-    let config = StreamConfig {
-        ring_capacity_chunks: 0,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.ring_capacity_chunks = 0;
     let err = open_err(Stream::open(config, backend), "capacity 0");
     assert!(
         matches!(err, Error::InvalidArg(_)),
@@ -81,12 +67,10 @@ fn open_rejects_zero_ring_capacity() {
 #[test]
 fn open_rejects_invalid_output_channels() {
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
-    let config = StreamConfig {
-        output: OutputFormat {
-            sample_rate: 48_000,
-            channels: 3,
-        },
-        ..Default::default()
+    let mut config = StreamConfig::default();
+    config.output = OutputFormat {
+        sample_rate: 48_000,
+        channels: 3,
     };
     let err = open_err(Stream::open(config, backend), "ch=3");
     assert!(
@@ -99,12 +83,10 @@ fn open_rejects_invalid_output_channels() {
 #[test]
 fn open_rejects_out_of_range_output_rate() {
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
-    let config = StreamConfig {
-        output: OutputFormat {
-            sample_rate: 1_000_000,
-            channels: 2,
-        },
-        ..Default::default()
+    let mut config = StreamConfig::default();
+    config.output = OutputFormat {
+        sample_rate: 1_000_000,
+        channels: 2,
     };
     let err = open_err(Stream::open(config, backend), "extreme rate");
     assert!(
@@ -144,10 +126,8 @@ fn open_rejects_zero_native_format() {
 fn invalid_gain_rejected() {
     // open: config.gain is negative.
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
-    let config = StreamConfig {
-        gain: -1.0,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.gain = -1.0;
     let err = open_err(Stream::open(config, backend), "gain=-1.0");
     assert!(
         matches!(err, Error::InvalidArg(_)),
@@ -156,10 +136,8 @@ fn invalid_gain_rejected() {
 
     // open: config.gain is NaN.
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
-    let config = StreamConfig {
-        gain: f32::NAN,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.gain = f32::NAN;
     let err = open_err(Stream::open(config, backend), "gain=NaN");
     assert!(
         matches!(err, Error::InvalidArg(_)),
@@ -184,25 +162,21 @@ fn invalid_gain_rejected() {
 /// secondary_output cannot be changed with switch_source (it is fixed at open).
 #[test]
 fn secondary_output_cannot_change_on_switch() {
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        }),
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    });
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
     let mut stream = Stream::open(config, backend).expect("open");
     stream.start().expect("start");
 
     // A switch request that changes the secondary format is rejected with InvalidArg before backend construction.
-    let new_config = StreamConfig {
-        secondary_output: Some(OutputFormat {
-            sample_rate: 8_000,
-            channels: 1,
-        }),
-        ..Default::default()
-    };
+    let mut new_config = StreamConfig::default();
+    new_config.secondary_output = Some(OutputFormat {
+        sample_rate: 8_000,
+        channels: 1,
+    });
     let err = stream.switch_source(new_config);
     stream.stop();
     assert!(

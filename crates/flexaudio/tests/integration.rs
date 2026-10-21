@@ -96,12 +96,10 @@ fn mock_passthrough_48000_stereo() {
 #[test]
 fn mock_output_16k_mono() {
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
-    let config = StreamConfig {
-        output: OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        },
-        ..Default::default()
+    let mut config = StreamConfig::default();
+    config.output = OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
     };
     let mut stream = Stream::open(config, backend).expect("open");
     stream.start().expect("start");
@@ -141,12 +139,10 @@ fn mock_output_16k_mono() {
 #[test]
 fn mock_output_16k_stereo() {
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
-    let config = StreamConfig {
-        output: OutputFormat {
-            sample_rate: 16_000,
-            channels: 2,
-        },
-        ..Default::default()
+    let mut config = StreamConfig::default();
+    config.output = OutputFormat {
+        sample_rate: 16_000,
+        channels: 2,
     };
     let mut stream = Stream::open(config, backend).expect("open");
     stream.start().expect("start");
@@ -276,10 +272,8 @@ fn switch_backend_keeps_seq_continuous_and_flags_discontinuity() {
     // MockBackend produces in real time (≤50 chunks/s); even with the hang guard, two
     // 30-second collection windows cap this test at just over 3,000 chunks. Set capacity high
     // enough to hold all of them and make drops structurally impossible.
-    let config = StreamConfig {
-        ring_capacity_chunks: 4096,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.ring_capacity_chunks = 4096;
     let backend = Box::new(MockBackend::new(44_100, 1, 440.0));
     let mut stream = Stream::open(config, backend).expect("open");
     stream.start().expect("start");
@@ -432,13 +426,10 @@ fn switch_source_rejects_output_change() {
     stream.start().expect("start");
 
     // new_config changes only output.
-    let new_config = StreamConfig {
-        kind: SourceKind::Mic,
-        output: OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        },
-        ..Default::default()
+    let mut new_config = StreamConfig::new(SourceKind::Mic);
+    new_config.output = OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
     };
     let err = stream
         .switch_source(new_config)
@@ -480,10 +471,7 @@ fn switch_source_on_unstarted_is_invalid_state() {
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
     let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
 
-    let new_config = StreamConfig {
-        kind: SourceKind::Mic,
-        ..Default::default()
-    };
+    let new_config = StreamConfig::new(SourceKind::Mic);
     let err = stream
         .switch_source(new_config)
         .expect_err("before start, expected InvalidState");

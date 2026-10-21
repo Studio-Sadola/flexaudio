@@ -48,6 +48,7 @@ bitflags! {
 /// with the output rate (48k=960 / 16k=320 / 8k=160). With default output `{48000, 2}`
 ///, `frames == 960` (1920 samples).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct AudioChunk {
     /// Interleaved `f32` samples. Length = `frames * output.channels`.
     pub data: Vec<f32>,
@@ -81,6 +82,35 @@ pub struct AudioChunk {
     pub peak: f32,
     /// Linear root-mean-square value in the final `data` (output format) for this chunk.
     pub rms: f32,
+}
+
+impl AudioChunk {
+    /// Create a chunk with zeroed timeline, sequence, drop count and meters, and no flags.
+    ///
+    /// The caller must supply interleaved samples with `data.len() == frames * channels`
+    /// for the intended output format. The channel count is not stored in a chunk, so
+    /// this constructor cannot validate that relationship. Set `peak` and `rms` after
+    /// processing; this constructor does not measure the samples.
+    ///
+    /// ```
+    /// use flexaudio_core::AudioChunk;
+    /// let mut chunk = AudioChunk::new(vec![0.0; 1920], 960);
+    /// chunk.seq = 1;
+    /// assert_eq!(chunk.frames, 960);
+    /// ```
+    pub fn new(data: Vec<f32>, frames: usize) -> Self {
+        Self {
+            data,
+            frames,
+            frame_index: 0,
+            pts_ns: 0,
+            seq: 0,
+            flags: ChunkFlags::empty(),
+            dropped_before: 0,
+            peak: 0.0,
+            rms: 0.0,
+        }
+    }
 }
 
 /// One 20ms chunk of a secondary output tap.
@@ -138,6 +168,7 @@ pub struct SecondaryChunk {
 /// native fallback with the recovered name. A name-based ID cannot be opened while
 /// its name is unreadable; the native ID remains openable in either name state.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeviceInfo {
     /// Selectable ID. Key accepted by [`StreamConfig::device_id`] (cpal = device name /
     /// PipeWire = `node.name`).
@@ -159,6 +190,33 @@ pub struct DeviceInfo {
     pub is_loopback: bool,
     /// `true` if this is the OS default device (default input / output sink).
     pub is_default: bool,
+}
+
+impl DeviceInfo {
+    /// Create device metadata with an unknown format (0 Hz, 0 channels) and no default status.
+    ///
+    /// `is_loopback` is true for system-output devices. If the native format is known,
+    /// set `sample_rate`, `channels` and `format_available` together. Public fields
+    /// remain writable so discovery providers can supply all available metadata.
+    ///
+    /// ```
+    /// use flexaudio_core::{DeviceInfo, SourceKind};
+    /// let mut device = DeviceInfo::new("input-id".into(), "Microphone".into(), SourceKind::Mic);
+    /// device.is_default = true;
+    /// assert!(!device.format_available);
+    /// ```
+    pub fn new(id: String, name: String, source_kind: SourceKind) -> Self {
+        Self {
+            id,
+            name,
+            source_kind,
+            sample_rate: 0,
+            channels: 0,
+            format_available: false,
+            is_loopback: source_kind == SourceKind::SystemLoopback,
+            is_default: false,
+        }
+    }
 }
 
 /// Information returned for each process by `processes()` (candidate for per-process capture).
@@ -375,6 +433,7 @@ impl Default for OutputFormat {
 /// uses the same exclusion set; microphone and process sources ignore both exclusion fields.
 /// The four `mix_*` fields apply only to [`SourceKind::Mix`] and are ignored for other sources.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct StreamConfig {
     /// Device to select. Applies to both mic (input device) and system (output endpoint).
     /// `None` selects the default (mic = default input / system = default output); `Some(id)` selects the device returned by `devices()`
@@ -468,6 +527,26 @@ pub struct StreamConfig {
     /// Pre-mix linear gain for the system side of [`SourceKind::Mix`]. Default 1.0. Ignored except for
     /// `Mix`. See [`gain`](Self::gain) for the global post-mix multiplier.
     pub mix_system_gain: f32,
+}
+
+impl StreamConfig {
+    /// Create a configuration for a source, keeping all other settings at their defaults.
+    ///
+    /// Set public fields to customize it. Process capture also requires `target_pid`;
+    /// configuration validation happens when opening or switching a stream.
+    ///
+    /// ```
+    /// use flexaudio_core::{SourceKind, StreamConfig};
+    /// let mut config = StreamConfig::new(SourceKind::ProcessLoopback);
+    /// config.target_pid = Some(1234);
+    /// config.gain = 0.5;
+    /// ```
+    pub fn new(kind: SourceKind) -> Self {
+        Self {
+            kind,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for StreamConfig {

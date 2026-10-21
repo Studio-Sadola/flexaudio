@@ -27,11 +27,9 @@ fn fixture(config: fa::StreamConfig, strict: bool) -> Stream {
 fn switch_commits_revision_retains_fixed_values_and_rolls_back_failures() {
     Python::initialize();
     Python::attach(|py| {
-        let config = fa::StreamConfig {
-            gain: 2.0,
-            ring_capacity_chunks: 7,
-            ..Default::default()
-        };
+        let mut config = fa::StreamConfig::default();
+        config.gain = 2.0;
+        config.ring_capacity_chunks = 7;
         let mut stream = fixture(config, true);
         let snapshot = stream.effective_settings(py).unwrap();
         stream.inner.set_gain(3.0).unwrap();
@@ -74,11 +72,9 @@ fn switch_commits_revision_retains_fixed_values_and_rolls_back_failures() {
             0
         );
         let before = stream.settings.report.clone().unwrap();
-        let ignored = fa::StreamConfig {
-            gain: 3.0,
-            ring_capacity_chunks: 7,
-            ..Default::default()
-        };
+        let mut ignored = fa::StreamConfig::default();
+        ignored.gain = 3.0;
+        ignored.ring_capacity_chunks = 7;
         let error = stream
             .switch_with(ignored, false, None, None, |_, _| {
                 panic!("strict rejection reached backend")
@@ -108,10 +104,11 @@ fn switch_commits_revision_retains_fixed_values_and_rolls_back_failures() {
         assert!(stream.settings.strict);
         stream
             .switch_with(
-                fa::StreamConfig {
-                    gain: 4.0,
-                    ring_capacity_chunks: 9,
-                    ..Default::default()
+                {
+                    let mut config_value = fa::StreamConfig::default();
+                    config_value.gain = 4.0;
+                    config_value.ring_capacity_chunks = 9;
+                    config_value
                 },
                 true,
                 None,
@@ -333,11 +330,9 @@ fn defaults_never_trigger_strict_rejection_and_nondefaults_are_permissive() {
         .entries
         .iter()
         .all(|entry| entry.outcome == fa::SettingOutcome::NotRequested));
-    let config = fa::StreamConfig {
-        silence_probe: false,
-        exclude_self: true,
-        ..Default::default()
-    };
+    let mut config = fa::StreamConfig::default();
+    config.silence_probe = false;
+    config.exclude_self = true;
     let request = crate::settings::Request {
         config: &config,
         ..request
@@ -353,16 +348,16 @@ fn both_chunk_arrival_properties_alias_pts_exactly() {
     Python::initialize();
     Python::attach(|py| {
         for pts_ns in [i64::MIN, -1, 0, 123_456_789, i64::MAX] {
-            let audio = chunk_to_py(fa::AudioChunk {
-                data: Vec::new(),
-                frames: 0,
-                frame_index: 0,
-                pts_ns,
-                seq: 0,
-                flags: fa::ChunkFlags::empty(),
-                dropped_before: 0,
-                peak: 0.0,
-                rms: 0.0,
+            let audio = chunk_to_py({
+                let mut chunk_value = fa::AudioChunk::new(Vec::new(), 0);
+                chunk_value.frame_index = 0;
+                chunk_value.pts_ns = pts_ns;
+                chunk_value.seq = 0;
+                chunk_value.flags = fa::ChunkFlags::empty();
+                chunk_value.dropped_before = 0;
+                chunk_value.peak = 0.0;
+                chunk_value.rms = 0.0;
+                chunk_value
             });
             let secondary = crate::secondary::PySecondaryChunk::new(
                 fa::SecondaryChunk {

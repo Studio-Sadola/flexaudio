@@ -58,10 +58,8 @@ fn backend() -> CheckedBackend {
 fn chunk_ms_defaults_to_twenty_and_rejects_other_values_before_acquisition() {
     assert_eq!(StreamConfig::default().chunk_ms, 20);
     for chunk_ms in [0, 1, 10, 21, u32::MAX] {
-        let config = StreamConfig {
-            chunk_ms,
-            ..Default::default()
-        };
+        let mut config = StreamConfig::default();
+        config.chunk_ms = chunk_ms;
         assert!(matches!(
             Stream::open(config.clone(), Box::new(backend())),
             Err(Error::InvalidArg(_))
@@ -245,10 +243,8 @@ fn backend_mix_loss_marks_next_delivered_chunk_on_each_tap_once() {
                 AudioLoss::mix_fifo_overflow(lane, samples),
                 AudioLoss::raw_overflow(Some(lane), samples, 48_000, 2).unwrap(),
             ] {
-                let config = StreamConfig {
-                    secondary_output: Some(OutputFormat::default()),
-                    ..Default::default()
-                };
+                let mut config = StreamConfig::default();
+                config.secondary_output = Some(OutputFormat::default());
                 let mut stream =
                     Stream::open(config, Box::new(LossBackend { loss: Some(loss) })).unwrap();
                 stream.enable_capture_tap().unwrap();
@@ -434,9 +430,10 @@ fn delayed_capture_poll_reports_exact_loss_and_next_delivery_discontinuity() {
     }
     let sink = Arc::new(Mutex::new(None));
     let mut stream = Stream::open(
-        StreamConfig {
-            ring_capacity_chunks: 2,
-            ..Default::default()
+        {
+            let mut config_value = StreamConfig::default();
+            config_value.ring_capacity_chunks = 2;
+            config_value
         },
         Box::new(ControlledBackend(sink.clone())),
     )

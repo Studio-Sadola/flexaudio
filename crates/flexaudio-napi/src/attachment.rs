@@ -513,13 +513,11 @@ mod tests {
             };
             let mut bridge =
                 VadBridge::new(params, VadRuntimeOptions { provisional: true }, selected).unwrap();
-            let config = StreamConfig {
-                secondary_output: Some(OutputFormat {
-                    sample_rate: 16_000,
-                    channels: 1,
-                }),
-                ..Default::default()
-            };
+            let mut config = StreamConfig::default();
+            config.secondary_output = Some(OutputFormat {
+                sample_rate: 16_000,
+                channels: 1,
+            });
             let mut stream = flexaudio::Stream::open(
                 config,
                 Box::new(flexaudio::MockBackend::new(48_000, 2, 0.0)),
@@ -586,16 +584,16 @@ mod tests {
             (base + 960, 20_000_000, ChunkFlags::empty()),
             (base + 1920, 1_000_000_000, ChunkFlags::DISCONTINUITY),
         ] {
-            bridge.process(AudioChunk {
-                data: vec![0.0; 1920],
-                frames: 960,
-                frame_index: index,
-                pts_ns: pts,
-                seq: 0,
-                flags,
-                dropped_before: 0,
-                peak: 0.0,
-                rms: 0.0,
+            bridge.process({
+                let mut chunk_value = AudioChunk::new(vec![0.0; 1920], 960);
+                chunk_value.frame_index = index;
+                chunk_value.pts_ns = pts;
+                chunk_value.seq = 0;
+                chunk_value.flags = flags;
+                chunk_value.dropped_before = 0;
+                chunk_value.peak = 0.0;
+                chunk_value.rms = 0.0;
+                chunk_value
             });
         }
         let events = bridge.take_events();

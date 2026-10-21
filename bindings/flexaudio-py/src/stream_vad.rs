@@ -83,16 +83,16 @@ impl Stream {
             self.secondary_vad_carrier();
             return;
         }
-        let mut chunk = chunk_to_py(fa::AudioChunk {
-            data: Vec::new(),
-            frames: 0,
-            frame_index: self.vad_origin.0,
-            pts_ns: self.vad_origin.1,
-            seq: 0,
-            flags: fa::ChunkFlags::empty(),
-            dropped_before: 0,
-            peak: 0.0,
-            rms: 0.0,
+        let mut chunk = chunk_to_py({
+            let mut chunk_value = fa::AudioChunk::new(Vec::new(), 0);
+            chunk_value.frame_index = self.vad_origin.0;
+            chunk_value.pts_ns = self.vad_origin.1;
+            chunk_value.seq = 0;
+            chunk_value.flags = fa::ChunkFlags::empty();
+            chunk_value.dropped_before = 0;
+            chunk_value.peak = 0.0;
+            chunk_value.rms = 0.0;
+            chunk_value
         });
         chunk.set_vad_events(std::mem::take(&mut self.vad_events));
         self.ready_chunks.push_back(chunk);

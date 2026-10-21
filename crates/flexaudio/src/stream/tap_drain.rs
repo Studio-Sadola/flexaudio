@@ -71,17 +71,14 @@ pub(super) fn drain(
         if state.discontinuity || resumed != state.resume_generation {
             flags |= ChunkFlags::DISCONTINUITY;
         }
-        let chunk = AudioChunk {
-            data,
-            frames,
-            frame_index,
-            pts_ns,
-            seq: state.seq,
-            flags,
-            dropped_before: 0,
-            peak,
-            rms,
-        };
+        let mut chunk = AudioChunk::new(data, frames);
+        chunk.frame_index = frame_index;
+        chunk.pts_ns = pts_ns;
+        chunk.seq = state.seq;
+        chunk.flags = flags;
+        chunk.dropped_before = 0;
+        chunk.peak = peak;
+        chunk.rms = rms;
         match &mut ring {
             Ring::Capture(producer) => {
                 if let Some((_, evicted)) = producer.push_with_evicted(chunk) {

@@ -41,16 +41,12 @@ mod tests {
     #[test]
     fn fake_device_list_preserves_selectors_and_provenance() {
         let id = "device\"\\\n\u{0000}";
-        let device = DeviceInfo {
-            id: id.into(),
-            name: "Input".into(),
-            source_kind: SourceKind::Mic,
-            sample_rate: 48000,
-            channels: 2,
-            format_available: true,
-            is_loopback: false,
-            is_default: true,
-        };
+        let mut device = DeviceInfo::new(id.into(), "Input".into(), SourceKind::Mic);
+        device.sample_rate = 48000;
+        device.channels = 2;
+        device.format_available = true;
+        device.is_loopback = false;
+        device.is_default = true;
         let entries = [NamespacedDevice::new(
             device,
             DeviceIdNamespace::CpalDeviceName,

@@ -39,13 +39,11 @@ fn first_chunk(stream: &mut Stream) -> Result<AudioChunk> {
 }
 #[test]
 fn startup_mic_gap_preserves_all_tap_frame_indices_and_discontinuity() -> Result<()> {
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        }),
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    });
     let mut stream = Stream::open(config, Box::new(input(3.058)))?;
     stream.enable_capture_tap()?;
     stream.start()?;
@@ -79,13 +77,7 @@ fn startup_valid_zeros_and_system_out_of_range_are_controls() -> Result<()> {
         (flexaudio_core::SourceKind::Mic, 0.0),
         (flexaudio_core::SourceKind::SystemLoopback, 3.058),
     ] {
-        let mut stream = Stream::open(
-            StreamConfig {
-                kind,
-                ..Default::default()
-            },
-            Box::new(input(prefix)),
-        )?;
+        let mut stream = Stream::open(StreamConfig::new(kind), Box::new(input(prefix)))?;
         stream.start()?;
         let first = first_chunk(&mut stream)?;
         stream.stop_checked()?;
@@ -354,13 +346,11 @@ fn valid_pending_startup_is_accounted_when_terminal_closes_capture() -> Result<(
 
 #[test]
 fn pending_startup_report_precedes_ordered_primary_secondary_and_capture() -> Result<()> {
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        }),
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    });
     let mut stream = Stream::open(config, Box::new(input(3.058)))?;
     stream.enable_capture_tap()?;
     stream.enable_ordered_delivery()?;

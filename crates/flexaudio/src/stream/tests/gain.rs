@@ -12,10 +12,8 @@ fn gain_scales_samples_and_meters() {
     // (gain, expected peak range). Sine amplitude 0.5 × gain.
     for (gain, lo, hi) in [(2.0f32, 0.95f32, 1.0f32), (0.5, 0.2, 0.3)] {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
-        let config = StreamConfig {
-            gain,
-            ..Default::default()
-        };
+        let mut config = StreamConfig::default();
+        config.gain = gain;
         let mut stream = Stream::open(config, backend).expect("open");
         stream.start().expect("start");
         let chunks = collect_for(&mut stream, Duration::from_millis(300));
@@ -85,10 +83,8 @@ fn set_gain_takes_effect_mid_stream() {
 #[test]
 fn gain_clamps_to_unit_range() {
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
-    let config = StreamConfig {
-        gain: 100.0,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.gain = 100.0;
     let mut stream = Stream::open(config, backend).expect("open");
     stream.start().expect("start");
     let chunks = collect_for(&mut stream, Duration::from_millis(300));

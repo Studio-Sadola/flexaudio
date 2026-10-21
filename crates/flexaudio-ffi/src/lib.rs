@@ -1115,16 +1115,16 @@ mod inventory_policy_tests {
     #[test]
     fn v2_format_accessor_preserves_v1_layout_and_zero_sentinel() {
         for (format, expected) in [((0, 0), false), ((48_000, 2), true)] {
-            let info = flexaudio::DeviceInfo {
-                id: "fixture".into(),
-                name: "fixture".into(),
-                source_kind: flexaudio::SourceKind::Mic,
-                sample_rate: format.0,
-                channels: format.1,
-                format_available: expected,
-                is_loopback: false,
-                is_default: false,
-            };
+            let mut info = flexaudio::DeviceInfo::new(
+                "fixture".into(),
+                "fixture".into(),
+                flexaudio::SourceKind::Mic,
+            );
+            info.sample_rate = format.0;
+            info.channels = format.1;
+            info.format_available = expected;
+            info.is_loopback = false;
+            info.is_default = false;
             let c = convert::device_info_to_c(info);
             unsafe {
                 assert_eq!(flexaudio_device_format_available_v2(&c), expected);

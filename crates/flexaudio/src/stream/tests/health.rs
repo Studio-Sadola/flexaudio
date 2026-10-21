@@ -267,10 +267,8 @@ fn backend_panic_on_watchdog_reopen_surfaces_event_error() {
 fn ring_overflow_marks_discontinuity() {
     let backend = Box::new(FloodingMockBackend::new());
     // Use a larger ChunkRing so DROP_OLDEST does not discard chunks before they can be observed.
-    let config = StreamConfig {
-        ring_capacity_chunks: 200,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.ring_capacity_chunks = 200;
     let mut stream = Stream::open(config, backend).expect("open");
     stream.start().expect("start");
 

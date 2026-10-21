@@ -109,10 +109,7 @@ fn every_ignored_matrix_cell_and_its_default_value() {
     }
     assert!(rows.len() > 500);
     for ((platform, kind, switch, exclusions), key, reason) in rows {
-        let mut r = SettingsRequest::new(StreamConfig {
-            kind,
-            ..Default::default()
-        });
+        let mut r = SettingsRequest::new(StreamConfig::new(kind));
         r.attachments.fixed_at_open = vec![Denoise, Vad];
         if exclusions {
             r.config.exclude_pids = vec![99];
@@ -152,12 +149,12 @@ fn defaults_applied_values_and_normalization() {
         .entries
         .iter()
         .all(|entry| entry.outcome == SettingOutcome::NotRequested));
-    let mut r = SettingsRequest::new(StreamConfig {
-        kind: SourceKind::Mix,
-        exclude_self: true,
-        exclude_pids: vec![42, 42],
-        mix_system_device_id: Some("output".into()),
-        ..Default::default()
+    let mut r = SettingsRequest::new({
+        let mut config_value = StreamConfig::new(SourceKind::Mix);
+        config_value.exclude_self = true;
+        config_value.exclude_pids = vec![42, 42];
+        config_value.mix_system_device_id = Some("output".into());
+        config_value
     });
     let report = resolve_settings(&r, SettingsPlatform::MacOs, 100, None).unwrap();
     let pids = report.get(SettingKey::ExcludePids).unwrap();
@@ -198,10 +195,11 @@ fn defaults_applied_values_and_normalization() {
 
 #[test]
 fn switch_defaults_compare_with_defaults_and_retain_fixed_values() {
-    let mut r = SettingsRequest::new(StreamConfig {
-        gain: 2.0,
-        ring_capacity_chunks: 7,
-        ..Default::default()
+    let mut r = SettingsRequest::new({
+        let mut config_value = StreamConfig::default();
+        config_value.gain = 2.0;
+        config_value.ring_capacity_chunks = 7;
+        config_value
     });
     let initial = resolve_settings(&r, SettingsPlatform::Linux, 100, None).unwrap();
     let identical = resolve_settings(&r, SettingsPlatform::Linux, 100, Some(&initial)).unwrap();
@@ -240,9 +238,10 @@ fn switch_defaults_compare_with_defaults_and_retain_fixed_values() {
 
 #[test]
 fn ignored_error_preserves_primary_context_and_existing_eq_contract() {
-    let r = SettingsRequest::new(StreamConfig {
-        mix_mic_gain: f32::NAN,
-        ..Default::default()
+    let r = SettingsRequest::new({
+        let mut config_value = StreamConfig::default();
+        config_value.mix_mic_gain = f32::NAN;
+        config_value
     });
     let report = resolve_settings(&r, SettingsPlatform::Linux, 100, None).unwrap();
     let error = Error::IgnoredSettings { report };
@@ -333,10 +332,10 @@ fn applicable_platform_rows_apply_without_discovery() {
         SourceKind::ProcessLoopback,
         SourceKind::Mix,
     ] {
-        let mut request = SettingsRequest::new(StreamConfig {
-            kind,
-            silence_probe: false,
-            ..Default::default()
+        let mut request = SettingsRequest::new({
+            let mut config_value = StreamConfig::new(kind);
+            config_value.silence_probe = false;
+            config_value
         });
         let report = resolve_settings(&request, SettingsPlatform::MacOs, 100, None).unwrap();
         assert_eq!(
@@ -361,10 +360,10 @@ fn applicable_platform_rows_apply_without_discovery() {
         SettingsPlatform::MacOs,
     ] {
         for kind in [SourceKind::Mic, SourceKind::SystemLoopback] {
-            let request = SettingsRequest::new(StreamConfig {
-                kind,
-                device_id: Some("selector".into()),
-                ..Default::default()
+            let request = SettingsRequest::new({
+                let mut config_value = StreamConfig::new(kind);
+                config_value.device_id = Some("selector".into());
+                config_value
             });
             let report = resolve_settings(&request, platform, 100, None).unwrap();
             assert_eq!(
@@ -382,10 +381,7 @@ fn omitted_switch_options_use_default_requests_and_inherit_effective_values() {
         SettingsPlatform::Windows,
         SettingsPlatform::MacOs,
     ] {
-        let mut request = SettingsRequest::new(StreamConfig {
-            kind: SourceKind::SystemLoopback,
-            ..Default::default()
-        });
+        let mut request = SettingsRequest::new(StreamConfig::new(SourceKind::SystemLoopback));
         request.keepalive = Some(false);
         request.attachments.denoise = Some(true);
         let initial = resolve_settings(&request, platform, 100, None).unwrap();
@@ -420,24 +416,17 @@ fn omitted_keepalive_switch_uses_configured_control_after_inapplicable_source() 
         for enabled in [true, false] {
             let options = OpenOptions::new().windows_classic_loopback_keepalive(enabled);
             let initial = resolve_for_platform(
-                &SettingsRequest::new(StreamConfig {
-                    kind,
-                    ..Default::default()
-                })
-                .open_options(&options),
+                &SettingsRequest::new(StreamConfig::new(kind)).open_options(&options),
                 SettingsPlatform::Windows,
                 100,
             )
             .unwrap();
             assert_eq!(initial.get(key).unwrap().effective, SettingValue::Absent);
 
-            let request = SettingsRequest::new(StreamConfig {
-                kind: SourceKind::SystemLoopback,
-                ..Default::default()
-            })
-            .open_options(&options)
-            .windows_classic_loopback_keepalive(None)
-            .previous(&initial);
+            let request = SettingsRequest::new(StreamConfig::new(SourceKind::SystemLoopback))
+                .open_options(&options)
+                .windows_classic_loopback_keepalive(None)
+                .previous(&initial);
             let report = resolve_for_platform(&request, SettingsPlatform::Windows, 100).unwrap();
             let entry = report.get(key).unwrap();
             assert_eq!(entry.requested, SettingValue::Bool(true));
@@ -453,11 +442,7 @@ fn omitted_keepalive_switch_restores_false_after_inapplicable_round_trip() {
     let key = SettingKey::WindowsClassicLoopbackKeepalive;
     let options = OpenOptions::new().windows_classic_loopback_keepalive(false);
     let initial = resolve_for_platform(
-        &SettingsRequest::new(StreamConfig {
-            kind: SourceKind::SystemLoopback,
-            ..Default::default()
-        })
-        .open_options(&options),
+        &SettingsRequest::new(StreamConfig::new(SourceKind::SystemLoopback)).open_options(&options),
         SettingsPlatform::Windows,
         100,
     )
@@ -481,10 +466,10 @@ fn omitted_keepalive_switch_restores_false_after_inapplicable_round_trip() {
                 SettingValue::Bool(false),
             ),
         ] {
-            let request = SettingsRequest::new(StreamConfig {
-                kind,
-                exclude_self,
-                ..Default::default()
+            let request = SettingsRequest::new({
+                let mut config_value = StreamConfig::new(kind);
+                config_value.exclude_self = exclude_self;
+                config_value
             })
             .open_options(&options)
             .windows_classic_loopback_keepalive(None)
@@ -502,25 +487,18 @@ fn omitted_keepalive_switch_restores_false_after_inapplicable_round_trip() {
 
 #[test]
 fn omitted_attachments_retain_configured_values_across_source_round_trip() {
-    let initial_request = SettingsRequest::new(StreamConfig {
-        kind: SourceKind::SystemLoopback,
-        ..Default::default()
-    })
-    .attachments(
-        SettingsAttachments::new()
-            .denoise(true)
-            .vad(true)
-            .secondary_encoding("s16"),
-    );
+    let initial_request = SettingsRequest::new(StreamConfig::new(SourceKind::SystemLoopback))
+        .attachments(
+            SettingsAttachments::new()
+                .denoise(true)
+                .vad(true)
+                .secondary_encoding("s16"),
+        );
     let mut previous =
         resolve_for_platform(&initial_request, SettingsPlatform::Windows, 100).unwrap();
     for kind in [SourceKind::Mic, SourceKind::SystemLoopback] {
         let report = resolve_for_platform(
-            &SettingsRequest::new(StreamConfig {
-                kind,
-                ..Default::default()
-            })
-            .previous(&previous),
+            &SettingsRequest::new(StreamConfig::new(kind)).previous(&previous),
             SettingsPlatform::Windows,
             100,
         )

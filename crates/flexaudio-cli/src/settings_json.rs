@@ -102,9 +102,10 @@ mod tests {
             json!({"sampleRate":48000,"channels":2})
         );
         let report = flexaudio::resolve_settings(
-            &flexaudio::SettingsRequest::new(flexaudio::StreamConfig {
-                gain: 2.0,
-                ..Default::default()
+            &flexaudio::SettingsRequest::new({
+                let mut config_value = flexaudio::StreamConfig::default();
+                config_value.gain = 2.0;
+                config_value
             })
             .attachments(
                 flexaudio::SettingsAttachments::new().legacy_sentinels([SettingKey::Gain]),

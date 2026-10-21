@@ -60,26 +60,28 @@ fn options_default_and_builder_preserve_legacy_keepalive() {
 #[test]
 fn facade_open_matches_explicit_default_options_without_hardware() {
     let configs = [
-        StreamConfig {
-            chunk_ms: 10,
-            ..Default::default()
+        {
+            let mut config_value = StreamConfig::default();
+            config_value.chunk_ms = 10;
+            config_value
         },
-        StreamConfig {
-            output: OutputFormat {
+        {
+            let mut config_value = StreamConfig::default();
+            config_value.output = OutputFormat {
                 sample_rate: 0,
                 channels: 2,
-            },
-            ..Default::default()
+            };
+            config_value
         },
-        StreamConfig {
-            kind: crate::SourceKind::SystemLoopback,
-            exclude_pids: vec![0],
-            ..Default::default()
+        {
+            let mut config_value = StreamConfig::new(crate::SourceKind::SystemLoopback);
+            config_value.exclude_pids = vec![0];
+            config_value
         },
-        StreamConfig {
-            kind: crate::SourceKind::ProcessLoopback,
-            target_pid: None,
-            ..Default::default()
+        {
+            let mut config_value = StreamConfig::new(crate::SourceKind::ProcessLoopback);
+            config_value.target_pid = None;
+            config_value
         },
     ];
     for config in configs {
@@ -98,11 +100,8 @@ fn facade_open_matches_explicit_default_options_without_hardware() {
 fn facade_open_retains_default_and_explicit_options_before_capture_starts() {
     // Process backend construction stores the PID and format without opening
     // native capture, so the successful facade path needs no device or consent.
-    let config = StreamConfig {
-        kind: crate::SourceKind::ProcessLoopback,
-        target_pid: Some(1),
-        ..Default::default()
-    };
+    let mut config = StreamConfig::new(crate::SourceKind::ProcessLoopback);
+    config.target_pid = Some(1);
     let legacy = crate::open(config.clone()).unwrap();
     let explicit = crate::open_with_options(config.clone(), OpenOptions::default()).unwrap();
     assert_eq!(legacy.config(), explicit.config());
@@ -140,10 +139,8 @@ fn successful_source_switch_commits_explicit_options() {
     let initial = StreamConfig::default();
     let mut stream = Stream::open(initial.clone(), Box::new(backend(false))).unwrap();
     stream.start().unwrap();
-    let replacement = StreamConfig {
-        kind: crate::SourceKind::SystemLoopback,
-        ..initial
-    };
+    let mut replacement = initial;
+    replacement.kind = crate::SourceKind::SystemLoopback;
     stream
         .switch_source_using(
             replacement.clone(),
@@ -198,10 +195,8 @@ fn source_start_failure_restores_backend_and_keeps_previous_options() {
         Stream::open_with_backend_options(initial.clone(), Box::new(old_backend), options(false))
             .unwrap();
     stream.start().unwrap();
-    let replacement = StreamConfig {
-        kind: crate::SourceKind::SystemLoopback,
-        ..initial.clone()
-    };
+    let mut replacement = initial.clone();
+    replacement.kind = crate::SourceKind::SystemLoopback;
     assert_eq!(
         stream.switch_source_using(replacement, None, Some(options(true)), |_, requested| {
             assert_eq!(requested, &options(true));
@@ -221,12 +216,10 @@ fn public_options_switch_does_not_commit_on_validation_failure() {
     let initial = StreamConfig::default();
     let mut stream = Stream::open(initial.clone(), Box::new(backend(false))).unwrap();
     stream.start().unwrap();
-    let replacement = StreamConfig {
-        output: OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        },
-        ..initial.clone()
+    let mut replacement = initial.clone();
+    replacement.output = OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
     };
     assert!(matches!(
         stream.switch_source_with_options(replacement, options(false)),

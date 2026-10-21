@@ -473,16 +473,16 @@ fn free_releases_attached_stream_and_unread_outputs() {
         flexaudio::Stream::open(Default::default(), Box::new(OwnedBackend(dropped.clone())))
             .unwrap();
     stream.vad_events.push(terminal());
-    let chunk = crate::convert::chunk_to_c(flexaudio::AudioChunk {
-        data: vec![0.25; 1920],
-        frames: 960,
-        frame_index: 0,
-        pts_ns: 0,
-        seq: 0,
-        flags: flexaudio::ChunkFlags::empty(),
-        dropped_before: 0,
-        peak: 0.25,
-        rms: 0.25,
+    let chunk = crate::convert::chunk_to_c({
+        let mut chunk_value = flexaudio::AudioChunk::new(vec![0.25; 1920], 960);
+        chunk_value.frame_index = 0;
+        chunk_value.pts_ns = 0;
+        chunk_value.seq = 0;
+        chunk_value.flags = flexaudio::ChunkFlags::empty();
+        chunk_value.dropped_before = 0;
+        chunk_value.peak = 0.25;
+        chunk_value.rms = 0.25;
+        chunk_value
     });
     let (data, len) = (chunk.data, chunk.len);
     let chunk = stream.versioned_chunk(chunk);

@@ -4,13 +4,11 @@ use crate::*;
 
 #[test]
 fn public_preflight_and_stream_own_the_same_complete_attachment_report() {
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        }),
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    });
     let attachments = SettingsAttachments::new()
         .denoise(true)
         .vad(true)
@@ -43,13 +41,11 @@ fn public_preflight_and_stream_own_the_same_complete_attachment_report() {
 
 #[test]
 fn fixed_attachment_policy_is_per_key_and_omission_retains_values() {
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        }),
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    });
     let initial = resolve_settings(
         &SettingsRequest::new(config).attachments(
             SettingsAttachments::new()
@@ -113,9 +109,10 @@ fn fixed_attachment_policy_is_per_key_and_omission_retains_values() {
 #[test]
 fn public_legacy_decoding_obeys_default_and_ignore_precedence() {
     for gain in [1.0, 2.0] {
-        let request = SettingsRequest::new(StreamConfig {
-            gain,
-            ..Default::default()
+        let request = SettingsRequest::new({
+            let mut config_value = StreamConfig::default();
+            config_value.gain = gain;
+            config_value
         })
         .attachments(SettingsAttachments::new().legacy_sentinels([SettingKey::Gain]));
         let report = resolve_settings(&request).unwrap();

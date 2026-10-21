@@ -39,15 +39,15 @@ pub(super) fn namespaced_devices(state: &EnumState) -> Vec<NamespacedDevice> {
                 n.channels.unwrap_or(NATIVE_CHANNELS),
             )));
         out.push(NamespacedDevice::new(
-            DeviceInfo {
-                id: n.node_name.clone(),
-                name: n.description.clone(),
-                source_kind,
-                sample_rate,
-                channels,
-                format_available,
-                is_loopback,
-                is_default,
+            {
+                let mut device_value =
+                    DeviceInfo::new(n.node_name.clone(), n.description.clone(), source_kind);
+                device_value.sample_rate = sample_rate;
+                device_value.channels = channels;
+                device_value.format_available = format_available;
+                device_value.is_loopback = is_loopback;
+                device_value.is_default = is_default;
+                device_value
             },
             DeviceIdNamespace::PipeWireNodeName,
         ));

@@ -428,24 +428,21 @@ fn parse_sources(spec: &str) -> std::result::Result<Vec<Segment>, String> {
 /// Build [`StreamConfig`] from the given [`SourceKind`] and shared CLI settings
 /// (output / pid / exclusions). Used for initial capture and every `--sources` segment.
 fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
-    let mut config = StreamConfig {
-        kind,
-        silence_probe: !cli.no_silence_probe,
-        output: cli.output_format(),
-        target_pid: cli.process_id,
-        mode: cli.mode.into(),
-        exclude_self: cli.exclude_self,
-        exclude_pids: cli.exclude_pids.clone(),
-        device_id: cli.device_id.clone(),
-        gain: cli.gain,
-        ring_capacity_chunks: cli.ring_capacity_chunks,
-        // Mix-only settings (the facade ignores them for other segment types).
-        mix_mic_device_id: cli.mic_device_id.clone(),
-        mix_system_device_id: cli.system_device_id.clone(),
-        mix_mic_gain: cli.mic_gain,
-        mix_system_gain: cli.system_gain,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::new(kind);
+    config.silence_probe = !cli.no_silence_probe;
+    config.output = cli.output_format();
+    config.target_pid = cli.process_id;
+    config.mode = cli.mode.into();
+    config.exclude_self = cli.exclude_self;
+    config.exclude_pids = cli.exclude_pids.clone();
+    config.device_id = cli.device_id.clone();
+    config.gain = cli.gain;
+    config.ring_capacity_chunks = cli.ring_capacity_chunks;
+    // Mix-only settings (the facade ignores them for other segment types).
+    config.mix_mic_device_id = cli.mic_device_id.clone();
+    config.mix_system_device_id = cli.system_device_id.clone();
+    config.mix_mic_gain = cli.mic_gain;
+    config.mix_system_gain = cli.system_gain;
     // A schedule shares arguments across sources. Only request routing settings on segments
     // that can use them; standalone commands still expose mistakes to strict validation.
     if cli.sources.is_some() {
@@ -2114,16 +2111,16 @@ mod tests {
 
     /// Create a test chunk with identical interleaved samples.
     fn chunk_of(frames: usize, channels: usize, value: f32) -> AudioChunk {
-        AudioChunk {
-            frame_index: 0,
-            data: vec![value; frames * channels],
-            frames,
-            pts_ns: 0,
-            seq: 0,
-            flags: flexaudio::core::ChunkFlags::empty(),
-            dropped_before: 0,
-            peak: value.abs(),
-            rms: value.abs(),
+        {
+            let mut chunk_value = AudioChunk::new(vec![value; frames * channels], frames);
+            chunk_value.frame_index = 0;
+            chunk_value.pts_ns = 0;
+            chunk_value.seq = 0;
+            chunk_value.flags = flexaudio::core::ChunkFlags::empty();
+            chunk_value.dropped_before = 0;
+            chunk_value.peak = value.abs();
+            chunk_value.rms = value.abs();
+            chunk_value
         }
     }
 
@@ -2158,17 +2155,14 @@ mod tests {
         let data: Vec<f32> = (0..320)
             .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
             .collect();
-        let chunk = AudioChunk {
-            frame_index: 0,
-            data,
-            frames: 320,
-            pts_ns: 0,
-            seq: 0,
-            flags: flexaudio::core::ChunkFlags::empty(),
-            dropped_before: 0,
-            peak: 0.5,
-            rms: 0.5,
-        };
+        let mut chunk = AudioChunk::new(data, 320);
+        chunk.frame_index = 0;
+        chunk.pts_ns = 0;
+        chunk.seq = 0;
+        chunk.flags = flexaudio::core::ChunkFlags::empty();
+        chunk.dropped_before = 0;
+        chunk.peak = 0.5;
+        chunk.rms = 0.5;
 
         let mut writer = RotatingWavWriter::new(&path, output, 0);
         assert!(writer.write_chunk(&chunk).expect("write").is_none());
@@ -2360,11 +2354,8 @@ mod tests {
             sample_rate: 16_000,
             channels: 1,
         };
-        let config = StreamConfig {
-            kind: SourceKind::Mic,
-            output,
-            ..Default::default()
-        };
+        let mut config = StreamConfig::new(SourceKind::Mic);
+        config.output = output;
         // 48 kHz mono sine-wave source (no real hardware required). Stream converts it to 16 kHz mono.
         let backend = Box::new(MockBackend::new(48_000, 1, 440.0));
         let mut stream = Stream::open(config, backend).expect("open stream");
@@ -2470,18 +2461,15 @@ mod tests {
     /// outside the range saturate.
     #[test]
     fn write_chunk_s16_quantizes_and_clamps() {
-        let chunk = AudioChunk {
-            frame_index: 0,
-            // 0.0 / 1.0 / -1.0 / out-of-range 2.0 (-> clamp 32767) / -2.0 (-> clamp -32768).
-            data: vec![0.0, 1.0, -1.0, 2.0, -2.0],
-            frames: 5,
-            pts_ns: 0,
-            seq: 0,
-            flags: flexaudio::core::ChunkFlags::empty(),
-            dropped_before: 0,
-            peak: 1.0,
-            rms: 0.5,
-        };
+        // Out-of-range samples saturate when quantized to signed 16-bit PCM.
+        let mut chunk = AudioChunk::new(vec![0.0, 1.0, -1.0, 2.0, -2.0], 5);
+        chunk.frame_index = 0;
+        chunk.pts_ns = 0;
+        chunk.seq = 0;
+        chunk.flags = flexaudio::core::ChunkFlags::empty();
+        chunk.dropped_before = 0;
+        chunk.peak = 1.0;
+        chunk.rms = 0.5;
         let mut buf: Vec<u8> = Vec::new();
         write_chunk(&mut buf, &chunk, EncodingArg::S16).expect("write");
         // s16 LE: 2 bytes per sample × 5 = 10 bytes.
@@ -2497,17 +2485,14 @@ mod tests {
     /// f32 path in `write_chunk`: byte length is sample count × 4 and little-endian decoding matches.
     #[test]
     fn write_chunk_f32_roundtrips() {
-        let chunk = AudioChunk {
-            frame_index: 0,
-            data: vec![0.25, -0.5, 0.75],
-            frames: 3,
-            pts_ns: 0,
-            seq: 0,
-            flags: flexaudio::core::ChunkFlags::empty(),
-            dropped_before: 0,
-            peak: 0.75,
-            rms: 0.5,
-        };
+        let mut chunk = AudioChunk::new(vec![0.25, -0.5, 0.75], 3);
+        chunk.frame_index = 0;
+        chunk.pts_ns = 0;
+        chunk.seq = 0;
+        chunk.flags = flexaudio::core::ChunkFlags::empty();
+        chunk.dropped_before = 0;
+        chunk.peak = 0.75;
+        chunk.rms = 0.5;
         let mut buf: Vec<u8> = Vec::new();
         write_chunk(&mut buf, &chunk, EncodingArg::F32).expect("write");
         assert_eq!(buf.len(), 12); // 3 samples × 4 bytes.
@@ -2839,10 +2824,8 @@ mod reproduction_tests {
     fn config_error_keeps_library_message_and_default_chunk_duration() {
         let cli = cli_from(&[]);
         assert_eq!(config_for_kind(&cli, SourceKind::Mic).chunk_ms, 20);
-        let config = StreamConfig {
-            chunk_ms: 10,
-            ..StreamConfig::default()
-        };
+        let mut config = StreamConfig::default();
+        config.chunk_ms = 10;
         let error = match Stream::open(
             config,
             Box::new(flexaudio::MockBackend::new(48_000, 1, 0.0)),

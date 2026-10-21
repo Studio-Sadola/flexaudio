@@ -314,15 +314,15 @@ mod tests {
     #[test]
     fn device_event_conversion_and_free() {
         // Added: all fields are populated.
-        let added = device_event_to_c(DeviceEvent::Added(DeviceInfo {
-            id: "node-1".to_string(),
-            name: "Mic A".to_string(),
-            source_kind: SourceKind::Mic,
-            sample_rate: 48_000,
-            channels: 2,
-            format_available: true,
-            is_loopback: false,
-            is_default: true,
+        let added = device_event_to_c(DeviceEvent::Added({
+            let mut device_value =
+                DeviceInfo::new("node-1".to_string(), "Mic A".to_string(), SourceKind::Mic);
+            device_value.sample_rate = 48_000;
+            device_value.channels = 2;
+            device_value.format_available = true;
+            device_value.is_loopback = false;
+            device_value.is_default = true;
+            device_value
         }));
         assert_eq!(added.kind, FlexDeviceEventKind::Added as i32);
         assert_eq!(added.source_kind, FlexSourceKind::Mic as i32);

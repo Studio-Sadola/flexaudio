@@ -361,15 +361,14 @@ fn microphone_device(
         flexaudio_core::inventory::device_format(format);
     let is_default = default_name == Some(name.as_str());
     flexaudio_core::NamespacedDevice::new(
-        DeviceInfo {
-            id: name.clone(),
-            name,
-            source_kind: SourceKind::Mic,
-            sample_rate,
-            channels,
-            format_available,
-            is_loopback: false,
-            is_default,
+        {
+            let mut device_value = DeviceInfo::new(name.clone(), name, SourceKind::Mic);
+            device_value.sample_rate = sample_rate;
+            device_value.channels = channels;
+            device_value.format_available = format_available;
+            device_value.is_loopback = false;
+            device_value.is_default = is_default;
+            device_value
         },
         flexaudio_core::DeviceIdNamespace::CpalDeviceName,
     )

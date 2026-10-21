@@ -386,16 +386,16 @@ pub unsafe extern "C" fn flexaudio_flush_vad(s: *mut FlexStream) -> i32 {
 }
 
 fn empty_carrier(origin: (u64, i64)) -> flexaudio::AudioChunk {
-    flexaudio::AudioChunk {
-        data: Vec::new(),
-        frames: 0,
-        frame_index: origin.0,
-        pts_ns: origin.1,
-        seq: 0,
-        flags: flexaudio::ChunkFlags::empty(),
-        dropped_before: 0,
-        peak: 0.0,
-        rms: 0.0,
+    {
+        let mut chunk_value = flexaudio::AudioChunk::new(Vec::new(), 0);
+        chunk_value.frame_index = origin.0;
+        chunk_value.pts_ns = origin.1;
+        chunk_value.seq = 0;
+        chunk_value.flags = flexaudio::ChunkFlags::empty();
+        chunk_value.dropped_before = 0;
+        chunk_value.peak = 0.0;
+        chunk_value.rms = 0.0;
+        chunk_value
     }
 }
 

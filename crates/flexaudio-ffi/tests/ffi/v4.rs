@@ -224,12 +224,9 @@ fn decoded_defaults_controls_and_fixed_processing_use_shared_resolution() {
 #[test]
 fn snapshots_own_strings_pids_and_formats_and_validate_borrowed_views() {
     unsafe {
-        let config = StreamConfig {
-            kind: flexaudio::SourceKind::Mix,
-            mix_mic_device_id: Some("input-selector".into()),
-            exclude_pids: vec![17, 17, 19],
-            ..Default::default()
-        };
+        let mut config = StreamConfig::new(flexaudio::SourceKind::Mix);
+        config.mix_mic_device_id = Some("input-selector".into());
+        config.exclude_pids = vec![17, 17, 19];
         let report = flexaudio::resolve_settings(&SettingsRequest::new(config)).unwrap();
         let snapshot = Box::into_raw(Box::new(FlexSettingsV4::new(&report)));
         let error = FlexErrorInfoV2::new(flexaudio::Error::IgnoredSettings {
@@ -700,16 +697,16 @@ fn namespaced_device_projection_preserves_ids_and_owns_only_device_strings() {
             (flexaudio::DeviceIdNamespace::Unknown, c"unknown"),
         ] {
             // Deliberately identical literals: provenance comes only from the provider.
-            let info = flexaudio::DeviceInfo {
-                id: "selector".into(),
-                name: "duplicate name".into(),
-                source_kind: flexaudio::SourceKind::Mic,
-                sample_rate: 48000,
-                channels: 2,
-                format_available: true,
-                is_loopback: false,
-                is_default: false,
-            };
+            let mut info = flexaudio::DeviceInfo::new(
+                "selector".into(),
+                "duplicate name".into(),
+                flexaudio::SourceKind::Mic,
+            );
+            info.sample_rate = 48000;
+            info.channels = 2;
+            info.format_available = true;
+            info.is_loopback = false;
+            info.is_default = false;
             let old = crate::convert::device_info_to_c(info.clone());
             let entry = device(flexaudio::NamespacedDevice::new(info, namespace));
             assert_eq!(CStr::from_ptr(entry.device.id), CStr::from_ptr(old.id));

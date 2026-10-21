@@ -332,15 +332,14 @@ fn namespaced_output_device(
     let (sample_rate, channels, format_available) =
         flexaudio_core::inventory::device_format(format);
     flexaudio_core::NamespacedDevice::new(
-        DeviceInfo {
-            id: identity,
-            name,
-            source_kind: SourceKind::SystemLoopback,
-            sample_rate,
-            channels,
-            format_available,
-            is_loopback: true,
-            is_default,
+        {
+            let mut device_value = DeviceInfo::new(identity, name, SourceKind::SystemLoopback);
+            device_value.sample_rate = sample_rate;
+            device_value.channels = channels;
+            device_value.format_available = format_available;
+            device_value.is_loopback = true;
+            device_value.is_default = is_default;
+            device_value
         },
         flexaudio_core::DeviceIdNamespace::CoreAudioOutputSelector,
     )

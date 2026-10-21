@@ -39,13 +39,11 @@ fn next_chunk(stream: &mut Stream) -> AudioChunk {
 fn attachment_preserves_output_pcm_and_metrics() {
     fn render(attached: bool) -> (Vec<f32>, f32, f32) {
         let sink = Arc::new(Mutex::new(None));
-        let config = StreamConfig {
-            gain: 2.0,
-            output: OutputFormat {
-                sample_rate: 16_000,
-                channels: 1,
-            },
-            ..Default::default()
+        let mut config = StreamConfig::default();
+        config.gain = 2.0;
+        config.output = OutputFormat {
+            sample_rate: 16_000,
+            channels: 1,
         };
         let mut stream = Stream::open(config, Box::new(PushBackend(sink.clone()))).unwrap();
         if attached {
@@ -225,10 +223,8 @@ fn native_restart_and_switch_preserve_produced_frame_indices() {
 #[test]
 fn simulated_queue_drop_preserves_primary_and_canonical_gap_lengths() {
     let sink = Arc::new(Mutex::new(None));
-    let config = StreamConfig {
-        ring_capacity_chunks: 1,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.ring_capacity_chunks = 1;
     let mut stream = Stream::open(config, Box::new(PushBackend(sink.clone()))).unwrap();
     stream.enable_capture_tap().unwrap();
     stream.start().unwrap();
@@ -268,13 +264,11 @@ fn fractional_output_rates_retain_the_cumulative_rational_remainder() {
 #[test]
 fn canonical_gain_is_applied_once_before_output_conversion() {
     let sink = Arc::new(Mutex::new(None));
-    let config = StreamConfig {
-        gain: 2.0,
-        output: OutputFormat {
-            sample_rate: 48_000,
-            channels: 1,
-        },
-        ..Default::default()
+    let mut config = StreamConfig::default();
+    config.gain = 2.0;
+    config.output = OutputFormat {
+        sample_rate: 48_000,
+        channels: 1,
     };
     let mut stream = Stream::open(config, Box::new(PushBackend(sink.clone()))).unwrap();
     stream.enable_capture_tap().unwrap();
@@ -328,10 +322,8 @@ fn exhausted_frame_index_fails_without_wrapping_or_advancing() {
 #[test]
 fn capture_loss_reanchors_pts_without_inserting_timeline_silence() {
     let sink = Arc::new(Mutex::new(None));
-    let config = StreamConfig {
-        ring_capacity_chunks: 200,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.ring_capacity_chunks = 200;
     let mut stream = Stream::open(config, Box::new(PushBackend(sink.clone()))).unwrap();
     stream.enable_capture_tap().unwrap();
     stream.start().unwrap();
@@ -371,12 +363,10 @@ fn compare_boundary_sample(boundary: &str, startup: bool) {
     use super::intake_generation::{GenerationEnd, IntakeGeneration};
     for channels in [1, 2] {
         let sink = Arc::new(Mutex::new(None));
-        let config = StreamConfig {
-            output: OutputFormat {
-                sample_rate: 48_000,
-                channels,
-            },
-            ..Default::default()
+        let mut config = StreamConfig::default();
+        config.output = OutputFormat {
+            sample_rate: 48_000,
+            channels,
         };
         let mut stream = Stream::open(config, Box::new(PushBackend(sink))).unwrap();
         stream.enable_capture_tap().unwrap();

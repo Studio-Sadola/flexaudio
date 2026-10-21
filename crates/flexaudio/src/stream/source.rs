@@ -412,19 +412,20 @@ impl Stream {
             Some(new_config.kind == flexaudio_core::SourceKind::Mic),
         )?;
         // Update mutable config fields only on success (keep output and other fields unchanged).
-        self.config = StreamConfig {
-            kind: new_config.kind,
-            device_id: new_config.device_id,
-            target_pid: new_config.target_pid,
-            mode: new_config.mode,
-            exclude_self: new_config.exclude_self,
-            silence_probe: new_config.silence_probe,
-            exclude_pids: new_config.exclude_pids,
-            mix_mic_device_id: new_config.mix_mic_device_id,
-            mix_system_device_id: new_config.mix_system_device_id,
-            mix_mic_gain: new_config.mix_mic_gain,
-            mix_system_gain: new_config.mix_system_gain,
-            ..self.config.clone()
+        self.config = {
+            let mut config_value = self.config.clone();
+            config_value.kind = new_config.kind;
+            config_value.device_id = new_config.device_id;
+            config_value.target_pid = new_config.target_pid;
+            config_value.mode = new_config.mode;
+            config_value.exclude_self = new_config.exclude_self;
+            config_value.silence_probe = new_config.silence_probe;
+            config_value.exclude_pids = new_config.exclude_pids;
+            config_value.mix_mic_device_id = new_config.mix_mic_device_id;
+            config_value.mix_system_device_id = new_config.mix_system_device_id;
+            config_value.mix_mic_gain = new_config.mix_mic_gain;
+            config_value.mix_system_gain = new_config.mix_system_gain;
+            config_value
         };
         self.open_options = options;
         if self.settings_report.is_some() {
@@ -476,12 +477,13 @@ mod combined_open_options_tests {
     fn combined_open_options_and_denoise_validation_is_atomic() {
         let mut stream = Stream::open(StreamConfig::default(), Box::new(Idle(false))).unwrap();
         stream.start().unwrap();
-        let config = StreamConfig {
-            output: OutputFormat {
+        let config = {
+            let mut config_value = stream.config().clone();
+            config_value.output = OutputFormat {
                 sample_rate: 16_000,
                 channels: 1,
-            },
-            ..stream.config().clone()
+            };
+            config_value
         };
         assert!(stream
             .switch_source_with_options_and_denoise(

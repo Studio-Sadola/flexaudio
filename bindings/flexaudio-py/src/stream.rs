@@ -608,16 +608,16 @@ mod tests {
                 capture_events: Default::default(),
                 settings: Default::default(),
             };
-            stream.ready_chunks.push_back(chunk_to_py(fa::AudioChunk {
-                data: vec![0.25; 1920],
-                frames: 960,
-                frame_index: 0,
-                pts_ns: 0,
-                seq: 0,
-                flags: fa::ChunkFlags::empty(),
-                dropped_before: 0,
-                peak: 0.25,
-                rms: 0.25,
+            stream.ready_chunks.push_back(chunk_to_py({
+                let mut chunk_value = fa::AudioChunk::new(vec![0.25; 1920], 960);
+                chunk_value.frame_index = 0;
+                chunk_value.pts_ns = 0;
+                chunk_value.seq = 0;
+                chunk_value.flags = fa::ChunkFlags::empty();
+                chunk_value.dropped_before = 0;
+                chunk_value.peak = 0.25;
+                chunk_value.rms = 0.25;
+                chunk_value
             }));
             let error = match stream.poll_chunk() {
                 Err(error) => error,

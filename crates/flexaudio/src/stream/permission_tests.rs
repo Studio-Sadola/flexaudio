@@ -78,10 +78,8 @@ fn terminal_query_failure_gates_both_lanes_and_never_retries() {
     let mailbox = backend.events.clone();
     let starts = backend.starts.clone();
     let stops = backend.stops.clone();
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat::default()),
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat::default());
     let mut stream = Stream::open(config, Box::new(backend)).unwrap();
     stream.start().unwrap();
     let error = Error::Backend("injected authorization query failure".into());
@@ -147,10 +145,8 @@ fn runtime_denial_suppresses_buffered_primary_secondary_and_tail() {
     let mailbox = backend.events.clone();
     let starts = backend.starts.clone();
     let stops = backend.stops.clone();
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat::default()),
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat::default());
     let mut stream = Stream::open(config, Box::new(backend)).unwrap();
     stream.start().unwrap();
     // Wait for evidence that both delivery paths are active, without native devices.
@@ -283,10 +279,8 @@ fn stop_preserves_queued_and_final_owner_denial_without_tail_delivery() {
         let mut backend = backend();
         backend.deny_on_stop = during_stop;
         let mailbox = backend.events.clone();
-        let config = StreamConfig {
-            secondary_output: Some(OutputFormat::default()),
-            ..Default::default()
-        };
+        let mut config = StreamConfig::default();
+        config.secondary_output = Some(OutputFormat::default());
         let mut stream = Stream::open(config, Box::new(backend)).unwrap();
         stream.start().unwrap();
         if !during_stop {

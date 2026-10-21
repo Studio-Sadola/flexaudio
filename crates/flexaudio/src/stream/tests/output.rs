@@ -9,10 +9,8 @@ use super::*;
 fn poll_event_yields_chunk_dropped() {
     // Capacity 1 plus almost no polling quickly triggers DROP_OLDEST.
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
-    let config = StreamConfig {
-        ring_capacity_chunks: 1,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.ring_capacity_chunks = 1;
     let mut stream = Stream::open(config, backend).expect("open");
     stream.start().expect("start");
 
@@ -81,15 +79,13 @@ fn recording_clock_is_zero_based() {
 /// together. A secondary chunk has 320 samples, and its PTS uses the same zero-based clock as the primary.
 #[test]
 fn dual_output_delivers_primary_and_secondary() {
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        }),
-        // Use a larger capacity so DROP_OLDEST does not discard the first chunk (pts 0) during collection.
-        ring_capacity_chunks: 200,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    });
+    // Use a larger capacity so DROP_OLDEST does not discard the first chunk (pts 0) during collection.
+    config.ring_capacity_chunks = 200;
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
     let mut stream = Stream::open(config, backend).expect("open");
     stream.start().expect("start");
@@ -175,13 +171,11 @@ fn denoise_enabled_still_delivers_both_taps() {
         }
     }
 
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        }),
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    });
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
     let mut stream = Stream::open(config, backend).expect("open");
     stream.set_denoise(true);

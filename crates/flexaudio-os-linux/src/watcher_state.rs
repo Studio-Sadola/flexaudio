@@ -47,15 +47,14 @@ mod tests {
     use flexaudio_core::SourceKind;
 
     fn device(id: &str, kind: SourceKind) -> DeviceInfo {
-        DeviceInfo {
-            id: id.into(),
-            name: id.into(),
-            source_kind: kind,
-            sample_rate: 48_000,
-            channels: 2,
-            format_available: true,
-            is_loopback: kind == SourceKind::SystemLoopback,
-            is_default: false,
+        {
+            let mut device_value = DeviceInfo::new(id.into(), id.into(), kind);
+            device_value.sample_rate = 48_000;
+            device_value.channels = 2;
+            device_value.format_available = true;
+            device_value.is_loopback = kind == SourceKind::SystemLoopback;
+            device_value.is_default = false;
+            device_value
         }
     }
 

@@ -10,7 +10,15 @@ on the tap's canonical 48 kHz timeline, continues across reopen, and exposes
 queue drops as gaps. Set it from the producing timeline when constructing
 chunks; use `frame_index: 0` for a single synthetic chunk starting at zero.
 The C `FlexChunk` v1 layout is unchanged.
-Rust `DeviceInfo` struct literals must also supply `format_available` (0.5.4).
+Historically, Rust `DeviceInfo` literals also gained `format_available` in 0.5.4.
+
+In 0.9, `AudioChunk`, `DeviceInfo` and `StreamConfig` are `#[non_exhaustive]`:
+construct them with `AudioChunk::new(data, frames)`,
+`DeviceInfo::new(id, name, source_kind)` or `StreamConfig::new(kind)`, then set
+public fields as needed. `StreamConfig::default()` remains available.
+For example, `let mut config = StreamConfig::new(SourceKind::Mic); config.gain = 0.5;`.
+Include `..` when destructuring these types. Chunk metadata initially contains
+zeros and empty flags; supply timeline values and meters when producing audio.
 
 **English** | [Japanese](README.ja.md)
 
@@ -27,10 +35,7 @@ device/stream events through a simple poll loop.
 ```rust
 use flexaudio::{open, StreamConfig, SourceKind};
 
-let mut stream = open(StreamConfig {
-    kind: SourceKind::Mic,
-    ..Default::default()
-})?;
+let mut stream = open(StreamConfig::new(SourceKind::Mic))?;
 stream.start()?;
 while let Some(chunk) = stream.poll_chunk() {
     // chunk.data is interleaved f32 in your chosen OutputFormat
@@ -323,11 +328,8 @@ cargo add flexaudio-vad@0.9
 ```rust
 use flexaudio::{open, StreamConfig, SourceKind, OutputFormat};
 
-let config = StreamConfig {
-    kind: SourceKind::Mic,
-    output: OutputFormat { sample_rate: 16_000, channels: 1 },
-    ..Default::default()
-};
+let mut config = StreamConfig::new(SourceKind::Mic);
+config.output = OutputFormat { sample_rate: 16_000, channels: 1 };
 let mut stream = open(config)?;
 stream.start()?;
 
@@ -621,12 +623,10 @@ for Mix. The linear pre-mix gains `mix_mic_gain` and `mix_system_gain` default t
 ```rust
 use flexaudio::{open, SourceKind, StreamConfig};
 
-let mut stream = open(StreamConfig {
-    kind: SourceKind::Mix,
-    mix_mic_gain: 1.0,
-    mix_system_gain: 0.5,
-    ..Default::default()
-})?;
+let mut config = StreamConfig::new(SourceKind::Mix);
+config.mix_mic_gain = 1.0;
+config.mix_system_gain = 0.5;
+let mut stream = open(config)?;
 stream.start()?;
 stream.stop();
 # Ok::<(), flexaudio::Error>(())
@@ -713,7 +713,7 @@ sources ignore valid exclusions. The same controls are available in each binding
 
 | Surface | PID exclusion |
 |---|---|
-| Rust | `StreamConfig { exclude_pids: vec![1234], ..Default::default() }` |
+| Rust | `let mut config = StreamConfig::new(SourceKind::SystemLoopback); config.exclude_pids = vec![1234];` |
 | N-API | `openStream({ kind: 'system', excludePids: [1234] }, onChunk)` |
 | C | `flexaudio_open_with_exclude_pids(&config, pids, count)`; source switching uses `flexaudio_switch_source_with_exclude_pids` |
 | Python | `flexaudio.open("system", exclude_pids=[1234])`; also accepted by `Stream.switch_source()` |
@@ -763,11 +763,9 @@ for p in processes()? {
 }
 let target = processes()?.into_iter().next();
 if let Some(p) = target {
-    let mut stream = open(StreamConfig {
-        kind: SourceKind::ProcessLoopback,
-        target_pid: Some(p.pid),
-        ..Default::default()
-    })?;
+    let mut config = StreamConfig::new(SourceKind::ProcessLoopback);
+    config.target_pid = Some(p.pid);
+    let mut stream = open(config)?;
     stream.start()?;
     stream.stop();
 }

@@ -466,18 +466,19 @@ fn v2_borrowed_device_and_error_views_survive_tls_changes() {
             Vec::new(),
         )),
     })));
-    let device = Box::into_raw(Box::new(FlexDeviceEventV2::new(fa::DeviceEvent::Added(
-        fa::DeviceInfo {
-            id: "fixture-device".into(),
-            name: "Fixture device".into(),
-            source_kind: fa::SourceKind::Mic,
-            sample_rate: 48_000,
-            channels: 1,
-            format_available: true,
-            is_loopback: false,
-            is_default: true,
-        },
-    ))));
+    let device = Box::into_raw(Box::new(FlexDeviceEventV2::new(fa::DeviceEvent::Added({
+        let mut device_value = fa::DeviceInfo::new(
+            "fixture-device".into(),
+            "Fixture device".into(),
+            fa::SourceKind::Mic,
+        );
+        device_value.sample_rate = 48_000;
+        device_value.channels = 1;
+        device_value.format_available = true;
+        device_value.is_loopback = false;
+        device_value.is_default = true;
+        device_value
+    }))));
     error::set_audio_error(fa::Error::DeviceNotFound);
     let snapshot = flexaudio_last_error_info_v2();
     unsafe {
@@ -607,12 +608,10 @@ fn stream(
 ) -> (FlexStream, Arc<Mutex<BackendState>>, Arc<AtomicUsize>) {
     let state = Arc::new(Mutex::new(BackendState::default()));
     let stops = Arc::new(AtomicUsize::new(0));
-    let config = fa::StreamConfig {
-        output: fa::OutputFormat {
-            sample_rate: 48_000,
-            channels: 1,
-        },
-        ..Default::default()
+    let mut config = fa::StreamConfig::default();
+    config.output = fa::OutputFormat {
+        sample_rate: 48_000,
+        channels: 1,
     };
     let inner = fa::Stream::open(
         config,

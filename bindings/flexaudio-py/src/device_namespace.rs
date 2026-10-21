@@ -39,16 +39,16 @@ mod tests {
                 fa::DeviceIdNamespace::CoreAudioOutputSelector,
                 fa::DeviceIdNamespace::Unknown,
             ] {
-                let device = fa::DeviceInfo {
-                    id: "same-selector".into(),
-                    name: "same-name".into(),
-                    source_kind: fa::SourceKind::SystemLoopback,
-                    sample_rate: 48_000,
-                    channels: 2,
-                    format_available: true,
-                    is_loopback: true,
-                    is_default: false,
-                };
+                let mut device = fa::DeviceInfo::new(
+                    "same-selector".into(),
+                    "same-name".into(),
+                    fa::SourceKind::SystemLoopback,
+                );
+                device.sample_rate = 48_000;
+                device.channels = 2;
+                device.format_available = true;
+                device.is_loopback = true;
+                device.is_default = false;
                 let object = Py::new(
                     py,
                     NamespacedDevice(fa::NamespacedDevice::new(device, namespace)),

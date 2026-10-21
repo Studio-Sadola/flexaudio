@@ -31,7 +31,7 @@ be passed straight through:
 use flexaudio::{open, SourceKind, StreamConfig};
 use flexaudio_encode::FlacWriter;
 
-let config = StreamConfig { kind: SourceKind::Mic, ..Default::default() };
+let config = StreamConfig::new(SourceKind::Mic);
 let mut stream = open(config)?;
 // flexaudio's default output format is 48 kHz / stereo.
 let mut writer = FlacWriter::create("recording.flac", 48_000, 2)?;

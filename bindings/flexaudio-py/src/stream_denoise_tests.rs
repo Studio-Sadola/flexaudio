@@ -63,12 +63,10 @@ fn stream_denoise_matches_facade_before_downmix_and_gain_on_both_taps() {
                 sample_rate: 48_000,
                 channels,
             };
-            let config = fa::StreamConfig {
-                output,
-                secondary_output: Some(output),
-                gain,
-                ..Default::default()
-            };
+            let mut config = fa::StreamConfig::default();
+            config.output = output;
+            config.secondary_output = Some(output);
+            config.gain = gain;
             let facade_sink = Sink::default();
             let mut facade =
                 fa::Stream::open(config.clone(), Box::new(Input(facade_sink.clone()))).unwrap();

@@ -28,13 +28,11 @@ impl CaptureBackend for BurstBackend {
 }
 
 fn open(bursts: Vec<Vec<f32>>, denoise: bool) -> Stream {
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat {
-            sample_rate: 48_000,
-            channels: 2,
-        }),
-        ..StreamConfig::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat {
+        sample_rate: 48_000,
+        channels: 2,
+    });
     let stream = Stream::open(
         config,
         Box::new(BurstBackend {

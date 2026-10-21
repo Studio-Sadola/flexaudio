@@ -385,14 +385,12 @@ fn regression_clipping_metadata_control() {
 }
 
 fn secondary_loss(overflow: bool) {
-    let config = StreamConfig {
-        ring_capacity_chunks: 8,
-        secondary_output: Some(OutputFormat {
-            sample_rate: 48_000,
-            channels: 2,
-        }),
-        ..StreamConfig::default()
-    };
+    let mut config = StreamConfig::default();
+    config.ring_capacity_chunks = 8;
+    config.secondary_output = Some(OutputFormat {
+        sample_rate: 48_000,
+        channels: 2,
+    });
     let mut stream = Stream::open(config, Box::new(Backend::silent())).unwrap();
     // Use the actual secondary ring with capacity one; isolate secondary loss
     // from primary loss so any required event must identify the secondary path.

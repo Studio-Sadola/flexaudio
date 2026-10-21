@@ -172,16 +172,16 @@ mod open_tests {
 
     #[test]
     fn explicit_open_keeps_checked_inventory_and_format_gate() {
-        let device = flexaudio_core::DeviceInfo {
-            id: "sink".into(),
-            name: "Sink".into(),
-            source_kind: flexaudio_core::SourceKind::SystemLoopback,
-            sample_rate: 0,
-            channels: 0,
-            format_available: false,
-            is_loopback: true,
-            is_default: false,
-        };
+        let mut device = flexaudio_core::DeviceInfo::new(
+            "sink".into(),
+            "Sink".into(),
+            flexaudio_core::SourceKind::SystemLoopback,
+        );
+        device.sample_rate = 0;
+        device.channels = 0;
+        device.format_available = false;
+        device.is_loopback = true;
+        device.is_default = false;
         let error = capture_target(false, Some("sink".into()), || Ok(vec![device])).unwrap_err();
         assert!(error.to_string().contains("could not be read"));
         assert_eq!(

@@ -1,6 +1,52 @@
 use super::*;
 
 #[test]
+fn stream_constructor_preserves_defaults_for_each_source() {
+    for kind in [
+        SourceKind::Mic,
+        SourceKind::SystemLoopback,
+        SourceKind::ProcessLoopback,
+        SourceKind::Mix,
+    ] {
+        let config = StreamConfig::new(kind);
+        assert_eq!(
+            config,
+            StreamConfig {
+                kind,
+                ..StreamConfig::default()
+            }
+        );
+    }
+}
+
+#[test]
+fn chunk_constructor_preserves_samples_and_initializes_metadata() {
+    let chunk = AudioChunk::new(vec![0.25, -0.25], 1);
+    assert_eq!(chunk.data, vec![0.25, -0.25]);
+    assert_eq!(chunk.frames, 1);
+    assert_eq!(chunk.frame_index, 0);
+    assert_eq!(chunk.arrival_ns(), 0);
+    assert_eq!(chunk.seq, 0);
+    assert_eq!(chunk.dropped_before, 0);
+    assert!(chunk.flags.is_empty());
+    assert_eq!((chunk.peak, chunk.rms), (0.0, 0.0));
+}
+
+#[test]
+fn device_constructor_represents_unknown_format() {
+    for kind in [SourceKind::Mic, SourceKind::SystemLoopback] {
+        let device = DeviceInfo::new("device-id".into(), "Device".into(), kind);
+        assert_eq!(device.id, "device-id");
+        assert_eq!(device.name, "Device");
+        assert_eq!(device.source_kind, kind);
+        assert_eq!((device.sample_rate, device.channels), (0, 0));
+        assert!(!device.format_available);
+        assert!(!device.is_default);
+        assert_eq!(device.is_loopback, kind == SourceKind::SystemLoopback);
+    }
+}
+
+#[test]
 fn permission_errors_name_cause_settings_and_recovery() {
     for permission in [Permission::Microphone, Permission::SystemAudio] {
         let error = Error::PermissionDenied {

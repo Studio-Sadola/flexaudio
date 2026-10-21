@@ -2868,16 +2868,16 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                             let is_default =
                                 is_loopback && st.default_sink.as_deref() == Some(node_name);
 
-                            let info = DeviceInfo {
-                                id: node_name.to_string(),
-                                name: description.to_string(),
+                            let mut info = DeviceInfo::new(
+                                node_name.to_string(),
+                                description.to_string(),
                                 source_kind,
-                                sample_rate,
-                                channels,
-                                format_available,
-                                is_loopback,
-                                is_default,
-                            };
+                            );
+                            info.sample_rate = sample_rate;
+                            info.channels = channels;
+                            info.format_available = format_available;
+                            info.is_loopback = is_loopback;
+                            info.is_default = is_default;
                             let event = st.add_device(global.id, info);
                             drop(st);
 
@@ -4216,15 +4216,14 @@ mod tests {
     #[test]
     fn enqueue_and_drain_is_fifo() {
         let events: WatchEventQueue = Arc::new(Mutex::new(WatchEvents::default()));
-        let mic = DeviceInfo {
-            id: "mic.a".into(),
-            name: "Mic A".into(),
-            source_kind: SourceKind::Mic,
-            format_available: true,
-            sample_rate: NATIVE_RATE,
-            channels: NATIVE_CHANNELS,
-            is_loopback: false,
-            is_default: false,
+        let mic = {
+            let mut device_value = DeviceInfo::new("mic.a".into(), "Mic A".into(), SourceKind::Mic);
+            device_value.format_available = true;
+            device_value.sample_rate = NATIVE_RATE;
+            device_value.channels = NATIVE_CHANNELS;
+            device_value.is_loopback = false;
+            device_value.is_default = false;
+            device_value
         };
         enqueue_event(&events, DeviceEvent::Added(mic.clone()));
         enqueue_event(&events, DeviceEvent::Removed { id: "mic.a".into() });

@@ -10,7 +10,15 @@
 キューで音声が失われると飛びが現れます。生成元のタイムラインから設定してください。
 時点 0 から始まる合成チャンクを 1 個作る場合は `frame_index: 0` を使います。
 C の `FlexChunk` v1 のレイアウトは変わりません。
-Rust の `DeviceInfo` 構造体リテラルにも `format_available` を指定してください（0.5.4）。
+過去の変更として、0.5.4 では Rust の `DeviceInfo` リテラルにも `format_available` が加わりました。
+
+0.9 では `AudioChunk`・`DeviceInfo`・`StreamConfig` が `#[non_exhaustive]` になります。
+`AudioChunk::new(data, frames)`・`DeviceInfo::new(id, name, source_kind)`・
+`StreamConfig::new(kind)` で作成してから、必要な公開フィールドを設定してください。
+`StreamConfig::default()` も引き続き使えます。
+例えば `let mut config = StreamConfig::new(SourceKind::Mic); config.gain = 0.5;` と書けます。
+分解するパターンには `..` を含めてください。チャンクのメタデータは初期状態では
+ゼロと空のフラグなので、音声を生成するときはタイムラインの値とメーターを設定してください。
 
 [English](README.md) | **日本語**
 
@@ -26,10 +34,7 @@ Rust の `DeviceInfo` 構造体リテラルにも `format_available` を指定�
 ```rust
 use flexaudio::{open, StreamConfig, SourceKind};
 
-let mut stream = open(StreamConfig {
-    kind: SourceKind::Mic,
-    ..Default::default()
-})?;
+let mut stream = open(StreamConfig::new(SourceKind::Mic))?;
 stream.start()?;
 while let Some(chunk) = stream.poll_chunk() {
     // chunk.data is interleaved f32 in your chosen OutputFormat
@@ -313,11 +318,8 @@ cargo add flexaudio-vad@0.9
 ```rust
 use flexaudio::{open, StreamConfig, SourceKind, OutputFormat};
 
-let config = StreamConfig {
-    kind: SourceKind::Mic,
-    output: OutputFormat { sample_rate: 16_000, channels: 1 },
-    ..Default::default()
-};
+let mut config = StreamConfig::new(SourceKind::Mic);
+config.output = OutputFormat { sample_rate: 16_000, channels: 1 };
 let mut stream = open(config)?;
 stream.start()?;
 
@@ -593,12 +595,10 @@ Mix では `device_id` は無視されます。ミックス前の線形ゲイン
 ```rust
 use flexaudio::{open, SourceKind, StreamConfig};
 
-let mut stream = open(StreamConfig {
-    kind: SourceKind::Mix,
-    mix_mic_gain: 1.0,
-    mix_system_gain: 0.5,
-    ..Default::default()
-})?;
+let mut config = StreamConfig::new(SourceKind::Mix);
+config.mix_mic_gain = 1.0;
+config.mix_system_gain = 0.5;
+let mut stream = open(config)?;
 stream.start()?;
 stream.stop();
 # Ok::<(), flexaudio::Error>(())
@@ -683,7 +683,7 @@ C の切替では 0 で維持します。Mix のシステム側にも適用し�
 
 | インターフェース | PID による除外 |
 |---|---|
-| Rust | `StreamConfig { exclude_pids: vec![1234], ..Default::default() }` |
+| Rust | `let mut config = StreamConfig::new(SourceKind::SystemLoopback); config.exclude_pids = vec![1234];` |
 | N-API | `openStream({ kind: 'system', excludePids: [1234] }, onChunk)` |
 | C | `flexaudio_open_with_exclude_pids(&config, pids, count)`。ソースの切り替えには `flexaudio_switch_source_with_exclude_pids` を使います。 |
 | Python | `flexaudio.open("system", exclude_pids=[1234])`。`Stream.switch_source()` でも指定できます。 |
@@ -734,11 +734,9 @@ for p in processes()? {
 }
 let target = processes()?.into_iter().next();
 if let Some(p) = target {
-    let mut stream = open(StreamConfig {
-        kind: SourceKind::ProcessLoopback,
-        target_pid: Some(p.pid),
-        ..Default::default()
-    })?;
+    let mut config = StreamConfig::new(SourceKind::ProcessLoopback);
+    config.target_pid = Some(p.pid);
+    let mut stream = open(config)?;
     stream.start()?;
     stream.stop();
 }

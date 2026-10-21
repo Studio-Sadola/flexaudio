@@ -7,10 +7,7 @@ and **macOS** through one unified API.
 ```rust
 use flexaudio::{open, StreamConfig, SourceKind};
 
-let mut stream = open(StreamConfig {
-    kind: SourceKind::Mic,
-    ..Default::default()
-})?;
+let mut stream = open(StreamConfig::new(SourceKind::Mic))?;
 stream.start()?;
 while let Some(chunk) = stream.poll_chunk() {
     let _ = chunk; // interleaved f32, plus frames / peak / rms / seq
@@ -20,6 +17,11 @@ stream.stop();
 ```
 
 ## Capability matrix
+
+In 0.9, `AudioChunk`, `DeviceInfo` and `StreamConfig` are `#[non_exhaustive]`.
+Use `AudioChunk::new(data, frames)`, `DeviceInfo::new(id, name, source_kind)` or
+`StreamConfig::new(kind)`, then assign customized public fields.
+`StreamConfig::default()` remains available; destructuring requires `..`.
 
 | Source            | Linux         | Windows               | macOS                 |
 |-------------------|---------------|-----------------------|-----------------------|
@@ -87,11 +89,8 @@ Use `open_with_options` to select optional backend behavior without changing
 ```rust
 use flexaudio::{open_with_options, OpenOptions, SourceKind, StreamConfig};
 
-let config = StreamConfig {
-    kind: SourceKind::SystemLoopback,
-    exclude_self: false,
-    ..Default::default()
-};
+let mut config = StreamConfig::new(SourceKind::SystemLoopback);
+config.exclude_self = false;
 let mut stream = open_with_options(
     config.clone(),
     OpenOptions::new().windows_classic_loopback_keepalive(false),

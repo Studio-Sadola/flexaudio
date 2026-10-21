@@ -10,6 +10,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > changes; **patch** bumps (`0.2.0 → 0.2.1`) remain backward-compatible. Pin to
 > `0.9` to receive only compatible updates.
 
+## [Unreleased]
+
+### Added
+
+- Rust constructors `AudioChunk::new(data, frames)`,
+  `DeviceInfo::new(id, name, source_kind)` and `StreamConfig::new(kind)`.
+  Public fields remain writable, and `StreamConfig::default()` remains available.
+
+### Changed
+
+- Rust `AudioChunk`, `DeviceInfo` and `StreamConfig` are now `#[non_exhaustive]`
+  so future fields can be added without requiring downstream literal updates.
+  Migration: replace struct literals with the corresponding constructor, then
+  assign any customized public fields. For example, use
+  `let mut config = StreamConfig::new(SourceKind::Mic); config.gain = 0.5;`.
+  Destructure with `..` to allow additional fields.
+
 ## [0.8.1] - 2026-10-20
 
 ### Fixed

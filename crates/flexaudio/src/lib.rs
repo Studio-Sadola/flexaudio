@@ -190,10 +190,7 @@ pub fn watch_devices() -> Result<DeviceWatcher> {
 /// ```no_run
 /// use flexaudio::{open, StreamConfig, SourceKind};
 ///
-/// let config = StreamConfig {
-///     kind: SourceKind::Mic,
-///     ..Default::default()
-/// };
+/// let config = StreamConfig::new(SourceKind::Mic);
 /// let mut stream = open(config)?;
 /// stream.start()?;
 /// while let Some(chunk) = stream.poll_chunk() {
@@ -442,11 +439,8 @@ mod tests {
     #[test]
     fn open_rejects_zero_exclusion_pid_for_system_capture() {
         for kind in [SourceKind::SystemLoopback, SourceKind::Mix] {
-            let config = StreamConfig {
-                kind,
-                exclude_pids: vec![0],
-                ..Default::default()
-            };
+            let mut config = StreamConfig::new(kind);
+            config.exclude_pids = vec![0];
             assert!(matches!(
                 open(config),
                 Err(Error::InvalidArg(message))
@@ -459,20 +453,14 @@ mod tests {
     fn exclusion_pid_validation_accepts_positive_and_ignored_pids() {
         for kind in [SourceKind::SystemLoopback, SourceKind::Mix] {
             for exclude_pids in [vec![], vec![42]] {
-                let config = StreamConfig {
-                    kind,
-                    exclude_pids,
-                    ..Default::default()
-                };
+                let mut config = StreamConfig::new(kind);
+                config.exclude_pids = exclude_pids;
                 assert!(validate_exclude_pids(&config).is_ok());
             }
         }
         for kind in [SourceKind::Mic, SourceKind::ProcessLoopback] {
-            let config = StreamConfig {
-                kind,
-                exclude_pids: vec![0],
-                ..Default::default()
-            };
+            let mut config = StreamConfig::new(kind);
+            config.exclude_pids = vec![0];
             assert!(validate_exclude_pids(&config).is_ok());
         }
     }
@@ -487,12 +475,9 @@ mod tests {
             (f32::NAN, 1.0),
             (1.0, f32::INFINITY),
         ] {
-            let config = StreamConfig {
-                kind: SourceKind::Mix,
-                mix_mic_gain: mic_gain,
-                mix_system_gain: system_gain,
-                ..Default::default()
-            };
+            let mut config = StreamConfig::new(SourceKind::Mix);
+            config.mix_mic_gain = mic_gain;
+            config.mix_system_gain = system_gain;
             match open(config) {
                 Ok(_) => {
                     panic!("mix gains ({mic_gain}, {system_gain}) should be rejected as InvalidArg")
@@ -512,12 +497,9 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     #[test]
     fn valid_mix_gains_pass_preflight_and_open_mock_composite() {
-        let config = StreamConfig {
-            kind: SourceKind::Mix,
-            mix_mic_gain: 0.5,
-            mix_system_gain: 2.0,
-            ..Default::default()
-        };
+        let mut config = StreamConfig::new(SourceKind::Mix);
+        config.mix_mic_gain = 0.5;
+        config.mix_system_gain = 2.0;
         // Public open also queries real microphone/system devices. Exercise its
         // shared gain validator here so this test stays hardware-free.
         validate_mix_gains(&config).expect("public open Mix gain validation");

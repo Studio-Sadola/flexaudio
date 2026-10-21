@@ -711,16 +711,16 @@ pub fn binding_contract_bridge(
                     .take()
                     .expect("the scenario owns its initialized VAD attachment");
                 for index in 0..2 {
-                    attachment.process(AudioChunk {
-                        data: vec![0.0; 1920],
-                        frames: 960,
-                        frame_index: index * 960,
-                        pts_ns: index as i64 * 20_000_000,
-                        seq: index,
-                        flags: ChunkFlags::empty(),
-                        dropped_before: 0,
-                        peak: 0.0,
-                        rms: 0.0,
+                    attachment.process({
+                        let mut chunk_value = AudioChunk::new(vec![0.0; 1920], 960);
+                        chunk_value.frame_index = index * 960;
+                        chunk_value.pts_ns = index as i64 * 20_000_000;
+                        chunk_value.seq = index;
+                        chunk_value.flags = ChunkFlags::empty();
+                        chunk_value.dropped_before = 0;
+                        chunk_value.peak = 0.0;
+                        chunk_value.rms = 0.0;
+                        chunk_value
                     });
                 }
                 bridge.attachment = Some(attachment);
@@ -737,16 +737,16 @@ pub fn binding_contract_bridge(
                 });
                 bridge.report_attachment_failure(); // No carrier yet: retain the notification.
                 if scenario == "attachment-secondary-orphan" {
-                    bridge.on_primary(AudioChunk {
-                        data: vec![0.0; 960],
-                        frames: 960,
-                        frame_index: 4800,
-                        pts_ns: 100_000_000,
-                        seq: 0,
-                        flags: ChunkFlags::empty(),
-                        dropped_before: 0,
-                        peak: 0.0,
-                        rms: 0.0,
+                    bridge.on_primary({
+                        let mut chunk_value = AudioChunk::new(vec![0.0; 960], 960);
+                        chunk_value.frame_index = 4800;
+                        chunk_value.pts_ns = 100_000_000;
+                        chunk_value.seq = 0;
+                        chunk_value.flags = ChunkFlags::empty();
+                        chunk_value.dropped_before = 0;
+                        chunk_value.peak = 0.0;
+                        chunk_value.rms = 0.0;
+                        chunk_value
                     });
                     bridge.drain_pairs();
                 } else {
@@ -776,16 +776,16 @@ pub fn binding_contract_bridge(
             bridge.secondary_fifo.back_mut().unwrap().vad_events = Some(vec![vad::JsVadEvent(flexaudio_vad::AttachedVadEvent::Vad(flexaudio_vad::VadEvent {
                 epoch: 0, seq: 0, kind: flexaudio_vad::VadEventKind::Segment(flexaudio_vad::SpeechSegment { start_ms: 0, end_ms: 20 }),
             }))]);
-            bridge.on_primary(AudioChunk {
-                frame_index: 0,
-                data: vec![0.25; 960],
-                frames: 960,
-                pts_ns: primary_pts,
-                seq: 7,
-                flags: ChunkFlags::empty(),
-                dropped_before: 3,
-                peak: 0.25,
-                rms: 0.25,
+            bridge.on_primary({
+                let mut chunk_value = AudioChunk::new(vec![0.25; 960], 960);
+                chunk_value.frame_index = 0;
+                chunk_value.pts_ns = primary_pts;
+                chunk_value.seq = 7;
+                chunk_value.flags = ChunkFlags::empty();
+                chunk_value.dropped_before = 3;
+                chunk_value.peak = 0.25;
+                chunk_value.rms = 0.25;
+                chunk_value
             });
             bridge.drain_pairs();
             bridge.emit_terminator();

@@ -148,14 +148,12 @@ fn resume_flags_discontinuity_and_keeps_seq_continuous() {
 #[test]
 fn resume_stress_marks_first_chunk_of_each_tap_discontinuous() {
     const ROUNDS: usize = 300;
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        }),
-        ring_capacity_chunks: 200,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    });
+    config.ring_capacity_chunks = 200;
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
     let mut stream = Stream::open(config, backend).expect("open");
     stream.start().expect("start");
@@ -216,14 +214,12 @@ fn resume_stress_marks_first_chunk_of_each_tap_discontinuous() {
 /// the worker has already read the pending flags at the top of its current iteration.
 #[test]
 fn resume_flags_secondary_first_chunk_with_raw_intake_blocked() {
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        }),
-        ring_capacity_chunks: 200,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    });
+    config.ring_capacity_chunks = 200;
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
     let mut stream = Stream::open(config, backend).expect("open");
     stream.start().expect("start");
@@ -425,14 +421,12 @@ fn pause_preserves_absolute_clock() {
 /// Starting after a pre-start pause clears that state for both taps.
 #[test]
 fn start_after_pause_delivers_the_secondary_tap() {
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        }),
-        ring_capacity_chunks: 200,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    });
+    config.ring_capacity_chunks = 200;
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
     let mut stream = Stream::open(config, backend).expect("open");
     stream.pause();

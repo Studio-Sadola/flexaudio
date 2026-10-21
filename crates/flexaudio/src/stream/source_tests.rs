@@ -9,33 +9,29 @@ fn mock_backend() -> Box<dyn CaptureBackend> {
 
 #[test]
 fn switch_source_snapshot_matches_mix_backend_and_survives_reopen() {
-    let initial = StreamConfig {
-        mix_mic_device_id: Some("old-mic".into()),
-        mix_system_device_id: Some("old-output".into()),
-        mix_mic_gain: 0.25,
-        mix_system_gain: 0.5,
-        gain: 0.75,
-        ring_capacity_chunks: 7,
-        secondary_output: Some(OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        }),
-        ..Default::default()
-    };
-    let replacement = StreamConfig {
-        kind: SourceKind::Mix,
-        mix_mic_device_id: Some("new-mic".into()),
-        mix_system_device_id: Some("new-output".into()),
-        mix_mic_gain: 1.5,
-        mix_system_gain: 2.0,
-        gain: 3.0,
-        ring_capacity_chunks: 19,
-        mode: ProcessMode::Exclude,
-        exclude_self: true,
-        exclude_pids: vec![42],
-        silence_probe: false,
-        ..initial.clone()
-    };
+    let mut initial = StreamConfig::default();
+    initial.mix_mic_device_id = Some("old-mic".into());
+    initial.mix_system_device_id = Some("old-output".into());
+    initial.mix_mic_gain = 0.25;
+    initial.mix_system_gain = 0.5;
+    initial.gain = 0.75;
+    initial.ring_capacity_chunks = 7;
+    initial.secondary_output = Some(OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    });
+    let mut replacement = initial.clone();
+    replacement.kind = SourceKind::Mix;
+    replacement.mix_mic_device_id = Some("new-mic".into());
+    replacement.mix_system_device_id = Some("new-output".into());
+    replacement.mix_mic_gain = 1.5;
+    replacement.mix_system_gain = 2.0;
+    replacement.gain = 3.0;
+    replacement.ring_capacity_chunks = 19;
+    replacement.mode = ProcessMode::Exclude;
+    replacement.exclude_self = true;
+    replacement.exclude_pids = vec![42];
+    replacement.silence_probe = false;
     let mut stream = Stream::open(initial.clone(), mock_backend()).unwrap();
     stream.start().unwrap();
     stream
@@ -44,11 +40,9 @@ fn switch_source_snapshot_matches_mix_backend_and_survives_reopen() {
             Ok(mock_backend())
         })
         .unwrap();
-    let expected = StreamConfig {
-        gain: initial.gain,
-        ring_capacity_chunks: initial.ring_capacity_chunks,
-        ..replacement
-    };
+    let mut expected = replacement;
+    expected.gain = initial.gain;
+    expected.ring_capacity_chunks = initial.ring_capacity_chunks;
     assert_eq!(stream.config(), &expected);
     assert_eq!(stream.gain(), initial.gain);
 
@@ -64,23 +58,19 @@ fn switch_source_snapshot_matches_mix_backend_and_survives_reopen() {
 
 #[test]
 fn failed_source_switch_keeps_mix_snapshot() {
-    let initial = StreamConfig {
-        mix_mic_device_id: Some("old-mic".into()),
-        mix_system_device_id: Some("old-output".into()),
-        mix_mic_gain: 0.25,
-        mix_system_gain: 0.5,
-        ..Default::default()
-    };
+    let mut initial = StreamConfig::default();
+    initial.mix_mic_device_id = Some("old-mic".into());
+    initial.mix_system_device_id = Some("old-output".into());
+    initial.mix_mic_gain = 0.25;
+    initial.mix_system_gain = 0.5;
     let mut stream = Stream::open(initial.clone(), mock_backend()).unwrap();
     stream.start().unwrap();
-    let replacement = StreamConfig {
-        kind: SourceKind::Mix,
-        mix_mic_device_id: Some("new-mic".into()),
-        mix_system_device_id: Some("new-output".into()),
-        mix_mic_gain: 1.5,
-        mix_system_gain: 2.0,
-        ..initial.clone()
-    };
+    let mut replacement = initial.clone();
+    replacement.kind = SourceKind::Mix;
+    replacement.mix_mic_device_id = Some("new-mic".into());
+    replacement.mix_system_device_id = Some("new-output".into());
+    replacement.mix_mic_gain = 1.5;
+    replacement.mix_system_gain = 2.0;
     let failure = Error::DeviceNotFound;
     assert_eq!(
         stream.switch_source_using(replacement, None, None, |_, _| Err(failure.clone())),
@@ -95,20 +85,16 @@ fn source_switch_rejects_output_and_secondary_changes_before_backend_constructio
     let initial = StreamConfig::default();
     let mut stream = Stream::open(initial.clone(), mock_backend()).unwrap();
     stream.start().unwrap();
-    let changed_output = StreamConfig {
-        output: OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        },
-        ..initial.clone()
+    let mut changed_output = initial.clone();
+    changed_output.output = OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
     };
-    let changed_secondary = StreamConfig {
-        secondary_output: Some(OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        }),
-        ..initial.clone()
-    };
+    let mut changed_secondary = initial.clone();
+    changed_secondary.secondary_output = Some(OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    });
     for config in [changed_output, changed_secondary] {
         assert!(matches!(
             stream.switch_source_using(config, None, None, |_, _| panic!(

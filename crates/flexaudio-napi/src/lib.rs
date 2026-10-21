@@ -1049,25 +1049,22 @@ fn build_config(options: &OpenOptions) -> napi::Result<StreamConfig> {
         sample_rate: s.rate,
         channels: s.channels,
     });
-    let mut config = StreamConfig {
-        kind,
-        output,
-        secondary_output,
-        device_id: options.device_id.clone(),
-        target_pid,
-        // The facade checks source-specific mode and exclusion semantics.
-        mode,
-        exclude_self: options.exclude_self.unwrap_or(false),
-        exclude_pids,
-        gain: options.gain.unwrap_or(1.0) as f32,
-        silence_probe: options.silence_probe.unwrap_or(true),
-        // mix only (the facade ignores these for mic/system/process). Per-side gains default to 1.0.
-        mix_mic_device_id: options.mic_device_id.clone(),
-        mix_system_device_id: options.system_device_id.clone(),
-        mix_mic_gain: options.mic_gain.unwrap_or(1.0) as f32,
-        mix_system_gain: options.system_gain.unwrap_or(1.0) as f32,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::new(kind);
+    config.output = output;
+    config.secondary_output = secondary_output;
+    config.device_id = options.device_id.clone();
+    config.target_pid = target_pid;
+    // The facade checks source-specific mode and exclusion semantics.
+    config.mode = mode;
+    config.exclude_self = options.exclude_self.unwrap_or(false);
+    config.exclude_pids = exclude_pids;
+    config.gain = options.gain.unwrap_or(1.0) as f32;
+    config.silence_probe = options.silence_probe.unwrap_or(true);
+    // mix only (the facade ignores these for mic/system/process). Per-side gains default to 1.0.
+    config.mix_mic_device_id = options.mic_device_id.clone();
+    config.mix_system_device_id = options.system_device_id.clone();
+    config.mix_mic_gain = options.mic_gain.unwrap_or(1.0) as f32;
+    config.mix_system_gain = options.system_gain.unwrap_or(1.0) as f32;
     if let Some(ms) = options.chunk_ms {
         if ms != 20.0 {
             return Err(to_napi_err(flexaudio::core::chunk_ms_error(
@@ -2477,18 +2474,15 @@ pub fn open_mock_stream(
         }),
         None => None,
     };
-    let config = StreamConfig {
-        kind: SourceKind::Mic,
-        output: OutputFormat {
-            sample_rate,
-            channels,
-        },
-        secondary_output: secondary_rate.map(|rate| OutputFormat {
-            sample_rate: rate,
-            channels: secondary_channels.unwrap_or(1),
-        }),
-        ..Default::default()
+    let mut config = StreamConfig::new(SourceKind::Mic);
+    config.output = OutputFormat {
+        sample_rate,
+        channels,
     };
+    config.secondary_output = secondary_rate.map(|rate| OutputFormat {
+        sample_rate: rate,
+        channels: secondary_channels.unwrap_or(1),
+    });
     let backend = Box::new(flexaudio::MockBackend::new(
         sample_rate,
         channels,
@@ -3053,15 +3047,15 @@ mod tests {
 
     #[test]
     fn device_event_to_js_maps_variants() {
-        let info = DeviceInfo {
-            id: "node-1".to_string(),
-            name: "Mic A".to_string(),
-            source_kind: SourceKind::Mic,
-            format_available: true,
-            sample_rate: 48_000,
-            channels: 2,
-            is_loopback: false,
-            is_default: true,
+        let info = {
+            let mut device_value =
+                DeviceInfo::new("node-1".to_string(), "Mic A".to_string(), SourceKind::Mic);
+            device_value.format_available = true;
+            device_value.sample_rate = 48_000;
+            device_value.channels = 2;
+            device_value.is_loopback = false;
+            device_value.is_default = true;
+            device_value
         };
         let added = device_event_to_js(DeviceEvent::Added(info));
         assert_eq!(added.kind, "added");
@@ -3116,16 +3110,16 @@ mod tests {
 
     #[test]
     fn device_info_to_js_maps_all_fields() {
-        let info = DeviceInfo {
-            id: "id-x".to_string(),
-            name: "Name X".to_string(),
-            source_kind: SourceKind::SystemLoopback,
-            format_available: true,
-            sample_rate: 44_100,
-            channels: 1,
-            is_loopback: true,
-            is_default: false,
-        };
+        let mut info = DeviceInfo::new(
+            "id-x".to_string(),
+            "Name X".to_string(),
+            SourceKind::SystemLoopback,
+        );
+        info.format_available = true;
+        info.sample_rate = 44_100;
+        info.channels = 1;
+        info.is_loopback = true;
+        info.is_default = false;
         let js = device_info_to_js(info);
         assert_eq!(js.id, "id-x");
         assert_eq!(js.name, "Name X");

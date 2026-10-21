@@ -48,11 +48,9 @@ fn open(config: StreamConfig, strict: bool, backend: Backend) -> Stream {
 
 #[test]
 fn successful_identical_switches_increment_recovery_does_not() {
-    let config = StreamConfig {
-        gain: 2.0,
-        ring_capacity_chunks: 7,
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.gain = 2.0;
+    config.ring_capacity_chunks = 7;
     let mut stream = open(config, false, Backend::new(false));
     stream.start().unwrap();
     let initial = stream.effective_settings().unwrap().clone();
@@ -101,10 +99,7 @@ fn construction_and_start_failures_keep_previous_report_options_and_config() {
     let report = stream.effective_settings().unwrap().clone();
     let config = stream.config().clone();
     for fail_start in [false, true] {
-        let replacement = StreamConfig {
-            kind: crate::SourceKind::SystemLoopback,
-            ..Default::default()
-        };
+        let replacement = StreamConfig::new(crate::SourceKind::SystemLoopback);
         let error = stream
             .switch_source_using(
                 replacement,
@@ -138,12 +133,10 @@ fn strict_switch_counts_zero_builds_and_old_source_stops_and_keeps_snapshot() {
     stream.start().unwrap();
     let initial = stream.effective_settings().unwrap().clone();
     let builds = AtomicUsize::new(0);
-    let requested = StreamConfig {
-        gain: 2.0,
-        ring_capacity_chunks: 7,
-        target_pid: Some(42),
-        ..Default::default()
-    };
+    let mut requested = StreamConfig::default();
+    requested.gain = 2.0;
+    requested.ring_capacity_chunks = 7;
+    requested.target_pid = Some(42);
     let error = stream
         .switch_source_using(requested, None, None, |_, _| {
             builds.fetch_add(1, Ordering::SeqCst);
@@ -166,9 +159,10 @@ fn strict_switch_counts_zero_builds_and_old_source_stops_and_keeps_snapshot() {
     // Explicit permissive replacement is committed together with a successful source.
     stream
         .switch_source_using(
-            StreamConfig {
-                gain: 2.0,
-                ..Default::default()
+            {
+                let mut config_value = StreamConfig::default();
+                config_value.gain = 2.0;
+                config_value
             },
             Some(true),
             Some(OpenOptions::new().strict(false)),
@@ -217,10 +211,10 @@ fn omitted_options_report_defaults_while_retaining_backend_options() {
 
 #[test]
 fn omitted_options_keep_controls_and_attachment_reports_across_source_round_trip() {
-    let config = |kind| StreamConfig {
-        kind,
-        target_pid: (kind == crate::SourceKind::ProcessLoopback).then_some(42),
-        ..Default::default()
+    let config = |kind| {
+        let mut config_value = StreamConfig::new(kind);
+        config_value.target_pid = (kind == crate::SourceKind::ProcessLoopback).then_some(42);
+        config_value
     };
     for initial_kind in [
         crate::SourceKind::Mic,
@@ -273,13 +267,11 @@ fn omitted_options_keep_controls_and_attachment_reports_across_source_round_trip
 
 #[test]
 fn attachment_switch_preflight_matches_public_report_and_commits_only_on_success() {
-    let config = StreamConfig {
-        secondary_output: Some(crate::OutputFormat {
-            sample_rate: 16_000,
-            channels: 1,
-        }),
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(crate::OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    });
     let attachments = crate::SettingsAttachments::new()
         .denoise(true)
         .vad(true)

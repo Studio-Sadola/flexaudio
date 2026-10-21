@@ -68,11 +68,9 @@ pub(crate) const PROCESS_ENUM_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// let candidates = processes()?;
 /// if let Some(target) = candidates.first() {
-///     let mut stream = open(StreamConfig {
-///         kind: SourceKind::ProcessLoopback,
-///         target_pid: Some(target.pid),
-///         ..Default::default()
-///     })?;
+///     let mut config = StreamConfig::new(SourceKind::ProcessLoopback);
+///     config.target_pid = Some(target.pid);
+///     let mut stream = open(config)?;
 ///     stream.start()?;
 ///     stream.stop();
 /// }

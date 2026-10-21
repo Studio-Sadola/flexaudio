@@ -207,36 +207,35 @@ pub unsafe fn build_config(
 
     let output = resolve_output(config);
 
-    Ok(StreamConfig {
-        kind: source_kind_from_c(config.kind)?,
-        device_id,
+    Ok({
+        let mut config_value = StreamConfig::new(source_kind_from_c(config.kind)?);
+        config_value.device_id = device_id;
         // process_id 0 is a sentinel meaning "none".
-        target_pid: if config.process_id == 0 {
+        config_value.target_pid = if config.process_id == 0 {
             None
         } else {
             Some(config.process_id)
-        },
+        };
         // mode is process-only; exclude_self is system-only. The facade handles them separately.
-        mode: process_mode_from_c(config.mode)?,
-        exclude_self: config.exclude_self != 0,
-        silence_probe: config.silence_probe != 2,
-        exclude_pids,
-        chunk_ms: if config.chunk_ms == 0 {
+        config_value.mode = process_mode_from_c(config.mode)?;
+        config_value.exclude_self = config.exclude_self != 0;
+        config_value.silence_probe = config.silence_probe != 2;
+        config_value.exclude_pids = exclude_pids;
+        config_value.chunk_ms = if config.chunk_ms == 0 {
             DEFAULT_CHUNK_MS
         } else {
             config.chunk_ms
-        },
+        };
         // gain 0.0 is a sentinel for default 1.0 (same convention as output_rate 0→48000).
         // To mute at runtime, use flexaudio_set_gain(s, 0.0). Mix side gains use the same
         // convention (0.0 sentinel → 1.0; muting one side before mixing is not currently supported).
-        gain: gain_or_default(config.gain),
-        mix_mic_device_id,
-        mix_system_device_id,
-        mix_mic_gain: gain_or_default(config.mix_mic_gain),
-        mix_system_gain: gain_or_default(config.mix_system_gain),
-        output,
-        // Do not expose ring_capacity_chunks (use the StreamConfig default).
-        ..Default::default()
+        config_value.gain = gain_or_default(config.gain);
+        config_value.mix_mic_device_id = mix_mic_device_id;
+        config_value.mix_system_device_id = mix_system_device_id;
+        config_value.mix_mic_gain = gain_or_default(config.mix_mic_gain);
+        config_value.mix_system_gain = gain_or_default(config.mix_system_gain);
+        config_value.output = output;
+        config_value
     })
 }
 
@@ -697,17 +696,14 @@ mod tests {
 
     #[test]
     fn chunk_to_c_keeps_ptr_and_len_consistent() {
-        let chunk = AudioChunk {
-            frame_index: 9_007_199_254_740_993,
-            data: vec![0.1, -0.2, 0.3, -0.4],
-            frames: 2,
-            pts_ns: 123,
-            seq: 9,
-            flags: ChunkFlags::DISCONTINUITY,
-            dropped_before: 1,
-            peak: 0.4,
-            rms: 0.25,
-        };
+        let mut chunk = AudioChunk::new(vec![0.1, -0.2, 0.3, -0.4], 2);
+        chunk.frame_index = 9_007_199_254_740_993;
+        chunk.pts_ns = 123;
+        chunk.seq = 9;
+        chunk.flags = ChunkFlags::DISCONTINUITY;
+        chunk.dropped_before = 1;
+        chunk.peak = 0.4;
+        chunk.rms = 0.25;
         let mut fc = chunk_to_c(chunk);
         unsafe {
             assert_eq!(
@@ -746,16 +742,16 @@ mod tests {
     #[test]
     fn empty_chunk_allocations_have_distinct_indices_and_free_invalidates_them() {
         fn empty(index: u64) -> FlexChunk {
-            chunk_to_c(AudioChunk {
-                data: Vec::new(),
-                frames: 0,
-                frame_index: index,
-                pts_ns: 0,
-                seq: 0,
-                flags: flexaudio::ChunkFlags::empty(),
-                dropped_before: 0,
-                peak: 0.0,
-                rms: 0.0,
+            chunk_to_c({
+                let mut chunk_value = AudioChunk::new(Vec::new(), 0);
+                chunk_value.frame_index = index;
+                chunk_value.pts_ns = 0;
+                chunk_value.seq = 0;
+                chunk_value.flags = flexaudio::ChunkFlags::empty();
+                chunk_value.dropped_before = 0;
+                chunk_value.peak = 0.0;
+                chunk_value.rms = 0.0;
+                chunk_value
             })
         }
         let mut first = empty(123);
@@ -868,15 +864,15 @@ mod tests {
 
     #[test]
     fn device_info_to_c_and_free_roundtrip() {
-        let infos = vec![DeviceInfo {
-            id: "id-1".to_string(),
-            name: "Mic A".to_string(),
-            source_kind: SourceKind::Mic,
-            sample_rate: 48_000,
-            channels: 2,
-            format_available: true,
-            is_loopback: false,
-            is_default: true,
+        let infos = vec![{
+            let mut device_value =
+                DeviceInfo::new("id-1".to_string(), "Mic A".to_string(), SourceKind::Mic);
+            device_value.sample_rate = 48_000;
+            device_value.channels = 2;
+            device_value.format_available = true;
+            device_value.is_loopback = false;
+            device_value.is_default = true;
+            device_value
         }];
         // As in production flexaudio_devices, collect into Box<[T]> and create ptr/count.
         let boxed: Box<[FlexDeviceInfo]> = infos.into_iter().map(device_info_to_c).collect();

@@ -112,24 +112,23 @@ pub(crate) fn build_config(
         sample_rate: output_rate,
         channels: output_channels,
     };
-    Ok(StreamConfig {
-        kind,
-        output,
-        device_id,
-        target_pid: process_id,
+    Ok({
+        let mut config_value = StreamConfig::new(kind);
+        config_value.output = output;
+        config_value.device_id = device_id;
+        config_value.target_pid = process_id;
         // mode is process-only; exclusions apply to system capture and the system side of mix.
-        mode,
-        exclude_self,
-        exclude_pids,
-        chunk_ms,
-        gain,
+        config_value.mode = mode;
+        config_value.exclude_self = exclude_self;
+        config_value.exclude_pids = exclude_pids;
+        config_value.chunk_ms = chunk_ms;
+        config_value.gain = gain;
         // Mix-only (the facade ignores these for other source kinds).
-        mix_mic_device_id: mic_device_id,
-        mix_system_device_id: system_device_id,
-        mix_mic_gain: mic_gain,
-        mix_system_gain: system_gain,
-        // Use the default for ring_capacity_chunks.
-        ..Default::default()
+        config_value.mix_mic_device_id = mic_device_id;
+        config_value.mix_system_device_id = system_device_id;
+        config_value.mix_mic_gain = mic_gain;
+        config_value.mix_system_gain = system_gain;
+        config_value
     })
 }
 

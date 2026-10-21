@@ -514,16 +514,16 @@ mod tests {
 
     #[test]
     fn vad_tap_only_event_batches_remain_deliverable() {
-        let mut carrier = chunk_to_py(AudioChunk {
-            frame_index: 0,
-            data: Vec::new(),
-            frames: 0,
-            pts_ns: 0,
-            seq: 0,
-            flags: fa::ChunkFlags::empty(),
-            dropped_before: 0,
-            peak: 0.0,
-            rms: 0.0,
+        let mut carrier = chunk_to_py({
+            let mut chunk_value = AudioChunk::new(Vec::new(), 0);
+            chunk_value.frame_index = 0;
+            chunk_value.pts_ns = 0;
+            chunk_value.seq = 0;
+            chunk_value.flags = fa::ChunkFlags::empty();
+            chunk_value.dropped_before = 0;
+            chunk_value.peak = 0.0;
+            chunk_value.rms = 0.0;
+            chunk_value
         });
         assert!(!carrier.has_audio_or_vad());
         carrier.set_vad_events(vec![flexaudio_vad::AttachedVadEvent::Vad(
@@ -625,17 +625,15 @@ mod tests {
 
     #[test]
     fn chunk_to_py_carries_fields() {
-        let chunk = AudioChunk {
-            frame_index: 0,
-            data: vec![0.0, 1.0, -1.0, 0.5],
-            frames: 2,
-            pts_ns: 123,
-            seq: 9_007_199_254_740_993, // 2^53 + 1 (not exactly representable as f64).
-            flags: fa::ChunkFlags::empty(),
-            dropped_before: 3,
-            peak: 1.0,
-            rms: 0.5,
-        };
+        let mut chunk = AudioChunk::new(vec![0.0, 1.0, -1.0, 0.5], 2);
+        chunk.frame_index = 0;
+        chunk.pts_ns = 123;
+        chunk.seq = 9_007_199_254_740_993;
+        // 2^53 + 1 (not exactly representable as f64).
+        chunk.flags = fa::ChunkFlags::empty();
+        chunk.dropped_before = 3;
+        chunk.peak = 1.0;
+        chunk.rms = 0.5;
         let py = chunk_to_py(chunk);
         assert_eq!(py.frames, 2);
         assert_eq!(py.pts_ns, 123);
@@ -647,16 +645,16 @@ mod tests {
 
     #[test]
     fn device_info_to_py_maps_all_fields() {
-        let info = DeviceInfo {
-            id: "id-x".to_string(),
-            name: "Name X".to_string(),
-            source_kind: SourceKind::SystemLoopback,
-            sample_rate: 44_100,
-            channels: 1,
-            format_available: true,
-            is_loopback: true,
-            is_default: false,
-        };
+        let mut info = DeviceInfo::new(
+            "id-x".to_string(),
+            "Name X".to_string(),
+            SourceKind::SystemLoopback,
+        );
+        info.sample_rate = 44_100;
+        info.channels = 1;
+        info.format_available = true;
+        info.is_loopback = true;
+        info.is_default = false;
         let py = device_info_to_py(info);
         assert_eq!(py.id, "id-x");
         assert_eq!(py.source_kind, "system");
@@ -667,15 +665,15 @@ mod tests {
 
     #[test]
     fn device_event_to_py_maps_each_variant() {
-        let info = DeviceInfo {
-            id: "mic-1".to_string(),
-            name: "Mic".to_string(),
-            source_kind: SourceKind::Mic,
-            sample_rate: 48_000,
-            channels: 2,
-            format_available: true,
-            is_loopback: false,
-            is_default: true,
+        let info = {
+            let mut device_value =
+                DeviceInfo::new("mic-1".to_string(), "Mic".to_string(), SourceKind::Mic);
+            device_value.sample_rate = 48_000;
+            device_value.channels = 2;
+            device_value.format_available = true;
+            device_value.is_loopback = false;
+            device_value.is_default = true;
+            device_value
         };
         let added = device_event_to_py(DeviceEvent::Added(info));
         assert_eq!(added.kind, "added");

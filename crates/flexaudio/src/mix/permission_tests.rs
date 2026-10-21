@@ -59,10 +59,8 @@ fn either_child_denial_stops_both_lanes_and_gates_stream() {
             },
             stops: system_stops.clone(),
         });
-        let config = StreamConfig {
-            secondary_output: Some(OutputFormat::default()),
-            ..Default::default()
-        };
+        let mut config = StreamConfig::default();
+        config.secondary_output = Some(OutputFormat::default());
         let mut stream = crate::Stream::open(
             config,
             Box::new(CompositeBackend::new(mic, system, 1.0, 1.0)),
@@ -256,10 +254,8 @@ fn terminal_error_waits_until_both_mix_children_have_stopped() {
         events: VecDeque::new(),
         stops: system_stops.clone(),
     });
-    let config = StreamConfig {
-        secondary_output: Some(OutputFormat::default()),
-        ..Default::default()
-    };
+    let mut config = StreamConfig::default();
+    config.secondary_output = Some(OutputFormat::default());
     let mut stream = crate::Stream::open(
         config,
         Box::new(CompositeBackend::new(mic, system, 1.0, 1.0)),
