@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Rust `validate_open` exposes the same device-independent argument validation
+  and strict preflight used by open, allowing model loading before backend access.
+- The non-default `test-support` feature is internal and test-only, with no
+  stability guarantee.
 - C v5 open/switch envelopes with presence-aware output and mix-lane gains:
   NULL pointers select unity (1.0), while explicit zero mutes. They reuse v4
   controls, strict defaults and settings reports. Output gain remains fixed at

@@ -14,9 +14,8 @@ readme = "README.md"
 documentation = "https://docs.rs/flexaudio-vad"
 
 [features]
-# Compiles the capture owner's fault injection used only by binding self-tests
-# (`VadTap::inject_failure` / `inject_reset_failure`). Off by default: no
-# production caller can latch a failure.
+# Compiles thread-local model-load and capture-owner faults for binding self-tests.
+# Off by default; these internal test hooks have no stability guarantee.
 test-faults = []
 
 [dependencies]

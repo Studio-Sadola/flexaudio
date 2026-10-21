@@ -22,6 +22,9 @@ mod resample;
 mod stream;
 mod tap;
 mod tap_types;
+#[cfg(feature = "test-faults")]
+#[doc(hidden)]
+pub mod test_faults;
 mod types;
 mod whisper_cpp_segments;
 

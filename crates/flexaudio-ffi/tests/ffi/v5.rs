@@ -297,28 +297,20 @@ fn strict_controls_report_literal_mix_zeros_and_invalid_gains_match_rust() {
                 .err()
                 .unwrap();
             let mut stream = ptr::dangling_mut();
-            let reached_core = std::cell::Cell::new(false);
             assert_eq!(
                 open_with(
                     &request(&b4, &gain_options(&invalid)),
                     &mut stream,
-                    |config, options| {
-                        reached_core.set(true);
-                        flexaudio::test_support::open(
-                            config,
-                            options,
-                            Box::new(Input(Sink::default())),
-                        )
-                    }
+                    |_, _| panic!("invalid gain reached the opener")
                 ),
                 code::FLEX_INVALID_ARG
             );
             assert!(stream.is_null());
-            assert!(
-                reached_core.get(),
-                "open gain validation must belong to core"
-            );
             assert_eq!(error::last_audio_error().unwrap().kind(), rust.kind());
+            assert_eq!(
+                error::last_audio_error().unwrap().to_string(),
+                rust.to_string()
+            );
         }
         // Mix accepts literal zero lanes under strict mode; omission is unity.
         let mut base: FlexConfig = mem::zeroed();
@@ -416,6 +408,87 @@ fn assert_same_row(actual: &flexaudio::SettingResolution, expected: &flexaudio::
             }
             _ => assert_eq!(actual, expected),
         }
+    }
+}
+
+#[test]
+fn attached_vad_model_failure_precedes_the_opener_in_v4_and_v5() {
+    // SAFETY: initialized envelopes and VAD options live throughout each call;
+    // out is writable. The opener must never run when the real model parser fails.
+    unsafe {
+        let base: FlexConfig = mem::zeroed();
+        let vad = crate::vad_integration::FlexStreamVadOptions {
+            params: crate::vad::flexaudio_vad_default_options(),
+            provisional: 0,
+            tap: crate::vad_integration::FLEX_VAD_PRIMARY,
+        };
+        let mut b3 = base3(&base);
+        b3.vad = &vad;
+        let options = controls(0);
+        let b4 = base4(&b3, &options);
+        let gains = gain_options(&0.0);
+        let config = request(&b4, &gains);
+        for version in [4, 5] {
+            let fault = flexaudio_vad::test_faults::ModelLoadFault::new();
+            let mut out = ptr::dangling_mut();
+            let status = if version == 4 {
+                v4::open_with(&b4, &mut out, |_, _| {
+                    panic!("opener ran before VAD model failure")
+                })
+            } else {
+                open_with(&config, &mut out, |_, _| {
+                    panic!("opener ran before VAD model failure")
+                })
+            };
+            assert_eq!(status, code::FLEX_FAILURE, "v{version}");
+            assert!(out.is_null());
+            assert_eq!(fault.attempts(), 1, "the real model parser must be reached");
+            assert_eq!(
+                error::last_audio_error().unwrap().vad_code(),
+                Some(flexaudio_vad::VadErrorCode::ModelLoad)
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_open_gain_precedes_vad_model_loading_and_the_opener() {
+    // SAFETY: envelopes, floats and VAD options have initialized aligned storage;
+    // the output pointer references a writable local destination.
+    unsafe {
+        let base: FlexConfig = mem::zeroed();
+        let vad = crate::vad_integration::FlexStreamVadOptions {
+            params: crate::vad::flexaudio_vad_default_options(),
+            provisional: 0,
+            tap: crate::vad_integration::FLEX_VAD_PRIMARY,
+        };
+        let mut b3 = base3(&base);
+        b3.vad = &vad;
+        let options = controls(0);
+        let b4 = base4(&b3, &options);
+        let gains = gain_options(&f32::NAN);
+        let config = request(&b4, &gains);
+        let fault = flexaudio_vad::test_faults::ModelLoadFault::new();
+        let mut out = ptr::dangling_mut();
+        assert_eq!(
+            open_with(&config, &mut out, |_, _| panic!(
+                "invalid gain reached the opener"
+            )),
+            code::FLEX_INVALID_ARG
+        );
+        assert!(out.is_null());
+        assert_eq!(
+            fault.attempts(),
+            0,
+            "invalid gain must precede model loading"
+        );
+        let mut rust_config = flexaudio::StreamConfig::new(flexaudio::SourceKind::Mic);
+        rust_config.gain = f32::NAN;
+        let rust =
+            flexaudio::validate_open(&rust_config, &flexaudio::OpenOptions::default()).unwrap_err();
+        let actual = error::last_audio_error().unwrap();
+        assert_eq!(actual.kind(), rust.kind());
+        assert_eq!(actual.to_string(), rust.to_string());
     }
 }
 

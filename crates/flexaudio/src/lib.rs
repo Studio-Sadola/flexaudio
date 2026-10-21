@@ -43,6 +43,7 @@ pub mod stream;
 #[doc(hidden)]
 pub mod test_support;
 mod validation;
+pub use validation::validate_open;
 
 pub use device_watcher::DeviceWatcher;
 pub use mock::MockBackend;
@@ -233,9 +234,7 @@ fn open_using(
     build: impl FnOnce(&StreamConfig, &OpenOptions) -> Result<Box<dyn CaptureBackend>>,
 ) -> Result<Stream> {
     // Share custom-open validation, but run it before any native construction.
-    validation::open_config(&config)?;
-    validation::source_config(&config)?;
-    let report = settings::preflight(&config, &options, None, None, false)?;
+    let report = validate_open(&config, &options)?;
     let backend = build(&config, &options)?;
 
     // Delegate to the low-level entry point (which configures the Normalizer and threads).

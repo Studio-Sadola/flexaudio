@@ -2,6 +2,26 @@
 
 use crate::{Error, Result, StreamConfig};
 
+/// Validate an open request and resolve its effective settings without native access.
+///
+/// This is the same argument validation and strict preflight used by
+/// [`crate::open_with_options`]. Callers may run it before loading attached models;
+/// it creates no backend, queries no device and requests no permission. The returned
+/// report describes the candidate settings, not device availability or permission.
+/// Opening revalidates the request before constructing its backend.
+///
+/// # Errors
+/// Returns argument-validation errors, settings-resolution errors, or
+/// [`Error::IgnoredSettings`] when strict mode rejects an ignored request.
+pub fn validate_open(
+    config: &StreamConfig,
+    options: &crate::OpenOptions,
+) -> Result<crate::SettingsReport> {
+    open_config(config)?;
+    source_config(config)?;
+    crate::settings::preflight(config, options, None, None, false)
+}
+
 pub(crate) fn open_config(config: &StreamConfig) -> Result<()> {
     flexaudio_core::validate_chunk_ms(config.chunk_ms)?;
     if config.ring_capacity_chunks == 0 {

@@ -203,32 +203,21 @@ pub(crate) unsafe fn open_shared(
             );
             // v5 delegates both argument validation and applicability to core.
             // Legacy entry points retain their existing preflight and ordering.
-            let core_first = gains.is_some();
-            if !core_first {
+            if gains.is_some() {
+                flexaudio::validate_open(&config, &options).map_err(error::set_audio_error)?;
+            } else {
                 preflight(&config, &options)?;
             }
-            Ok::<_, i32>((
-                PreparedOpen {
-                    config,
-                    options,
-                    secondary,
-                    vad,
-                    denoise,
-                },
-                core_first,
-            ))
+            Ok::<_, i32>(PreparedOpen {
+                config,
+                options,
+                secondary,
+                vad,
+                denoise,
+            })
         })();
         match prepared {
-            Ok((prepared, true)) => {
-                // Core's open_config/source_config and strict preflight must run
-                // before model loading. The already opened stream is then attached
-                // through the same finishing path as every other C entry point.
-                match open(prepared.config.clone(), prepared.options.clone()) {
-                    Ok(inner) => finish_open(prepared, out, |_, _| Ok(inner)),
-                    Err(error) => error::set_audio_error(error),
-                }
-            }
-            Ok((prepared, false)) => finish_open(prepared, out, open),
+            Ok(prepared) => finish_open(prepared, out, open),
             Err(status) => status,
         }
     })

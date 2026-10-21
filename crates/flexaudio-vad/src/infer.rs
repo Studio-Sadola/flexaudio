@@ -152,8 +152,12 @@ impl SileroEngine {
 }
 
 fn load_plan() -> Result<(Arc<TypedSimplePlan>, usize, usize, usize, usize), InferenceError> {
+    #[cfg(feature = "test-faults")]
+    let model_bytes = crate::test_faults::model_bytes(MODEL_BYTES);
+    #[cfg(not(feature = "test-faults"))]
+    let model_bytes = MODEL_BYTES;
     let mut model = tract_onnx::onnx()
-        .model_for_read(&mut Cursor::new(MODEL_BYTES))
+        .model_for_read(&mut Cursor::new(model_bytes))
         .map_err(|e| InferenceError::ModelLoad(format!("{e:#}")))?;
     let (input_ix, state_ix) = locate_silero_inputs(&model)?;
     let (output_ix, state_out_ix) = locate_silero_outputs(&model)?;
