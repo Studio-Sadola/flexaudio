@@ -94,7 +94,7 @@ unsafe fn pcm(config: &FlexStreamConfigV5, expected_gain: f32) -> Vec<f32> {
                     SettingOutcome::Applied
                 }
             );
-            flexaudio::Stream::open(config, Box::new(Input(sink.clone())))
+            flexaudio::test_support::open(config, options, Box::new(Input(sink.clone())))
         }),
         code::FLEX_OK
     );
@@ -262,13 +262,12 @@ fn strict_controls_report_literal_mix_zeros_and_invalid_gains_match_rust() {
             let config = request(&b4, &gains);
             let mut stream = ptr::dangling_mut();
             let status = open_with(&config, &mut stream, |config, options| {
-                assert_eq!(strict, 2);
-                assert!(!options.strict);
+                assert_eq!(options.strict, strict != 2);
                 assert_eq!(
                     (config.gain, config.mix_mic_gain, config.mix_system_gain),
                     (0.0, 0.0, 0.0)
                 );
-                flexaudio::Stream::open(config, Box::new(Input(Sink::default())))
+                flexaudio::test_support::open(config, options, Box::new(Input(Sink::default())))
             });
             if strict == 2 {
                 assert_eq!(status, 0);
@@ -291,22 +290,34 @@ fn strict_controls_report_literal_mix_zeros_and_invalid_gains_match_rust() {
         }
         options.strict = 0;
         let b4 = base4(&b3, &options);
-        for invalid in [f32::NAN, -0.5, f32::INFINITY] {
+        for invalid in [f32::NAN, -0.5, -1.0, f32::INFINITY] {
             let mut config = flexaudio::StreamConfig::new(flexaudio::SourceKind::Mic);
             config.gain = invalid;
             let rust = flexaudio::Stream::open(config, Box::new(Input(Sink::default())))
                 .err()
                 .unwrap();
             let mut stream = ptr::dangling_mut();
+            let reached_core = std::cell::Cell::new(false);
             assert_eq!(
                 open_with(
                     &request(&b4, &gain_options(&invalid)),
                     &mut stream,
-                    |_, _| panic!("invalid gain reached backend")
+                    |config, options| {
+                        reached_core.set(true);
+                        flexaudio::test_support::open(
+                            config,
+                            options,
+                            Box::new(Input(Sink::default())),
+                        )
+                    }
                 ),
                 code::FLEX_INVALID_ARG
             );
             assert!(stream.is_null());
+            assert!(
+                reached_core.get(),
+                "open gain validation must belong to core"
+            );
             assert_eq!(error::last_audio_error().unwrap().kind(), rust.kind());
         }
         // Mix accepts literal zero lanes under strict mode; omission is unity.
@@ -315,7 +326,14 @@ fn strict_controls_report_literal_mix_zeros_and_invalid_gains_match_rust() {
         let b3 = base3(&base);
         let b4 = base4(&b3, &options);
         for lane in [0, 1] {
-            for value in [None, Some(0.0), Some(0.5), Some(f32::NAN), Some(-1.0)] {
+            for value in [
+                None,
+                Some(0.0),
+                Some(0.5),
+                Some(f32::NAN),
+                Some(-1.0),
+                Some(f32::INFINITY),
+            ] {
                 let mut gains = gain_options(&0.0);
                 let pointer = value.as_ref().map_or(ptr::null(), ptr::from_ref);
                 if lane == 0 {
@@ -325,6 +343,11 @@ fn strict_controls_report_literal_mix_zeros_and_invalid_gains_match_rust() {
                 }
                 let mut stream = ptr::null_mut();
                 let status = open_with(&request(&b4, &gains), &mut stream, |config, options| {
+                    let inner = flexaudio::test_support::open(
+                        config.clone(),
+                        options.clone(),
+                        Box::new(Input(Sink::default())),
+                    )?;
                     let expected = value.unwrap_or(1.0);
                     assert_eq!(
                         if lane == 0 {
@@ -353,14 +376,261 @@ fn strict_controls_report_literal_mix_zeros_and_invalid_gains_match_rust() {
                             SettingOutcome::Applied
                         }
                     );
-                    flexaudio::Stream::open(config, Box::new(Input(Sink::default())))
+                    Ok(inner)
                 });
                 if value.is_some_and(|v| !v.is_finite() || v < 0.0) {
                     assert_eq!(status, code::FLEX_INVALID_ARG);
                     assert!(stream.is_null());
+                    let mut config = flexaudio::StreamConfig::new(flexaudio::SourceKind::Mix);
+                    if lane == 0 {
+                        config.mix_mic_gain = value.unwrap();
+                    } else {
+                        config.mix_system_gain = value.unwrap();
+                    }
+                    let rust =
+                        flexaudio::open_with_options(config, flexaudio::OpenOptions::default())
+                            .err()
+                            .unwrap();
+                    assert_eq!(error::last_audio_error().unwrap().kind(), rust.kind());
                 } else {
                     assert_eq!(status, 0);
                     crate::flexaudio_free(stream);
+                }
+            }
+        }
+    }
+}
+
+fn assert_same_row(actual: &flexaudio::SettingResolution, expected: &flexaudio::SettingResolution) {
+    assert_eq!(actual.setting, expected.setting);
+    assert_eq!(actual.outcome, expected.outcome);
+    for (actual, expected) in [
+        (&actual.requested, &expected.requested),
+        (&actual.effective, &expected.effective),
+    ] {
+        match (actual, expected) {
+            // NaN is not equal to itself. Comparing bits also detects accidental
+            // clamping or replacement of a literal at the binding boundary.
+            (SettingValue::Float(actual), SettingValue::Float(expected)) => {
+                assert_eq!(actual.to_bits(), expected.to_bits());
+            }
+            _ => assert_eq!(actual, expected),
+        }
+    }
+}
+
+#[test]
+fn switch_nonfinite_and_negative_output_gain_follow_core_fixed_at_open() {
+    // SAFETY: all borrowed envelopes and floats are live and aligned; both started
+    // streams are exclusively owned. Only backend construction is replaced in the
+    // permissive case; production core preflight and switch commit still execute.
+    unsafe {
+        for value in [f32::NAN, -1.0] {
+            for strict in [0, 1, 2] {
+                let base: FlexConfig = mem::zeroed();
+                let b3 = base3(&base);
+                let opening_options = controls(0);
+                let b4 = base4(&b3, &opening_options);
+                let mut stream = ptr::null_mut();
+                assert_eq!(
+                    open_with(
+                        &request(&b4, &gain_options(&0.5)),
+                        &mut stream,
+                        |config, options| flexaudio::test_support::open(
+                            config,
+                            options,
+                            Box::new(Input(Sink::default()))
+                        )
+                    ),
+                    0
+                );
+                let mut rust_config = flexaudio::StreamConfig::new(flexaudio::SourceKind::Mic);
+                rust_config.gain = 0.5;
+                let mut rust = flexaudio::test_support::open(
+                    rust_config,
+                    flexaudio::OpenOptions::default(),
+                    Box::new(Input(Sink::default())),
+                )
+                .unwrap();
+                assert_eq!(crate::flexaudio_start(stream), 0);
+                rust.start().unwrap();
+                let switch3 = FlexSwitchConfigV3 {
+                    size: mem::size_of::<FlexSwitchConfigV3>().try_into().unwrap(),
+                    version: 3,
+                    config: &base,
+                    exclude_pids: ptr::null(),
+                    exclude_pids_len: 0,
+                    windows_classic_loopback_keepalive: 0,
+                };
+                let options = controls(strict);
+                let switch4 = FlexSwitchConfigV4 {
+                    size: mem::size_of::<FlexSwitchConfigV4>().try_into().unwrap(),
+                    version: 4,
+                    base: &switch3,
+                    options: &options,
+                };
+                let gains = gain_options(&value);
+                let config = FlexSwitchConfigV5 {
+                    size: mem::size_of::<FlexSwitchConfigV5>().try_into().unwrap(),
+                    version: 5,
+                    base: &switch4,
+                    gains: &gains,
+                };
+                let status = if strict == 2 {
+                    switch_with(stream, &config, |stream, config, options| {
+                        assert_eq!(config.gain.to_bits(), value.to_bits());
+                        assert!(!options.strict);
+                        flexaudio::test_support::switch(
+                            stream,
+                            config,
+                            options,
+                            Box::new(Input(Sink::default())),
+                        )
+                    })
+                } else {
+                    // Rejection precedes native construction, so use the exported
+                    // C entry point and public Rust switch directly in strict mode.
+                    flexaudio_switch_source_v5(stream, &config)
+                };
+                let c_error = error::last_audio_error();
+                let mut replacement = flexaudio::StreamConfig::new(flexaudio::SourceKind::Mic);
+                replacement.gain = value;
+                let rust_options = flexaudio::OpenOptions::default().strict(strict != 2);
+                let result = if strict == 2 {
+                    flexaudio::test_support::switch(
+                        &mut rust,
+                        replacement,
+                        rust_options,
+                        Box::new(Input(Sink::default())),
+                    )
+                } else {
+                    rust.switch_source_with_options(replacement, rust_options)
+                };
+                let (actual, expected) = if strict == 2 {
+                    assert_eq!(status, code::FLEX_OK);
+                    result.unwrap();
+                    assert!(c_error.is_none());
+                    assert_eq!((*stream).inner.effective_settings().unwrap().revision, 1);
+                    (
+                        (*stream)
+                            .inner
+                            .effective_settings()
+                            .unwrap()
+                            .get(K::Gain)
+                            .unwrap(),
+                        rust.effective_settings().unwrap().get(K::Gain).unwrap(),
+                    )
+                } else {
+                    assert_eq!(status, code::FLEX_IGNORED_SETTINGS);
+                    let c_error = c_error.as_ref().unwrap();
+                    let rust_error = result.err().unwrap();
+                    assert_eq!(c_error.kind(), rust_error.kind());
+                    let actual = c_error.ignored_settings().unwrap().get(K::Gain).unwrap();
+                    let expected = rust_error.ignored_settings().unwrap().get(K::Gain).unwrap();
+                    assert_same_row(actual, expected);
+                    assert_eq!(actual.effective, SettingValue::Float(0.5));
+                    assert!(
+                        matches!(actual.outcome, SettingOutcome::Ignored(reason) if reason.as_str() == "fixedAtOpen")
+                    );
+                    assert_eq!((*stream).inner.effective_settings().unwrap().revision, 0);
+                    assert_eq!((*stream).inner.gain(), 0.5);
+                    assert_eq!(rust.gain(), 0.5);
+                    crate::flexaudio_free(stream);
+                    continue;
+                };
+                assert_same_row(actual, expected);
+                assert_eq!(actual.effective, SettingValue::Float(0.5));
+                assert!(
+                    matches!(actual.outcome, SettingOutcome::Ignored(reason) if reason.as_str() == "fixedAtOpen")
+                );
+                assert_eq!((*stream).inner.config().gain, 0.5);
+                assert_eq!(rust.config().gain, 0.5);
+                assert_eq!((*stream).inner.gain(), 0.5);
+                assert_eq!(rust.gain(), 0.5);
+                crate::flexaudio_free(stream);
+            }
+        }
+    }
+}
+
+#[test]
+fn microphone_invalid_mix_gains_are_reported_like_rust_in_both_strict_modes() {
+    // SAFETY: live aligned envelopes and float storage are borrowed for each call;
+    // owned handles are freed once. Injected backends use full core open validation.
+    unsafe {
+        for key in [K::MixMicGain, K::MixSystemGain] {
+            for value in [f32::NAN, -1.0] {
+                for strict in [0, 1, 2] {
+                    let base: FlexConfig = mem::zeroed();
+                    let b3 = base3(&base);
+                    let options = controls(strict);
+                    let b4 = base4(&b3, &options);
+                    let mut gains = gain_options(&0.0);
+                    let mut rust_config = flexaudio::StreamConfig::new(flexaudio::SourceKind::Mic);
+                    rust_config.gain = 0.0;
+                    if key == K::MixMicGain {
+                        gains.mix_mic_gain = &value;
+                        rust_config.mix_mic_gain = value;
+                    } else {
+                        gains.mix_system_gain = &value;
+                        rust_config.mix_system_gain = value;
+                    }
+                    let rust = flexaudio::test_support::open(
+                        rust_config,
+                        flexaudio::OpenOptions::default().strict(strict != 2),
+                        Box::new(Input(Sink::default())),
+                    );
+                    let mut stream = ptr::dangling_mut();
+                    let status =
+                        open_with(&request(&b4, &gains), &mut stream, |config, options| {
+                            flexaudio::test_support::open(
+                                config,
+                                options,
+                                Box::new(Input(Sink::default())),
+                            )
+                        });
+                    let actual = if let Ok(rust) = &rust {
+                        assert_eq!(status, code::FLEX_OK);
+                        assert!(!stream.is_null());
+                        assert_eq!((*stream).inner.config().gain, 0.0);
+                        let actual = (*stream)
+                            .inner
+                            .effective_settings()
+                            .unwrap()
+                            .get(key)
+                            .unwrap()
+                            .clone();
+                        assert_same_row(
+                            &actual,
+                            rust.effective_settings().unwrap().get(key).unwrap(),
+                        );
+                        crate::flexaudio_free(stream);
+                        actual
+                    } else {
+                        let rust_error = rust.as_ref().err().unwrap();
+                        assert_eq!(status, error::root_code(rust_error));
+                        assert_eq!(status, code::FLEX_IGNORED_SETTINGS);
+                        assert!(stream.is_null());
+                        let c_error = error::last_audio_error().unwrap();
+                        let actual = c_error
+                            .ignored_settings()
+                            .unwrap()
+                            .get(key)
+                            .unwrap()
+                            .clone();
+                        assert_same_row(
+                            &actual,
+                            rust_error.ignored_settings().unwrap().get(key).unwrap(),
+                        );
+                        actual
+                    };
+                    assert!(
+                        matches!(actual.outcome, SettingOutcome::Ignored(reason) if reason.as_str() == "wrongSourceKind")
+                    );
+                    assert_eq!(actual.effective, SettingValue::Absent);
+                    assert!(
+                        matches!(actual.requested, SettingValue::Float(v) if v.to_bits() == value.to_bits())
+                    );
                 }
             }
         }

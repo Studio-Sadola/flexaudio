@@ -318,7 +318,7 @@ impl Stream {
         self.switch_source_using(new_config, denoise, options, crate::build_backend)
     }
 
-    fn switch_source_using(
+    pub(crate) fn switch_source_using(
         &mut self,
         new_config: StreamConfig,
         denoise: Option<bool>,

@@ -767,7 +767,9 @@ typedef struct FlexSwitchConfigV4 {
 } FlexSwitchConfigV4;
 
 // Borrowed gains. Each NULL pointer selects 1.0; each supplied float is literal,
-// including 0.0 (mute). Values must be finite and nonnegative, with no upper bound.
+// including 0.0 (mute). Core validates output gain on open and mix gains only for
+// Mix sources: finite, nonnegative, no upper bound. Other sources report non-default
+// mix gains as ignored; switch output gain follows fixedAtOpen without range checks.
 // These replace all three gain fields in the nested FlexConfig, which must be zero.
 // Nonzero legacy gain fields return InvalidArg; use FlexGainsV5 instead.
 typedef struct FlexGainsV5 {
@@ -1699,6 +1701,8 @@ int32_t flexaudio_switch_source_v4(struct FlexStream *stream,
 // NULL gain pointers select unity; explicit zero mutes. Nested FlexConfig gain,
 // mix_mic_gain and mix_system_gain must be zero; otherwise InvalidArg names the
 // field and directs callers to FlexGainsV5 before any native access.
+// Core validates output gain on open and mix gains only for Mix sources.
+// Other sources report non-default mix gains as ignored (strict rejects them).
 // out is NULL on failure. All borrowed configuration is copied.
 // # Safety
 // Envelopes have readable header words and full storage only when those match.
@@ -1708,7 +1712,10 @@ int32_t flexaudio_open_v5(const struct FlexStreamConfigV5 *config, struct FlexSt
 // Switch with v4 strict semantics (0 retain, 1 on, 2 off). Omitted output gain
 // retains the current gain. Explicit non-default output gain, including zero,
 // returns FLEX_IGNORED_SETTINGS under strict mode, or is ignored in permissive mode.
-// Mix gains use literal values or unity defaults. Failure preserves the old source/report.
+// Mix gains apply to Mix sources, using literal values or unity defaults. Other
+// sources report non-default mix gains as ignored. Failure preserves the old source/report.
+// Output gain requests, even NaN or negative values, follow core's fixedAtOpen
+// reporting without range validation on switch. Core validates Mix-source gains.
 // Nested FlexConfig gain fields must be zero, as on open_v5; nonzero fields
 // return InvalidArg directing callers to FlexGainsV5 before any native access.
 // # Safety

@@ -201,17 +201,34 @@ pub(crate) unsafe fn open_shared(
                 .vad(vad.is_some())
                 .secondary_encoding(encoding),
             );
-            preflight(&config, &options)?;
-            Ok::<_, i32>(PreparedOpen {
-                config,
-                options,
-                secondary,
-                vad,
-                denoise,
-            })
+            // v5 delegates both argument validation and applicability to core.
+            // Legacy entry points retain their existing preflight and ordering.
+            let core_first = gains.is_some();
+            if !core_first {
+                preflight(&config, &options)?;
+            }
+            Ok::<_, i32>((
+                PreparedOpen {
+                    config,
+                    options,
+                    secondary,
+                    vad,
+                    denoise,
+                },
+                core_first,
+            ))
         })();
         match prepared {
-            Ok(prepared) => finish_open(prepared, out, open),
+            Ok((prepared, true)) => {
+                // Core's open_config/source_config and strict preflight must run
+                // before model loading. The already opened stream is then attached
+                // through the same finishing path as every other C entry point.
+                match open(prepared.config.clone(), prepared.options.clone()) {
+                    Ok(inner) => finish_open(prepared, out, |_, _| Ok(inner)),
+                    Err(error) => error::set_audio_error(error),
+                }
+            }
+            Ok((prepared, false)) => finish_open(prepared, out, open),
             Err(status) => status,
         }
     })
@@ -233,6 +250,18 @@ pub unsafe extern "C" fn flexaudio_switch_source_v4(
 pub(crate) unsafe fn switch_shared(
     stream: *mut FlexStream,
     decode: impl FnOnce() -> Result<(*const FlexSwitchConfigV4, Option<LiteralGains>), i32>,
+) -> i32 {
+    switch_shared_with(
+        stream,
+        decode,
+        flexaudio::Stream::switch_source_with_options,
+    )
+}
+
+pub(crate) unsafe fn switch_shared_with(
+    stream: *mut FlexStream,
+    decode: impl FnOnce() -> Result<(*const FlexSwitchConfigV4, Option<LiteralGains>), i32>,
+    switch: impl FnOnce(&mut flexaudio::Stream, StreamConfig, OpenOptions) -> flexaudio::Result<()>,
 ) -> i32 {
     guard_i32(|| {
         error::clear_last_error();
@@ -279,7 +308,7 @@ pub(crate) unsafe fn switch_shared(
             Ok(value) => value,
             Err(status) => return status,
         };
-        match (*stream).inner.switch_source_with_options(config, options) {
+        match switch(&mut (*stream).inner, config, options) {
             Ok(()) => 0,
             Err(error) => error::set_audio_error(error),
         }

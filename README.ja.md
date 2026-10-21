@@ -139,7 +139,8 @@ C v5 は v4 の制御を使い、出力と Mix 各入力のゲインの有無を
 入れ子の `FlexConfig` のゲイン欄はすべて 0 にします。非ゼロ値は `FLEX_INVALID_ARG` で拒否し、
 `FlexGainsV5` での指定を案内します。C v1-v4 は設定の 0 を引き続き 1.0 と解釈します。
 切替時に出力ゲインを省略すると現在値を維持し、明示した非既定値は `fixedAtOpen` として
-strict モードで拒否します。Mix 各入力のゲインは省略時に 1.0、指定時はその値を使います。
+strict モードで拒否します。Mix 各入力のゲインは Mix ソースに適用し、省略時は 1.0、指定時は
+その値を使います。他のソースでは非既定値を無視する設定として報告し、strict モードで拒否します。
 [C v5 の使用例](crates/flexaudio-ffi/README.md#version-5-presence-aware-gains)も参照してください。
 
 Rust（返されたストリームは `start()` まで開始しません）:

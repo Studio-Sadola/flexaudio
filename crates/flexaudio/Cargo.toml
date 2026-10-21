@@ -12,6 +12,10 @@ categories = ["multimedia::audio"]
 readme = "README.md"
 documentation = "https://docs.rs/flexaudio"
 
+[features]
+# Internal binding contract tests inject backends without replacing core decisions.
+test-support = []
+
 [dependencies]
 flexaudio-core = { path = "../flexaudio-core", version = "0.9.0" }
 # Bundle the microphone input backend (cpal, all OSes) for device enumeration (`devices()`).

@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   open on source switches; v1-v4 keep interpreting configuration zero as unity.
   Both v5 entry points reject nonzero legacy `FlexConfig` gain fields with
   `FLEX_INVALID_ARG` before native access and direct callers to `FlexGainsV5`.
+  Gain validation uses the Rust core path: output gain is validated on open,
+  Mix gains only for Mix sources; inapplicable gains are reported as ignored.
 - Rust constructors `AudioChunk::new(data, frames)`,
   `DeviceInfo::new(id, name, source_kind)` and `StreamConfig::new(kind)`.
   Public fields remain writable, and `StreamConfig::default()` remains available.

@@ -145,7 +145,9 @@ mute; the nested `FlexConfig` gain fields must be zero or v5 returns
 `FLEX_INVALID_ARG` directing callers to `FlexGainsV5`. C v1-v4 keep interpreting
 configuration zero as unity. On switch, omitted output gain retains the current
 value; explicit non-default gain is `fixedAtOpen` and strict mode rejects it.
-Mix gains use unity when omitted and literal values when supplied. See the
+Mix gains apply to Mix sources, using unity when omitted and literal values when
+supplied. On other sources, non-default mix gains are reported as ignored and
+rejected under strict mode. See the
 [C v5 example](crates/flexaudio-ffi/README.md#version-5-presence-aware-gains).
 
 Rust (the returned stream is not started until `start()`):

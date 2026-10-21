@@ -39,6 +39,9 @@ mod settings_tests;
 pub use settings_request::{SettingsAttachments, SettingsRequest};
 pub use settings_resolver::resolve_settings;
 pub mod stream;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
 mod validation;
 
 pub use device_watcher::DeviceWatcher;

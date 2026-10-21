@@ -530,7 +530,12 @@ and `FLEX_STREAM_VERSION_5`; nested v4/v3 envelopes retain their own versions.
 `FlexGainsV5.gain`, `mix_mic_gain` and `mix_system_gain` are borrowed nullable
 float pointers, following v4's optional capacity-pointer convention. NULL means
 omitted (1.0); a supplied float is literal, so 0.0 mutes and 0.5 halves amplitude.
-All supplied gains must be finite and nonnegative; there is no upper bound.
+Gain validation follows Rust's core path. Output gain must be finite and
+nonnegative on open, with no upper bound. Mix-lane gains have those constraints
+only when opening or switching to a Mix source. On other source kinds, a
+non-default mix gain (including NaN or a negative value) is reported as ignored
+with `wrongSourceKind`: strict mode rejects it with `FLEX_IGNORED_SETTINGS`,
+while permissive mode accepts the ignored request.
 A NULL `gains` pointer omits all three. The three legacy fields `FlexConfig.gain`,
 `mix_mic_gain` and `mix_system_gain` must be zero, including when `gains` is NULL.
 On both open and switch, any nonzero legacy gain returns `FLEX_INVALID_ARG`
@@ -575,6 +580,8 @@ explicit default 1.0) retains the current value, including runtime gain changes.
 An explicit non-default output gain, including 0.0, is reported as `fixedAtOpen`
 and rejected with `FLEX_IGNORED_SETTINGS` in strict mode; permissive mode ignores
 it and retains the current gain. Use `flexaudio_set_gain` to change it.
+This fixed-at-open rule also covers NaN and negative output gain requests on
+switch: they are reported as ignored, without range validation, just as in Rust.
 Mix microphone/system gains apply to the new Mix source: each omission selects
 1.0 and each explicit zero mutes that lane. On other source kinds, non-default
 mix gains are ignored requests and therefore rejected by strict mode.

@@ -4,7 +4,9 @@ use crate::v4_types::{FlexStreamConfigV4, FlexSwitchConfigV4};
 pub const FLEX_STREAM_VERSION_5: u32 = 5;
 
 /// Borrowed gains. Each NULL pointer selects 1.0; each supplied float is literal,
-/// including 0.0 (mute). Values must be finite and nonnegative, with no upper bound.
+/// including 0.0 (mute). Core validates output gain on open and mix gains only for
+/// Mix sources: finite, nonnegative, no upper bound. Other sources report non-default
+/// mix gains as ignored; switch output gain follows fixedAtOpen without range checks.
 /// These replace all three gain fields in the nested FlexConfig, which must be zero.
 /// Nonzero legacy gain fields return InvalidArg; use FlexGainsV5 instead.
 #[repr(C)]
