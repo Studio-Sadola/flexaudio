@@ -45,17 +45,30 @@ network access is unnecessary; the VAD model is embedded.
 5. **Failures remain visible and typed.** Capture and cleanup failures must not
    disappear into silence; retained errors and `ShutdownReport` expose them.
 6. **Versions keep their promises.** Patches fix bugs and documentation; minors
-   add or change features. Default and compatibility changes below belong
-   together in 1.0, not scattered across minors.
+   add or change features. The default and compatibility changes below are made
+   together in 0.9, not scattered across minors. Only the removal of `pts_ns`
+   waits for 0.10, because the old names were published to remain through 0.9.
 
-## The 1.0 boundary
+## The road to 1.0
 
-Strict mode becomes the default, so opening rejects requested settings that
-would be ignored. Today `OpenOptions::strict` defaults to `false`. In the same
-release: remove `pts_ns` / `ptsNs` in favor of `arrival_ns` / `arrivalNs` (the old
-names remain through 0.9); align omitted `denoise` on Python `switch_source`
-with the other bindings; stop interpreting C configuration `gain=0` as unity;
-mark `AudioChunk`, `DeviceInfo` and `StreamConfig` `#[non_exhaustive]`.
+0.9 collects the default and compatibility changes:
+
+- Strict mode becomes the default, so opening rejects requested settings that
+  would be ignored. Before 0.9, `OpenOptions::strict` defaults to `false`.
+- Omitted `denoise` on Python `switch_source` has the same meaning as in the
+  other bindings.
+- A new C configuration entry point, v5, treats an explicit `gain = 0` as mute.
+  The existing C entry points keep interpreting `gain = 0` as unity gain (1.0).
+- `AudioChunk`, `DeviceInfo` and `StreamConfig` are marked `#[non_exhaustive]`.
+  Constructor functions are added at the same time, so users do not have to
+  write these structs field by field.
+- Denoise works at any output rate.
+- Promises 1 and 5 get checks.
+
+0.10 removes `pts_ns` / `ptsNs` in favor of `arrival_ns` / `arrivalNs`. The old
+names remain through 0.9, as published.
+
+1.0 only declares stability. It adds no new breaking change.
 
 ## How progress is checked
 
