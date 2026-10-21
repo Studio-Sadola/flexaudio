@@ -142,7 +142,8 @@ class DeclarationContracts(unittest.TestCase):
         self.assertNotIn("vad", {argument.arg for argument in method.args.kwonlyargs})
         doc = ast.get_docstring(method)
         self.assertIn("persists across switches", doc)
-        self.assertIn("Omitting denoise disables noise suppression", doc)
+        self.assertIn("Omitting denoise or passing None retains", doc)
+        self.assertIn("explicit True/False enables/disables noise suppression", doc)
 
 
 if __name__ == "__main__":

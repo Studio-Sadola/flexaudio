@@ -178,7 +178,7 @@ jobs:
           python3 -m venv /tmp/pyenv
           . /tmp/pyenv/bin/activate
           pip install -q 'maturin[patchelf]'
-          maturin build --manifest-path bindings/flexaudio-py/Cargo.toml --out /tmp/wheels
+          maturin build --manifest-path bindings/flexaudio-py/Cargo.toml --features test-faults --out /tmp/wheels
           pip install --no-index --find-links /tmp/wheels flexaudio
           python -m unittest bindings/flexaudio-py/tests/test_contracts.py bindings/flexaudio-py/tests/test_pcm_buffer.py bindings/flexaudio-py/tests/test_settings_lifecycle.py -v
           # Discovery fails closed: without a PipeWire daemon (this runner) devices()

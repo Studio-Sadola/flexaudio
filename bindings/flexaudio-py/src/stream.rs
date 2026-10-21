@@ -10,6 +10,9 @@ mod secondary_delivery;
 mod settings_capture;
 #[path = "stream_stop.rs"]
 mod shutdown;
+#[cfg(feature = "test-faults")]
+#[path = "stream_test_backend.rs"]
+mod test_backend;
 #[path = "stream_vad.rs"]
 mod vad_capture;
 
@@ -250,7 +253,8 @@ impl Stream {
     ///
     /// The VAD attachment configured with `vad` at `open()` persists across switches. New PCM
     /// starts a new VAD epoch at the discontinuity. `denoise` configures noise suppression for
-    /// the new source; omitting it disables noise suppression (`denoise=False`).
+    /// the new source; omitting it or passing `None` retains the current setting.
+    /// Pass `True` or `False` explicitly to enable or disable noise suppression.
     #[pyo3(signature = (
         kind,
         *,
@@ -267,7 +271,7 @@ impl Stream {
         system_device_id = None,
         mic_gain = 1.0,
         system_gain = 1.0,
-        denoise = false,
+        denoise = None,
         silence_probe = true,
         windows_classic_loopback_keepalive = None,
         strict = None,
@@ -290,7 +294,7 @@ impl Stream {
         system_device_id: Option<String>,
         mic_gain: f32,
         system_gain: f32,
-        denoise: bool,
+        denoise: Option<bool>,
         silence_probe: bool,
         windows_classic_loopback_keepalive: Option<bool>,
         strict: Option<bool>,
@@ -301,6 +305,10 @@ impl Stream {
         }
         let exclude_pids = parse_exclude_pids(exclude_pids.as_ref())?;
 
+        #[cfg(feature = "test-faults")]
+        let mock_source = kind == "mock";
+        #[cfg(feature = "test-faults")]
+        let kind = self.test_source_kind(kind)?;
         let mut config = build_config(
             kind,
             device_id,
@@ -344,7 +352,18 @@ impl Stream {
             denoise,
             windows_classic_loopback_keepalive,
             strict,
-            |inner, config| inner.switch_source_with_options_and_denoise(config, options, denoise),
+            |inner, config| {
+                #[cfg(feature = "test-faults")]
+                if mock_source {
+                    return test_backend::switch(inner, denoise);
+                }
+                match denoise {
+                    Some(denoise) => {
+                        inner.switch_source_with_options_and_denoise(config, options, denoise)
+                    }
+                    None => inner.switch_source_with_options(config, options),
+                }
+            },
         )
     }
 
@@ -437,6 +456,10 @@ pub fn open(
     ring_capacity_chunks: Option<Bound<'_, PyAny>>,
 ) -> PyResult<Stream> {
     let exclude_pids = parse_exclude_pids(exclude_pids.as_ref())?;
+    #[cfg(feature = "test-faults")]
+    let mock_source = kind == "mock";
+    #[cfg(feature = "test-faults")]
+    let kind = if mock_source { "mic" } else { kind };
     let mut config = build_config(
         kind,
         device_id,
@@ -476,11 +499,12 @@ pub fn open(
     let request = crate::settings::Request {
         config: &config,
         keepalive: Some(windows_classic_loopback_keepalive),
-        denoise,
+        denoise: Some(denoise),
         vad: vad.is_some(),
         secondary: secondary_output,
     };
-    request.resolve(None, strict).map_err(to_py_err)?;
+    let report = request.resolve(None, strict).map_err(to_py_err)?;
+    let _ = &report;
     let attachments = request.attachments(false);
     let vad_tap = vad
         .map(|options| {
@@ -494,15 +518,22 @@ pub fn open(
         .transpose()
         .map_err(crate::vad::tap_error)?;
 
-    let stream = fa::open_with_options(
-        config,
-        fa::OpenOptions::new()
-            .strict(strict)
-            .settings_attachments(attachments)
-            .windows_classic_loopback_keepalive(windows_classic_loopback_keepalive),
-    )
+    let options = fa::OpenOptions::new()
+        .strict(strict)
+        .settings_attachments(attachments)
+        .windows_classic_loopback_keepalive(windows_classic_loopback_keepalive);
+    #[cfg(feature = "test-faults")]
+    let stream = if mock_source {
+        fa::Stream::open(config, test_backend::backend())
+    } else {
+        fa::open_with_options(config, options)
+    }
     .map_err(to_py_err)?;
+    #[cfg(not(feature = "test-faults"))]
+    let stream = fa::open_with_options(config, options).map_err(to_py_err)?;
     let stream = start_capture(stream, denoise, vad_tap.is_some())?;
+    #[cfg(any(test, feature = "test-faults"))]
+    let settings_report = stream.effective_settings().is_none().then_some(report);
     Ok(Stream {
         secondary: secondary_output.copied(),
         ready_secondary: Default::default(),
@@ -520,8 +551,8 @@ pub fn open(
         lifecycle_events: Default::default(),
         capture_events: Default::default(),
         settings: crate::settings::SettingsState {
-            #[cfg(test)]
-            report: None,
+            #[cfg(any(test, feature = "test-faults"))]
+            report: settings_report,
             strict,
         },
     })

@@ -14,6 +14,45 @@ SETTING_KEYS = {
 
 
 class SettingsLifecycleContracts(unittest.TestCase):
+    # Successful capture fixtures require a wheel built with --features test-faults.
+    def test_switch_omitted_denoise_retains_enabled_setting(self):
+        with fa.open("mock", denoise=True) as stream:
+            self.assertIs(self.denoise_entry(stream)["effective"], True)
+            for options in ({}, {"denoise": None}):
+                stream.switch_source("mock", **options)
+                entry = self.denoise_entry(stream)
+                self.assertIs(entry["requested"], False)
+                self.assertIs(entry["effective"], True)
+                self.assertEqual(entry["outcome"], {"status": "notRequested", "reason": None})
+
+    def test_switch_explicit_false_disables_denoise(self):
+        with fa.open("mock", denoise=True) as stream:
+            self.assertIs(self.denoise_entry(stream)["effective"], True)
+            stream.switch_source("mock", denoise=False)
+            entry = self.denoise_entry(stream)
+            self.assertIs(entry["requested"], False)
+            self.assertIs(entry["effective"], False)
+            self.assertEqual(entry["outcome"], {"status": "notRequested", "reason": None})
+            stream.switch_source("mock", denoise=None)
+            self.assertIs(self.denoise_entry(stream)["effective"], False)
+            stream.switch_source("mock", denoise=True)
+            self.assertIs(self.denoise_entry(stream)["effective"], True)
+
+    def test_switch_omitted_denoise_retains_disabled_setting(self):
+        with fa.open("mock", denoise=False) as stream:
+            self.assertIs(self.denoise_entry(stream)["effective"], False)
+            for options in ({}, {"denoise": None}):
+                stream.switch_source("mock", **options)
+                entry = self.denoise_entry(stream)
+                self.assertIs(entry["requested"], False)
+                self.assertIs(entry["effective"], False)
+                self.assertEqual(entry["outcome"], {"status": "notRequested", "reason": None})
+
+    @staticmethod
+    def denoise_entry(stream: fa.Stream):
+        report = stream.effective_settings()
+        return next(row for row in report["entries"] if row["setting"] == "denoise")
+
     def test_open_defaults_to_strict(self):
         for strict in ({}, {"strict": None}):
             with self.subTest(strict=strict), self.assertRaises(fa.IgnoredSettingsError) as raised:

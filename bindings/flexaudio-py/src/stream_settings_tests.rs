@@ -6,7 +6,7 @@ fn fixture(config: fa::StreamConfig, strict: bool) -> Stream {
     let report = crate::settings::Request {
         config: &config,
         keepalive: Some(true),
-        denoise: false,
+        denoise: Some(false),
         vad: false,
         secondary: None,
     }
@@ -24,6 +24,71 @@ fn fixture(config: fa::StreamConfig, strict: bool) -> Stream {
 }
 
 #[test]
+fn switch_denoise_retains_omitted_values_and_applies_explicit_values() {
+    Python::initialize();
+    Python::attach(|_| {
+        for (initial, requested, expected) in [
+            (true, None, true),
+            (true, Some(false), false),
+            (false, None, false),
+            (false, Some(true), true),
+        ] {
+            let config = fa::StreamConfig::default();
+            let inner = fa::Stream::open(
+                config.clone(),
+                Box::new(LifecycleBackend(Default::default())),
+            )
+            .unwrap();
+            let mut stream = denoise_tests::binding(start_capture(inner, initial, false).unwrap());
+            stream.settings = crate::settings::SettingsState {
+                strict: true,
+                report: Some(
+                    crate::settings::Request {
+                        config: &config,
+                        keepalive: Some(true),
+                        denoise: Some(initial),
+                        vad: false,
+                        secondary: None,
+                    }
+                    .resolve(None, true)
+                    .unwrap(),
+                ),
+            };
+            stream
+                .switch_with(config, requested, None, None, |inner, _| {
+                    let backend = Box::new(LifecycleBackend(Default::default()));
+                    match requested {
+                        Some(enabled) => inner.switch_backend_with_denoise(backend, enabled),
+                        None => inner.switch_backend(backend),
+                    }
+                })
+                .unwrap();
+            let report = stream.capture_settings().unwrap();
+            assert_eq!(report.revision, 1);
+            assert!(stream.settings.strict);
+            let entry = report.get(fa::SettingKey::Denoise).unwrap();
+            assert_eq!(
+                entry.requested,
+                fa::SettingValue::Bool(requested.unwrap_or(false))
+            );
+            assert_eq!(entry.effective, fa::SettingValue::Bool(expected));
+            assert_eq!(
+                entry.outcome,
+                if requested == Some(true) {
+                    fa::SettingOutcome::Applied
+                } else {
+                    fa::SettingOutcome::NotRequested
+                }
+            );
+            // With no input, only an enabled canonical denoiser has a padded stop tail.
+            stream.stop().unwrap();
+            assert_eq!(stream.poll_chunk().unwrap().is_some(), expected);
+            assert!(stream.poll_chunk().unwrap().is_none());
+        }
+    });
+}
+
+#[test]
 fn switch_commits_revision_retains_fixed_values_and_rolls_back_failures() {
     Python::initialize();
     Python::attach(|py| {
@@ -37,7 +102,7 @@ fn switch_commits_revision_retains_fixed_values_and_rolls_back_failures() {
             stream
                 .switch_with(
                     fa::StreamConfig::default(),
-                    false,
+                    Some(false),
                     None,
                     None,
                     |inner, _| {
@@ -76,7 +141,7 @@ fn switch_commits_revision_retains_fixed_values_and_rolls_back_failures() {
         ignored.gain = 3.0;
         ignored.ring_capacity_chunks = 7;
         let error = stream
-            .switch_with(ignored, false, None, None, |_, _| {
+            .switch_with(ignored, Some(false), None, None, |_, _| {
                 panic!("strict rejection reached backend")
             })
             .unwrap_err();
@@ -94,7 +159,7 @@ fn switch_commits_revision_retains_fixed_values_and_rolls_back_failures() {
         assert!(stream
             .switch_with(
                 fa::StreamConfig::default(),
-                false,
+                Some(false),
                 None,
                 Some(false),
                 |_, _| Err(fa::Error::DeviceNotFound)
@@ -110,7 +175,7 @@ fn switch_commits_revision_retains_fixed_values_and_rolls_back_failures() {
                     config_value.ring_capacity_chunks = 9;
                     config_value
                 },
-                true,
+                Some(true),
                 None,
                 Some(false),
                 |inner, _| {
@@ -321,7 +386,7 @@ fn defaults_never_trigger_strict_rejection_and_nondefaults_are_permissive() {
     let request = crate::settings::Request {
         config: &config,
         keepalive: Some(true),
-        denoise: false,
+        denoise: Some(false),
         vad: false,
         secondary: None,
     };

@@ -24,6 +24,8 @@ crate-type = ["cdylib"]
 # (extensions are expected to link to Python at runtime), so keep this feature optional. Plain cargo
 # build/test then work without it.
 extension-module = ["pyo3/extension-module"]
+# Device-free integration fixtures; never enabled for release wheels.
+test-faults = []
 
 [dependencies]
 flexaudio = { path = "../../crates/flexaudio" }

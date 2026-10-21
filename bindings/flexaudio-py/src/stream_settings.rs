@@ -4,7 +4,7 @@ use super::*;
 impl Stream {
     pub(super) fn capture_settings(&self) -> Option<&fa::SettingsReport> {
         let report = self.inner.effective_settings();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-faults"))]
         let report = report.or(self.settings.report.as_ref());
         report
     }
@@ -12,7 +12,7 @@ impl Stream {
     pub(super) fn switch_with(
         &mut self,
         config: fa::StreamConfig,
-        denoise: bool,
+        denoise: Option<bool>,
         keepalive: Option<bool>,
         strict: Option<bool>,
         commit: impl FnOnce(&mut fa::Stream, fa::StreamConfig) -> fa::Result<()>,
@@ -22,7 +22,10 @@ impl Stream {
                 "switch_source is only available on a started stream".into(),
             )));
         }
-        validate_denoise(denoise, self.inner.config().output.sample_rate)?;
+        validate_denoise(
+            denoise.unwrap_or(false),
+            self.inner.config().output.sample_rate,
+        )?;
         if config.output != self.inner.config().output {
             return Err(to_py_err(fa::Error::InvalidArg(
                 "output format cannot change during switch_source".into(),
@@ -50,7 +53,7 @@ impl Stream {
         .map_err(to_py_err)?;
         commit(&mut self.inner, config).map_err(to_py_err)?;
         self.settings = crate::settings::SettingsState {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-faults"))]
             report: self
                 .inner
                 .effective_settings()

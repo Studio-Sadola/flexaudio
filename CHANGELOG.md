@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Python `Stream.switch_source()` now retains the current denoise setting when
+  `denoise` is omitted or `None`; explicit `True`/`False` enables/disables it.
+  Migration: pass `denoise=False` explicitly to keep the old behavior.
 - Capture opens strict by default in Rust, Node, Python, C v1-v4 and the CLI.
   Ignored settings are rejected only when their decoded values differ from defaults;
   C zero-initialized microphone configurations still use defaults and remain valid.

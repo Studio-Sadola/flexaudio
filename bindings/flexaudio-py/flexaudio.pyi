@@ -642,7 +642,7 @@ class Stream:
         output_channels: int = 2, chunk_ms: int = 20, gain: float = 1.0,
         mic_device_id: Optional[str] = None, system_device_id: Optional[str] = None,
         mic_gain: float = 1.0, system_gain: float = 1.0,
-        denoise: bool = False, silence_probe: bool = True,
+        denoise: Optional[bool] = None, silence_probe: bool = True,
         windows_classic_loopback_keepalive: Optional[bool] = None,
         strict: Optional[bool] = None,
         ring_capacity_chunks: Optional[int] = None
@@ -651,7 +651,8 @@ class Stream:
         transition waits for new PCM. Return means backend replaced, not delivered.
         Old epoch_end need not precede new primary PCM; use its DISCONTINUITY boundary.
         The VAD attachment configured with vad at open() persists across switches;
-        new PCM starts a new VAD epoch. Omitting denoise disables noise suppression.
+        new PCM starts a new VAD epoch. Omitting denoise or passing None retains
+        the current setting; explicit True/False enables/disables noise suppression.
         strict=None retains the current strictness; strict=False allows ignored settings.
         """
         ...

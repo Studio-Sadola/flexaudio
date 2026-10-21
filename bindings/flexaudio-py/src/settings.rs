@@ -7,7 +7,7 @@ use pyo3::types::{PyDict, PyList};
 #[derive(Default)]
 pub(crate) struct SettingsState {
     // Device-free custom-backend fixtures have no facade report.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub(crate) report: Option<fa::SettingsReport>,
     pub(crate) strict: bool,
 }
@@ -15,16 +15,18 @@ pub(crate) struct SettingsState {
 pub(crate) struct Request<'a> {
     pub(crate) config: &'a fa::StreamConfig,
     pub(crate) keepalive: Option<bool>,
-    pub(crate) denoise: bool,
+    pub(crate) denoise: Option<bool>,
     pub(crate) vad: bool,
     pub(crate) secondary: Option<&'a crate::secondary::SecondaryOutputOptions>,
 }
 
 impl Request<'_> {
     pub(crate) fn attachments(&self, switching: bool) -> fa::SettingsAttachments {
-        let attachments = fa::SettingsAttachments::new()
-            .denoise(self.denoise)
-            .windows_classic_loopback_keepalive(self.keepalive);
+        let mut attachments =
+            fa::SettingsAttachments::new().windows_classic_loopback_keepalive(self.keepalive);
+        if let Some(enabled) = self.denoise {
+            attachments = attachments.denoise(enabled);
+        }
         if switching {
             attachments.omitted_on_switch([K::SecondaryOutput, K::SecondaryEncoding, K::Vad])
         } else {

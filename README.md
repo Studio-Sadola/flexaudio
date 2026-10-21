@@ -231,6 +231,11 @@ requests, on open and switch unless marked switch-only.
 Exclusions are active when `excludeSelf` is true or `excludePids` is nonempty.
 macOS supports exclusions together with explicit system-device selection.
 Python switch denoise and Rust's explicit denoise-switch methods remain applied.
+Python `switch_source(..., denoise=None)` or an omitted `denoise` retains the
+current setting; explicit `True`/`False` enables/disables it. The retained setting
+is reported with `requested=False`, its current `effective` value, and
+`outcome.status='notRequested'`, as in Node. Migration from before 0.9: pass
+`denoise=False` explicitly to keep the old behavior of disabling it on switch.
 
 ## Optional playback helpers and lifecycle
 

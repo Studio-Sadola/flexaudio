@@ -140,6 +140,11 @@ Denoise runs before output polling and queue drops, continues processing while
 paused, and keeps its history on resume. Source switches/reopens start fresh
 history and normally discard the previous generation's buffered remainder.
 
+`stream.switch_source(..., denoise=None)` retains the current denoise setting,
+as does omitting `denoise`. Explicit `True` enables it and `False` disables it.
+Migration from before 0.9: pass `denoise=False` explicitly to keep the old
+behavior of disabling denoise on a switch.
+
 Attach the same generic VAD engine with
 `vad=flexaudio.StreamVadOptions(provisional=True)`. Each chunk's `vad_events`
 contains ordered segments, optional provisional hints, and epoch markers.
@@ -328,7 +333,9 @@ raising `IgnoredSettingsError` with its complete candidate `.report`.
 to allow ignored settings. Gain and ring capacity
 stay fixed at open; non-default switch requests are rejected with `fixedAtOpen`
 unless `strict=False` permits ignoring them.
-Use `set_gain()` for runtime gain changes. Python switch denoise remains applied.
+Use `set_gain()` for runtime gain changes. Python switch denoise remains applied
+when explicitly supplied. When omitted or `None`, its report has `requested=False`,
+the retained `effective` value, and `outcome.status='notRequested'`, matching Node.
 See the root README's [ignored-setting table](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#strict-mode-and-effective-settings).
 
 `stream.poll_lifecycle_event()` consumes a separate ordered helper-event FIFO;

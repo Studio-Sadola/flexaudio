@@ -226,6 +226,10 @@ Rust の `resolve_settings(&SettingsRequest::new(config))` はデバイスなし
 `excludeSelf` が true、または `excludePids` が空でなければ除外は有効です。
 macOS は除外とシステムデバイスの明示選択を併用できます。
 Python の切替時のノイズ抑制と Rust の明示的なノイズ抑制切替メソッドは引き続き適用します。
+Python の `switch_source(..., denoise=None)` または `denoise` の省略は現在の設定を保持し、
+明示的な `True`／`False` は有効／無効にします。保持した設定のレポートは Node と同じく、
+`requested=False`、現在の `effective` 値、`outcome.status='notRequested'` になります。
+0.9 より前からの移行: 切替時に無効にする従来の挙動を保つには、`denoise=False` を明示してください。
 
 ## 任意の再生ヘルパーとライフサイクル
 
