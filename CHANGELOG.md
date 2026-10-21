@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Capture denoise now accepts any supported output rate in every binding,
+  including Node, Python and C v1/v2. All entry points use the shared canonical
+  48 kHz processing path before output conversion; settings reports mark denoise
+  as applied without a rate adjustment. No migration is needed, except that code
+  relying on the former non-48 kHz rejection no longer receives an error.
 - Python `Stream.switch_source()` now retains the current denoise setting when
   `denoise` is omitted or `None`; explicit `True`/`False` enables/disables it.
   Migration: pass `denoise=False` explicitly to keep the old behavior.

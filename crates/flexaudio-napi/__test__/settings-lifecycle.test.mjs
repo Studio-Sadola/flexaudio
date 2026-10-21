@@ -10,6 +10,23 @@ const row = (report, key) => {
   assert.ok(entry, `missing ${key}`);
   return entry;
 };
+
+test('denoise opens at noncanonical output rates with the shared settings report', async () => {
+  for (const outputRate of [16000, 44100, 48000]) {
+    const chunks = [];
+    const stream = native.openStream({ kind: 'mock', outputRate, outputChannels: 1,
+      denoise: true }, chunk => chunks.push(chunk));
+    try {
+      const report = stream.effectiveSettings();
+      assert.equal(row(report, 'denoise').requested, true);
+      assert.equal(row(report, 'denoise').effective, true);
+      assert.deepEqual(row(report, 'denoise').outcome, { status: 'applied' });
+      assert.deepEqual(row(report, 'output').effective, { sampleRate: outputRate, channels: 1 });
+      assert.deepEqual(row(report, 'output').outcome, { status: 'applied' });
+    } finally { await stream.stop(); }
+    assert.ok(chunks.some(chunk => chunk.frames === outputRate / 50));
+  }
+});
 const ignored = (options, keys) => {
   let report;
   assert.throws(() => native.openStream({ ...options, strict: true }, () => {}), error => {

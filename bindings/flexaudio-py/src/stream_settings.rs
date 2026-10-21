@@ -22,10 +22,6 @@ impl Stream {
                 "switch_source is only available on a started stream".into(),
             )));
         }
-        validate_denoise(
-            denoise.unwrap_or(false),
-            self.inner.config().output.sample_rate,
-        )?;
         if config.output != self.inner.config().output {
             return Err(to_py_err(fa::Error::InvalidArg(
                 "output format cannot change during switch_source".into(),

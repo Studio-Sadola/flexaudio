@@ -133,7 +133,9 @@ Platform behavior:
 
 `denoise=True` enables RNNoise on the canonical 48 kHz stereo capture signal
 before downmix and gain, feeding both output taps and attached VAD.
-It requires 48000 Hz output and introduces 480 samples/channel of delay.
+It supports any output rate and introduces 10 ms of delay (480 samples/channel
+on the canonical signal). For example, `output_rate=16000, denoise=True`
+returns denoised 16 kHz audio.
 Graceful stop queues the denoiser tail and zero-pads the final output to a full
 20 ms chunk (`flags` bit 8 when padding is added); continue polling to receive it.
 Denoise runs before output polling and queue drops, continues processing while

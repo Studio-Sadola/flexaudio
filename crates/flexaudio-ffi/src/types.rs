@@ -69,8 +69,8 @@ pub struct FlexConfig {
     pub mix_system_gain: f32,
     /// Whether to apply noise suppression (RNNoise) to the stream. Enabled when `true`.
     /// Runs once in the library on canonical 48 kHz stereo capture before downmix and gain,
-    /// feeding output conversion and attached VAD before polling. v1/v2 require a 48000 Hz
-    /// primary output rate; v3 permits other primary output rates.
+    /// feeding output conversion and attached VAD before polling. Every C version supports
+    /// denoise at any supported primary output rate.
     /// Boolean integer: only 0 and 1 are valid.
     pub denoise: u8,
     /// Silence diagnosis probe: 0 = default (enabled), 1 = enabled, 2 = disabled.

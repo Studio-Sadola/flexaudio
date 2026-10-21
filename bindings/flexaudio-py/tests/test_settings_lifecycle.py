@@ -15,6 +15,30 @@ SETTING_KEYS = {
 
 class SettingsLifecycleContracts(unittest.TestCase):
     # Successful capture fixtures require a wheel built with --features test-faults.
+    def test_denoise_opens_at_noncanonical_output_rates(self):
+        for rate in (16000, 44100, 48000):
+            with self.subTest(rate=rate), fa.open("mock", output_rate=rate,
+                                                output_channels=1, denoise=True) as stream:
+                entry = self.denoise_entry(stream)
+                self.assertIs(entry["requested"], True)
+                self.assertIs(entry["effective"], True)
+                self.assertEqual(entry["outcome"], {"status": "applied", "reason": None})
+                output = next(row for row in stream.effective_settings()["entries"]
+                              if row["setting"] == "output")
+                self.assertEqual(output["effective"], (rate, 1))
+                self.assertEqual(output["outcome"], {"status": "applied", "reason": None})
+
+    def test_switch_enables_denoise_at_noncanonical_output_rates(self):
+        for rate in (16000, 44100):
+            with self.subTest(rate=rate), fa.open("mock", output_rate=rate) as stream:
+                stream.switch_source("mock", output_rate=rate, denoise=True)
+                entry = self.denoise_entry(stream)
+                self.assertIs(entry["requested"], True)
+                self.assertIs(entry["effective"], True)
+                self.assertEqual(entry["outcome"], {"status": "applied", "reason": None})
+                stream.switch_source("mock", output_rate=rate)
+                self.assertIs(self.denoise_entry(stream)["effective"], True)
+
     def test_switch_omitted_denoise_retains_enabled_setting(self):
         with fa.open("mock", denoise=True) as stream:
             self.assertIs(self.denoise_entry(stream)["effective"], True)

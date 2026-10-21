@@ -442,10 +442,10 @@ export interface OpenOptions {
    */
   windowsClassicLoopbackKeepalive?: boolean
   /**
-   * true enables recording-time noise suppression. **Only available with 48000 Hz output**
-   * (RNNoise is fixed at 48kHz). Applied once to the internal 48kHz/stereo canonical form;
-   * both primary and secondary taps receive denoised audio (+10ms fixed latency). Setting true
-   * at any other rate makes `openStream` throw InvalidArg. Omission/false disables noise suppression.
+   * true enables recording-time noise suppression at any supported output rate.
+   * Applied once to the internal 48kHz/stereo canonical form before output conversion;
+   * both primary and secondary taps receive denoised audio (+10ms fixed latency).
+   * Omission/false disables noise suppression.
    */
   denoise?: boolean
   /**

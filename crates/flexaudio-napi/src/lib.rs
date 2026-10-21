@@ -865,10 +865,10 @@ pub struct OpenOptions {
     /// Requires the shared canonical capture feed with exact producer provenance.
     #[napi(ts_type = "StreamVadOptions")]
     pub vad: Option<napi::JsUnknown>,
-    /// true enables recording-time noise suppression. **Only available with 48000 Hz output**
-    /// (RNNoise is fixed at 48kHz). Applied once to the internal 48kHz/stereo canonical form;
-    /// both primary and secondary taps receive denoised audio (+10ms fixed latency). Setting true
-    /// at any other rate makes `openStream` throw InvalidArg. Omission/false disables noise suppression.
+    /// true enables recording-time noise suppression at any supported output rate.
+    /// Applied once to the internal 48kHz/stereo canonical form before output conversion;
+    /// both primary and secondary taps receive denoised audio (+10ms fixed latency).
+    /// Omission/false disables noise suppression.
     pub denoise: Option<bool>,
     /// Enable the macOS silence diagnostic probe. Default true.
     pub silence_probe: Option<bool>,
@@ -998,23 +998,6 @@ fn parse_sec_encoding(s: Option<&str>) -> napi::Result<SecEncoding> {
             format!("unknown secondaryOutput.encoding: {other:?} (expected f32|s16)"),
         )),
     }
-}
-
-/// Validate integrated denoise's 48kHz requirement (pure function, separated for testing).
-///
-/// RNNoise is fixed at 48kHz; when `enabled` and the output rate is not 48000,
-/// return InvalidArg. `open_stream` rejects this before opening the stream.
-fn check_denoise_rate(enabled: bool, output_rate: u32) -> napi::Result<()> {
-    if enabled && output_rate != 48_000 {
-        return Err(NapiError::new(
-            Status::InvalidArg,
-            format!(
-                "denoise supports only 48000 Hz output (RNNoise is fixed at 48kHz). \
-                 Cannot use outputRate={output_rate}"
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// Validate a JavaScript PID before converting it to the core's integer type.
@@ -2229,7 +2212,7 @@ pub fn processes() -> AsyncTask<ProcessesTask> {
 /// (e.g. excludeSelf: false). Stopping cancels the probe without a late event.
 ///
 /// `denoise`, `secondaryOutput` and `vad` are independent optional processing features.
-/// Denoise requires 48 kHz output and affects both taps. The attached VAD consumes
+/// Denoise supports any output rate and affects both taps. The attached VAD consumes
 /// the canonical capture feed; `vad.tap` selects the event carrier only. Both standalone
 /// and attached VAD default to an unbounded maximum speech duration. Call `flushVad()`
 /// to finish/reset its current epoch and await delivery of closing events.
@@ -2264,9 +2247,7 @@ pub fn open_stream(
                 .unwrap_or(flexaudio::OpenOptions::default().strict),
         )
         .map_err(|error| boundary::throw_error(&env, error))?;
-    let output_rate = config.output.sample_rate;
     let denoise_enabled = options.denoise.unwrap_or(false);
-    check_denoise_rate(denoise_enabled, output_rate)?;
     let attachment_options = options
         .vad
         .as_ref()
@@ -3140,20 +3121,6 @@ mod tests {
         assert_eq!(js.channels, 1);
         assert!(js.is_loopback);
         assert!(!js.is_default);
-    }
-
-    // --- check_denoise_rate (denoise's 48kHz requirement) ---
-
-    #[test]
-    fn denoise_requires_48k() {
-        // Enabled + 48000 is OK.
-        assert!(check_denoise_rate(true, 48_000).is_ok());
-        // Enabled + any rate other than 48000 yields InvalidArg.
-        let err = check_denoise_rate(true, 16_000).unwrap_err();
-        assert_eq!(err.status, Status::InvalidArg);
-        // Disabled is OK regardless of rate (no validation).
-        assert!(check_denoise_rate(false, 16_000).is_ok());
-        assert!(check_denoise_rate(false, 48_000).is_ok());
     }
 
     // --- Error mapping for each addon ---

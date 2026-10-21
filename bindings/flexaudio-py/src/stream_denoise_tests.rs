@@ -126,31 +126,27 @@ fn stream_denoise_matches_facade_before_downmix_and_gain_on_both_taps() {
 }
 
 #[test]
-fn switch_denoise_rejects_non_48khz_output_as_value_error() {
+fn switch_denoise_accepts_noncanonical_output() {
     Python::initialize();
-    Python::attach(|py| {
+    Python::attach(|_py| {
         let sink = Sink::default();
         let mut config = fa::StreamConfig::default();
         config.output.sample_rate = 16_000;
         let inner = fa::Stream::open(config, Box::new(Input(sink))).unwrap();
-        let object = Py::new(py, binding(start_capture(inner, false, false).unwrap())).unwrap();
-        let locals = pyo3::types::PyDict::new(py);
-        locals.set_item("stream", object).unwrap();
-        py.run(
-            pyo3::ffi::c_str!(
-                r#"
-try:
-    stream.switch_source('mic', output_rate=16000, denoise=True)
-except ValueError as error:
-    assert 'denoise requires 48000 Hz output (output_rate=16000)' in str(error)
-else:
-    raise AssertionError('non-48 kHz denoise was accepted')
-stream.stop()
-"#
-            ),
-            None,
-            Some(&locals),
-        )
-        .unwrap();
+        let mut stream = binding(start_capture(inner, false, false).unwrap());
+        let config = stream.inner.config().clone();
+        stream
+            .switch_with(config, Some(true), None, None, |inner, _| {
+                inner.switch_backend_with_denoise(Box::new(Input(Sink::default())), true)
+            })
+            .unwrap();
+        let entry = stream
+            .capture_settings()
+            .unwrap()
+            .get(fa::SettingKey::Denoise)
+            .unwrap();
+        assert_eq!(entry.effective, fa::SettingValue::Bool(true));
+        assert_eq!(entry.outcome, fa::SettingOutcome::Applied);
+        stream.stop().unwrap();
     });
 }

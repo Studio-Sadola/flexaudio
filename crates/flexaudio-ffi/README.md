@@ -257,17 +257,16 @@ All v1/v2 layouts, signatures and symbols remain unchanged.
 
 ## Noise Suppression and Attached VAD
 
-Set `FlexConfig.denoise=1` to enable RNNoise. v1/v2 require 48000 Hz primary output;
-v3 permits other primary output rates. Noise suppression runs once in the library
+Set `FlexConfig.denoise=1` to enable RNNoise at any output rate in every C version.
+Noise suppression runs once in the library
 on canonical 48 kHz stereo capture before downmix and gain, feeding both
 output taps and attached VAD.
-It introduces a 480-sample delay per channel. Stop queues its tail through the
+It introduces 10 ms of delay (480 samples per canonical channel). Stop queues its tail through the
 facade and zero-pads the final output to a full 20 ms chunk (`flags` bit 8 when
 padding is added); continue polling to retain it. Denoise runs before output
 polling and queue drops, continues processing while paused, and keeps its history
 on resume. Source switches/reopens start fresh history and normally discard the
-previous generation's buffered remainder. These rules also apply to legacy opens;
-C v3 additionally permits denoise with primary output rates other than 48000 Hz.
+previous generation's buffered remainder. These rules also apply to legacy opens.
 See the generic VAD section below for canonical capture attachment.
 
 `FlexConfig.silence_probe` accepts 0 (default enabled), 1 (enabled), or 2

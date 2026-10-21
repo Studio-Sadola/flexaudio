@@ -83,7 +83,7 @@ which output carries its events. — = not exposed.
 | Delivery model | Poll | Callbacks over internal polling | Poll | Poll | Internal polling → stdout/WAV |
 | Secondary output tap | Yes | Yes (`chunk.secondary`) | Yes (`poll_secondary`, f32/s16) | Yes (v3, f32/s16) | — |
 | Attached VAD (primary/secondary) | Canonical capture via `VadTap` | Primary or secondary carrier | Primary or secondary carrier | Primary (v2/v3) or secondary (v3) carrier | — |
-| Denoise | Canonical 48 kHz; any output rate | Requires 48 kHz output | Requires 48 kHz output | v1/v2: 48 kHz output; v3/v4: any output rate | `--denoise` |
+| Denoise | Canonical 48 kHz; any output rate | Any output rate | Any output rate | Any output rate (v1-v4) | `--denoise`; any output rate |
 | Ring capacity (default 50 chunks) | `ring_capacity_chunks` | `ringCapacityChunks` | `ring_capacity_chunks` | v4 `ring_capacity_chunks` | `--ring-capacity-chunks` |
 | Source switching | `switch_source` | `switchSource`; retains add-on settings | `switch_source` | `flexaudio_switch_source` | `--sources` schedule |
 | Event detail | Typed events/errors/loss | Typed events/errors/loss | Typed events/errors/loss | v1 flattened; v2 detailed | stderr diagnostics/loss summaries |

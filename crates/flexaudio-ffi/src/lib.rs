@@ -150,8 +150,8 @@ fn fail(err: flexaudio::Error) -> i32 {
 ///
 /// `config.denoise` enables noise suppression on delivered PCM. Use `flexaudio_open_v2`
 /// with `FlexStreamVadOptions` to attach VAD on the canonical capture branch.
-/// When denoise is enabled, the output rate must be 48000 (otherwise return NULL and set
-/// last_error; RNNoise requires 48 kHz). Free the returned handle with `flexaudio_free`.
+/// Denoise runs on canonical 48 kHz capture before conversion to any supported output rate.
+/// Free the returned handle with `flexaudio_free`.
 /// This is equivalent to `flexaudio_open_with_exclude_pids(config, NULL, 0)`.
 /// Opens strict by default: ignored non-default settings fail with FLEX_IGNORED_SETTINGS.
 /// Zero-initialized microphone settings use defaults. To opt out, use v4 strict = 2.
@@ -251,8 +251,7 @@ unsafe fn open_with_exclude_pids_using(
             // build_config has already set last_error.
             Err(()) => return std::ptr::null_mut(),
         };
-        // Preserve the public 48 kHz constraint before acquiring a device.
-        if integration::validate_denoise(config).is_err() {
+        if integration::validate_denoise_channels(config).is_err() {
             return std::ptr::null_mut();
         }
         match open(stream_config) {

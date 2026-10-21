@@ -80,7 +80,7 @@ stream.stop();
 | 配信方式 | ポーリング | 内部ポーリングからコールバック | ポーリング | ポーリング | 内部ポーリング → stdout/WAV |
 | 副出力タップ | あり | あり（`chunk.secondary`） | あり（`poll_secondary`、f32/s16） | あり（v3、f32/s16） | — |
 | 接続 VAD（主／副） | `VadTap` で内部標準形式のキャプチャを処理 | 主または副のチャンクにイベントを付与 | 主または副のチャンクにイベントを付与 | 主（v2/v3）または副（v3）のチャンクにイベントを付与 | — |
-| ノイズ抑制 | 内部の 48 kHz で処理、出力レートは任意 | 48 kHz 出力が必要 | 48 kHz 出力が必要 | v1/v2: 48 kHz 出力、v3/v4: 出力レートは任意 | `--denoise` |
+| ノイズ抑制 | 内部の 48 kHz で処理、出力レートは任意 | 出力レートは任意 | 出力レートは任意 | 出力レートは任意（v1-v4） | `--denoise`、出力レートは任意 |
 | リング容量（既定は 50 チャンク） | `ring_capacity_chunks` | `ringCapacityChunks` | `ring_capacity_chunks` | v4 の `ring_capacity_chunks` | `--ring-capacity-chunks` |
 | ソース切替 | `switch_source` | `switchSource`、アドオン設定を維持 | `switch_source` | `flexaudio_switch_source` | `--sources` のスケジュール |
 | イベントの詳細 | 型付きイベント／エラー／損失 | 型付きイベント／エラー／損失 | 型付きイベント／エラー／損失 | v1 は平坦化、v2 は詳細情報 | stderr に診断／損失の要約 |

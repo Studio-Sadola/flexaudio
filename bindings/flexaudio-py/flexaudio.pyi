@@ -13,7 +13,7 @@ failures or writes after finalization.
 open/switch_source validate exclude_pids before addons/device access: non-integer
 entries (including bool) or non-sequences raise TypeError; PIDs outside
 1..=4294967295 or more than 4096 entries raise ValueError. Integrated denoise
-requires 48000 Hz (ValueError). Invalid integrated VAD field types propagate
+supports any output rate through canonical 48 kHz processing. Invalid integrated VAD field types propagate
 PyO3 extraction errors. processes raises RuntimeError when unavailable, timed
 out, or already in progress. Context exits return False and preserve the block's
 exception; FlacEncoder propagates finalization errors only on normal exit.

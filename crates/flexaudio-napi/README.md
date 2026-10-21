@@ -331,8 +331,9 @@ const stream = openStream(
 );
 ```
 
-`denoise` requires `outputRate: 48000` (RNNoise is 48 kHz only) — any other rate
-makes `openStream` throw.
+`denoise` supports any output rate. RNNoise runs once on canonical 48 kHz stereo
+capture before output conversion, feeding both taps with 10 ms fixed latency.
+For example, `outputRate: 16000, denoise: true` returns denoised 16 kHz audio.
 
 ## Streaming VAD
 

@@ -362,8 +362,8 @@ typedef struct FlexConfig {
     float mix_system_gain;
     // Whether to apply noise suppression (RNNoise) to the stream. Enabled when `true`.
     // Runs once in the library on canonical 48 kHz stereo capture before downmix and gain,
-    // feeding output conversion and attached VAD before polling. v1/v2 require a 48000 Hz
-    // primary output rate; v3 permits other primary output rates.
+    // feeding output conversion and attached VAD before polling. Every C version supports
+    // denoise at any supported primary output rate.
     // Boolean integer: only 0 and 1 are valid.
     uint8_t denoise;
     // Silence diagnosis probe: 0 = default (enabled), 1 = enabled, 2 = disabled.
@@ -838,8 +838,8 @@ typedef struct FlexDeviceEvent {
 //
 // `config.denoise` enables noise suppression on delivered PCM. Use `flexaudio_open_v2`
 // with `FlexStreamVadOptions` to attach VAD on the canonical capture branch.
-// When denoise is enabled, the output rate must be 48000 (otherwise return NULL and set
-// last_error; RNNoise requires 48 kHz). Free the returned handle with `flexaudio_free`.
+// Denoise runs on canonical 48 kHz capture before conversion to any supported output rate.
+// Free the returned handle with `flexaudio_free`.
 // This is equivalent to `flexaudio_open_with_exclude_pids(config, NULL, 0)`.
 // Opens strict by default: ignored non-default settings fail with FLEX_IGNORED_SETTINGS.
 // Zero-initialized microphone settings use defaults. To opt out, use v4 strict = 2.

@@ -205,8 +205,7 @@ mod tests {
     //! assert fa.Vad().process([0.0]*16000, 16000, 1) == []      # Silence contains no speech.
     //! d = fa.Denoiser(1); assert len(d.process([0.0]*1000)) == 1000; assert len(d.flush()) == 480
     //! fa.watch_devices().poll_event()                           # None or DeviceEvent.
-    //! try: fa.open("mic", denoise=True, output_rate=16000); assert False
-    //! except ValueError: pass                                   # denoise supports only 48 kHz.
+    //! # Integrated denoise accepts any output rate; capture still needs a usable device.
     //! PY
     //! ```
     //! (If maturin is available, `maturin develop` can do the same.)

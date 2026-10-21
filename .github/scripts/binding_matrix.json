@@ -107,9 +107,9 @@
     }},
     {"feature": "Capture denoise", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::set_denoise"], "note": "Canonical 48 kHz processing supports any output rate."},
-      "Node": {"status": "supported", "symbols": ["OpenOptions.denoise"], "note": "Requires 48 kHz primary output."},
-      "Python": {"status": "supported", "symbols": ["open.denoise", "Stream.switch_source.denoise"], "note": "Requires 48 kHz primary output. Switch omission/None retains denoise; explicit True/False enables/disables it."},
-      "C": {"status": "supported", "symbols": ["flexaudio_open_v3", "FlexConfig.denoise"], "note": "v3 supports any output rate; v1/v2 require 48 kHz."},
+      "Node": {"status": "supported", "symbols": ["OpenOptions.denoise"], "note": "Canonical 48 kHz processing supports any output rate."},
+      "Python": {"status": "supported", "symbols": ["open.denoise", "Stream.switch_source.denoise"], "note": "Canonical 48 kHz processing supports any output rate. Switch omission/None retains denoise; explicit True/False enables/disables it."},
+      "C": {"status": "supported", "symbols": ["flexaudio_open_v3", "FlexConfig.denoise"], "note": "Canonical 48 kHz processing supports any output rate in v1-v4."},
       "CLI": {"status": "supported", "symbols": ["--denoise"], "note": "Canonical 48 kHz processing supports any output rate."}
     }},
     {"feature": "Attached VAD: primary carrier", "bindings": {

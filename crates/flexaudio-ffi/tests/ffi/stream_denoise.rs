@@ -124,40 +124,62 @@ fn legacy_stream_denoise_matches_facade_before_downmix_and_gain() {
 }
 
 #[test]
-fn legacy_denoise_rate_rejection_preserves_results_and_message() {
+fn legacy_v1_denoise_accepts_noncanonical_output_rates() {
+    legacy_denoise_accepts_noncanonical_output_rates(false);
+}
+
+#[test]
+fn legacy_v2_denoise_accepts_noncanonical_output_rates() {
+    legacy_denoise_accepts_noncanonical_output_rates(true);
+}
+
+fn legacy_denoise_accepts_noncanonical_output_rates(v2: bool) {
     for rate in [16_000, 44_100] {
         unsafe {
             let config = FlexConfig {
                 output_rate: rate,
+                output_channels: 1,
                 denoise: 1,
                 ..mem::zeroed()
             };
-            assert!(flexaudio_open(&config).is_null());
-            assert_eq!(
-                std::ffi::CStr::from_ptr(flexaudio_last_error())
-                    .to_str()
-                    .unwrap(),
-                "denoise requires output_rate 48000"
-            );
-            assert!(error::last_audio_error().is_none());
-            let envelope = vad_integration::FlexStreamConfigV2 {
-                size: u32::try_from(mem::size_of::<vad_integration::FlexStreamConfigV2>()).unwrap(),
-                version: 2,
-                config: &config,
-                vad: ptr::null(),
+            let open = |decoded: flexaudio::StreamConfig, options: flexaudio::OpenOptions| {
+                let report = flexaudio::resolve_settings(
+                    &flexaudio::SettingsRequest::new(decoded.clone()).open_options(&options),
+                )?;
+                let denoise = report.get(flexaudio::SettingKey::Denoise).unwrap();
+                assert_eq!(denoise.requested, flexaudio::SettingValue::Bool(true));
+                assert_eq!(denoise.effective, flexaudio::SettingValue::Bool(true));
+                assert_eq!(denoise.outcome, flexaudio::SettingOutcome::Applied);
+                let output = report.get(flexaudio::SettingKey::Output).unwrap();
+                assert_eq!(
+                    output.effective,
+                    flexaudio::SettingValue::Format(decoded.output)
+                );
+                assert_eq!(output.outcome, flexaudio::SettingOutcome::Applied);
+                flexaudio::Stream::open(decoded, Box::new(Input(Sink::default())))
             };
-            let mut out = ptr::dangling_mut();
-            assert_eq!(
-                vad_integration::flexaudio_open_v2(&envelope, &mut out),
-                code::FLEX_FAILURE
-            );
-            assert!(out.is_null());
-            assert_eq!(
-                std::ffi::CStr::from_ptr(flexaudio_last_error())
-                    .to_str()
-                    .unwrap(),
-                "denoise requires output_rate 48000"
-            );
+            let stream = if v2 {
+                let envelope = vad_integration::FlexStreamConfigV2 {
+                    size: u32::try_from(mem::size_of::<vad_integration::FlexStreamConfigV2>())
+                        .unwrap(),
+                    version: 2,
+                    config: &config,
+                    vad: ptr::null(),
+                };
+                let mut out = ptr::null_mut();
+                assert_eq!(
+                    vad_integration::open_v2_with(&envelope, &mut out, open),
+                    code::FLEX_OK
+                );
+                out
+            } else {
+                open_with_exclude_pids_options(&config, ptr::null(), 0, open)
+            };
+            assert!(!stream.is_null());
+            assert_eq!((*stream).inner.config().output.sample_rate, rate);
+            assert_eq!(flexaudio_start(stream), code::FLEX_OK);
+            assert_eq!(flexaudio_stop(stream), code::FLEX_OK);
+            flexaudio_free(stream);
         }
     }
 }

@@ -20,7 +20,7 @@ use pyo3::prelude::*;
 
 use ::flexaudio as fa;
 
-use crate::config::{build_config, parse_exclude_pids, parse_ring_capacity, validate_denoise};
+use crate::config::{build_config, parse_exclude_pids, parse_ring_capacity};
 use crate::marshal::{chunk_to_py, event_to_py, PyAudioChunk, PyStreamEvent};
 use crate::to_py_err;
 
@@ -33,7 +33,7 @@ const LIFECYCLE_EVENT_CAPACITY: usize = 256;
 ///
 /// Integrated addons:
 /// - Open with `denoise=True` to apply RNNoise to canonical capture before both output taps
-///   (48kHz output only; the first 480 samples/channel are silent due to denoise latency).
+///   (any supported output rate; 10 ms fixed denoise latency).
 /// - Open with `vad=StreamVadOptions(...)` to attach VAD to canonical capture.
 ///   Ordered events and epoch origins are available through `chunk.vad_events`.
 ///
@@ -403,7 +403,7 @@ impl Stream {
 /// Applies to system capture and the system side of mix, alongside `exclude_self`.
 ///
 /// `vad=StreamVadOptions(...)` attaches canonical VAD before output conversion.
-/// `denoise=true` enables RNNoise and requires 48000 Hz output.
+/// `denoise=true` enables RNNoise before conversion to any supported output rate.
 /// `silence_probe=false` disables the optional macOS silence diagnosis tone.
 /// Strict mode defaults to true; use `strict=False` to allow ignored non-default settings.
 #[pyfunction]
@@ -488,7 +488,6 @@ pub fn open(
             )
         }));
     }
-    validate_denoise(denoise, output_rate)?;
     if denoise && !(1..=2).contains(&output_channels) {
         return Err(crate::denoise_err_to_py(
             flexaudio_denoise::DenoiseError::InvalidChannels(output_channels),

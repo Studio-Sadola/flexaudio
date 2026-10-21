@@ -1,18 +1,13 @@
 //! Deliver facade PCM unchanged. VAD uses the canonical capture tap.
 use crate::{
     convert::{self, resolve_output},
-    error::set_last_error,
     types::{FlexChunk, FlexConfig, FlexStream},
 };
-pub(crate) fn validate_denoise(config: &FlexConfig) -> Result<(), ()> {
+pub(crate) fn validate_denoise_channels(config: &FlexConfig) -> Result<(), ()> {
     if config.denoise == 0 {
         return Ok(());
     }
     let output = resolve_output(config);
-    if output.sample_rate != 48_000 {
-        set_last_error("denoise requires output_rate 48000");
-        return Err(());
-    }
     if !(1..=2).contains(&output.channels) {
         crate::error::set_audio_error(flexaudio::Error::InvalidArg(
             flexaudio_denoise::DenoiseError::InvalidChannels(output.channels).to_string(),

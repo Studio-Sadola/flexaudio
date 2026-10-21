@@ -1,7 +1,6 @@
 //! Convert and validate Python arguments for core configuration types.
 //!
 //! - [`build_config`]: Build [`StreamConfig`] from `open` / `switch_source` arguments.
-//! - [`validate_denoise`]: Validate the 48 kHz requirement for integrated denoise.
 
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -132,22 +131,9 @@ pub(crate) fn build_config(
     })
 }
 
-/// Validate the 48 kHz output requirement for integrated denoise. If denoise is enabled and
-/// the output rate is not 48000, return `ValueError` because RNNoise only accepts fixed frames
-/// at 48 kHz.
-pub(crate) fn validate_denoise(denoise: bool, output_rate: u32) -> PyResult<()> {
-    if denoise && output_rate != 48_000 {
-        return Err(PyValueError::new_err(format!(
-            "denoise requires 48000 Hz output (output_rate={output_rate}). \
-             Set output_rate to 48000 when denoise=True."
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    //! Check configuration construction, exclusion parsing, and denoise validation.
+    //! Check configuration construction and exclusion parsing.
 
     use super::*;
     use fa::{ProcessMode, SourceKind};
@@ -297,16 +283,5 @@ mod tests {
     #[test]
     fn build_config_rejects_unknown_kind() {
         assert!(build_config_with_defaults("speaker").is_err());
-    }
-
-    #[test]
-    fn validate_denoise_gate() {
-        // Any rate is accepted when denoise is disabled.
-        assert!(validate_denoise(false, 16_000).is_ok());
-        assert!(validate_denoise(false, 48_000).is_ok());
-        // When denoise is enabled, only 48000 is accepted.
-        assert!(validate_denoise(true, 48_000).is_ok());
-        assert!(validate_denoise(true, 16_000).is_err());
-        assert!(validate_denoise(true, 44_100).is_err());
     }
 }
