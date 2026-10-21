@@ -13,6 +13,33 @@ use crate::{
 };
 use flexaudio::{OpenOptions, SettingKey as K, SettingsRequest, StreamConfig};
 
+/// Literal gains replace the three legacy sentinel fields only for v5.
+pub(crate) struct LiteralGains {
+    pub gain: f32,
+    pub mix_mic_gain: f32,
+    pub mix_system_gain: f32,
+}
+
+fn apply_gains(config: &mut StreamConfig, gains: &Option<LiteralGains>) {
+    if let Some(gains) = gains {
+        config.gain = gains.gain;
+        config.mix_mic_gain = gains.mix_mic_gain;
+        config.mix_system_gain = gains.mix_system_gain;
+    }
+}
+
+fn settings_attachments(
+    base: &crate::types::FlexConfig,
+    keepalive: u32,
+    gains: &Option<LiteralGains>,
+) -> flexaudio::SettingsAttachments {
+    if gains.is_some() {
+        crate::settings_request::literal_gain_attachments(base, keepalive)
+    } else {
+        attachments(base, keepalive)
+    }
+}
+
 unsafe fn envelope<'a, T>(value: *const T) -> Result<&'a T, i32> {
     if !valid_pointer(value) {
         return Err(invalid("invalid v4 envelope pointer"));
@@ -95,8 +122,16 @@ pub unsafe extern "C" fn flexaudio_open_v4(
 ) -> i32 {
     open_with(config, out, flexaudio::open_with_options)
 }
-unsafe fn open_with(
+pub(crate) unsafe fn open_with(
     config: *const FlexStreamConfigV4,
+    out: *mut *mut FlexStream,
+    open: impl FnOnce(StreamConfig, OpenOptions) -> flexaudio::Result<flexaudio::Stream>,
+) -> i32 {
+    open_shared(|| Ok((config, None)), out, open)
+}
+
+pub(crate) unsafe fn open_shared(
+    decode: impl FnOnce() -> Result<(*const FlexStreamConfigV4, Option<LiteralGains>), i32>,
     out: *mut *mut FlexStream,
     open: impl FnOnce(StreamConfig, OpenOptions) -> flexaudio::Result<flexaudio::Stream>,
 ) -> i32 {
@@ -106,9 +141,11 @@ unsafe fn open_with(
             return status;
         }
         let prepared = (|| {
+            let (config, gains) = decode()?;
             let envelope = envelope(config)?;
             let base = v3::envelope(envelope.base)?;
             let mut config = v3::config(base.config, base.exclude_pids, base.exclude_pids_len)?;
+            apply_gains(&mut config, &gains);
             let mut options = v3::options(
                 base.windows_classic_loopback_keepalive,
                 &OpenOptions::default(),
@@ -123,9 +160,13 @@ unsafe fn open_with(
                 _ => "f32",
             };
             options = options.settings_attachments(
-                attachments(&*base.config, base.windows_classic_loopback_keepalive)
-                    .vad(vad.is_some())
-                    .secondary_encoding(encoding),
+                settings_attachments(
+                    &*base.config,
+                    base.windows_classic_loopback_keepalive,
+                    &gains,
+                )
+                .vad(vad.is_some())
+                .secondary_encoding(encoding),
             );
             preflight(&config, &options)?;
             Ok::<_, i32>(PreparedOpen {
@@ -153,15 +194,24 @@ pub unsafe extern "C" fn flexaudio_switch_source_v4(
     stream: *mut FlexStream,
     config: *const FlexSwitchConfigV4,
 ) -> i32 {
+    switch_shared(stream, || Ok((config, None)))
+}
+
+pub(crate) unsafe fn switch_shared(
+    stream: *mut FlexStream,
+    decode: impl FnOnce() -> Result<(*const FlexSwitchConfigV4, Option<LiteralGains>), i32>,
+) -> i32 {
     guard_i32(|| {
         error::clear_last_error();
         if !valid_pointer(stream) {
             return invalid("invalid stream handle");
         }
         let prepared = (|| {
+            let (config, gains) = decode()?;
             let envelope = envelope(config)?;
             let base = v3::envelope(envelope.base)?;
             let mut config = v3::config(base.config, base.exclude_pids, base.exclude_pids_len)?;
+            apply_gains(&mut config, &gains);
             let stream = &*stream;
             config.secondary_output = stream.inner.config().secondary_output;
             if config.output != stream.inner.config().output {
@@ -173,8 +223,16 @@ pub unsafe extern "C" fn flexaudio_switch_source_v4(
             )?;
             controls(envelope.options, &mut config, &mut options)?;
             options = options.settings_attachments(
-                attachments(&*base.config, base.windows_classic_loopback_keepalive)
-                    .omitted_on_switch([K::SecondaryOutput, K::SecondaryEncoding, K::Vad]),
+                settings_attachments(
+                    &*base.config,
+                    base.windows_classic_loopback_keepalive,
+                    &gains,
+                )
+                .omitted_on_switch([
+                    K::SecondaryOutput,
+                    K::SecondaryEncoding,
+                    K::Vad,
+                ]),
             );
             // The facade preflights switches before backend construction, using the
             // actual retained gain/denoise values, then commits options atomically.

@@ -521,3 +521,61 @@ provider provenance. Namespace tags describe selector domains, not persistent
 native IDs. Free the returned array and device strings with
 `flexaudio_namespaced_devices_free_v4`; namespace strings have static lifetime.
 All new owner-free functions are NULL-safe.
+
+## Version 5 presence-aware gains
+
+`flexaudio_open_v5` and `flexaudio_switch_source_v5` wrap the unchanged v4
+envelopes. Set the outer envelope and `FlexGainsV5` to their exact `sizeof`
+and `FLEX_STREAM_VERSION_5`; nested v4/v3 envelopes retain their own versions.
+`FlexGainsV5.gain`, `mix_mic_gain` and `mix_system_gain` are borrowed nullable
+float pointers, following v4's optional capacity-pointer convention. NULL means
+omitted (1.0); a supplied float is literal, so 0.0 mutes and 0.5 halves amplitude.
+All supplied gains must be finite and nonnegative; there is no upper bound.
+A NULL `gains` pointer omits all three. The three legacy gain fields inside
+`FlexConfig` are ignored entirely by v5. C v1-v4 retain their zero-means-unity
+convention; `flexaudio_set_gain(stream, 0.0f)` still mutes at runtime.
+
+This microphone example has no ignored requests under the strict default:
+
+```c
+#include "flexaudio.h"
+
+int main(void) {
+    FlexConfig base = {0};
+    FlexStreamConfigV3 v3 = {
+        .size = sizeof v3, .version = FLEX_STREAM_VERSION_3, .config = &base
+    };
+    FlexStreamConfigV4 v4 = {
+        .size = sizeof v4, .version = FLEX_STREAM_VERSION_4, .base = &v3
+    };
+    float mute = 0.0f;
+    FlexGainsV5 gains = {
+        .size = sizeof gains, .version = FLEX_STREAM_VERSION_5, .gain = &mute
+    };
+    FlexStreamConfigV5 request = {
+        .size = sizeof request, .version = FLEX_STREAM_VERSION_5,
+        .base = &v4, .gains = &gains
+    };
+    FlexStream *stream = NULL;
+    int32_t result = flexaudio_open_v5(&request, &stream);
+    if (result != FLEX_OK) return 1;
+    /* Start and poll as usual; output gain is zero. */
+    flexaudio_free(stream);
+    return 0;
+}
+```
+
+The same `FlexGainsV5` attaches to `FlexSwitchConfigV5`, whose `base` points
+to `FlexSwitchConfigV4`. Output gain is fixed at open: an omitted gain (or an
+explicit default 1.0) retains the current value, including runtime gain changes.
+An explicit non-default output gain, including 0.0, is reported as `fixedAtOpen`
+and rejected with `FLEX_IGNORED_SETTINGS` in strict mode; permissive mode ignores
+it and retains the current gain. Use `flexaudio_set_gain` to change it.
+Mix microphone/system gains apply to the new Mix source: each omission selects
+1.0 and each explicit zero mutes that lane. On other source kinds, non-default
+mix gains are ignored requests and therefore rejected by strict mode.
+
+All other behavior uses v4's shared path: `FlexOptionsV4.strict` accepts
+0 (strict on open, retain on switch), 1 (on), or 2 (off); capacity, keepalive,
+secondary output, VAD, reports and errors use the existing APIs. In particular,
+read reports with `flexaudio_settings_v4` and `flexaudio_error_settings_v4`.

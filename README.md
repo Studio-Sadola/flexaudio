@@ -83,7 +83,7 @@ which output carries its events. — = not exposed.
 | Delivery model | Poll | Callbacks over internal polling | Poll | Poll | Internal polling → stdout/WAV |
 | Secondary output tap | Yes | Yes (`chunk.secondary`) | Yes (`poll_secondary`, f32/s16) | Yes (v3, f32/s16) | — |
 | Attached VAD (primary/secondary) | Canonical capture via `VadTap` | Primary or secondary carrier | Primary or secondary carrier | Primary (v2/v3) or secondary (v3) carrier | — |
-| Denoise | Canonical 48 kHz; any output rate | Any output rate | Any output rate | Any output rate (v1-v4) | `--denoise`; any output rate |
+| Denoise | Canonical 48 kHz; any output rate | Any output rate | Any output rate | Any output rate (v1-v5) | `--denoise`; any output rate |
 | Ring capacity (default 50 chunks) | `ring_capacity_chunks` | `ringCapacityChunks` | `ring_capacity_chunks` | v4 `ring_capacity_chunks` | `--ring-capacity-chunks` |
 | Source switching | `switch_source` | `switchSource`; retains add-on settings | `switch_source` | `flexaudio_switch_source` | `--sources` schedule |
 | Event detail | Typed events/errors/loss | Typed events/errors/loss | Typed events/errors/loss | v1 flattened; v2 detailed | stderr diagnostics/loss summaries |
@@ -134,10 +134,18 @@ and is retained on switch unless explicitly replaced. Ring capacity and initial
 gain remain fixed at open; use runtime gain setters to change gain.
 
 To allow ignored settings, use Rust `OpenOptions::new().strict(false)`, Node
-`strict: false`, Python `strict=False`, C v4 `strict = 2`, or CLI `--no-strict`.
-C v1-v3 always open strict; migrate to v4 to opt out. C v4 `strict = 0` selects
+`strict: false`, Python `strict=False`, C v4/v5 `strict = 2`, or CLI `--no-strict`.
+C v1-v3 always open strict; migrate to v4 or v5 to opt out. C v4/v5 `strict = 0` selects
 strict on open and retains the current strictness on switch. The CLI still
 accepts `--strict`; combining it with `--no-strict` is a usage error.
+
+C v5 adds presence-aware output and mix-lane gains over the v4 controls. Each
+`FlexGainsV5` float pointer uses NULL for omission (1.0) and a supplied 0.0 for
+mute; the nested `FlexConfig` gain fields are ignored. C v1-v4 keep interpreting
+configuration zero as unity. On switch, omitted output gain retains the current
+value; explicit non-default gain is `fixedAtOpen` and strict mode rejects it.
+Mix gains use unity when omitted and literal values when supplied. See the
+[C v5 example](crates/flexaudio-ffi/README.md#version-5-presence-aware-gains).
 
 Rust (the returned stream is not started until `start()`):
 

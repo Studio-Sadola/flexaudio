@@ -80,7 +80,7 @@ stream.stop();
 | 配信方式 | ポーリング | 内部ポーリングからコールバック | ポーリング | ポーリング | 内部ポーリング → stdout/WAV |
 | 副出力タップ | あり | あり（`chunk.secondary`） | あり（`poll_secondary`、f32/s16） | あり（v3、f32/s16） | — |
 | 接続 VAD（主／副） | `VadTap` で内部標準形式のキャプチャを処理 | 主または副のチャンクにイベントを付与 | 主または副のチャンクにイベントを付与 | 主（v2/v3）または副（v3）のチャンクにイベントを付与 | — |
-| ノイズ抑制 | 内部の 48 kHz で処理、出力レートは任意 | 出力レートは任意 | 出力レートは任意 | 出力レートは任意（v1-v4） | `--denoise`、出力レートは任意 |
+| ノイズ抑制 | 内部の 48 kHz で処理、出力レートは任意 | 出力レートは任意 | 出力レートは任意 | 出力レートは任意（v1-v5） | `--denoise`、出力レートは任意 |
 | リング容量（既定は 50 チャンク） | `ring_capacity_chunks` | `ringCapacityChunks` | `ring_capacity_chunks` | v4 の `ring_capacity_chunks` | `--ring-capacity-chunks` |
 | ソース切替 | `switch_source` | `switchSource`、アドオン設定を維持 | `switch_source` | `flexaudio_switch_source` | `--sources` のスケジュール |
 | イベントの詳細 | 型付きイベント／エラー／損失 | 型付きイベント／エラー／損失 | 型付きイベント／エラー／損失 | v1 は平坦化、v2 は詳細情報 | stderr に診断／損失の要約 |
@@ -128,11 +128,18 @@ VAD の値はモデルのパスではなく接続の有無です。Rust の独�
 含みません。strict はオープン時は既定で true、切替時は明示的に置き換えない限り維持します。
 
 無視される設定を許容するには、Rust は `OpenOptions::new().strict(false)`、Node は
-`strict: false`、Python は `strict=False`、C v4 は `strict = 2`、CLI は `--no-strict`
-を指定します。C v1-v3 のオープンは常に strict なので、解除するには v4 へ移行してください。
-C v4 の `strict = 0` はオープン時は strict、切替時は現在の値の維持を意味します。
+`strict: false`、Python は `strict=False`、C v4/v5 は `strict = 2`、CLI は `--no-strict`
+を指定します。C v1-v3 のオープンは常に strict なので、解除するには v4 または v5 へ移行してください。
+C v4/v5 の `strict = 0` はオープン時は strict、切替時は現在の値の維持を意味します。
 CLI の `--strict` は引き続き利用できますが、`--no-strict` との併用は使用方法のエラーです。
 リング容量と初期ゲインはオープン時に固定します。ゲイン変更には実行時の setter を使います。
+
+C v5 は v4 の制御を使い、出力と Mix 各入力のゲインの有無を明示できます。
+`FlexGainsV5` の各 float ポインターは NULL が省略（1.0）、明示した 0.0 がミュートです。
+入れ子の `FlexConfig` のゲイン欄は使いません。C v1-v4 は設定の 0 を引き続き 1.0 と解釈します。
+切替時に出力ゲインを省略すると現在値を維持し、明示した非既定値は `fixedAtOpen` として
+strict モードで拒否します。Mix 各入力のゲインは省略時に 1.0、指定時はその値を使います。
+[C v5 の使用例](crates/flexaudio-ffi/README.md#version-5-presence-aware-gains)も参照してください。
 
 Rust（返されたストリームは `start()` まで開始しません）:
 

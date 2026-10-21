@@ -47,6 +47,9 @@ L(FlexSecondaryMetadataV3, 64, 8, rms, 60);
 L(FlexOptionsV4, 24, 8, ring_capacity_chunks, 16);
 L(FlexStreamConfigV4, 24, 8, options, 16);
 L(FlexSwitchConfigV4, 24, 8, options, 16);
+L(FlexGainsV5, 32, 8, mix_system_gain, 24);
+L(FlexStreamConfigV5, 24, 8, gains, 16);
+L(FlexSwitchConfigV5, 24, 8, gains, 16);
 L(FlexPidsV4, 16, 8, len, 8);
 L(FlexFormatV4, 8, 4, channels, 4);
 L(FlexValuePayloadV4, 16, 8, pids, 0);
@@ -56,6 +59,7 @@ L(FlexNamespacedDeviceV4, 40, 8, id_namespace, 32);
 #endif
 
 _Static_assert(FLEX_STREAM_VERSION_4 == 4, "v4 version");
+_Static_assert(FLEX_STREAM_VERSION_5 == 5, "v5 version");
 _Static_assert(FLEX_IGNORED_SETTINGS == -13, "strict error");
 _Static_assert(FLEX_VALUE_FORMAT == 6, "value discriminator");
 _Static_assert(sizeof(FlexValueKindV4) == 4, "value enum size");
@@ -66,6 +70,8 @@ _Static_assert(FLEX_LIFECYCLE_CLASSIC_LOOPBACK_KEEPALIVE_STOPPED == 4, "lifecycl
 int main(void) {
     int32_t (*open_v4)(const FlexStreamConfigV4 *, FlexStream **) = flexaudio_open_v4;
     int32_t (*switch_v4)(FlexStream *, const FlexSwitchConfigV4 *) = flexaudio_switch_source_v4;
+    int32_t (*open_v5)(const FlexStreamConfigV5 *, FlexStream **) = flexaudio_open_v5;
+    int32_t (*switch_v5)(FlexStream *, const FlexSwitchConfigV5 *) = flexaudio_switch_source_v5;
     int32_t (*settings)(const FlexStream *, FlexSettingsV4 **) = flexaudio_settings_v4;
     int32_t (*count)(const FlexSettingsV4 *, uint64_t *, size_t *) = flexaudio_settings_count_v4;
     int32_t (*item)(const FlexSettingsV4 *, size_t, FlexSettingResolutionV4 *) = flexaudio_settings_item_v4;
@@ -81,6 +87,7 @@ int main(void) {
     void (*free_event)(FlexLifecycleEventV4 *) = flexaudio_lifecycle_event_free_v4;
     void (*free_devices)(FlexNamespacedDeviceV4 *, size_t) = flexaudio_namespaced_devices_free_v4;
     (void)open_v4; (void)switch_v4; (void)settings; (void)count; (void)item; (void)error;
+    (void)open_v5; (void)switch_v5;
     (void)poll; (void)kind; (void)reason; (void)message; (void)arrival; (void)secondary;
     (void)devices; (void)free_settings; (void)free_event; (void)free_devices;
     return 0;

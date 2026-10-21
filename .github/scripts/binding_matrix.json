@@ -4,56 +4,56 @@
       "Rust": {"status": "supported", "symbols": ["flexaudio::open", "flexaudio::SourceKind::Mic"]},
       "Node": {"status": "supported", "symbols": ["openStream", "OpenOptions.kind"], "note": "kind=mic"},
       "Python": {"status": "supported", "symbols": ["open.kind"], "note": "kind=mic"},
-      "C": {"status": "supported", "symbols": ["flexaudio_open_v3", "FLEX_SOURCE_KIND_MIC"]},
+      "C": {"status": "supported", "symbols": ["flexaudio_open_v3", "flexaudio_open_v5", "FLEX_SOURCE_KIND_MIC"]},
       "CLI": {"status": "supported", "symbols": ["--source=mic"]}
     }},
     {"feature": "Open system capture", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::open", "flexaudio::SourceKind::SystemLoopback"]},
       "Node": {"status": "supported", "symbols": ["openStream", "OpenOptions.kind"], "note": "kind=system"},
       "Python": {"status": "supported", "symbols": ["open.kind"], "note": "kind=system"},
-      "C": {"status": "supported", "symbols": ["flexaudio_open_v3", "FLEX_SOURCE_KIND_SYSTEM"]},
+      "C": {"status": "supported", "symbols": ["flexaudio_open_v3", "flexaudio_open_v5", "FLEX_SOURCE_KIND_SYSTEM"]},
       "CLI": {"status": "supported", "symbols": ["--source=system"]}
     }},
     {"feature": "Open process capture", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::open", "flexaudio::SourceKind::ProcessLoopback", "flexaudio::StreamConfig::target_pid"]},
       "Node": {"status": "supported", "symbols": ["openStream", "OpenOptions.kind", "OpenOptions.processId"], "note": "kind=process"},
       "Python": {"status": "supported", "symbols": ["open.kind", "open.process_id"], "note": "kind=process"},
-      "C": {"status": "supported", "symbols": ["flexaudio_open_v3", "FLEX_SOURCE_KIND_PROCESS", "FlexConfig.process_id"]},
+      "C": {"status": "supported", "symbols": ["flexaudio_open_v3", "flexaudio_open_v5", "FLEX_SOURCE_KIND_PROCESS", "FlexConfig.process_id"]},
       "CLI": {"status": "supported", "symbols": ["--source=process", "--process-id"]}
     }},
     {"feature": "Open microphone/system mix", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::open", "flexaudio::SourceKind::Mix"]},
       "Node": {"status": "supported", "symbols": ["openStream", "OpenOptions.kind"], "note": "kind=mix"},
       "Python": {"status": "supported", "symbols": ["open.kind"], "note": "kind=mix"},
-      "C": {"status": "supported", "symbols": ["flexaudio_open_v3", "FLEX_SOURCE_KIND_MIX"]},
+      "C": {"status": "supported", "symbols": ["flexaudio_open_v3", "flexaudio_open_v5", "FLEX_SOURCE_KIND_MIX"]},
       "CLI": {"status": "supported", "symbols": ["--source=mix"]}
     }},
     {"feature": "Switch to microphone", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::switch_source", "flexaudio::SourceKind::Mic"]},
       "Node": {"status": "supported", "symbols": ["FlexStream.switchSource", "OpenOptions.kind"], "note": "kind=mic"},
       "Python": {"status": "supported", "symbols": ["Stream.switch_source.kind"], "note": "kind=mic"},
-      "C": {"status": "supported", "symbols": ["flexaudio_switch_source_v3", "FLEX_SOURCE_KIND_MIC"]},
+      "C": {"status": "supported", "symbols": ["flexaudio_switch_source_v3", "flexaudio_switch_source_v5", "FLEX_SOURCE_KIND_MIC"]},
       "CLI": {"status": "supported", "symbols": ["--sources"], "note": "mic:2 schedules two seconds."}
     }},
     {"feature": "Switch to system", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::switch_source", "flexaudio::SourceKind::SystemLoopback"]},
       "Node": {"status": "supported", "symbols": ["FlexStream.switchSource", "OpenOptions.kind"], "note": "kind=system"},
       "Python": {"status": "supported", "symbols": ["Stream.switch_source.kind"], "note": "kind=system"},
-      "C": {"status": "supported", "symbols": ["flexaudio_switch_source_v3", "FLEX_SOURCE_KIND_SYSTEM"]},
+      "C": {"status": "supported", "symbols": ["flexaudio_switch_source_v3", "flexaudio_switch_source_v5", "FLEX_SOURCE_KIND_SYSTEM"]},
       "CLI": {"status": "supported", "symbols": ["--sources"], "note": "system:2 schedules two seconds."}
     }},
     {"feature": "Switch to process", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::switch_source", "flexaudio::SourceKind::ProcessLoopback"]},
       "Node": {"status": "supported", "symbols": ["FlexStream.switchSource", "OpenOptions.kind", "OpenOptions.processId"], "note": "kind=process"},
       "Python": {"status": "supported", "symbols": ["Stream.switch_source.kind", "Stream.switch_source.process_id"], "note": "kind=process"},
-      "C": {"status": "supported", "symbols": ["flexaudio_switch_source_v3", "FLEX_SOURCE_KIND_PROCESS"]},
+      "C": {"status": "supported", "symbols": ["flexaudio_switch_source_v3", "flexaudio_switch_source_v5", "FLEX_SOURCE_KIND_PROCESS"]},
       "CLI": {"status": "supported", "symbols": ["--sources", "--process-id"], "note": "process:2 schedules two seconds."}
     }},
     {"feature": "Switch to microphone/system mix", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::switch_source", "flexaudio::SourceKind::Mix"]},
       "Node": {"status": "supported", "symbols": ["FlexStream.switchSource", "OpenOptions.kind"], "note": "kind=mix"},
       "Python": {"status": "supported", "symbols": ["Stream.switch_source.kind"], "note": "kind=mix"},
-      "C": {"status": "supported", "symbols": ["flexaudio_switch_source_v3", "FLEX_SOURCE_KIND_MIX"]},
+      "C": {"status": "supported", "symbols": ["flexaudio_switch_source_v3", "flexaudio_switch_source_v5", "FLEX_SOURCE_KIND_MIX"]},
       "CLI": {"status": "missing", "reason": "The --sources schedule accepts mic, system and process only."}
     }},
     {"feature": "System/mix exclusions", "bindings": {
@@ -109,7 +109,7 @@
       "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::set_denoise"], "note": "Canonical 48 kHz processing supports any output rate."},
       "Node": {"status": "supported", "symbols": ["OpenOptions.denoise"], "note": "Canonical 48 kHz processing supports any output rate."},
       "Python": {"status": "supported", "symbols": ["open.denoise", "Stream.switch_source.denoise"], "note": "Canonical 48 kHz processing supports any output rate. Switch omission/None retains denoise; explicit True/False enables/disables it."},
-      "C": {"status": "supported", "symbols": ["flexaudio_open_v3", "FlexConfig.denoise"], "note": "Canonical 48 kHz processing supports any output rate in v1-v4."},
+      "C": {"status": "supported", "symbols": ["flexaudio_open_v3", "flexaudio_open_v5", "FlexConfig.denoise"], "note": "Canonical 48 kHz processing supports any output rate in v1-v5."},
       "CLI": {"status": "supported", "symbols": ["--denoise"], "note": "Canonical 48 kHz processing supports any output rate."}
     }},
     {"feature": "Attached VAD: primary carrier", "bindings": {
@@ -172,7 +172,7 @@
       "Rust": {"status": "supported", "symbols": ["flexaudio::OpenOptions::strict"], "note": "Strict by default; OpenOptions::new().strict(false) allows ignored settings."},
       "Node": {"status": "supported", "symbols": ["OpenOptions.strict"], "note": "Strict by default; strict: false allows ignored settings."},
       "Python": {"status": "supported", "symbols": ["open.strict", "Stream.switch_source.strict"], "note": "Strict by default; strict=False allows ignored settings."},
-      "C": {"status": "supported", "symbols": ["FlexOptionsV4.strict", "flexaudio_open_v4", "FLEX_IGNORED_SETTINGS"], "note": "v1-v4 open strict by default; use v4 strict = 2 to allow ignored settings. v4 strict = 0 retains on switch."},
+      "C": {"status": "supported", "symbols": ["FlexOptionsV4.strict", "flexaudio_open_v4", "flexaudio_open_v5", "FLEX_IGNORED_SETTINGS"], "note": "v1-v5 open strict by default; use v4/v5 strict = 2 to allow ignored settings. v4/v5 strict = 0 retains on switch."},
       "CLI": {"status": "supported", "symbols": ["--strict", "--no-strict"], "note": "Strict by default; --no-strict allows ignored settings. Only decoded non-default requests can be rejected."}
     }},
     {"feature": "Helper lifecycle channel", "bindings": {
@@ -256,7 +256,7 @@
       "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::set_gain", "flexaudio::StreamConfig::mix_mic_gain", "flexaudio::StreamConfig::mix_system_gain"], "note": "Zero mutes."},
       "Node": {"status": "supported", "symbols": ["FlexStream.setGain", "OpenOptions.micGain", "OpenOptions.systemGain"], "note": "Zero mutes."},
       "Python": {"status": "supported", "symbols": ["Stream.set_gain", "open.mic_gain", "open.system_gain"], "note": "Zero mutes."},
-      "C": {"status": "supported", "symbols": ["flexaudio_set_gain", "FlexConfig.mix_mic_gain", "FlexConfig.mix_system_gain"], "note": "Config zero means unity; runtime set_gain(0) mutes."},
+      "C": {"status": "supported", "symbols": ["flexaudio_set_gain", "FlexGainsV5.gain", "FlexGainsV5.mix_mic_gain", "FlexGainsV5.mix_system_gain"], "note": "v5 NULL means unity; explicit zero mutes. v1-v4 config zero means unity; runtime set_gain(0) mutes."},
       "CLI": {"status": "supported", "symbols": ["--gain", "--mic-gain", "--system-gain"], "note": "Zero mutes."}
     }}
   ]

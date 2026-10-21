@@ -3,6 +3,18 @@ use crate::types::FlexConfig;
 use flexaudio::{SettingKey as K, SettingsAttachments};
 
 pub(crate) fn attachments(base: &FlexConfig, keepalive: u32) -> SettingsAttachments {
+    decoded_attachments(base, keepalive, true)
+}
+
+pub(crate) fn literal_gain_attachments(base: &FlexConfig, keepalive: u32) -> SettingsAttachments {
+    decoded_attachments(base, keepalive, false)
+}
+
+fn decoded_attachments(
+    base: &FlexConfig,
+    keepalive: u32,
+    legacy_gains: bool,
+) -> SettingsAttachments {
     let mut sentinels = Vec::new();
     for (sentinel, key) in [
         (base.process_id == 0, K::TargetPid),
@@ -11,9 +23,12 @@ pub(crate) fn attachments(base: &FlexConfig, keepalive: u32) -> SettingsAttachme
             K::Output,
         ),
         (base.chunk_ms == 0, K::ChunkMs),
-        (base.gain == 0.0, K::Gain),
-        (base.mix_mic_gain == 0.0, K::MixMicGain),
-        (base.mix_system_gain == 0.0, K::MixSystemGain),
+        (legacy_gains && base.gain == 0.0, K::Gain),
+        (legacy_gains && base.mix_mic_gain == 0.0, K::MixMicGain),
+        (
+            legacy_gains && base.mix_system_gain == 0.0,
+            K::MixSystemGain,
+        ),
         (base.silence_probe == 0, K::SilenceProbe),
     ] {
         if sentinel {

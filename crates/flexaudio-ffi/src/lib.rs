@@ -47,6 +47,8 @@ mod v3_types;
 mod v3_validation;
 mod v4;
 mod v4_types;
+mod v5;
+mod v5_types;
 mod vad;
 mod vad_integration;
 mod vad_types;
