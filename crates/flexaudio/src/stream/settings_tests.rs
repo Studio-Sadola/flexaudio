@@ -117,7 +117,7 @@ fn construction_and_start_failures_keep_previous_report_options_and_config() {
         assert_eq!(error.kind(), ErrorKind::DeviceNotFound);
         assert_eq!(stream.effective_settings(), Some(&report));
         assert_eq!(stream.config(), &config);
-        assert_eq!(stream.open_options(), &OpenOptions::default());
+        assert_eq!(stream.open_options(), &OpenOptions::new().strict(false));
         assert!(!stream.shared.denoise_enabled.load(Ordering::SeqCst));
     }
     assert_eq!(starts.load(Ordering::SeqCst), 2);
@@ -185,9 +185,12 @@ fn strict_switch_counts_zero_builds_and_old_source_stops_and_keeps_snapshot() {
 
 #[test]
 fn omitted_options_report_defaults_while_retaining_backend_options() {
+    // Permissive open stores a keepalive control that does not apply to a microphone.
     let mut stream = crate::open_using(
         StreamConfig::default(),
-        OpenOptions::new().windows_classic_loopback_keepalive(false),
+        OpenOptions::new()
+            .strict(false)
+            .windows_classic_loopback_keepalive(false),
         |_, _| Ok(Box::new(Backend::new(false))),
     )
     .unwrap();
@@ -206,11 +209,13 @@ fn omitted_options_report_defaults_while_retaining_backend_options() {
     assert_eq!(entry.requested, SettingValue::Bool(true));
     assert_eq!(entry.effective, SettingValue::Absent);
     assert_eq!(entry.outcome, SettingOutcome::NotRequested);
+    assert!(!stream.open_options().strict);
     stream.stop_checked().unwrap();
 }
 
 #[test]
 fn omitted_options_keep_controls_and_attachment_reports_across_source_round_trip() {
+    // The configured control deliberately survives sources/platforms that ignore it.
     let config = |kind| {
         let mut config_value = StreamConfig::new(kind);
         config_value.target_pid = (kind == crate::SourceKind::ProcessLoopback).then_some(42);
@@ -223,6 +228,7 @@ fn omitted_options_keep_controls_and_attachment_reports_across_source_round_trip
     ] {
         for enabled in [true, false] {
             let options = OpenOptions::new()
+                .strict(false)
                 .windows_classic_loopback_keepalive(enabled)
                 .settings_attachments(crate::SettingsAttachments::new().secondary_encoding("s16"));
             let mut stream = crate::open_using(config(initial_kind), options, |_, _| {
@@ -242,6 +248,7 @@ fn omitted_options_keep_controls_and_attachment_reports_across_source_round_trip
                     })
                     .unwrap();
                 let report = stream.effective_settings().unwrap();
+                assert!(!stream.open_options().strict);
                 let keepalive = report
                     .get(SettingKey::WindowsClassicLoopbackKeepalive)
                     .unwrap();

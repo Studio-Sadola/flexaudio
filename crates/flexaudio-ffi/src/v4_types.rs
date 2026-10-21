@@ -11,7 +11,7 @@ pub const FLEX_SETTING_APPLIED: u32 = 1;
 pub const FLEX_SETTING_IGNORED: u32 = 2;
 pub const FLEX_SETTING_ADJUSTED: u32 = 3;
 
-/// Borrowed controls. Strict: 0 default/retain, 1 strict, 2 permissive.
+/// Borrowed controls. Strict: 0 strict on open/retain on switch, 1 strict, 2 permissive.
 /// NULL ring capacity uses 50 on open and retains capacity on switch.
 #[repr(C)]
 pub struct FlexOptionsV4 {

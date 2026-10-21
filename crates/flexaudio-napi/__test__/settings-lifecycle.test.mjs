@@ -25,6 +25,20 @@ const ignored = (options, keys) => {
   return report;
 };
 
+test('open defaults to strict and explicit false permits ignored settings and survives switches', async () => {
+  assert.throws(() => native.openStream({ kind: 'mic', excludeSelf: true }, () => {}), error => {
+    assert.equal(error.code, 'FLEX_IGNORED_SETTINGS');
+    assert.equal(row(error.report, 'excludeSelf').outcome.status, 'ignored');
+    return true;
+  });
+  const stream = native.openStream({ kind: 'mock', excludeSelf: true, strict: false }, () => {});
+  try {
+    assert.equal(row(stream.effectiveSettings(), 'excludeSelf').outcome.status, 'ignored');
+    stream.switchSource({ kind: 'mock', excludeSelf: true });
+    assert.equal(row(stream.effectiveSettings(), 'excludeSelf').outcome.status, 'ignored');
+  } finally { await stream.stop(); }
+});
+
 test('default values use value comparison, and reports include all binding settings', async () => {
   const stream = native.openStream({ kind: 'mock', strict: true, gain: 1, ringCapacityChunks: 50,
     excludeSelf: false, excludePids: [], mode: 'include', micGain: 1, systemGain: 1,

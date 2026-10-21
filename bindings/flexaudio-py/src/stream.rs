@@ -386,6 +386,7 @@ impl Stream {
 /// `vad=StreamVadOptions(...)` attaches canonical VAD before output conversion.
 /// `denoise=true` enables RNNoise and requires 48000 Hz output.
 /// `silence_probe=false` disables the optional macOS silence diagnosis tone.
+/// Strict mode defaults to true; use `strict=False` to allow ignored non-default settings.
 #[pyfunction]
 #[pyo3(signature = (
     kind,
@@ -471,7 +472,7 @@ pub fn open(
         ));
     }
     crate::settings_validation::validate(&config, true).map_err(to_py_err)?;
-    let strict = strict.unwrap_or(false);
+    let strict = strict.unwrap_or(fa::OpenOptions::default().strict);
     let request = crate::settings::Request {
         config: &config,
         keepalive: Some(windows_classic_loopback_keepalive),

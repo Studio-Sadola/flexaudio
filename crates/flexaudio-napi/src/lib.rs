@@ -810,6 +810,7 @@ pub struct SecondaryOutputOptions {
 /// Options for openStream.
 #[napi(object)]
 pub struct OpenOptions {
+    /// Strict by default on open; false allows ignored settings. Omission retains on switch.
     pub strict: Option<bool>,
     pub ring_capacity_chunks: Option<f64>,
     #[napi(ts_type = "(event: LifecycleEvent) => void")]
@@ -890,7 +891,11 @@ fn capture_open_options(options: &OpenOptions) -> flexaudio::OpenOptions {
         &flexaudio::OpenOptions::default(),
         options.windows_classic_loopback_keepalive,
     )
-    .strict(options.strict.unwrap_or(false))
+    .strict(
+        options
+            .strict
+            .unwrap_or(flexaudio::OpenOptions::default().strict),
+    )
 }
 
 /// An omitted switch option retains the current facade-owned value.
@@ -2252,7 +2257,12 @@ pub fn open_stream(
     let config = config_at_boundary(&env, &options)?;
     let request = settings::Request::new(&options, config.clone())?;
     let settings = request
-        .resolve(None, options.strict.unwrap_or(false))
+        .resolve(
+            None,
+            options
+                .strict
+                .unwrap_or(flexaudio::OpenOptions::default().strict),
+        )
         .map_err(|error| boundary::throw_error(&env, error))?;
     let output_rate = config.output.sample_rate;
     let denoise_enabled = options.denoise.unwrap_or(false);
@@ -2326,7 +2336,9 @@ pub fn open_stream(
     let bridge = PairingBridge {
         settings: mock_source.then_some(settings),
         lifecycle: Some(lifecycle),
-        strict: options.strict.unwrap_or(false),
+        strict: options
+            .strict
+            .unwrap_or(flexaudio::OpenOptions::default().strict),
         attachment,
         on_chunk: on_chunk.as_ref().clone(),
         stop_phase,

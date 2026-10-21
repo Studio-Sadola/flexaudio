@@ -107,8 +107,10 @@ fn facade_open_retains_default_and_explicit_options_before_capture_starts() {
     assert_eq!(legacy.config(), explicit.config());
     assert_eq!(legacy.open_options(), explicit.open_options());
     assert_eq!(legacy.open_options(), &OpenOptions::default());
-    let disabled = crate::open_with_options(config, options(false)).unwrap();
-    assert_eq!(disabled.open_options(), &options(false));
+    // Retain the control even though process capture cannot apply it.
+    let disabled_options = options(false).strict(false);
+    let disabled = crate::open_with_options(config, disabled_options.clone()).unwrap();
+    assert_eq!(disabled.open_options(), &disabled_options);
 }
 
 #[test]
@@ -141,18 +143,20 @@ fn successful_source_switch_commits_explicit_options() {
     stream.start().unwrap();
     let mut replacement = initial;
     replacement.kind = crate::SourceKind::SystemLoopback;
+    // This test commits an explicitly permissive, potentially inapplicable control.
+    let requested_options = options(false).strict(false);
     stream
         .switch_source_using(
             replacement.clone(),
             None,
-            Some(options(false)),
+            Some(requested_options.clone()),
             |_, requested| {
-                assert_eq!(requested, &options(false));
+                assert_eq!(requested, &requested_options);
                 Ok(Box::new(backend(false)))
             },
         )
         .unwrap();
-    assert_eq!(stream.open_options(), &options(false));
+    assert_eq!(stream.open_options(), &requested_options);
     assert_eq!(stream.config(), &replacement);
     stream.stop_checked().unwrap();
 }
@@ -165,13 +169,15 @@ fn source_construction_failure_keeps_previous_options_and_backend() {
     let initial = StreamConfig::default();
     let mut stream = Stream::open(initial.clone(), Box::new(old_backend)).unwrap();
     stream.start().unwrap();
+    // Reach the construction failure instead of rejecting the inapplicable control.
+    let requested_options = options(false).strict(false);
     assert_eq!(
         stream.switch_source_using(
             initial.clone(),
             None,
-            Some(options(false)),
+            Some(requested_options.clone()),
             |_, requested| {
-                assert_eq!(requested, &options(false));
+                assert_eq!(requested, &requested_options);
                 Err(Error::DeviceNotFound)
             }
         ),

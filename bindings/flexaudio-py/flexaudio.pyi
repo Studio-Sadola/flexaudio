@@ -652,6 +652,7 @@ class Stream:
         Old epoch_end need not precede new primary PCM; use its DISCONTINUITY boundary.
         The VAD attachment configured with vad at open() persists across switches;
         new PCM starts a new VAD epoch. Omitting denoise disables noise suppression.
+        strict=None retains the current strictness; strict=False allows ignored settings.
         """
         ...
     def __enter__(self) -> Stream: ...
@@ -879,6 +880,9 @@ def open(
     ring_capacity_chunks: Optional[int] = None
 ) -> Stream:
     """Open capture synchronously; macOS microphone consent must be decided.
+
+    strict=None uses strict mode by default, rejecting ignored non-default settings
+    with IgnoredSettingsError. Set strict=False to allow ignored settings.
 
     Bundled prompts wait at most 30 seconds; an unanswered prompt raises a typed
     backend error without starting capture. Answer the prompt and retry. Built-in

@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Capture opens strict by default in Rust, Node, Python, C v1-v4 and the CLI.
+  Ignored settings are rejected only when their decoded values differ from defaults;
+  C zero-initialized microphone configurations still use defaults and remain valid.
+  Migration: opt out with Rust `OpenOptions::new().strict(false)`, Node
+  `strict: false`, Python `strict=False`, C v4 `strict = 2`, or CLI `--no-strict`.
+  C v1-v3 users must migrate to v4 to opt out. C v4 `strict = 0` selects strict
+  on open and retains the current value on switch. All bindings retain strictness
+  on switches when omitted. CLI `--strict` remains accepted; combining it with
+  `--no-strict` is a usage error.
 - Rust `AudioChunk`, `DeviceInfo` and `StreamConfig` are now `#[non_exhaustive]`
   so future fields can be added without requiring downstream literal updates.
   Migration: replace struct literals with the corresponding constructor, then

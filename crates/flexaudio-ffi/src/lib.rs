@@ -153,6 +153,8 @@ fn fail(err: flexaudio::Error) -> i32 {
 /// When denoise is enabled, the output rate must be 48000 (otherwise return NULL and set
 /// last_error; RNNoise requires 48 kHz). Free the returned handle with `flexaudio_free`.
 /// This is equivalent to `flexaudio_open_with_exclude_pids(config, NULL, 0)`.
+/// Opens strict by default: ignored non-default settings fail with FLEX_IGNORED_SETTINGS.
+/// Zero-initialized microphone settings use defaults. To opt out, use v4 strict = 2.
 ///
 /// # Safety
 /// `config` must point to a valid `FlexConfig` (NULL is treated as a failure).
@@ -197,10 +199,27 @@ unsafe fn open_with_exclude_pids(
     exclude_pids: *const u32,
     exclude_pids_len: usize,
 ) -> *mut FlexStream {
+    open_with_exclude_pids_options(
+        config,
+        exclude_pids,
+        exclude_pids_len,
+        flexaudio::open_with_options,
+    )
+}
+
+unsafe fn open_with_exclude_pids_options(
+    config: *const FlexConfig,
+    exclude_pids: *const u32,
+    exclude_pids_len: usize,
+    open: impl FnOnce(
+        flexaudio::StreamConfig,
+        flexaudio::OpenOptions,
+    ) -> flexaudio::Result<flexaudio::Stream>,
+) -> *mut FlexStream {
     open_with_exclude_pids_using(config, exclude_pids, exclude_pids_len, |decoded| {
         let options = flexaudio::OpenOptions::default()
             .settings_attachments(settings_request::attachments(&*config, 0).vad(false));
-        flexaudio::open_with_options(decoded, options)
+        open(decoded, options)
     })
 }
 
@@ -1141,3 +1160,7 @@ mod inventory_policy_tests {
 #[cfg(test)]
 #[path = "../tests/ffi/stream_denoise.rs"]
 mod stream_denoise_tests;
+
+#[cfg(test)]
+#[path = "../tests/ffi/strict_defaults.rs"]
+mod strict_defaults_tests;

@@ -6,7 +6,8 @@
 pub struct OpenOptions {
     pub(crate) settings_attachments: crate::SettingsAttachments,
     /// Reject non-default capture settings that would be ignored, before native access.
-    /// Defaults to false; plain source switches retain the current value.
+    /// Defaults to true; set false to allow ignored settings. Plain source switches
+    /// retain the current value.
     pub strict: bool,
     /// Keep Windows classic system loopback active by rendering silence.
     ///
@@ -24,7 +25,7 @@ impl Default for OpenOptions {
     fn default() -> Self {
         Self {
             settings_attachments: crate::SettingsAttachments::default(),
-            strict: false,
+            strict: true,
             windows_classic_loopback_keepalive: true,
         }
     }

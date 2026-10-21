@@ -113,7 +113,7 @@ Construction/startup failures retain the previous settings.
 
 ## Settings and metadata in 0.8
 
-- `OpenOptions::new().strict(true)` rejects non-default settings that would be ignored
+- `OpenOptions::new()` defaults to strict and rejects non-default settings that would be ignored
   before native access. `Stream::effective_settings()` exposes the last successful
   facade open/switch report, including after stop; custom-backend streams return
   `None`. Failed switches retain the previous report.
@@ -121,6 +121,8 @@ Construction/startup failures retain the previous settings.
   model loading. `SettingsAttachments` describes processing attachments and switch
   policy; it does not install those attachments. The resolver reports applicability
   but does not validate capture arguments or enforce strictness itself.
+  Use `OpenOptions::new().strict(false)` to allow ignored settings. Source switches
+  retain the current strictness unless explicitly replaced.
 - `Stream::poll_event()` carries `Event::SilenceProbeStarted`,
   `Event::SilenceProbeStopped`, `Event::ClassicLoopbackKeepaliveStarted`, and
   `Event::ClassicLoopbackKeepaliveStopped`. Every emitted Started has exactly one

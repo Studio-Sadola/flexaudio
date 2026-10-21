@@ -97,6 +97,56 @@ fn envelopes_validate_header_before_following_pointers() {
 }
 
 #[test]
+fn default_open_is_strict_and_explicit_permissive_reaches_the_opener() {
+    unsafe {
+        let mut base = base();
+        base.exclude_self = 1;
+        let base3 = v3(&base);
+        let mut opts = options();
+        for controls in [ptr::null(), &opts] {
+            let config = v4(&base3, controls);
+            let mut out = ptr::dangling_mut();
+            assert_eq!(
+                open_with(&config, &mut out, |_, _| panic!(
+                    "strict preflight must reject"
+                )),
+                code::FLEX_IGNORED_SETTINGS
+            );
+            assert!(out.is_null());
+            let error = error::last_audio_error().unwrap();
+            assert!(matches!(
+                error
+                    .ignored_settings()
+                    .unwrap()
+                    .get(K::ExcludeSelf)
+                    .unwrap()
+                    .outcome,
+                flexaudio::SettingOutcome::Ignored(_)
+            ));
+        }
+        opts.strict = 2;
+        let config = v4(&base3, &opts);
+        let mut out = ptr::null_mut();
+        assert_eq!(
+            open_with(&config, &mut out, |config, options| {
+                assert!(!options.strict);
+                let report = flexaudio::resolve_settings(
+                    &SettingsRequest::new(config.clone()).open_options(&options),
+                )?;
+                assert!(report.has_ignored());
+                flexaudio::Stream::open(
+                    config,
+                    Box::new(flexaudio::MockBackend::new(48_000, 2, 0.0)),
+                )
+            }),
+            0
+        );
+        assert!(!out.is_null());
+        crate::flexaudio_free(out);
+    }
+}
+
+#[test]
 fn strict_rejection_is_complete_readable_and_precedes_model_and_backend_work() {
     unsafe {
         let mut base = base();
@@ -218,6 +268,10 @@ fn decoded_defaults_controls_and_fixed_processing_use_shared_resolution() {
         opts.ring_capacity_chunks = ptr::null();
         controls(&opts, &mut config, &mut current).unwrap();
         assert_eq!(config.ring_capacity_chunks, 17);
+        assert!(!current.strict);
+        current.strict = true;
+        controls(&opts, &mut config, &mut current).unwrap();
+        assert!(current.strict);
     }
 }
 
@@ -635,7 +689,7 @@ fn switch_validates_envelopes_and_strict_failures_preserve_the_old_source() {
             windows_classic_loopback_keepalive: 0,
         };
         let mut opts = options();
-        opts.strict = 1;
+        opts.strict = 0;
         let mut switch = FlexSwitchConfigV4 {
             size: mem::size_of::<FlexSwitchConfigV4>().try_into().unwrap(),
             version: 4,
@@ -655,7 +709,7 @@ fn switch_validates_envelopes_and_strict_failures_preserve_the_old_source() {
             flexaudio::SettingValue::Bool(false)
         );
         assert_eq!(stops.load(Ordering::SeqCst), 0);
-        assert!(!(*stream).inner.open_options().strict);
+        assert!((*stream).inner.open_options().strict);
         assert!((*stream).inner.effective_settings().is_none());
         for bad_version in [0, 3, 5, u32::MAX] {
             switch.version = bad_version;

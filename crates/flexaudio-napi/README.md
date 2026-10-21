@@ -194,7 +194,8 @@ target an output endpoint. Microphone selection is unaffected.
 ## Settings reports, strict mode, and lifecycle
 
 `openStream({ kind: 'mic', strict: true, ringCapacityChunks: 100 }, onChunk)`
-opts into applicability checks and a 100-chunk output ring (default 50).
+uses default strict applicability checks and a 100-chunk output ring (default 50).
+Omitted `strict` is true on open; set `strict: false` to allow ignored settings.
 `stream.effectiveSettings()` returns the last successful open/switch snapshot,
 with a `bigint` revision and requested/effective values and outcomes for every
 recognized capture setting. Effective values describe configuration, not proof

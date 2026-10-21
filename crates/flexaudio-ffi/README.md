@@ -451,7 +451,11 @@ VAD status codes occupy a distinct range starting at -100.
 envelopes. Initialize every envelope's `size` to its `sizeof` and use its matching
 version constant. All sizes and versions must match exactly. NULL `options` uses
 defaults on open and retains controls on switch. `FlexOptionsV4.strict` accepts
-only 0 (default/retain), 1 (strict), or 2 (permissive). A NULL capacity pointer
+only 0 (strict on open/retain on switch), 1 (strict), or 2 (permissive).
+C v1-v3 also open strict, rejecting ignored non-default settings; migrate to
+v4 and set `strict = 2` to opt out. Zero-initialized microphone configurations
+still use defaults, including `silence_probe = 0` meaning enabled.
+A NULL capacity pointer
 selects 50 on open and retains capacity on switch; a supplied capacity must be
 positive and fit `size_t`.
 

@@ -319,7 +319,8 @@ Only decoded values differing from documented defaults are requests. Explicit
 defaults are `notRequested`, including on switch. Strict rejects all requested
 ignored settings before device access, model loading, or stopping the old source,
 raising `IgnoredSettingsError` with its complete candidate `.report`.
-`strict=None` means false on open and retention on switch. Gain and ring capacity
+`strict=None` means true on open and retention on switch. Use `strict=False`
+to allow ignored settings. Gain and ring capacity
 stay fixed at open; non-default switch requests are ignored with `fixedAtOpen`.
 Use `set_gain()` for runtime gain changes. Python switch denoise remains applied.
 See the root README's [ignored-setting table](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#strict-mode-and-effective-settings).

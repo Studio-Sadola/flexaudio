@@ -98,7 +98,7 @@ The optional silence diagnosis probe is macOS-only and enabled by default.
 
 ## Strict mode and effective settings
 
-Capture is permissive by default. A setting counts as **requested only when its
+Capture is strict by default. A setting counts as **requested only when its
 decoded value differs from its documented default**, even when explicitly supplied
 or switching sources. For example, microphone `silenceProbe: false` is ignored
 and rejected in strict mode; `silenceProbe: true` is `notRequested`. On switch,
@@ -125,9 +125,15 @@ Defaults are microphone, absent device/PID, include mode, 20 ms chunks, 50 chunk
 of ring capacity, unity gain and Mix gains, no exclusions or Mix device IDs,
 48000 Hz stereo primary output, no secondary output, `f32` secondary encoding,
 enabled probe/keepalive, disabled denoise, and no VAD. Strictness and callback
-registration are controls outside the report. Strict defaults to false on open
+registration are controls outside the report. Strict defaults to true on open
 and is retained on switch unless explicitly replaced. Ring capacity and initial
 gain remain fixed at open; use runtime gain setters to change gain.
+
+To allow ignored settings, use Rust `OpenOptions::new().strict(false)`, Node
+`strict: false`, Python `strict=False`, C v4 `strict = 2`, or CLI `--no-strict`.
+C v1-v3 always open strict; migrate to v4 to opt out. C v4 `strict = 0` selects
+strict on open and retains the current strictness on switch. The CLI still
+accepts `--strict`; combining it with `--no-strict` is a usage error.
 
 Rust (the returned stream is not started until `start()`):
 

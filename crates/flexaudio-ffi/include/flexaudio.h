@@ -739,7 +739,7 @@ typedef struct FlexSwitchConfigV3 {
     uint32_t windows_classic_loopback_keepalive;
 } FlexSwitchConfigV3;
 
-// Borrowed controls. Strict: 0 default/retain, 1 strict, 2 permissive.
+// Borrowed controls. Strict: 0 strict on open/retain on switch, 1 strict, 2 permissive.
 // NULL ring capacity uses 50 on open and retains capacity on switch.
 typedef struct FlexOptionsV4 {
     uint32_t size;
@@ -841,6 +841,8 @@ typedef struct FlexDeviceEvent {
 // When denoise is enabled, the output rate must be 48000 (otherwise return NULL and set
 // last_error; RNNoise requires 48 kHz). Free the returned handle with `flexaudio_free`.
 // This is equivalent to `flexaudio_open_with_exclude_pids(config, NULL, 0)`.
+// Opens strict by default: ignored non-default settings fail with FLEX_IGNORED_SETTINGS.
+// Zero-initialized microphone settings use defaults. To opt out, use v4 strict = 2.
 //
 // # Safety
 // `config` must point to a valid `FlexConfig` (NULL is treated as a failure).
@@ -1628,6 +1630,7 @@ int32_t flexaudio_error_diagnostic_detail_v2(const struct FlexErrorInfoV2 *value
 // Open an unstarted stream with optional VAD, PID exclusions and secondary output.
 // Denoise runs once on canonical capture, before both output formats and VAD.
 // Valid out initializes to NULL, including on errors. All options are copied.
+// Opens strict by default; use v4 strict = 2 to allow ignored non-default settings.
 // # Safety
 // Config has at least its size/version words, and complete readable storage when
 // they match. Borrowed fields must be readable for the call; out must be writable.
@@ -1747,6 +1750,7 @@ void flexaudio_vad_segments_free(struct FlexSpeechSegment *v, size_t len);
 
 // Open a versioned primary stream, returning a typed result code and last_error.
 // Attachment uses the producer canonical branch before output conversion.
+// Opens strict by default; use v4 strict = 2 to allow ignored non-default settings.
 // # Safety
 // Config and its borrowed fields must be valid; out must be writable.
 int32_t flexaudio_open_v2(const struct FlexStreamConfigV2 *config, struct FlexStream **out);

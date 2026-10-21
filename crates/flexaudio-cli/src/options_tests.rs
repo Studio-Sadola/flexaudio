@@ -3,9 +3,21 @@ use super::*;
 use serde_json::json;
 
 #[test]
-fn new_flags_parse_with_unchanged_defaults() {
+fn strict_is_default_and_can_be_disabled() {
     let defaults = Cli::try_parse_from(["flexaudio-cli"]).unwrap();
-    assert!(!defaults.strict && !defaults.settings_json && !defaults.lifecycle_events);
+    assert!(defaults.strict && !defaults.settings_json && !defaults.lifecycle_events);
+    assert!(defaults.open_options().strict);
+    let permissive = Cli::try_parse_from(["flexaudio-cli", "--no-strict"]).unwrap();
+    assert!(!permissive.open_options().strict);
+    let mut config = StreamConfig::default();
+    config.exclude_self = true;
+    assert!(flexaudio::resolve_settings(
+        &flexaudio::SettingsRequest::new(config).open_options(&permissive.open_options())
+    )
+    .unwrap()
+    .has_ignored());
+    let conflict = Cli::try_parse_from(["flexaudio-cli", "--strict", "--no-strict"]).unwrap_err();
+    assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
     assert!(!defaults.list_devices_json && !defaults.denoise);
     assert_eq!(defaults.ring_capacity_chunks, 50);
     let cli = Cli::try_parse_from([

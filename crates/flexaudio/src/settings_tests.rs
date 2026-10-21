@@ -12,7 +12,11 @@ fn strict_preflight_precedes_all_backend_construction_and_device_access() {
     config.exclude_self = true;
     config.mix_mic_gain = 2.0;
     config.silence_probe = false;
-    let error = crate::open_using(config.clone(), OpenOptions::new().strict(true), |_, _| {
+    assert!(OpenOptions::default().strict);
+    assert!(OpenOptions::new().strict);
+    let public_error = crate::open(config.clone()).err().unwrap();
+    assert_eq!(public_error.kind(), ErrorKind::IgnoredSettings);
+    let error = crate::open_using(config.clone(), OpenOptions::new(), |_, _| {
         // Any permission/format/device query or model load is below this boundary.
         calls.set(calls.get() + 1);
         Err(Error::DeviceNotFound)
@@ -32,7 +36,7 @@ fn strict_preflight_precedes_all_backend_construction_and_device_access() {
             .count(),
         4
     );
-    let error = crate::open_using(config, OpenOptions::default(), |_, _| {
+    let error = crate::open_using(config, OpenOptions::default().strict(false), |_, _| {
         calls.set(calls.get() + 1);
         Err(Error::DeviceNotFound)
     })
@@ -62,7 +66,7 @@ fn explicit_defaults_pass_strict_and_facade_streams_have_reports() {
     )
     .unwrap();
     assert!(custom.effective_settings().is_none());
-    assert!(!OpenOptions::new().strict);
+    assert!(OpenOptions::new().strict);
 }
 
 #[test]

@@ -354,12 +354,10 @@ impl Stream {
         // a public applicability snapshot for its original backend.
         let mut previous = match self.settings_report.clone() {
             Some(report) => report,
-            None => crate::settings::preflight(
-                &self.config,
-                &OpenOptions::default(),
-                None,
-                None,
-                false,
+            // This is historical state from a custom backend, not a new request.
+            // Resolve it for retained values without enforcing applicability again.
+            None => crate::resolve_settings(
+                &crate::SettingsRequest::new(self.config.clone()).open_options(&self.open_options),
             )?,
         };
         if let Some(entry) = previous
@@ -506,7 +504,11 @@ mod combined_open_options_tests {
             .switch_source_using(
                 initial.clone(),
                 Some(true),
-                Some(OpenOptions::new().windows_classic_loopback_keepalive(false)),
+                Some(
+                    OpenOptions::new()
+                        .strict(false)
+                        .windows_classic_loopback_keepalive(false),
+                ),
                 |_, options| {
                     assert!(!options.windows_classic_loopback_keepalive);
                     Ok(Box::new(Idle(false)))
@@ -514,6 +516,7 @@ mod combined_open_options_tests {
             )
             .unwrap();
         assert!(!stream.open_options().windows_classic_loopback_keepalive);
+        assert!(!stream.open_options().strict);
         assert!(stream.shared.denoise_enabled.load(Ordering::SeqCst));
         for fail_start in [false, true] {
             let result = stream.switch_source_using(
@@ -528,8 +531,9 @@ mod combined_open_options_tests {
                     }
                 },
             );
-            assert!(result.is_err());
+            assert_eq!(result, Err(Error::DeviceNotFound));
             assert!(!stream.open_options().windows_classic_loopback_keepalive);
+            assert!(!stream.open_options().strict);
             assert!(stream.shared.denoise_enabled.load(Ordering::SeqCst));
         }
         stream.stop_checked().unwrap();

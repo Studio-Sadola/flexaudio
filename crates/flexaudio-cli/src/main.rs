@@ -19,7 +19,8 @@
 //! ```
 //!
 //! `--settings-json` writes one compact report per successful open or scheduled switch to stderr.
-//! With `--strict`, ignored non-default settings instead emit the candidate report and fail.
+//! By default, ignored non-default settings emit the candidate report and fail.
+//! Use `--no-strict` to allow ignored settings; `--strict` remains accepted.
 //! `--lifecycle-events` writes helper start/stop JSON lines to stderr, including shutdown events;
 //! without it helper lifecycle events are silent. JSON uses shared lower-camel tags and escaped
 //! strings. Device JSON is an array of `{device, idNamespace}` entries on stdout. Namespace tags
@@ -154,9 +155,13 @@ struct Cli {
     #[arg(long)]
     capabilities: bool,
 
-    /// Reject non-default capture settings that would be ignored (also on scheduled switches).
-    #[arg(long)]
+    /// Reject ignored non-default settings (the default; also on scheduled switches).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::SetTrue, conflicts_with = "no_strict")]
     strict: bool,
+
+    /// Allow non-default capture settings that would be ignored.
+    #[arg(long, conflicts_with = "strict")]
+    no_strict: bool,
 
     /// Emit settings JSON to stderr after open/switch, or on strict rejection (then fail).
     #[arg(long)]
@@ -325,7 +330,7 @@ impl Cli {
 
     fn open_options(&self) -> flexaudio::OpenOptions {
         flexaudio::OpenOptions::new()
-            .strict(self.strict)
+            .strict(self.strict && !self.no_strict)
             .windows_classic_loopback_keepalive(!self.no_classic_loopback_keepalive)
     }
 
@@ -669,7 +674,7 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         }
     };
 
-    if !cli.strict {
+    if cli.no_strict {
         validate_exclusion_sources(cli, segments.as_deref()).map_err(describe_error)?;
     }
 
@@ -1687,15 +1692,17 @@ mod tests {
 
     #[test]
     fn run_rejects_exclusions_without_system_capture() {
+        // Preserve the permissive-mode guidance; strict mode uses the settings report.
         for exclusion in [vec!["--exclude-self"], vec!["--exclude-pid", "123"]] {
             for source in ["mic", "process"] {
-                let mut args = vec!["--source", source, "--process-id", "42"];
+                let mut args = vec!["--no-strict", "--source", source, "--process-id", "42"];
                 args.extend_from_slice(&exclusion);
                 let err = run(&cli_from(&args)).expect_err("reject before device access");
                 assert!(err.contains("require --source system or mix"), "err: {err}");
             }
             // The schedule overrides --source, so its effective sources decide validity.
             let mut args = vec![
+                "--no-strict",
                 "--source",
                 "system",
                 "--sources",

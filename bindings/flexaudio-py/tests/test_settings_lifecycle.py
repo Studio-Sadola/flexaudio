@@ -14,6 +14,24 @@ SETTING_KEYS = {
 
 
 class SettingsLifecycleContracts(unittest.TestCase):
+    def test_open_defaults_to_strict(self):
+        for strict in ({}, {"strict": None}):
+            with self.subTest(strict=strict), self.assertRaises(fa.IgnoredSettingsError) as raised:
+                fa.open("mic", exclude_self=True, **strict)
+            rows = {row["setting"]: row for row in raised.exception.report["entries"]}
+            self.assertEqual(rows["excludeSelf"]["outcome"]["status"], "ignored")
+
+    def test_explicit_false_reaches_backend_with_ignored_settings(self):
+        # An impossible selector makes this hardware-independent: permissive mode
+        # reaches native selection, which must fail with a different typed error.
+        options = {"device_id": "nonexistent-input-for-settings-test", "exclude_self": True}
+        with self.assertRaises(fa.IgnoredSettingsError):
+            fa.open("mic", **options)
+        with self.assertRaises((fa.DeviceNotFoundError, fa.RecordingPermissionError,
+                                fa.BackendError)) as raised:
+            fa.open("mic", strict=False, **options)
+        self.assertNotIsInstance(raised.exception, fa.IgnoredSettingsError)
+
     def test_parameters_are_appended_defaulted_and_keyword_only(self):
         for function in (fa.open, fa.Stream.switch_source):
             parameters = inspect.signature(function).parameters
@@ -65,7 +83,7 @@ class SettingsLifecycleContracts(unittest.TestCase):
         for key in SETTING_KEYS - {"mixMicGain"}:
             self.assertEqual(rows[key]["outcome"], {"status": "notRequested", "reason": None})
 
-    def test_permissive_omitted_and_none_strict_do_not_reject_ignored_settings(self):
+    def test_invalid_arguments_precede_strict_rejection(self):
         # A missing process ID supplies a typed error before any device is acquired.
         for strict in ({}, {"strict": None}, {"strict": False}, {"strict": True}):
             with self.subTest(strict=strict), self.assertRaises(fa.InvalidArgumentError):

@@ -216,8 +216,9 @@ pub fn open(config: StreamConfig) -> Result<Stream> {
 /// Open a not-yet-started capture stream with explicit backend options.
 ///
 /// Uses the same validation and source selection as [`open`]. Options that do
-/// not apply to the selected operating system or source are ignored by default.
-/// With [`OpenOptions::strict`] enabled, non-default ignored settings return
+/// not apply to the selected operating system or source are rejected when non-default.
+/// [`OpenOptions::strict`] defaults to true; set false to allow ignored settings.
+/// Non-default ignored settings in strict mode return
 /// [`Error::IgnoredSettings`] before backend construction or native access.
 pub fn open_with_options(config: StreamConfig, options: OpenOptions) -> Result<Stream> {
     open_using(config, options, build_backend)

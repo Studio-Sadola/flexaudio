@@ -13,6 +13,7 @@ use crate::{
 /// Open an unstarted stream with optional VAD, PID exclusions and secondary output.
 /// Denoise runs once on canonical capture, before both output formats and VAD.
 /// Valid out initializes to NULL, including on errors. All options are copied.
+/// Opens strict by default; use v4 strict = 2 to allow ignored non-default settings.
 /// # Safety
 /// Config has at least its size/version words, and complete readable storage when
 /// they match. Borrowed fields must be readable for the call; out must be writable.
@@ -24,7 +25,7 @@ pub unsafe extern "C" fn flexaudio_open_v3(
     open_with(config, out, flexaudio::open_with_options)
 }
 
-unsafe fn open_with(
+pub(crate) unsafe fn open_with(
     config: *const FlexStreamConfigV3,
     out: *mut *mut FlexStream,
     open: impl FnOnce(

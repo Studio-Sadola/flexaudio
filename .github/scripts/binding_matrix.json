@@ -173,7 +173,7 @@
       "Node": {"status": "supported", "symbols": ["OpenOptions.strict"]},
       "Python": {"status": "supported", "symbols": ["open.strict", "Stream.switch_source.strict"]},
       "C": {"status": "supported", "symbols": ["FlexOptionsV4.strict", "flexaudio_open_v4", "FLEX_IGNORED_SETTINGS"]},
-      "CLI": {"status": "supported", "symbols": ["--strict"], "note": "Only decoded non-default requests can be rejected."}
+      "CLI": {"status": "supported", "symbols": ["--strict", "--no-strict"], "note": "Strict by default; --no-strict allows ignored settings. Only decoded non-default requests can be rejected."}
     }},
     {"feature": "Helper lifecycle channel", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::poll_event"], "note": "Existing Event channel; exactly one Stopped per emitted Started."},

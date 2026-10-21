@@ -360,7 +360,8 @@ export interface SecondaryOutputOptions {
 }
 /** Options for openStream. */
 export interface OpenOptions {
-  /** Reject non-default settings that would be ignored. Retained on switch when omitted. */
+  /** Reject non-default settings that would be ignored. Defaults to true on open;
+   * set false to allow ignored settings. Retained on switch when omitted. */
   strict?: boolean
   /** Positive safe integer queue capacity. Default 50; fixed at open. */
   ringCapacityChunks?: number

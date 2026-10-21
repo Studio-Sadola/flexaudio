@@ -224,12 +224,24 @@ pub(crate) unsafe fn validate_vad(
 
 /// Open a versioned primary stream, returning a typed result code and last_error.
 /// Attachment uses the producer canonical branch before output conversion.
+/// Opens strict by default; use v4 strict = 2 to allow ignored non-default settings.
 /// # Safety
 /// Config and its borrowed fields must be valid; out must be writable.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_open_v2(
     config: *const FlexStreamConfigV2,
     out: *mut *mut FlexStream,
+) -> i32 {
+    open_v2_with(config, out, flexaudio::open_with_options)
+}
+
+pub(crate) unsafe fn open_v2_with(
+    config: *const FlexStreamConfigV2,
+    out: *mut *mut FlexStream,
+    open: impl FnOnce(
+        flexaudio::StreamConfig,
+        flexaudio::OpenOptions,
+    ) -> flexaudio::Result<flexaudio::Stream>,
 ) -> i32 {
     guard_i32(|| {
         clear_last_error();
@@ -257,7 +269,7 @@ pub unsafe extern "C" fn flexaudio_open_v2(
             let options = flexaudio::OpenOptions::default().settings_attachments(
                 crate::settings_request::attachments(&*config, 0).vad(vad_tap.is_some()),
             );
-            flexaudio::open_with_options(decoded, options)
+            open(decoded, options)
         });
         if stream.is_null() {
             crate::error::last_audio_error()

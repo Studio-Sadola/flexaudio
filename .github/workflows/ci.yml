@@ -180,7 +180,7 @@ jobs:
           pip install -q 'maturin[patchelf]'
           maturin build --manifest-path bindings/flexaudio-py/Cargo.toml --out /tmp/wheels
           pip install --no-index --find-links /tmp/wheels flexaudio
-          python -m unittest bindings/flexaudio-py/tests/test_contracts.py bindings/flexaudio-py/tests/test_pcm_buffer.py -v
+          python -m unittest bindings/flexaudio-py/tests/test_contracts.py bindings/flexaudio-py/tests/test_pcm_buffer.py bindings/flexaudio-py/tests/test_settings_lifecycle.py -v
           # Discovery fails closed: without a PipeWire daemon (this runner) devices()
           # raises a typed BackendError instead of returning a partial list.
           python -c "
@@ -340,7 +340,7 @@ jobs:
           FLEXAUDIO_REPRO_ADDON: ${{ github.workspace }}/crates/flexaudio-napi/__test__/repro.node
           FLEXAUDIO_TEST_ADDON: ${{ github.workspace }}/crates/flexaudio-napi/__test__/repro.node
           FLEXAUDIO_RELEASE_ADDON: ${{ github.workspace }}/crates/flexaudio-napi/__test__/plain-debug.node
-        run: node --test __test__/binding-contract.test.mjs __test__/binding-declarations.test.mjs __test__/vad.test.mjs __test__/vad-concurrency.test.mjs
+        run: node --test __test__/binding-contract.test.mjs __test__/binding-declarations.test.mjs __test__/vad.test.mjs __test__/vad-concurrency.test.mjs __test__/settings-lifecycle.test.mjs
 
   smoke-linux-pipewire:
     name: Self-exclusion smoke (Linux / real PipeWire)
