@@ -4,7 +4,7 @@ use crate::{
     convert::valid_pointer,
     error, guard_i32,
     settings_request::attachments,
-    types::FlexStream,
+    types::{FlexConfig, FlexStream},
     v3::{finish_open, PreparedOpen},
     v3_types::*,
     v3_validation as v3,
@@ -26,6 +26,35 @@ fn apply_gains(config: &mut StreamConfig, gains: &Option<LiteralGains>) {
         config.mix_mic_gain = gains.mix_mic_gain;
         config.mix_system_gain = gains.mix_system_gain;
     }
+}
+
+unsafe fn decode_config(
+    base: *const FlexConfig,
+    pids: *const u32,
+    len: usize,
+    gains: &Option<LiteralGains>,
+) -> Result<StreamConfig, i32> {
+    if gains.is_some() {
+        if !valid_pointer(base) {
+            return Err(invalid("invalid base config pointer"));
+        }
+        // The caller guarantees readable storage after the structural pointer check.
+        let base = &*base;
+        for (field, value) in [
+            ("gain", base.gain),
+            ("mix_mic_gain", base.mix_mic_gain),
+            ("mix_system_gain", base.mix_system_gain),
+        ] {
+            if value != 0.0 {
+                return Err(invalid(&format!(
+                    "FlexConfig.{field} must be zero in v5; use FlexGainsV5.{field}"
+                )));
+            }
+        }
+    }
+    let mut config = v3::config(base, pids, len)?;
+    apply_gains(&mut config, gains);
+    Ok(config)
 }
 
 fn settings_attachments(
@@ -144,8 +173,12 @@ pub(crate) unsafe fn open_shared(
             let (config, gains) = decode()?;
             let envelope = envelope(config)?;
             let base = v3::envelope(envelope.base)?;
-            let mut config = v3::config(base.config, base.exclude_pids, base.exclude_pids_len)?;
-            apply_gains(&mut config, &gains);
+            let mut config = decode_config(
+                base.config,
+                base.exclude_pids,
+                base.exclude_pids_len,
+                &gains,
+            )?;
             let mut options = v3::options(
                 base.windows_classic_loopback_keepalive,
                 &OpenOptions::default(),
@@ -210,8 +243,12 @@ pub(crate) unsafe fn switch_shared(
             let (config, gains) = decode()?;
             let envelope = envelope(config)?;
             let base = v3::envelope(envelope.base)?;
-            let mut config = v3::config(base.config, base.exclude_pids, base.exclude_pids_len)?;
-            apply_gains(&mut config, &gains);
+            let mut config = decode_config(
+                base.config,
+                base.exclude_pids,
+                base.exclude_pids_len,
+                &gains,
+            )?;
             let stream = &*stream;
             config.secondary_output = stream.inner.config().secondary_output;
             if config.output != stream.inner.config().output {

@@ -768,7 +768,8 @@ typedef struct FlexSwitchConfigV4 {
 
 // Borrowed gains. Each NULL pointer selects 1.0; each supplied float is literal,
 // including 0.0 (mute). Values must be finite and nonnegative, with no upper bound.
-// These replace all three gain fields in the nested FlexConfig; those are ignored.
+// These replace all three gain fields in the nested FlexConfig, which must be zero.
+// Nonzero legacy gain fields return InvalidArg; use FlexGainsV5 instead.
 typedef struct FlexGainsV5 {
     uint32_t size;
     uint32_t version;
@@ -778,7 +779,8 @@ typedef struct FlexGainsV5 {
 } FlexGainsV5;
 
 // Borrowed v5 envelope; exact size/version required. base uses unchanged v4/v3
-// layouts and controls. NULL gains omits all gains, regardless of legacy fields.
+// layouts and controls. NULL gains omits all gains. Nested FlexConfig gain,
+// mix_mic_gain and mix_system_gain must be zero; use FlexGainsV5 for gain values.
 typedef struct FlexStreamConfigV5 {
     uint32_t size;
     uint32_t version;
@@ -789,6 +791,7 @@ typedef struct FlexStreamConfigV5 {
 // Borrowed v5 switch envelope. Omitted gain retains the current output gain;
 // explicit non-default gain is fixedAtOpen (strict rejects, permissive ignores).
 // Mix gains select 1.0 when omitted and literal values when supplied on switch.
+// Nested FlexConfig gain fields must be zero, as in FlexStreamConfigV5.
 typedef struct FlexSwitchConfigV5 {
     uint32_t size;
     uint32_t version;
@@ -1693,7 +1696,9 @@ int32_t flexaudio_switch_source_v4(struct FlexStream *stream,
                                    const struct FlexSwitchConfigV4 *config);
 
 // Open with presence-aware gains and unchanged v4 controls, reports and strict default.
-// NULL gain pointers select unity; explicit zero mutes. Legacy gain fields are ignored.
+// NULL gain pointers select unity; explicit zero mutes. Nested FlexConfig gain,
+// mix_mic_gain and mix_system_gain must be zero; otherwise InvalidArg names the
+// field and directs callers to FlexGainsV5 before any native access.
 // out is NULL on failure. All borrowed configuration is copied.
 // # Safety
 // Envelopes have readable header words and full storage only when those match.
@@ -1704,6 +1709,8 @@ int32_t flexaudio_open_v5(const struct FlexStreamConfigV5 *config, struct FlexSt
 // retains the current gain. Explicit non-default output gain, including zero,
 // returns FLEX_IGNORED_SETTINGS under strict mode, or is ignored in permissive mode.
 // Mix gains use literal values or unity defaults. Failure preserves the old source/report.
+// Nested FlexConfig gain fields must be zero, as on open_v5; nonzero fields
+// return InvalidArg directing callers to FlexGainsV5 before any native access.
 // # Safety
 // stream is live/exclusively borrowed; envelopes and fields obey open_v5's requirements.
 int32_t flexaudio_switch_source_v5(struct FlexStream *stream,

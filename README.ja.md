@@ -136,7 +136,8 @@ CLI の `--strict` は引き続き利用できますが、`--no-strict` との�
 
 C v5 は v4 の制御を使い、出力と Mix 各入力のゲインの有無を明示できます。
 `FlexGainsV5` の各 float ポインターは NULL が省略（1.0）、明示した 0.0 がミュートです。
-入れ子の `FlexConfig` のゲイン欄は使いません。C v1-v4 は設定の 0 を引き続き 1.0 と解釈します。
+入れ子の `FlexConfig` のゲイン欄はすべて 0 にします。非ゼロ値は `FLEX_INVALID_ARG` で拒否し、
+`FlexGainsV5` での指定を案内します。C v1-v4 は設定の 0 を引き続き 1.0 と解釈します。
 切替時に出力ゲインを省略すると現在値を維持し、明示した非既定値は `fixedAtOpen` として
 strict モードで拒否します。Mix 各入力のゲインは省略時に 1.0、指定時はその値を使います。
 [C v5 の使用例](crates/flexaudio-ffi/README.md#version-5-presence-aware-gains)も参照してください。

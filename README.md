@@ -141,7 +141,8 @@ accepts `--strict`; combining it with `--no-strict` is a usage error.
 
 C v5 adds presence-aware output and mix-lane gains over the v4 controls. Each
 `FlexGainsV5` float pointer uses NULL for omission (1.0) and a supplied 0.0 for
-mute; the nested `FlexConfig` gain fields are ignored. C v1-v4 keep interpreting
+mute; the nested `FlexConfig` gain fields must be zero or v5 returns
+`FLEX_INVALID_ARG` directing callers to `FlexGainsV5`. C v1-v4 keep interpreting
 configuration zero as unity. On switch, omitted output gain retains the current
 value; explicit non-default gain is `fixedAtOpen` and strict mode rejects it.
 Mix gains use unity when omitted and literal values when supplied. See the

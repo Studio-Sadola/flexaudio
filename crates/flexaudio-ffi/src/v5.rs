@@ -44,7 +44,9 @@ unsafe fn gains(value: *const FlexGainsV5) -> Result<v4::LiteralGains, i32> {
 }
 
 /// Open with presence-aware gains and unchanged v4 controls, reports and strict default.
-/// NULL gain pointers select unity; explicit zero mutes. Legacy gain fields are ignored.
+/// NULL gain pointers select unity; explicit zero mutes. Nested FlexConfig gain,
+/// mix_mic_gain and mix_system_gain must be zero; otherwise InvalidArg names the
+/// field and directs callers to FlexGainsV5 before any native access.
 /// out is NULL on failure. All borrowed configuration is copied.
 /// # Safety
 /// Envelopes have readable header words and full storage only when those match.
@@ -79,6 +81,8 @@ unsafe fn open_with(
 /// retains the current gain. Explicit non-default output gain, including zero,
 /// returns FLEX_IGNORED_SETTINGS under strict mode, or is ignored in permissive mode.
 /// Mix gains use literal values or unity defaults. Failure preserves the old source/report.
+/// Nested FlexConfig gain fields must be zero, as on open_v5; nonzero fields
+/// return InvalidArg directing callers to FlexGainsV5 before any native access.
 /// # Safety
 /// stream is live/exclusively borrowed; envelopes and fields obey open_v5's requirements.
 #[no_mangle]

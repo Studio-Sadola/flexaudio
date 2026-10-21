@@ -131,7 +131,6 @@ fn literal_zero_mutes_omission_is_unity_half_scales_and_v4_keeps_its_sentinel() 
     // handles and returned chunks are exclusively owned and freed once.
     unsafe {
         let mut base: FlexConfig = mem::zeroed();
-        base.gain = 17.0; // v5 ignores legacy gain fields even when gains are omitted.
         let b3 = base3(&base);
         let options = controls(0);
         let b4 = base4(&b3, &options);
@@ -515,4 +514,123 @@ unsafe fn options_invalid_strict(base: &FlexStreamConfigV3) {
         code::FLEX_INVALID_ARG
     );
     assert!(stream.is_null());
+}
+
+#[test]
+fn legacy_gain_fields_are_rejected_on_open_and_switch_before_the_opener() {
+    // SAFETY: all envelopes and floats have live aligned storage. The mock stream
+    // is exclusively owned and unstarted, so reaching core switch would return
+    // InvalidState rather than the field-specific InvalidArg required here.
+    unsafe {
+        let zeroed: FlexConfig = mem::zeroed();
+        let b3 = base3(&zeroed);
+        let options = controls(0);
+        let b4 = base4(&b3, &options);
+        let literal = gain_options(&0.0);
+        pcm(&request(&b4, &literal), 0.0);
+        let sink = Sink::default();
+        let mut stream = ptr::null_mut();
+        assert_eq!(
+            open_with(&request(&b4, &literal), &mut stream, |config, _| {
+                flexaudio::Stream::open(config, Box::new(Input(sink.clone())))
+            }),
+            code::FLEX_OK
+        );
+        for field in ["gain", "mix_mic_gain", "mix_system_gain"] {
+            for value in [0.5, 1.0, -0.5, f32::NAN, f32::INFINITY] {
+                let mut base: FlexConfig = mem::zeroed();
+                match field {
+                    "gain" => base.gain = value,
+                    "mix_mic_gain" => base.mix_mic_gain = value,
+                    "mix_system_gain" => base.mix_system_gain = value,
+                    _ => unreachable!(),
+                }
+                let b3 = base3(&base);
+                let switch3 = FlexSwitchConfigV3 {
+                    size: mem::size_of::<FlexSwitchConfigV3>().try_into().unwrap(),
+                    version: 3,
+                    config: &base,
+                    exclude_pids: ptr::null(),
+                    exclude_pids_len: 0,
+                    windows_classic_loopback_keepalive: 0,
+                };
+                // The rejection is unconditional, including permissive controls
+                // and supplied literal gains that would otherwise mask the legacy value.
+                for strict in [0, 1, 2] {
+                    let options = controls(strict);
+                    let b4 = base4(&b3, &options);
+                    let switch4 = FlexSwitchConfigV4 {
+                        size: mem::size_of::<FlexSwitchConfigV4>().try_into().unwrap(),
+                        version: 4,
+                        base: &switch3,
+                        options: &options,
+                    };
+                    for gains in [ptr::null(), &literal] {
+                        let config = request(&b4, gains);
+                        let mut out = ptr::dangling_mut();
+                        assert_eq!(
+                            open_with(&config, &mut out, |_, _| panic!(
+                                "nonzero legacy gain reached the opener"
+                            )),
+                            code::FLEX_INVALID_ARG,
+                            "open {field}={value}, strict={strict}"
+                        );
+                        assert!(out.is_null());
+                        let message = std::ffi::CStr::from_ptr(crate::flexaudio_last_error())
+                            .to_str()
+                            .unwrap();
+                        assert!(
+                            message.contains(&format!(
+                                "FlexConfig.{field} must be zero in v5; use FlexGainsV5.{field}"
+                            )),
+                            "{message}"
+                        );
+                        let switch = FlexSwitchConfigV5 {
+                            size: mem::size_of::<FlexSwitchConfigV5>().try_into().unwrap(),
+                            version: 5,
+                            base: &switch4,
+                            gains,
+                        };
+                        assert_eq!(
+                            flexaudio_switch_source_v5(stream, &switch),
+                            code::FLEX_INVALID_ARG,
+                            "switch {field}={value}, strict={strict}"
+                        );
+                        let message = std::ffi::CStr::from_ptr(crate::flexaudio_last_error())
+                            .to_str()
+                            .unwrap();
+                        assert!(
+                            message.contains(&format!(
+                                "FlexConfig.{field} must be zero in v5; use FlexGainsV5.{field}"
+                            )),
+                            "{message}"
+                        );
+                        assert!(sink.lock().unwrap().is_none());
+                        assert_eq!((*stream).inner.config().gain, 0.0);
+                    }
+                }
+            }
+        }
+        crate::flexaudio_free(stream);
+        // All three zeroed legacy fields permit explicit, independently chosen
+        // v5 gains, including muted output and a muted system lane.
+        let mut base: FlexConfig = mem::zeroed();
+        base.kind = crate::FLEX_SOURCE_KIND_MIX;
+        let b3 = base3(&base);
+        let b4 = base4(&b3, &options);
+        let mut literal = gain_options(&0.0);
+        literal.mix_mic_gain = &0.5;
+        literal.mix_system_gain = &0.0;
+        let mut stream = ptr::null_mut();
+        assert_eq!(
+            open_with(&request(&b4, &literal), &mut stream, |config, _| {
+                assert_eq!(config.gain, 0.0);
+                assert_eq!(config.mix_mic_gain, 0.5);
+                assert_eq!(config.mix_system_gain, 0.0);
+                flexaudio::Stream::open(config, Box::new(Input(Sink::default())))
+            }),
+            code::FLEX_OK
+        );
+        crate::flexaudio_free(stream);
+    }
 }

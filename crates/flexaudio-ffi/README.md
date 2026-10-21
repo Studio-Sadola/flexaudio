@@ -531,8 +531,12 @@ and `FLEX_STREAM_VERSION_5`; nested v4/v3 envelopes retain their own versions.
 float pointers, following v4's optional capacity-pointer convention. NULL means
 omitted (1.0); a supplied float is literal, so 0.0 mutes and 0.5 halves amplitude.
 All supplied gains must be finite and nonnegative; there is no upper bound.
-A NULL `gains` pointer omits all three. The three legacy gain fields inside
-`FlexConfig` are ignored entirely by v5. C v1-v4 retain their zero-means-unity
+A NULL `gains` pointer omits all three. The three legacy fields `FlexConfig.gain`,
+`mix_mic_gain` and `mix_system_gain` must be zero, including when `gains` is NULL.
+On both open and switch, any nonzero legacy gain returns `FLEX_INVALID_ARG`
+before native access, regardless of strictness. The message names the field and
+directs the caller to the corresponding `FlexGainsV5` field. Zero-initialized
+legacy fields remain valid. C v1-v4 retain their zero-means-unity
 convention; `flexaudio_set_gain(stream, 0.0f)` still mutes at runtime.
 
 This microphone example has no ignored requests under the strict default:
