@@ -50,6 +50,8 @@ jobs:
         run: python3 -m unittest discover -s .github/scripts -p "test_*.py" -v
       - name: Check workspace release versions and documentation
         run: python3 .github/scripts/check-release-versions.py --workspace
+      - name: Check binding tests are named by a workflow
+        run: python3 .github/scripts/check_ci_test_coverage.py
 
   binding-capability-matrix:
     name: Binding capability matrix
@@ -177,10 +179,11 @@ jobs:
         run: |
           python3 -m venv /tmp/pyenv
           . /tmp/pyenv/bin/activate
-          pip install -q 'maturin[patchelf]'
+          pip install -q 'maturin[patchelf]' pytest
           maturin build --manifest-path bindings/flexaudio-py/Cargo.toml --features test-faults --out /tmp/wheels
           pip install --no-index --find-links /tmp/wheels flexaudio
-          python -m unittest bindings/flexaudio-py/tests/test_contracts.py bindings/flexaudio-py/tests/test_pcm_buffer.py bindings/flexaudio-py/tests/test_settings_lifecycle.py -v
+          python -m unittest bindings/flexaudio-py/tests/test_contracts.py bindings/flexaudio-py/tests/test_pcm_buffer.py bindings/flexaudio-py/tests/test_settings_lifecycle.py bindings/flexaudio-py/tests/test_capabilities_secondary.py bindings/flexaudio-py/tests/test_capability_fallbacks.py bindings/flexaudio-py/tests/test_startup_documentation.py bindings/flexaudio-py/tests/test_stream_denoise.py -v
+          python -m pytest bindings/flexaudio-py/tests/test_exclude_pids.py -v
           # Discovery fails closed: without a PipeWire daemon (this runner) devices()
           # raises a typed BackendError instead of returning a partial list.
           python -c "
@@ -189,6 +192,19 @@ jobs:
               print('flexaudio import OK; devices:', len(flexaudio.devices()))
           except flexaudio.BackendError as error:
               print('flexaudio import OK; discovery failed closed:', error)
+          "
+          # maturin patches target/maturin in place, so remove it before the plain build.
+          rm -rf target/maturin
+          maturin build --manifest-path bindings/flexaudio-py/Cargo.toml --out /tmp/wheels-plain
+          pip install --force-reinstall --no-index --find-links /tmp/wheels-plain flexaudio
+          python -c "
+          import flexaudio
+          try:
+              flexaudio.open('mock')
+          except ValueError:
+              print('plain wheel rejects mock open')
+          else:
+              raise SystemExit('plain wheel accepted mock open')
           "
 
   build-test-windows:
