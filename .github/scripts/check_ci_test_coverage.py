@@ -3,15 +3,15 @@
 
 Enumerates bindings/flexaudio-py/tests/test_*.py and
 crates/flexaudio-napi/__test__/*.test.mjs from the filesystem. A file is
-covered only when its filename is its own token inside a step ``run:`` value
-(a single-line command, or a ``|`` / ``>`` block, including chomp markers).
-The block ends when a non-comment line returns to that key's indentation or
-less. Full-line comments and trailing `` #`` comments do not count, nor do
-``name:``, ``with:``, ``env:``, or any other key. A step whose ``if:`` is
-literally false (any casing, quoted or not) does not count. Workflow steps
-sometimes name a crate-relative path, so the repository-relative path is not
-required. An empty test directory, or a workflows directory with no ``.yml``
-or ``.yaml`` file, fails closed. Standard library only.
+covered only when its filename is its own token in ``jobs.<id>.steps[*].run``.
+Workflows are parsed with PyYAML (``yaml.safe_load``). A line scan counts
+matrix entries, disabled jobs, and ``${{ false }}`` as commands, and an
+unbalanced quote hides a trailing YAML comment. GitHub-hosted Ubuntu runners
+do not install PyYAML for the system Python, so CI installs a pinned PyYAML
+before this gate. A job or step whose ``if`` is statically false does not
+count. Literal block scalars keep shell comments; those lines are not
+commands. An empty test directory, a workflows directory with no ``.yml`` or
+``.yaml`` file, or a workflow that cannot be parsed fails closed.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import argparse
 from pathlib import Path
 import re
 import sys
+from types import ModuleType
 
 
 SPECS = (
@@ -27,16 +28,10 @@ SPECS = (
     ("crates/flexaudio-napi/__test__", "*.test.mjs"),
 )
 WORKFLOWS = Path(".github/workflows")
-# Comments and step names are descriptions, not executed commands.
-COMMENT_OR_BLANK = re.compile(r"^\s*(#.*)?$")
-KEY_LINE = re.compile(
-    r"^(?P<indent> *)(?:(?P<dash>- +))?(?P<key>[A-Za-z_][\w-]*):(?P<value>.*)$"
-)
-BLOCK_HEADER = re.compile(r"[|>](?:[1-9][+-]?|[+-][1-9]?)?")
 
 
 class CoverageError(Exception):
-    """A binding test is absent from CI, or a test directory matched nothing."""
+    """A binding test is absent from CI, or a workflow cannot be trusted."""
 
 
 def matching_files(root: Path, relative: str, pattern: str) -> list[Path]:
@@ -56,8 +51,28 @@ def workflow_files(root: Path) -> list[Path]:
     return sorted(found)
 
 
-def strip_trailing_comment(line: str) -> str:
-    """Drop a trailing YAML comment. ``#`` inside quotes stays in the command."""
+def load_yaml() -> ModuleType:
+    try:
+        import yaml
+    except ImportError as error:
+        raise CoverageError("PyYAML is required") from error
+    return yaml
+
+
+def statically_false(value: object) -> bool:
+    """True for boolean false or a string that is only ``false`` / ``${{ false }}``."""
+    if value is False:
+        return True
+    if not isinstance(value, str):
+        return False
+    token = value.strip()
+    if token.startswith("${{") and token.endswith("}}"):
+        token = token[3:-2].strip()
+    return token.casefold() == "false"
+
+
+def strip_trailing_shell_comment(line: str) -> str:
+    """Drop a trailing `` #`` shell comment. ``#`` inside quotes stays."""
     in_single = False
     in_double = False
     for index, char in enumerate(line):
@@ -65,119 +80,78 @@ def strip_trailing_comment(line: str) -> str:
             in_single = not in_single
         elif char == '"' and not in_single:
             in_double = not in_double
-        elif char == "#" and not in_single and not in_double and (index == 0 or line[index - 1].isspace()):
+        elif (
+            char == "#"
+            and not in_single
+            and not in_double
+            and (index == 0 or line[index - 1].isspace())
+        ):
             return line[:index].rstrip()
     return line.rstrip()
 
 
-def is_block_header(value: str) -> bool:
-    return BLOCK_HEADER.fullmatch(value) is not None
-
-
-def is_literal_false(value: str) -> bool:
-    token = value.strip()
-    if len(token) >= 2 and token[0] == token[-1] and token[0] in "'\"":
-        token = token[1:-1]
-    return token.casefold() == "false"
-
-
-def parse_key_line(line: str) -> tuple[int, int | None, str, str] | None:
-    """Return ``(key_column, dash_indent, key, value)`` for a mapping entry."""
-    match = KEY_LINE.match(strip_trailing_comment(line))
-    if match is None:
-        return None
-    indent = len(match.group("indent"))
-    dash = match.group("dash")
-    key_column = indent + (len(dash) if dash is not None else 0)
-    dash_indent = indent if dash is not None else None
-    return key_column, dash_indent, match.group("key"), match.group("value").strip()
-
-
-def indentation(line: str) -> int:
-    return len(line) - len(line.lstrip(" "))
-
-
-def consume_block(lines: list[str], index: int, key_column: int, *, collect: bool) -> tuple[int, str]:
-    """Read a block scalar. Stop when indentation returns to ``key_column`` or less."""
-    collected: list[str] = []
-    index += 1
-    total = len(lines)
-    while index < total:
-        line = lines[index]
-        if COMMENT_OR_BLANK.match(line):
-            index += 1
+def command_text(run: str) -> str:
+    """Return the command lines of a parsed ``run`` value."""
+    kept: list[str] = []
+    for line in run.splitlines():
+        if line.lstrip().startswith("#"):
             continue
-        if indentation(line) <= key_column:
-            break
-        if collect:
-            collected.append(strip_trailing_comment(line).strip())
-        index += 1
-    return index, "\n".join(collected)
+        kept.append(strip_trailing_shell_comment(line))
+    return "\n".join(kept)
 
 
-def executed_commands(text: str) -> str:
-    """Return the ``run:`` text of steps that are not ``if: false``."""
-    lines = text.splitlines()
-    executed: list[str] = []
-    index = 0
-    step_key_column: int | None = None
-    step_dash: int | None = None
-    step_disabled = False
-    step_chunks: list[str] = []
+def require_mapping(value: object, relative: str, label: str) -> dict[object, object]:
+    if not isinstance(value, dict):
+        raise CoverageError(f"{relative}: {label}")
+    return value
 
-    def close_step() -> None:
-        nonlocal step_key_column, step_dash, step_disabled, step_chunks
-        if step_key_column is not None and not step_disabled:
-            executed.extend(step_chunks)
-        step_key_column = None
-        step_dash = None
-        step_disabled = False
-        step_chunks = []
 
-    while index < len(lines):
-        line = lines[index]
-        if COMMENT_OR_BLANK.match(line):
-            index += 1
+def step_commands(job: dict[object, object], relative: str) -> list[str]:
+    if "uses" in job or statically_false(job.get("if")):
+        return []
+    if "steps" not in job or job.get("steps") is None:
+        return []
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        raise CoverageError(f"{relative}: steps is not a list")
+    commands: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict) or statically_false(step.get("if")):
             continue
-        parsed = parse_key_line(line)
-        if parsed is None:
-            index += 1
+        run = step.get("run")
+        if not isinstance(run, str):
             continue
-        key_column, dash_indent, key, value = parsed
-        if dash_indent is not None and (step_dash is None or dash_indent <= step_dash):
-            close_step()
-            step_dash = dash_indent
-            step_key_column = key_column
-        elif step_key_column is not None and key_column < step_key_column:
-            close_step()
-        elif step_key_column is not None and key_column != step_key_column:
-            if is_block_header(value):
-                index, _ = consume_block(lines, index, key_column, collect=False)
-                continue
-            index += 1
-            continue
+        text = command_text(run)
+        if text.strip():
+            commands.append(text)
+    return commands
 
-        in_step = step_key_column is not None and key_column == step_key_column
-        if in_step and key == "if" and is_literal_false(value):
-            step_disabled = True
-            index += 1
-            continue
-        if in_step and key == "run":
-            if is_block_header(value):
-                index, body = consume_block(lines, index, key_column, collect=True)
-                if body:
-                    step_chunks.append(body)
-                continue
-            if value:
-                step_chunks.append(value)
-            index += 1
-            continue
-        if is_block_header(value):
-            index, _ = consume_block(lines, index, key_column, collect=False)
-            continue
-        index += 1
-    close_step()
-    return "\n".join(executed)
+
+def workflow_commands(document: object, relative: str) -> list[str]:
+    if not isinstance(document, dict):
+        raise CoverageError(f"{relative}: workflow root is not a mapping")
+    if "jobs" not in document or not isinstance(document.get("jobs"), dict):
+        raise CoverageError(f"{relative}: jobs is missing or not a mapping")
+    jobs = require_mapping(document.get("jobs"), relative, "jobs is missing or not a mapping")
+    commands: list[str] = []
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            raise CoverageError(f"{relative}: job is not a mapping")
+        commands.extend(step_commands(job, relative))
+    return commands
+
+
+def read_workflow(path: Path, root: Path, yaml: ModuleType) -> list[str]:
+    relative = path.relative_to(root).as_posix()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise CoverageError(f"{relative}: cannot read workflow ({type(error).__name__})") from error
+    try:
+        document = yaml.safe_load(text)
+    except yaml.YAMLError as error:
+        raise CoverageError(f"{relative}: workflow does not parse ({type(error).__name__})") from error
+    return workflow_commands(document, relative)
 
 
 def name_referenced(text: str, name: str) -> bool:
@@ -199,10 +173,21 @@ def check(root: Path) -> int:
         problems.append(f"no workflow files under {WORKFLOWS.as_posix()}")
     if problems:
         raise CoverageError("\n".join(problems))
-    text = "\n".join(executed_commands(path.read_text(encoding="utf-8")) for path in workflows)
+    yaml = load_yaml()
+    errors: list[str] = []
+    chunks: list[str] = []
+    for path in workflows:
+        try:
+            chunks.extend(read_workflow(path, root, yaml))
+        except CoverageError as error:
+            errors.append(str(error))
+    text = "\n".join(chunks)
     missing = [path.relative_to(root).as_posix() for path in found if not name_referenced(text, path.name)]
-    if missing:
-        raise CoverageError("workflow files do not name:\n" + "\n".join(missing))
+    if errors or missing:
+        parts = list(errors)
+        if missing:
+            parts.append("workflow files do not name:\n" + "\n".join(missing))
+        raise CoverageError("\n".join(parts))
     return len(found)
 
 

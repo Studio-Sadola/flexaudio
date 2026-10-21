@@ -237,6 +237,91 @@ class CiTestCoverageTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("no workflow files under .github/workflows", result.stderr)
 
+    def test_job_if_false_does_not_count(self) -> None:
+        self.assert_orphans_uncovered("""\
+            jobs:
+              r:
+                if: false
+                steps:
+                  - run: python test_orphan.py orphan.test.mjs
+            """)
+
+    def test_step_expression_false_does_not_count(self) -> None:
+        for condition in ("${{ false }}", "${{false}}"):
+            with self.subTest(condition=condition):
+                self.assert_orphans_uncovered("""\
+                    jobs:
+                      r:
+                        steps:
+                          - if: {condition}
+                            run: python test_orphan.py orphan.test.mjs
+                    """.format(condition=condition))
+
+    def test_matrix_include_run_does_not_count(self) -> None:
+        self.assert_orphans_uncovered("""\
+            jobs:
+              r:
+                strategy:
+                  matrix:
+                    include:
+                      - run: python test_orphan.py orphan.test.mjs
+                steps:
+                  - run: echo hi
+            """)
+
+    def test_plain_scalar_comment_after_apostrophe_does_not_count(self) -> None:
+        self.assert_orphans_uncovered("""\
+            jobs:
+              r:
+                steps:
+                  - run: echo don't  # test_orphan.py orphan.test.mjs
+            """)
+
+    def test_job_expression_false_does_not_count(self) -> None:
+        for condition in ("${{ false }}", "${{false}}"):
+            with self.subTest(condition=condition):
+                self.assert_orphans_uncovered("""\
+                    jobs:
+                      r:
+                        if: {condition}
+                        steps:
+                          - run: python test_orphan.py orphan.test.mjs
+                    """.format(condition=condition))
+
+    def test_non_false_if_still_counts(self) -> None:
+        self.write("bindings/flexaudio-py/tests/test_kept.py")
+        self.write("crates/flexaudio-napi/__test__/kept.test.mjs")
+        self.write(".github/workflows/ci.yml", dedent("""\
+            jobs:
+              test:
+                steps:
+                  - if: runner.os == 'Linux'
+                    run: python test_kept.py kept.test.mjs
+            """))
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CI test coverage check passed: 2 binding tests", result.stdout)
+
+    def test_unparsable_workflow_names_the_file(self) -> None:
+        self.seed_orphans()
+        self.write(".github/workflows/broken.yml", "jobs: [\n")
+        result = self.run_gate()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(".github/workflows/broken.yml", result.stderr)
+
+    def test_missing_jobs_names_the_file(self) -> None:
+        cases = {
+            "missing": "name: CI\non: push\n",
+            "not-a-mapping": "jobs:\n  - run: echo hi\n",
+        }
+        for label, workflow in cases.items():
+            with self.subTest(label=label):
+                self.seed_orphans()
+                self.write(".github/workflows/ci.yml", workflow)
+                result = self.run_gate()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(".github/workflows/ci.yml", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
