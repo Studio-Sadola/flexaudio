@@ -776,19 +776,37 @@ stream.stop()
 #[cfg(test)]
 mod repro_tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    struct ManualBackend(Arc<Mutex<Option<fa::core::backend::RawSink>>>);
+    /// One installed generation. A second start is refused so stall recovery cannot
+    /// replace it. Replacement discards the unflushed denoise remainder, and the new
+    /// generation's primed flush has no arrival anchor, so its PTS is the wall clock
+    /// rather than the original chunk timeline.
+    struct ManualBackend {
+        sink: Arc<Mutex<Option<fa::core::backend::RawSink>>>,
+        fence: Arc<AtomicBool>,
+    }
     impl fa::CaptureBackend for ManualBackend {
         fn native_format(&self) -> (u32, u16) {
             (48_000, 1)
         }
         fn start(&mut self, sink: fa::core::backend::RawSink) -> fa::Result<()> {
-            *self.0.lock().unwrap() = Some(sink);
+            let mut current = self.sink.lock().expect("fake producer ownership lock");
+            if self.fence.load(Ordering::SeqCst) && current.is_some() {
+                return Err(fa::Error::Backend(
+                    "This fixture keeps one capture generation so the stop tail stays on the original arrival anchor.".into(),
+                ));
+            }
+            *current = Some(sink);
+            self.fence.store(true, Ordering::SeqCst);
             Ok(())
         }
         fn stop(&mut self) {
-            self.0.lock().unwrap().take();
+            let mut current = self.sink.lock().expect("fake producer ownership lock");
+            if !self.fence.load(Ordering::SeqCst) {
+                current.take();
+            }
         }
     }
     fn fixture(
@@ -798,7 +816,14 @@ mod repro_tests {
         let sink = Arc::new(Mutex::new(None));
         let mut config = fa::StreamConfig::default();
         config.output.channels = 1;
-        let mut inner = fa::Stream::open(config, Box::new(ManualBackend(sink.clone()))).unwrap();
+        let mut inner = fa::Stream::open(
+            config,
+            Box::new(ManualBackend {
+                sink: sink.clone(),
+                fence: Arc::new(AtomicBool::new(false)),
+            }),
+        )
+        .unwrap();
         inner.set_denoise(denoise);
         inner.start().unwrap();
         (

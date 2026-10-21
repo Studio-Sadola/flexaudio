@@ -5,7 +5,10 @@ use crate::types::FlexConfig;
 use crate::vad_integration::*;
 use std::{
     mem, ptr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -196,6 +199,33 @@ impl flexaudio::CaptureBackend for Push {
         self.0.lock().unwrap().take();
     }
 }
+/// One installed generation. A second start is refused so stall recovery cannot
+/// drop the pushed samples while this test is still polling.
+struct HeldPush {
+    sink: Sink,
+    fence: Arc<AtomicBool>,
+}
+impl flexaudio::CaptureBackend for HeldPush {
+    fn native_format(&self) -> (u32, u16) {
+        (48_000, 2)
+    }
+    fn start(&mut self, sink: flexaudio::core::backend::RawSink) -> flexaudio::Result<()> {
+        let mut current = self.sink.lock().unwrap();
+        if self.fence.load(Ordering::SeqCst) && current.is_some() {
+            return Err(flexaudio::Error::Backend(
+                "This fixture keeps one capture generation.".into(),
+            ));
+        }
+        *current = Some(sink);
+        self.fence.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    fn stop(&mut self) {
+        if !self.fence.load(Ordering::SeqCst) {
+            self.sink.lock().unwrap().take();
+        }
+    }
+}
 struct Handle(*mut FlexStream);
 impl Drop for Handle {
     fn drop(&mut self) {
@@ -248,7 +278,13 @@ fn v3_open_combines_vad_exclusions_secondary_and_keepalive() {
             open_with(&config, &mut out, |config, options| {
                 assert!(!options.windows_classic_loopback_keepalive);
                 assert_eq!(config.exclude_pids, pids);
-                flexaudio::Stream::open(config, Box::new(Push(sink.clone())))
+                flexaudio::Stream::open(
+                    config,
+                    Box::new(HeldPush {
+                        sink: sink.clone(),
+                        fence: Arc::new(AtomicBool::new(false)),
+                    }),
+                )
             }),
             0
         );
@@ -260,23 +296,62 @@ fn v3_open_combines_vad_exclusions_secondary_and_keepalive() {
             .as_mut()
             .unwrap()
             .push(&[0.25; 1920], 0);
-        let chunk = next_secondary(handle.0);
-        let mut len = 0;
-        let events = flexaudio_secondary_vad_events_v3(chunk, &mut len);
-        assert!(len > 0);
-        assert_eq!((*events).r#type, FLEX_VAD_EPOCH_START);
-        assert_eq!((*events).data.epoch_start.capture_sample, 0);
-        let mut primary = mem::zeroed();
-        assert_eq!(flexaudio_poll_chunk_v2(handle.0, &mut primary), 1);
-        assert_eq!(
-            primary.vad_events_len, 0,
-            "secondary events must not be duplicated on primary"
-        );
-        flexaudio_chunk_free_v2(&mut primary);
-        flexaudio_secondary_chunk_free_v3(chunk);
+        // Capture can publish the epoch before either PCM tap. A zero-frame
+        // secondary carrier is that event, not this push. Wait for the origin
+        // and both PCM taps before stop, so the closing chunk is the epoch end.
+        let mut saw_origin = false;
+        let mut saw_secondary_pcm = false;
+        let mut deadline = Instant::now() + Duration::from_secs(5);
+        while !saw_origin || !saw_secondary_pcm {
+            assert!(
+                Instant::now() < deadline,
+                "secondary tap must deliver the epoch origin and the pushed PCM"
+            );
+            let mut chunk = ptr::null_mut();
+            let status = flexaudio_poll_secondary_chunk_v3(handle.0, &mut chunk);
+            assert!(status >= 0, "secondary poll error {status}");
+            if status == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            let mut len = 0;
+            let events = flexaudio_secondary_vad_events_v3(chunk, &mut len);
+            if len > 0 && !saw_origin {
+                assert_eq!((*events).r#type, FLEX_VAD_EPOCH_START);
+                assert_eq!((*events).data.epoch_start.capture_sample, 0);
+                saw_origin = true;
+            }
+            if (*chunk).metadata.frames > 0 {
+                saw_secondary_pcm = true;
+            }
+            flexaudio_secondary_chunk_free_v3(chunk);
+        }
+        deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_primary_pcm = false;
+        while !saw_primary_pcm {
+            assert!(
+                Instant::now() < deadline,
+                "primary tap must deliver the pushed PCM without secondary events"
+            );
+            let mut primary = mem::zeroed();
+            match flexaudio_poll_chunk_v2(handle.0, &mut primary) {
+                1 => {
+                    assert_eq!(
+                        primary.vad_events_len, 0,
+                        "secondary events must not be duplicated on primary"
+                    );
+                    saw_primary_pcm = primary.chunk.frames > 0;
+                    flexaudio_chunk_free_v2(&mut primary);
+                }
+                0 => std::thread::sleep(Duration::from_millis(1)),
+                status => panic!("primary poll error {status}"),
+            }
+        }
         assert_eq!(crate::flexaudio_stop(handle.0), 0);
         let closing = next_secondary(handle.0);
+        let mut len = 0;
         let events = flexaudio_secondary_vad_events_v3(closing, &mut len);
+        assert!(len > 0, "stop must publish the secondary epoch end");
         assert_eq!(
             (*events.add(len - 1)).r#type,
             crate::vad_types::FLEX_VAD_EPOCH_END

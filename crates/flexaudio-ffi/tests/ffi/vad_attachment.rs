@@ -3,6 +3,7 @@ use super::*;
 use flexaudio_vad::{
     AttachedVadEvent, EpochEndReason, VadEvent, VadEventKind, VadTapError, VadTapFailure,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -128,23 +129,47 @@ fn flush_failures_return_root_status_and_preserve_terminal_carriers() {
 
 /// Pushes canonical capture chunks on demand, so a failure and its recovery boundary can be
 /// driven without a device.
-struct PushBackend(Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>);
+///
+/// After the first start, another start is refused while the sink is still installed.
+/// Stall recovery would otherwise open a new generation during a slow poll and clear a
+/// latched processor failure before the test's own discontinuity.
+struct PushBackend {
+    sink: Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>,
+    fence: Arc<AtomicBool>,
+}
 impl flexaudio::CaptureBackend for PushBackend {
     fn native_format(&self) -> (u32, u16) {
         (48_000, 2)
     }
     fn start(&mut self, sink: flexaudio::core::backend::RawSink) -> flexaudio::Result<()> {
-        *self.0.lock().unwrap() = Some(sink);
+        let mut current = self.sink.lock().expect("fake producer ownership lock");
+        if self.fence.load(Ordering::SeqCst) && current.is_some() {
+            return Err(flexaudio::Error::Backend(
+                "This fixture keeps one capture generation until the test opens the next one."
+                    .into(),
+            ));
+        }
+        *current = Some(sink);
+        self.fence.store(true, Ordering::SeqCst);
         Ok(())
     }
     fn stop(&mut self) {
-        self.0.lock().unwrap().take();
+        let mut current = self.sink.lock().expect("fake producer ownership lock");
+        if !self.fence.load(Ordering::SeqCst) {
+            current.take();
+        }
     }
 }
 
 fn capture_stream(sink: &Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>) -> FlexStream {
-    let mut inner =
-        flexaudio::Stream::open(Default::default(), Box::new(PushBackend(sink.clone()))).unwrap();
+    let mut inner = flexaudio::Stream::open(
+        Default::default(),
+        Box::new(PushBackend {
+            sink: sink.clone(),
+            fence: Arc::new(AtomicBool::new(false)),
+        }),
+    )
+    .unwrap();
     inner.enable_capture_tap().unwrap();
     inner.start().unwrap();
     FlexStream {
@@ -191,27 +216,83 @@ unsafe fn has_start(chunk: &FlexChunkV2) -> bool {
             .any(|event| event.r#type == FLEX_VAD_EPOCH_START)
 }
 
+unsafe fn has_error_end(chunk: &FlexChunkV2) -> bool {
+    !chunk.vad_events.is_null()
+        && std::slice::from_raw_parts(chunk.vad_events, chunk.vad_events_len)
+            .iter()
+            .any(|event| {
+                event.r#type == FLEX_VAD_EPOCH_END
+                    && event.data.vad.epoch_end.reason == crate::vad_types::FLEX_VAD_ERROR
+            })
+}
+
+/// Capture publication can precede the matching primary chunk. A zero-frame carrier
+/// is not that push's PCM; wait until both the marker and one audio chunk arrive.
+unsafe fn consume_marked_pcm(
+    stream: &mut FlexStream,
+    marker: impl Fn(&FlexChunkV2) -> bool,
+) -> (u64, u32, u32) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut marked = false;
+    let mut audio = None;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "fake capture must deliver the marked PCM"
+        );
+        let mut chunk = mem::zeroed();
+        match flexaudio_poll_chunk_v2(stream, &mut chunk) {
+            1 => {
+                if marker(&chunk) {
+                    marked = true;
+                }
+                if chunk.chunk.frames > 0 && audio.is_none() {
+                    audio = Some((
+                        crate::flexaudio_chunk_frame_index(&chunk.chunk),
+                        chunk.chunk.frames,
+                        chunk.chunk.flags,
+                    ));
+                }
+                flexaudio_chunk_free_v2(&mut chunk);
+                if marked {
+                    if let Some(delivered) = audio.take() {
+                        return delivered;
+                    }
+                }
+            }
+            0 => std::thread::sleep(Duration::from_millis(2)),
+            status => panic!("VAD failure must not end polling: {status}"),
+        }
+    }
+}
+
 unsafe fn fail_attachment(
     stream: &mut FlexStream,
     sink: &Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>,
 ) {
     sink.lock().unwrap().as_mut().unwrap().push(&[0.2; 1920], 0);
-    poll_until(stream, |chunk| has_start(chunk));
+    let (index, frames, _) = consume_marked_pcm(stream, |chunk| {
+        // SAFETY: this carrier stays live until chunk_free_v2, which runs after the marker.
+        unsafe { has_start(chunk) }
+    });
+    // 1920 interleaved stereo samples are one 20 ms chunk.
+    assert_eq!(index, 0);
+    assert_eq!(frames, 960);
     stream.vad_tap.as_mut().unwrap().inject_failure();
     sink.lock()
         .unwrap()
         .as_mut()
         .unwrap()
         .push(&[0.2; 1920], 20_000_000);
-    poll_until(stream, |chunk| {
-        !chunk.vad_events.is_null()
-            && std::slice::from_raw_parts(chunk.vad_events, chunk.vad_events_len)
-                .iter()
-                .any(|event| {
-                    event.r#type == FLEX_VAD_EPOCH_END
-                        && event.data.vad.epoch_end.reason == crate::vad_types::FLEX_VAD_ERROR
-                })
+    let (index, frames, _) = consume_marked_pcm(stream, |chunk| {
+        // SAFETY: this carrier stays live until chunk_free_v2, which runs after the marker.
+        unsafe { has_error_end(chunk) }
     });
+    assert_eq!(
+        index, 960,
+        "the failure push must continue the first chunk before another push is issued"
+    );
+    assert_eq!(frames, 960);
     assert_eq!(
         stream.vad_error.as_ref().unwrap().audio_error().vad_code(),
         Some(flexaudio::VadErrorCode::Inference)
@@ -232,7 +313,18 @@ unsafe fn fail_attachment(
         .as_mut()
         .unwrap()
         .push(&[0.2; 1920], 40_000_000);
-    poll_until(stream, |chunk| chunk.chunk.frames == 960);
+    let (index, frames, flags) = consume_marked_pcm(stream, |_| true);
+    assert_eq!(
+        index, 1920,
+        "a contiguous push must not skip or reset frames"
+    );
+    assert_eq!(frames, 960);
+    let recovery = (flexaudio::ChunkFlags::DISCONTINUITY | flexaudio::ChunkFlags::RECOVERED).bits();
+    assert_eq!(
+        flags & recovery,
+        0,
+        "the contiguous push must not recover the failed attachment; flags={flags:#x}"
+    );
     assert!(stream.vad_error.is_some());
 }
 
@@ -316,7 +408,11 @@ fn a_failed_attachment_reinitializes_at_the_next_discontinuity() {
             if switch {
                 stream
                     .inner
-                    .switch_backend(Box::new(PushBackend(sink.clone())))
+                    .switch_backend(Box::new(PushBackend {
+                        sink: sink.clone(),
+                        // Cleared until this start installs the sink, then armed again.
+                        fence: Arc::new(AtomicBool::new(false)),
+                    }))
                     .unwrap();
             } else {
                 stream.inner.pause();

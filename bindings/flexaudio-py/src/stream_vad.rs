@@ -167,6 +167,44 @@ mod tests {
         }
     }
 
+    /// PCM metadata for one delivered primary chunk. Event-only carriers are not audio.
+    struct DeliveredPcm {
+        frame_index: u64,
+        frames: u64,
+        pts_ns: i64,
+        flags: u32,
+    }
+
+    fn delivered_pcm(py: Python<'_>, chunk: &Py<PyAudioChunk>) -> Option<DeliveredPcm> {
+        let bound = chunk.bind(py);
+        let frames: usize = bound
+            .getattr("frames")
+            .expect("chunk frames")
+            .extract()
+            .expect("integer frames");
+        if frames == 0 {
+            return None;
+        }
+        Some(DeliveredPcm {
+            frame_index: bound
+                .getattr("frame_index")
+                .expect("chunk frame index")
+                .extract()
+                .expect("integer frame index"),
+            frames: frames as u64,
+            pts_ns: bound
+                .getattr("pts_ns")
+                .expect("chunk PTS")
+                .extract()
+                .expect("integer PTS"),
+            flags: bound
+                .getattr("flags")
+                .expect("chunk flags")
+                .extract()
+                .expect("integer flags"),
+        })
+    }
+
     /// Whether one attached carrier publishes an epoch origin.
     fn has_epoch_start(events: &pyo3::Bound<'_, pyo3::PyAny>) -> bool {
         if events.is_none() {
@@ -185,32 +223,68 @@ mod tests {
             .unwrap_or(false)
     }
 
+    fn has_error_epoch_end(events: &pyo3::Bound<'_, pyo3::PyAny>) -> bool {
+        if events.is_none() {
+            return false;
+        }
+        events
+            .try_iter()
+            .map(|iter| {
+                iter.flatten().any(|event| {
+                    let kind = event
+                        .getattr("type")
+                        .and_then(|kind| kind.extract::<String>())
+                        .ok();
+                    let reason = event
+                        .getattr("reason")
+                        .and_then(|reason| reason.extract::<String>())
+                        .ok();
+                    kind.as_deref() == Some("epoch_end") && reason.as_deref() == Some("error")
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Capture publication can precede the matching primary chunk. Keep polling until
+    /// both the requested event and that push's PCM have been observed; a zero-frame
+    /// carrier is not evidence that the PCM was delivered.
+    fn consume_marked_pcm(
+        py: Python<'_>,
+        stream: &mut Stream,
+        marker: impl Fn(&pyo3::Bound<'_, pyo3::PyAny>) -> bool,
+    ) -> DeliveredPcm {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut marked = false;
+        let mut audio = None;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "fake capture must deliver the marked PCM"
+            );
+            match stream.poll_chunk().unwrap() {
+                Some(chunk) => {
+                    let wrapped = Py::new(py, chunk).unwrap();
+                    let bound = wrapped.bind(py);
+                    marked |= marker(&bound.getattr("vad_events").unwrap());
+                    if audio.is_none() {
+                        audio = delivered_pcm(py, &wrapped);
+                    }
+                    if marked {
+                        if let Some(delivered) = audio.take() {
+                            return delivered;
+                        }
+                    }
+                }
+                None => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+    }
+
     fn next_chunk(stream: &mut Stream) -> PyAudioChunk {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(chunk) = stream.poll_chunk().unwrap() {
                 return chunk;
-            }
-            assert!(Instant::now() < deadline, "fake capture timed out");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
-
-    /// Poll until a real PCM chunk is delivered (attached carriers carry `frames` 0).
-    fn next_audio_chunk(py: Python<'_>, stream: &mut Stream) -> Py<PyAudioChunk> {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(chunk) = stream.poll_chunk().unwrap() {
-                let wrapped = Py::new(py, chunk).unwrap();
-                let frames = wrapped
-                    .bind(py)
-                    .getattr("frames")
-                    .unwrap()
-                    .extract::<usize>()
-                    .unwrap();
-                if frames > 0 {
-                    return wrapped;
-                }
             }
             assert!(Instant::now() < deadline, "fake capture timed out");
             std::thread::sleep(Duration::from_millis(2));
@@ -409,46 +483,25 @@ mod tests {
         };
         let first_push_ns = fa::core::clock::monotonic_now_ns();
         sink.lock().unwrap().as_mut().unwrap().push(&[0.2; 1920], 0);
-        wait_for_epoch_start(py, stream);
+        let first = consume_marked_pcm(py, stream, has_epoch_start);
         let first_delivery_ns = fa::core::clock::monotonic_now_ns();
+        // 1920 interleaved stereo samples are one 20 ms chunk. Later pushes continue
+        // this measured timeline; they must not be identified by a fixed sleep.
+        assert_eq!(first.frame_index, 0);
+        assert_eq!(first.frames, 960);
         stream.vad_tap.as_mut().unwrap().inject_failure();
         sink.lock()
             .unwrap()
             .as_mut()
             .unwrap()
             .push(&[0.2; 1920], 20_000_000);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut ended = false;
-        while !ended {
-            assert!(
-                Instant::now() < deadline,
-                "injected failure must deliver its terminal batch"
-            );
-            if let Some(chunk) = stream.poll_chunk().unwrap() {
-                let chunk = Py::new(py, chunk).unwrap();
-                let events = chunk.bind(py).getattr("vad_events").unwrap();
-                if !events.is_none() {
-                    for event in events.try_iter().unwrap() {
-                        let event = event.unwrap();
-                        if event.getattr("type").unwrap().extract::<String>().unwrap()
-                            == "epoch_end"
-                        {
-                            assert_eq!(
-                                event
-                                    .getattr("reason")
-                                    .unwrap()
-                                    .extract::<String>()
-                                    .unwrap(),
-                                "error"
-                            );
-                            ended = true;
-                        }
-                    }
-                }
-            } else {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        }
+        let second = consume_marked_pcm(py, stream, has_error_epoch_end);
+        assert_eq!(
+            second.frame_index,
+            first.frame_index + first.frames,
+            "the failure push must continue the first chunk before another push is issued"
+        );
+        assert_eq!(second.frames, 960);
         assert_eq!(
             stream.vad_error.as_ref().unwrap().audio_error().vad_code(),
             Some(fa::VadErrorCode::Inference)
@@ -459,6 +512,8 @@ mod tests {
             "one real processor failure must retain exactly one cleanup cause"
         );
         // This empty poll used to raise the retained VAD error and end capture loops.
+        // It is only empty after the failure push's PCM has been consumed; a single
+        // poll beside an event carrier still races the primary chunk under load.
         assert!(stream.poll_chunk().unwrap().is_none());
         std::thread::sleep(idle);
         let third_push_ns = fa::core::clock::monotonic_now_ns();
@@ -467,29 +522,20 @@ mod tests {
             .as_mut()
             .unwrap()
             .push(&[0.2; 1920], 40_000_000);
-        let chunk = next_audio_chunk(py, stream);
+        let third = consume_marked_pcm(py, stream, |_| true);
         let third_delivery_ns = fa::core::clock::monotonic_now_ns();
+        let end = second.frame_index + second.frames;
         assert_eq!(
-            chunk
-                .bind(py)
-                .getattr("frame_index")
-                .unwrap()
-                .extract::<u64>()
-                .unwrap(),
-            1920
+            end, 1920,
+            "two delivered 20 ms chunks precede the idle push"
         );
-        let flags: u32 = chunk
-            .bind(py)
-            .getattr("flags")
-            .expect("capture flags")
-            .extract()
-            .expect("integer flags");
-        let pts_ns: i64 = chunk
-            .bind(py)
-            .getattr("pts_ns")
-            .expect("capture PTS")
-            .extract()
-            .expect("integer PTS");
+        assert_eq!(
+            third.frame_index, end,
+            "idle time must not skip or reset the frame timeline"
+        );
+        assert_eq!(third.frames, 960);
+        let flags = third.flags;
+        let pts_ns = third.pts_ns;
         assert_eq!(flags & (fa::ChunkFlags::DISCONTINUITY | fa::ChunkFlags::RECOVERED).bits(), 0,
             "the contiguous fixture must not recover while its producer is idle; flags={flags:#x}, pts_ns={pts_ns}, retained_failure={}", stream.vad_error.is_some());
         // Public PCM PTS follows capture arrival time after startup confirmation. The lease
