@@ -1,13 +1,13 @@
 # flexaudio (Python)
 
-Python bindings for [flexaudio](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md), a
+Python bindings for [flexaudio](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md), a
 cross-platform audio capture library (microphone, system loopback, and
 per-process loopback) written in Rust. Built with PyO3 and maturin.
 
 ## Install
 
 ```sh
-pip install "flexaudio>=0.8,<0.9"
+pip install "flexaudio>=0.9,<0.10"
 ```
 
 ## Usage
@@ -322,7 +322,7 @@ raising `IgnoredSettingsError` with its complete candidate `.report`.
 `strict=None` means false on open and retention on switch. Gain and ring capacity
 stay fixed at open; non-default switch requests are ignored with `fixedAtOpen`.
 Use `set_gain()` for runtime gain changes. Python switch denoise remains applied.
-See the root README's [ignored-setting table](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#strict-mode-and-effective-settings).
+See the root README's [ignored-setting table](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#strict-mode-and-effective-settings).
 
 `stream.poll_lifecycle_event()` consumes a separate ordered helper-event FIFO;
 `poll_event()` never returns lifecycle notifications, even as unknown events.
@@ -333,7 +333,7 @@ overflow. Every emitted Started has exactly one Stopped with a reason. macOS
 Started means entry into a diagnostic attempt; Windows Started means successful
 keepalive render start. Stopped ends ownership after teardown attempts; typed cleanup
 errors remain authoritative. There is no ordering guarantee relative to PCM or
-ordinary events. See [helper behavior and controls](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#optional-playback-helpers-and-lifecycle).
+ordinary events. See [helper behavior and controls](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#optional-playback-helpers-and-lifecycle).
 
 Both chunk types expose `arrival_ns`, exactly equal to `pts_ns`. The old chunk
 name is documentation-only deprecated since 0.8 and retained throughout 0.9.

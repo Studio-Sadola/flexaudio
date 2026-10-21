@@ -461,8 +461,8 @@ non-default effective values; existing C sentinels are decoded before comparison
 For example, a supplied capacity of 50 is not requested and retains switch
 capacity; another value is ignored with `fixedAtOpen`. Gain is also fixed at open,
 as is `config.denoise` on source switch. Use `flexaudio_set_gain` for runtime gain.
-See the root README's [ignored-setting table](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#strict-mode-and-effective-settings)
-and [complete C example](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#strict-mode-and-effective-settings).
+See the root README's [ignored-setting table](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#strict-mode-and-effective-settings)
+and [complete C example](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#strict-mode-and-effective-settings).
 Strict requests that would be ignored return `FLEX_IGNORED_SETTINGS` (-13)
 before device access, model loading, or stopping the current source. Obtain an
 owned error with `flexaudio_last_error_info_v2`, then borrow its complete candidate
@@ -496,7 +496,7 @@ Every emitted Started has exactly one Stopped: macOS Started means entry into
 a diagnostic attempt; Windows Started follows successful keepalive render start.
 Stopped ends ownership after teardown attempts, without guaranteeing native
 cleanup succeeded. Lifecycle ordering relative to PCM or ordinary events is not
-guaranteed. See [helper behavior and controls](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#optional-playback-helpers-and-lifecycle).
+guaranteed. See [helper behavior and controls](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#optional-playback-helpers-and-lifecycle).
 
 Use `flexaudio_chunk_arrival_ns_v4` and `flexaudio_secondary_arrival_ns_v4` for
 arrival time. They return the existing `pts_ns` value exactly. The old naming is

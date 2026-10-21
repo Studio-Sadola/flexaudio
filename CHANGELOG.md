@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **0.x stability note:** while in the `0.x` series the public API is not yet
 > stable. Per SemVer, a **minor** bump (`0.2 → 0.3`) may include breaking
 > changes; **patch** bumps (`0.2.0 → 0.2.1`) remain backward-compatible. Pin to
-> `0.8` to receive only compatible updates.
+> `0.9` to receive only compatible updates.
 
 ## [0.8.1] - 2026-10-20
 

@@ -139,7 +139,7 @@ Construction/startup failures retain the previous settings.
 ## Install
 
 ```sh
-cargo add flexaudio@0.8
+cargo add flexaudio@0.9
 ```
 
 ## Permissions
@@ -147,7 +147,7 @@ cargo add flexaudio@0.8
 Audio capture requires user consent: macOS TCC (`kTCCServiceAudioCapture`, add
 `NSAudioCaptureUsageDescription` to `Info.plist`), the Windows Microphone privacy
 setting, and a running PipeWire session on Linux for system/process capture. See
-the [workspace README](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#os-specific-permission-requirements).
+the [workspace README](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#os-specific-permission-requirements).
 
 On macOS, system/process loopback (Core Audio process taps) requires macOS 14.4
 or later.
@@ -159,4 +159,4 @@ Rust **1.85**.
 ## License
 
 [MIT](LICENSE) © 2026 tubome / Studio Sadola. Third-party notices:
-[`THIRD_PARTY_NOTICES.md`](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/THIRD_PARTY_NOTICES.md).
+[`THIRD_PARTY_NOTICES.md`](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/THIRD_PARTY_NOTICES.md).

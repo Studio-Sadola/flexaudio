@@ -1,7 +1,7 @@
 # @studio-sadola/flexaudio
 
 Native **N-API** bindings that let Node.js / TypeScript / Electron capture audio
-through the [flexaudio](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md) Rust library:
+through the [flexaudio](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md) Rust library:
 microphone, system output (loopback), per-process capture, and mic + system mix on **Linux**,
 **Windows**, and **macOS**.
 
@@ -18,7 +18,7 @@ offline — no model files to ship, no network at runtime.
 ## Install
 
 ```sh
-npm install @studio-sadola/flexaudio@0.8
+npm install @studio-sadola/flexaudio@0.9
 ```
 
 The correct prebuilt native binary for your platform is pulled in automatically
@@ -208,7 +208,7 @@ the old source. Failed switches keep the previous report and controls.
 Gain, ring capacity, denoise and VAD cannot be replaced by `switchSource`:
 non-default requests are `ignored` with `fixedAtOpen` (strict rejects them).
 Use `setGain()` for runtime gain changes. See the root README's
-[ignored-setting table](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#strict-mode-and-effective-settings)
+[ignored-setting table](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#strict-mode-and-effective-settings)
 for all reasons and the default-value rule.
 
 Register `onLifecycleEvent` inside `OpenOptions` for a separate ordered helper
@@ -226,7 +226,7 @@ Every emitted helper Started has exactly one Stopped with a reason. On macOS,
 Started means a diagnostic attempt; on Windows it means successful silent-render
 start. Stopped ends ownership after teardown attempts; cleanup errors remain
 authoritative. Ordering against PCM and ordinary events is not guaranteed.
-See [helper behavior and controls](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#optional-playback-helpers-and-lifecycle).
+See [helper behavior and controls](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#optional-playback-helpers-and-lifecycle).
 
 Library-created primary and secondary chunks always expose `arrivalNs`, identical
 to `ptsNs`. The declaration is optional to preserve consumer-created objects.
@@ -413,7 +413,7 @@ Audio capture requires OS-level consent: macOS TCC
 (`kTCCServiceAudioCapture`; add `NSAudioCaptureUsageDescription` to your app's
 `Info.plist`), the Windows microphone privacy setting, and a running PipeWire
 session on Linux for system / per-process capture. See the
-[workspace README](https://github.com/Studio-Sadola/flexaudio/blob/v0.8.1/README.md#os-specific-permission-requirements).
+[workspace README](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#os-specific-permission-requirements).
 
 On macOS, system / per-process loopback (Core Audio process taps) requires
 macOS 14.4 or later.

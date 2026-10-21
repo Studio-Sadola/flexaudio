@@ -291,19 +291,19 @@ Linux では PipeWire のソケットがなければ `Unavailable`、ソケッ�
 
 ```toml
 [dependencies]
-flexaudio = "0.8"
+flexaudio = "0.9"
 ```
 
 または、次のコマンドを使います。
 
 ```sh
-cargo add flexaudio@0.8
+cargo add flexaudio@0.9
 ```
 
 音声区間検出（VAD）のアドオンは、別のクレートです。
 
 ```sh
-cargo add flexaudio-vad@0.8
+cargo add flexaudio-vad@0.9
 ```
 
 ---
@@ -915,7 +915,7 @@ flexaudio は [Semantic Versioning](https://semver.org/) に従います。
 クレートが **0.x** 系である間は、公開 API は**まだ安定していません**。
 SemVer に従い、**マイナー**バージョンの更新（`0.2 → 0.3`）には互換性を壊す変更が含まれる場合がありますが、
 **パッチ**バージョンの更新（`0.2.0 → 0.2.1`）は後方互換性を保ちます。
-互換性のある更新だけを受け取るには、バージョンを `0.8` に固定してください。
+互換性のある更新だけを受け取るには、バージョンを `0.9` に固定してください。
 [`CHANGELOG.md`](CHANGELOG.md) を参照してください。
 
 ---
