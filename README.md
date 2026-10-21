@@ -93,6 +93,10 @@ which output carries its events. — = not exposed.
 | Gain 0 | Mute | Mute | Mute | Config gains: unity (1.0); runtime `flexaudio_set_gain(s, 0)`: mute | Mute |
 
 The optional silence diagnosis probe is macOS-only and enabled by default.
+Disabling the probe outside macOS system/process/Mix capture, or disabling the
+keepalive outside Windows system/Mix capture without exclusions, requests a
+setting that would be ignored. Strict mode (the 0.9 default) rejects that request;
+turn strict off explicitly to permit ignoring it.
 
 ---
 
@@ -251,6 +255,10 @@ ended after teardown attempts; typed cleanup errors still report native cleanup
 failures. Windows capture-start failure after render start stops the helper with
 `startupFailed`. Lifecycle events are ordered among themselves, with no relative
 ordering guarantee against PCM or ordinary events.
+
+The disable controls below require the applicable source and platform described
+above. Elsewhere, strict mode rejects their non-default values unless strict is
+turned off explicitly; leaving the controls at their defaults remains valid.
 
 | Binding | Lifecycle delivery | Disable macOS probe | Disable Windows keepalive |
 |---|---|---|---|
@@ -623,7 +631,8 @@ or cleanup errors, and prints structured permission detail after safe guidance.
 `SourceKind::Mix` combines microphone input and system output into one stream.
 Select each side with `mix_mic_device_id` and `mix_system_device_id`, using IDs
 from `devices()`; `None` selects the default input/output. `device_id` is ignored
-for Mix. The linear pre-mix gains `mix_mic_gain` and `mix_system_gain` default to
+for Mix; default strict mode rejects a non-default value unless strict is turned
+off explicitly. The linear pre-mix gains `mix_mic_gain` and `mix_system_gain` default to
 `1.0`; `gain` is the global multiplier applied after mixing.
 
 ```rust
@@ -688,7 +697,8 @@ failure terminates capture with a typed `Event::TerminalError` and stops both
 streams. It does not enter stall/reopen recovery; open a new stream to retry.
 Process loopback, including system capture with exclusions, does not use it.
 
-Keepalive is enabled by default. Disable it in Rust with
+Keepalive is enabled by default. For Windows system capture without exclusions,
+disable it in Rust with
 `open_with_options(config, OpenOptions::new().windows_classic_loopback_keepalive(false))`.
 `Stream::switch_source_with_options(config, options)` replaces it with the source;
 ordinary `switch_source` retains it, and failed switches retain the previous options.
@@ -697,7 +707,10 @@ Node uses `windowsClassicLoopbackKeepalive: false`, Python
 `windows_classic_loopback_keepalive = 2` (0 default/retain, 1 enabled), and the CLI
 uses `--no-classic-loopback-keepalive`. Node/Python switches retain it when omitted;
 C switches retain it with 0. The option also applies to the system lane of Mix,
-and is ignored on other platforms and process/exclusion paths.
+without exclusions. On other platforms or process/exclusion paths, requesting
+false would be ignored and default strict mode rejects it. To allow that ignored
+request, use Rust `.strict(false)`, Node `strict: false`, Python `strict=False`,
+C v4 `strict = 2`, or CLI `--no-strict`.
 
 With keepalive disabled, idle classic loopback delivers no packets. The unchanged
 2 s watchdog reports `Event::StreamStalled` and reopens repeatedly until audio
@@ -715,7 +728,8 @@ The exact display and removal timing depend on the Windows Mixer UI.
 
 `StreamConfig::exclude_pids` excludes playback from **system capture and the
 system side of Mix**, combined with `exclude_self`. Microphone and per-process
-sources ignore valid exclusions. The same controls are available in each binding:
+sources cannot apply exclusions: default strict mode rejects nonempty exclusions
+there unless strict is turned off explicitly. The same controls are available in each binding:
 
 | Surface | PID exclusion |
 |---|---|
@@ -747,6 +761,9 @@ sources ignore valid exclusions. The same controls are available in each binding
 
 The device rules also apply to `mix_system_device_id`; microphone selection
 is unaffected.
+On Linux and Windows, default strict mode rejects non-default system-device
+selection together with exclusions; turn strict off explicitly to permit
+ignoring that selection.
 
 ---
 

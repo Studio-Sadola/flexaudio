@@ -114,7 +114,8 @@ Strings, bytes, dictionaries, sets, and generators are not accepted as the
 sequence (`TypeError`). More than 4096 entries raises `ValueError`. `None` and
 an empty sequence exclude no explicit PIDs. Order and duplicates are preserved.
 Validation happens before any device access, including for `"mic"` and
-`"process"`, which ignore valid exclusions.
+`"process"`, where non-default exclusions are rejected by default strict mode;
+`strict=False` permits ignoring them.
 
 Platform behavior:
 
@@ -125,6 +126,8 @@ Platform behavior:
   device together with exclusions.
 - Linux matches exact PIDs, without excluding descendants. Linux and Windows
   ignore the selected system device while exclusion is active.
+  Default strict mode rejects that non-default selection; `strict=False`
+  permits ignoring it.
 
 ### Noise suppression and attached VAD
 
@@ -150,6 +153,8 @@ captured process has active output (honoring exclusions and device selection),
 it probes once per capture generation. A 1 kHz signal at amplitude 1e-5 plays for
 roughly 300 ms to help distinguish permission failure from silence. This low-level
 signal is not guaranteed inaudible and may enter capture when the host is included.
+On a microphone or outside macOS, requesting `silence_probe=False` is rejected by
+default strict mode; `strict=False` permits ignoring it.
 
 ### Standalone add-ons
 
@@ -321,7 +326,8 @@ ignored settings before device access, model loading, or stopping the old source
 raising `IgnoredSettingsError` with its complete candidate `.report`.
 `strict=None` means true on open and retention on switch. Use `strict=False`
 to allow ignored settings. Gain and ring capacity
-stay fixed at open; non-default switch requests are ignored with `fixedAtOpen`.
+stay fixed at open; non-default switch requests are rejected with `fixedAtOpen`
+unless `strict=False` permits ignoring them.
 Use `set_gain()` for runtime gain changes. Python switch denoise remains applied.
 See the root README's [ignored-setting table](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#strict-mode-and-effective-settings).
 
@@ -361,7 +367,8 @@ classic loopback silent keepalive. Set it to `False` to disable it.
 `switch_source(..., windows_classic_loopback_keepalive=None)` retains the
 current setting; an explicit boolean replaces it only on successful switching.
 The option applies to system capture and the system lane of Mix without PID
-exclusions. Other platforms and process/exclusion capture ignore it. With it
+exclusions. Requesting `False` on other platforms or process/exclusion capture is
+rejected by default strict mode; `strict=False` permits ignoring it. With it
 disabled, idle classic loopback delivers no packets; the 2 s stall watchdog reports
 `stalled` (`Event::StreamStalled` in Rust) and reopens repeatedly until audio plays.
 

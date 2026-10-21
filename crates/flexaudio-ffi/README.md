@@ -143,14 +143,18 @@ Lists are copied during each call; the array can be changed or released afterwar
 must be in `1..=4294967295`, and the list can contain at most 4096 entries. Order and duplicates
 are preserved. NULL is allowed with length zero; NULL with a nonzero length or a misaligned
 pointer is invalid. Zero-PID errors identify the offending index. Validation applies even to
-mic and process sources, which ignore valid lists. Legacy `flexaudio_open` and
-`flexaudio_switch_source` use the same implementation with an empty list.
+mic and process sources; nonempty lists there are rejected by default strict mode
+(`FLEX_IGNORED_SETTINGS`). To permit ignoring them, open through v4 with `strict = 2`.
+Legacy `flexaudio_open` and `flexaudio_switch_source` use the same implementation
+with an empty list.
 
 Exclusion applies to system capture and the system side of mix, combined with `exclude_self`.
 Windows requires every listed PID to equal one process tree root (the current process when
 `exclude_self` is true, otherwise the first listed PID). macOS resolves PIDs once at start;
 Linux matches exact PIDs without descendants. macOS honors the selected device alongside
 exclusion; Linux and Windows ignore device selection while exclusion is active.
+Default strict mode rejects a non-default selected system device in that case;
+use v4 with `strict = 2` to permit ignoring it.
 
 ## Capabilities and Version 3 Capture
 
@@ -203,7 +207,7 @@ FlexStreamConfigV3 options = {
     .config = &base, .vad = &vad,
     .exclude_pids = excluded, .exclude_pids_len = 1,
     .secondary_output = &secondary,
-    .windows_classic_loopback_keepalive = FLEX_KEEPALIVE_OFF
+    .windows_classic_loopback_keepalive = FLEX_KEEPALIVE_DEFAULT
 };
 FlexStream *stream = NULL;
 int result = flexaudio_open_v3(&options, &stream);
@@ -214,7 +218,10 @@ int result = flexaudio_open_v3(&options, &stream);
 Keepalive accepts 0 (default enabled at open; retain current value on switch),
 1 (enabled), or 2 (disabled). Other values are InvalidArg. The option applies to
 Windows classic system loopback without exclusions, including the system lane of
-mix. Other platforms and process/exclusion paths ignore it. Use
+mix. The example keeps the default because its exclusions bypass classic loopback.
+Disabling keepalive on other platforms or process/exclusion paths is an ignored
+non-default request: default strict mode rejects it with `FLEX_IGNORED_SETTINGS`.
+To permit that request, use v4 with `strict = 2`. Use
 `FlexSwitchConfigV3` with `flexaudio_switch_source_v3` to change it together with
 the source. The switch retains output formats, encoding, attached VAD, gain and
 denoise from open; failed switches retain the previous options. With keepalive
@@ -270,7 +277,9 @@ seconds of bit-exact zero native samples while an eligible external captured
 process has active output (honoring exclusions and device selection). The probe
 plays a roughly 300 ms, 1 kHz signal at amplitude 1e-5. This low-level signal is
 not guaranteed inaudible and may enter capture when the host is included.
-Set 2 to disable this optional diagnostic.
+Set 2 to disable this optional diagnostic on those macOS sources. On a microphone
+or outside macOS, that non-default request is rejected by default strict mode;
+use v4 with `strict = 2` to permit the ignored request.
 
 ## Standalone Handles (Without a Stream)
 
@@ -463,7 +472,8 @@ Only decoded values differing from documented defaults count as requested.
 Explicit defaults are not requested, including on switch after retaining
 non-default effective values; existing C sentinels are decoded before comparison.
 For example, a supplied capacity of 50 is not requested and retains switch
-capacity; another value is ignored with `fixedAtOpen`. Gain is also fixed at open,
+capacity; another value is rejected with `fixedAtOpen` in strict mode. Permissive
+mode (v4 `strict = 2` on open) permits ignoring it. Gain is also fixed at open,
 as is `config.denoise` on source switch. Use `flexaudio_set_gain` for runtime gain.
 See the root README's [ignored-setting table](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#strict-mode-and-effective-settings)
 and [complete C example](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/README.md#strict-mode-and-effective-settings).

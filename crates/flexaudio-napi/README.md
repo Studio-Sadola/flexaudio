@@ -49,8 +49,9 @@ await stream.stop();
 
 `stream.switchSource(options)` hot-swaps the input source without stopping.
 It applies only the stream configuration: `options.denoise` and `options.vad`
-are ignored, and the existing denoise and VAD settings remain in effect.
-`options.gain` is also ignored; use `setGain()` to change gain.
+retain their existing settings. Non-default requests to replace fixed attachments
+or `options.gain` are rejected by default strict mode; `strict: false` permits
+ignoring them. Use `setGain()` to change gain.
 `watchDevices(cb)` reports Linux PipeWire system output additions, removals and
 default changes using the same output IDs as `devices()`. Microphone and
 default-microphone changes are not reported: CPAL microphone IDs cannot be resolved
@@ -91,7 +92,9 @@ connection or server sync means unknown, with the structured query error retaine
 disables silent rendering used to keep classic loopback delivering idle packets.
 Omitting the option on open defaults to `true`. It also applies to the system lane
 of `mix`, without PID exclusions. Other platforms and process/exclusion capture
-paths ignore it.
+paths cannot apply it: requesting false there is rejected by default strict mode.
+Use `strict: false` to permit the ignored request. The example above is for Windows
+system capture without exclusions.
 
 `stream.switchSource({ kind: 'system', windowsClassicLoopbackKeepalive: true })`
 updates the option with the source only after a successful switch. Omitting it
@@ -103,7 +106,8 @@ audio plays.
 
 Use `kind: 'mix'` to combine microphone and system audio in one stream.
 `micDeviceId` and `systemDeviceId` select IDs from `devices()`; omitting them
-uses the default input/output. `deviceId` is ignored for mix. `micGain` and
+uses the default input/output. A supplied `deviceId` for mix is rejected by default
+strict mode; `strict: false` permits ignoring it. `micGain` and
 `systemGain` are linear pre-mix multipliers (default `1.0`); `gain` applies
 ommediately after mixing.
 
@@ -150,7 +154,8 @@ Server 2022).
 ## Excluding your own app (Electron hosts)
 
 `excludePids` and `excludeSelf` apply to system capture and the system side of
-mix; mic/process sources ignore valid exclusions. `excludeSelf: true` excludes
+mix; mic/process sources reject non-default exclusions under default strict mode.
+Use `strict: false` to permit ignoring those requests. `excludeSelf: true` excludes
 the process the addon runs in. Electron renders
 audio from an audio utility process. On Linux and macOS, pass the audio service
 PIDs from `app.getAppMetrics()` as well. On Windows, use `excludeSelf: true`
@@ -190,6 +195,8 @@ macOS honors `deviceId` (or `systemDeviceId` for mix) together with exclusion.
 Linux and Windows do not use the requested system device while exclusion is
 active: Linux fan-in is not device-scoped, and WASAPI process loopback cannot
 target an output endpoint. Microphone selection is unaffected.
+Default strict mode rejects a selected system device in that case;
+`strict: false` permits ignoring it.
 
 ## Settings reports, strict mode, and lifecycle
 
@@ -431,4 +438,6 @@ The macOS silence diagnostic probe is enabled by default for system/process capt
 and the system lane of Mix. It runs once per generation after five continuous
 seconds of bit-exact zero native samples with eligible external output activity,
 honoring exclusions and device selection. Its low-level signal is not guaranteed
-inaudible. Set `silenceProbe: false` in `openStream` to disable it. Other platforms ignore the option.
+inaudible. Set `silenceProbe: false` in `openStream` to disable it on those macOS
+sources. On a microphone or other platforms, that request is rejected by default
+strict mode; `strict: false` permits ignoring it.

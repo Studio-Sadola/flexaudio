@@ -49,14 +49,17 @@ Use `AudioChunk::new(data, frames)`, `DeviceInfo::new(id, name, source_kind)` or
 - `SourceKind::Mix` combines mic + system audio. Select each side with
   `mix_mic_device_id` / `mix_system_device_id` (`None` uses defaults), and set
   `mix_mic_gain` / `mix_system_gain` before mixing; `gain` applies afterward.
-  `device_id` is ignored for Mix.
+  A non-default `device_id` for Mix is rejected by default strict mode;
+  `.strict(false)` permits ignoring it.
 - `exclude_pids` combines with `exclude_self` for system capture and the system
   side of Mix. Windows excludes one process-tree root (self when `exclude_self`
   is true, otherwise the first PID); every entry must equal that root, and
   distinct PIDs are rejected. macOS resolves audio objects once at start and
   honors device selection. Linux matches exact PIDs (`application.process.id`
   for pulse-proxied streams, `pipewire.sec.pid` for native clients), without
-  descendants. Linux and Windows ignore system-device selection during exclusion.
+  descendants. Linux and Windows cannot apply system-device selection during
+  exclusion; default strict mode rejects a non-default ID there unless
+  `.strict(false)` permits ignoring it.
 - Output is normalized interleaved `f32` at a sample rate / channel count you
   choose (two-stage resampling internally).
 
@@ -91,10 +94,14 @@ use flexaudio::{open_with_options, OpenOptions, SourceKind, StreamConfig};
 
 let mut config = StreamConfig::new(SourceKind::SystemLoopback);
 config.exclude_self = false;
-let mut stream = open_with_options(
-    config.clone(),
-    OpenOptions::new().windows_classic_loopback_keepalive(false),
-)?;
+let mut options = OpenOptions::new();
+if matches!(
+    flexaudio::capabilities().side_effects.classic_loopback_keepalive.availability,
+    flexaudio::Availability::Supported
+) {
+    options = options.windows_classic_loopback_keepalive(false);
+}
+let mut stream = open_with_options(config.clone(), options)?;
 stream.start()?;
 stream.switch_source_with_options(config, OpenOptions::new())?;
 stream.stop();
@@ -103,15 +110,18 @@ stream.stop();
 
 Windows classic loopback keepalive is enabled by default and renders silence to
 keep idle system capture delivering packets. It also applies to the system lane
-of Mix without PID exclusions. Other platforms and process/exclusion paths ignore
-it. Disabling it means idle classic loopback delivers no packets: the 2 s watchdog
+of Mix without PID exclusions. The example disables it only when capability
+discovery confirms support; it keeps strict mode enabled. On other platforms or
+process/exclusion paths, requesting false is rejected by default strict mode;
+`.strict(false)` permits ignoring that request. Disabling it means idle classic
+loopback delivers no packets: the 2 s watchdog
 reports `Event::StreamStalled` and reopens repeatedly until audio plays.
 
 `Stream::open_options()` reads the current settings. `switch_source_with_options`
 replaces them together with the source; ordinary `switch_source` retains them.
 Construction/startup failures retain the previous settings.
 
-## Settings and metadata in 0.8
+## Settings and metadata
 
 - `OpenOptions::new()` defaults to strict and rejects non-default settings that would be ignored
   before native access. `Stream::effective_settings()` exposes the last successful

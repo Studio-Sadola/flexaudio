@@ -169,10 +169,10 @@
       "CLI": {"status": "supported", "symbols": ["--settings-json"], "note": "stderr snapshots on successful open/switch or strict rejection."}
     }},
     {"feature": "Strict ignored-setting validation", "bindings": {
-      "Rust": {"status": "supported", "symbols": ["flexaudio::OpenOptions::strict"]},
-      "Node": {"status": "supported", "symbols": ["OpenOptions.strict"]},
-      "Python": {"status": "supported", "symbols": ["open.strict", "Stream.switch_source.strict"]},
-      "C": {"status": "supported", "symbols": ["FlexOptionsV4.strict", "flexaudio_open_v4", "FLEX_IGNORED_SETTINGS"]},
+      "Rust": {"status": "supported", "symbols": ["flexaudio::OpenOptions::strict"], "note": "Strict by default; OpenOptions::new().strict(false) allows ignored settings."},
+      "Node": {"status": "supported", "symbols": ["OpenOptions.strict"], "note": "Strict by default; strict: false allows ignored settings."},
+      "Python": {"status": "supported", "symbols": ["open.strict", "Stream.switch_source.strict"], "note": "Strict by default; strict=False allows ignored settings."},
+      "C": {"status": "supported", "symbols": ["FlexOptionsV4.strict", "flexaudio_open_v4", "FLEX_IGNORED_SETTINGS"], "note": "v1-v4 open strict by default; use v4 strict = 2 to allow ignored settings. v4 strict = 0 retains on switch."},
       "CLI": {"status": "supported", "symbols": ["--strict", "--no-strict"], "note": "Strict by default; --no-strict allows ignored settings. Only decoded non-default requests can be rejected."}
     }},
     {"feature": "Helper lifecycle channel", "bindings": {

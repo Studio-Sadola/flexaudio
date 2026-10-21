@@ -185,7 +185,8 @@ struct Cli {
 
     /// Disable the silent-render keepalive for Windows classic system loopback only.
     /// An idle endpoint then delivers no packets and may repeatedly report stalls.
-    /// Ignored on other platforms and process/exclusion capture paths.
+    /// Rejected by default on other platforms and process/exclusion capture paths;
+    /// --no-strict allows the ignored request.
     #[arg(long)]
     no_classic_loopback_keepalive: bool,
 
@@ -223,6 +224,7 @@ struct Cli {
     /// printed and recording continues with the previous source. For WAV output, each `secs` must
     /// be at least 1. `--mode` / `--process-id` apply only to process segments, exclusions only
     /// to system segments, and `--device-id` only to mic/system segments.
+    /// A non-default routing request requires at least one segment that can use it.
     #[arg(long)]
     sources: Option<String>,
 
@@ -483,6 +485,27 @@ fn validate_exclusion_sources(cli: &Cli, segments: Option<&[Segment]>) -> Result
     Ok(())
 }
 
+/// Reject routing arguments before a schedule can clear them from every segment.
+fn validate_schedule_routing(cli: &Cli, segments: &[Segment]) -> Result<(), Error> {
+    let has_process = segments
+        .iter()
+        .any(|segment| segment.kind == SourceKind::ProcessLoopback);
+    if !has_process && (cli.process_id.is_some() || cli.mode != ModeArg::Include) {
+        return Err(Error::InvalidArg(
+            "--process-id and non-default --mode require a process segment in --sources.".into(),
+        ));
+    }
+    let has_device_selection = segments
+        .iter()
+        .any(|segment| matches!(segment.kind, SourceKind::Mic | SourceKind::SystemLoopback));
+    if !has_device_selection && cli.device_id.is_some() {
+        return Err(Error::InvalidArg(
+            "--device-id requires a mic or system segment in --sources.".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Hot-swap scheduler for `--sources`.
 ///
 /// The first segment is the initial source (already opened and started). At each later segment
@@ -674,8 +697,9 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         }
     };
 
-    if cli.no_strict {
-        validate_exclusion_sources(cli, segments.as_deref()).map_err(describe_error)?;
+    validate_exclusion_sources(cli, segments.as_deref()).map_err(describe_error)?;
+    if let Some(segments) = &segments {
+        validate_schedule_routing(cli, segments).map_err(describe_error)?;
     }
 
     // Resolve SourceKind and its display label. The `flexaudio::open` facade builds and selects
@@ -1692,7 +1716,7 @@ mod tests {
 
     #[test]
     fn run_rejects_exclusions_without_system_capture() {
-        // Preserve the permissive-mode guidance; strict mode uses the settings report.
+        // Source-plan usage errors apply in both strict and permissive modes.
         for exclusion in [vec!["--exclude-self"], vec!["--exclude-pid", "123"]] {
             for source in ["mic", "process"] {
                 let mut args = vec!["--no-strict", "--source", source, "--process-id", "42"];

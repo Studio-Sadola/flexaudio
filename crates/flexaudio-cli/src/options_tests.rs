@@ -3,6 +3,74 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn default_schedule_rejects_exclusions_without_a_system_segment() {
+    for exclusion in [vec!["--exclude-self"], vec!["--exclude-pid", "1"]] {
+        let mut args = vec!["flexaudio-cli", "--sources", "mic:1"];
+        args.extend(exclusion);
+        let cli = Cli::try_parse_from(args).unwrap();
+        let error = run(&cli).expect_err("source-plan rejection must precede device access");
+        assert!(error.contains("system segment in --sources"), "{error}");
+    }
+}
+
+#[test]
+fn default_schedule_rejects_process_routing_without_a_process_segment() {
+    for request in [vec!["--process-id", "1"], vec!["--mode", "exclude"]] {
+        let mut args = vec!["flexaudio-cli", "--sources", "mic:1"];
+        args.extend(request);
+        let cli = Cli::try_parse_from(args).unwrap();
+        let error = run(&cli).expect_err("source-plan rejection must precede device access");
+        assert!(
+            error.contains("require a process segment in --sources"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn default_schedule_rejects_device_selection_without_a_selectable_segment() {
+    let cli = Cli::try_parse_from([
+        "flexaudio-cli",
+        "--sources",
+        "process:1",
+        "--process-id",
+        "1",
+        "--device-id",
+        "unused-selector",
+    ])
+    .unwrap();
+    let error = run(&cli).expect_err("source-plan rejection must precede device access");
+    assert!(
+        error.contains("--device-id requires a mic or system segment"),
+        "{error}"
+    );
+}
+
+#[test]
+fn schedule_accepts_routing_used_by_a_later_segment_and_default_mode() {
+    let cli = Cli::try_parse_from([
+        "flexaudio-cli",
+        "--sources",
+        "mic:1,system:1,process:1",
+        "--process-id",
+        "1",
+        "--mode",
+        "exclude",
+        "--device-id",
+        "selected-device",
+        "--exclude-self",
+    ])
+    .unwrap();
+    let segments = parse_sources(cli.sources.as_deref().unwrap()).unwrap();
+    validate_exclusion_sources(&cli, Some(&segments)).unwrap();
+    validate_schedule_routing(&cli, &segments).unwrap();
+    let cli =
+        Cli::try_parse_from(["flexaudio-cli", "--sources", "mic:1", "--mode", "include"]).unwrap();
+    let segments = parse_sources(cli.sources.as_deref().unwrap()).unwrap();
+    validate_schedule_routing(&cli, &segments).unwrap();
+}
+
+#[test]
 fn strict_is_default_and_can_be_disabled() {
     let defaults = Cli::try_parse_from(["flexaudio-cli"]).unwrap();
     assert!(defaults.strict && !defaults.settings_json && !defaults.lifecycle_events);
