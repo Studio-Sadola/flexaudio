@@ -1,4 +1,4 @@
-"""Offline checks that binding tests are named by a workflow."""
+"""Offline checks that binding tests are named by a workflow command."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from textwrap import dedent
 import unittest
 
 
@@ -34,12 +35,12 @@ class CiTestCoverageTests(unittest.TestCase):
         self.write("bindings/flexaudio-py/tests/test_orphan.py")
         self.write("crates/flexaudio-napi/__test__/kept.test.mjs")
         self.write("crates/flexaudio-napi/__test__/orphan.test.mjs")
-        self.write(".github/workflows/ci.yml", "\n".join([
-            "test_kept.py",
-            "kept.test.mjs",
-            "not-test_orphan.py",
-            "orphan.test.mjs.disabled",
-        ]))
+        self.write(".github/workflows/ci.yml", dedent("""\
+            jobs:
+              test:
+                steps:
+                  - run: python test_kept.py kept.test.mjs not-test_orphan.py orphan.test.mjs.disabled
+            """))
         result = self.run_gate()
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("bindings/flexaudio-py/tests/test_orphan.py", result.stderr)
@@ -52,7 +53,12 @@ class CiTestCoverageTests(unittest.TestCase):
         self.write("bindings/flexaudio-py/tests/helper.py", "not a test module\n")
         self.write("crates/flexaudio-napi/__test__/kept.test.mjs")
         self.write("crates/flexaudio-napi/__test__/notes.mjs", "not a test\n")
-        self.write(".github/workflows/release.yml", "test_kept.py\nkept.test.mjs\n")
+        self.write(".github/workflows/release.yml", dedent("""\
+            jobs:
+              test:
+                steps:
+                  - run: python test_kept.py kept.test.mjs
+            """))
         result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CI test coverage check passed: 2 binding tests", result.stdout)
@@ -91,6 +97,145 @@ class CiTestCoverageTests(unittest.TestCase):
                     result = self.run_gate(root)
                     self.assertNotEqual(result.returncode, 0, result.stdout)
                     self.assertIn(marker, result.stderr)
+
+    def seed_orphans(self) -> None:
+        self.write("bindings/flexaudio-py/tests/test_orphan.py")
+        self.write("crates/flexaudio-napi/__test__/orphan.test.mjs")
+
+    def assert_orphans_uncovered(self, workflow: str, filename: str = ".github/workflows/ci.yml") -> None:
+        self.seed_orphans()
+        self.write(filename, dedent(workflow))
+        result = self.run_gate()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("bindings/flexaudio-py/tests/test_orphan.py", result.stderr)
+        self.assertIn("crates/flexaudio-napi/__test__/orphan.test.mjs", result.stderr)
+
+    def test_full_line_comment_does_not_count(self) -> None:
+        outside = """\
+            # TODO run test_orphan.py and orphan.test.mjs
+            - run: echo hi
+            """
+        inside = """\
+            jobs:
+              test:
+                steps:
+                  - run: |
+                      # TODO run test_orphan.py and orphan.test.mjs
+                      echo hi
+            """
+        for label, workflow in (("outside", outside), ("inside", inside)):
+            with self.subTest(label=label):
+                self.assert_orphans_uncovered(workflow)
+
+    def test_trailing_comment_does_not_count(self) -> None:
+        on_run = """\
+            jobs:
+              test:
+                steps:
+                  - run: echo hi # test_orphan.py orphan.test.mjs
+            """
+        inside = """\
+            jobs:
+              test:
+                steps:
+                  - run: |
+                      echo hi # test_orphan.py orphan.test.mjs
+            """
+        for label, workflow in (("run-line", on_run), ("inside-block", inside)):
+            with self.subTest(label=label):
+                self.assert_orphans_uncovered(workflow)
+
+    def test_step_name_does_not_count(self) -> None:
+        self.assert_orphans_uncovered("""\
+            jobs:
+              test:
+                steps:
+                  - name: run test_orphan.py and orphan.test.mjs
+                    run: echo hi
+            """)
+
+    def test_literal_false_if_does_not_count(self) -> None:
+        cases = (
+            "false",
+            "False",
+            "FALSE",
+            '"false"',
+            "'FALSE'",
+        )
+        for condition in cases:
+            with self.subTest(condition=condition):
+                self.assert_orphans_uncovered(f"""\
+                    jobs:
+                      test:
+                        steps:
+                          - name: skipped
+                            if: {condition}
+                            run: python test_orphan.py orphan.test.mjs
+                    """)
+        self.assert_orphans_uncovered("""\
+            jobs:
+              test:
+                steps:
+                  - run: |
+                      python test_orphan.py
+                      node orphan.test.mjs
+                    if: false
+            """)
+
+    def test_executed_run_forms_pass(self) -> None:
+        self.write("bindings/flexaudio-py/tests/test_kept.py")
+        self.write("crates/flexaudio-napi/__test__/kept.test.mjs")
+        forms = {
+            "single-line": """\
+                jobs:
+                  test:
+                    steps:
+                      - if: false
+                        run: echo test_orphan.py orphan.test.mjs
+                      - run: python test_kept.py kept.test.mjs # ignored
+                """,
+            "literal-block": """\
+                jobs:
+                  test:
+                    steps:
+                      - name: block
+                        run: |
+                          python test_kept.py
+                          node kept.test.mjs
+                """,
+            "folded-block": """\
+                jobs:
+                  test:
+                    steps:
+                      - name: folded
+                        run: >
+                          python test_kept.py
+                          node kept.test.mjs
+                """,
+        }
+        filenames = {
+            "single-line": ".github/workflows/ci.yml",
+            "literal-block": ".github/workflows/ci.yml",
+            "folded-block": ".github/workflows/ci.yaml",
+        }
+        for label, workflow in forms.items():
+            with self.subTest(label=label):
+                for path in (self.root / ".github" / "workflows").glob("*"):
+                    path.unlink()
+                self.write(filenames[label], dedent(workflow))
+                result = self.run_gate()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("CI test coverage check passed: 2 binding tests", result.stdout)
+
+    def test_no_workflow_files_fails(self) -> None:
+        self.write("bindings/flexaudio-py/tests/test_kept.py")
+        self.write("crates/flexaudio-napi/__test__/kept.test.mjs")
+        notes = self.root / ".github" / "workflows" / "notes.txt"
+        notes.parent.mkdir(parents=True)
+        notes.write_text("test_kept.py kept.test.mjs\n", encoding="utf-8")
+        result = self.run_gate()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("no workflow files under .github/workflows", result.stderr)
 
 
 if __name__ == "__main__":
