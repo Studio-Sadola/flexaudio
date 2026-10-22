@@ -725,6 +725,77 @@ mod retained_cause_tests {
 #[cfg(test)]
 mod error_projection_tests {
     use super::*;
+
+    #[test]
+    fn every_core_error_variant_preserves_canonical_kind_and_typed_payload() {
+        Python::initialize();
+        Python::attach(|py| {
+            for (kind, canonical_name, error) in flexaudio_core::test_support::error_variant_cases()
+            {
+                assert_eq!(error.kind(), kind, "core variant: {error:?}");
+                let payload = AudioError(error.clone());
+                assert_eq!(payload.kind(), canonical_name, "variant: {error:?}");
+                let dict = payload.to_dict(py).unwrap();
+                assert_eq!(
+                    dict.get_item("kind")
+                        .unwrap()
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    canonical_name,
+                    "serialized variant: {error:?}"
+                );
+
+                let exception = to_py_err(error.clone());
+                if kind == fa::ErrorKind::IgnoredSettings {
+                    assert!(exception.value(py).getattr("report").is_ok());
+                    assert!(exception.value(py).getattr("audio_error").is_err());
+                    continue;
+                }
+                let attached = exception.value(py).getattr("audio_error").unwrap();
+                assert_eq!(
+                    attached
+                        .getattr("kind")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    canonical_name,
+                    "exception variant: {error:?}"
+                );
+                assert_eq!(
+                    attached
+                        .getattr("addon_kind")
+                        .unwrap()
+                        .extract::<Option<String>>()
+                        .unwrap(),
+                    error.addon_kind().map(|kind| kind.as_str().to_owned()),
+                    "addon identity: {error:?}"
+                );
+                assert_eq!(
+                    attached
+                        .getattr("addon_message")
+                        .unwrap()
+                        .extract::<Option<String>>()
+                        .unwrap(),
+                    match error.root() {
+                        fa::Error::Addon { message, .. } => Some(message.clone()),
+                        _ => None,
+                    },
+                    "addon message: {error:?}"
+                );
+                assert_eq!(
+                    attached
+                        .getattr("vad_code")
+                        .unwrap()
+                        .extract::<Option<String>>()
+                        .unwrap(),
+                    error.vad_code().map(|code| code.as_str().to_owned()),
+                    "VAD code: {error:?}"
+                );
+            }
+        });
+    }
+
     #[test]
     fn typed_python_flac_exceptions_retain_shared_addon_projection() {
         Python::initialize();

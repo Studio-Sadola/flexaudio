@@ -235,15 +235,37 @@ fn c_header_symbol_values(symbols: &[String]) -> Vec<i32> {
         .collect()
 }
 
+/// Resolve a canonical symbol to the Rust ABI constant, independently of root_code.
+/// This lists symbols, not a second ErrorKind-to-code mapping.
+fn rust_error_code(symbol: &str) -> i32 {
+    macro_rules! resolve {
+        ($($constant:ident),+ $(,)?) => {
+            match symbol {
+                $(stringify!($constant) => crate::error::code::$constant,)+
+                _ => panic!("canonical C error symbol has no Rust constant: {symbol}"),
+            }
+        };
+    }
+    resolve!(
+        FLEX_INVALID_ARG,
+        FLEX_INVALID_STATE,
+        FLEX_DEVICE_NOT_FOUND,
+        FLEX_DEVICE_LOST,
+        FLEX_PERMISSION_DENIED,
+        FLEX_UNSUPPORTED_OS_VERSION,
+        FLEX_UNSUPPORTED,
+        FLEX_UNSUPPORTED_FORMAT,
+        FLEX_NATIVE_FORMAT_CHANGED,
+        FLEX_AMBIGUOUS_DEVICE_NAME,
+        FLEX_IGNORED_SETTINGS,
+        FLEX_FAILURE,
+    )
+}
+
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "requires the cc C compiler; the Linux CI job enforces this check"
-)]
 fn every_core_error_kind_maps_to_canonical_distinct_c_code() {
     let cases = flexaudio_core::test_support::error_cases();
     let mut by_code = std::collections::BTreeMap::<i32, Vec<flexaudio::ErrorKind>>::new();
-    let mut symbols = Vec::new();
     for (kind, name, error) in &cases {
         assert_eq!(
             error.kind(),
@@ -257,7 +279,11 @@ fn every_core_error_kind_maps_to_canonical_distinct_c_code() {
             ascii_c_identifier(&symbol),
             "canonical code symbol is not an ASCII identifier: {symbol}"
         );
-        symbols.push(symbol);
+        assert_eq!(
+            code,
+            rust_error_code(&symbol),
+            "C error code must equal the canonical Rust constant for {kind:?}"
+        );
     }
     for (code, kinds) in &by_code {
         assert!(
@@ -265,17 +291,43 @@ fn every_core_error_kind_maps_to_canonical_distinct_c_code() {
             "C error code collision or fallback for {kinds:?} sharing {code}"
         );
     }
+}
+
+#[test]
+fn every_core_error_variant_maps_to_its_canonical_c_code() {
+    for (kind, name, error) in flexaudio_core::test_support::error_variant_cases() {
+        assert_eq!(error.kind(), kind, "core error fixture must match its kind");
+        let symbol = flexaudio_core::test_support::canonical_error_code_symbol(name);
+        assert_eq!(
+            crate::error::root_code(&error),
+            rust_error_code(&symbol),
+            "C error code must be canonical for {kind:?}: {error:?}"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "requires the cc C compiler; the Linux CI job enforces this check"
+)]
+fn canonical_c_header_error_values_match_rust_constants() {
+    let cases = flexaudio_core::test_support::error_cases();
+    let symbols: Vec<_> = cases
+        .iter()
+        .map(|(_, name, _)| flexaudio_core::test_support::canonical_error_code_symbol(name))
+        .collect();
     let values = c_header_symbol_values(&symbols);
     assert_eq!(
         values.len(),
         cases.len(),
         "header program must print one value per kind"
     );
-    for ((kind, _, error), value) in cases.iter().zip(values) {
+    for (((kind, _, _), symbol), value) in cases.iter().zip(&symbols).zip(values) {
         assert_eq!(
-            crate::error::root_code(error),
+            rust_error_code(symbol),
             value,
-            "C error code must equal the canonical header value for {kind:?}"
+            "canonical Rust error constant must equal the header value for {kind:?}"
         );
     }
 }

@@ -111,6 +111,10 @@ inventory from its definition. A discarded `Result` written as `let _ =` or
 crates: flexaudio, flexaudio-mic, the three OS backends, flexaudio-napi,
 flexaudio-py and flexaudio-ffi. Intentional non-stop discards carry a local
 reason; stop and cleanup paths retain their outcomes without lint exceptions.
+The registration proves that each path has a typed fixture that touches its
+backend, not what the fixture asserts. Fixture contents are reviewed like any
+other test.
+
 The limit is explicit: a failure swallowed inside a function in some other way,
 outside the registered entry and without a discarded `Result`, is not detected
 automatically. These checks replace the removed source-text stop guard.

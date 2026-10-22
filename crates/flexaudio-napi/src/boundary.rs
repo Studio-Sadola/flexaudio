@@ -24,6 +24,24 @@ pub(super) fn error_code(kind: ErrorKind) -> &'static str {
     }
 }
 
+fn kind_name(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::InvalidArg => "invalidArg",
+        ErrorKind::InvalidState => "invalidState",
+        ErrorKind::DeviceNotFound => "deviceNotFound",
+        ErrorKind::PermissionDenied => "permissionDenied",
+        ErrorKind::UnsupportedOsVersion => "unsupportedOsVersion",
+        ErrorKind::DeviceLost => "deviceLost",
+        ErrorKind::Backend => "backend",
+        ErrorKind::UnsupportedFormat => "unsupportedFormat",
+        ErrorKind::NativeFormatChanged => "nativeFormatChanged",
+        ErrorKind::Unsupported => "unsupported",
+        ErrorKind::AmbiguousDeviceName => "ambiguousDeviceName",
+        ErrorKind::IgnoredSettings => "ignoredSettings",
+        _ => panic!("unmapped Node error kind: {kind:?}"),
+    }
+}
+
 pub(super) fn to_napi_err(error: Error) -> NapiError {
     let status = match error.kind() {
         ErrorKind::InvalidArg | ErrorKind::UnsupportedFormat => Status::InvalidArg,
@@ -106,6 +124,33 @@ pub struct JsShutdownReport {
 #[cfg(test)]
 mod contract_tests {
     use super::*;
+
+    #[test]
+    fn every_core_error_variant_projects_its_canonical_kind_and_code() {
+        for (kind, name, error) in flexaudio_core::test_support::error_variant_cases() {
+            assert_eq!(error.kind(), kind, "core error fixture must match its kind");
+            let projected = audio_error(&error);
+            assert_eq!(
+                projected.kind, name,
+                "Node kind must be canonical for {kind:?}: {error:?}"
+            );
+            assert_eq!(
+                error_code(kind),
+                flexaudio_core::test_support::canonical_error_code_symbol(name),
+                "Node error code must be canonical for {kind:?}: {error:?}"
+            );
+            assert_eq!(
+                projected.addon_kind.as_deref(),
+                error.addon_kind().map(|kind| kind.as_str()),
+                "Node must preserve the addon identity"
+            );
+            assert_eq!(
+                projected.vad_code.as_deref(),
+                error.vad_code().map(|code| code.as_str()),
+                "Node must preserve the VAD code"
+            );
+        }
+    }
 
     #[test]
     fn every_core_error_kind_maps_to_canonical_distinct_node_projection() {
@@ -232,26 +277,7 @@ pub(super) fn audio_error(error: &Error) -> JsAudioError {
             _ => break,
         }
     }
-    let kind = match root {
-        Error::InvalidArg(_) => "invalidArg",
-        Error::InvalidState(_) => "invalidState",
-        Error::DeviceNotFound => "deviceNotFound",
-        Error::PermissionDenied { .. } => "permissionDenied",
-        Error::UnsupportedOsVersion => "unsupportedOsVersion",
-        Error::DeviceLost => "deviceLost",
-        Error::Backend(_) | Error::Vad { .. } => "backend",
-        Error::Addon { .. } => match error.kind() {
-            ErrorKind::InvalidArg => "invalidArg",
-            ErrorKind::UnsupportedFormat => "unsupportedFormat",
-            _ => "backend",
-        },
-        Error::UnsupportedFormat(_) => "unsupportedFormat",
-        Error::NativeFormatChanged { .. } => "nativeFormatChanged",
-        Error::Unsupported => "unsupported",
-        Error::AmbiguousDeviceName => "ambiguousDeviceName",
-        Error::IgnoredSettings { .. } => "ignoredSettings",
-        _ => "unknown",
-    };
+    let kind = kind_name(root.kind());
     let (advertised, actual) = match root {
         Error::NativeFormatChanged { advertised, actual } => (
             Some(JsNativeFormat {

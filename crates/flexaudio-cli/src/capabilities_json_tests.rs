@@ -37,6 +37,25 @@ fn error_kind_tags_match_core_inventory_without_collisions() {
 }
 
 #[test]
+fn every_core_error_variant_projects_its_canonical_kind() {
+    for (kind, canonical_name, error) in flexaudio_core::test_support::error_variant_cases() {
+        assert_eq!(error.kind(), kind, "core variant: {error:?}");
+        assert_eq!(
+            error_kind(&error.kind()),
+            canonical_name,
+            "variant: {error:?}"
+        );
+        let projected = availability(&Availability::Unknown {
+            error: error.clone(),
+        });
+        assert_eq!(
+            projected["error"]["kind"], canonical_name,
+            "capability variant: {error:?}"
+        );
+    }
+}
+
+#[test]
 fn availability_and_reason_shapes_match_contract() {
     assert_eq!(
         availability(&Availability::Supported),

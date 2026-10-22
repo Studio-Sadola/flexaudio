@@ -3,6 +3,143 @@
 pub use crate::error_context::shutdown_fields;
 pub use crate::errors::error_cases;
 
+// Each list also generates an exhaustive match in the defining crate, so a new
+// typed cause cannot silently miss the shared binding fixtures.
+macro_rules! variant_inventory {
+    ($name:ident, $ty:ident, [$($variant:ident),+ $(,)?]) => {
+        fn $name() -> Vec<crate::$ty> {
+            fn covered(value: crate::$ty) {
+                match value { $(crate::$ty::$variant => ()),+ }
+            }
+            let values = vec![$(crate::$ty::$variant),+];
+            for value in &values {
+                covered(*value);
+            }
+            values
+        }
+    };
+}
+
+variant_inventory!(
+    addon_kinds,
+    AddonErrorKind,
+    [
+        VadModelLoad,
+        VadInference,
+        VadInvalidConfig,
+        VadInvalidFormat,
+        VadResample,
+        VadReset,
+        FlacIo,
+        FlacUnsupported,
+        FlacEncoder,
+    ]
+);
+variant_inventory!(
+    vad_codes,
+    VadErrorCode,
+    [
+        InvalidParameter,
+        InvalidProbability,
+        InvalidPcm,
+        Overflow,
+        SessionFinished,
+        Inference,
+        ModelLoad,
+        FailedSession,
+        InvalidStereoLength,
+        CaptureSampleOverflow,
+        PtsOutOfRange,
+        UnsupportedTap,
+        UnsupportedConversionClock,
+        Conversion,
+        Stopped,
+    ]
+);
+
+macro_rules! error_shapes {
+    ($($name:literal => $pattern:pat),+ $(,)?) => {
+        fn error_shape(error: &crate::Error) -> &'static str {
+            match error { $($pattern => $name),+ }
+        }
+        const ERROR_SHAPES: &[&str] = &[$($name),+];
+    };
+}
+
+error_shapes! {
+    "InvalidArg" => crate::Error::InvalidArg(_),
+    "InvalidState" => crate::Error::InvalidState(_),
+    "DeviceNotFound" => crate::Error::DeviceNotFound,
+    "PermissionDenied" => crate::Error::PermissionDenied { .. },
+    "UnsupportedOsVersion" => crate::Error::UnsupportedOsVersion,
+    "DeviceLost" => crate::Error::DeviceLost,
+    "Backend" => crate::Error::Backend(_),
+    "Addon" => crate::Error::Addon { .. },
+    "Vad" => crate::Error::Vad { .. },
+    "UnsupportedFormat" => crate::Error::UnsupportedFormat(_),
+    "NativeFormatChanged" => crate::Error::NativeFormatChanged { .. },
+    "Unsupported" => crate::Error::Unsupported,
+    "AmbiguousDeviceName" => crate::Error::AmbiguousDeviceName,
+    "Diagnostic" => crate::Error::Diagnostic { .. },
+    "Context" => crate::Error::Context { .. },
+    "Multiple" => crate::Error::Multiple(_),
+    "IgnoredSettings" => crate::Error::IgnoredSettings { .. },
+}
+
+/// Representative values of every error variant, addon kind and VAD code,
+/// both directly and inside context, diagnostic and related-error wrappers.
+/// Internal test support only; no stability guarantee.
+pub fn error_variant_cases() -> Vec<(crate::ErrorKind, &'static str, crate::Error)> {
+    use crate::{Error, ErrorContext, ErrorGroup, Operation};
+
+    let canonical = error_cases();
+    let mut roots: Vec<_> = canonical
+        .iter()
+        .map(|(_, _, error)| error.clone())
+        .collect();
+    roots.extend(addon_kinds().into_iter().map(|kind| Error::Addon {
+        kind,
+        message: "addon diagnostic".into(),
+    }));
+    roots.extend(vad_codes().into_iter().map(|code| Error::Vad { code }));
+    let mut cases = Vec::new();
+    for error in roots {
+        let kind = error.kind();
+        let name = canonical
+            .iter()
+            .find(|(candidate, _, _)| *candidate == kind)
+            .expect("every variant kind must have a canonical core name")
+            .1;
+        let wrapped = [
+            error.clone(),
+            error
+                .clone()
+                .with_context(ErrorContext::new(Operation::Stop)),
+            error
+                .clone()
+                .with_diagnostic_detail("fixture diagnostic".into()),
+            Error::Multiple(ErrorGroup::new(error, Error::DeviceLost, Vec::new())),
+        ];
+        for error in wrapped {
+            assert_eq!(
+                error.kind(),
+                kind,
+                "wrappers must preserve the primary kind"
+            );
+            cases.push((kind, name, error));
+        }
+    }
+    for shape in ERROR_SHAPES {
+        assert!(
+            cases
+                .iter()
+                .any(|(_, _, error)| error_shape(error) == *shape),
+            "core error variant has no binding fixture: {shape}"
+        );
+    }
+    cases
+}
+
 /// C and Node code symbol for a canonical camelCase kind name.
 ///
 /// `backend` is the one existing ABI exception and is spelled `FLEX_FAILURE`.

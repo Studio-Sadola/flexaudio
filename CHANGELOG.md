@@ -42,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"ignoredSettings"`.
 - Node structured `AudioError.kind` retains `"ignoredSettings"` instead of
   falling back to `"unknown"`.
+- Node structured `AudioError.kind` is now derived from the error's kind, as in
+  Python, C and the CLI. Errors whose kind is not `backend` but were reported
+  as `"backend"` or `"unknown"` (for example, VAD errors classified as invalid
+  arguments) now report their canonical kind name.
 - Capture denoise now accepts any supported output rate in every binding,
   including Node, Python and C v1/v2. All entry points use the shared canonical
   48 kHz processing path before output conversion; settings reports mark denoise
