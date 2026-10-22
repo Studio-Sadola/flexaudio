@@ -3,7 +3,7 @@
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use flexaudio_core::backend::CaptureBackend;
@@ -15,35 +15,76 @@ use crate::probe::{GenerationProbe, Probe, ProbeControl, ProbeOutcome, PROBE_TIM
 use crate::tap::TapResources;
 use crate::{MacProcessBackend, MacSystemBackend};
 
-/// Stop or native release phase selected by the facade's exhaustive contract.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Phase {
-    /// System owner returns a stop failure.
-    SystemStop,
-    /// System owner panics before join.
-    SystemJoin,
-    /// Process owner returns a stop failure.
-    ProcessStop,
-    /// Process owner panics before join.
-    ProcessJoin,
-    /// Main tap callback stop fails.
-    TapStop,
-    /// Main tap callback destruction fails.
-    TapIoProc,
-    /// Main tap aggregate destruction fails.
-    TapAggregate,
-    /// Main process tap destruction fails.
-    TapDestroy,
-    /// Probe callback stop fails.
-    ProbeStop,
-    /// Probe callback destruction fails.
-    ProbeIoProc,
-    /// Probe aggregate destruction fails.
-    ProbeAggregate,
-    /// Probe process tap destruction fails.
-    ProbeTap,
-    /// Probe cleanup fails while stop cancels result publication.
-    ProbeCleanupCancelled,
+macro_rules! phases {
+    ($(#[$meta:meta])* pub enum $name:ident {
+        $($(#[$variant_meta:meta])* $variant:ident,)*
+    }) => {
+        $(#[$meta])*
+        pub enum $name {
+            $($(#[$variant_meta])* $variant,)*
+        }
+
+        impl $name {
+            /// Every stop and native release operation in the fixture contract.
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)*];
+        }
+    };
+}
+
+phases! {
+    /// Stop or native release phase selected by the facade's exhaustive contract.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Phase {
+        /// System owner returns a stop failure.
+        SystemStop,
+        /// System owner panics before join.
+        SystemJoin,
+        /// Process owner returns a stop failure.
+        ProcessStop,
+        /// Process owner panics before join.
+        ProcessJoin,
+        /// Main tap callback stop fails.
+        TapStop,
+        /// Main tap callback destruction fails.
+        TapIoProc,
+        /// Main tap aggregate destruction fails.
+        TapAggregate,
+        /// Main process tap destruction fails.
+        TapDestroy,
+        /// Probe callback stop fails.
+        ProbeStop,
+        /// Probe callback destruction fails.
+        ProbeIoProc,
+        /// Probe aggregate destruction fails.
+        ProbeAggregate,
+        /// Probe process tap destruction fails.
+        ProbeTap,
+        /// Probe cleanup fails while stop cancels result publication.
+        ProbeCleanupCancelled,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Path {
+    System,
+    Process,
+    Tap,
+    Probe,
+}
+
+impl Phase {
+    fn path(self) -> Path {
+        match self {
+            Self::SystemStop | Self::SystemJoin => Path::System,
+            Self::ProcessStop | Self::ProcessJoin => Path::Process,
+            Self::TapStop | Self::TapIoProc | Self::TapAggregate | Self::TapDestroy => Path::Tap,
+            Self::ProbeStop
+            | Self::ProbeIoProc
+            | Self::ProbeAggregate
+            | Self::ProbeTap
+            | Self::ProbeCleanupCancelled => Path::Probe,
+        }
+    }
 }
 
 pub(crate) trait FixtureBackend: CaptureBackend {
@@ -153,11 +194,12 @@ fn owner_result(phase: Phase, cleanup: Arc<CleanupLedger>, exit: Exit) -> Result
     })
 }
 
-fn assert_backend(
-    mut backend: impl FixtureBackend,
+fn assert_backend<B: FixtureBackend>(
+    mut backend: B,
     phase: Phase,
     primary: Option<Error>,
     checked_first: bool,
+    observe: fn(&B),
 ) {
     let checked = if checked_first {
         Some(backend.stop_checked())
@@ -241,6 +283,7 @@ fn assert_backend(
         "second stop must preserve the report"
     );
     assert_eq!(backend.stop_checked(), report.result());
+    observe(&backend);
 }
 
 fn assert_native(status: Option<NativeStatus>, call: &'static str) {
@@ -250,28 +293,69 @@ fn assert_native(status: Option<NativeStatus>, call: &'static str) {
 /// Inject a failure at a real owner join or native cleanup dispatch and check retention.
 /// Each entry uses fresh owners, with and without a capture primary, for both stop APIs.
 pub fn check(phase: Phase) {
+    match phase.path() {
+        Path::Process => check_phase(phase, MacProcessBackend::shutdown_fixture, |_| {}),
+        Path::System | Path::Tap | Path::Probe => {
+            check_phase(phase, MacSystemBackend::shutdown_fixture, |_| {})
+        }
+    }
+}
+
+fn check_phase<B: FixtureBackend>(
+    phase: Phase,
+    construct: impl Fn(JoinHandle<Result<()>>, Arc<CleanupLedger>, Option<Error>) -> B,
+    observe: fn(&B),
+) {
     for primary in [None, Some(Error::DeviceLost)] {
         for checked_first in [false, true] {
             for exit in [Exit::Stop, Exit::Drop, Exit::Rollback] {
                 let cleanup = Arc::new(CleanupLedger::default());
                 let owner_cleanup = cleanup.clone();
                 let handle = thread::spawn(move || owner_result(phase, owner_cleanup, exit));
-                if matches!(phase, Phase::ProcessStop | Phase::ProcessJoin) {
-                    assert_backend(
-                        MacProcessBackend::shutdown_fixture(handle, cleanup, primary.clone()),
-                        phase,
-                        primary.clone(),
-                        checked_first,
-                    );
-                } else {
-                    assert_backend(
-                        MacSystemBackend::shutdown_fixture(handle, cleanup, primary.clone()),
-                        phase,
-                        primary.clone(),
-                        checked_first,
-                    );
-                }
+                assert_backend(
+                    construct(handle, cleanup, primary.clone()),
+                    phase,
+                    primary.clone(),
+                    checked_first,
+                    observe,
+                );
             }
         }
     }
+}
+
+fn check_path<B: FixtureBackend>(
+    path: Path,
+    construct: impl Fn(JoinHandle<Result<()>>, Arc<CleanupLedger>, Option<Error>) -> B,
+    observe: fn(&B),
+) {
+    for &phase in Phase::ALL {
+        if phase.path() == path {
+            check_phase(phase, &construct, observe);
+        }
+    }
+}
+
+/// Check system owner phases and observe the same backends after retention assertions.
+/// Internal test API, with no stability guarantee.
+pub fn check_system(observe: fn(&MacSystemBackend)) {
+    check_path(Path::System, MacSystemBackend::shutdown_fixture, observe);
+}
+
+/// Check process owner phases and observe the same backends after retention assertions.
+/// Internal test API, with no stability guarantee.
+pub fn check_process(observe: fn(&MacProcessBackend)) {
+    check_path(Path::Process, MacProcessBackend::shutdown_fixture, observe);
+}
+
+/// Check tap release phases and observe the system owners retaining their cleanup.
+/// Internal test API, with no stability guarantee.
+pub fn check_tap(observe: fn(&MacSystemBackend)) {
+    check_path(Path::Tap, MacSystemBackend::shutdown_fixture, observe);
+}
+
+/// Check probe release phases and observe the system owners retaining their cleanup.
+/// Internal test API, with no stability guarantee.
+pub fn check_probe(observe: fn(&MacSystemBackend)) {
+    check_path(Path::Probe, MacSystemBackend::shutdown_fixture, observe);
 }

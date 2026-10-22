@@ -25,41 +25,63 @@ pub enum Path {
     Process,
 }
 
-/// Failing operation. Internal, with no stability guarantee.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Phase {
-    /// Native capture stop (and render stop on the system path).
-    Stop,
-    /// Owner thread panic observed by its real join operation.
-    Join,
-    /// Native event close after the owner has formed its report.
-    Close,
-    /// Terminal capture cause followed by native stop failure.
-    TerminalAndStop,
-    /// Session Drop observes a native stop failure.
-    Drop,
-    /// Native startup failure with rollback and event-close cleanup.
-    StartupRollback,
+macro_rules! phases {
+    ($(#[$meta:meta])* pub enum $name:ident {
+        $($(#[$variant_meta:meta])* $variant:ident,)*
+    }) => {
+        $(#[$meta])*
+        pub enum $name {
+            $($(#[$variant_meta])* $variant,)*
+        }
+
+        impl $name {
+            /// Every operation tested for each registered Windows path.
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)*];
+        }
+    };
 }
 
-impl Phase {
-    /// Every operation tested for each registered Windows path.
-    pub const ALL: &'static [Self] = &[
-        Self::Stop,
-        Self::Join,
-        Self::Close,
-        Self::TerminalAndStop,
-        Self::Drop,
-        Self::StartupRollback,
-    ];
+phases! {
+    /// Failing operation. Internal, with no stability guarantee.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Phase {
+        /// Native capture stop (and render stop on the system path).
+        Stop,
+        /// Owner thread panic observed by its real join operation.
+        Join,
+        /// Native event close after the owner has formed its report.
+        Close,
+        /// Terminal capture cause followed by native stop failure.
+        TerminalAndStop,
+        /// Session Drop observes a native stop failure.
+        Drop,
+        /// Native startup failure with rollback and event-close cleanup.
+        StartupRollback,
+    }
 }
 
 /// Drive a fresh backend fixture and check void, checked, and repeated stops.
 /// Internal test API, with no stability guarantee.
 pub fn check(path: Path, phase: Phase) {
     match path {
-        Path::System => crate::system::WasapiSystemBackend::check_stop_phase(phase),
-        Path::Process => crate::process::WasapiProcessBackend::check_stop_phase(phase),
+        Path::System => crate::system::WasapiSystemBackend::check_stop_phase(phase, |_| {}),
+        Path::Process => crate::process::WasapiProcessBackend::check_stop_phase(phase, |_| {}),
+    }
+}
+
+/// Check every system phase and observe each backend that passed the assertions.
+/// Internal test API, with no stability guarantee.
+pub fn check_system(observe: fn(&crate::WasapiSystemBackend)) {
+    for &phase in Phase::ALL {
+        crate::WasapiSystemBackend::check_stop_phase(phase, observe);
+    }
+}
+
+/// Check every process phase and observe each backend that passed the assertions.
+/// Internal test API, with no stability guarantee.
+pub fn check_process(observe: fn(&crate::WasapiProcessBackend)) {
+    for &phase in Phase::ALL {
+        crate::WasapiProcessBackend::check_stop_phase(phase, observe);
     }
 }
 

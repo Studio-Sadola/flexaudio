@@ -2,8 +2,7 @@
 use super::*;
 use crate::test_support::{stop_failure, StopPhase};
 
-#[derive(Clone, Copy)]
-pub(crate) enum Phase {
+crate::stop_contract::phases! {
     Stop,
     Panic,
     TerminalAndStop,
@@ -11,7 +10,13 @@ pub(crate) enum Phase {
     WatchdogJoin,
 }
 
-pub(crate) fn check(phase: Phase) {
+pub(crate) fn check_all(observe: fn(&Stream)) {
+    for phase in Phase::ALL {
+        check(*phase, observe);
+    }
+}
+
+fn check(phase: Phase, observe: fn(&Stream)) {
     for checked_first in [false, true] {
         let stop_cause = Error::DeviceLost
             .with_context(ErrorContext::new(Operation::Stop))
@@ -67,5 +72,6 @@ pub(crate) fn check(phase: Phase) {
         stream.stop();
         assert_eq!(stream.shutdown_report(), Some(report.clone()));
         assert_eq!(stream.stop_checked(), report.result());
+        observe(&stream);
     }
 }

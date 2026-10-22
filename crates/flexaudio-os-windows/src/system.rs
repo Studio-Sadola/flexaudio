@@ -1026,7 +1026,7 @@ impl WasapiSystemBackend {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn check_stop_phase(phase: crate::test_support::Phase) {
+    pub(crate) fn check_stop_phase(phase: crate::test_support::Phase, observe: fn(&Self)) {
         let mut backend = Self::new(true, None);
         let expected = crate::test_support::prepare(
             &mut backend.shutdown,
@@ -1042,5 +1042,6 @@ impl WasapiSystemBackend {
         backend.stop();
         assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
         assert_eq!(backend.stop_checked(), expected.result());
+        observe(&backend);
     }
 }

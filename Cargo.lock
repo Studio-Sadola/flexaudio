@@ -739,6 +739,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "flexaudio",
+ "flexaudio-core",
  "flexaudio-mic",
  "flexaudio-os-linux",
  "hound",

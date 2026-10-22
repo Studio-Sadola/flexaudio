@@ -4,9 +4,22 @@
 
 use crate::*;
 
-/// Real owner operations selected for failure injection.
-#[derive(Clone, Copy)]
-pub enum Phase {
+macro_rules! phases {
+    ($( $(#[$doc:meta])* $variant:ident, )*) => {
+        /// Real owner operations selected for failure injection.
+        #[derive(Clone, Copy)]
+        pub enum Phase {
+            $( $(#[$doc])* $variant, )*
+        }
+
+        impl Phase {
+            /// Every supported injection phase, generated from its definition.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),*];
+        }
+    };
+}
+
+phases! {
     /// Microphone capture owner join failure.
     Join,
     /// Callback terminal failure followed by an owner join failure.
@@ -18,6 +31,10 @@ pub enum Phase {
 /// Exercise void stop, checked stop, and repeated stop through a real worker join.
 /// This internal test entry has no stability guarantee and runs on every CI OS.
 pub fn check(phase: Phase) {
+    check_observed(phase, |_| {});
+}
+
+fn check_observed(phase: Phase, observe: impl Fn(&CpalMicBackend)) {
     for checked_first in [false, true] {
         let mut owner = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
         let terminal = match phase {
@@ -52,6 +69,15 @@ pub fn check(phase: Phase) {
         owner.stop();
         assert_eq!(owner.shutdown_report(), Some(&expected));
         assert_eq!(owner.stop_checked(), expected.result());
+        observe(&owner);
+    }
+}
+
+/// Exercise every microphone phase and observe each tested concrete owner.
+/// This internal test entry has no stability guarantee and runs on every CI OS.
+pub fn check_all(observe: fn(&CpalMicBackend)) {
+    for &phase in Phase::ALL {
+        check_observed(phase, observe);
     }
 }
 
@@ -61,9 +87,7 @@ mod tests {
 
     #[test]
     fn microphone_shutdown_retains_primary_and_join_cleanup() {
-        check(Phase::Join);
-        check(Phase::TerminalAndJoin);
-        check(Phase::ConsumedTerminalAndJoin);
+        check_all(|_| {});
     }
 
     #[test]

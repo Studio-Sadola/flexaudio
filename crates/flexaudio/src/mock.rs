@@ -591,20 +591,11 @@ impl MockShutdown {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy)]
-pub(crate) enum StopFixture {
-    Sine,
-    Stallable,
-    Panicking,
-    Reopening,
-}
-
-#[cfg(test)]
-pub(crate) fn check_stop_contract(fixture: StopFixture) {
-    macro_rules! check {
-        ($backend:expr) => {{
+macro_rules! stop_fixture {
+    ($name:ident, $backend:ty, $construct:expr) => {
+        pub(crate) fn $name(observe: fn(&$backend)) {
             for checked_first in [false, true] {
-                let mut backend = $backend;
+                let mut backend: $backend = $construct;
                 backend.handle = Some(thread::spawn(|| panic!("injected generator join failure")));
                 if checked_first {
                     assert!(backend.stop_checked().is_err());
@@ -625,20 +616,29 @@ pub(crate) fn check_stop_contract(fixture: StopFixture) {
                 backend.stop();
                 assert_eq!(backend.shutdown.report, Some(report.clone()));
                 assert_eq!(backend.stop_checked(), report.result());
+                observe(&backend);
             }
-        }};
-    }
-    match fixture {
-        StopFixture::Sine => check!(MockBackend::new(48_000, 2, 0.0)),
-        StopFixture::Stallable => check!(StallableMockBackend::new(48_000, 2, 0.0, Duration::ZERO)),
-        StopFixture::Panicking => {
-            check!(PanickingMockBackend::new(48_000, 2, 0.0, PanicMode::Start))
         }
-        StopFixture::Reopening => check!(StallThenPanicOnReopenBackend::new(
-            48_000,
-            2,
-            0.0,
-            Duration::ZERO
-        )),
-    }
+    };
 }
+
+#[cfg(test)]
+stop_fixture!(check_sine, MockBackend, MockBackend::new(48_000, 2, 0.0));
+#[cfg(test)]
+stop_fixture!(
+    check_stallable,
+    StallableMockBackend,
+    StallableMockBackend::new(48_000, 2, 0.0, Duration::ZERO)
+);
+#[cfg(test)]
+stop_fixture!(
+    check_panicking,
+    PanickingMockBackend,
+    PanickingMockBackend::new(48_000, 2, 0.0, PanicMode::Start)
+);
+#[cfg(test)]
+stop_fixture!(
+    check_reopening,
+    StallThenPanicOnReopenBackend,
+    StallThenPanicOnReopenBackend::new(48_000, 2, 0.0, Duration::ZERO)
+);

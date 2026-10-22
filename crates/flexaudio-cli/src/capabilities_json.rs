@@ -134,20 +134,25 @@ tags!(source_kind, SourceKind, {
     SourceKind::ProcessLoopback => "process",
     SourceKind::Mix => "mix",
 });
-tags!(error_kind, ErrorKind, {
-    ErrorKind::InvalidArg => "invalidArg",
-    ErrorKind::InvalidState => "invalidState",
-    ErrorKind::DeviceNotFound => "deviceNotFound",
-    ErrorKind::PermissionDenied => "permissionDenied",
-    ErrorKind::UnsupportedOsVersion => "unsupportedOsVersion",
-    ErrorKind::DeviceLost => "deviceLost",
-    ErrorKind::Backend => "backend",
-    ErrorKind::UnsupportedFormat => "unsupportedFormat",
-    ErrorKind::NativeFormatChanged => "nativeFormatChanged",
-    ErrorKind::Unsupported => "unsupported",
-    ErrorKind::AmbiguousDeviceName => "ambiguousDeviceName",
-    ErrorKind::IgnoredSettings => "ignoredSettings",
-});
+fn error_kind(value: &ErrorKind) -> &'static str {
+    match value {
+        ErrorKind::InvalidArg => "invalidArg",
+        ErrorKind::InvalidState => "invalidState",
+        ErrorKind::DeviceNotFound => "deviceNotFound",
+        ErrorKind::PermissionDenied => "permissionDenied",
+        ErrorKind::UnsupportedOsVersion => "unsupportedOsVersion",
+        ErrorKind::DeviceLost => "deviceLost",
+        ErrorKind::Backend => "backend",
+        ErrorKind::UnsupportedFormat => "unsupportedFormat",
+        ErrorKind::NativeFormatChanged => "nativeFormatChanged",
+        ErrorKind::Unsupported => "unsupported",
+        ErrorKind::AmbiguousDeviceName => "ambiguousDeviceName",
+        ErrorKind::IgnoredSettings => "ignoredSettings",
+        // ErrorKind is non-exhaustive outside core. Its runtime inventory test
+        // makes a new kind fail until this explicit wire mapping is updated.
+        _ => panic!("unmapped error kind: {value:?}"),
+    }
+}
 
 #[cfg(test)]
 #[path = "capabilities_json_tests.rs"]

@@ -1,125 +1,74 @@
-//! Adding a registered path requires a fixture arm: this match has no wildcard.
+//! The production registrations drive typed fixtures; paths only name coverage.
 use super::*;
+use std::cell::Cell;
+
+thread_local! {
+    static OBSERVED: Cell<usize> = const { Cell::new(0) };
+}
+
+fn check_fixture<B>(fixture: fn(fn(&B)), path: &StopPath) {
+    OBSERVED.with(|count| count.set(0));
+    fixture(|_: &B| OBSERVED.with(|count| count.set(count.get() + 1)));
+    assert!(
+        OBSERVED.with(Cell::get) > 0,
+        "{} fixture did not observe its backend",
+        path.name()
+    );
+}
 
 #[test]
 fn registered_stop_paths_retain_injected_operation_failures() {
+    // Stream owns the facade teardown but is not a factory CaptureBackend.
+    let stream = StopPath::Stream(crate::stream::stop_contract_tests::check_all);
+    stream.check();
+    let mut covered = vec![stream.name()];
+    for registration in REGISTRATIONS {
+        assert!(!registration.is_empty());
+        for path in *registration {
+            path.check();
+            covered.push(path.name());
+        }
+    }
     for path in ALL {
-        check(*path);
+        assert_eq!(
+            covered.iter().filter(|covered| **covered == *path).count(),
+            1,
+            "{} must have exactly one fixture registration",
+            path
+        );
     }
 }
 
-fn check(path: StopPath) {
-    match path {
-        StopPath::Stream => {
-            use crate::stream::stop_contract_tests::{check, Phase::*};
-            for phase in [Stop, Panic, TerminalAndStop, IntakeJoin, WatchdogJoin] {
-                check(phase);
-            }
-        }
-        StopPath::Mix => {
-            use crate::mix::stop_contract_tests::{check, Phase::*};
-            for phase in [
-                MicrophoneStop,
-                SystemStop,
-                MixerJoin,
-                TerminalAndStop,
-                RestorePrevious,
-            ] {
-                check(phase);
-            }
-        }
-        StopPath::Mock => crate::mock::check_stop_contract(crate::mock::StopFixture::Sine),
-        StopPath::StallableMock => {
-            crate::mock::check_stop_contract(crate::mock::StopFixture::Stallable)
-        }
-        StopPath::PanickingMock => {
-            crate::mock::check_stop_contract(crate::mock::StopFixture::Panicking)
-        }
-        StopPath::ReopeningMock => {
-            crate::mock::check_stop_contract(crate::mock::StopFixture::Reopening)
-        }
-        StopPath::Microphone => {
-            use flexaudio_mic::test_support::{check, Phase::*};
-            for phase in [Join, TerminalAndJoin, ConsumedTerminalAndJoin] {
-                check(phase);
-            }
-        }
-        #[cfg(target_os = "linux")]
-        StopPath::LinuxSystem => {
-            use flexaudio_os_linux::test_support::{check, Phase::*};
-            for phase in [
-                SystemJoin,
-                SystemTerminalAndJoin,
-                SystemConsumedTerminalAndJoin,
-            ] {
-                check(phase);
-            }
-        }
-        #[cfg(target_os = "linux")]
-        StopPath::LinuxProcess => {
-            use flexaudio_os_linux::test_support::{check, Phase::*};
-            for phase in [
-                ProcessJoin,
-                ProcessTerminalAndJoin,
-                ProcessConsumedTerminalAndJoin,
-            ] {
-                check(phase);
-            }
-        }
-        #[cfg(target_os = "linux")]
-        StopPath::LinuxWatcher => {
-            use flexaudio_os_linux::test_support::{check, Phase::*};
-            for phase in [WatcherJoin, WatcherTerminalAndJoin] {
-                check(phase);
-            }
-        }
-        #[cfg(target_os = "windows")]
-        StopPath::WindowsSystem => {
-            use flexaudio_os_windows::test_support::{check, Path, Phase};
-            for phase in Phase::ALL {
-                check(Path::System, *phase);
-            }
-        }
-        #[cfg(target_os = "windows")]
-        StopPath::WindowsProcess => {
-            use flexaudio_os_windows::test_support::{check, Path, Phase};
-            for phase in Phase::ALL {
-                check(Path::Process, *phase);
-            }
-        }
-        #[cfg(target_os = "macos")]
-        StopPath::MacSystem => {
-            use flexaudio_os_macos::test_support::{check, Phase::*};
-            for phase in [SystemStop, SystemJoin] {
-                check(phase);
-            }
-        }
-        #[cfg(target_os = "macos")]
-        StopPath::MacProcess => {
-            use flexaudio_os_macos::test_support::{check, Phase::*};
-            for phase in [ProcessStop, ProcessJoin] {
-                check(phase);
-            }
-        }
-        #[cfg(target_os = "macos")]
-        StopPath::MacTap => {
-            use flexaudio_os_macos::test_support::{check, Phase::*};
-            for phase in [TapStop, TapIoProc, TapAggregate, TapDestroy] {
-                check(phase);
-            }
-        }
-        #[cfg(target_os = "macos")]
-        StopPath::MacProbe => {
-            use flexaudio_os_macos::test_support::{check, Phase::*};
-            for phase in [
-                ProbeStop,
-                ProbeIoProc,
-                ProbeAggregate,
-                ProbeTap,
-                ProbeCleanupCancelled,
-            ] {
-                check(phase);
-            }
+impl StopPath {
+    // This executes the runner carried by the registration. The match cannot
+    // select an unrelated backend: each variant fixes its runner's type.
+    fn check(&self) {
+        match self {
+            Self::Stream(fixture) => check_fixture(*fixture, self),
+            Self::Mix(fixture) => check_fixture(*fixture, self),
+            Self::Mock(fixture) => check_fixture(*fixture, self),
+            Self::StallableMock(fixture) => check_fixture(*fixture, self),
+            Self::PanickingMock(fixture) => check_fixture(*fixture, self),
+            Self::ReopeningMock(fixture) => check_fixture(*fixture, self),
+            Self::Microphone(fixture) => check_fixture(*fixture, self),
+            #[cfg(target_os = "linux")]
+            Self::LinuxSystem(fixture) => check_fixture(*fixture, self),
+            #[cfg(target_os = "linux")]
+            Self::LinuxProcess(fixture) => check_fixture(*fixture, self),
+            #[cfg(target_os = "linux")]
+            Self::LinuxWatcher(fixture) => check_fixture(*fixture, self),
+            #[cfg(target_os = "windows")]
+            Self::WindowsSystem(fixture) => check_fixture(*fixture, self),
+            #[cfg(target_os = "windows")]
+            Self::WindowsProcess(fixture) => check_fixture(*fixture, self),
+            #[cfg(target_os = "macos")]
+            Self::MacSystem(fixture) => check_fixture(*fixture, self),
+            #[cfg(target_os = "macos")]
+            Self::MacProcess(fixture) => check_fixture(*fixture, self),
+            #[cfg(target_os = "macos")]
+            Self::MacTap(fixture) => check_fixture(*fixture, self),
+            #[cfg(target_os = "macos")]
+            Self::MacProbe(fixture) => check_fixture(*fixture, self),
         }
     }
 }

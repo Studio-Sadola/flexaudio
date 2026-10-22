@@ -665,7 +665,7 @@ impl WasapiProcessBackend {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn check_stop_phase(phase: crate::test_support::Phase) {
+    pub(crate) fn check_stop_phase(phase: crate::test_support::Phase, observe: fn(&Self)) {
         let mut backend = Self::new(1, ProcessMode::Include);
         let expected = crate::test_support::prepare(
             &mut backend.shutdown,
@@ -681,5 +681,6 @@ impl WasapiProcessBackend {
         backend.stop();
         assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
         assert_eq!(backend.stop_checked(), expected.result());
+        observe(&backend);
     }
 }

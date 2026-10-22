@@ -23,19 +23,17 @@ fn enum_tags_match_contract() {
     assert_tags!(watch_scope, [WatchScope::SystemOutputs => "systemOutputs", WatchScope::DefaultSystemOutput => "defaultSystemOutput"]);
     assert_tags!(side_effect_condition, [SideEffectCondition::SilentActiveSystemAudio => "silentActiveSystemAudio", SideEffectCondition::ClassicLoopbackWithoutExclusions => "classicLoopbackWithoutExclusions"]);
     assert_tags!(source_kind, [SourceKind::Mic => "mic", SourceKind::SystemLoopback => "system", SourceKind::ProcessLoopback => "process", SourceKind::Mix => "mix"]);
-    assert_tags!(error_kind, [
-        ErrorKind::InvalidArg => "invalidArg",
-        ErrorKind::InvalidState => "invalidState",
-        ErrorKind::DeviceNotFound => "deviceNotFound",
-        ErrorKind::PermissionDenied => "permissionDenied",
-        ErrorKind::UnsupportedOsVersion => "unsupportedOsVersion",
-        ErrorKind::DeviceLost => "deviceLost",
-        ErrorKind::Backend => "backend",
-        ErrorKind::UnsupportedFormat => "unsupportedFormat",
-        ErrorKind::NativeFormatChanged => "nativeFormatChanged",
-        ErrorKind::Unsupported => "unsupported",
-        ErrorKind::AmbiguousDeviceName => "ambiguousDeviceName",
-    ]);
+}
+
+#[test]
+fn error_kind_tags_match_core_inventory_without_collisions() {
+    let mut names = std::collections::HashSet::new();
+    for (kind, canonical_name, error) in flexaudio_core::test_support::error_cases() {
+        let name = error_kind(&kind);
+        assert_eq!(name, canonical_name, "canonical name for {kind:?}");
+        assert_eq!(error_kind(&error.kind()), name);
+        assert!(names.insert(name), "duplicate error kind name: {name}");
+    }
 }
 
 #[test]

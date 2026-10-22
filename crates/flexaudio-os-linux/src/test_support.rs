@@ -4,9 +4,22 @@
 
 use crate::*;
 
-/// Real owner operations selected for failure injection.
-#[derive(Clone, Copy)]
-pub enum Phase {
+macro_rules! phases {
+    ($( $(#[$doc:meta])* $variant:ident, )*) => {
+        /// Real owner operations selected for failure injection.
+        #[derive(Clone, Copy)]
+        pub enum Phase {
+            $( $(#[$doc])* $variant, )*
+        }
+
+        impl Phase {
+            /// Every supported injection phase, generated from its definition.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),*];
+        }
+    };
+}
+
+phases! {
     /// System capture owner join failure.
     SystemJoin,
     /// System capture terminal failure followed by a join failure.
@@ -23,6 +36,27 @@ pub enum Phase {
     WatcherJoin,
     /// Device watcher terminal failure followed by a join failure.
     WatcherTerminalAndJoin,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixtureKind {
+    System,
+    Process,
+    Watcher,
+}
+
+impl Phase {
+    fn fixture_kind(self) -> FixtureKind {
+        match self {
+            Self::SystemJoin
+            | Self::SystemTerminalAndJoin
+            | Self::SystemConsumedTerminalAndJoin => FixtureKind::System,
+            Self::ProcessJoin
+            | Self::ProcessTerminalAndJoin
+            | Self::ProcessConsumedTerminalAndJoin => FixtureKind::Process,
+            Self::WatcherJoin | Self::WatcherTerminalAndJoin => FixtureKind::Watcher,
+        }
+    }
 }
 
 enum Fixture {
@@ -142,6 +176,10 @@ fn fixture(phase: Phase) -> (Fixture, bool, bool) {
 /// Exercise void stop, checked stop, and repeated stop through a real worker join.
 /// This internal test entry has no stability guarantee and runs on Linux CI.
 pub fn check(phase: Phase) {
+    check_observed(phase, |_| {});
+}
+
+fn check_observed(phase: Phase, observe: impl Fn(&Fixture)) {
     for checked_first in [false, true] {
         let (mut fixture, terminal, consumed) = fixture(phase);
         if consumed {
@@ -161,7 +199,43 @@ pub fn check(phase: Phase) {
         fixture.stop();
         assert_eq!(fixture.report(), &expected);
         assert_eq!(fixture.stop_checked(), expected.result());
+        observe(&fixture);
     }
+}
+
+fn check_kind(kind: FixtureKind, observe: impl Fn(&Fixture)) {
+    for &phase in Phase::ALL {
+        if phase.fixture_kind() == kind {
+            check_observed(phase, &observe);
+        }
+    }
+}
+
+/// Exercise every system capture phase and observe each tested concrete owner.
+/// This internal test entry has no stability guarantee and runs on Linux CI.
+pub fn check_system(observe: fn(&PwSystemBackend)) {
+    check_kind(FixtureKind::System, |fixture| match fixture {
+        Fixture::System(owner) => observe(owner),
+        Fixture::Process(_) | Fixture::Watcher(_) => panic!("expected a system capture fixture"),
+    });
+}
+
+/// Exercise every process capture phase and observe each tested concrete owner.
+/// This internal test entry has no stability guarantee and runs on Linux CI.
+pub fn check_process(observe: fn(&PwProcessBackend)) {
+    check_kind(FixtureKind::Process, |fixture| match fixture {
+        Fixture::Process(owner) => observe(owner),
+        Fixture::System(_) | Fixture::Watcher(_) => panic!("expected a process capture fixture"),
+    });
+}
+
+/// Exercise every watcher phase and observe each tested concrete owner.
+/// This internal test entry has no stability guarantee and runs on Linux CI.
+pub fn check_watcher(observe: fn(&PwDeviceWatcher)) {
+    check_kind(FixtureKind::Watcher, |fixture| match fixture {
+        Fixture::Watcher(owner) => observe(owner),
+        Fixture::System(_) | Fixture::Process(_) => panic!("expected a device watcher fixture"),
+    });
 }
 
 #[cfg(test)]
@@ -170,22 +244,17 @@ mod tests {
 
     #[test]
     fn system_shutdown_retains_primary_and_join_cleanup() {
-        check(Phase::SystemJoin);
-        check(Phase::SystemTerminalAndJoin);
-        check(Phase::SystemConsumedTerminalAndJoin);
+        check_system(|_| {});
     }
 
     #[test]
     fn process_shutdown_retains_primary_and_join_cleanup() {
-        check(Phase::ProcessJoin);
-        check(Phase::ProcessTerminalAndJoin);
-        check(Phase::ProcessConsumedTerminalAndJoin);
+        check_process(|_| {});
     }
 
     #[test]
     fn watcher_shutdown_retains_primary_and_join_cleanup() {
-        check(Phase::WatcherJoin);
-        check(Phase::WatcherTerminalAndJoin);
+        check_watcher(|_| {});
     }
 
     #[test]

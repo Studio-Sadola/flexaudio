@@ -2,8 +2,7 @@
 use super::*;
 use crate::test_support::{failing_backend, StopPhase};
 
-#[derive(Clone, Copy)]
-pub(crate) enum Phase {
+crate::stop_contract::phases! {
     MicrophoneStop,
     SystemStop,
     MixerJoin,
@@ -15,9 +14,15 @@ fn clean() -> Box<dyn CaptureBackend> {
     Box::new(crate::MockBackend::new(48_000, 2, 0.0))
 }
 
-pub(crate) fn check(phase: Phase) {
+pub(crate) fn check_all(observe: fn(&CompositeBackend)) {
+    for phase in Phase::ALL {
+        check(*phase, observe);
+    }
+}
+
+fn check(phase: Phase, observe: fn(&CompositeBackend)) {
     if matches!(phase, Phase::RestorePrevious) {
-        check_restore();
+        check_restore(observe);
         return;
     }
     for checked_first in [false, true] {
@@ -66,10 +71,11 @@ pub(crate) fn check(phase: Phase) {
         mix.stop();
         assert_eq!(mix.shutdown, Some(report.clone()));
         assert_eq!(mix.stop_checked(), report.result());
+        observe(&mix);
     }
 }
 
-fn check_restore() {
+fn check_restore(observe: fn(&CompositeBackend)) {
     struct RestartFailure {
         starts: usize,
     }
@@ -117,4 +123,5 @@ fn check_restore() {
     assert_eq!(mix.stop_checked(), report.result());
     mix.stop();
     assert_eq!(mix.shutdown, Some(report));
+    observe(&mix);
 }

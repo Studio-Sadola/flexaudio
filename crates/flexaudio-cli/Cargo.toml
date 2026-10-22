@@ -27,6 +27,10 @@ ctrlc = "3"
 # Capability JSON projection; already present in the workspace lockfile.
 serde_json = "1"
 
+[dev-dependencies]
+# Internal runtime error-kind inventory; never enabled for production builds.
+flexaudio-core = { path = "../flexaudio-core", features = ["test-support"] }
+
 # System audio (PipeWire) backend for --source system (Linux only).
 [target.'cfg(target_os = "linux")'.dependencies]
 flexaudio-os-linux = { path = "../flexaudio-os-linux" }

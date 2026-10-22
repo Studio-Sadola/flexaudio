@@ -99,9 +99,14 @@ the Linux jobs. Cross-crate fixtures use non-default `test-support` features
 enabled only by dev-dependencies; they are internal and have no stability guarantee.
 
 Two regressions turn CI red automatically. A new stop path in `StopPath` needs
-an injection fixture arm in a wildcard-free match (compiler error E0004), and a
-built-in backend passed through the registered factory must implement
-`RegisteredBuiltin` (E0277). A discarded `Result` written as `let _ =` or
+a named arm in a wildcard-free match (compiler error E0004) and exactly one
+fixture registration. One registration list generates both `RegisteredBuiltin`
+implementations and the executable test inventory. Each registration is bound
+to a fixture that observes the same concrete backend type: a wrong type/path
+pair fails to compile. A built-in backend passed through the registered factory
+must implement `RegisteredBuiltin` (E0277). Stream is tested directly because
+it is not a factory backend. Each phase enum generates its complete test
+inventory from its definition. A discarded `Result` written as `let _ =` or
 `let _: T =` fails `clippy::let_underscore_must_use` in the eight production
 crates: flexaudio, flexaudio-mic, the three OS backends, flexaudio-napi,
 flexaudio-py and flexaudio-ffi. Intentional non-stop discards carry a local
