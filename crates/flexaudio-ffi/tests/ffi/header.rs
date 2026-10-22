@@ -1,5 +1,9 @@
 //! Check that the checked-in header is exactly the repository cbindgen projection.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "requires the cc C compiler; the Linux CI job enforces this check"
+)]
 fn c_header_layouts_and_v4_signatures_compile() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let output = std::process::Command::new("cc")
@@ -22,6 +26,10 @@ fn c_header_layouts_and_v4_signatures_compile() {
     );
 }
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "requires cbindgen; the Linux CI job enforces this check"
+)]
 fn generated_header_matches_cbindgen() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let output = std::env::temp_dir().join(format!("flexaudio-header-{}.h", std::process::id()));
@@ -102,6 +110,10 @@ fn legacy_v040_codes_keep_their_names_and_values() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "requires the cc C compiler; the Linux CI job enforces this check"
+)]
 fn readme_basic_capture_compiles_against_header() {
     use std::io::Write;
     use std::process::{Command, Stdio};

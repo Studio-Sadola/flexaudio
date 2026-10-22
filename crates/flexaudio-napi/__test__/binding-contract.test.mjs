@@ -6,7 +6,9 @@ import { fileURLToPath } from 'node:url';
 let native;
 const addonPath = process.env.FLEXAUDIO_REPRO_ADDON || process.env.FLEXAUDIO_TEST_ADDON || fileURLToPath(new URL('./flexaudio.node', import.meta.url));
 try { native = createRequire(import.meta.url)(addonPath); }
-catch (error) { if (error.code !== 'MODULE_NOT_FOUND' || process.env.FLEXAUDIO_RUN_REPRO === '1') throw error; }
+catch (error) {
+  if (error.code !== 'MODULE_NOT_FOUND' || process.env.FLEXAUDIO_RUN_REPRO === '1') throw error;
+}
 function test(name, options, fn) {
   if (typeof options === 'function') { fn = options; options = {}; }
   return nodeTest(name, native ? options : { skip: options.skip || 'test addon is not built' }, fn);

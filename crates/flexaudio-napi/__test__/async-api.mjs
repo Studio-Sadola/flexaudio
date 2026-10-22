@@ -17,7 +17,7 @@ import { dirname, join } from 'node:path';
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
-const { native } = await import('./test-native.mjs');
+const { native } = await import('./load-addon.mjs');
 
 function assert(cond, msg) {
   if (!cond) {

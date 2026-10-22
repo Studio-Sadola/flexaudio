@@ -4,6 +4,8 @@ import unittest
 
 import flexaudio as fa
 
+from mock_capture import skip_unless_mock_capture
+
 
 SETTING_KEYS = {
     "kind", "deviceId", "targetPid", "mode", "chunkMs", "ringCapacityChunks",
@@ -15,6 +17,7 @@ SETTING_KEYS = {
 
 class SettingsLifecycleContracts(unittest.TestCase):
     # Successful capture fixtures require a wheel built with --features test-faults.
+    @skip_unless_mock_capture
     def test_denoise_opens_at_noncanonical_output_rates(self):
         for rate in (16000, 44100, 48000):
             with self.subTest(rate=rate), fa.open("mock", output_rate=rate,
@@ -28,6 +31,7 @@ class SettingsLifecycleContracts(unittest.TestCase):
                 self.assertEqual(output["effective"], (rate, 1))
                 self.assertEqual(output["outcome"], {"status": "applied", "reason": None})
 
+    @skip_unless_mock_capture
     def test_switch_enables_denoise_at_noncanonical_output_rates(self):
         for rate in (16000, 44100):
             with self.subTest(rate=rate), fa.open("mock", output_rate=rate) as stream:
@@ -39,6 +43,7 @@ class SettingsLifecycleContracts(unittest.TestCase):
                 stream.switch_source("mock", output_rate=rate)
                 self.assertIs(self.denoise_entry(stream)["effective"], True)
 
+    @skip_unless_mock_capture
     def test_switch_omitted_denoise_retains_enabled_setting(self):
         with fa.open("mock", denoise=True) as stream:
             self.assertIs(self.denoise_entry(stream)["effective"], True)
@@ -49,6 +54,7 @@ class SettingsLifecycleContracts(unittest.TestCase):
                 self.assertIs(entry["effective"], True)
                 self.assertEqual(entry["outcome"], {"status": "notRequested", "reason": None})
 
+    @skip_unless_mock_capture
     def test_switch_explicit_false_disables_denoise(self):
         with fa.open("mock", denoise=True) as stream:
             self.assertIs(self.denoise_entry(stream)["effective"], True)
@@ -62,6 +68,7 @@ class SettingsLifecycleContracts(unittest.TestCase):
             stream.switch_source("mock", denoise=True)
             self.assertIs(self.denoise_entry(stream)["effective"], True)
 
+    @skip_unless_mock_capture
     def test_switch_omitted_denoise_retains_disabled_setting(self):
         with fa.open("mock", denoise=False) as stream:
             self.assertIs(self.denoise_entry(stream)["effective"], False)

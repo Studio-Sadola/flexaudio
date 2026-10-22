@@ -2,7 +2,7 @@
 # Build flexaudio-napi and run Node smoke tests (no real audio required).
 # Prepare the .node file with cargo build and a manual rename, without the napi CLI (minimize network use).
 #
-# exclude-smoke.mjs is NOT run here: it needs a real PipeWire session
+# ../manual-test/exclude-smoke.mjs is NOT run here: it needs a real PipeWire session
 # (pw-cli, pw-play, paplay). CI runs it in the smoke-linux-pipewire job.
 set -euo pipefail
 

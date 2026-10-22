@@ -3,8 +3,11 @@ import unittest
 
 import flexaudio as fa
 
+from mock_capture import skip_unless_mock_capture
+
 
 class StreamDenoiseValidation(unittest.TestCase):
+    @skip_unless_mock_capture
     def test_open_accepts_noncanonical_output_rates(self):
         for rate in (16000, 44100):
             for channels in (1, 2):

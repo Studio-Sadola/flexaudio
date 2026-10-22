@@ -10,7 +10,7 @@
 //     - Confirm that at least one chunk arrives.
 //  3. The process exits cleanly without hanging after stop().
 
-import { native } from './test-native.mjs';
+import { native } from './load-addon.mjs';
 
 function assert(cond, msg) {
   if (!cond) {

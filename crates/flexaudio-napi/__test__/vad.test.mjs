@@ -4,7 +4,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { native, releaseNative as plainNative } from './test-native.mjs';
+import { capabilitySkip } from './require-capabilities.mjs';
+import { native, releaseNative as plainNative } from './load-addon.mjs';
 const { Vad } = plainNative;
 const faultTests = {};
 assert.equal(typeof Vad, 'function', 'release addon must export Vad');
@@ -347,7 +348,8 @@ test('one failed reset at a real boundary stays failed until explicit flush succ
 });
 
 test('attached primary and secondary close epochs before flush and stop settle',
-  { skip: typeof native.__openMockStream !== 'function' && 'addon has no fake capture API' }, async t => {
+  { skip: capabilitySkip(typeof native.__openMockStream !== 'function',
+    'the addon was built without the test-faults feature, so the fake capture API is unavailable') }, async t => {
   for (const tap of ['primary', 'secondary']) {
     const chunks = [];
     const events = [];

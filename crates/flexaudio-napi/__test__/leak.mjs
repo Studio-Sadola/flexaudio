@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
-const { native } = await import('./test-native.mjs');
+const { native } = await import('./load-addon.mjs');
 
 if (typeof global.gc !== 'function') {
   console.error('leak.mjs requires node --expose-gc (global.gc is missing)');

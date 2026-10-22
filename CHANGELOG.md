@@ -61,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assign any customized public fields. For example, use
   `let mut config = StreamConfig::new(SourceKind::Mic); config.gain = 0.5;`.
   Destructure with `..` to allow additional fields.
+- CI runs the Python and Node binding tests by directory, so a new test file
+  runs without being named in the workflow; the file-name coverage gate is
+  removed. A test that needs the test-faults build skips with a reason on every
+  operating system. Tests that need real audio devices moved to
+  `crates/flexaudio-napi/manual-test`. The C ABI contract tests also run on
+  Windows and macOS; the three checks that invoke `cc` or `cbindgen` stay on
+  Linux and are reported as ignored, with a reason, elsewhere.
 
 ### Fixed
 

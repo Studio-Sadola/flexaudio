@@ -25,7 +25,7 @@ import { dirname, join } from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { writeToneWav } from './tone-wav.mjs';
+import { writeToneWav } from '../__test__/tone-wav.mjs';
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));

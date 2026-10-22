@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
-import { native, releaseNative } from './test-native.mjs';
+import { native, releaseNative } from './load-addon.mjs';
 
 /** @typedef {import('../index.js').VadEvent} VadEvent */
 /** @typedef {import('../index.js').AttachedVadEvent} AttachedVadEvent */

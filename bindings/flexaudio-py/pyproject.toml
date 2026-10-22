@@ -31,3 +31,9 @@ module-name = "flexaudio"
 # LICENSE and the generated third-party notices are shipped through PEP 639 `license-files`, so they
 # land in .dist-info/licenses/ instead of the top of site-packages, where same-named files from other
 # packages would overwrite each other.
+
+[tool.pytest.ini_options]
+# CI passes tests/ so a new test_*.py is collected without a workflow edit.
+# tests/rust is a Rust fixture, not a Python package.
+testpaths = ["tests"]
+norecursedirs = ["rust", ".*", "build", "dist", "CVS", "_darcs", "{arch}", "*.egg", "venv"]

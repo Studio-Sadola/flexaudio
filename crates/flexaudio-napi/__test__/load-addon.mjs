@@ -6,5 +6,8 @@ export const releaseNative = process.env.FLEXAUDIO_RELEASE_ADDON
   ? require(process.env.FLEXAUDIO_RELEASE_ADDON)
   : existsSync(new URL('./plain-debug.node', import.meta.url)) ? require('./plain-debug.node') : native;
 if (typeof native.__openMockStream !== 'function') {
-  throw new Error('Build the test addon with the test-faults feature before running mock contracts');
+  throw new Error(
+    'Build the test addon with the test-faults feature before running mock contracts ' +
+    '(the addon was built without the test-faults feature, so the fake capture API is unavailable)',
+  );
 }
