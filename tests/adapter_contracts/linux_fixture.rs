@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::sync::{mpsc, atomic::{AtomicBool, Ordering}};
 use std::rc::Rc;
 use flexaudio_core::types::ProcessMode;
-use flexaudio_core::{ErrorContext, Event, Operation, ErrorKind, DefaultDeviceKind, AudioPath, LossReason};
+use flexaudio_core::{ErrorContext, Event, Operation, ErrorKind, DefaultDeviceKind, AudioPath, LossReason, ShutdownReport};
 mod owner { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/owner.rs")); }
-use owner::{finish_worker, poll_backend_event, push_backend_event, rollback_worker, BackendEvents};
+use owner::{finish_worker, poll_backend_event, push_backend_event, rollback_capture, rollback_worker, BackendEvents};
 mod watcher_queue { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/watcher_queue.rs")); }
 use watcher_queue::{lock_events, transition_default, WatchEventQueue, WatchEvents};
 mod discovery { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/discovery.rs")); }
@@ -347,7 +347,7 @@ fn setup_pw(_: Option<String>, sink: RawSink, readiness: Rc<Readiness>, events: 
 fn pipewire_early_readiness() {
     let (tx, rx) = mpsc::channel(); READY_RX.with(|r| *r.borrow_mut() = Some(rx));
     let (_, stop) = pw::channel::channel(); let (producer, _) = flexaudio_core::raw_ring(16);
-    run_pw_loop(None, RawSink::new(producer, 48_000, 2), stop, &tx, Arc::new(Mutex::new(VecDeque::new())));
+    run_pw_loop(None, RawSink::new(producer, 48_000, 2), stop, &tx, Arc::new(Mutex::new(Default::default())));
     assert!(!READY_EARLY.get(), "successful readiness observable before loop runs negotiation");
 }
 #[test]
@@ -356,7 +356,7 @@ fn pipewire_early_readiness_control() {
     READY_EARLY.set(false);
     let (tx, rx) = mpsc::channel(); drop(rx);
     let (_, stop) = pw::channel::channel(); let (producer, _) = flexaudio_core::raw_ring(16);
-    run_pw_loop(None, RawSink::new(producer, 48_000, 2), stop, &tx, Arc::new(Mutex::new(VecDeque::new())));
+    run_pw_loop(None, RawSink::new(producer, 48_000, 2), stop, &tx, Arc::new(Mutex::new(Default::default())));
     assert!(!READY_EARLY.get());
 }
 mod thread {
@@ -378,7 +378,7 @@ mod thread {
     }
 }
 struct ProcessOwner {
-    shutdown: Option<Result<()>>, events: BackendEvents,
+    shutdown: Option<ShutdownReport>, events: BackendEvents,
     running: Arc<AtomicBool>, target_pid: u32, mode: ProcessMode,
     stop_tx: Option<pw::channel::Sender<Terminate>>, handle: Option<thread::JoinHandle<()>>,
 }
@@ -397,7 +397,7 @@ impl flexaudio_core::CaptureBackend for ProcessOwner {
     fn stop_checked(&mut self) -> Result<()> { ProcessOwner::stop_checked(self) }
     fn poll_event(&mut self) -> Option<Event> { ProcessOwner::poll_event(self) }
 }
-fn process_owner() -> ProcessOwner { ProcessOwner { shutdown: None, events: Arc::new(Mutex::new(VecDeque::new())), running: Arc::new(AtomicBool::new(false)), target_pid: 42, mode: ProcessMode::Include, stop_tx: None, handle: None } }
+fn process_owner() -> ProcessOwner { ProcessOwner { shutdown: None, events: Arc::new(Mutex::new(Default::default())), running: Arc::new(AtomicBool::new(false)), target_pid: 42, mode: ProcessMode::Include, stop_tx: None, handle: None } }
 fn sink() -> RawSink { let (producer, _) = flexaudio_core::raw_ring(16); RawSink::new(producer, 48_000, 2) }
 #[test]
 fn pipewire_spawn_rollback() {
@@ -665,7 +665,7 @@ impl LinkFixture {
         for (channel, id) in [("FL", 1000), ("FR", 1001)] {
             ports.insert(id, PortEntry { node_id: 99, direction: "in".into(), channel: channel.into() });
         }
-        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let events = Arc::new(Mutex::new(Default::default()));
         let readiness = Rc::new(Readiness::new(mpsc::channel().0, true));
         let sequence = Rc::new(Cell::new(0));
         let next = sequence.clone();
@@ -755,7 +755,7 @@ fn process_fixture(bytes: Vec<u8>, stride: i32, flags: i32) -> (pw::stream::Stre
     let (producer, consumer) = flexaudio_core::raw_ring(16);
     let mut format = spa::param::audio::AudioInfoRaw::new();
     format.set_format(spa::param::audio::AudioFormat::F32LE); format.set_rate(48_000); format.set_channels(2);
-    let listener = add_capture_listener(&stream, UserData { format, sink: RawSink::new(producer, 48_000, 2), scratch: Default::default(), events: Arc::new(Mutex::new(VecDeque::new())), readiness: Rc::new(Readiness::new(mpsc::channel().0, false)) }, &FakeLoop).unwrap();
+    let listener = add_capture_listener(&stream, UserData { format, sink: RawSink::new(producer, 48_000, 2), scratch: Default::default(), events: Arc::new(Mutex::new(Default::default())), readiness: Rc::new(Readiness::new(mpsc::channel().0, false)) }, &FakeLoop).unwrap();
     (stream, listener, consumer)
 }
 #[test]

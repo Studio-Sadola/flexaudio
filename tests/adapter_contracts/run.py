@@ -58,6 +58,10 @@ def mic_source():
     # Leave the adapter's functions/closures intact. Replace platform modules,
     # whose consent behavior is already covered by the repository's own tests.
     source = source.replace(between(source, "mod capture_owner;", "/// Fallback format"), "")
+    # Native backend injection has its own production tests. Keep its original
+    # gate, but exclude that module from this separate fixture translation unit.
+    source = splice(source, "pub mod test_support;",
+                    "#[cfg(not(adapter_contract_fixture))]\npub mod test_support;")
     config_source = (MIC.parent / "input_config.rs").read_text()
     config = clean(config_source[:marker_index(config_source, "#[cfg(test)]")] + between(
         config_source, "/// Materialize a query failure", "#[cfg(test)]\nmod diagnostic_tests"))
@@ -92,7 +96,7 @@ def linux_source():
         "// LIVE_SYSTEM_STOP": between(source, "    fn stop(&mut self)", "}\n\nimpl Drop for PwSystemBackend")
             + between(
                 source,
-                "    fn retain_shutdown_outcome(&mut self) -> Result<()>",
+                "    fn retain_shutdown_outcome(&mut self) {",
                 "}\n\nimpl PwProcessBackend",
             ),
         "// LIVE_POLL": between(source[marker_index(source, "impl PwDeviceWatcher {"):], "    pub fn poll_event(", "    /// Stop watching"),
@@ -131,7 +135,7 @@ def main():
         rust = Path(folder) / "fixture.rs"
         binary = Path(folder) / "fixture"
         rust.write_text(source)
-        subprocess.run(["rustc", "--edition=2021", "--test", str(rust), "-o", str(binary),
+        subprocess.run(["rustc", "--edition=2021", "--test", "--cfg", "adapter_contract_fixture", str(rust), "-o", str(binary),
                         "-L", f"dependency={deps}", "--extern", f"flexaudio_core={core}"], env=env, check=True)
         return subprocess.run([str(binary), *test_args], env=env).returncode
 

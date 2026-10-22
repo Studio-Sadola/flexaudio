@@ -309,23 +309,36 @@ fn microphone_join_failure_control() {
     assert!(backend.poll_event().is_none());
 }
 #[test]
-fn failed_start_preserves_primary_join_cause_and_previous_shutdown_result() {
+fn failed_start_preserves_primary_join_cause_and_previous_shutdown_cleanup() {
     // The fixture owner exits by panic before readiness without any native calls.
     for previous_panics in [false, true] {
         let mut backend = owner_fixture(previous_panics);
         let previous_shutdown = backend.stop_checked();
+        let previous_report = backend.shutdown_report().unwrap().clone();
+        assert_eq!(previous_report.result(), previous_shutdown);
         while backend.poll_event().is_some() {}
         let (producer, _) = flexaudio_core::raw_ring(16);
         let error = backend.start(RawSink::new(producer, 48_000, 1)).unwrap_err();
-        let Error::Multiple(group) = error else { panic!("start and join failures must both survive") };
+        let Error::Multiple(group) = &error else { panic!("start and join failures must both survive") };
         assert!(matches!(group.primary(), Error::Context { context, .. } if context.operation() == Operation::Start));
         let cleanup: Vec<_> = group.secondary().collect();
-        assert_eq!(cleanup.len(), 1);
-        assert!(matches!(cleanup[0], Error::Context { context, .. } if context.operation() == Operation::Join));
+        assert_eq!(cleanup.len(), previous_report.cleanup().len() + 1);
+        assert_eq!(&cleanup[..previous_report.cleanup().len()], previous_report.cleanup().iter().collect::<Vec<_>>().as_slice());
+        assert!(cleanup.iter().all(|error| matches!(error, Error::Context { context, .. } if context.operation() == Operation::Join)));
+        let join_error = Error::Backend("microphone capture owner panicked".into())
+            .with_context(ErrorContext::new(Operation::Join));
+        assert_eq!(cleanup.last(), Some(&&join_error));
+        let report = backend.shutdown_report().unwrap().clone();
+        assert_eq!(report.primary(), Some(group.primary()));
+        assert_eq!(report.cleanup().iter().collect::<Vec<_>>(), cleanup);
+        assert_eq!(report.result(), Err(error.clone()));
         assert!(backend.handle.is_none());
         assert!(backend.stop_flag.load(Ordering::SeqCst));
-        assert_eq!(backend.stop_checked(), previous_shutdown);
-        assert!(matches!(backend.poll_event(), Some(Event::ShutdownError { .. })));
+        assert_eq!(backend.stop_checked(), Err(error));
+        assert_eq!(backend.shutdown_report(), Some(&report));
+        backend.stop();
+        assert_eq!(backend.shutdown_report(), Some(&report));
+        assert_eq!(backend.poll_event(), Some(Event::ShutdownError { error: join_error }));
         assert!(backend.poll_event().is_none());
     }
 }

@@ -80,6 +80,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal/join outcomes. Failed startup rollback and Mix report restoration
   preserve observed cleanup. Rust, Node, Python and C stop paths expose the
   retained failure to their callers, including repeated stops.
+- After a failed microphone restart, `stop_checked()` and `shutdown_report()`
+  now report the new startup and join failures together with the previous
+  cleanup failures. They previously returned the earlier run's result, which
+  hid the join failure observed during the failed restart.
 - Windows capture sessions publish native cleanup failures discovered during
   drop through the existing shutdown-error event channel, including sessions
   without a keepalive renderer.
