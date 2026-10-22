@@ -13,7 +13,7 @@ readme = "README.md"
 documentation = "https://docs.rs/flexaudio"
 
 [features]
-# Internal binding contract tests inject backends without replacing core decisions.
+# Internal fixtures only; no stability guarantee. Never enabled by default.
 test-support = []
 
 [dependencies]
@@ -39,3 +39,15 @@ flexaudio-os-macos = { path = "../flexaudio-os-macos", version = "0.9.0" }
 [package.metadata.docs.rs]
 default-target = "x86_64-unknown-linux-gnu"
 targets = ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
+
+[dev-dependencies]
+flexaudio-mic = { path = "../flexaudio-mic", features = ["test-support"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+flexaudio-os-linux = { path = "../flexaudio-os-linux", features = ["test-support"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+flexaudio-os-windows = { path = "../flexaudio-os-windows", features = ["test-support"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+flexaudio-os-macos = { path = "../flexaudio-os-macos", features = ["test-support"] }

@@ -15,6 +15,8 @@
 //!
 //! No network communication occurs at runtime (napi is only the N-API bridge).
 
+#![deny(clippy::let_underscore_must_use)]
+
 mod boundary;
 mod bridge_drain;
 mod callback;
@@ -381,6 +383,10 @@ fn unref_chunk_tsfn(tsfn: &ChunkTsfn, env: &Env) {
         return;
     }
     let mut tsfn = tsfn.clone();
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "A closing Node environment may reject unref; it already owns TSFN destruction."
+    )]
     let _ = tsfn.unref(env);
 }
 
@@ -538,6 +544,10 @@ fn make_chunk_tsfn(
             }
         })?;
     let tsfn = Arc::new(tsfn);
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "The write-once weak slot already names the same delivery owner if initialized."
+    )]
     let _ = chunk_weak.set(Arc::downgrade(&tsfn));
     Ok(tsfn)
 }
@@ -1458,6 +1468,7 @@ impl FlexStream {
                                 let report = stream.effective_settings().cloned().or_else(|| {
                                     thread_settings.lock().unwrap_or_else(lock_poisoned).clone()
                                 });
+                                #[allow(clippy::let_underscore_must_use, reason = "A dropped command receiver no longer needs this settings response.")]
                                 let _ = result_tx.send(report);
                             }
                             BridgeCmd::Switch(sw) => {
@@ -1517,15 +1528,18 @@ impl FlexStream {
                                     }
                                 }
                                 // Ignore a dropped receiver (switch_source caller).
+                                #[allow(clippy::let_underscore_must_use, reason = "A dropped switch caller no longer receives the completed command response.")]
                                 let _ = sw.result_tx.send(r);
                             }
                             BridgeCmd::Pause => stream.pause(),
                             BridgeCmd::Resume(result_tx) => {
+                                #[allow(clippy::let_underscore_must_use, reason = "Resume is executed even if its caller dropped the response receiver.")]
                                 let _ = result_tx.send(stream.resume());
                             }
                             BridgeCmd::SetGain(g) => {
                                 // napi validates before sending, so Err is not expected.
                                 // Even an unexpected Err does not become an event (the result is discarded).
+                                #[allow(clippy::let_underscore_must_use, reason = "The Node command boundary already validated this finite nonnegative gain.")]
                                 let _ = stream.set_gain(g);
                             }
                             BridgeCmd::Query(q) => {
@@ -1538,6 +1552,7 @@ impl FlexStream {
                                     dropped_chunks: stream.dropped_chunks(),
                                 };
                                 // Ignore a dropped receiver.
+                                #[allow(clippy::let_underscore_must_use, reason = "A dropped query receiver no longer needs this snapshot.")]
                                 let _ = q.result_tx.send(snap);
                             }
                             BridgeCmd::FlushVad(deferred) => {
@@ -1584,7 +1599,7 @@ impl FlexStream {
                 //      a dedicated trailing carrier (independent of pairing; no drops even without a primary tail).
                 // This delivers both trailing recorded audio (2) and final VAD events (3). Audio stop-flush and
                 // flushVad are separate (audio samples versus VAD events).
-                let _ = stream.stop_checked();
+                stream.stop();
                 // Stop can discover a pending backend denial. The shared drain
                 // forwards it and suppresses failed PCM before accepting the tail.
                 bridge.drain_stream(&mut stream, on_event.as_ref(), &thread_terminal);

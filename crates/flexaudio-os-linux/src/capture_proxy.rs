@@ -300,17 +300,14 @@ impl Drop for ReleaseOnDrop {
 mod tests {
     use super::*;
     use crate::{capture_error::CoreErrorDisposition, readiness::Readiness};
-    use std::{
-        collections::VecDeque,
-        sync::{mpsc, Arc, Mutex},
-    };
+    use std::sync::{mpsc, Arc, Mutex};
 
     #[test]
     fn queued_link_verification_survives_proxy_release_acknowledgement() {
         let (tx, _rx) = mpsc::channel();
         let callbacks = CaptureCallbacks::new(
             Rc::new(Readiness::new(tx, true)),
-            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mutex::new(Default::default())),
             || {},
         );
         let sequence = Cell::new(100);

@@ -26,6 +26,8 @@
 //! No network communication occurs at runtime (PyO3 is only a Python extension bridge; embedded VAD
 //! model, FLAC encoder, and RNNoise model require no files or network access).
 
+#![deny(clippy::let_underscore_must_use)]
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 

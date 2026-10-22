@@ -111,10 +111,11 @@ mod tests {
             if let Some(cause) = cause.as_ref() {
                 terminal.record(cause.clone());
             }
-            let _ = catch_unwind(AssertUnwindSafe(|| {
+            assert!(catch_unwind(AssertUnwindSafe(|| {
                 let _guard = terminal.error.lock().unwrap();
                 panic!("injected terminal state poisoning");
-            }));
+            }))
+            .is_err());
             let expected =
                 cause.unwrap_or_else(|| Error::Backend("backend terminal state poisoned".into()));
             assert_eq!(terminal.check_start(true), Err(expected.clone()));

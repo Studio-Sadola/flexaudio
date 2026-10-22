@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI replaces the source-text stop guard with registered, exhaustive failure
+  injection fixtures and denied must-use Result discards in the eight capture
+  and binding crates. Binding error-kind checks use the core runtime inventory
+  to verify canonical, unique names without source-text matching.
 - Python `AudioError.kind` classifies ignored settings as `"ignoredSettings"`
   instead of `"backend"`, matching the Node and C classifications. Migration:
   code comparing `kind` to `"backend"` for ignored settings must compare to
@@ -71,6 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Stop reports retain Windows handle-close and session destructor failures,
+  macOS probe cleanup even when capture is cancelled, and Linux and microphone
+  terminal/join outcomes. Failed startup rollback and Mix report restoration
+  preserve observed cleanup. Rust, Node, Python and C stop paths expose the
+  retained failure to their callers, including repeated stops.
 - Windows capture sessions publish native cleanup failures discovered during
   drop through the existing shutdown-error event channel, including sessions
   without a keepalive renderer.

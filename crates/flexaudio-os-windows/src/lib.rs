@@ -28,6 +28,7 @@
 //! Build-number and capture lifecycle helpers are unit-tested without devices on non-Windows platforms.
 
 #![warn(missing_docs)]
+#![deny(clippy::let_underscore_must_use)]
 
 /// Build number → process-loopback availability. Decoupled from OS calls so it can be
 /// unit-tested on non-Windows platforms.
@@ -73,3 +74,7 @@ mod native_outcomes;
 
 #[cfg(any(target_os = "windows", test))]
 mod inventory;
+
+/// Internal shutdown injection support; no stability guarantee.
+#[cfg(all(target_os = "windows", any(test, feature = "test-support")))]
+pub mod test_support;

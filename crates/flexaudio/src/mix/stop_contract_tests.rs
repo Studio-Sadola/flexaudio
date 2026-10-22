@@ -1,0 +1,120 @@
+//! Child stops and mixer joins use the production composite owner.
+use super::*;
+use crate::test_support::{failing_backend, StopPhase};
+
+#[derive(Clone, Copy)]
+pub(crate) enum Phase {
+    MicrophoneStop,
+    SystemStop,
+    MixerJoin,
+    TerminalAndStop,
+    RestorePrevious,
+}
+
+fn clean() -> Box<dyn CaptureBackend> {
+    Box::new(crate::MockBackend::new(48_000, 2, 0.0))
+}
+
+pub(crate) fn check(phase: Phase) {
+    if matches!(phase, Phase::RestorePrevious) {
+        check_restore();
+        return;
+    }
+    for checked_first in [false, true] {
+        let (mic, system) = match phase {
+            Phase::MicrophoneStop => (failing_backend(StopPhase::Stop), clean()),
+            Phase::SystemStop => (clean(), failing_backend(StopPhase::Stop)),
+            Phase::TerminalAndStop => (failing_backend(StopPhase::TerminalAndStop), clean()),
+            Phase::MixerJoin | Phase::RestorePrevious => (clean(), clean()),
+        };
+        let mut mix = CompositeBackend::new(mic, system, 1.0, 1.0);
+        if matches!(phase, Phase::MixerJoin) {
+            mix.mixer = Some(thread::spawn(|| panic!("injected mixer failure")));
+        } else {
+            let (producer, _consumer) = flexaudio_core::raw_ring(4096);
+            mix.start(RawSink::new(producer, 48_000, 2)).unwrap();
+        }
+        if checked_first {
+            assert!(mix.stop_checked().is_err());
+        } else {
+            mix.stop();
+        }
+        let report = mix
+            .shutdown
+            .clone()
+            .expect("void mix stop retains its report");
+        let lane = if matches!(phase, Phase::SystemStop) {
+            MixLane::SystemAudio
+        } else {
+            MixLane::Microphone
+        };
+        let primary = matches!(phase, Phase::TerminalAndStop)
+            .then(|| lane_error(Error::Unsupported, Operation::Normalize, lane));
+        let cleanup = if matches!(phase, Phase::MixerJoin) {
+            Error::Backend("mix worker panicked".into())
+                .with_context(ErrorContext::new(Operation::Join))
+        } else {
+            lane_error(
+                Error::DeviceLost.with_context(ErrorContext::new(Operation::Stop)),
+                Operation::Stop,
+                lane,
+            )
+        };
+        assert_eq!(report, ShutdownReport::new(primary, vec![cleanup]));
+        assert_eq!(mix.stop_checked(), report.result());
+        assert_eq!(mix.shutdown, Some(report.clone()));
+        mix.stop();
+        assert_eq!(mix.shutdown, Some(report.clone()));
+        assert_eq!(mix.stop_checked(), report.result());
+    }
+}
+
+fn check_restore() {
+    struct RestartFailure {
+        starts: usize,
+    }
+    impl CaptureBackend for RestartFailure {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 2)
+        }
+        fn start(&mut self, _: RawSink) -> Result<()> {
+            self.starts += 1;
+            if self.starts > 1 {
+                Err(Error::DeviceNotFound)
+            } else {
+                Ok(())
+            }
+        }
+        fn stop(&mut self) {}
+        fn stop_checked(&mut self) -> Result<()> {
+            if self.starts > 1 {
+                Err(Error::DeviceLost)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let mut mix = CompositeBackend::new(Box::new(RestartFailure { starts: 0 }), clean(), 1.0, 1.0);
+    let (producer, _consumer) = flexaudio_core::raw_ring(4096);
+    mix.start(RawSink::new(producer, 48_000, 2)).unwrap();
+    mix.stop();
+    assert!(mix.shutdown.as_ref().unwrap().result().is_ok());
+    let (producer, _consumer) = flexaudio_core::raw_ring(4096);
+    assert!(mix.start(RawSink::new(producer, 48_000, 2)).is_err());
+    let report = mix
+        .shutdown
+        .clone()
+        .expect("failed restart retains cleanup");
+    assert!(report.primary().is_none());
+    assert_eq!(
+        report.cleanup(),
+        &[lane_error(
+            Error::DeviceLost,
+            Operation::Stop,
+            MixLane::Microphone
+        )]
+    );
+    assert_eq!(mix.stop_checked(), report.result());
+    mix.stop();
+    assert_eq!(mix.shutdown, Some(report));
+}

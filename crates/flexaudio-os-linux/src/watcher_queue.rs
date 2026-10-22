@@ -124,7 +124,12 @@ mod failure_tests {
     fn later_join_failure_is_retained_with_original_terminal_cause() {
         let mut queue = WatchEvents::default();
         queue.fail(Error::DeviceLost);
-        let _ = queue.poll();
+        assert_eq!(
+            queue.poll(),
+            Some(DeviceEvent::TerminalError {
+                error: Error::DeviceLost
+            })
+        );
         let cleanup = Error::Backend("worker failed".into());
         queue.fail(cleanup.clone());
         assert!(

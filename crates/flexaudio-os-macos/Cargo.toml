@@ -12,6 +12,10 @@ keywords = ["audio", "coreaudio", "loopback", "capture", "macos"]
 categories = ["multimedia::audio", "os::macos-apis"]
 documentation = "https://docs.rs/flexaudio-os-macos"
 
+[features]
+# Internal injection fixtures only; no stability guarantee.
+test-support = []
+
 # Native adapters and objc2 dependencies are macOS-only. The private capture-health
 # policy compiles on every platform for device-free tests.
 #

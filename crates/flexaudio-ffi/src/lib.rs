@@ -19,6 +19,8 @@
 //!
 //! Regenerate the `include/flexaudio.h` header with cbindgen (using `cbindgen.toml`).
 
+#![deny(clippy::let_underscore_must_use)]
+
 mod boundary;
 mod capabilities;
 mod capability_records;

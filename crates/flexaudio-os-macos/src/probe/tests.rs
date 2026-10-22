@@ -45,6 +45,7 @@ fn control() -> (ProbeControl, Arc<FakeClock>) {
             cancellation: Arc::new(AtomicBool::new(false)),
             clock: clock.clone(),
             cleanup: Arc::new(ProbeCleanup::default()),
+            cleanup_ledger: Arc::new(CleanupLedger::default()),
             events: None,
             stop_reason: Arc::new(Mutex::new(HelperStopReason::StreamStopped)),
             running: AtomicBool::new(false),
@@ -246,10 +247,11 @@ fn assert_publication_precedes_stop(poisoned: bool) {
     let (control, _) = control();
     let gate = Arc::new(PublicationGate::default());
     if poisoned {
-        let _ = catch_unwind(AssertUnwindSafe(|| {
+        assert!(catch_unwind(AssertUnwindSafe(|| {
             let _guard = gate.0.lock().unwrap();
             panic!("injected publication panic");
-        }));
+        }))
+        .is_err());
     }
     let control = Arc::new(control);
     let (entered_tx, entered_rx) = mpsc::channel();
@@ -334,10 +336,11 @@ fn uncancelled_poison_can_publish_terminal_failure_in_order() {
 
     let (control, _) = control();
     let gate = PublicationGate::default();
-    let _ = catch_unwind(AssertUnwindSafe(|| {
+    assert!(catch_unwind(AssertUnwindSafe(|| {
         let _guard = gate.0.lock().unwrap();
         panic!("injected publication panic");
-    }));
+    }))
+    .is_err());
     let mut terminal_published = false;
     assert!(gate.recover_when_active(&control, || terminal_published = true));
     assert!(terminal_published);

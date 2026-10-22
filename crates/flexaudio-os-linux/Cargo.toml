@@ -12,6 +12,9 @@ keywords = ["audio", "pipewire", "loopback", "capture", "linux"]
 categories = ["multimedia::audio", "os::unix-apis"]
 documentation = "https://docs.rs/flexaudio-os-linux"
 
+[features]
+test-support = []
+
 # Linux-only. On other platforms, lib.rs is empty under `#![cfg(target_os = "linux")]`, and the
 # pipewire dependency is included only by the target-specific section below.
 [target.'cfg(target_os = "linux")'.dependencies]

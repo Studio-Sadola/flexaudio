@@ -25,6 +25,8 @@ use flexaudio_core::CaptureDiagnostics;
 mod child;
 mod drift;
 mod notices;
+#[cfg(test)]
+pub(crate) mod stop_contract_tests;
 mod worker;
 use child::*;
 use drift::*;
@@ -265,8 +267,19 @@ impl CaptureBackend for CompositeBackend {
             self.notices.retain_primary(error);
             self.set_helper_stop_reason(flexaudio_core::HelperStopReason::StartupFailed);
             let result = self.stop_checked();
-            if previous_report.is_some() {
-                self.shutdown = previous_report;
+            if let Some(previous_report) = previous_report {
+                // A failed acquisition keeps the previous primary and every newly
+                // observed cleanup, even when restoring the previous generation.
+                let attempt = self.shutdown.as_ref().expect("rollback retained report");
+                let mut cleanup = previous_report.cleanup().to_vec();
+                cleanup.extend_from_slice(attempt.cleanup());
+                for error in attempt.cleanup() {
+                    previous_notices.cleanup(error.clone());
+                }
+                self.shutdown = Some(ShutdownReport::new(
+                    previous_report.primary().cloned(),
+                    cleanup,
+                ));
                 for event in self.notices.take_lifecycle() {
                     previous_notices.queue_final(event);
                 }
@@ -278,7 +291,7 @@ impl CaptureBackend for CompositeBackend {
     }
 
     fn stop(&mut self) {
-        let _ = self.retain_shutdown_outcome();
+        self.retain_shutdown_outcome();
     }
 
     fn set_helper_stop_reason(&mut self, reason: flexaudio_core::HelperStopReason) {
@@ -287,7 +300,11 @@ impl CaptureBackend for CompositeBackend {
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.retain_shutdown_outcome()
+        self.retain_shutdown_outcome();
+        self.shutdown
+            .as_ref()
+            .expect("completed mix shutdown")
+            .result()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
@@ -328,9 +345,9 @@ fn lane_error(error: Error, operation: Operation, lane: MixLane) -> Error {
 
 impl CompositeBackend {
     // Both stop entry points use this one retained teardown outcome.
-    fn retain_shutdown_outcome(&mut self) -> Result<()> {
-        if let Some(report) = &self.shutdown {
-            return report.result();
+    fn retain_shutdown_outcome(&mut self) {
+        if self.shutdown.is_some() {
+            return;
         }
         self.stop_producers();
         // Keep the mixer alive through producer stops; final denial closes its
@@ -340,15 +357,13 @@ impl CompositeBackend {
         self.stopping.store(true, Ordering::SeqCst);
         if let Some(handle) = self.mixer.take() {
             if handle.join().is_err() {
-                self.notices.fail(
+                self.notices.cleanup(
                     Error::Backend("mix worker panicked".into())
                         .with_context(ErrorContext::new(Operation::Join)),
                 );
             }
         }
         let report = self.notices.report();
-        let result = report.result();
         self.shutdown = Some(report);
-        result
     }
 }

@@ -26,6 +26,9 @@ use std::time::Duration;
 
 use crate::OpenOptions;
 use flexaudio_core::backend::{CaptureBackend, RawSink};
+
+#[cfg(test)]
+pub(crate) mod stop_contract_tests;
 use flexaudio_core::chunk_ring::{chunk_ring, ChunkConsumer, ChunkProducer};
 use flexaudio_core::clock::{monotonic_now_ns, ClockNormalizer};
 use flexaudio_core::normalizer::{InnerProcessor, NormalizedChunk, Normalizer};

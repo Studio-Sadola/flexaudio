@@ -187,6 +187,7 @@ where
             // Clear the marker before sending the result so the next call can start as soon as
             // recv returns instead of still appearing busy.
             drop(guard);
+            #[allow(clippy::let_underscore_must_use, reason = "Enumeration may finish after the caller times out; the expired receiver needs no response.")]
             let _ = tx.send(result);
         });
     if let Err(e) = spawn {
@@ -250,13 +251,16 @@ mod tests {
             let finished = Arc::new(AtomicBool::new(false));
             let (release_tx, release_rx) = mpsc::channel::<()>();
             let watchdog_tx = release_tx.clone();
+            let watchdog_finished = finished.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_secs(2));
-                let _ = watchdog_tx.send(());
+                if !watchdog_finished.load(Ordering::SeqCst) {
+                    watchdog_tx.send(()).expect("release pending enumeration");
+                }
             });
             let finished_for_job = Arc::clone(&finished);
             let job = move || {
-                let _ = release_rx.recv();
+                release_rx.recv().expect("enumeration release signal");
                 finished_for_job.store(true, Ordering::SeqCst);
                 Ok(())
             };
@@ -274,13 +278,17 @@ mod tests {
         }
 
         fn release(&self) {
-            let _ = self.release_tx.send(());
+            if !self.is_finished() {
+                self.release_tx
+                    .send(())
+                    .expect("release pending enumeration");
+            }
         }
     }
 
     impl Drop for StuckJob {
         fn drop(&mut self) {
-            let _ = self.release_tx.send(());
+            self.release();
         }
     }
 

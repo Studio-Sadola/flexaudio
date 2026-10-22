@@ -32,7 +32,7 @@ use std::thread::{self, JoinHandle};
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::types::{DeviceInfo, Error, Event, ProcessMode, Result, SourceKind};
 
-use crate::owner::{join_owner, OwnerShutdown};
+use crate::owner::{CleanupLedger, OwnerShutdown};
 use flexaudio_core::{ErrorContext, Operation, ShutdownReport};
 
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
@@ -44,7 +44,7 @@ use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, S
 
 use crate::common::{
     capture_loop, init_loopback_capture, map_hr, map_hr_at, parse_mix_format, pwstr_to_string,
-    CaptureSetup, ComThread, EventHandle,
+    CaptureSetup, ComThread,
 };
 use crate::format::{native_format_from_source, retain_format_query, verify_format};
 use crate::keepalive::SilentRender;
@@ -494,6 +494,8 @@ impl CaptureBackend for WasapiSystemBackend {
         }
         // Reset the flag so start can run again after a previous stop.
         self.stop_flag.store(false, Ordering::SeqCst);
+        self.shutdown.cleanup = CleanupLedger::default();
+        let cleanup = self.shutdown.cleanup.clone();
 
         let stop_flag = self.stop_flag.clone();
         let device_id = self.device_id.clone();
@@ -505,6 +507,7 @@ impl CaptureBackend for WasapiSystemBackend {
         let keepalive = KeepaliveConfig {
             enabled: self.classic_loopback_keepalive,
             stop_reason: helper_stop_reason,
+            cleanup,
         };
         // Channel for synchronously returning setup status (COM init through successful Start).
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
@@ -538,25 +541,22 @@ impl CaptureBackend for WasapiSystemBackend {
                 self.shutdown.retain_capture_events(event_rx);
                 // Setup failed. Join because the thread exits just after sending ready.
                 self.stop_flag.store(true, Ordering::SeqCst);
-                ShutdownReport::new(Some(e), join_owner(handle).cleanup().to_vec()).result()
+                self.shutdown.retain_start_failure(e, handle)
             }
             Err(_) => {
                 self.shutdown.retain_capture_events(event_rx);
                 self.stop_flag.store(true, Ordering::SeqCst);
-                ShutdownReport::new(
-                    Some(
-                        Error::Backend("capture owner exited before reporting readiness".into())
-                            .with_context(ErrorContext::new(Operation::Start)),
-                    ),
-                    join_owner(handle).cleanup().to_vec(),
+                self.shutdown.retain_start_failure(
+                    Error::Backend("capture owner exited before reporting readiness".into())
+                        .with_context(ErrorContext::new(Operation::Start)),
+                    handle,
                 )
-                .result()
             }
         }
     }
 
     fn stop(&mut self) {
-        let _ = self.retain_shutdown_outcome();
+        self.retain_shutdown_outcome();
     }
 
     fn set_helper_stop_reason(&mut self, reason: flexaudio_core::HelperStopReason) {
@@ -567,7 +567,8 @@ impl CaptureBackend for WasapiSystemBackend {
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.retain_shutdown_outcome()
+        self.retain_shutdown_outcome();
+        self.shutdown.result()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
@@ -584,6 +585,7 @@ impl Drop for WasapiSystemBackend {
 struct KeepaliveConfig {
     enabled: bool,
     stop_reason: Arc<Mutex<flexaudio_core::HelperStopReason>>,
+    cleanup: CleanupLedger,
 }
 
 /// Thread body. Initialize COM, configure loopback based on `exclude_root`, and
@@ -609,10 +611,15 @@ fn run_system_thread(
     ready_tx: mpsc::Sender<Result<()>>,
     event_tx: mpsc::Sender<Event>,
 ) -> ShutdownReport {
+    let cleanup = keepalive.cleanup;
     // Initialize COM on this thread (uninitialize on drop). Declared first, dropped last.
     let _com = match ComThread::new() {
         Ok(com) => com,
         Err(error) => {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "readiness receiver may have cancelled startup"
+            )]
             let _ = ready_tx.send(Err(error));
             return ShutdownReport::new(None, Vec::new());
         }
@@ -623,8 +630,10 @@ fn run_system_thread(
     let setup = if let Some(root) = exclude_root {
         // Exclude the PID root and its tree to capture all system audio without feedback.
         // Reuse the process loopback mechanism from the `process` module.
-        unsafe { crate::process::setup_process_loopback(root, ProcessMode::Exclude) }
-            .map(CaptureSetup::process)
+        unsafe {
+            crate::process::setup_process_loopback(root, ProcessMode::Exclude, cleanup.clone())
+        }
+        .map(CaptureSetup::process)
     } else {
         // Classic loopback on the render endpoint selected by device_id (None uses default).
         unsafe {
@@ -633,18 +642,23 @@ fn run_system_thread(
                 &sink,
                 keepalive.enabled,
                 keepalive.stop_reason,
+                cleanup.clone(),
             )
         }
     };
     let setup = match setup {
         Ok(t) => t,
         Err(e) => {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "readiness receiver may have cancelled startup"
+            )]
             let _ = ready_tx.send(Err(e));
             return ShutdownReport::new(None, Vec::new());
         }
     };
 
-    unsafe { capture_loop(setup, sink, &stop_flag, ready_tx, event_tx) }
+    unsafe { capture_loop(setup, sink, &stop_flag, ready_tx, event_tx, cleanup) }
 }
 
 /// Set up classic loopback on the render endpoint selected by `device_id` (`None`
@@ -662,6 +676,7 @@ unsafe fn setup_system_loopback(
     sink: &RawSink,
     classic_loopback_keepalive: bool,
     helper_stop_reason: Arc<Mutex<flexaudio_core::HelperStopReason>>,
+    cleanup: CleanupLedger,
 ) -> Result<CaptureSetup> {
     let enumerator: IMMDeviceEnumerator =
         CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
@@ -684,13 +699,13 @@ unsafe fn setup_system_loopback(
         let format = parse_mix_format(pwfx)?;
         verify_format(format, (sink.native_rate(), sink.native_channels()))?;
         let keepalive = create_keepalive(classic_loopback_keepalive, || {
-            SilentRender::new(&device, pwfx, helper_stop_reason)
+            SilentRender::new(&device, pwfx, helper_stop_reason, cleanup.clone())
         })?;
-        let (capture, event) = init_loopback_capture(&client, pwfx, 0)?;
+        let (capture, event) = init_loopback_capture(&client, pwfx, 0, cleanup)?;
         Ok(CaptureSetup {
             client,
             capture,
-            event: EventHandle(event),
+            event,
             channels: format.1,
             keepalive,
         })
@@ -1000,7 +1015,7 @@ mod tests {
 
 impl WasapiSystemBackend {
     // Both stop entry points use this one retained teardown outcome.
-    fn retain_shutdown_outcome(&mut self) -> Result<()> {
+    fn retain_shutdown_outcome(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         let handle = self.handle.take();
         let joined_owner = handle.is_some();
@@ -1008,6 +1023,24 @@ impl WasapiSystemBackend {
         if joined_owner {
             self.pending_error = result.as_ref().err().cloned();
         }
-        result
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn check_stop_phase(phase: crate::test_support::Phase) {
+        let mut backend = Self::new(true, None);
+        let expected = crate::test_support::prepare(
+            &mut backend.shutdown,
+            &mut backend.handle,
+            phase,
+            true,
+            backend.stop_flag.clone(),
+        );
+        backend.stop();
+        assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
+        assert_eq!(backend.stop_checked(), expected.result());
+        assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
+        backend.stop();
+        assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
+        assert_eq!(backend.stop_checked(), expected.result());
     }
 }

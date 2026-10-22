@@ -130,7 +130,6 @@ pub(crate) fn replace_format(
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::collections::VecDeque;
     use std::sync::{mpsc, Arc, Mutex};
 
     #[test]
@@ -197,7 +196,7 @@ mod tests {
                 assert_eq!(rx.recv().unwrap(), Ok(()));
             }
             let diagnostics = CaptureDiagnostics::new(48_000, 2);
-            let events = Arc::new(Mutex::new(VecDeque::new()));
+            let events = Arc::new(Mutex::new(Default::default()));
             let error = Error::Backend("synthetic bind failure; retry".into())
                 .with_context(ErrorContext::new(Operation::Link));
             assert_eq!(
@@ -228,7 +227,7 @@ mod tests {
     fn callback_panic_reports_terminal_and_quits_without_exposing_panic_text() {
         let (tx, rx) = mpsc::channel();
         let readiness = Readiness::new(tx, true);
-        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let events = Arc::new(Mutex::new(Default::default()));
         let quit = Cell::new(false);
         run_capture_callback(
             &readiness,

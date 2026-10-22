@@ -63,6 +63,7 @@ fn bounded(
                 .unwrap_or_else(|_| unknown("PipeWire capability probe worker panicked"));
             // Release the slot before publishing a completed result.
             drop(guard);
+            #[allow(clippy::let_underscore_must_use, reason = "A timed-out capability caller no longer needs the completed probe notification.")]
             let _ = tx.send(result);
         });
     if let Err(error) = worker {

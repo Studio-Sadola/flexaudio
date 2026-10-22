@@ -43,6 +43,7 @@ pub struct MockBackend {
     running: Arc<AtomicBool>,
     /// Generator thread handle (Some after start).
     handle: Option<JoinHandle<()>>,
+    shutdown: MockShutdown,
 }
 
 impl MockBackend {
@@ -56,6 +57,7 @@ impl MockBackend {
             freq_hz,
             running: Arc::new(AtomicBool::new(false)),
             handle: None,
+            shutdown: MockShutdown::default(),
         }
     }
 }
@@ -120,15 +122,21 @@ impl CaptureBackend for MockBackend {
             })?;
 
         self.handle = Some(handle);
+        self.shutdown = MockShutdown::default();
         Ok(())
     }
 
     fn stop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
-            // Join the generator thread. It will stop at the next loop iteration, even if sleeping.
-            let _ = h.join();
-        }
+        self.shutdown.retain(&self.running, &mut self.handle);
+    }
+
+    fn stop_checked(&mut self) -> Result<()> {
+        self.stop();
+        self.shutdown.result()
+    }
+
+    fn poll_event(&mut self) -> Option<flexaudio_core::Event> {
+        self.shutdown.events.pop_front()
     }
 }
 
@@ -161,6 +169,7 @@ pub struct StallableMockBackend {
     start_count: Arc<AtomicU32>,
     /// Generator thread handle.
     handle: Option<JoinHandle<()>>,
+    shutdown: MockShutdown,
 }
 
 impl StallableMockBackend {
@@ -175,6 +184,7 @@ impl StallableMockBackend {
             running: Arc::new(AtomicBool::new(false)),
             start_count: Arc::new(AtomicU32::new(0)),
             handle: None,
+            shutdown: MockShutdown::default(),
         }
     }
 
@@ -247,14 +257,21 @@ impl CaptureBackend for StallableMockBackend {
             })?;
 
         self.handle = Some(handle);
+        self.shutdown = MockShutdown::default();
         Ok(())
     }
 
     fn stop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        self.shutdown.retain(&self.running, &mut self.handle);
+    }
+
+    fn stop_checked(&mut self) -> Result<()> {
+        self.stop();
+        self.shutdown.result()
+    }
+
+    fn poll_event(&mut self) -> Option<flexaudio_core::Event> {
+        self.shutdown.events.pop_front()
     }
 }
 
@@ -302,6 +319,7 @@ pub struct PanickingMockBackend {
     /// Feed thread (Some only if start succeeds in `PanicMode::Stop`).
     running: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    shutdown: MockShutdown,
 }
 
 impl PanickingMockBackend {
@@ -314,6 +332,7 @@ impl PanickingMockBackend {
             mode,
             running: Arc::new(AtomicBool::new(false)),
             handle: None,
+            shutdown: MockShutdown::default(),
         }
     }
 }
@@ -375,19 +394,26 @@ impl CaptureBackend for PanickingMockBackend {
             })?;
 
         self.handle = Some(handle);
+        self.shutdown = MockShutdown::default();
         Ok(())
     }
 
     fn stop(&mut self) {
         // Stop and join the feed thread first to prevent leaks or hangs.
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        self.shutdown.retain(&self.running, &mut self.handle);
         if self.mode == PanicMode::Stop {
             // Panic in stop to simulate a backend contract violation.
             panic!("PanickingMockBackend: intentional panic in stop()");
         }
+    }
+
+    fn stop_checked(&mut self) -> Result<()> {
+        self.stop();
+        self.shutdown.result()
+    }
+
+    fn poll_event(&mut self) -> Option<flexaudio_core::Event> {
+        self.shutdown.events.pop_front()
     }
 }
 
@@ -395,10 +421,7 @@ impl Drop for PanickingMockBackend {
     fn drop(&mut self) {
         // Do not panic from Drop (to avoid a double panic leading to abort). Just make sure the
         // feed thread stops. PanicMode::Stop panics only on an explicit `stop()` call.
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        self.shutdown.retain(&self.running, &mut self.handle);
     }
 }
 
@@ -424,6 +447,7 @@ pub struct StallThenPanicOnReopenBackend {
     /// generations panic.
     start_count: Arc<AtomicU32>,
     handle: Option<JoinHandle<()>>,
+    shutdown: MockShutdown,
 }
 
 impl StallThenPanicOnReopenBackend {
@@ -438,6 +462,7 @@ impl StallThenPanicOnReopenBackend {
             running: Arc::new(AtomicBool::new(false)),
             start_count: Arc::new(AtomicU32::new(0)),
             handle: None,
+            shutdown: MockShutdown::default(),
         }
     }
 }
@@ -506,22 +531,114 @@ impl CaptureBackend for StallThenPanicOnReopenBackend {
             })?;
 
         self.handle = Some(handle);
+        self.shutdown = MockShutdown::default();
         Ok(())
     }
 
     fn stop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        self.shutdown.retain(&self.running, &mut self.handle);
+    }
+
+    fn stop_checked(&mut self) -> Result<()> {
+        self.stop();
+        self.shutdown.result()
+    }
+
+    fn poll_event(&mut self) -> Option<flexaudio_core::Event> {
+        self.shutdown.events.pop_front()
     }
 }
 
 impl Drop for StallThenPanicOnReopenBackend {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        self.shutdown.retain(&self.running, &mut self.handle);
+    }
+}
+
+/// Generator teardown has the same retained outcome for explicit stop and Drop.
+#[derive(Default)]
+struct MockShutdown {
+    report: Option<crate::ShutdownReport>,
+    events: std::collections::VecDeque<flexaudio_core::Event>,
+}
+
+impl MockShutdown {
+    fn retain(&mut self, running: &AtomicBool, handle: &mut Option<JoinHandle<()>>) {
+        running.store(false, Ordering::SeqCst);
+        if self.report.is_some() {
+            return;
         }
+        let mut cleanup = Vec::new();
+        if let Some(handle) = handle.take() {
+            if handle.join().is_err() {
+                let error = crate::Error::Backend("mock capture owner panicked".into())
+                    .with_context(crate::ErrorContext::new(crate::Operation::Join));
+                self.events.push_back(flexaudio_core::Event::ShutdownError {
+                    error: error.clone(),
+                });
+                cleanup.push(error);
+            }
+        }
+        self.report = Some(crate::ShutdownReport::new(None, cleanup));
+    }
+
+    fn result(&self) -> Result<()> {
+        self.report
+            .as_ref()
+            .expect("completed mock shutdown")
+            .result()
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum StopFixture {
+    Sine,
+    Stallable,
+    Panicking,
+    Reopening,
+}
+
+#[cfg(test)]
+pub(crate) fn check_stop_contract(fixture: StopFixture) {
+    macro_rules! check {
+        ($backend:expr) => {{
+            for checked_first in [false, true] {
+                let mut backend = $backend;
+                backend.handle = Some(thread::spawn(|| panic!("injected generator join failure")));
+                if checked_first {
+                    assert!(backend.stop_checked().is_err());
+                } else {
+                    backend.stop();
+                }
+                let report = backend
+                    .shutdown
+                    .report
+                    .clone()
+                    .expect("void mock stop retains report");
+                assert!(report.primary().is_none());
+                assert_eq!(report.cleanup().len(), 1);
+                let cause = crate::Error::Backend("mock capture owner panicked".into())
+                    .with_context(crate::ErrorContext::new(crate::Operation::Join));
+                assert_eq!(report.cleanup(), std::slice::from_ref(&cause));
+                assert_eq!(backend.stop_checked(), report.result());
+                backend.stop();
+                assert_eq!(backend.shutdown.report, Some(report.clone()));
+                assert_eq!(backend.stop_checked(), report.result());
+            }
+        }};
+    }
+    match fixture {
+        StopFixture::Sine => check!(MockBackend::new(48_000, 2, 0.0)),
+        StopFixture::Stallable => check!(StallableMockBackend::new(48_000, 2, 0.0, Duration::ZERO)),
+        StopFixture::Panicking => {
+            check!(PanickingMockBackend::new(48_000, 2, 0.0, PanicMode::Start))
+        }
+        StopFixture::Reopening => check!(StallThenPanicOnReopenBackend::new(
+            48_000,
+            2,
+            0.0,
+            Duration::ZERO
+        )),
     }
 }

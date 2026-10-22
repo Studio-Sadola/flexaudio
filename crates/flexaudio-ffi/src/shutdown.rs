@@ -21,10 +21,18 @@ impl FlexStream {
     }
 
     pub(crate) fn stop_binding(&mut self) -> flexaudio::Result<()> {
-        if let Some(report) = &self.shutdown {
-            return report.result();
+        self.retain_shutdown_outcome();
+        self.shutdown
+            .as_ref()
+            .expect("completed C shutdown")
+            .result()
+    }
+
+    fn retain_shutdown_outcome(&mut self) {
+        if self.shutdown.is_some() {
+            return;
         }
-        let _ = self.inner.stop_checked();
+        self.inner.stop();
         let core = self
             .inner
             .shutdown_report()
@@ -63,8 +71,58 @@ impl FlexStream {
         self.queue_secondary_input();
         cleanup.extend(self.vad_cleanup.iter().cloned());
         let report = ShutdownReport::new(core.primary().cloned(), cleanup);
-        let result = report.result();
         self.shutdown = Some(report);
-        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn facade_stop_failure_reaches_c_status_and_owned_shutdown_report() {
+        let inner = flexaudio::test_support::stop_failure(flexaudio::test_support::StopPhase::Stop)
+            .unwrap();
+        let mut stream = FlexStream {
+            events: Default::default(),
+            inner,
+            secondary: None,
+            shutdown: None,
+            shutdown_event_index: 0,
+            vad_tap: None,
+            vad_events: Vec::new(),
+            vad_origin: (0, 0),
+            vad_error: None,
+            vad_cleanup: Vec::new(),
+            ready_chunks: Default::default(),
+        };
+        // The C caller receives both its legacy status and a separately owned typed report.
+        unsafe {
+            assert_eq!(
+                crate::flexaudio_stop(&mut stream),
+                crate::code::FLEX_DEVICE_LOST
+            );
+            let report = crate::v2::flexaudio_shutdown_report_v2(&stream);
+            assert!(!report.is_null());
+            assert!(crate::v2::flexaudio_shutdown_primary_v2(report).is_null());
+            let mut count = 0;
+            assert_eq!(
+                crate::v2::flexaudio_shutdown_cleanup_count_v2(report, &mut count),
+                1
+            );
+            assert_eq!(count, 1);
+            let cleanup = crate::v2::flexaudio_shutdown_cleanup_v2(report, 0);
+            assert!(!cleanup.is_null());
+            let mut kind = 0;
+            assert_eq!(crate::v2::flexaudio_error_kind_v2(cleanup, &mut kind), 1);
+            assert_eq!(kind, crate::code::FLEX_DEVICE_LOST);
+            crate::v2::flexaudio_shutdown_report_free_v2(report);
+            let retained = stream.shutdown.clone();
+            assert_eq!(
+                crate::flexaudio_stop(&mut stream),
+                crate::code::FLEX_DEVICE_LOST
+            );
+            assert_eq!(stream.shutdown, retained);
+        }
     }
 }

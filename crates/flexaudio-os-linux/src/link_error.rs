@@ -240,10 +240,7 @@ mod tests {
     fn native_dispatch_preserves_the_policy_decision_and_diagnostic_tuple() {
         use crate::{capture_proxy::CoreOutcome, owner::poll_backend_event, readiness::Readiness};
         use flexaudio_core::Event;
-        use std::{
-            collections::VecDeque,
-            sync::{mpsc, Arc, Mutex},
-        };
+        use std::sync::{mpsc, Arc, Mutex};
         for decision in [
             Decision::Continue,
             Decision::Recoverable(CoreErrorDisposition::VanishedLink),
@@ -252,7 +249,7 @@ mod tests {
             let (_, _, failure) = fixture();
             let (tx, rx) = mpsc::channel();
             let readiness = Readiness::new(tx, true);
-            let events = Arc::new(Mutex::new(VecDeque::new()));
+            let events = Arc::new(Mutex::new(Default::default()));
             let quit = Cell::new(false);
             let stopped = crate::capture_control::apply_core_outcome(
                 CoreOutcome {

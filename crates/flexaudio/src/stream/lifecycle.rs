@@ -49,7 +49,7 @@ impl Stream {
         if let Err(error) = Self::open_backend_once(&self.shared, GenerationChange::Initial) {
             // Permission denial already closes delivery and stops the backend
             // in open_backend_once. Other failures still need startup cleanup.
-            let _ = self.stop_checked();
+            self.retain_shutdown_outcome();
             let cleanup = cleanup_error_since(&self.shared, old_cleanup_count);
             *self
                 .shared
@@ -91,7 +91,7 @@ impl Stream {
             Err(error) => {
                 let primary = Error::Backend(format!("spawn intake thread: {error}"))
                     .with_context(ErrorContext::new(Operation::Start));
-                let _ = self.stop_checked();
+                self.retain_shutdown_outcome();
                 let cleanup = cleanup_error_since(&self.shared, old_cleanup_count);
                 return Err(with_cleanup(primary, cleanup));
             }
@@ -109,7 +109,7 @@ impl Stream {
             Err(error) => {
                 let primary = Error::Backend(format!("spawn watchdog thread: {error}"))
                     .with_context(ErrorContext::new(Operation::Start));
-                let _ = self.stop_checked();
+                self.retain_shutdown_outcome();
                 let cleanup = cleanup_error_since(&self.shared, old_cleanup_count);
                 return Err(with_cleanup(primary, cleanup));
             }
@@ -149,19 +149,23 @@ impl Stream {
     /// Safe for reentry and repeated stop calls. After stop, drain chunks already buffered in the
     /// ring with [`poll_chunk`](Self::poll_chunk).
     pub fn stop(&mut self) {
-        let _ = self.retain_shutdown_outcome();
+        self.retain_shutdown_outcome();
     }
 
     /// Stop producers before final intake drain, join every worker and retain the outcome.
     /// Repeated calls return the identical outcome without duplicate events, joins or tails.
     pub fn stop_checked(&mut self) -> Result<()> {
-        self.retain_shutdown_outcome()
+        self.retain_shutdown_outcome();
+        self.shutdown
+            .as_ref()
+            .expect("completed stream shutdown")
+            .result()
     }
 
     // Explicit stop, checked stop and startup rollback share this retained report.
-    fn retain_shutdown_outcome(&mut self) -> Result<()> {
-        if let Some(report) = &self.shutdown {
-            return report.result();
+    fn retain_shutdown_outcome(&mut self) {
+        if self.shutdown.is_some() {
+            return;
         }
         // Block new recovery work while intake continues until producer quiescence.
         self.shared.switching.store(true, Ordering::SeqCst);
@@ -204,9 +208,7 @@ impl Stream {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
         );
-        let result = report.result();
         self.shutdown = Some(report);
-        result
     }
 
     /// Completed shutdown outcome, or None while capture has not finished shutting down.

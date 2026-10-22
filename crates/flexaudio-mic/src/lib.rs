@@ -27,6 +27,7 @@
 //! ```
 
 #![warn(missing_docs)]
+#![deny(clippy::let_underscore_must_use)]
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,7 +41,10 @@ use cpal::{Device, SampleFormat};
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::clock::monotonic_now_ns;
 use flexaudio_core::types::{DeviceInfo, Error, Event, Result, SourceKind};
-use flexaudio_core::{ErrorContext, ErrorGroup, Operation};
+use flexaudio_core::{ErrorContext, Operation, ShutdownReport};
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 mod capture_owner;
 
@@ -100,12 +104,13 @@ pub struct CpalMicBackend {
     device_id: Option<String>,
     /// Control-thread teardown notifications; callbacks never query consent.
     events: mpsc::Receiver<Event>,
+    #[cfg(test)]
     event_tx: mpsc::Sender<Event>,
     /// A retained terminal failure prevents restarting this backend instance.
     terminal_error: Option<Error>,
     /// Runtime failures are materialized on the control thread, never the callback.
     callback_errors: Arc<callback_mailbox::CallbackMailbox>,
-    shutdown_result: Option<Result<()>>,
+    shutdown: Option<ShutdownReport>,
     pending_events: VecDeque<Event>,
 }
 
@@ -165,7 +170,7 @@ impl CpalMicBackend {
     }
 
     fn with_format(device_id: Option<String>, native: (u32, u16)) -> Self {
-        let (event_tx, events) = mpsc::channel();
+        let (_event_tx, events) = mpsc::channel();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let callback_errors = Arc::new(callback_mailbox::CallbackMailbox::new(stop_flag.clone()));
         Self {
@@ -174,17 +179,23 @@ impl CpalMicBackend {
             native,
             device_id,
             events,
-            event_tx,
+            #[cfg(test)]
+            event_tx: _event_tx,
             terminal_error: None,
             callback_errors,
-            shutdown_result: None,
+            shutdown: None,
             pending_events: VecDeque::new(),
         }
     }
 
-    fn teardown(&mut self) -> Result<()> {
-        if let Some(result) = &self.shutdown_result {
-            return result.clone();
+    /// Completed stop outcome, retained independently of event polling.
+    pub fn shutdown_report(&self) -> Option<&ShutdownReport> {
+        self.shutdown.as_ref()
+    }
+
+    fn retain_shutdown_outcome(&mut self) {
+        if self.shutdown.is_some() {
+            return;
         }
         self.stop_flag.store(true, Ordering::SeqCst);
         let result = match self.handle.take() {
@@ -197,14 +208,46 @@ impl CpalMicBackend {
             }
             None => Ok(()),
         };
+        self.reconcile_events();
         if let Err(error) = &result {
-            let _ = self.event_tx.send(Event::ShutdownError {
+            self.pending_events.push_back(Event::ShutdownError {
                 error: error.clone(),
             });
         }
-        self.reconcile_events();
-        self.shutdown_result = Some(result.clone());
-        result
+        self.shutdown = Some(ShutdownReport::new(
+            self.terminal_error.clone(),
+            result.err().into_iter().collect(),
+        ));
+    }
+
+    fn complete_start(
+        &mut self,
+        readiness: Result<()>,
+        previous_shutdown: Option<ShutdownReport>,
+    ) -> Result<()> {
+        match readiness {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.retain_shutdown_outcome();
+                if let Error::NativeFormatChanged { actual, .. } = &error {
+                    self.native = *actual;
+                }
+                let current_cleanup = self
+                    .shutdown
+                    .take()
+                    .expect("rollback retains its report")
+                    .cleanup()
+                    .to_vec();
+                let mut cleanup = previous_shutdown
+                    .map(|previous| previous.cleanup().to_vec())
+                    .unwrap_or_default();
+                cleanup.extend(current_cleanup);
+                let report = ShutdownReport::new(Some(error), cleanup);
+                let result = report.result();
+                self.shutdown = Some(report);
+                result
+            }
+        }
     }
 
     fn retain_terminal(&mut self, event: &Event) {
@@ -436,7 +479,7 @@ impl CaptureBackend for CpalMicBackend {
                 flexaudio_core::spawn_error("CPAL microphone capture owner", e)
             })?;
         self.handle = Some(handle);
-        let previous_shutdown = self.shutdown_result.take();
+        let previous_shutdown = self.shutdown.take();
 
         // Wait for the owner thread to build and play the stream.
         let readiness = ready_rx.recv().unwrap_or_else(|_| {
@@ -445,30 +488,19 @@ impl CaptureBackend for CpalMicBackend {
                     .with_context(ErrorContext::new(Operation::Start)),
             )
         });
-        match readiness {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let cleanup = self.teardown();
-                if let Error::NativeFormatChanged { actual, .. } = &e {
-                    self.native = *actual;
-                }
-                if previous_shutdown.is_some() {
-                    self.shutdown_result = previous_shutdown;
-                }
-                match cleanup {
-                    Ok(()) => Err(e),
-                    Err(cleanup) => Err(Error::Multiple(ErrorGroup::new(e, cleanup, Vec::new()))),
-                }
-            }
-        }
+        self.complete_start(readiness, previous_shutdown)
     }
 
     fn stop(&mut self) {
-        let _ = self.teardown();
+        self.retain_shutdown_outcome();
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.teardown()
+        self.retain_shutdown_outcome();
+        self.shutdown
+            .as_ref()
+            .expect("stop retains its report")
+            .result()
     }
 
     fn poll_event(&mut self) -> Option<Event> {

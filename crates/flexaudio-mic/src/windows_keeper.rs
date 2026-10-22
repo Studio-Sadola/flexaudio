@@ -43,6 +43,7 @@ fn start_keeper() -> std::result::Result<(), String> {
                 .map_err(panic_message)
                 .and_then(|result| result);
             let keep_alive = initialized.is_ok();
+            #[allow(clippy::let_underscore_must_use, reason = "Keeper lifetime follows initialization, even if the waiting caller has exited.")]
             let _ = ready_tx.send(initialized);
 
             if keep_alive {
@@ -72,6 +73,10 @@ fn initialize_enumerator() -> std::result::Result<(), String> {
     let host = cpal::default_host();
     // On Windows/WASAPI, `default_input_device()` calls `get_enumerator()` first even when no
     // input endpoint exists. Thus, the keeper initializes `ENUMERATOR` even if the result is None.
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "Only enumerator initialization is needed; the default device may legitimately be absent."
+    )]
     let _ = host.default_input_device();
     Ok(())
 }

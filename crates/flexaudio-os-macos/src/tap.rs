@@ -40,6 +40,7 @@ mod buffer;
 use buffer::{push_buffer_list, BufferReport};
 
 use crate::capture_health::SampleMailbox;
+use crate::cleanup::{native_cleanup, CleanupLedger, NativeCleanup};
 use crate::common::{map_os_status, map_os_status_at, tap_native_format, NO_ERR};
 
 /// Tap kind. INCLUDE = mixdown of the selected processes / EXCLUDE = everything except them.
@@ -71,24 +72,12 @@ pub(crate) enum TapKind {
 // the Linux backend.
 #[allow(clippy::type_complexity)]
 pub(crate) struct TapChain {
-    /// Aggregate device ID used by the IOProc.
-    aggregate_id: AudioObjectID,
-    /// Registered IOProc ID (block-driven).
-    io_proc_id: AudioDeviceIOProcID,
-    /// Process tap ID.
-    tap_id: AudioObjectID,
-    /// IOProc stop gate. Set `stopped=true` (Release) before calling `AudioDeviceStop`, then load
-    /// it with `Acquire` at the start of the IOProc block and return immediately if set. This
-    /// fail-safe closes the window where a late in-flight callback could access `RefCell<RawSink>`
-    /// after `AudioDeviceStop` returns. Apple does not document that CoreAudio calls the IOProc
-    /// on one thread without reentrancy, so guard against it. Shared with the block via `Arc`.
-    stopped: Arc<AtomicBool>,
+    resources: TapResources,
     /// Atomic native-sample observations read by the owner thread.
     pub(crate) observations: Arc<SampleMailbox>,
     /// Confirmed native format for the advisory duration, or unknown (no inference).
     pub(crate) observed_format: Option<(u32, u16)>,
     buffer_report: Arc<BufferReport>,
-    shutdown_report: Option<ShutdownReport>,
     /// Block passed to the IOProc (must live until `DestroyIOProcID`). Dropped last.
     _block: RcBlock<
         dyn Fn(
@@ -103,6 +92,23 @@ pub(crate) struct TapChain {
     _desc: Retained<CATapDescription>,
 }
 
+pub(crate) struct TapResources {
+    /// Aggregate device ID used by the IOProc.
+    aggregate_id: AudioObjectID,
+    /// Registered IOProc ID (block-driven).
+    io_proc_id: AudioDeviceIOProcID,
+    /// Process tap ID.
+    tap_id: AudioObjectID,
+    /// IOProc stop gate. Set `stopped=true` (Release) before calling `AudioDeviceStop`, then load
+    /// it with `Acquire` at the start of the IOProc block and return immediately if set. This
+    /// fail-safe closes the window where a late in-flight callback could access `RefCell<RawSink>`
+    /// after `AudioDeviceStop` returns. Apple does not document that CoreAudio calls the IOProc
+    /// on one thread without reentrancy, so guard against it. Shared with the block via `Arc`.
+    stopped: Arc<AtomicBool>,
+    shutdown_report: Option<ShutdownReport>,
+    cleanup: Arc<CleanupLedger>,
+}
+
 // SAFETY: The IDs held by TapChain are `u32` and `Send`. `RcBlock` / `Retained<CATapDescription>`
 // are created and dropped on the owner thread (the backend's dedicated thread) and are not
 // shared across thread boundaries. The backend (`MacSystemBackend`/`MacProcessBackend`) is `Send`,
@@ -111,7 +117,13 @@ pub(crate) struct TapChain {
 
 impl Drop for TapChain {
     fn drop(&mut self) {
-        let _ = self.retain_shutdown_outcome();
+        self.retain_shutdown_outcome();
+    }
+}
+
+impl Drop for TapResources {
+    fn drop(&mut self) {
+        self.retain_shutdown_outcome();
     }
 }
 
@@ -124,10 +136,17 @@ unsafe fn release_resources(
     let mut errors = Vec::new();
     if io_proc.is_some() {
         for (call, status) in [
-            ("AudioDeviceStop", AudioDeviceStop(aggregate, io_proc)),
+            (
+                "AudioDeviceStop",
+                native_cleanup(NativeCleanup::TapStop, || {
+                    AudioDeviceStop(aggregate, io_proc)
+                }),
+            ),
             (
                 "AudioDeviceDestroyIOProcID",
-                AudioDeviceDestroyIOProcID(aggregate, io_proc),
+                native_cleanup(NativeCleanup::TapIoProc, || {
+                    AudioDeviceDestroyIOProcID(aggregate, io_proc)
+                }),
             ),
         ] {
             if status != NO_ERR {
@@ -136,7 +155,9 @@ unsafe fn release_resources(
         }
     }
     if aggregate != 0 {
-        let status = AudioHardwareDestroyAggregateDevice(aggregate);
+        let status = native_cleanup(NativeCleanup::TapAggregate, || {
+            AudioHardwareDestroyAggregateDevice(aggregate)
+        });
         if status != NO_ERR {
             errors.push(map_os_status_at(
                 Operation::Stop,
@@ -146,7 +167,9 @@ unsafe fn release_resources(
         }
     }
     if tap != 0 {
-        let status = AudioHardwareDestroyProcessTap(tap);
+        let status = native_cleanup(NativeCleanup::TapDestroy, || {
+            AudioHardwareDestroyProcessTap(tap)
+        });
         if status != NO_ERR {
             errors.push(map_os_status_at(
                 Operation::Stop,
@@ -163,32 +186,69 @@ unsafe fn rollback(
     aggregate: AudioObjectID,
     io_proc: AudioDeviceIOProcID,
     tap: AudioObjectID,
+    cleanup: &Arc<CleanupLedger>,
 ) -> Error {
-    ShutdownReport::new(Some(error), release_resources(aggregate, io_proc, tap))
-        .result()
-        .expect_err("startup failed")
+    let mut resources = TapResources {
+        aggregate_id: aggregate,
+        io_proc_id: io_proc,
+        tap_id: tap,
+        stopped: Arc::new(AtomicBool::new(true)),
+        shutdown_report: None,
+        cleanup: cleanup.clone(),
+    };
+    resources.retain_shutdown_outcome();
+    error
 }
 
 impl TapChain {
     pub(crate) fn gate_delivery(&self) {
-        self.stopped.store(true, Ordering::Release);
+        self.resources.stopped.store(true, Ordering::Release);
     }
 
     pub(crate) fn take_buffer_error(&self) -> Option<Error> {
         self.buffer_report.take_error()
     }
 
-    pub(crate) fn retain_shutdown_outcome(&mut self) -> Result<(), Error> {
+    pub(crate) fn retain_shutdown_outcome(&mut self) {
+        self.resources.retain_shutdown_outcome();
+    }
+}
+
+impl TapResources {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn rollback_fixture(cleanup: &Arc<CleanupLedger>) -> Error {
+        // SAFETY: test injection intercepts every native release of these inert IDs.
+        unsafe {
+            rollback(
+                Error::DeviceLost,
+                1,
+                Some(crate::test_support::unused_io_proc),
+                1,
+                cleanup,
+            )
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn fixture(cleanup: Arc<CleanupLedger>) -> Self {
+        Self {
+            aggregate_id: 1,
+            io_proc_id: Some(crate::test_support::unused_io_proc),
+            tap_id: 1,
+            stopped: Arc::new(AtomicBool::new(false)),
+            shutdown_report: None,
+            cleanup,
+        }
+    }
+
+    pub(crate) fn retain_shutdown_outcome(&mut self) {
         if self.shutdown_report.is_none() {
-            self.gate_delivery();
+            self.stopped.store(true, Ordering::Release);
             let errors =
                 unsafe { release_resources(self.aggregate_id, self.io_proc_id, self.tap_id) };
+            self.cleanup.extend(errors.iter().cloned());
             self.shutdown_report = Some(ShutdownReport::new(None, errors));
         }
-        self.shutdown_report
-            .as_ref()
-            .expect("completed tap shutdown")
-            .result()
     }
 }
 
@@ -219,6 +279,7 @@ pub(crate) unsafe fn build_tap_chain(
     kind: TapKind,
     name: &str,
     sink: RawSink,
+    cleanup: Arc<CleanupLedger>,
 ) -> Result<TapChain, Error> {
     // 1) CATapDescription (INCLUDE = mixdown / EXCLUDE = global-but-exclude /
     //    ExcludeOnDevice = exclude audio sent to a specific output device).
@@ -269,7 +330,7 @@ pub(crate) unsafe fn build_tap_chain(
     // Unknown or unsupported ASBDs fail before any callback can read samples.
     let native = match tap_native_format(tap_id) {
         Ok(native) => native,
-        Err(error) => return Err(rollback(error, 0, None, tap_id)),
+        Err(error) => return Err(rollback(error, 0, None, tap_id, &cleanup)),
     };
     let advertised = (sink.native_rate(), sink.native_channels());
     if native != advertised {
@@ -282,6 +343,7 @@ pub(crate) unsafe fn build_tap_chain(
             0,
             None,
             tap_id,
+            &cleanup,
         ));
     }
 
@@ -289,7 +351,7 @@ pub(crate) unsafe fn build_tap_chain(
     let aggregate_id = match create_aggregate_device(name, &uuid_str) {
         Ok(id) => id,
         Err(e) => {
-            return Err(rollback(e, 0, None, tap_id));
+            return Err(rollback(e, 0, None, tap_id, &cleanup));
         }
     };
 
@@ -390,7 +452,7 @@ pub(crate) unsafe fn build_tap_chain(
         } else {
             map_os_status("AudioDeviceCreateIOProcIDWithBlock", status)
         };
-        return Err(rollback(error, aggregate_id, io_proc_id, tap_id));
+        return Err(rollback(error, aggregate_id, io_proc_id, tap_id, &cleanup));
     }
 
     // 6) Start.
@@ -403,18 +465,22 @@ pub(crate) unsafe fn build_tap_chain(
             aggregate_id,
             io_proc_id,
             tap_id,
+            &cleanup,
         ));
     }
 
     Ok(TapChain {
-        aggregate_id,
-        io_proc_id,
-        tap_id,
-        stopped,
+        resources: TapResources {
+            aggregate_id,
+            io_proc_id,
+            tap_id,
+            stopped,
+            cleanup,
+            shutdown_report: None,
+        },
         observations,
         observed_format,
         buffer_report,
-        shutdown_report: None,
         _block: block,
         _desc: desc,
     })

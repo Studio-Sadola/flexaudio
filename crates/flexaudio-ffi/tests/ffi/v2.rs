@@ -37,46 +37,27 @@ fn context(error: *const FlexErrorInfoV2, index: usize) -> FlexErrorContextV2 {
 
 #[test]
 fn v2_error_root_codes_survive_context_and_multiple() {
-    let roots = [
-        (fa::Error::InvalidArg("validation".into()), -1),
-        (fa::Error::InvalidState("lifecycle".into()), -4),
-        (fa::Error::DeviceNotFound, -5),
-        (fa::Error::DeviceLost, -6),
-        (
-            fa::Error::PermissionDenied {
-                permission: fa::Permission::Microphone,
-                detail: "private fixture".into(),
-            },
-            -7,
-        ),
-        (fa::Error::UnsupportedOsVersion, -8),
-        (fa::Error::Unsupported, -9),
-        (fa::Error::UnsupportedFormat("validation".into()), -10),
-        (
-            fa::Error::NativeFormatChanged {
-                advertised: (48_000, 2),
-                actual: (44_100, 1),
-            },
-            -11,
-        ),
-        (fa::Error::AmbiguousDeviceName, -12),
-        (fa::Error::Backend("safe backend failure".into()), -2),
-    ];
-    for (root, expected) in roots {
+    let device_lost = crate::error::root_code(&fa::Error::DeviceLost);
+    for (error_kind, _, root) in flexaudio_core::test_support::error_cases() {
+        let expected = crate::error::root_code(&root);
         let wrapped = fa::Error::Multiple(fa::ErrorGroup::new(
             root.with_context(fa::ErrorContext::new(fa::Operation::Start)),
             fa::Error::DeviceLost,
             Vec::new(),
         ))
         .with_context(fa::ErrorContext::new(fa::Operation::Rollback));
-        assert_eq!(crate::fail(wrapped), expected);
+        assert_eq!(
+            crate::fail(wrapped),
+            expected,
+            "{error_kind:?} code changed across context"
+        );
         let owner = flexaudio_last_error_info_v2();
         assert!(!owner.is_null());
         unsafe {
             assert_eq!(kind(owner), expected);
             assert_eq!(context(owner, 0).operation, 5);
             assert_eq!(context(owner, 1).operation, 1);
-            assert_eq!(kind(flexaudio_error_secondary_v2(owner, 0)), -6);
+            assert_eq!(kind(flexaudio_error_secondary_v2(owner, 0)), device_lost);
             flexaudio_error_info_free_v2(owner);
         }
     }

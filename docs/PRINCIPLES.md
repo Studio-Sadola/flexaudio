@@ -84,13 +84,32 @@ it checks declarations, not runtime behavior. Promise 3 has the backend probe
 and keepalive lifecycle tests. Promise 4 has
 `bindings_cannot_construct_applicability_reasons`: bindings may not name
 `IgnoreReason` or `AdjustmentReason`, including their variants. Promise 5 has
-binding error-kind checks against a compiler-exhaustive core inventory, shutdown
-field checks against an exhaustive core `ShutdownReport` destructure and the
-Node, Python and current C declarations, and
-`production_stop_and_cleanup_discards_retain_failures`. The last scans production
-Rust functions for discarded stop/cleanup results without an explicit retained
-outcome in that function. It excludes test code, examples, comments and literals;
-its matched calls and retention operations are documented beside the test.
+runtime binding checks against the flexaudio-core error-kind inventory: every
+kind maps to its canonical name and no two names collide. This is not a
+source-text check. Shutdown field checks compare an exhaustive core
+`ShutdownReport` destructure with the Node, Python and current C declarations.
+
+A stop or cleanup failure that the library observes stays in `ShutdownReport`
+and reaches the caller in Rust, Node, Python and C. CI injects operation failures
+into Stream, Mix, mock backends, microphone and each OS backend. Shared fixtures
+run on Linux, Windows and macOS; PipeWire system/process/watcher fixtures run on
+Linux, WASAPI system/process fixtures on Windows, and Core Audio
+system/process/tap/probe cleanup fixtures on macOS. Binding caller tests run in
+the Linux jobs. Cross-crate fixtures use non-default `test-support` features
+enabled only by dev-dependencies; they are internal and have no stability guarantee.
+
+Two regressions turn CI red automatically. A new stop path in `StopPath` needs
+an injection fixture arm in a wildcard-free match (compiler error E0004), and a
+built-in backend passed through the registered factory must implement
+`RegisteredBuiltin` (E0277). A discarded `Result` written as `let _ =` or
+`let _: T =` fails `clippy::let_underscore_must_use` in the eight production
+crates: flexaudio, flexaudio-mic, the three OS backends, flexaudio-napi,
+flexaudio-py and flexaudio-ffi. Intentional non-stop discards carry a local
+reason; stop and cleanup paths retain their outcomes without lint exceptions.
+The limit is explicit: a failure swallowed inside a function in some other way,
+outside the registered entry and without a discarded `Result`, is not detected
+automatically. These checks replace the removed source-text stop guard.
+
 Promise 6 has
 the API compatibility gates and the
 [registry completion gate](../.github/scripts/check_registry_completion.py).

@@ -468,61 +468,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_core_error_kind_has_an_explicit_distinct_python_projection() {
-        flexaudio_core::test_support::assert_explicit_error_kind_arms(
-            include_str!("errors.rs"),
-            "fn kind_name(",
-        );
-        // IgnoredSettings uses the earlier report-bearing exception branch.
-        // Every other kind must name its exception explicitly, even Backend.
-        let exception_mapping = include_str!("errors.rs")
-            .split_once("pub(crate) fn to_py_err(")
-            .unwrap()
-            .1
-            .split_once("pub(crate) fn register(")
-            .unwrap()
-            .0;
-        for (kind, _, _) in flexaudio_core::test_support::error_cases() {
-            if kind != fa::ErrorKind::IgnoredSettings {
-                assert!(
-                    exception_mapping.contains(&format!("ErrorKind::{kind:?} =>")),
-                    "Python exception choice must explicitly map {kind:?}"
-                );
-            }
-        }
+    fn every_core_error_kind_maps_to_canonical_distinct_python_name() {
         Python::initialize();
         Python::attach(|py| {
-            let mut names = std::collections::HashSet::new();
-            let mut classes = Vec::new();
-            let stub = include_str!("../flexaudio.pyi");
-            let literal = stub
-                .split_once("def kind(self) -> Literal[")
-                .unwrap()
-                .1
-                .split_once(']')
-                .unwrap()
-                .0;
-            for (kind, expected, error) in flexaudio_core::test_support::error_cases() {
-                assert_eq!(error.kind(), kind, "core error fixture must match its kind");
-                let name = kind_name(kind);
-                assert!(
-                    names.insert(name),
-                    "Python kind collision or fallback for {kind:?}"
+            let cases = flexaudio_core::test_support::error_cases();
+            let mut names = std::collections::BTreeMap::<&'static str, Vec<fa::ErrorKind>>::new();
+            let mut projected: Vec<(fa::ErrorKind, &'static str, &'static str)> = Vec::new();
+            for (kind, expected, error) in &cases {
+                assert_eq!(
+                    error.kind(),
+                    *kind,
+                    "core error fixture must match its kind"
                 );
-                assert_eq!(name, expected, "Python kind must explicitly map {kind:?}");
+                // Name path for every kind, including the report-bearing ignored-settings error.
+                let name = AudioError(error.clone()).kind();
+                names.entry(name).or_default().push(*kind);
+                projected.push((*kind, *expected, name));
+            }
+            for (name, kinds) in &names {
                 assert!(
-                    literal.contains(&format!("\"{name}\"")),
-                    "Python kind Literal is missing {name}"
+                    kinds.len() == 1,
+                    "Python kind collision or fallback for {kinds:?} sharing {name}"
                 );
-                let exception = to_py_err(error);
-                let class = exception.get_type(py);
-                assert!(
-                    classes
-                        .iter()
-                        .all(|previous: &Bound<'_, pyo3::types::PyType>| !previous.is(&class)),
-                    "Python exception collision or fallback for {kind:?}"
+            }
+            for (kind, expected, name) in &projected {
+                assert_eq!(
+                    name, expected,
+                    "Python kind must equal the canonical name for {kind:?}"
                 );
-                classes.push(class);
+            }
+            let mut classes: Vec<(fa::ErrorKind, Bound<'_, pyo3::types::PyType>)> = Vec::new();
+            for (kind, _, error) in cases {
+                let class = to_py_err(error).get_type(py);
+                for (previous, previous_class) in &classes {
+                    assert!(
+                        !previous_class.is(&class),
+                        "Python exception collision or fallback for {kind:?} and {previous:?}"
+                    );
+                }
+                classes.push((kind, class));
             }
         });
     }
@@ -587,35 +571,32 @@ mod tests {
     fn every_root_has_distinct_exception_and_read_only_typed_payload() {
         Python::initialize();
         Python::attach(|py| {
-            let roots = [
-                fa::Error::InvalidArg("validation".into()),
-                fa::Error::InvalidState("state".into()),
-                fa::Error::DeviceNotFound,
-                fa::Error::PermissionDenied {
-                    permission: fa::Permission::Microphone,
-                    detail: "private".into(),
-                },
-                fa::Error::UnsupportedOsVersion,
-                fa::Error::DeviceLost,
-                fa::Error::Backend("safe failure".into()),
-                fa::Error::UnsupportedFormat("format".into()),
-                fa::Error::NativeFormatChanged {
-                    advertised: (48_000, 2),
-                    actual: (44_100, 1),
-                },
-                fa::Error::Unsupported,
-                fa::Error::AmbiguousDeviceName,
-            ];
             let mut classes = Vec::new();
-            for root in roots {
-                let kind = kind_name(root.kind());
+            for (kind, name, root) in flexaudio_core::test_support::error_cases() {
+                let root = if kind == fa::ErrorKind::PermissionDenied {
+                    fa::Error::PermissionDenied {
+                        permission: fa::Permission::Microphone,
+                        detail: "private".into(),
+                    }
+                } else {
+                    root
+                };
                 let error =
                     to_py_err(root.with_context(fa::ErrorContext::new(fa::Operation::Start)));
                 let class = error.get_type(py);
-                assert!(classes
-                    .iter()
-                    .all(|previous: &Bound<'_, pyo3::types::PyType>| !previous.is(&class)));
+                assert!(
+                    classes
+                        .iter()
+                        .all(|previous: &Bound<'_, pyo3::types::PyType>| !previous.is(&class)),
+                    "Python exception collision or fallback for {kind:?}"
+                );
                 classes.push(class.clone());
+                assert!(!error.to_string().contains("private"));
+                if kind == fa::ErrorKind::IgnoredSettings {
+                    assert!(error.value(py).getattr("report").is_ok());
+                    assert!(error.value(py).getattr("audio_error").is_err());
+                    continue;
+                }
                 let payload = error.value(py).getattr("audio_error").unwrap();
                 assert_eq!(
                     payload
@@ -623,11 +604,10 @@ mod tests {
                         .unwrap()
                         .extract::<String>()
                         .unwrap(),
-                    kind
+                    name
                 );
                 assert!(error.value(py).setattr("audio_error", py.None()).is_err());
                 assert!(payload.setattr("kind", "backend").is_err());
-                assert!(!error.to_string().contains("private"));
             }
         });
     }

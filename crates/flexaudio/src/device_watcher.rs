@@ -94,6 +94,7 @@ pub(crate) fn watch_devices() -> flexaudio_core::types::Result<DeviceWatcher> {
     {
         watcher_from_start(
             flexaudio_os_linux::PwDeviceWatcher::start()
+                .map(crate::stop_contract::registered)
                 .map(|watcher| Box::new(watcher) as Box<dyn DeviceWatchBackend>),
         )
     }

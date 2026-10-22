@@ -19,6 +19,7 @@ use objc2_core_audio_types::{
     AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp,
 };
 
+use crate::cleanup::{native_cleanup, NativeCleanup};
 use crate::probe::{ProbeCleanup, ProbeControl, ProbeOutcome};
 
 pub(super) type DeviceBlock = RcBlock<
@@ -183,6 +184,17 @@ pub(super) struct IoRegistration {
 }
 
 impl IoRegistration {
+    #[cfg(feature = "test-support")]
+    pub(super) fn fixture(control: &ProbeControl) -> Self {
+        Self {
+            cleanup: control.cleanup_diagnostics(),
+            device: 1,
+            id: Some(crate::test_support::unused_io_proc),
+            gate: Arc::new(AtomicBool::new(false)),
+            _block: RcBlock::new(|_, _, _, _, _| {}),
+        }
+    }
+
     pub(super) fn start(
         device: AudioObjectID,
         block: DeviceBlock,
@@ -225,9 +237,13 @@ impl IoRegistration {
             return true;
         };
         // SAFETY: ID belongs to device; callback block/state remain retained until both calls return.
-        let stop = unsafe { AudioDeviceStop(self.device, Some(id)) };
+        let stop = native_cleanup(NativeCleanup::ProbeStop, || unsafe {
+            AudioDeviceStop(self.device, Some(id))
+        });
         // SAFETY: this is this owner's registered IOProc, not shared with another capture.
-        let destroy = unsafe { AudioDeviceDestroyIOProcID(self.device, Some(id)) };
+        let destroy = native_cleanup(NativeCleanup::ProbeIoProc, || unsafe {
+            AudioDeviceDestroyIOProcID(self.device, Some(id))
+        });
         self.cleanup.record_native("IOProc stop", stop);
         self.cleanup.record_native("IOProc destruction", destroy);
         if destroy == 0 {
@@ -239,7 +255,7 @@ impl IoRegistration {
 
 impl Drop for IoRegistration {
     fn drop(&mut self) {
-        let _ = self.record_cleanup();
+        self.record_cleanup();
     }
 }
 

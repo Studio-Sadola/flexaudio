@@ -116,7 +116,6 @@ mod tests {
     use crate::{link_error::CoreFailure, owner::poll_backend_event, proxy_release::RequestWindow};
     use std::{
         cell::Cell,
-        collections::VecDeque,
         sync::{mpsc, Arc, Mutex},
     };
 
@@ -142,7 +141,7 @@ mod tests {
             let readiness = Rc::new(Readiness::new(tx, true));
             readiness.set_target_present(true);
             readiness.registry_synchronized();
-            let events = Arc::new(Mutex::new(VecDeque::new()));
+            let events = Arc::new(Mutex::new(Default::default()));
             let stopped = Rc::new(Cell::new(false));
             let stopped_for_callback = stopped.clone();
             let callbacks = CaptureCallbacks::new(readiness.clone(), events.clone(), move || {

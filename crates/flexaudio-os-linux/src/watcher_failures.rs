@@ -1,6 +1,6 @@
 // One terminal reporting path for watcher callbacks and explicit owner teardown.
 use crate::watcher_queue::{lock_events, WatchEventQueue};
-use flexaudio_core::{Error, ErrorContext, Operation};
+use flexaudio_core::{Error, ErrorContext, Operation, ShutdownReport};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::thread::JoinHandle;
 
@@ -23,12 +23,22 @@ pub(crate) fn run_watcher_callback(
     }
 }
 
-pub(crate) fn finish_watch_worker(handle: &mut Option<JoinHandle<()>>, events: &WatchEventQueue) {
-    if let Some(handle) = handle.take() {
-        if let Err(error) = crate::owner::join_worker(handle) {
-            fail_watcher(events, error);
-        }
+pub(crate) fn finish_watch_worker(
+    handle: &mut Option<JoinHandle<()>>,
+    shutdown: &mut Option<ShutdownReport>,
+    events: &WatchEventQueue,
+) {
+    if shutdown.is_some() {
+        return;
     }
+    let result = handle.take().map_or(Ok(()), crate::owner::join_worker);
+    // Read after joining, before publishing a join failure as a watcher event.
+    let primary = lock_events(events).terminal_error();
+    let cleanup: Vec<_> = result.err().into_iter().collect();
+    for error in &cleanup {
+        fail_watcher(events, error.clone());
+    }
+    *shutdown = Some(ShutdownReport::new(primary, cleanup));
 }
 
 #[cfg(test)]

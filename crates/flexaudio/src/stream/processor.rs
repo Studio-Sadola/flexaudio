@@ -28,6 +28,10 @@ impl DenoiseInnerProcessor {
 
 impl InnerProcessor for DenoiseInnerProcessor {
     fn process(&mut self, samples: &mut [f32]) {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "Canonical stereo buffers contain complete frames; the denoiser only rejects incomplete frames."
+        )]
         let _ = self.denoiser.process(samples);
     }
     fn flush(&mut self) -> Vec<f32> {

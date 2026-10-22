@@ -372,6 +372,12 @@ mod tests {
     use std::ffi::CString;
     use std::fs;
 
+    fn remove_test_file(path: &Path) {
+        if let Err(error) = fs::remove_file(path) {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        }
+    }
+
     #[test]
     fn invalid_lazy_chunk_preserves_existing_destination() {
         let path = temp_path("invalid_lazy");
@@ -453,7 +459,7 @@ mod tests {
     #[test]
     fn create_write_finalize_and_write_after_finalize_is_invalid_state() {
         let path = temp_path("single");
-        let _ = fs::remove_file(&path);
+        remove_test_file(&path);
         let cpath = CString::new(path.to_str().unwrap()).unwrap();
 
         let f = unsafe { flexaudio_flac_create(cpath.as_ptr(), 48_000, 1, 0) };
@@ -480,7 +486,7 @@ mod tests {
             fs::metadata(&path).unwrap().len() > 0,
             "file should not be empty"
         );
-        let _ = fs::remove_file(&path);
+        fs::remove_file(&path).expect("remove completed FLAC fixture");
     }
 
     #[test]
@@ -488,8 +494,8 @@ mod tests {
         let base = temp_path("split");
         let f1 = split_file_path(&base, 1);
         let f2 = split_file_path(&base, 2);
-        let _ = fs::remove_file(&f1);
-        let _ = fs::remove_file(&f2);
+        remove_test_file(&f1);
+        remove_test_file(&f2);
         let cpath = CString::new(base.to_str().unwrap()).unwrap();
 
         // split_seconds=1 at 48 kHz mono → 48000 frames per file.
@@ -512,8 +518,8 @@ mod tests {
 
         assert!(f1.exists(), "first file {f1:?} should have been created");
         assert!(f2.exists(), "second file {f2:?} should have been created");
-        let _ = fs::remove_file(&f1);
-        let _ = fs::remove_file(&f2);
+        fs::remove_file(&f1).expect("remove first completed FLAC fixture");
+        fs::remove_file(&f2).expect("remove second completed FLAC fixture");
     }
 
     #[test]

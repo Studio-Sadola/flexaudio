@@ -34,6 +34,14 @@
 //! other platforms so its sample, activity, and timing policy can be tested without audio devices.
 
 #![warn(missing_docs)]
+#![deny(clippy::let_underscore_must_use)]
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod cleanup;
+
+/// Internal shutdown injection fixtures, with no stability guarantee.
+#[cfg(all(target_os = "macos", feature = "test-support"))]
+pub mod test_support;
 
 #[cfg(target_os = "macos")]
 mod activity;

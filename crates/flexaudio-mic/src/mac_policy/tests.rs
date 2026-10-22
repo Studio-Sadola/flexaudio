@@ -109,7 +109,10 @@ fn unanswered_prompt_returns_bounded_error_without_entering_blocking_hal_query()
             queries.fetch_add(1, Ordering::SeqCst);
             // Simulate a native query that waits for undecided consent. The test
             // has its own bound so a regression cannot hang CI.
-            let _ = blocked.recv_timeout(Duration::from_millis(100));
+            assert_eq!(
+                blocked.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
             None
         },
     );

@@ -108,27 +108,55 @@ mod contract_tests {
     use super::*;
 
     #[test]
-    fn every_core_error_kind_has_an_explicit_distinct_node_projection() {
-        flexaudio_core::test_support::assert_explicit_error_kind_arms(
-            include_str!("boundary.rs"),
-            "fn error_code(",
-        );
-        let mut codes = std::collections::HashSet::new();
-        let mut names = std::collections::HashSet::new();
-        let declarations = include_str!("../index.d.ts");
-        for (kind, name, error) in flexaudio_core::test_support::error_cases() {
-            assert_eq!(error.kind(), kind, "core error fixture must match its kind");
-            let code = error_code(kind);
-            assert!(
-                codes.insert(code),
-                "Node error code collision or fallback for {kind:?}"
+    fn every_core_error_kind_maps_to_canonical_distinct_node_projection() {
+        let cases = flexaudio_core::test_support::error_cases();
+        let mut rows = Vec::new();
+        for (kind, name, error) in &cases {
+            assert_eq!(
+                error.kind(),
+                *kind,
+                "core error fixture must match its kind"
             );
-            let mapped = audio_error(&error).kind;
-            assert_eq!(mapped, name, "Node kind must explicitly map {kind:?}");
-            assert!(names.insert(mapped), "Node kind collision for {kind:?}");
+            let symbol = flexaudio_core::test_support::canonical_error_code_symbol(name);
+            rows.push((
+                *kind,
+                (*name).to_owned(),
+                audio_error(error).kind,
+                error_code(*kind),
+                symbol,
+            ));
+        }
+        let mut codes = std::collections::BTreeMap::<&str, Vec<ErrorKind>>::new();
+        for (kind, _, _, code, _) in &rows {
+            codes.entry(*code).or_default().push(*kind);
+        }
+        for (code, kinds) in &codes {
             assert!(
-                declarations.contains(&format!("kind: '{name}'")),
-                "Node AudioError declaration is missing {name}"
+                kinds.len() == 1,
+                "Node error code collision or fallback for {kinds:?} sharing {code}"
+            );
+        }
+        for (kind, _, _, code, symbol) in &rows {
+            assert_eq!(
+                *code,
+                symbol.as_str(),
+                "Node error code must equal the canonical symbol for {kind:?}"
+            );
+        }
+        let mut names = std::collections::BTreeMap::<String, Vec<ErrorKind>>::new();
+        for (kind, _, mapped, _, _) in &rows {
+            names.entry(mapped.clone()).or_default().push(*kind);
+        }
+        for (mapped, kinds) in &names {
+            assert!(
+                kinds.len() == 1,
+                "Node kind collision or fallback for {kinds:?} sharing {mapped}"
+            );
+        }
+        for (kind, name, mapped, _, _) in &rows {
+            assert_eq!(
+                mapped, name,
+                "Node kind must equal the canonical name for {kind:?}"
             );
         }
     }
@@ -451,26 +479,13 @@ pub(super) fn device_event_to_js(event: DeviceEvent) -> JsDeviceEvent {
 
 #[cfg(any(test, all(flexaudio_test_addon, feature = "test-faults")))]
 pub(super) fn fixture_error(kind: &str) -> Error {
-    match kind {
-        "invalidArg" => Error::InvalidArg("invalid rate".into()),
-        "invalidState" => Error::InvalidState("stopped".into()),
-        "deviceNotFound" => Error::DeviceNotFound,
-        "permissionDenied" => Error::PermissionDenied {
-            permission: flexaudio::Permission::Microphone,
-            detail: "private detail".into(),
-        },
-        "unsupportedOsVersion" => Error::UnsupportedOsVersion,
-        "deviceLost" => Error::DeviceLost,
-        "backend" => Error::Backend("control cause".into()),
-        "unsupportedFormat" => Error::UnsupportedFormat("unsupported rate".into()),
-        "nativeFormatChanged" => Error::NativeFormatChanged {
-            advertised: (48_000, 2),
-            actual: (44_100, 1),
-        },
-        "unsupported" => Error::Unsupported,
-        "ambiguousDeviceName" => Error::AmbiguousDeviceName,
-        "wrapped" => Error::Multiple(flexaudio::core::ErrorGroup::new(
-            fixture_error("permissionDenied").with_context(
+    if kind == "wrapped" {
+        return Error::Multiple(flexaudio::core::ErrorGroup::new(
+            Error::PermissionDenied {
+                permission: flexaudio::Permission::Microphone,
+                detail: "private detail".into(),
+            }
+            .with_context(
                 ErrorContext::new(Operation::Start)
                     .with_lane(MixLane::Microphone)
                     .with_native_status(NativeStatus::HResult {
@@ -493,9 +508,13 @@ pub(super) fn fixture_error(kind: &str) -> Error {
             ),
             Vec::new(),
         ))
-        .with_context(ErrorContext::new(Operation::Stop)),
-        _ => Error::InvalidArg("unknown fixture kind".into()),
+        .with_context(ErrorContext::new(Operation::Stop));
     }
+    flexaudio_core::test_support::error_cases()
+        .into_iter()
+        .find(|(_, name, _)| *name == kind)
+        .map(|(_, _, error)| error)
+        .unwrap_or_else(|| Error::InvalidArg("unknown fixture kind".into()))
 }
 
 #[cfg(test)]
@@ -504,28 +523,27 @@ mod tests {
 
     #[test]
     fn every_root_error_has_a_distinct_stable_code_and_payload() {
-        let kinds = [
-            "invalidArg",
-            "invalidState",
-            "deviceNotFound",
-            "permissionDenied",
-            "unsupportedOsVersion",
-            "deviceLost",
-            "backend",
-            "unsupportedFormat",
-            "nativeFormatChanged",
-            "unsupported",
-            "ambiguousDeviceName",
-        ];
-        let mut codes = std::collections::HashSet::new();
-        for kind in kinds {
-            let error = fixture_error(kind);
-            assert!(codes.insert(error_code(error.kind())));
+        let mut codes = std::collections::BTreeMap::<&str, Vec<ErrorKind>>::new();
+        for (kind, name, error) in flexaudio_core::test_support::error_cases() {
+            assert_eq!(error.kind(), kind, "core error fixture must match its kind");
+            codes
+                .entry(error_code(error.kind()))
+                .or_default()
+                .push(kind);
             let projected = audio_error(&error);
-            assert_eq!(projected.kind, kind);
+            assert_eq!(
+                projected.kind, name,
+                "Node kind must equal the canonical name for {kind:?}"
+            );
             assert_eq!(projected.message, error.to_string());
             assert!(projected.contexts.is_empty());
             assert!(projected.secondary.is_empty());
+        }
+        for (code, kinds) in &codes {
+            assert!(
+                kinds.len() == 1,
+                "Node error code collision or fallback for {kinds:?} sharing {code}"
+            );
         }
     }
 

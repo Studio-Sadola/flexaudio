@@ -33,6 +33,7 @@ impl SilentRender {
         device: &IMMDevice,
         format: *const WAVEFORMATEX,
         stop_reason: Arc<Mutex<HelperStopReason>>,
+        cleanup: crate::owner::CleanupLedger,
     ) -> Result<Self> {
         // Microsoft, Loopback Recording:
         // "In loopback mode, a client of WASAPI can capture the audio stream
@@ -56,12 +57,13 @@ impl SilentRender {
                 None,
             )
             .map_err(|e| map_hr("silent keepalive Initialize", e))?;
-        let event = EventHandle(
+        let event = EventHandle::new(
             CreateEventW(None, false, false, PCWSTR::null())
                 .map_err(|e| map_hr("silent keepalive CreateEventW", e))?,
+            cleanup,
         );
         client
-            .SetEventHandle(event.0)
+            .SetEventHandle(event.handle)
             .map_err(|e| map_hr("silent keepalive SetEventHandle", e))?;
         let render = client
             .GetService()

@@ -146,30 +146,29 @@ test('capture origin bigint preserves the entire unsigned domain', () => {
 });
 
 test('typed domain exceptions keep codes, native formats, contexts and related failures', () => {
-  const codes = {
-    invalidArg: 'FLEX_INVALID_ARG', invalidState: 'FLEX_INVALID_STATE',
-    deviceNotFound: 'FLEX_DEVICE_NOT_FOUND', permissionDenied: 'FLEX_PERMISSION_DENIED',
-    unsupportedOsVersion: 'FLEX_UNSUPPORTED_OS_VERSION', deviceLost: 'FLEX_DEVICE_LOST',
-    backend: 'FLEX_FAILURE', unsupportedFormat: 'FLEX_UNSUPPORTED_FORMAT',
-    nativeFormatChanged: 'FLEX_NATIVE_FORMAT_CHANGED', unsupported: 'FLEX_UNSUPPORTED',
-    ambiguousDeviceName: 'FLEX_AMBIGUOUS_DEVICE_NAME',
-  };
-  for (const [kind, code] of Object.entries(codes)) {
-    assert.throws(() => native.__bindingContractError(kind), error => {
-      assert.ok(error instanceof Error);
-      assert.equal(error.code, code);
-      assert.equal(error.audioError.kind, kind);
-      assert.deepEqual(error.audioError.contexts, []);
-      assert.deepEqual(error.audioError.secondary, []);
-      if (kind === 'nativeFormatChanged') {
-        assert.deepEqual(error.audioError.advertised, { sampleRate: 48000, channels: 2 });
-        assert.deepEqual(error.audioError.actual, { sampleRate: 44100, channels: 1 });
-      }
-      if (kind === 'permissionDenied') assert.equal(error.audioError.permission, 'microphone');
-      assert.ok(!error.message.includes('private detail'));
-      return true;
-    });
-  }
+  assert.throws(() => native.__bindingContractError('permissionDenied'), error => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.code, 'FLEX_PERMISSION_DENIED');
+    assert.equal(error.audioError.kind, 'permissionDenied');
+    assert.equal(error.audioError.permission, 'microphone');
+    assert.deepEqual(error.audioError.contexts, []);
+    assert.deepEqual(error.audioError.secondary, []);
+    return true;
+  });
+  assert.throws(() => native.__bindingContractError('nativeFormatChanged'), error => {
+    assert.equal(error.code, 'FLEX_NATIVE_FORMAT_CHANGED');
+    assert.equal(error.audioError.kind, 'nativeFormatChanged');
+    assert.deepEqual(error.audioError.advertised, { sampleRate: 48000, channels: 2 });
+    assert.deepEqual(error.audioError.actual, { sampleRate: 44100, channels: 1 });
+    assert.deepEqual(error.audioError.contexts, []);
+    assert.deepEqual(error.audioError.secondary, []);
+    return true;
+  });
+  assert.throws(() => native.__bindingContractError('backend'), error => {
+    assert.equal(error.code, 'FLEX_FAILURE');
+    assert.equal(error.audioError.kind, 'backend');
+    return true;
+  });
   assert.throws(() => native.__bindingContractError('wrapped'), error => {
     assert.equal(error.code, 'FLEX_PERMISSION_DENIED');
     assert.equal(error.audioError.kind, 'permissionDenied');

@@ -2,11 +2,11 @@
 use super::*;
 
 impl Stream {
-    pub(super) fn retain_shutdown_outcome(&mut self) -> fa::Result<()> {
-        if let Some(report) = &self.shutdown {
-            return report.result();
+    pub(super) fn retain_shutdown_outcome(&mut self) {
+        if self.shutdown.is_some() {
+            return;
         }
-        let _ = self.inner.stop_checked();
+        self.inner.stop();
         self.route_events();
         let core_report = self.inner.shutdown_report();
         let primary = self.inner.terminal_error();
@@ -51,15 +51,13 @@ impl Stream {
                 .map(|error| fa::Event::ShutdownError { error }),
         );
         let report = fa::ShutdownReport::new(primary, cleanup);
-        let result = report.result();
         self.shutdown = Some(report);
-        result
     }
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        let _ = self.retain_shutdown_outcome();
+        self.retain_shutdown_outcome();
     }
 }
 
@@ -69,23 +67,8 @@ mod tests {
     use pyo3::ffi::c_str;
     use pyo3::types::PyDict;
 
-    struct CleanupFailure;
-    impl fa::CaptureBackend for CleanupFailure {
-        fn native_format(&self) -> (u32, u16) {
-            (48_000, 2)
-        }
-        fn start(&mut self, _sink: fa::core::backend::RawSink) -> fa::Result<()> {
-            Ok(())
-        }
-        fn stop(&mut self) {}
-        fn stop_checked(&mut self) -> fa::Result<()> {
-            Err(fa::Error::DeviceLost.with_context(fa::ErrorContext::new(fa::Operation::Stop)))
-        }
-    }
     fn fixture() -> Stream {
-        let mut inner =
-            fa::Stream::open(fa::StreamConfig::default(), Box::new(CleanupFailure)).unwrap();
-        inner.start().unwrap();
+        let inner = fa::test_support::stop_failure(fa::test_support::StopPhase::Stop).unwrap();
         Stream {
             inner,
             shutdown: None,
@@ -112,6 +95,15 @@ mod tests {
             let mut stream = fixture();
             assert!(stream.shutdown_report().is_none());
             let first = stream.stop().unwrap_err();
+            let audio_error = first.value(py).getattr("audio_error").unwrap();
+            assert_eq!(
+                audio_error
+                    .getattr("kind")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "deviceLost"
+            );
             let second = stream.stop().unwrap_err();
             assert!(first.get_type(py).is(second.get_type(py)));
             let report = stream.shutdown_report().unwrap().0;

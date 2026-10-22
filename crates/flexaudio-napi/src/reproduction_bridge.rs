@@ -19,7 +19,7 @@ impl flexaudio::core::CaptureBackend for StartupOrderFixtureBackend {
 
 struct ShutdownFixtureBackend {
     sink: Option<flexaudio::core::RawSink>,
-    cleanup_failure: bool,
+    cleanup: Option<Box<dyn flexaudio::CaptureBackend>>,
     capture_failure: bool,
     stopped: bool,
 }
@@ -41,12 +41,8 @@ impl flexaudio::core::CaptureBackend for ShutdownFixtureBackend {
     }
     fn stop_checked(&mut self) -> flexaudio::Result<()> {
         self.stop();
-        if self.cleanup_failure {
-            Err(
-                flexaudio::Error::DeviceLost.with_context(flexaudio::core::ErrorContext::new(
-                    flexaudio::core::Operation::Stop,
-                )),
-            )
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            cleanup.stop_checked()
         } else {
             Ok(())
         }
@@ -630,7 +626,13 @@ pub fn binding_contract_bridge(
             StreamConfig::default(),
             Box::new(ShutdownFixtureBackend {
                 sink: None,
-                cleanup_failure: scenario.ends_with("cleanup") || scenario.ends_with("primary"),
+                cleanup: (scenario.ends_with("cleanup") || scenario.ends_with("primary")).then(
+                    || {
+                        flexaudio::test_support::failing_backend(
+                            flexaudio::test_support::StopPhase::Stop,
+                        )
+                    },
+                ),
                 capture_failure: scenario.ends_with("primary"),
                 stopped: false,
             }),

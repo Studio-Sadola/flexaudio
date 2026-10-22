@@ -28,12 +28,20 @@ pub(crate) fn run(
     ) {
         Ok(stream) => stream,
         Err(error) => {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "A closed readiness receiver means the starter has already abandoned startup."
+            )]
             let _ = ready_tx.send(Err(permission::after_failure(error)));
             return;
         }
     };
     if let Err(error) = stream.play() {
         let error = permission::after_failure(Error::Backend(format!("cpal play: {error}")));
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "A closed readiness receiver means the starter has already abandoned startup."
+        )]
         let _ = ready_tx.send(Err(error));
         return;
     }

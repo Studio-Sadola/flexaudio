@@ -27,11 +27,11 @@ use std::thread::{self, JoinHandle};
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::types::{Error, Event, ProcessMode, Result};
 
-use crate::owner::{join_owner, OwnerShutdown};
+use crate::owner::{CleanupLedger, OwnerShutdown};
 use flexaudio_core::{ErrorContext, NativeStatus, Operation, ShutdownReport};
 
 use windows::core::{implement, Interface, HRESULT, PROPVARIANT};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Media::Audio::{
     ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
@@ -45,7 +45,7 @@ use windows::Win32::Media::Multimedia::WAVE_FORMAT_IEEE_FLOAT;
 use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 
 use crate::common::{
-    capture_loop, init_loopback_capture, map_hr, wait_event, CaptureSetup, ComThread,
+    capture_loop, init_loopback_capture, map_hr, wait_event, CaptureSetup, ComThread, EventHandle,
 };
 use windows::core::PCWSTR;
 
@@ -231,6 +231,8 @@ impl CaptureBackend for WasapiProcessBackend {
         }
         crate::format::verify_format(self.native, (sink.native_rate(), sink.native_channels()))?;
         self.stop_flag.store(false, Ordering::SeqCst);
+        self.shutdown.cleanup = CleanupLedger::default();
+        let cleanup = self.shutdown.cleanup.clone();
 
         let stop_flag = self.stop_flag.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
@@ -241,7 +243,9 @@ impl CaptureBackend for WasapiProcessBackend {
         let handle = thread::Builder::new()
             .name("flexaudio-wasapi-process".into())
             .spawn(move || {
-                run_process_thread(target_pid, mode, sink, stop_flag, ready_tx, event_tx)
+                run_process_thread(
+                    target_pid, mode, sink, stop_flag, ready_tx, event_tx, cleanup,
+                )
             })
             .map_err(|error| {
                 self.stop_flag.store(true, Ordering::SeqCst);
@@ -255,29 +259,29 @@ impl CaptureBackend for WasapiProcessBackend {
                 Ok(())
             }
             Ok(Err(e)) => {
+                self.shutdown.retain_capture_events(event_rx);
                 self.stop_flag.store(true, Ordering::SeqCst);
-                ShutdownReport::new(Some(e), join_owner(handle).cleanup().to_vec()).result()
+                self.shutdown.retain_start_failure(e, handle)
             }
             Err(_) => {
+                self.shutdown.retain_capture_events(event_rx);
                 self.stop_flag.store(true, Ordering::SeqCst);
-                ShutdownReport::new(
-                    Some(
-                        Error::Backend("capture owner exited before reporting readiness".into())
-                            .with_context(ErrorContext::new(Operation::Start)),
-                    ),
-                    join_owner(handle).cleanup().to_vec(),
+                self.shutdown.retain_start_failure(
+                    Error::Backend("capture owner exited before reporting readiness".into())
+                        .with_context(ErrorContext::new(Operation::Start)),
+                    handle,
                 )
-                .result()
             }
         }
     }
 
     fn stop(&mut self) {
-        let _ = self.retain_shutdown_outcome();
+        self.retain_shutdown_outcome();
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.retain_shutdown_outcome()
+        self.retain_shutdown_outcome();
+        self.shutdown.result()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
@@ -315,25 +319,34 @@ fn run_process_thread(
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<()>>,
     event_tx: mpsc::Sender<Event>,
+    cleanup: CleanupLedger,
 ) -> ShutdownReport {
     let _com = match ComThread::new() {
         Ok(com) => com,
         Err(error) => {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "readiness receiver may have cancelled startup"
+            )]
             let _ = ready_tx.send(Err(error));
             return ShutdownReport::new(None, Vec::new());
         }
     };
 
-    let setup = unsafe { setup_process_loopback(target_pid, mode) };
+    let setup = unsafe { setup_process_loopback(target_pid, mode, cleanup.clone()) };
     let setup = match setup {
         Ok(t) => CaptureSetup::process(t),
         Err(e) => {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "readiness receiver may have cancelled startup"
+            )]
             let _ = ready_tx.send(Err(e));
             return ShutdownReport::new(None, Vec::new());
         }
     };
 
-    unsafe { capture_loop(setup, sink, &stop_flag, ready_tx, event_tx) }
+    unsafe { capture_loop(setup, sink, &stop_flag, ready_tx, event_tx, cleanup) }
 }
 
 /// Set up process loopback and return the initialized `IAudioClient` / `IAudioCaptureClient` / event
@@ -349,10 +362,11 @@ fn run_process_thread(
 pub(crate) unsafe fn setup_process_loopback(
     target_pid: u32,
     mode: ProcessMode,
+    cleanup: CleanupLedger,
 ) -> Result<(
     IAudioClient,
     windows::Win32::Media::Audio::IAudioCaptureClient,
-    HANDLE,
+    EventHandle,
     u16,
 )> {
     // Same OS-version check as enumeration. Keep reactive mapping for E_NOTIMPL / E_NOINTERFACE.
@@ -379,13 +393,18 @@ pub(crate) unsafe fn setup_process_loopback(
     let prop = make_blob_propvariant(&mut params as *mut _);
 
     // Completion notification event (manual reset=true / initially non-signaled).
-    let done_event = CreateEventW(None, true, false, PCWSTR::null())
-        .map_err(|e| map_hr("CreateEventW(activation done)", e))?;
+    let done_event = EventHandle::new(
+        CreateEventW(None, true, false, PCWSTR::null())
+            .map_err(|e| map_hr("CreateEventW(activation done)", e))?,
+        cleanup.clone(),
+    );
 
     // Completion handler (only calls SetEvent). Keep it alive until WaitForSingleObject completes
     // so its reference count remains valid.
-    let handler: IActivateAudioInterfaceCompletionHandler =
-        ActivationHandler { done: done_event }.into();
+    let handler: IActivateAudioInterfaceCompletionHandler = ActivationHandler {
+        done: done_event.handle,
+    }
+    .into();
 
     let op: IActivateAudioInterfaceAsyncOperation = match ActivateAudioInterfaceAsync(
         VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
@@ -396,15 +415,13 @@ pub(crate) unsafe fn setup_process_loopback(
     ) {
         Ok(op) => op,
         Err(e) => {
-            let _ = CloseHandle(done_event);
             // Older OS versions without process loopback return E_NOINTERFACE/E_NOTIMPL, etc.
             return Err(map_process_activation_err("ActivateAudioInterfaceAsync", e));
         }
     };
 
     // Close the native event after retaining its exact wait outcome and OS error.
-    let waited = wait_event(done_event, 5000);
-    let _ = CloseHandle(done_event);
+    let waited = wait_event(done_event.handle, 5000);
     crate::native_outcomes::activation_wait(waited)?;
 
     // Retrieve the activation result on the initiating thread (keep COM objects on one thread).
@@ -429,6 +446,7 @@ pub(crate) unsafe fn setup_process_loopback(
         &client,
         &wfx as *const WAVEFORMATEX,
         AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+        cleanup,
     )?;
 
     // Keep params/prop/handler/op alive until here before dropping them (BLOB reference and handler lifetime).
@@ -636,7 +654,7 @@ mod repro_tests {
 
 impl WasapiProcessBackend {
     // Both stop entry points use this one retained teardown outcome.
-    fn retain_shutdown_outcome(&mut self) -> Result<()> {
+    fn retain_shutdown_outcome(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         let handle = self.handle.take();
         let joined_owner = handle.is_some();
@@ -644,6 +662,24 @@ impl WasapiProcessBackend {
         if joined_owner {
             self.pending_error = result.as_ref().err().cloned();
         }
-        result
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn check_stop_phase(phase: crate::test_support::Phase) {
+        let mut backend = Self::new(1, ProcessMode::Include);
+        let expected = crate::test_support::prepare(
+            &mut backend.shutdown,
+            &mut backend.handle,
+            phase,
+            false,
+            backend.stop_flag.clone(),
+        );
+        backend.stop();
+        assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
+        assert_eq!(backend.stop_checked(), expected.result());
+        assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
+        backend.stop();
+        assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
+        assert_eq!(backend.stop_checked(), expected.result());
     }
 }

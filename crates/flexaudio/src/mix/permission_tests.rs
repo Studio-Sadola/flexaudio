@@ -235,7 +235,9 @@ fn terminal_error_waits_until_both_mix_children_have_stopped() {
             if let Some(release) = self.release.take() {
                 self.entered.send(()).unwrap();
                 // A bounded wait also prevents a failed assertion from hanging Drop.
-                let _ = release.recv_timeout(Duration::from_secs(5));
+                release
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release blocked child stop");
             }
             self.stops.fetch_add(1, Ordering::SeqCst);
         }

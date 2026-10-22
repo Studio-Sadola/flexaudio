@@ -89,7 +89,7 @@ impl CaptureBackend for ConstBackend {
     fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            h.join().expect("mix test generator joins");
         }
     }
 }

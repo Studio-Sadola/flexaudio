@@ -51,6 +51,10 @@ impl BufferReport {
     }
 
     fn channels_changed(&self, channels: u32) {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "Only the first observed format mismatch owns the diagnostic; later mismatches must not replace it."
+        )]
         let _ =
             self.actual_channels
                 .compare_exchange(0, channels, Ordering::AcqRel, Ordering::Acquire);

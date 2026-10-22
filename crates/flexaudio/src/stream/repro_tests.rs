@@ -289,11 +289,12 @@ fn poison(poison: bool) {
     let mut stream = open(Backend::silent());
     if poison {
         let events = stream.events.clone();
-        let _ = thread::spawn(move || {
+        assert!(thread::spawn(move || {
             let _g = events.lock().unwrap();
             panic!("injected queue poison");
         })
-        .join();
+        .join()
+        .is_err());
     }
     stream.shared.push_event(Event::RecoverableError {
         error: Error::Backend("retained diagnostic".into()),

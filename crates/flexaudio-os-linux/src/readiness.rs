@@ -63,12 +63,20 @@ impl Readiness {
         let ready =
             self.format_ready.get() || (self.registry_complete.get() && !self.target_present.get());
         if ready && !self.control_pending.get() && !self.sent.replace(true) {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "A closed readiness receiver means the starter has already abandoned startup."
+            )]
             let _ = self.tx.send(Ok(()));
         }
     }
 
     pub(crate) fn report_failure(&self, error: Error) {
         if !self.sent.replace(true) {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "The terminal failure is retained in the event ledger even if the starter has exited."
+            )]
             let _ = self.tx.send(Err(error));
         }
     }

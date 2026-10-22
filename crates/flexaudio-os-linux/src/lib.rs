@@ -25,8 +25,8 @@
 
 #![cfg(target_os = "linux")]
 #![warn(missing_docs)]
+#![deny(clippy::let_underscore_must_use)]
 
-use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -36,7 +36,10 @@ use std::thread::{self, JoinHandle};
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::clock::monotonic_now_ns;
 use flexaudio_core::types::{DeviceEvent, DeviceInfo, Error, ProcessMode, Result, SourceKind};
-use flexaudio_core::{ErrorContext, Event, Operation};
+use flexaudio_core::{ErrorContext, Event, Operation, ShutdownReport};
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 mod capabilities;
 mod capability_probe;
@@ -56,7 +59,8 @@ use device_info::{namespaced_devices, EnumState, NodeRecord};
 mod owner;
 mod readiness;
 use owner::{
-    finish_worker, poll_backend_event, push_backend_event, rollback_worker, BackendEvents,
+    finish_worker, poll_backend_event, push_backend_event, rollback_capture, rollback_worker,
+    BackendEvents,
 };
 use readiness::{negotiation_timeout_error, Readiness, NEGOTIATION_DEADLINE};
 mod watcher_failures;
@@ -162,7 +166,7 @@ pub struct PwSystemBackend {
     stop_tx: Option<pw::channel::Sender<Terminate>>,
     /// Handle for the PipeWire loop thread. Set to `Some` by `start`.
     handle: Option<JoinHandle<()>>,
-    shutdown: Option<Result<()>>,
+    shutdown: Option<ShutdownReport>,
     events: BackendEvents,
 }
 
@@ -193,7 +197,7 @@ impl PwSystemBackend {
             stop_tx: None,
             handle: None,
             shutdown: None,
-            events: Arc::new(Mutex::new(VecDeque::new())),
+            events: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -212,6 +216,11 @@ impl PwSystemBackend {
     /// The extra excluded pids.
     pub fn exclude_pids(&self) -> &[u32] {
         &self.exclude_pids
+    }
+
+    /// Completed stop outcome, retained independently of event polling.
+    pub fn shutdown_report(&self) -> Option<&ShutdownReport> {
+        self.shutdown.as_ref()
     }
 }
 
@@ -258,7 +267,7 @@ impl CaptureBackend for PwSystemBackend {
         // `exclude_pids` joins the same mechanism: the excluded PID is now the
         // whole `excluded` set, and an empty set (neither flag nor pids) is what
         // keeps the plain sink-monitor path.
-        let generation_events: BackendEvents = Arc::new(Mutex::new(VecDeque::new()));
+        let generation_events: BackendEvents = Arc::new(Mutex::new(Default::default()));
         let events_for_thread = generation_events.clone();
         let handle = thread::Builder::new()
             .name(
@@ -312,28 +321,41 @@ impl CaptureBackend for PwSystemBackend {
                 // classification like macOS/Windows is not possible. A missing requested sink
                 // is detected earlier via enumerate_pw and returned as DeviceNotFound.
                 running.store(false, Ordering::SeqCst);
-                Err(rollback_worker(msg, handle))
+                Err(rollback_capture(
+                    msg,
+                    handle,
+                    generation_events,
+                    &mut self.events,
+                    &mut self.shutdown,
+                ))
             }
             Err(_) => {
                 // The thread exited without sending ready (e.g. an unexpected panic).
                 running.store(false, Ordering::SeqCst);
-                Err(rollback_worker(
+                Err(rollback_capture(
                     Error::Backend(
                         "pipewire setup thread terminated before signaling readiness".into(),
                     )
                     .with_context(ErrorContext::new(Operation::Start)),
                     handle,
+                    generation_events,
+                    &mut self.events,
+                    &mut self.shutdown,
                 ))
             }
         }
     }
 
     fn stop(&mut self) {
-        let _ = self.retain_shutdown_outcome();
+        self.retain_shutdown_outcome();
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.retain_shutdown_outcome()
+        self.retain_shutdown_outcome();
+        self.shutdown
+            .as_ref()
+            .expect("stop retains its report")
+            .result()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
@@ -432,7 +454,7 @@ pub struct PwProcessBackend {
     stop_tx: Option<pw::channel::Sender<Terminate>>,
     /// Handle for the PipeWire loop thread. Set to `Some` by `start`.
     handle: Option<JoinHandle<()>>,
-    shutdown: Option<Result<()>>,
+    shutdown: Option<ShutdownReport>,
     events: BackendEvents,
 }
 
@@ -451,7 +473,7 @@ impl PwProcessBackend {
             stop_tx: None,
             handle: None,
             shutdown: None,
-            events: Arc::new(Mutex::new(VecDeque::new())),
+            events: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -494,7 +516,7 @@ impl CaptureBackend for PwProcessBackend {
         let running = self.running.clone();
         running.store(true, Ordering::SeqCst);
 
-        let generation_events: BackendEvents = Arc::new(Mutex::new(VecDeque::new()));
+        let generation_events: BackendEvents = Arc::new(Mutex::new(Default::default()));
         let events_for_thread = generation_events.clone();
         let handle = thread::Builder::new()
             .name("flexaudio-pw-process".into())
@@ -524,29 +546,42 @@ impl CaptureBackend for PwProcessBackend {
                 // target PID is an expected wait for a registry event, not an error, so do not
                 // return DeviceNotFound here.
                 running.store(false, Ordering::SeqCst);
-                Err(rollback_worker(msg, handle))
+                Err(rollback_capture(
+                    msg,
+                    handle,
+                    generation_events,
+                    &mut self.events,
+                    &mut self.shutdown,
+                ))
             }
             Err(_) => {
                 // The thread exited without sending ready (e.g. an unexpected panic).
                 running.store(false, Ordering::SeqCst);
-                Err(rollback_worker(
+                Err(rollback_capture(
                     Error::Backend(
                         "pipewire process setup thread terminated before signaling readiness"
                             .into(),
                     )
                     .with_context(ErrorContext::new(Operation::Start)),
                     handle,
+                    generation_events,
+                    &mut self.events,
+                    &mut self.shutdown,
                 ))
             }
         }
     }
 
     fn stop(&mut self) {
-        let _ = self.retain_shutdown_outcome();
+        self.retain_shutdown_outcome();
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.retain_shutdown_outcome()
+        self.retain_shutdown_outcome();
+        self.shutdown
+            .as_ref()
+            .expect("stop retains its report")
+            .result()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
@@ -582,6 +617,10 @@ fn run_pw_process_loop(
         Ok(t) => t,
         Err(msg) => {
             // Report setup failure and exit (without panicking).
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "A closed readiness receiver means the starter has already abandoned startup."
+            )]
             let _ = ready_tx.send(Err(
                 Error::Backend(msg).with_context(ErrorContext::new(Operation::Start))
             ));
@@ -660,9 +699,13 @@ impl ClientEntry {
 
 impl PwSystemBackend {
     // Both stop entry points use this one retained teardown outcome.
-    fn retain_shutdown_outcome(&mut self) -> Result<()> {
+    fn retain_shutdown_outcome(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(tx) = self.stop_tx.take() {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "A disconnected stop receiver has already exited; the owner join still observes cleanup failures."
+            )]
             let _ = tx.send(Terminate);
         }
         finish_worker(&mut self.handle, &mut self.shutdown, &self.events)
@@ -670,10 +713,19 @@ impl PwSystemBackend {
 }
 
 impl PwProcessBackend {
+    /// Completed stop outcome, retained independently of event polling.
+    pub fn shutdown_report(&self) -> Option<&ShutdownReport> {
+        self.shutdown.as_ref()
+    }
+
     // Both stop entry points use this one retained teardown outcome.
-    fn retain_shutdown_outcome(&mut self) -> Result<()> {
+    fn retain_shutdown_outcome(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(tx) = self.stop_tx.take() {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "A disconnected stop receiver has already exited; the owner join still observes cleanup failures."
+            )]
             let _ = tx.send(Terminate);
         }
         finish_worker(&mut self.handle, &mut self.shutdown, &self.events)
@@ -1500,6 +1552,7 @@ fn setup_pw_process(
 
                                         // All state borrows have ended. Reconciliation also
                                         // unlinks a Pulse node whose app PID was invalidated.
+                                        #[allow(clippy::let_underscore_must_use, reason = "try_link already retains and publishes the failure before terminating the loop.")]
                                         let _ = try_link(
                                             &core_for_info,
                                             &lifecycle_for_info,
@@ -1565,6 +1618,7 @@ fn setup_pw_process(
 
                 // State changed regardless of whether this was a Client, Node, or Port; reevaluate.
                 // We are on the loop thread, so it is safe to access the `!Send` core/stream.
+                #[allow(clippy::let_underscore_must_use, reason = "try_link already retains and publishes the failure before terminating the loop.")]
                 let _ = try_link(
                     &core_for_global,
                     &lifecycle_for_global,
@@ -1689,6 +1743,7 @@ fn setup_pw_process(
 
                 // Once waiting again, immediately retry links if another target is already ready.
                 if relink_needed || !readiness_for_remove.is_reported() {
+                    #[allow(clippy::let_underscore_must_use, reason = "try_link already retains and publishes the failure before terminating the loop.")]
                     let _ = try_link(
                         &core_for_remove,
                         &lifecycle_for_remove,
@@ -2047,17 +2102,25 @@ fn run_pw_loop(
     let readiness = std::rc::Rc::new(Readiness::new(ready_tx.clone(), false));
 
     // Setup is in a separate function. Keep its return values alive for the whole run (dropping them stops it).
-    let (main_loop, _stream, _listener) =
-        match setup_pw(device_id, sink, readiness.clone(), events.clone()) {
-            Ok(t) => t,
-            Err(msg) => {
-                // Report setup failure and exit (without panicking).
-                let _ = ready_tx.send(Err(
-                    Error::Backend(msg).with_context(ErrorContext::new(Operation::Start))
-                ));
-                return;
-            }
-        };
+    let (main_loop, _stream, _listener) = match setup_pw(
+        device_id,
+        sink,
+        readiness.clone(),
+        events.clone(),
+    ) {
+        Ok(t) => t,
+        Err(msg) => {
+            // Report setup failure and exit (without panicking).
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "A closed readiness receiver means the starter has already abandoned startup."
+            )]
+            let _ = ready_tx.send(Err(
+                Error::Backend(msg).with_context(ErrorContext::new(Operation::Start))
+            ));
+            return;
+        }
+    };
 
     // Attach the stop channel receiver to the loop. On Terminate, call quit(). attach only
     // borrows this local `main_loop`, so AttachedReceiver is scoped to this stack frame (no
@@ -2571,7 +2634,7 @@ fn extract_json_name(value: &str) -> Option<String> {
 ///
 /// `MainLoop` / `Context` / `Core` / `Registry` are `!Send`, so confine them to the dedicated
 /// `flexaudio-pw-watch` thread. The backend stores only `Send` values (event queue
-/// [`Arc<Mutex<VecDeque>>`], stop flag, stop [`pipewire::channel::Sender`], and [`JoinHandle`]).
+/// a shared event queue, stop flag, stop [`pipewire::channel::Sender`], and [`JoinHandle`]).
 ///
 /// # Published events
 /// - [`DeviceEvent::Added`]: Audio/Sink nodes that appear after the initial scan. Nodes
@@ -2609,6 +2672,7 @@ pub struct PwDeviceWatcher {
     stop_tx: Option<pw::channel::Sender<Terminate>>,
     /// Handle for the watcher thread. Set to `Some` by [`start`](Self::start).
     handle: Option<JoinHandle<()>>,
+    shutdown: Option<ShutdownReport>,
 }
 
 impl PwDeviceWatcher {
@@ -2657,6 +2721,7 @@ impl PwDeviceWatcher {
                 running,
                 stop_tx: Some(stop_tx),
                 handle: Some(handle),
+                shutdown: None,
             }),
             Ok(Err(msg)) => {
                 // Setup failed (PipeWire unavailable, connection/registry failure, etc.). The
@@ -2698,7 +2763,7 @@ impl PwDeviceWatcher {
         // Safe on duplicate stop or stop before start.
         if !self.running.swap(false, Ordering::SeqCst) {
             // Already stopped or not started. Join any leftover thread just in case.
-            finish_watch_worker(&mut self.handle, &self.events);
+            finish_watch_worker(&mut self.handle, &mut self.shutdown, &self.events);
             self.stop_tx = None;
             return;
         }
@@ -2706,12 +2771,30 @@ impl PwDeviceWatcher {
         // Notify the watcher thread to stop (the receiver callback calls loop.quit()).
         // Ignore failure (the receiver is gone because the thread has exited).
         if let Some(tx) = self.stop_tx.take() {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "A disconnected stop receiver has already exited; the owner join still observes cleanup failures."
+            )]
             let _ = tx.send(Terminate);
         }
 
         // Wait for run() to exit and the thread to finish. On exit, Registry→Core→Context→MainLoop
         // are dropped in order, all on the watcher thread.
-        finish_watch_worker(&mut self.handle, &self.events);
+        finish_watch_worker(&mut self.handle, &mut self.shutdown, &self.events);
+    }
+
+    /// Stop watching and return the retained capture and cleanup outcome.
+    pub fn stop_checked(&mut self) -> Result<()> {
+        self.stop();
+        self.shutdown
+            .as_ref()
+            .expect("stop retains its report")
+            .result()
+    }
+
+    /// Completed stop outcome, retained independently of event polling.
+    pub fn shutdown_report(&self) -> Option<&ShutdownReport> {
+        self.shutdown.as_ref()
     }
 }
 
@@ -2737,6 +2820,10 @@ fn run_watch_loop(
         Ok(t) => t,
         Err(msg) => {
             // Report setup failure and exit (without panicking).
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "The watcher failure remains in its ledger if the readiness receiver has exited."
+            )]
             let _ = ready_tx.send(Err(msg));
             return;
         }
@@ -3155,7 +3242,7 @@ mod tests {
                 },
             );
         }));
-        backend.stop_checked().unwrap();
+        assert_eq!(backend.stop_checked(), Err(Error::DeviceLost));
         let events: Vec<_> = std::iter::from_fn(|| backend.poll_event()).collect();
         // Exact equality both confirms the mailbox was exercised and rejects any
         // invented helper event before, between, or after the ordinary events.
@@ -3169,7 +3256,7 @@ mod tests {
             ]
         );
         assert!(backend.poll_event().is_none());
-        backend.stop_checked().unwrap();
+        assert_eq!(backend.stop_checked(), Err(Error::DeviceLost));
         assert!(backend.poll_event().is_none());
     }
 
@@ -4204,7 +4291,10 @@ mod tests {
             Ok(mut w) => {
                 // PipeWire session available. poll_event is nonblocking; since initial scan
                 // events are suppressed, it may immediately return None (an event is also fine).
-                let _ = w.poll_event();
+                assert!(!matches!(
+                    w.poll_event(),
+                    Some(DeviceEvent::TerminalError { .. })
+                ));
                 w.stop();
             }
             Err(error) if error.kind() == flexaudio_core::ErrorKind::Backend => {
@@ -4318,6 +4408,7 @@ mod silent_failure_tests {
             running: Arc::new(AtomicBool::new(true)),
             stop_tx: None,
             handle: Some(thread::spawn(|| panic!("synthetic watcher failure"))),
+            shutdown: None,
         };
         watcher.stop();
         watcher.stop();

@@ -242,6 +242,7 @@ impl CaptureBackend for MacSystemBackend {
         let silence_probe = self.silence_probe;
         let publication = self.publication.clone();
         let terminal = self.terminal.clone();
+        let cleanup = self.shutdown.cleanup.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let (event_tx, event_rx) = mpsc::channel();
         // Effective exclusion set: `exclude_pids ∪ {self if exclude_self}`. Built here
@@ -265,6 +266,7 @@ impl CaptureBackend for MacSystemBackend {
                     let macos_pid = match checked_exclusion_pid(pid) {
                         Ok(pid) => pid,
                         Err(e) => {
+                            #[allow(clippy::let_underscore_must_use, reason = "A disconnected readiness receiver means the startup caller has gone away.")]
                             let _ = ready_tx.send(Err(e));
                             return Ok(());
                         }
@@ -277,6 +279,7 @@ impl CaptureBackend for MacSystemBackend {
                         Ok(None) => {}
                         Ok(Some(object_id)) => ids.push(object_id),
                         Err(e) => {
+                            #[allow(clippy::let_underscore_must_use, reason = "A disconnected readiness receiver means the startup caller has gone away.")]
                             let _ = ready_tx.send(Err(e));
                             return Ok(());
                         }
@@ -286,6 +289,7 @@ impl CaptureBackend for MacSystemBackend {
                     match crate::devices::resolve_output_device_uid(device_id.as_deref()) {
                         Ok(uid) => uid,
                         Err(error) => {
+                            #[allow(clippy::let_underscore_must_use, reason = "A disconnected readiness receiver means the startup caller has gone away.")]
                             let _ = ready_tx.send(Err(error));
                             return Ok(());
                         }
@@ -295,6 +299,7 @@ impl CaptureBackend for MacSystemBackend {
                     TapThreadConfig {
                         kind,
                         silence_probe,
+                        cleanup,
                     },
                     sink,
                     stop_flag,
@@ -321,25 +326,27 @@ impl CaptureBackend for MacSystemBackend {
                 if e.permission().is_some() {
                     self.terminal.record(e.clone());
                 }
-                ShutdownReport::new(
+                let report = ShutdownReport::new(
                     Some(e),
                     stop_owner(&self.publication, &self.stop_flag, Some(handle)),
-                )
-                .result()
+                );
+                self.shutdown.retain_startup_report(report)
             }
-            Err(_) => ShutdownReport::new(
-                Some(
-                    Error::Backend("capture owner exited before reporting readiness".into())
-                        .with_context(ErrorContext::new(Operation::Start)),
-                ),
-                stop_owner(&self.publication, &self.stop_flag, Some(handle)),
-            )
-            .result(),
+            Err(_) => {
+                let report = ShutdownReport::new(
+                    Some(
+                        Error::Backend("capture owner exited before reporting readiness".into())
+                            .with_context(ErrorContext::new(Operation::Start)),
+                    ),
+                    stop_owner(&self.publication, &self.stop_flag, Some(handle)),
+                );
+                self.shutdown.retain_startup_report(report)
+            }
         }
     }
 
     fn stop(&mut self) {
-        let _ = self.retain_shutdown_outcome();
+        self.retain_shutdown_outcome();
     }
 
     fn set_helper_stop_reason(&mut self, reason: flexaudio_core::HelperStopReason) {
@@ -347,7 +354,11 @@ impl CaptureBackend for MacSystemBackend {
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.retain_shutdown_outcome()
+        self.retain_shutdown_outcome();
+        self.shutdown
+            .report()
+            .expect("completed owner shutdown")
+            .result()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
@@ -374,6 +385,8 @@ pub(crate) struct TapThreadConfig {
     pub kind: TapKind,
     /// Enable the bounded diagnostic probe when an active source produces silence.
     pub silence_probe: bool,
+    /// Retained by the backend until owner join and all native drops complete.
+    pub cleanup: Arc<crate::cleanup::CleanupLedger>,
 }
 
 /// Owner-thread body for the tap chain (shared by system / process capture).
@@ -392,6 +405,7 @@ pub(crate) fn run_tap_thread(
     event_tx: mpsc::Sender<Event>,
 ) -> Result<()> {
     let kind = config.kind;
+    let cleanup = config.cleanup;
     let activity = ActivityQuery::new(&kind);
     // CATapDescription / aggregate display name (private, so collisions are harmless; debug only).
     let label = match &kind {
@@ -400,9 +414,13 @@ pub(crate) fn run_tap_thread(
         TapKind::ExcludeProcessesOnDevice { .. } => "flexaudio-system-device-tap",
     };
     // SAFETY: build_tap_chain calls CoreAudio. Move sink into the block.
-    let mut chain: TapChain = match unsafe { build_tap_chain(kind, label, sink) } {
+    let mut chain: TapChain = match unsafe { build_tap_chain(kind, label, sink, cleanup.clone()) } {
         Ok(c) => c,
         Err(e) => {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "Startup cleanup is retained independently when the readiness receiver disconnects."
+            )]
             let _ = ready_tx.send(Err(e));
             return Ok(());
         }
@@ -410,7 +428,8 @@ pub(crate) fn run_tap_thread(
 
     if ready_tx.send(Ok(())).is_err() {
         // The caller has gone away. Drop the chain to clean up.
-        return chain.retain_shutdown_outcome();
+        chain.retain_shutdown_outcome();
+        return Ok(());
     }
 
     let origin = std::time::Instant::now();
@@ -425,6 +444,10 @@ pub(crate) fn run_tap_thread(
         if let Some(error) = chain.take_buffer_error() {
             chain.gate_delivery();
             terminal_failure.record(error.clone());
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "The terminal cause is retained independently if the event receiver disconnects."
+            )]
             let _ = event_tx.send(Event::TerminalError { error });
             break;
         }
@@ -444,6 +467,7 @@ pub(crate) fn run_tap_thread(
             detector = None;
             let control =
                 ProbeControl::new(std::time::Instant::now() + PROBE_TIMEOUT, stop_flag.clone())
+                    .with_cleanup_ledger(cleanup.clone())
                     .with_lifecycle(event_tx.clone(), publication.stop_reason());
             let decision = generation_probe.on_silence(&mut NativeProbe::new(), &control);
             let mut terminal = false;
@@ -466,11 +490,13 @@ pub(crate) fn run_tap_thread(
                         }
                         ProbeDecision::Advisory { detail, error } => {
                             if let Some(error) = error {
+                                #[allow(clippy::let_underscore_must_use, reason = "Probe cleanup is retained in the generation ledger if the event receiver disconnects.")]
                                 let _ = event_tx.send(Event::RecoverableError { error });
                             }
                             Event::SilenceWhileSourceActive { detail }
                         }
                     };
+                    #[allow(clippy::let_underscore_must_use, reason = "No listener remains when the event receiver disconnects; terminal and cleanup causes have separate retention.")]
                     let _ = event_tx.send(event);
                 });
                 if published.is_err() {
@@ -478,6 +504,7 @@ pub(crate) fn run_tap_thread(
                     publication.recover_when_active(&control, || {
                         let error = Error::Backend("self-probe publication gate poisoned".into());
                         terminal_failure.record(error.clone());
+                        #[allow(clippy::let_underscore_must_use, reason = "The terminal cause is retained independently if the event receiver disconnects.")]
                         let _ = event_tx.send(Event::TerminalError { error });
                     });
                     terminal = true;
@@ -490,12 +517,16 @@ pub(crate) fn run_tap_thread(
     }
 
     // Quiesce the callback, then report even a final-buffer failure with no following PCM.
-    let result = chain.retain_shutdown_outcome();
+    chain.retain_shutdown_outcome();
     if let Some(error) = chain.take_buffer_error() {
         terminal_failure.record(error.clone());
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "The terminal cause is retained independently if the event receiver disconnects."
+        )]
         let _ = event_tx.send(Event::TerminalError { error });
     }
-    result
+    Ok(())
 }
 
 #[cfg(test)]
@@ -800,12 +831,34 @@ mod repro_tests {
 
 impl MacSystemBackend {
     // Both stop entry points use this one retained teardown outcome.
-    fn retain_shutdown_outcome(&mut self) -> Result<()> {
+    fn retain_shutdown_outcome(&mut self) {
         self.shutdown.finish(
             &self.publication,
             &self.stop_flag,
             &self.terminal,
             self.handle.take(),
         )
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn shutdown_fixture(
+        handle: JoinHandle<Result<()>>,
+        cleanup: Arc<crate::cleanup::CleanupLedger>,
+        primary: Option<Error>,
+    ) -> Self {
+        let mut backend = Self::new(false, None);
+        backend.handle = Some(handle);
+        backend.shutdown.cleanup = cleanup;
+        if let Some(primary) = primary {
+            backend.terminal.record(primary);
+        }
+        backend
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl crate::test_support::FixtureBackend for MacSystemBackend {
+    fn retained_report(&self) -> &ShutdownReport {
+        self.shutdown.report().expect("shutdown report retained")
     }
 }

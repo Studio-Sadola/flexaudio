@@ -7,6 +7,7 @@
 //! thread → Normalizer → ChunkRing → poll, with watchdog recovery).
 
 #![warn(missing_docs)]
+#![deny(clippy::let_underscore_must_use)]
 
 pub use flexaudio_core as core;
 
@@ -37,13 +38,12 @@ mod settings_resolver;
 mod settings_resolver_tests;
 #[cfg(test)]
 mod settings_tests;
-#[cfg(test)]
-mod shutdown_guard_tests;
+mod stop_contract;
 
 pub use settings_request::{SettingsAttachments, SettingsRequest};
 pub use settings_resolver::resolve_settings;
 pub mod stream;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;
 mod validation;
@@ -312,7 +312,7 @@ pub(crate) fn build_backend(
         // Microphone input is common to all OSes (cpal). device_id selects an input device
         // (None=default input; id is the stable device-name key returned by devices()). The
         // same device_id selects the output endpoint for system capture.
-        SourceKind::Mic => Box::new(flexaudio_mic::CpalMicBackend::try_new(
+        SourceKind::Mic => stop_contract::builtin(flexaudio_mic::CpalMicBackend::try_new(
             config.device_id.clone(),
         )?),
 
@@ -338,18 +338,21 @@ pub(crate) fn build_backend(
                 })?;
                 #[cfg(target_os = "linux")]
                 {
-                    Box::new(flexaudio_os_linux::PwProcessBackend::new(pid, config.mode))
+                    stop_contract::builtin(flexaudio_os_linux::PwProcessBackend::new(
+                        pid,
+                        config.mode,
+                    ))
                 }
                 #[cfg(target_os = "windows")]
                 {
-                    Box::new(flexaudio_os_windows::WasapiProcessBackend::new(
+                    stop_contract::builtin(flexaudio_os_windows::WasapiProcessBackend::new(
                         pid,
                         config.mode,
                     ))
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    Box::new(
+                    stop_contract::builtin(
                         flexaudio_os_macos::MacProcessBackend::new(pid, config.mode)
                             .with_silence_probe(config.silence_probe),
                     )
@@ -366,7 +369,7 @@ pub(crate) fn build_backend(
         // Ignore device_id; select each side with mix_mic_device_id / mix_system_device_id.
         SourceKind::Mix => {
             validate_mix_gains(config)?;
-            let mic = Box::new(flexaudio_mic::CpalMicBackend::try_new(
+            let mic = stop_contract::builtin(flexaudio_mic::CpalMicBackend::try_new(
                 config.mix_mic_device_id.clone(),
             )?);
             // For Mix, apply exclude_self to the system side (same feedback-prevention intent
@@ -378,7 +381,7 @@ pub(crate) fn build_backend(
                 config.silence_probe,
                 options,
             )?;
-            Box::new(mix::CompositeBackend::new(
+            stop_contract::builtin(mix::CompositeBackend::new(
                 mic,
                 system,
                 config.mix_mic_gain,
@@ -411,14 +414,14 @@ fn build_system_backend(
     let _ = options;
     #[cfg(target_os = "linux")]
     {
-        Ok(Box::new(
+        Ok(stop_contract::builtin(
             flexaudio_os_linux::PwSystemBackend::new(exclude_self, device_id)
                 .with_exclude_pids(exclude_pids),
         ))
     }
     #[cfg(target_os = "windows")]
     {
-        Ok(Box::new(
+        Ok(stop_contract::builtin(
             flexaudio_os_windows::WasapiSystemBackend::new(exclude_self, device_id)
                 .with_exclude_pids(exclude_pids)
                 .with_classic_loopback_keepalive(options.windows_classic_loopback_keepalive),
@@ -426,7 +429,7 @@ fn build_system_backend(
     }
     #[cfg(target_os = "macos")]
     {
-        Ok(Box::new(
+        Ok(stop_contract::builtin(
             flexaudio_os_macos::MacSystemBackend::new(exclude_self, device_id)
                 .with_exclude_pids(exclude_pids)
                 .with_silence_probe(silence_probe),

@@ -1,9 +1,31 @@
 //! One retained join outcome for both WASAPI backends.
 use std::collections::VecDeque;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use flexaudio_core::{Error, ErrorContext, Event, Operation, Result, ShutdownReport};
+
+/// Cleanup observed by resources in one capture generation, including Drop.
+#[derive(Clone, Default)]
+pub(crate) struct CleanupLedger(Arc<Mutex<Vec<Error>>>);
+
+impl CleanupLedger {
+    pub(crate) fn retain(&self, error: Error) {
+        let mut errors = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match error {
+            Error::Multiple(group) => {
+                errors.push(group.primary().clone());
+                errors.extend(group.secondary().cloned());
+            }
+            error => errors.push(error),
+        }
+    }
+
+    pub(crate) fn take(&self) -> Vec<Error> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|error| error.into_inner()))
+    }
+}
 
 pub(crate) fn join_owner(handle: JoinHandle<ShutdownReport>) -> ShutdownReport {
     match handle.join() {
@@ -24,6 +46,10 @@ pub(crate) fn finish_capture(
 ) -> ShutdownReport {
     let primary = capture.err();
     if let Some(error) = &primary {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "notification receiver may already be gone; the report retains the cause"
+        )]
         let _ = events.send(Event::TerminalError {
             error: error.clone(),
         });
@@ -40,7 +66,8 @@ pub(crate) fn finish_capture(
 
 #[derive(Default)]
 pub(crate) struct OwnerShutdown {
-    report: Option<ShutdownReport>,
+    pub(crate) report: Option<ShutdownReport>,
+    pub(crate) cleanup: CleanupLedger,
     events: VecDeque<Event>,
     capture_events: Option<mpsc::Receiver<Event>>,
     pending_capture: VecDeque<Event>,
@@ -76,15 +103,59 @@ impl OwnerShutdown {
             let report = handle
                 .map(join_owner)
                 .unwrap_or_else(|| ShutdownReport::new(None, Vec::new()));
-            self.events.extend(
-                report
-                    .cleanup()
-                    .iter()
-                    .cloned()
-                    .map(|error| Event::ShutdownError { error }),
-            );
-            self.report = Some(report);
+            self.retain(report);
         }
+        self.result()
+    }
+
+    /// Join before draining: thread-local resources have all been dropped then.
+    pub(crate) fn retain_start_failure(
+        &mut self,
+        error: Error,
+        handle: JoinHandle<ShutdownReport>,
+    ) -> Result<()> {
+        let joined = join_owner(handle);
+        let cleanup = joined
+            .cleanup()
+            .iter()
+            .cloned()
+            .chain(self.cleanup.take())
+            .collect();
+        let report = ShutdownReport::new(Some(error.clone()), cleanup);
+        let result = report.result();
+        if self.report.is_none() {
+            self.events.push_back(Event::TerminalError { error });
+        }
+        self.retain(report);
+        result
+    }
+
+    fn retain(&mut self, report: ShutdownReport) {
+        let cleanup: Vec<Error> = report
+            .cleanup()
+            .iter()
+            .cloned()
+            .chain(self.cleanup.take())
+            .collect();
+        let previous = self.report.take();
+        let primary = match previous.as_ref() {
+            Some(previous) => previous.primary().cloned(),
+            None => report.primary().cloned(),
+        };
+        self.events.extend(
+            cleanup
+                .iter()
+                .cloned()
+                .map(|error| Event::ShutdownError { error }),
+        );
+        let mut retained_cleanup = previous
+            .map(|report| report.cleanup().to_vec())
+            .unwrap_or_default();
+        retained_cleanup.extend(cleanup);
+        self.report = Some(ShutdownReport::new(primary, retained_cleanup));
+    }
+
+    pub(crate) fn result(&self) -> Result<()> {
         self.report
             .as_ref()
             .expect("completed owner shutdown")
@@ -108,6 +179,102 @@ mod tests {
     use super::*;
     use flexaudio_core::{ErrorKind, Permission};
     use std::thread;
+
+    #[test]
+    fn startup_failure_retains_join_cleanup() {
+        let mut shutdown = OwnerShutdown::default();
+        let worker = thread::spawn(|| panic!("injected startup owner panic"));
+        let primary = Error::Backend("injected start failure".into());
+        let expected = ShutdownReport::new(
+            Some(primary.clone()),
+            vec![Error::Backend("capture owner thread panicked".into())
+                .with_context(ErrorContext::new(Operation::Join))],
+        );
+        assert_eq!(
+            shutdown.retain_start_failure(primary, worker),
+            expected.result()
+        );
+        assert_eq!(shutdown.report, Some(expected.clone()));
+        assert_eq!(shutdown.finish(None), expected.result());
+        assert_eq!(shutdown.report, Some(expected.clone()));
+        assert_eq!(
+            shutdown.poll_event(),
+            Some(Event::TerminalError {
+                error: expected.primary().unwrap().clone(),
+            })
+        );
+        assert_eq!(
+            shutdown.poll_event(),
+            Some(Event::ShutdownError {
+                error: expected.cleanup()[0].clone(),
+            })
+        );
+        assert!(shutdown.poll_event().is_none());
+    }
+
+    #[test]
+    fn failed_restart_keeps_previous_primary_and_appends_cleanup_until_success() {
+        for previous_primary in [None, Some(Error::DeviceLost)] {
+            let mut shutdown = OwnerShutdown::default();
+            let (events, receiver) = mpsc::channel();
+            shutdown.reset(receiver);
+            let previous_cleanup = Error::Backend("injected previous stop failure".into())
+                .with_context(ErrorContext::new(Operation::Stop));
+            let capture = previous_primary.clone().map_or(Ok(()), Err);
+            let stop_error = previous_cleanup.clone();
+            let previous_worker =
+                thread::spawn(move || finish_capture(capture, || Err(stop_error), &events));
+            let previous =
+                ShutdownReport::new(previous_primary.clone(), vec![previous_cleanup.clone()]);
+            assert_eq!(shutdown.finish(Some(previous_worker)), previous.result());
+            if let Some(error) = &previous_primary {
+                assert_eq!(
+                    shutdown.poll_event(),
+                    Some(Event::TerminalError {
+                        error: error.clone(),
+                    })
+                );
+            }
+            assert_eq!(
+                shutdown.poll_event(),
+                Some(Event::ShutdownError {
+                    error: previous_cleanup.clone(),
+                })
+            );
+            assert!(shutdown.poll_event().is_none());
+
+            let restart_error = Error::Backend("injected restart failure".into())
+                .with_context(ErrorContext::new(Operation::Start));
+            let restart_cleanup = Error::Backend("capture owner thread panicked".into())
+                .with_context(ErrorContext::new(Operation::Join));
+            let attempt =
+                ShutdownReport::new(Some(restart_error.clone()), vec![restart_cleanup.clone()]);
+            let worker = thread::spawn(|| panic!("injected failed restart owner panic"));
+            assert_eq!(
+                shutdown.retain_start_failure(restart_error, worker),
+                attempt.result()
+            );
+            let retained = ShutdownReport::new(
+                previous_primary,
+                vec![previous_cleanup, restart_cleanup.clone()],
+            );
+            assert_eq!(shutdown.report.as_ref(), Some(&retained));
+            assert_eq!(shutdown.finish(None), retained.result());
+            assert_eq!(shutdown.report.as_ref(), Some(&retained));
+            assert_eq!(
+                shutdown.poll_event(),
+                Some(Event::ShutdownError {
+                    error: restart_cleanup,
+                })
+            );
+            assert!(shutdown.poll_event().is_none());
+
+            let (_events, receiver) = mpsc::channel();
+            shutdown.reset(receiver);
+            assert!(shutdown.finish(None).is_ok());
+            assert_eq!(shutdown.report, Some(ShutdownReport::new(None, Vec::new())));
+        }
+    }
 
     #[test]
     fn replacing_failed_start_mailbox_preserves_the_unread_stopped_before_new_start() {

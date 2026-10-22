@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::capture_health::ADVISORY_DETAIL;
+use crate::cleanup::CleanupLedger;
 use flexaudio_core::{
     Error, ErrorContext, ErrorGroup, Event, HelperStopReason, NativeStatus, Operation,
 };
@@ -90,9 +91,16 @@ pub(crate) struct ProbeControl {
     cancellation: Arc<AtomicBool>,
     clock: Arc<dyn Clock>,
     cleanup: Arc<ProbeCleanup>,
+    cleanup_ledger: Arc<CleanupLedger>,
     events: Option<mpsc::Sender<Event>>,
     stop_reason: Arc<Mutex<HelperStopReason>>,
     running: AtomicBool,
+}
+
+impl Drop for ProbeControl {
+    fn drop(&mut self) {
+        self.cleanup_ledger.extend(self.cleanup.take());
+    }
 }
 
 impl ProbeControl {
@@ -102,10 +110,16 @@ impl ProbeControl {
             cancellation,
             clock: Arc::new(SystemClock),
             cleanup: Arc::new(ProbeCleanup::default()),
+            cleanup_ledger: Arc::new(CleanupLedger::default()),
             events: None,
             stop_reason: Arc::new(Mutex::new(HelperStopReason::StreamStopped)),
             running: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn with_cleanup_ledger(mut self, ledger: Arc<CleanupLedger>) -> Self {
+        self.cleanup_ledger = ledger;
+        self
     }
 
     pub(crate) fn with_lifecycle(
@@ -265,6 +279,10 @@ impl<'a> ProbeLifecycle<'a> {
             reason: HelperStopReason::RuntimeFailed,
         };
         if let Some(events) = guard.events {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "A disconnected event receiver has no remaining lifecycle listener."
+            )]
             let _ = events.send(Event::SilenceProbeStarted);
         }
         guard
@@ -279,6 +297,10 @@ impl Drop for ProbeLifecycle<'_> {
             } else {
                 self.reason
             };
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "A disconnected event receiver has no remaining lifecycle listener; native cleanup has separate retention."
+            )]
             let _ = events.send(Event::SilenceProbeStopped { reason });
         }
     }
@@ -303,6 +325,10 @@ impl GenerationProbe {
         } else {
             probe.run(control)
         };
+        // Native owners have completed teardown. Retain their failures before
+        // cancellation suppresses probe-result publication.
+        let mut errors = control.cleanup.take();
+        control.cleanup_ledger.extend(errors.iter().cloned());
         // Stop wins even when requested during native teardown after collecting a result.
         if control.cancelled() {
             lifecycle.reason = control.cancellation_reason();
@@ -312,7 +338,6 @@ impl GenerationProbe {
             lifecycle.reason = HelperStopReason::Cancelled;
             return None;
         }
-        let mut errors = control.cleanup.take();
         lifecycle.reason = if !errors.is_empty() {
             HelperStopReason::RuntimeFailed
         } else if control.timed_out() || matches!(outcome, ProbeOutcome::TimedOut) {

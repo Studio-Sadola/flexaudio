@@ -25,7 +25,8 @@ impl CaptureBackend for CheckedBackend {
         Ok(())
     }
     fn stop(&mut self) {
-        let _ = self.stop_checked();
+        let fails = self.stop_error.is_some() || self.cleanup_failure;
+        assert_eq!(self.stop_checked().is_err(), fails);
     }
     fn stop_checked(&mut self) -> Result<()> {
         self.stops.fetch_add(1, Ordering::SeqCst);
@@ -635,7 +636,8 @@ fn unsuccessful_start_preserves_previous_outcome_and_successful_retry_clears_it(
             }
         }
         fn stop(&mut self) {
-            let _ = self.stop_checked();
+            let result = self.stop_checked();
+            assert_eq!(result.is_err(), self.stops == 1);
         }
         fn stop_checked(&mut self) -> Result<()> {
             self.stops += 1;

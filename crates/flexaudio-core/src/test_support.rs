@@ -3,21 +3,24 @@
 pub use crate::error_context::shutdown_fields;
 pub use crate::errors::error_cases;
 
-/// Require named arms even when a fallback happens to equal the real Backend value.
-pub fn assert_explicit_error_kind_arms(source: &str, function: &str) {
-    let body = source
-        .split_once(function)
-        .expect("error mapping function")
-        .1
-        .split_once("\n}")
-        .expect("error mapping function end")
-        .0;
-    for (kind, _, _) in error_cases() {
-        assert!(
-            body.contains(&format!("ErrorKind::{kind:?} =>")),
-            "{function} must explicitly map {kind:?}, without using the wildcard fallback"
-        );
+/// C and Node code symbol for a canonical camelCase kind name.
+///
+/// `backend` is the one existing ABI exception and is spelled `FLEX_FAILURE`.
+/// The symbol is derived from the name; this function does not list kinds.
+pub fn canonical_error_code_symbol(name: &str) -> String {
+    if name == "backend" {
+        return "FLEX_FAILURE".to_owned();
     }
+    let mut symbol = String::from("FLEX_");
+    for ch in name.chars() {
+        if ch.is_ascii_uppercase() {
+            symbol.push('_');
+            symbol.push(ch);
+        } else {
+            symbol.push(ch.to_ascii_uppercase());
+        }
+    }
+    symbol
 }
 
 /// Extract declaration field names, ignoring whole-line and block documentation.

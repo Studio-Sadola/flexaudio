@@ -36,6 +36,10 @@ fn generated_header_matches_cbindgen() {
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "the temporary file is absent when the step that creates it failed"
+            )]
             let _ = std::fs::remove_file(&self.0);
         }
     }
@@ -156,4 +160,122 @@ fn readme_basic_capture_compiles_against_header() {
         "README capture example failed to compile: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn ascii_c_identifier(symbol: &str) -> bool {
+    let mut bytes = symbol.bytes();
+    match bytes.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Compile the checked-in header and print one validated symbol per line.
+/// Symbols must already be ASCII identifiers. The program is built from Rust
+/// strings and passed to cc as arguments, never through a shell.
+fn c_header_symbol_values(symbols: &[String]) -> Vec<i32> {
+    for symbol in symbols {
+        assert!(
+            ascii_c_identifier(symbol),
+            "canonical code symbol is not an ASCII identifier: {symbol}"
+        );
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let stamp = std::process::id();
+    let source_path = std::env::temp_dir().join(format!("flexaudio-error-codes-{stamp}.c"));
+    let binary_path = std::env::temp_dir().join(format!("flexaudio-error-codes-{stamp}"));
+    let mut source =
+        String::from("#include <stdio.h>\n#include \"flexaudio.h\"\nint main(void) {\n");
+    for symbol in symbols {
+        source.push_str("    (void)printf(\"%d\\n\", ");
+        source.push_str(symbol);
+        source.push_str(");\n");
+    }
+    source.push_str("    return 0;\n}\n");
+    std::fs::write(&source_path, &source).expect("write error code program");
+    struct Cleanup(std::path::PathBuf, std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for path in [&self.0, &self.1] {
+                #[allow(
+                    clippy::let_underscore_must_use,
+                    reason = "the temporary file is absent when the step that creates it failed"
+                )]
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    let _cleanup = Cleanup(source_path.clone(), binary_path.clone());
+    let compile = std::process::Command::new("cc")
+        .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg("-I")
+        .arg(root.join("include"))
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&binary_path)
+        .output()
+        .expect("C compiler required for error code verification");
+    assert!(
+        compile.status.success(),
+        "error code program failed to compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = std::process::Command::new(&binary_path)
+        .output()
+        .expect("run error code program");
+    assert!(
+        run.status.success(),
+        "error code program failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let text = String::from_utf8(run.stdout).expect("error code program output is utf-8");
+    text.lines()
+        .map(|line| line.parse::<i32>().expect("error code integer"))
+        .collect()
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "requires the cc C compiler; the Linux CI job enforces this check"
+)]
+fn every_core_error_kind_maps_to_canonical_distinct_c_code() {
+    let cases = flexaudio_core::test_support::error_cases();
+    let mut by_code = std::collections::BTreeMap::<i32, Vec<flexaudio::ErrorKind>>::new();
+    let mut symbols = Vec::new();
+    for (kind, name, error) in &cases {
+        assert_eq!(
+            error.kind(),
+            *kind,
+            "core error fixture must match its kind"
+        );
+        let code = crate::error::root_code(error);
+        by_code.entry(code).or_default().push(*kind);
+        let symbol = flexaudio_core::test_support::canonical_error_code_symbol(name);
+        assert!(
+            ascii_c_identifier(&symbol),
+            "canonical code symbol is not an ASCII identifier: {symbol}"
+        );
+        symbols.push(symbol);
+    }
+    for (code, kinds) in &by_code {
+        assert!(
+            kinds.len() == 1,
+            "C error code collision or fallback for {kinds:?} sharing {code}"
+        );
+    }
+    let values = c_header_symbol_values(&symbols);
+    assert_eq!(
+        values.len(),
+        cases.len(),
+        "header program must print one value per kind"
+    );
+    for ((kind, _, error), value) in cases.iter().zip(values) {
+        assert_eq!(
+            crate::error::root_code(error),
+            value,
+            "C error code must equal the canonical header value for {kind:?}"
+        );
+    }
 }

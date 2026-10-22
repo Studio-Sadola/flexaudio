@@ -12,6 +12,11 @@ keywords = ["audio", "wasapi", "loopback", "capture", "windows"]
 categories = ["multimedia::audio", "os::windows-apis"]
 documentation = "https://docs.rs/flexaudio-os-windows"
 
+[features]
+default = []
+# Internal shutdown injection support; no stability guarantee.
+test-support = []
+
 # Windows-only crate. The backend compiles to an empty module under `#[cfg(target_os = "windows")]`
 # on other platforms, and the windows dependency is included only by the target-specific section below.
 # Pure functions for build-number handling still compile on non-Windows platforms.

@@ -313,6 +313,6 @@ fn c_startup_timeout_is_terminal_without_event_polling() {
                 "startup terminal failure must be observable without consuming its pending event; versioned={versioned}");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let _ = stream.stop_binding();
+        assert!(stream.stop_binding().is_err());
     }
 }

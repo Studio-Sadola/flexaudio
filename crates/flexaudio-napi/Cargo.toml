@@ -53,6 +53,7 @@ napi-derive = "2.16"
 napi-build = "2"
 
 [dev-dependencies]
+flexaudio = { path = "../flexaudio", features = ["test-support"] }
 flexaudio-core = { path = "../flexaudio-core", features = ["test-support"] }
 
 [lints.rust]

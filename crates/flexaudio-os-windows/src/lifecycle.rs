@@ -1,5 +1,6 @@
 //! Device-free capture lifecycle and wait-result validation.
 
+use crate::owner::CleanupLedger;
 use flexaudio_core::types::{Error, Result};
 use flexaudio_core::{ErrorContext, Event, HelperStopReason, Operation, ShutdownReport};
 use std::sync::{mpsc, Arc, Mutex};
@@ -45,6 +46,8 @@ pub(crate) struct Session<C: StreamClient, K: StreamClient> {
     render_started: bool,
     lifecycle: Option<KeepaliveLifecycle>,
     cleanup_events: Option<mpsc::Sender<Event>>,
+    cleanup: CleanupLedger,
+    shutdown_report: Option<ShutdownReport>,
 }
 
 /// The session owns teardown; this final field also reports unwinding after
@@ -64,6 +67,10 @@ impl KeepaliveLifecycle {
             reason: None,
             startup_complete: false,
         };
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "lifecycle notification is optional after the receiver is dropped"
+        )]
         let _ = guard.events.send(Event::ClassicLoopbackKeepaliveStarted);
         guard
     }
@@ -83,6 +90,10 @@ impl Drop for KeepaliveLifecycle {
                     .unwrap_or_else(|error| error.into_inner())
             })
         };
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "lifecycle notification is optional after the receiver is dropped"
+        )]
         let _ = self
             .events
             .send(Event::ClassicLoopbackKeepaliveStopped { reason });
@@ -107,12 +118,31 @@ impl<C: StreamClient, K: StreamClient> Session<C, K> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn start_and_report_with_lifecycle(
         capture: C,
         keepalive: Option<K>,
         report: impl FnOnce(Result<()>) -> bool,
         events: Option<mpsc::Sender<Event>>,
         stop_reason: Arc<Mutex<HelperStopReason>>,
+    ) -> Option<Self> {
+        Self::start_and_report_with_cleanup(
+            capture,
+            keepalive,
+            report,
+            events,
+            stop_reason,
+            CleanupLedger::default(),
+        )
+    }
+
+    pub(crate) fn start_and_report_with_cleanup(
+        capture: C,
+        keepalive: Option<K>,
+        report: impl FnOnce(Result<()>) -> bool,
+        events: Option<mpsc::Sender<Event>>,
+        stop_reason: Arc<Mutex<HelperStopReason>>,
+        cleanup: CleanupLedger,
     ) -> Option<Self> {
         let mut session = Self {
             capture,
@@ -121,6 +151,8 @@ impl<C: StreamClient, K: StreamClient> Session<C, K> {
             render_started: false,
             lifecycle: None,
             cleanup_events: events.clone(),
+            cleanup,
+            shutdown_report: None,
         };
         let start = (|| {
             if let Some(render) = session.keepalive.as_mut() {
@@ -136,8 +168,8 @@ impl<C: StreamClient, K: StreamClient> Session<C, K> {
         })();
         if let Err(error) = start {
             session.set_stop_reason(HelperStopReason::StartupFailed);
-            let cleanup = session.stop().err().into_iter().collect();
-            report(ShutdownReport::new(Some(error), cleanup).result());
+            session.retain_shutdown_outcome();
+            report(Err(error));
             return None;
         }
         if !report(Ok(())) {
@@ -167,7 +199,19 @@ impl<C: StreamClient, K: StreamClient> Session<C, K> {
     }
 
     /// Attempt both stops even when capture stop fails; preserve every failure.
+    #[cfg(test)]
     pub(crate) fn stop(&mut self) -> Result<()> {
+        self.retain_shutdown_outcome();
+        self.shutdown_report
+            .as_ref()
+            .expect("retained session shutdown")
+            .result()
+    }
+
+    pub(crate) fn retain_shutdown_outcome(&mut self) {
+        if self.shutdown_report.is_some() {
+            return;
+        }
         let capture = if self.capture_started {
             self.capture_started = false;
             stop_client(&mut self.capture)
@@ -187,21 +231,40 @@ impl<C: StreamClient, K: StreamClient> Session<C, K> {
                     .get_or_insert(HelperStopReason::RuntimeFailed);
             }
         }
-        // Consume the only owner after both native stop attempts, including failures.
-        drop(self.lifecycle.take());
-        ShutdownReport::new(
+        let report = ShutdownReport::new(
             None,
             capture.err().into_iter().chain(render.err()).collect(),
-        )
-        .result()
+        );
+        for error in report.cleanup() {
+            self.cleanup.retain(error.clone());
+        }
+        self.shutdown_report = Some(report);
+        // Retain cleanup before publishing the helper's final lifecycle event.
+        drop(self.lifecycle.take());
     }
 }
 
 impl<C: StreamClient, K: StreamClient> Drop for Session<C, K> {
     fn drop(&mut self) {
-        if let Err(error) = self.stop() {
+        let needs_stop = self.shutdown_report.is_none();
+        self.retain_shutdown_outcome();
+        if needs_stop {
             if let Some(events) = &self.cleanup_events {
-                let _ = events.send(Event::ShutdownError { error });
+                for error in self
+                    .shutdown_report
+                    .as_ref()
+                    .expect("retained session shutdown")
+                    .cleanup()
+                {
+                    // The ledger is already durable for this generation before notification.
+                    #[allow(
+                        clippy::let_underscore_must_use,
+                        reason = "the generation ledger retains cleanup when the notification receiver has gone"
+                    )]
+                    let _ = events.send(Event::ShutdownError {
+                        error: error.clone(),
+                    });
+                }
             }
         }
     }
@@ -474,15 +537,18 @@ mod tests {
     fn drop_publishes_native_cleanup_failures_without_keepalive() {
         let trace = Trace::default();
         let (events, receiver) = mpsc::channel();
-        let session = Session::<FakeClient, FakeClient>::start_and_report_with_lifecycle(
+        let cleanup = CleanupLedger::default();
+        let session = Session::<FakeClient, FakeClient>::start_and_report_with_cleanup(
             client("capture", &trace, Some("stop")),
             None,
             |_| true,
             Some(events),
             Arc::new(Mutex::new(HelperStopReason::StreamStopped)),
+            cleanup.clone(),
         )
         .unwrap();
         drop(session);
+        assert_eq!(cleanup.take(), [Error::Backend("capture.stop".into())]);
         assert!(
             matches!(receiver.try_recv(), Ok(Event::ShutdownError { error })
             if error == Error::Backend("capture.stop".into())),

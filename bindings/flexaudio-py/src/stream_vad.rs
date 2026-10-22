@@ -614,7 +614,9 @@ mod tests {
             stream.flush_vad().expect("shared-owner recovery flush");
             assert!(stream.vad_error.is_none());
             assert_eq!(stream.vad_cleanup.len(), 1);
-            let _ = stream.stop();
+            stream
+                .stop()
+                .expect("isolated attachment cleanup does not reject capture stop");
         });
     }
 

@@ -127,6 +127,7 @@ impl CaptureBackend for MacProcessBackend {
         let silence_probe = self.silence_probe;
         let publication = self.publication.clone();
         let terminal = self.terminal.clone();
+        let cleanup = self.shutdown.cleanup.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let (event_tx, event_rx) = mpsc::channel();
         // ProcessMode is Copy, so it can be moved directly into the closure.
@@ -139,6 +140,7 @@ impl CaptureBackend for MacProcessBackend {
                 let kind = match translate_pid_to_object(target_pid) {
                     Ok(0) => {
                         // No audio object for the target process (silent or absent).
+                        #[allow(clippy::let_underscore_must_use, reason = "A disconnected readiness receiver means the startup caller has gone away.")]
                         let _ = ready_tx.send(Err(Error::DeviceNotFound));
                         return Ok(());
                     }
@@ -149,6 +151,7 @@ impl CaptureBackend for MacProcessBackend {
                         ProcessMode::Exclude => TapKind::ExcludeProcesses(vec![object_id]),
                     },
                     Err(e) => {
+                        #[allow(clippy::let_underscore_must_use, reason = "A disconnected readiness receiver means the startup caller has gone away.")]
                         let _ = ready_tx.send(Err(e));
                         return Ok(());
                     }
@@ -157,6 +160,7 @@ impl CaptureBackend for MacProcessBackend {
                     TapThreadConfig {
                         kind,
                         silence_probe,
+                        cleanup,
                     },
                     sink,
                     stop_flag,
@@ -183,25 +187,27 @@ impl CaptureBackend for MacProcessBackend {
                 if e.permission().is_some() {
                     self.terminal.record(e.clone());
                 }
-                ShutdownReport::new(
+                let report = ShutdownReport::new(
                     Some(e),
                     stop_owner(&self.publication, &self.stop_flag, Some(handle)),
-                )
-                .result()
+                );
+                self.shutdown.retain_startup_report(report)
             }
-            Err(_) => ShutdownReport::new(
-                Some(
-                    Error::Backend("capture owner exited before reporting readiness".into())
-                        .with_context(ErrorContext::new(Operation::Start)),
-                ),
-                stop_owner(&self.publication, &self.stop_flag, Some(handle)),
-            )
-            .result(),
+            Err(_) => {
+                let report = ShutdownReport::new(
+                    Some(
+                        Error::Backend("capture owner exited before reporting readiness".into())
+                            .with_context(ErrorContext::new(Operation::Start)),
+                    ),
+                    stop_owner(&self.publication, &self.stop_flag, Some(handle)),
+                );
+                self.shutdown.retain_startup_report(report)
+            }
         }
     }
 
     fn stop(&mut self) {
-        let _ = self.retain_shutdown_outcome();
+        self.retain_shutdown_outcome();
     }
 
     fn set_helper_stop_reason(&mut self, reason: flexaudio_core::HelperStopReason) {
@@ -209,7 +215,11 @@ impl CaptureBackend for MacProcessBackend {
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.retain_shutdown_outcome()
+        self.retain_shutdown_outcome();
+        self.shutdown
+            .report()
+            .expect("completed owner shutdown")
+            .result()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
@@ -338,12 +348,34 @@ mod repro_tests {
 
 impl MacProcessBackend {
     // Both stop entry points use this one retained teardown outcome.
-    fn retain_shutdown_outcome(&mut self) -> Result<()> {
+    fn retain_shutdown_outcome(&mut self) {
         self.shutdown.finish(
             &self.publication,
             &self.stop_flag,
             &self.terminal,
             self.handle.take(),
         )
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn shutdown_fixture(
+        handle: JoinHandle<Result<()>>,
+        cleanup: Arc<crate::cleanup::CleanupLedger>,
+        primary: Option<Error>,
+    ) -> Self {
+        let mut backend = Self::new(1, ProcessMode::Include);
+        backend.handle = Some(handle);
+        backend.shutdown.cleanup = cleanup;
+        if let Some(primary) = primary {
+            backend.terminal.record(primary);
+        }
+        backend
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl crate::test_support::FixtureBackend for MacProcessBackend {
+    fn retained_report(&self) -> &ShutdownReport {
+        self.shutdown.report().expect("shutdown report retained")
     }
 }

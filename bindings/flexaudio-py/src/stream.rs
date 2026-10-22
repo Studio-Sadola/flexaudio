@@ -96,7 +96,12 @@ impl Stream {
     /// Stop once, drain graceful addon tails, and raise any retained capture or cleanup failure.
     /// The stopped stream is spent; open a new stream to capture again.
     fn stop(&mut self) -> PyResult<()> {
-        self.retain_shutdown_outcome().map_err(to_py_err)
+        self.retain_shutdown_outcome();
+        self.shutdown
+            .as_ref()
+            .expect("completed Python shutdown")
+            .result()
+            .map_err(to_py_err)
     }
 
     /// Final capture primary and ordered cleanup failures; absent until shutdown completes.
@@ -659,7 +664,7 @@ mod tests {
             assert!(!error.to_string().contains("denied by user"));
             assert!(stream.poll_event().is_some());
             assert!(stream.terminal_error().is_some());
-            let _ = stream.stop();
+            assert!(stream.stop().is_err());
             assert!(stream.poll_chunk().is_err());
             assert!(stream.resume().is_err());
             assert!(stream.terminal_error().is_some());
@@ -873,7 +878,7 @@ mod repro_tests {
     fn stop_retains_denoise_tail() {
         let (mut stream, sink) = fixture(true, false);
         let mut delivered = send(&mut stream, &sink).samples().len();
-        let _ = stream.stop();
+        stream.stop().expect("denoise tail shutdown");
         while let Some(chunk) = stream.poll_chunk().unwrap() {
             delivered += chunk.samples().len();
         }

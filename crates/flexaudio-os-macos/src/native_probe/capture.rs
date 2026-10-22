@@ -19,6 +19,7 @@ use objc2_core_audio_types::{
 use objc2_foundation::{NSArray, NSNumber, NSString};
 
 use super::io::{buffers, check, failed, float_rate, read_property, IoRegistration};
+use crate::cleanup::{native_cleanup, NativeCleanup};
 use crate::probe::{ProbeCleanup, ProbeControl, ProbeOutcome};
 use crate::probe_signal::CapturedFrame;
 use crate::tap::create_aggregate_device;
@@ -141,15 +142,24 @@ impl CaptureState {
     }
 }
 
-struct CaptureResources {
+pub(super) struct CaptureResources {
     cleanup: Arc<ProbeCleanup>,
     registration: Option<IoRegistration>,
     aggregate: AudioObjectID,
     tap: AudioObjectID,
-    _description: Retained<CATapDescription>,
 }
 
 impl CaptureResources {
+    #[cfg(feature = "test-support")]
+    pub(super) fn inject_cleanup(control: &ProbeControl) {
+        drop(Self {
+            cleanup: control.cleanup_diagnostics(),
+            registration: Some(IoRegistration::fixture(control)),
+            aggregate: 1,
+            tap: 1,
+        });
+    }
+
     fn stop(&mut self) -> bool {
         self.registration
             .as_mut()
@@ -161,7 +171,9 @@ impl CaptureResources {
         if self.aggregate != 0 {
             // SAFETY: uniquely owned private aggregate; IOProc stop/destruction were attempted.
             // HAL's copied block keeps Arc context alive if removal fails; its gate is closed.
-            let status = unsafe { AudioHardwareDestroyAggregateDevice(self.aggregate) };
+            let status = native_cleanup(NativeCleanup::ProbeAggregate, || unsafe {
+                AudioHardwareDestroyAggregateDevice(self.aggregate)
+            });
             self.cleanup.record_native("aggregate destruction", status);
             clean &= status == 0;
             if status == 0 {
@@ -170,7 +182,9 @@ impl CaptureResources {
         }
         if self.tap != 0 {
             // SAFETY: this owner created the tap and attempted to tear down all dependents first.
-            let status = unsafe { AudioHardwareDestroyProcessTap(self.tap) };
+            let status = native_cleanup(NativeCleanup::ProbeTap, || unsafe {
+                AudioHardwareDestroyProcessTap(self.tap)
+            });
             self.cleanup
                 .record_native("private tap destruction", status);
             clean &= status == 0;
@@ -184,13 +198,15 @@ impl CaptureResources {
 
 impl Drop for CaptureResources {
     fn drop(&mut self) {
-        let _ = self.record_cleanup();
+        self.record_cleanup();
     }
 }
 
 pub(super) struct Capture {
     resources: CaptureResources,
     pub(super) state: Arc<CaptureState>,
+    // Drop native resources before releasing their description.
+    _description: Retained<CATapDescription>,
 }
 
 impl Capture {
@@ -216,12 +232,10 @@ impl Capture {
             registration: None,
             aggregate: 0,
             tap: 0,
-            _description: description,
         };
         // SAFETY: description and output tap-ID storage remain owned on this thread.
-        let status = unsafe {
-            AudioHardwareCreateProcessTap(Some(&resources._description), &mut resources.tap)
-        };
+        let status =
+            unsafe { AudioHardwareCreateProcessTap(Some(&description), &mut resources.tap) };
         if status != 0 || resources.tap == 0 {
             return Err(failed("private tap creation", status));
         }
@@ -239,7 +253,7 @@ impl Capture {
             return Err(failed("private tap is not stereo", -1));
         }
         // SAFETY: description is valid and retained until tap/aggregate destruction; UUID is owned.
-        let uuid = unsafe { resources._description.UUID() }.UUIDString();
+        let uuid = unsafe { description.UUID() }.UUIDString();
         resources.aggregate = create_aggregate_device("flexaudio-private-permission-probe", &uuid)
             .map_err(|error| ProbeOutcome::Failed { error })?;
         check(control)?;
@@ -284,7 +298,11 @@ impl Capture {
             state.gate.clone(),
             control,
         )?);
-        Ok(Self { resources, state })
+        Ok(Self {
+            resources,
+            state,
+            _description: description,
+        })
     }
 
     pub(super) fn close(&mut self) -> bool {

@@ -33,6 +33,7 @@ use windows::Win32::System::Threading::{
 use crate::keepalive::SilentRender;
 use crate::lifecycle::{check_wait_result, Session, StreamClient};
 use crate::owner::finish_capture;
+use crate::owner::CleanupLedger;
 use flexaudio_core::{ErrorContext, NativeStatus, Operation, ShutdownReport};
 
 /// Classify access-denied and device-unavailable HRESULTs as typed [`Error`] variants.
@@ -238,11 +239,45 @@ pub(crate) unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32,
 }
 
 /// Close a thread-owned event on every return path.
-pub(crate) struct EventHandle(pub(crate) HANDLE);
+pub(crate) struct EventHandle {
+    pub(crate) handle: HANDLE,
+    cleanup: CleanupLedger,
+    #[cfg(any(test, feature = "test-support"))]
+    fail_close: bool,
+}
+
+impl EventHandle {
+    pub(crate) fn new(handle: HANDLE, cleanup: CleanupLedger) -> Self {
+        Self {
+            handle,
+            cleanup,
+            #[cfg(any(test, feature = "test-support"))]
+            fail_close: false,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn inject_close_failure(&mut self) {
+        self.fail_close = true;
+    }
+}
 
 impl Drop for EventHandle {
     fn drop(&mut self) {
-        let _ = unsafe { CloseHandle(self.0) };
+        let closed = unsafe { CloseHandle(self.handle) };
+        // Close the real resource even when testing the native error path.
+        #[cfg(any(test, feature = "test-support"))]
+        let closed = if self.fail_close && closed.is_ok() {
+            Err(windows::core::Error::from(windows::core::HRESULT(
+                0x80070006u32 as i32,
+            )))
+        } else {
+            closed
+        };
+        if let Err(error) = closed {
+            self.cleanup
+                .retain(map_hr_at(Operation::Stop, "CloseHandle", error));
+        }
     }
 }
 
@@ -257,12 +292,12 @@ pub(crate) struct CaptureSetup {
 
 impl CaptureSetup {
     pub(crate) fn process(
-        (client, capture, event, channels): (IAudioClient, IAudioCaptureClient, HANDLE, u16),
+        (client, capture, event, channels): (IAudioClient, IAudioCaptureClient, EventHandle, u16),
     ) -> Self {
         Self {
             client,
             capture,
-            event: EventHandle(event),
+            event,
             channels,
             keepalive: None,
         }
@@ -296,6 +331,7 @@ pub(crate) unsafe fn capture_loop(
     stop_flag: &Arc<AtomicBool>,
     ready: mpsc::Sender<Result<(), Error>>,
     event_tx: mpsc::Sender<flexaudio_core::Event>,
+    cleanup: CleanupLedger,
 ) -> ShutdownReport {
     let CaptureSetup {
         client,
@@ -309,14 +345,18 @@ pub(crate) unsafe fn capture_loop(
     let buffer_frames = match client.GetBufferSize() {
         Ok(frames) => frames,
         Err(e) => {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "readiness receiver may have cancelled startup"
+            )]
             let _ = ready.send(Err(map_hr("IAudioClient::GetBufferSize(capture)", e)));
             return ShutdownReport::new(None, Vec::new());
         }
     };
     let silence = vec![0.0f32; buffer_frames as usize * channels];
-    let mut events = [event.0, event.0];
+    let mut events = [event.handle, event.handle];
     let event_count = if let Some(render) = &keepalive {
-        events[1] = render.event.0;
+        events[1] = render.event.handle;
         2
     } else {
         1
@@ -329,12 +369,13 @@ pub(crate) unsafe fn capture_loop(
                 flexaudio_core::HelperStopReason::StreamStopped,
             ))
         });
-    let Some(mut session) = Session::start_and_report_with_lifecycle(
+    let Some(mut session) = Session::start_and_report_with_cleanup(
         CaptureClient(&client),
         keepalive,
         |status| ready.send(status).is_ok(),
         Some(event_tx.clone()),
         helper_stop_reason,
+        cleanup,
     ) else {
         return ShutdownReport::new(None, Vec::new());
     };
@@ -407,7 +448,14 @@ pub(crate) unsafe fn capture_loop(
     if result.is_err() {
         session.set_stop_reason(flexaudio_core::HelperStopReason::RuntimeFailed);
     }
-    finish_capture(result, || session.stop(), &event_tx)
+    finish_capture(
+        result,
+        || {
+            session.retain_shutdown_outcome();
+            Ok(())
+        },
+        &event_tx,
+    )
 }
 
 /// Shared sequence that initializes `client` in shared mode with
@@ -428,7 +476,8 @@ pub(crate) unsafe fn init_loopback_capture(
     client: &IAudioClient,
     pwfx: *const WAVEFORMATEX,
     extra_streamflags: u32,
-) -> Result<(IAudioCaptureClient, HANDLE), Error> {
+    cleanup: CleanupLedger,
+) -> Result<(IAudioCaptureClient, EventHandle), Error> {
     client
         .Initialize(
             AUDCLNT_SHAREMODE_SHARED,
@@ -441,18 +490,18 @@ pub(crate) unsafe fn init_loopback_capture(
         .map_err(|e| map_hr("IAudioClient::Initialize", e))?;
 
     // Auto-reset, initially non-signaled, unnamed event.
-    let event =
-        CreateEventW(None, false, false, PCWSTR::null()).map_err(|e| map_hr("CreateEventW", e))?;
+    let event = EventHandle::new(
+        CreateEventW(None, false, false, PCWSTR::null()).map_err(|e| map_hr("CreateEventW", e))?,
+        cleanup,
+    );
 
-    if let Err(e) = client.SetEventHandle(event) {
-        let _ = CloseHandle(event);
+    if let Err(e) = client.SetEventHandle(event.handle) {
         return Err(map_hr("IAudioClient::SetEventHandle", e));
     }
 
     let capture: IAudioCaptureClient = match client.GetService() {
         Ok(c) => c,
         Err(e) => {
-            let _ = CloseHandle(event);
             return Err(map_hr("IAudioClient::GetService(IAudioCaptureClient)", e));
         }
     };
