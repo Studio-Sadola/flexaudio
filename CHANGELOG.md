@@ -56,6 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `let mut config = StreamConfig::new(SourceKind::Mic); config.gain = 0.5;`.
   Destructure with `..` to allow additional fields.
 
+### Fixed
+
+- Documentation: the Rust row of the PID exclusion table in `README.md` and
+  `README.ja.md` used a microphone configuration, which ignores exclusions and
+  is rejected at open under the 0.9 strict default. It now uses system output,
+  like the other rows of the table. Library behavior is unchanged.
+
 ## [0.8.1] - 2026-10-20
 
 ### Fixed
