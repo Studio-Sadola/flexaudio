@@ -6,12 +6,13 @@
 //! cleanup, cleanup_* or *_cleanup requires an explicit retention operation in
 //! that same function. Storing operations count even inside `let _ =`: calls to
 //! record_cleanup, record_native and retain_shutdown_outcome, and construction
-//! with ShutdownReport::new(...) or ShutdownReport { ... }. Discarding a summary
-//! return value does not undo those operations. Value-returning operations,
-//! with_cleanup and shutdown_report, count only outside `let _ =`: discarding
-//! their combined error or report snapshot loses that result. Type mentions do
-//! not count. Explicitly named retaining teardown helpers are the single
-//! implementation used by void and checked entry points.
+//! with ShutdownReport::new(...). Struct literals, destructuring patterns and
+//! type mentions do not count. Discarding a summary return value does not undo
+//! storing operations. Value-returning operations, with_cleanup and
+//! shutdown_report, count only outside `let _ =`: discarding
+//! their combined error or report snapshot loses that result. Explicitly named
+//! retaining teardown helpers are the single implementation used by void and
+//! checked entry points.
 //! Locks, channel sends, logging, and encoder finish/finalize are not this call set.
 //! Comments and literals cannot satisfy the rule. There is no location allowlist.
 
@@ -191,11 +192,9 @@ fn retains_failure(body: &[String]) -> bool {
             || (matches!(pair[0].as_str(), "with_cleanup" | "shutdown_report")
                 && pair[1] == "("
                 && !discarded.iter().any(|statement| statement.contains(&index)))
-            || (pair[0] == "ShutdownReport"
-                && (pair[1] == "{"
-                    || body
-                        .get(index..index + 5)
-                        .is_some_and(|tokens| tokens == ["ShutdownReport", ":", ":", "new", "("])))
+            || body
+                .get(index..index + 5)
+                .is_some_and(|tokens| tokens == ["ShutdownReport", ":", ":", "new", "("])
     })
 }
 
@@ -383,6 +382,8 @@ fn guard_distinguishes_storing_operations_from_returned_retention_values() {
         "fn f(x: &mut dyn CaptureBackend) { let _ = x.stop_checked(); let report: Option<ShutdownReport> = None; }",
         "fn f(x: &mut dyn CaptureBackend) { let _ = x.stop(); let _ = x.shutdown_report(); }",
         "fn f(x: &mut dyn CaptureBackend) { let _ = x.stop(); let _ = with_cleanup(error, cleanup); }",
+        "fn f(x: &mut dyn CaptureBackend, existing: ShutdownReport) { let _ = x.stop_checked(); let ShutdownReport { primary, cleanup } = existing; let _ = (primary, cleanup); }",
+        "fn f(x: &mut dyn CaptureBackend) { let _ = x.stop_checked(); let r = ShutdownReport { primary: None, cleanup }; }",
     ] {
         // A discarded with_cleanup is itself a discarded cleanup call, so it may
         // add a second violation; any violation rejects the function.
@@ -396,7 +397,6 @@ fn guard_distinguishes_storing_operations_from_returned_retention_values() {
         "record_native(call, status)",
         "retain_shutdown_outcome(report)",
         "ShutdownReport::new(None, cleanup)",
-        "ShutdownReport { primary: None, cleanup }",
     ] {
         assert!(
             violations(&format!(
