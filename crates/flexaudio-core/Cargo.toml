@@ -12,6 +12,10 @@ keywords = ["audio", "capture", "resampling", "stream", "dsp"]
 categories = ["multimedia::audio"]
 documentation = "https://docs.rs/flexaudio-core"
 
+[features]
+# Internal contract fixtures only; not part of the stable public API.
+test-support = []
+
 [dependencies]
 bitflags = { workspace = true }
 ringbuf = { workspace = true }

@@ -219,7 +219,7 @@ impl IoRegistration {
         Ok(owner)
     }
 
-    pub(super) fn stop(&mut self) -> bool {
+    pub(super) fn record_cleanup(&mut self) -> bool {
         self.gate.store(true, Ordering::Release);
         let Some(id) = self.id else {
             return true;
@@ -239,7 +239,7 @@ impl IoRegistration {
 
 impl Drop for IoRegistration {
     fn drop(&mut self) {
-        let _ = self.stop();
+        let _ = self.record_cleanup();
     }
 }
 

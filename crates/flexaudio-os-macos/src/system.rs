@@ -339,7 +339,7 @@ impl CaptureBackend for MacSystemBackend {
     }
 
     fn stop(&mut self) {
-        let _ = self.stop_checked();
+        let _ = self.retain_shutdown_outcome();
     }
 
     fn set_helper_stop_reason(&mut self, reason: flexaudio_core::HelperStopReason) {
@@ -347,12 +347,7 @@ impl CaptureBackend for MacSystemBackend {
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.shutdown.finish(
-            &self.publication,
-            &self.stop_flag,
-            &self.terminal,
-            self.handle.take(),
-        )
+        self.retain_shutdown_outcome()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
@@ -415,7 +410,7 @@ pub(crate) fn run_tap_thread(
 
     if ready_tx.send(Ok(())).is_err() {
         // The caller has gone away. Drop the chain to clean up.
-        return chain.stop_checked();
+        return chain.retain_shutdown_outcome();
     }
 
     let origin = std::time::Instant::now();
@@ -495,7 +490,7 @@ pub(crate) fn run_tap_thread(
     }
 
     // Quiesce the callback, then report even a final-buffer failure with no following PCM.
-    let result = chain.stop_checked();
+    let result = chain.retain_shutdown_outcome();
     if let Some(error) = chain.take_buffer_error() {
         terminal_failure.record(error.clone());
         let _ = event_tx.send(Event::TerminalError { error });
@@ -800,5 +795,17 @@ mod repro_tests {
     #[test]
     fn regression_unresolved_live_exclusion_fails_closed() {
         assert!(resolve_exclusion(Ok(0), false, || Ok(())).is_err());
+    }
+}
+
+impl MacSystemBackend {
+    // Both stop entry points use this one retained teardown outcome.
+    fn retain_shutdown_outcome(&mut self) -> Result<()> {
+        self.shutdown.finish(
+            &self.publication,
+            &self.stop_flag,
+            &self.terminal,
+            self.handle.take(),
+        )
     }
 }

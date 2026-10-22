@@ -153,6 +153,17 @@ pub struct ShutdownReport {
     primary: Option<Error>,
     cleanup: Vec<Error>,
 }
+
+/// Internal field inventory and cardinalities, with no stability guarantee.
+/// The exhaustive destructure makes new fields a compile error until represented.
+#[cfg(any(test, feature = "test-support"))]
+pub fn shutdown_fields(report: &ShutdownReport) -> [(&'static str, usize); 2] {
+    let ShutdownReport { primary, cleanup } = report;
+    [
+        ("primary", usize::from(primary.is_some())),
+        ("cleanup", cleanup.len()),
+    ]
+}
 impl ShutdownReport {
     /// Construct a completed report, including a clean empty outcome.
     pub fn new(primary: Option<Error>, cleanup: Vec<Error>) -> Self {

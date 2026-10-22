@@ -80,7 +80,7 @@ class DeclarationContracts(unittest.TestCase):
         expected = {
             "InvalidArgument", "InvalidState", "DeviceNotFound", "RecordingPermission",
             "UnsupportedOsVersion", "DeviceLost", "Backend", "UnsupportedFormat",
-            "NativeFormatChanged", "Unsupported", "AmbiguousDeviceName",
+            "NativeFormatChanged", "Unsupported", "AmbiguousDeviceName", "IgnoredSettings",
         }
         self.assertEqual(self.members("AudioErrorDict"), {name + "ErrorDict" for name in expected})
         for name in expected:

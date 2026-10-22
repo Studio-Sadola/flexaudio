@@ -778,6 +778,7 @@ name = "flexaudio-ffi"
 version = "0.9.0"
 dependencies = [
  "flexaudio",
+ "flexaudio-core",
  "flexaudio-denoise",
  "flexaudio-encode",
  "flexaudio-vad",
@@ -800,6 +801,7 @@ name = "flexaudio-napi"
 version = "0.9.0"
 dependencies = [
  "flexaudio",
+ "flexaudio-core",
  "flexaudio-denoise",
  "flexaudio-encode",
  "flexaudio-vad",
@@ -843,6 +845,7 @@ name = "flexaudio-py"
 version = "0.9.0"
 dependencies = [
  "flexaudio",
+ "flexaudio-core",
  "flexaudio-denoise",
  "flexaudio-encode",
  "flexaudio-vad",

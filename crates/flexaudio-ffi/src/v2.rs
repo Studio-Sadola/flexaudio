@@ -11,6 +11,68 @@ use crate::{
 };
 use std::{os::raw::c_char, ptr};
 
+#[cfg(test)]
+mod shutdown_contract_tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_report_fields_match_core_storage_and_current_c_accessors() {
+        let core = flexaudio::ShutdownReport::new(
+            Some(flexaudio::Error::DeviceLost),
+            vec![flexaudio::Error::Unsupported],
+        );
+        let fields = flexaudio_core::test_support::shutdown_fields(&core);
+        assert_eq!(
+            fields,
+            [("primary", 1), ("cleanup", 1)],
+            "C ShutdownReport field mapping differs from core"
+        );
+        let report = FlexShutdownReportV2::new(core);
+        // Exhaustive storage destructure rejects extra payload fields. Frozen
+        // older C structs and their size/version members are outside this check.
+        let FlexShutdownReportV2 {
+            ref primary,
+            ref cleanup,
+        } = report;
+        assert!(primary.is_some(), "C ShutdownReport storage lost primary");
+        assert_eq!(cleanup.len(), 1, "C ShutdownReport storage lost cleanup");
+        unsafe {
+            let primary = flexaudio_shutdown_primary_v2(&report);
+            assert!(
+                !primary.is_null(),
+                "C shutdown primary accessor lost its field"
+            );
+            assert_eq!((*primary).root.kind(), flexaudio::ErrorKind::DeviceLost);
+            let mut count = 0;
+            assert_eq!(flexaudio_shutdown_cleanup_count_v2(&report, &mut count), 1);
+            assert_eq!(
+                count, fields[1].1,
+                "C shutdown cleanup count lost its field"
+            );
+            let cleanup = flexaudio_shutdown_cleanup_v2(&report, 0);
+            assert!(
+                !cleanup.is_null(),
+                "C shutdown cleanup accessor lost its field"
+            );
+            assert_eq!((*cleanup).root.kind(), flexaudio::ErrorKind::Unsupported);
+        }
+        let header = include_str!("../include/flexaudio.h");
+        let mut accessors: Vec<_> = header
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter_map(|line| line.split_once("flexaudio_shutdown_"))
+            .filter_map(|(_, suffix)| suffix.split_once('(').map(|(name, _)| name))
+            .filter(|name| !matches!(*name, "report_v2" | "report_free_v2"))
+            .collect();
+        accessors.sort();
+        assert_eq!(
+            accessors,
+            ["cleanup_count_v2", "cleanup_v2", "primary_v2"],
+            "C shutdown accessor declarations differ from core fields"
+        );
+    }
+}
+
 pub(crate) fn invalid() -> i32 {
     error::set_audio_error(flexaudio::Error::InvalidArg(
         "invalid v2 pointer or index".into(),

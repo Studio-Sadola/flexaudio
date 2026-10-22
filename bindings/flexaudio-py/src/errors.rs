@@ -17,6 +17,7 @@ pub(crate) fn kind_name(kind: fa::ErrorKind) -> &'static str {
         fa::ErrorKind::NativeFormatChanged => "nativeFormatChanged",
         fa::ErrorKind::Unsupported => "unsupported",
         fa::ErrorKind::AmbiguousDeviceName => "ambiguousDeviceName",
+        fa::ErrorKind::IgnoredSettings => "ignoredSettings",
         _ => "backend",
     }
 }
@@ -465,6 +466,122 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_core_error_kind_has_an_explicit_distinct_python_projection() {
+        flexaudio_core::test_support::assert_explicit_error_kind_arms(
+            include_str!("errors.rs"),
+            "fn kind_name(",
+        );
+        // IgnoredSettings uses the earlier report-bearing exception branch.
+        // Every other kind must name its exception explicitly, even Backend.
+        let exception_mapping = include_str!("errors.rs")
+            .split_once("pub(crate) fn to_py_err(")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn register(")
+            .unwrap()
+            .0;
+        for (kind, _, _) in flexaudio_core::test_support::error_cases() {
+            if kind != fa::ErrorKind::IgnoredSettings {
+                assert!(
+                    exception_mapping.contains(&format!("ErrorKind::{kind:?} =>")),
+                    "Python exception choice must explicitly map {kind:?}"
+                );
+            }
+        }
+        Python::initialize();
+        Python::attach(|py| {
+            let mut names = std::collections::HashSet::new();
+            let mut classes = Vec::new();
+            let stub = include_str!("../flexaudio.pyi");
+            let literal = stub
+                .split_once("def kind(self) -> Literal[")
+                .unwrap()
+                .1
+                .split_once(']')
+                .unwrap()
+                .0;
+            for (kind, expected, error) in flexaudio_core::test_support::error_cases() {
+                assert_eq!(error.kind(), kind, "core error fixture must match its kind");
+                let name = kind_name(kind);
+                assert!(
+                    names.insert(name),
+                    "Python kind collision or fallback for {kind:?}"
+                );
+                assert_eq!(name, expected, "Python kind must explicitly map {kind:?}");
+                assert!(
+                    literal.contains(&format!("\"{name}\"")),
+                    "Python kind Literal is missing {name}"
+                );
+                let exception = to_py_err(error);
+                let class = exception.get_type(py);
+                assert!(
+                    classes
+                        .iter()
+                        .all(|previous: &Bound<'_, pyo3::types::PyType>| !previous.is(&class)),
+                    "Python exception collision or fallback for {kind:?}"
+                );
+                classes.push(class);
+            }
+        });
+    }
+
+    #[test]
+    fn shutdown_report_fields_match_core_and_python_stub() {
+        Python::initialize();
+        Python::attach(|py| {
+            let core =
+                fa::ShutdownReport::new(Some(fa::Error::DeviceLost), vec![fa::Error::Unsupported]);
+            let mut expected: Vec<_> = flexaudio_core::test_support::shutdown_fields(&core)
+                .into_iter()
+                .map(|(field, _)| match field {
+                    "primary" => "primary".to_owned(),
+                    "cleanup" => "cleanup_errors".to_owned(),
+                    _ => panic!("Python ShutdownReport field mapping missing {field}"),
+                })
+                .collect();
+            expected.sort();
+            let dict = ShutdownReport(core).to_dict(py).unwrap();
+            let mut actual: Vec<String> = dict.keys().extract().unwrap();
+            actual.sort();
+            assert_eq!(
+                actual, expected,
+                "Python ShutdownReport dict fields differ from core"
+            );
+            assert_eq!(
+                dict.get_item("primary")
+                    .unwrap()
+                    .unwrap()
+                    .get_item("kind")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "deviceLost"
+            );
+            assert_eq!(
+                dict.get_item("cleanup_errors")
+                    .unwrap()
+                    .unwrap()
+                    .get_item(0)
+                    .unwrap()
+                    .get_item("kind")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "unsupported"
+            );
+            assert_eq!(
+                flexaudio_core::test_support::declaration_fields(
+                    include_str!("../flexaudio.pyi"),
+                    "class ShutdownReportDict(TypedDict):",
+                    "\nclass "
+                ),
+                expected,
+                "Python ShutdownReportDict declaration fields differ from core"
+            );
+        });
+    }
 
     #[test]
     fn every_root_has_distinct_exception_and_read_only_typed_payload() {

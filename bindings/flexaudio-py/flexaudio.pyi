@@ -129,7 +129,9 @@ class UnsupportedErrorDict(_AudioErrorFields):
     kind: Literal["unsupported"]
 class AmbiguousDeviceNameErrorDict(_AudioErrorFields):
     kind: Literal["ambiguousDeviceName"]
-AudioErrorDict = Union[InvalidArgumentErrorDict, InvalidStateErrorDict, DeviceNotFoundErrorDict, RecordingPermissionErrorDict, UnsupportedOsVersionErrorDict, DeviceLostErrorDict, BackendErrorDict, UnsupportedFormatErrorDict, NativeFormatChangedErrorDict, UnsupportedErrorDict, AmbiguousDeviceNameErrorDict]
+class IgnoredSettingsErrorDict(_AudioErrorFields):
+    kind: Literal["ignoredSettings"]
+AudioErrorDict = Union[InvalidArgumentErrorDict, InvalidStateErrorDict, DeviceNotFoundErrorDict, RecordingPermissionErrorDict, UnsupportedOsVersionErrorDict, DeviceLostErrorDict, BackendErrorDict, UnsupportedFormatErrorDict, NativeFormatChangedErrorDict, UnsupportedErrorDict, AmbiguousDeviceNameErrorDict, IgnoredSettingsErrorDict]
 
 CapabilityBackend = Literal["cpal", "pipeWire", "wasapiLoopback", "wasapiProcessLoopback", "coreAudioProcessTap", "composite", "unsupported", "other"]
 PidScope = Literal["exactPid", "processTree", "notApplicable", "other"]
@@ -218,7 +220,7 @@ class ErrorContext:
     def to_dict(self) -> ErrorContextDict: ...
 class AudioError:
     @property
-    def kind(self) -> Literal["invalidArg", "invalidState", "deviceNotFound", "permissionDenied", "unsupportedOsVersion", "deviceLost", "backend", "unsupportedFormat", "nativeFormatChanged", "unsupported", "ambiguousDeviceName"]: ...
+    def kind(self) -> Literal["invalidArg", "invalidState", "deviceNotFound", "permissionDenied", "unsupportedOsVersion", "deviceLost", "backend", "unsupportedFormat", "nativeFormatChanged", "unsupported", "ambiguousDeviceName", "ignoredSettings"]: ...
     @property
     def message(self) -> str: ...
     @property

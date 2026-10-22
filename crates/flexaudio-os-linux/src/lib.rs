@@ -329,15 +329,11 @@ impl CaptureBackend for PwSystemBackend {
     }
 
     fn stop(&mut self) {
-        let _ = self.stop_checked();
+        let _ = self.retain_shutdown_outcome();
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.send(Terminate);
-        }
-        finish_worker(&mut self.handle, &mut self.shutdown, &self.events)
+        self.retain_shutdown_outcome()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
@@ -546,15 +542,11 @@ impl CaptureBackend for PwProcessBackend {
     }
 
     fn stop(&mut self) {
-        let _ = self.stop_checked();
+        let _ = self.retain_shutdown_outcome();
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.send(Terminate);
-        }
-        finish_worker(&mut self.handle, &mut self.shutdown, &self.events)
+        self.retain_shutdown_outcome()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
@@ -663,6 +655,28 @@ impl ClientEntry {
             pid: pid_from_props(app_pid, sec_pid),
             pulse_proxied: is_pulse_proxied(api),
         }
+    }
+}
+
+impl PwSystemBackend {
+    // Both stop entry points use this one retained teardown outcome.
+    fn retain_shutdown_outcome(&mut self) -> Result<()> {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(Terminate);
+        }
+        finish_worker(&mut self.handle, &mut self.shutdown, &self.events)
+    }
+}
+
+impl PwProcessBackend {
+    // Both stop entry points use this one retained teardown outcome.
+    fn retain_shutdown_outcome(&mut self) -> Result<()> {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(Terminate);
+        }
+        finish_worker(&mut self.handle, &mut self.shutdown, &self.events)
     }
 }
 

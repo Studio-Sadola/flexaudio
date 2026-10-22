@@ -96,7 +96,7 @@ impl Stream {
     /// Stop once, drain graceful addon tails, and raise any retained capture or cleanup failure.
     /// The stopped stream is spent; open a new stream to capture again.
     fn stop(&mut self) -> PyResult<()> {
-        self.finish_shutdown().map_err(to_py_err)
+        self.retain_shutdown_outcome().map_err(to_py_err)
     }
 
     /// Final capture primary and ordered cleanup failures; absent until shutdown completes.

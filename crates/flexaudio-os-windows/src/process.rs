@@ -273,18 +273,11 @@ impl CaptureBackend for WasapiProcessBackend {
     }
 
     fn stop(&mut self) {
-        let _ = self.stop_checked();
+        let _ = self.retain_shutdown_outcome();
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.stop_flag.store(true, Ordering::SeqCst);
-        let handle = self.handle.take();
-        let joined_owner = handle.is_some();
-        let result = self.shutdown.finish(handle);
-        if joined_owner {
-            self.pending_error = result.as_ref().err().cloned();
-        }
-        result
+        self.retain_shutdown_outcome()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
@@ -638,5 +631,19 @@ mod repro_tests {
             Some(Event::ShutdownError { .. })
         ));
         assert!(backend.poll_event().is_none());
+    }
+}
+
+impl WasapiProcessBackend {
+    // Both stop entry points use this one retained teardown outcome.
+    fn retain_shutdown_outcome(&mut self) -> Result<()> {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        let handle = self.handle.take();
+        let joined_owner = handle.is_some();
+        let result = self.shutdown.finish(handle);
+        if joined_owner {
+            self.pending_error = result.as_ref().err().cloned();
+        }
+        result
     }
 }

@@ -278,7 +278,7 @@ impl CaptureBackend for CompositeBackend {
     }
 
     fn stop(&mut self) {
-        let _ = self.stop_checked();
+        let _ = self.retain_shutdown_outcome();
     }
 
     fn set_helper_stop_reason(&mut self, reason: flexaudio_core::HelperStopReason) {
@@ -287,27 +287,7 @@ impl CaptureBackend for CompositeBackend {
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        if let Some(report) = &self.shutdown {
-            return report.result();
-        }
-        self.stop_producers();
-        // Keep the mixer alive through producer stops; final denial closes its
-        // publication gate before the graceful raw/normalizer/FIFO drain begins.
-        self.drain_child_final(MixLane::Microphone);
-        self.drain_child_final(MixLane::SystemAudio);
-        self.stopping.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.mixer.take() {
-            if handle.join().is_err() {
-                self.notices.fail(
-                    Error::Backend("mix worker panicked".into())
-                        .with_context(ErrorContext::new(Operation::Join)),
-                );
-            }
-        }
-        let report = self.notices.report();
-        let result = report.result();
-        self.shutdown = Some(report);
-        result
+        self.retain_shutdown_outcome()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
@@ -344,4 +324,31 @@ impl Drop for CompositeBackend {
 
 fn lane_error(error: Error, operation: Operation, lane: MixLane) -> Error {
     error.with_context(ErrorContext::new(operation).with_lane(lane))
+}
+
+impl CompositeBackend {
+    // Both stop entry points use this one retained teardown outcome.
+    fn retain_shutdown_outcome(&mut self) -> Result<()> {
+        if let Some(report) = &self.shutdown {
+            return report.result();
+        }
+        self.stop_producers();
+        // Keep the mixer alive through producer stops; final denial closes its
+        // publication gate before the graceful raw/normalizer/FIFO drain begins.
+        self.drain_child_final(MixLane::Microphone);
+        self.drain_child_final(MixLane::SystemAudio);
+        self.stopping.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.mixer.take() {
+            if handle.join().is_err() {
+                self.notices.fail(
+                    Error::Backend("mix worker panicked".into())
+                        .with_context(ErrorContext::new(Operation::Join)),
+                );
+            }
+        }
+        let report = self.notices.report();
+        let result = report.result();
+        self.shutdown = Some(report);
+        result
+    }
 }

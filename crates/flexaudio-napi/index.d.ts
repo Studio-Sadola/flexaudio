@@ -264,6 +264,7 @@ export type AudioError = {
   | { kind: 'nativeFormatChanged'; advertised: JsNativeFormat; actual: JsNativeFormat }
   | { kind: 'unsupported' }
   | { kind: 'ambiguousDeviceName' }
+  | { kind: 'ignoredSettings' }
   | { kind: 'unknown' }
 )
 

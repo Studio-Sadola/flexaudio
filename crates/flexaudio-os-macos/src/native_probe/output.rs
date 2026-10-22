@@ -234,6 +234,6 @@ impl Output {
     }
 
     pub(super) fn stop(&mut self) -> bool {
-        self.registration.stop()
+        self.registration.record_cleanup()
     }
 }

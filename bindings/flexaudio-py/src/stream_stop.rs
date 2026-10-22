@@ -2,7 +2,7 @@
 use super::*;
 
 impl Stream {
-    pub(super) fn finish_shutdown(&mut self) -> fa::Result<()> {
+    pub(super) fn retain_shutdown_outcome(&mut self) -> fa::Result<()> {
         if let Some(report) = &self.shutdown {
             return report.result();
         }
@@ -59,7 +59,7 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        let _ = self.finish_shutdown();
+        let _ = self.retain_shutdown_outcome();
     }
 }
 

@@ -201,7 +201,7 @@ impl CaptureBackend for MacProcessBackend {
     }
 
     fn stop(&mut self) {
-        let _ = self.stop_checked();
+        let _ = self.retain_shutdown_outcome();
     }
 
     fn set_helper_stop_reason(&mut self, reason: flexaudio_core::HelperStopReason) {
@@ -209,12 +209,7 @@ impl CaptureBackend for MacProcessBackend {
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.shutdown.finish(
-            &self.publication,
-            &self.stop_flag,
-            &self.terminal,
-            self.handle.take(),
-        )
+        self.retain_shutdown_outcome()
     }
 
     fn poll_event(&mut self) -> Option<Event> {
@@ -338,5 +333,17 @@ mod repro_tests {
         );
         assert_eq!(backend.stop_checked(), result);
         assert!(backend.poll_event().is_none());
+    }
+}
+
+impl MacProcessBackend {
+    // Both stop entry points use this one retained teardown outcome.
+    fn retain_shutdown_outcome(&mut self) -> Result<()> {
+        self.shutdown.finish(
+            &self.publication,
+            &self.stop_flag,
+            &self.terminal,
+            self.handle.take(),
+        )
     }
 }

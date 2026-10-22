@@ -111,7 +111,7 @@ pub(crate) struct TapChain {
 
 impl Drop for TapChain {
     fn drop(&mut self) {
-        let _ = self.stop_checked();
+        let _ = self.retain_shutdown_outcome();
     }
 }
 
@@ -178,7 +178,7 @@ impl TapChain {
         self.buffer_report.take_error()
     }
 
-    pub(crate) fn stop_checked(&mut self) -> Result<(), Error> {
+    pub(crate) fn retain_shutdown_outcome(&mut self) -> Result<(), Error> {
         if self.shutdown_report.is_none() {
             self.gate_delivery();
             let errors =

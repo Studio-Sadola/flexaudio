@@ -162,6 +162,21 @@ mod addon_tests {
 mod error_projection_tests {
     use super::*;
     #[test]
+    fn every_core_error_kind_has_an_explicit_distinct_c_code() {
+        flexaudio_core::test_support::assert_explicit_error_kind_arms(
+            include_str!("error.rs"),
+            "fn root_code(",
+        );
+        let mut codes = std::collections::HashSet::new();
+        for (kind, _, error) in flexaudio_core::test_support::error_cases() {
+            assert_eq!(error.kind(), kind, "core error fixture must match its kind");
+            assert!(
+                codes.insert(root_code(&error)),
+                "C error code collision or fallback for {kind:?}"
+            );
+        }
+    }
+    #[test]
     fn typed_message_only_failure_has_no_fabricated_typed_cause() {
         set_audio_error(flexaudio::Error::DeviceLost);
         set_last_error("legacy message");

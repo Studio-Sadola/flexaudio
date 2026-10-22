@@ -149,12 +149,17 @@ impl Stream {
     /// Safe for reentry and repeated stop calls. After stop, drain chunks already buffered in the
     /// ring with [`poll_chunk`](Self::poll_chunk).
     pub fn stop(&mut self) {
-        let _ = self.stop_checked();
+        let _ = self.retain_shutdown_outcome();
     }
 
     /// Stop producers before final intake drain, join every worker and retain the outcome.
     /// Repeated calls return the identical outcome without duplicate events, joins or tails.
     pub fn stop_checked(&mut self) -> Result<()> {
+        self.retain_shutdown_outcome()
+    }
+
+    // Explicit stop, checked stop and startup rollback share this retained report.
+    fn retain_shutdown_outcome(&mut self) -> Result<()> {
         if let Some(report) = &self.shutdown {
             return report.result();
         }

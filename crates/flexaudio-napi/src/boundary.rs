@@ -97,8 +97,41 @@ pub struct JsAudioError {
 
 #[napi(object)]
 pub struct JsShutdownReport {
+    #[napi(js_name = "primary")]
     pub primary: Either<JsAudioError, Null>,
+    #[napi(js_name = "cleanupErrors")]
     pub cleanup_errors: Vec<JsAudioError>,
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    #[test]
+    fn every_core_error_kind_has_an_explicit_distinct_node_projection() {
+        flexaudio_core::test_support::assert_explicit_error_kind_arms(
+            include_str!("boundary.rs"),
+            "fn error_code(",
+        );
+        let mut codes = std::collections::HashSet::new();
+        let mut names = std::collections::HashSet::new();
+        let declarations = include_str!("../index.d.ts");
+        for (kind, name, error) in flexaudio_core::test_support::error_cases() {
+            assert_eq!(error.kind(), kind, "core error fixture must match its kind");
+            let code = error_code(kind);
+            assert!(
+                codes.insert(code),
+                "Node error code collision or fallback for {kind:?}"
+            );
+            let mapped = audio_error(&error).kind;
+            assert_eq!(mapped, name, "Node kind must explicitly map {kind:?}");
+            assert!(names.insert(mapped), "Node kind collision for {kind:?}");
+            assert!(
+                declarations.contains(&format!("kind: '{name}'")),
+                "Node AudioError declaration is missing {name}"
+            );
+        }
+    }
 }
 
 fn lane_name(lane: MixLane) -> Option<&'static str> {
@@ -188,6 +221,7 @@ pub(super) fn audio_error(error: &Error) -> JsAudioError {
         Error::NativeFormatChanged { .. } => "nativeFormatChanged",
         Error::Unsupported => "unsupported",
         Error::AmbiguousDeviceName => "ambiguousDeviceName",
+        Error::IgnoredSettings { .. } => "ignoredSettings",
         _ => "unknown",
     };
     let (advertised, actual) = match root {

@@ -44,6 +44,7 @@ pub(crate) struct Session<C: StreamClient, K: StreamClient> {
     capture_started: bool,
     render_started: bool,
     lifecycle: Option<KeepaliveLifecycle>,
+    cleanup_events: Option<mpsc::Sender<Event>>,
 }
 
 /// The session owns teardown; this final field also reports unwinding after
@@ -119,6 +120,7 @@ impl<C: StreamClient, K: StreamClient> Session<C, K> {
             capture_started: false,
             render_started: false,
             lifecycle: None,
+            cleanup_events: events.clone(),
         };
         let start = (|| {
             if let Some(render) = session.keepalive.as_mut() {
@@ -197,7 +199,11 @@ impl<C: StreamClient, K: StreamClient> Session<C, K> {
 
 impl<C: StreamClient, K: StreamClient> Drop for Session<C, K> {
     fn drop(&mut self) {
-        let _ = self.stop();
+        if let Err(error) = self.stop() {
+            if let Some(events) = &self.cleanup_events {
+                let _ = events.send(Event::ShutdownError { error });
+            }
+        }
     }
 }
 
@@ -462,6 +468,30 @@ mod tests {
         assert!(session.stop().is_err());
         drop(session);
         assert_eq!(&trace.borrow()[3..], ["capture.stop", "render.stop"]);
+    }
+
+    #[test]
+    fn drop_publishes_native_cleanup_failures_without_keepalive() {
+        let trace = Trace::default();
+        let (events, receiver) = mpsc::channel();
+        let session = Session::<FakeClient, FakeClient>::start_and_report_with_lifecycle(
+            client("capture", &trace, Some("stop")),
+            None,
+            |_| true,
+            Some(events),
+            Arc::new(Mutex::new(HelperStopReason::StreamStopped)),
+        )
+        .unwrap();
+        drop(session);
+        assert!(
+            matches!(receiver.try_recv(), Ok(Event::ShutdownError { error })
+            if error == Error::Backend("capture.stop".into())),
+            "dropping a session must publish native cleanup failures"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "cleanup must be reported once"
+        );
     }
 
     #[test]

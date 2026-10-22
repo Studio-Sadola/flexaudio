@@ -102,6 +102,78 @@ impl ShutdownReport {
 mod tests {
     use super::*;
 
+    #[test]
+    fn shutdown_report_fields_match_core_and_typescript() {
+        let core = flexaudio::ShutdownReport::new(
+            Some(flexaudio::Error::DeviceLost),
+            vec![flexaudio::Error::Unsupported],
+        );
+        let expected: Vec<_> = flexaudio_core::test_support::shutdown_fields(&core)
+            .into_iter()
+            .map(|(field, count)| {
+                (
+                    match field {
+                        "primary" => "primary",
+                        "cleanup" => "cleanupErrors",
+                        _ => panic!("Node ShutdownReport field mapping missing {field}"),
+                    },
+                    count,
+                )
+            })
+            .collect();
+        let boundary::JsShutdownReport {
+            primary,
+            cleanup_errors,
+        } = ShutdownReport::from_core(Some(core)).to_js();
+        assert!(
+            matches!(primary, Either::A(ref error) if error.kind == "deviceLost"),
+            "Node ShutdownReport primary must retain the core field"
+        );
+        assert_eq!(
+            cleanup_errors
+                .iter()
+                .map(|e| e.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["unsupported"],
+            "Node ShutdownReport cleanup must retain the core field"
+        );
+        assert_eq!(
+            expected,
+            [("primary", 1), ("cleanupErrors", cleanup_errors.len())]
+        );
+        let mut fields: Vec<_> = expected
+            .iter()
+            .map(|(field, _)| (*field).to_owned())
+            .collect();
+        fields.sort();
+        let rust = include_str!("boundary.rs")
+            .split_once("pub struct JsShutdownReport {")
+            .unwrap()
+            .1
+            .split_once("\n}")
+            .unwrap()
+            .0;
+        let mut object_names: Vec<_> = rust
+            .split("#[napi(js_name = \"")
+            .skip(1)
+            .map(|field| field.split_once('"').unwrap().0.to_owned())
+            .collect();
+        object_names.sort();
+        assert_eq!(
+            object_names, fields,
+            "Node ShutdownReport object property names differ from core"
+        );
+        assert_eq!(
+            flexaudio_core::test_support::declaration_fields(
+                include_str!("../index.d.ts"),
+                "export interface ShutdownReport {",
+                "\n}"
+            ),
+            fields,
+            "Node ShutdownReport declaration fields differ from core"
+        );
+    }
+
     fn attachment_failure() -> VadFailure {
         VadFailure {
             error: VadTapError::Vad(flexaudio_vad::VadError::Inference),

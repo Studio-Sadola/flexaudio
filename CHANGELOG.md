@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Python `AudioError.kind` classifies ignored settings as `"ignoredSettings"`
+  instead of `"backend"`, matching the Node and C classifications. Migration:
+  code comparing `kind` to `"backend"` for ignored settings must compare to
+  `"ignoredSettings"`.
+- Node structured `AudioError.kind` retains `"ignoredSettings"` instead of
+  falling back to `"unknown"`.
 - Capture denoise now accepts any supported output rate in every binding,
   including Node, Python and C v1/v2. All entry points use the shared canonical
   48 kHz processing path before output conversion; settings reports mark denoise
@@ -58,6 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows capture sessions publish native cleanup failures discovered during
+  drop through the existing shutdown-error event channel, including sessions
+  without a keepalive renderer.
 - Documentation: the Rust row of the PID exclusion table in `README.md` and
   `README.ja.md` used a microphone configuration, which ignores exclusions and
   is rejected at open under the 0.9 strict default. It now uses system output,

@@ -151,10 +151,12 @@ struct CaptureResources {
 
 impl CaptureResources {
     fn stop(&mut self) -> bool {
-        self.registration.as_mut().is_none_or(IoRegistration::stop)
+        self.registration
+            .as_mut()
+            .is_none_or(IoRegistration::record_cleanup)
     }
 
-    fn close(&mut self) -> bool {
+    fn record_cleanup(&mut self) -> bool {
         let mut clean = self.stop();
         if self.aggregate != 0 {
             // SAFETY: uniquely owned private aggregate; IOProc stop/destruction were attempted.
@@ -182,7 +184,7 @@ impl CaptureResources {
 
 impl Drop for CaptureResources {
     fn drop(&mut self) {
-        let _ = self.close();
+        let _ = self.record_cleanup();
     }
 }
 
@@ -286,6 +288,6 @@ impl Capture {
     }
 
     pub(super) fn close(&mut self) -> bool {
-        self.resources.close()
+        self.resources.record_cleanup()
     }
 }

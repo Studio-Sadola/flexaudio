@@ -63,7 +63,8 @@ network access is unnecessary; the VAD model is embedded.
   Constructor functions are added at the same time, so users do not have to
   write these structs field by field.
 - Denoise works at any output rate.
-- Promises 1 and 5 get checks.
+- Promises 1 and 5 get capture-cell, binding error-kind, shutdown-report field
+  and discarded-cleanup checks.
 
 0.10 removes `pts_ns` / `ptsNs` in favor of `arrival_ns` / `arrivalNs`. The old
 names remain through 0.9, as published.
@@ -73,15 +74,28 @@ names remain through 0.9, as published.
 ## How progress is checked
 
 Progress means closing the distance to these six promises, not fixing a score.
+Promise 1 has `current_os_capture_cells_have_capabilities_and_construction_paths`:
+on each desktop OS, the public capabilities and real backend constructors must
+support microphone, system output and process capture. It never starts capture;
+device and permission errors are acceptable, unsupported errors are not. An
+unavailable capability fails, and failure messages include the runner OS version.
 Promise 2 has the [binding capability matrix CI check](../.github/scripts/binding_matrix.py);
 it checks declarations, not runtime behavior. Promise 3 has the backend probe
 and keepalive lifecycle tests. Promise 4 has
 `bindings_cannot_construct_applicability_reasons`: bindings may not name
-`IgnoreReason` or `AdjustmentReason`, including their variants. Promise 6 has
+`IgnoreReason` or `AdjustmentReason`, including their variants. Promise 5 has
+binding error-kind checks against a compiler-exhaustive core inventory, shutdown
+field checks against an exhaustive core `ShutdownReport` destructure and the
+Node, Python and current C declarations, and
+`production_stop_and_cleanup_discards_retain_failures`. The last scans production
+Rust functions for discarded stop/cleanup results without an explicit retained
+outcome in that function. It excludes test code, examples, comments and literals;
+its matched calls and retention operations are documented beside the test.
+Promise 6 has
 the API compatibility gates and the
 [registry completion gate](../.github/scripts/check_registry_completion.py).
-Promises 1 and 5 do not yet have a check covering the whole promise. These
-checks guard parts of the target; they do not prove it complete.
+These checks guard parts of the target; they do not prove it complete or verify
+that audio is recorded.
 
 The complete target is an application that reads capabilities at startup and
 the report when opening, uses defaults that reject ineffective settings,

@@ -34,6 +34,45 @@ pub enum ErrorKind {
     IgnoredSettings,
 }
 
+// A single list generates fixtures and a wildcard-free match inside the defining
+// crate. Adding an ErrorKind requires extending this list, even though downstream
+// crates must use a wildcard for the non-exhaustive enum.
+#[cfg(any(test, feature = "test-support"))]
+macro_rules! error_cases {
+    ($($kind:ident => ($name:literal, $error:expr)),+ $(,)?) => {
+        /// Every root kind, its canonical name and a representative typed error.
+        /// Internal test support only; no stability guarantee.
+        pub fn error_cases() -> Vec<(ErrorKind, &'static str, Error)> {
+            fn exhaustive_name(kind: ErrorKind) -> &'static str {
+                match kind { $(ErrorKind::$kind => $name),+ }
+            }
+            vec![$((ErrorKind::$kind, exhaustive_name(ErrorKind::$kind), $error)),+]
+        }
+    };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+error_cases! {
+    InvalidArg => ("invalidArg", Error::InvalidArg("invalid argument".into())),
+    InvalidState => ("invalidState", Error::InvalidState("invalid state".into())),
+    DeviceNotFound => ("deviceNotFound", Error::DeviceNotFound),
+    PermissionDenied => ("permissionDenied", Error::PermissionDenied {
+        permission: Permission::Microphone, detail: String::new()
+    }),
+    UnsupportedOsVersion => ("unsupportedOsVersion", Error::UnsupportedOsVersion),
+    DeviceLost => ("deviceLost", Error::DeviceLost),
+    Backend => ("backend", Error::Backend("backend failure".into())),
+    UnsupportedFormat => ("unsupportedFormat", Error::UnsupportedFormat("format".into())),
+    NativeFormatChanged => ("nativeFormatChanged", Error::NativeFormatChanged {
+        advertised: (48_000, 2), actual: (44_100, 1)
+    }),
+    Unsupported => ("unsupported", Error::Unsupported),
+    AmbiguousDeviceName => ("ambiguousDeviceName", Error::AmbiguousDeviceName),
+    IgnoredSettings => ("ignoredSettings", Error::IgnoredSettings {
+        report: crate::SettingsReport { revision: 0, entries: Vec::new() }
+    }),
+}
+
 /// Typed failure with library-authored explanations and redacted private fields.
 ///
 /// Message-bearing variants must contain safe, library-authored explanations, which may

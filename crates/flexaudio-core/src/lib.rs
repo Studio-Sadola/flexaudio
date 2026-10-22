@@ -47,6 +47,10 @@ mod helper_stop_reason;
 pub use helper_stop_reason::HelperStopReason;
 mod errors;
 mod spawn_error;
+/// Internal contract fixtures with no stability guarantee. Never enable in production.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 pub use spawn_error::spawn_error;
 mod device_namespace;
 pub mod inventory;

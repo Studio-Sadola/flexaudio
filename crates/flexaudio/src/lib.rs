@@ -11,6 +11,8 @@
 pub use flexaudio_core as core;
 
 mod capabilities;
+#[cfg(test)]
+mod capture_cell_tests;
 pub use capabilities::capabilities;
 pub use flexaudio_core::capabilities::{
     Availability, BackendKind, Capabilities, DeviceSelectionBehavior, DeviceWatcherCapabilities,
@@ -35,6 +37,8 @@ mod settings_resolver;
 mod settings_resolver_tests;
 #[cfg(test)]
 mod settings_tests;
+#[cfg(test)]
+mod shutdown_guard_tests;
 
 pub use settings_request::{SettingsAttachments, SettingsRequest};
 pub use settings_resolver::resolve_settings;
