@@ -4,10 +4,14 @@
 //! stop_checked, shutdown, finish_shutdown, stop_binding, stop_owner,
 //! stop_client, stop_producers, finish_worker, close, release_resources,
 //! cleanup, cleanup_* or *_cleanup requires an explicit retention operation in
-//! that same function: with_cleanup, record_cleanup, record_native,
-//! retain_shutdown_outcome, a ShutdownReport, or shutdown_report (the retained
-//! checked outcome consumed by the CLI). Explicitly named retaining teardown
-//! helpers are the single implementation used by void and checked entry points.
+//! that same function. Storing operations count even inside `let _ =`: calls to
+//! record_cleanup, record_native and retain_shutdown_outcome, and construction
+//! with ShutdownReport::new(...) or ShutdownReport { ... }. Discarding a summary
+//! return value does not undo those operations. Value-returning operations,
+//! with_cleanup and shutdown_report, count only outside `let _ =`: discarding
+//! their combined error or report snapshot loses that result. Type mentions do
+//! not count. Explicitly named retaining teardown helpers are the single
+//! implementation used by void and checked entry points.
 //! Locks, channel sends, logging, and encoder finish/finalize are not this call set.
 //! Comments and literals cannot satisfy the rule. There is no location allowlist.
 
@@ -178,36 +182,52 @@ fn cleanup_call(name: &str) -> bool {
 }
 
 fn retains_failure(body: &[String]) -> bool {
-    body.windows(2).any(|pair| {
+    let discarded = discarded_statements(body);
+    body.windows(2).enumerate().any(|(index, pair)| {
         (matches!(
             pair[0].as_str(),
-            "with_cleanup"
-                | "record_cleanup"
-                | "record_native"
-                | "retain_shutdown_outcome"
-                | "shutdown_report"
+            "record_cleanup" | "record_native" | "retain_shutdown_outcome"
         ) && pair[1] == "(")
-            || pair[0] == "ShutdownReport"
+            || (matches!(pair[0].as_str(), "with_cleanup" | "shutdown_report")
+                && pair[1] == "("
+                && !discarded.iter().any(|statement| statement.contains(&index)))
+            || (pair[0] == "ShutdownReport"
+                && (pair[1] == "{"
+                    || body
+                        .get(index..index + 5)
+                        .is_some_and(|tokens| tokens == ["ShutdownReport", ":", ":", "new", "("])))
     })
 }
 
-fn discarded_calls(body: &[String]) -> Vec<&str> {
-    let mut calls = Vec::new();
+fn discarded_statements(body: &[String]) -> Vec<std::ops::Range<usize>> {
+    let mut statements = Vec::new();
     for i in 0..body.len().saturating_sub(3) {
         if body[i..i + 3] != ["let", "_", "="] {
             continue;
         }
         let mut depth = 0isize;
-        for pair in body[i + 3..].windows(2) {
-            if pair[0] == ";" && depth == 0 {
+        let mut end = body.len();
+        for (index, token) in body.iter().enumerate().skip(i + 3) {
+            if token == ";" && depth == 0 {
+                end = index + 1;
                 break;
             }
-            if matches!(pair[0].as_str(), "(" | "[" | "{") {
+            if matches!(token.as_str(), "(" | "[" | "{") {
                 depth += 1;
             }
-            if matches!(pair[0].as_str(), ")" | "]" | "}") {
+            if matches!(token.as_str(), ")" | "]" | "}") {
                 depth -= 1;
             }
+        }
+        statements.push(i..end);
+    }
+    statements
+}
+
+fn discarded_calls(body: &[String]) -> Vec<&str> {
+    let mut calls = Vec::new();
+    for statement in discarded_statements(body) {
+        for pair in body[statement].windows(2) {
             if cleanup_call(&pair[0]) && pair[1] == "(" {
                 calls.push(pair[0].as_str());
             }
@@ -354,4 +374,63 @@ fn guard_rejects_discards_without_retention_and_ignores_test_code_and_literals()
     "###
     )
     .is_empty());
+}
+
+#[test]
+fn guard_distinguishes_storing_operations_from_returned_retention_values() {
+    for source in [
+        "fn f(x: &mut dyn CaptureBackend) -> Option<ShutdownReport> { let _ = x.stop_checked(); None }",
+        "fn f(x: &mut dyn CaptureBackend) { let _ = x.stop_checked(); let report: Option<ShutdownReport> = None; }",
+        "fn f(x: &mut dyn CaptureBackend) { let _ = x.stop(); let _ = x.shutdown_report(); }",
+        "fn f(x: &mut dyn CaptureBackend) { let _ = x.stop(); let _ = with_cleanup(error, cleanup); }",
+    ] {
+        // A discarded with_cleanup is itself a discarded cleanup call, so it may
+        // add a second violation; any violation rejects the function.
+        assert!(
+            !violations(source).is_empty(),
+            "must reject unretained cleanup: {source}"
+        );
+    }
+    for operation in [
+        "record_cleanup(error)",
+        "record_native(call, status)",
+        "retain_shutdown_outcome(report)",
+        "ShutdownReport::new(None, cleanup)",
+        "ShutdownReport { primary: None, cleanup }",
+    ] {
+        assert!(
+            violations(&format!(
+                "fn f() {{ let _ = x.stop(); let _ = {operation}; }}"
+            ))
+            .is_empty(),
+            "must accept a storing operation with a discarded return value: {operation}"
+        );
+        assert!(
+            violations(&format!(
+                "fn f() {{ let _ = x.stop(); let report = {operation}; }}"
+            ))
+            .is_empty(),
+            "must accept an explicit retention operation: {operation}"
+        );
+    }
+    assert!(
+        violations("fn drop() { let _ = self.record_cleanup(); }").is_empty(),
+        "discarding a recorded cleanup's summary bool must retain its ledger entries"
+    );
+    for operation in ["with_cleanup(error, cleanup)", "x.shutdown_report()"] {
+        assert!(
+            !violations(&format!(
+                "fn f() {{ let _ = x.stop(); let _ = {operation}; }}"
+            ))
+            .is_empty(),
+            "must reject a discarded retention value: {operation}"
+        );
+        assert!(
+            violations(&format!(
+                "fn f() {{ let _ = x.stop(); let report = {operation}; }}"
+            ))
+            .is_empty(),
+            "must accept an undiscarded retention value: {operation}"
+        );
+    }
 }
