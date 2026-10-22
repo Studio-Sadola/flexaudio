@@ -18,7 +18,7 @@ use objc2_core_audio_types::{
 };
 use objc2_foundation::{NSArray, NSNumber, NSString};
 
-use super::io::{buffers, check, failed, float_rate, read_property, IoRegistration};
+use super::io::{buffers, check, failed, float_rate, read_property, IoRegistration, IoRole};
 use crate::cleanup::{native_cleanup, NativeCleanup};
 use crate::probe::{ProbeCleanup, ProbeControl, ProbeOutcome};
 use crate::probe_signal::CapturedFrame;
@@ -154,7 +154,7 @@ impl CaptureResources {
     pub(super) fn inject_cleanup(control: &ProbeControl) {
         drop(Self {
             cleanup: control.cleanup_diagnostics(),
-            registration: Some(IoRegistration::fixture(control)),
+            registration: Some(IoRegistration::fixture(control, IoRole::Capture)),
             aggregate: 1,
             tap: 1,
         });
@@ -297,6 +297,7 @@ impl Capture {
             block,
             state.gate.clone(),
             control,
+            IoRole::Capture,
         )?);
         Ok(Self {
             resources,

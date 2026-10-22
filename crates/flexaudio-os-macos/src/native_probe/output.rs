@@ -15,7 +15,9 @@ use objc2_core_audio_types::{
     AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp, AudioTimeStampFlags,
 };
 
-use super::io::{buffers, check, failed, float_rate, read_objects, read_property, IoRegistration};
+use super::io::{
+    buffers, check, failed, float_rate, read_objects, read_property, IoRegistration, IoRole,
+};
 use crate::probe::{ProbeControl, ProbeOutcome};
 use crate::probe_signal::{ProbeSignal, RenderEvidence};
 
@@ -225,7 +227,8 @@ impl Output {
                 }
             },
         );
-        let registration = IoRegistration::start(device, block, state.gate.clone(), control)?;
+        let registration =
+            IoRegistration::start(device, block, state.gate.clone(), control, IoRole::Output)?;
         Ok(Self {
             device,
             state,

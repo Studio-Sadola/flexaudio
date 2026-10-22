@@ -79,6 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Shutdown errors now identify capture workers, replacement rollback, Windows clients/event handles and macOS probe IOProc roles so independent failures remain distinct during deduplication.
 - Stop reports retain Windows handle-close and session destructor failures,
   macOS probe cleanup even when capture is cancelled, and Linux and microphone
   terminal/join outcomes. Failed startup rollback and Mix report restoration

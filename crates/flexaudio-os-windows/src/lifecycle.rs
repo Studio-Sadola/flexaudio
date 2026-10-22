@@ -29,10 +29,10 @@ pub(crate) trait StreamClient {
     fn fill_silence(&mut self) -> Result<()>;
 }
 
-fn stop_client(client: &mut impl StreamClient) -> Result<()> {
+fn stop_client(client: &mut impl StreamClient, role: &str) -> Result<()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client.stop())).unwrap_or_else(|_| {
         Err(
-            Error::Backend("audio client panicked during teardown".into())
+            Error::Backend(format!("{role} audio client panicked during teardown"))
                 .with_context(ErrorContext::new(Operation::Stop)),
         )
     })
@@ -214,13 +214,16 @@ impl<C: StreamClient, K: StreamClient> Session<C, K> {
         }
         let capture = if self.capture_started {
             self.capture_started = false;
-            stop_client(&mut self.capture)
+            stop_client(&mut self.capture, "capture")
         } else {
             Ok(())
         };
         let render = if self.render_started {
             self.render_started = false;
-            stop_client(self.keepalive.as_mut().expect("started render exists"))
+            stop_client(
+                self.keepalive.as_mut().expect("started render exists"),
+                "render",
+            )
         } else {
             Ok(())
         };

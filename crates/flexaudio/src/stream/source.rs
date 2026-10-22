@@ -201,7 +201,9 @@ impl Stream {
                 Err(e) => {
                     new_backend
                         .set_helper_stop_reason(flexaudio_core::HelperStopReason::StartupFailed);
-                    let replacement_cleanup = stop_backend_catching(&mut new_backend).err();
+                    let replacement_cleanup = stop_backend_catching(&mut new_backend)
+                        .err()
+                        .map(|error| error.with_context(ErrorContext::new(Operation::Rollback)));
                     control::drain_replacement_lifecycle(&self.shared, &mut new_backend);
                     if let Some(error) = replacement_cleanup.clone() {
                         self.shared.record_cleanup(error);

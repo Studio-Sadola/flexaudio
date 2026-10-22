@@ -242,15 +242,17 @@ pub(crate) unsafe fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<(u32,
 pub(crate) struct EventHandle {
     pub(crate) handle: HANDLE,
     cleanup: CleanupLedger,
+    close_call: &'static str,
     #[cfg(any(test, feature = "test-support"))]
     fail_close: bool,
 }
 
 impl EventHandle {
-    pub(crate) fn new(handle: HANDLE, cleanup: CleanupLedger) -> Self {
+    pub(crate) fn new(handle: HANDLE, cleanup: CleanupLedger, close_call: &'static str) -> Self {
         Self {
             handle,
             cleanup,
+            close_call,
             #[cfg(any(test, feature = "test-support"))]
             fail_close: false,
         }
@@ -276,7 +278,7 @@ impl Drop for EventHandle {
         };
         if let Err(error) = closed {
             self.cleanup
-                .retain(map_hr_at(Operation::Stop, "CloseHandle", error));
+                .retain(map_hr_at(Operation::Stop, self.close_call, error));
         }
     }
 }
@@ -493,6 +495,7 @@ pub(crate) unsafe fn init_loopback_capture(
     let event = EventHandle::new(
         CreateEventW(None, false, false, PCWSTR::null()).map_err(|e| map_hr("CreateEventW", e))?,
         cleanup,
+        "CloseHandle(capture)",
     );
 
     if let Err(e) = client.SetEventHandle(event.handle) {

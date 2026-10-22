@@ -51,6 +51,10 @@ phases! {
         Join,
         /// Native event close after the owner has formed its report.
         Close,
+        /// Both capture and render clients panic during stop on the system path.
+        StopPanics,
+        /// Both event handles fail to close on the system path.
+        BothCloses,
         /// Terminal capture cause followed by native stop failure.
         TerminalAndStop,
         /// Session Drop observes a native stop failure.
@@ -99,10 +103,10 @@ fn start_error() -> Error {
         .with_context(ErrorContext::new(Operation::Start))
 }
 
-fn close_error() -> Error {
+fn close_error(call: &'static str) -> Error {
     map_hr_at(
         Operation::Stop,
-        "CloseHandle",
+        call,
         windows::core::Error::from(windows::core::HRESULT(0x80070006u32 as i32)),
     )
 }
@@ -126,7 +130,8 @@ impl StreamClient for InjectedClient {
             Phase::Stop | Phase::TerminalAndStop | Phase::Drop | Phase::StartupRollback => {
                 Err(stop_error(self.render))
             }
-            Phase::Join | Phase::Close => Ok(()),
+            Phase::StopPanics => panic!("injected client stop panic"),
+            Phase::Join | Phase::Close | Phase::BothCloses => Ok(()),
         }
     }
 
@@ -152,10 +157,21 @@ pub(crate) fn prepare(
         }
         let native_event = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
             .expect("fixture event creation");
-        let mut event = EventHandle::new(native_event, cleanup.clone());
-        if matches!(phase, Phase::Close | Phase::StartupRollback) {
+        let mut event = EventHandle::new(native_event, cleanup.clone(), "CloseHandle(capture)");
+        if matches!(
+            phase,
+            Phase::Close | Phase::BothCloses | Phase::StartupRollback
+        ) {
             event.inject_close_failure();
         }
+        let _render_event = (system && phase == Phase::BothCloses).then(|| {
+            let native_event = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
+                .expect("fixture render event creation");
+            let mut event =
+                EventHandle::new(native_event, cleanup.clone(), "CloseHandle(keepalive)");
+            event.inject_close_failure();
+            event
+        });
         let capture = InjectedClient {
             phase,
             render: false,
@@ -206,7 +222,12 @@ pub(crate) fn prepare(
     let primary = match phase {
         Phase::TerminalAndStop => Some(Error::DeviceLost),
         Phase::StartupRollback => Some(start_error()),
-        Phase::Stop | Phase::Join | Phase::Close | Phase::Drop => None,
+        Phase::Stop
+        | Phase::Join
+        | Phase::Close
+        | Phase::Drop
+        | Phase::StopPanics
+        | Phase::BothCloses => None,
     };
     match phase {
         Phase::Stop | Phase::TerminalAndStop | Phase::Drop => {
@@ -219,12 +240,30 @@ pub(crate) fn prepare(
             Error::Backend("capture owner thread panicked".into())
                 .with_context(ErrorContext::new(Operation::Join)),
         ),
-        Phase::Close => cleanup.push(close_error()),
+        Phase::StopPanics => {
+            cleanup.push(
+                Error::Backend("capture audio client panicked during teardown".into())
+                    .with_context(ErrorContext::new(Operation::Stop)),
+            );
+            if system {
+                cleanup.push(
+                    Error::Backend("render audio client panicked during teardown".into())
+                        .with_context(ErrorContext::new(Operation::Stop)),
+                );
+            }
+        }
+        Phase::Close => cleanup.push(close_error("CloseHandle(capture)")),
+        Phase::BothCloses => {
+            if system {
+                cleanup.push(close_error("CloseHandle(keepalive)"));
+            }
+            cleanup.push(close_error("CloseHandle(capture)"));
+        }
         Phase::StartupRollback => {
             if system {
                 cleanup.push(stop_error(true));
             }
-            cleanup.push(close_error());
+            cleanup.push(close_error("CloseHandle(capture)"));
         }
     }
     if phase == Phase::StartupRollback {

@@ -397,6 +397,7 @@ pub(crate) unsafe fn setup_process_loopback(
         CreateEventW(None, true, false, PCWSTR::null())
             .map_err(|e| map_hr("CreateEventW(activation done)", e))?,
         cleanup.clone(),
+        "CloseHandle(activation done)",
     );
 
     // Completion handler (only calls SetEvent). Keep it alive until WaitForSingleObject completes

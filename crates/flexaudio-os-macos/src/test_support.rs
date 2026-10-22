@@ -277,9 +277,11 @@ fn assert_backend<B: FixtureBackend>(
                 assert_native(context.native_status(), "AudioHardwareDestroyProcessTap")
             }
             Phase::ProbeStop | Phase::ProbeCleanupCancelled => {
-                assert_native(context.native_status(), "IOProc stop")
+                assert_native(context.native_status(), "capture IOProc stop")
             }
-            Phase::ProbeIoProc => assert_native(context.native_status(), "IOProc destruction"),
+            Phase::ProbeIoProc => {
+                assert_native(context.native_status(), "capture IOProc destruction")
+            }
             Phase::ProbeAggregate => {
                 assert_native(context.native_status(), "aggregate destruction")
             }

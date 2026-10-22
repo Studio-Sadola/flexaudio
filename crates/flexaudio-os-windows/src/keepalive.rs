@@ -61,6 +61,7 @@ impl SilentRender {
             CreateEventW(None, false, false, PCWSTR::null())
                 .map_err(|e| map_hr("silent keepalive CreateEventW", e))?,
             cleanup,
+            "CloseHandle(keepalive)",
         );
         client
             .SetEventHandle(event.handle)

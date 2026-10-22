@@ -186,13 +186,13 @@ impl Stream {
                 );
             }
         }
-        for handle in [self.worker.take(), self.watchdog.take()]
-            .into_iter()
-            .flatten()
-        {
-            if handle.join().is_err() {
+        for (name, handle) in [
+            ("intake worker", self.worker.take()),
+            ("watchdog", self.watchdog.take()),
+        ] {
+            if handle.is_some_and(|handle| handle.join().is_err()) {
                 self.shared.record_cleanup(
-                    Error::Backend("capture worker panicked".into())
+                    Error::Backend(format!("capture {name} panicked"))
                         .with_context(ErrorContext::new(Operation::Join)),
                 );
             }

@@ -170,6 +170,21 @@ pub(super) fn float_rate(format: &AudioStreamBasicDescription) -> Result<u32, Pr
     Ok(format.mSampleRate as u32)
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum IoRole {
+    Capture,
+    Output,
+}
+
+impl IoRole {
+    fn cleanup_calls(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Capture => ("capture IOProc stop", "capture IOProc destruction"),
+            Self::Output => ("output IOProc stop", "output IOProc destruction"),
+        }
+    }
+}
+
 /// HAL explicitly Block_copy's the callback and retains that copy until DestroyIOProcID.
 /// All captured context is Arc-owned, so even a failed native destroy cannot free live
 /// callback data. The gate stays closed; failure makes the probe inconclusive, and Drop
@@ -177,6 +192,7 @@ pub(super) fn float_rate(format: &AudioStreamBasicDescription) -> Result<u32, Pr
 /// force their release or preempt a synchronous native hang.
 pub(super) struct IoRegistration {
     cleanup: Arc<ProbeCleanup>,
+    role: IoRole,
     device: AudioObjectID,
     id: AudioDeviceIOProcID,
     gate: Arc<AtomicBool>,
@@ -185,9 +201,10 @@ pub(super) struct IoRegistration {
 
 impl IoRegistration {
     #[cfg(any(test, feature = "test-support"))]
-    pub(super) fn fixture(control: &ProbeControl) -> Self {
+    pub(super) fn fixture(control: &ProbeControl, role: IoRole) -> Self {
         Self {
             cleanup: control.cleanup_diagnostics(),
+            role,
             device: 1,
             id: Some(crate::test_support::unused_io_proc),
             gate: Arc::new(AtomicBool::new(false)),
@@ -200,10 +217,12 @@ impl IoRegistration {
         block: DeviceBlock,
         gate: Arc<AtomicBool>,
         control: &ProbeControl,
+        role: IoRole,
     ) -> Result<Self, ProbeOutcome> {
         check(control)?;
         let mut owner = Self {
             cleanup: control.cleanup_diagnostics(),
+            role,
             device,
             id: None,
             gate,
@@ -244,8 +263,9 @@ impl IoRegistration {
         let destroy = native_cleanup(NativeCleanup::ProbeIoProc, || unsafe {
             AudioDeviceDestroyIOProcID(self.device, Some(id))
         });
-        self.cleanup.record_native("IOProc stop", stop);
-        self.cleanup.record_native("IOProc destruction", destroy);
+        let (stop_call, destroy_call) = self.role.cleanup_calls();
+        self.cleanup.record_native(stop_call, stop);
+        self.cleanup.record_native(destroy_call, destroy);
         if destroy == 0 {
             self.id = None;
         }
@@ -290,4 +310,39 @@ pub(super) unsafe fn buffers<'a>(list: *const AudioBufferList) -> Option<&'a [Au
             buffer.mDataByteSize as usize / (4 * buffer.mNumberChannels as usize) == frames
         })
         .then_some(buffers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cleanup::{inject, CleanupLedger};
+    use std::time::Instant;
+
+    #[test]
+    fn capture_and_output_cleanup_failures_keep_distinct_roles() {
+        for operation in [NativeCleanup::ProbeStop, NativeCleanup::ProbeIoProc] {
+            let ledger = Arc::new(CleanupLedger::default());
+            let control = ProbeControl::new(
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .with_cleanup_ledger(ledger.clone());
+            inject(operation, || {
+                drop(IoRegistration::fixture(&control, IoRole::Capture));
+                drop(IoRegistration::fixture(&control, IoRole::Output));
+            });
+            drop(control);
+            let errors = ledger.take();
+            assert_eq!(errors.len(), 2);
+            assert_ne!(errors[0], errors[1]);
+            let calls = if operation == NativeCleanup::ProbeStop {
+                ("capture IOProc stop", "output IOProc stop")
+            } else {
+                ("capture IOProc destruction", "output IOProc destruction")
+            };
+            for (error, call) in errors.iter().zip([calls.0, calls.1]) {
+                assert!(error.to_string().contains(call));
+            }
+        }
+    }
 }
