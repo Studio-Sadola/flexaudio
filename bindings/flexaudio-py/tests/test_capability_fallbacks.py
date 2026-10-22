@@ -12,7 +12,7 @@ class CapabilityFallbacks(unittest.TestCase):
     def test_unknown_rust_variants_are_never_known_tags_or_dropped(self):
         # Future non-exhaustive variants cannot be constructed safely today.
         # Guard their actual match arms until the upstream enums gain variants.
-        source = (ROOT / "bindings/flexaudio-py/src/capabilities.rs").read_text()
+        source = (ROOT / "bindings/flexaudio-py/src/capabilities.rs").read_text(encoding="utf-8")
         for enum in ["PidScope", "DeviceSelectionBehavior", "WatcherMode", "WatchScope"]:
             with self.subTest(enum=enum):
                 match = re.search(rf"fa::{enum}::\w+\s*=>.*?\n\s*_\s*=>\s*([^,\n]+)", source, re.S)
@@ -22,12 +22,12 @@ class CapabilityFallbacks(unittest.TestCase):
         self.assertNotIn("filter_map", scopes)
         self.assertIn(".map(", scopes)
         self.assertIn("other => return other_unavailable(py, other)", source)
-        helper = (ROOT / "bindings/flexaudio-py/src/lib.rs").read_text().split("fn source_kind_str", 1)[1].split("\n}", 1)[0]
+        helper = (ROOT / "bindings/flexaudio-py/src/lib.rs").read_text(encoding="utf-8").split("fn source_kind_str", 1)[1].split("\n}", 1)[0]
         self.assertIn('_ => "other"', helper)
 
     def test_capability_literals_match_node_tags_including_other(self):
-        tree = ast.parse((ROOT / "bindings/flexaudio-py/flexaudio.pyi").read_text())
-        declarations = (ROOT / "crates/flexaudio-napi/index.d.ts").read_text()
+        tree = ast.parse((ROOT / "bindings/flexaudio-py/flexaudio.pyi").read_text(encoding="utf-8"))
+        declarations = (ROOT / "crates/flexaudio-napi/index.d.ts").read_text(encoding="utf-8")
         aliases = {node.targets[0].id: node.value for node in tree.body if isinstance(node, ast.Assign)}
         classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
 
@@ -54,7 +54,7 @@ class CapabilityFallbacks(unittest.TestCase):
         self.assertEqual(literals(field("SideEffectCapabilityDict", "sources")), set(re.findall(r"'([^']+)'", sources)))
 
     def test_poll_chunk_documentation_describes_polling(self):
-        tree = ast.parse((ROOT / "bindings/flexaudio-py/flexaudio.pyi").read_text())
+        tree = ast.parse((ROOT / "bindings/flexaudio-py/flexaudio.pyi").read_text(encoding="utf-8"))
         stream = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Stream")
         poll = next(node for node in stream.body if isinstance(node, ast.FunctionDef) and node.name == "poll_chunk")
         doc = ast.get_docstring(poll)

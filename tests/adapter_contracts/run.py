@@ -87,7 +87,14 @@ def linux_source():
         "// LIVE_JSON_NAME": between(source, "fn extract_json_name(", "// ============================================================================"),
         "// LIVE_READINESS": between(source, "fn run_pw_loop(", "/// PipeWire setup"),
         "// LIVE_PROCESS_START": between(source[marker_index(source, "impl CaptureBackend for PwProcessBackend"):], "    fn start(&mut self, sink: RawSink)", "    fn stop(&mut self)"),
-        "// LIVE_SYSTEM_STOP": between(source, "    fn stop(&mut self)", "}\n\nimpl Drop for PwSystemBackend"),
+        # stop and stop_checked call retain_shutdown_outcome, which lives in a later impl.
+        # Keep the system helper that those extracted methods call; stop before the process copy.
+        "// LIVE_SYSTEM_STOP": between(source, "    fn stop(&mut self)", "}\n\nimpl Drop for PwSystemBackend")
+            + between(
+                source,
+                "    fn retain_shutdown_outcome(&mut self) -> Result<()>",
+                "}\n\nimpl PwProcessBackend",
+            ),
         "// LIVE_POLL": between(source[marker_index(source, "impl PwDeviceWatcher {"):], "    pub fn poll_event(", "    /// Stop watching"),
         "// LIVE_DEADLINE": between(source, "    let deadline = std::time::Instant::now();", "    // Build DeviceInfo values"),
         "// LIVE_REMOVE_CALLBACK": callback_expression(source, ".global_remove(move |id| {", "        .register();"),

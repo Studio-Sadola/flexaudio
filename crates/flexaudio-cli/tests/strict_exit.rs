@@ -47,9 +47,14 @@ fn no_strict_allows_ignored_settings_to_reach_device_selection() {
         ])
         .output()
         .unwrap();
+    // Permissive mode must not reject the ignored process mode. The open then
+    // reaches device access and fails there: the endpoint is missing, or the
+    // OS denies microphone permission before that lookup.
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("device/endpoint was not found"), "{stderr}");
+    let reached_device = stderr.contains("device/endpoint was not found")
+        || stderr.contains("microphone recording permission denied or not granted");
+    assert!(reached_device, "{stderr}");
     assert!(!stderr.contains("IgnoredSettings"), "{stderr}");
 }
 

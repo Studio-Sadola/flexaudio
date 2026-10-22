@@ -8,7 +8,7 @@ import unittest
 class DeclarationContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tree = ast.parse((Path(__file__).parent.parent / "flexaudio.pyi").read_text())
+        cls.tree = ast.parse((Path(__file__).parent.parent / "flexaudio.pyi").read_text(encoding="utf-8"))
         cls.classes = {node.name: node for node in cls.tree.body if isinstance(node, ast.ClassDef)}
         cls.aliases = {
             node.targets[0].id: node.value
@@ -122,17 +122,17 @@ class DeclarationContracts(unittest.TestCase):
 
     def test_vad_error_codes_match_rust_typescript_and_c(self):
         root = Path(__file__).resolve().parents[3]
-        rust = (root / "crates/flexaudio-core/src/vad_error.rs").read_text()
+        rust = (root / "crates/flexaudio-core/src/vad_error.rs").read_text(encoding="utf-8")
         variants = rust.split("pub enum VadErrorCode {", 1)[1].split("}", 1)[0]
         expected = set(re.findall(r"^    (\w+),$", variants, re.MULTILINE))
         spellings = dict(re.findall(r'Self::(\w+) => "(\w+)"', rust))
         self.assertEqual(spellings, {name: name for name in expected})
         python_codes = self.aliases["VadErrorCode"].slice.elts
         self.assertEqual({node.value for node in python_codes}, expected)
-        typescript = (root / "crates/flexaudio-napi/index.d.ts").read_text()
+        typescript = (root / "crates/flexaudio-napi/index.d.ts").read_text(encoding="utf-8")
         declaration = typescript.split("export type VadErrorCode =", 1)[1].split("/**", 1)[0]
         self.assertEqual(set(re.findall(r"'(\w+)'", declaration)), expected)
-        header = (root / "crates/flexaudio-ffi/include/flexaudio.h").read_text()
+        header = (root / "crates/flexaudio-ffi/include/flexaudio.h").read_text(encoding="utf-8")
         codes = header.split("// Codes: ", 1)[1].split("// # Safety", 1)[0]
         self.assertEqual(set(re.findall(r"\b[A-Z]\w+\b", codes)), expected)
 

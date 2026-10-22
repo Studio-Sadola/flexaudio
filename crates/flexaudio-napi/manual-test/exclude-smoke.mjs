@@ -9,12 +9,14 @@
 // control reads, per channel. Distinct stereo tones detect missing, swapped,
 // or duplicated source channels that a mono level check cannot distinguish.
 // The control capture runs FIRST so (4) has its reference.
-// Both (2) and (3) name the test sink via `deviceId` so neither
-// depends on this sink being the PipeWire default. `excludePids` is now
-// implemented, and a non-empty exclusion set takes the Linux fan-in path,
-// which ignores `deviceId` — so a green (2) is genuine pid exclusion, not an
-// artifact of sink scoping, and its failure mode is the real leak (1 kHz
-// still present). `deviceId` still scopes (3), the control capture.
+// (3) names the test sink via `deviceId`, so the control does not require
+// that sink to be the PipeWire default. A non-empty exclusion set takes the
+// Linux fan-in path. That path is not device-scoped: requesting `deviceId`
+// with exclusions is reported as ignored, and a strict open rejects it.
+// (2) therefore requests only `excludePids`. Fan-in links application output
+// ports directly, and the players target this sink by name, so (2) does not
+// require the sink to be the default either. A green (2) is genuine pid
+// exclusion, and its failure mode is the real leak (1 kHz still present).
 // Requires: pw-cli, pw-play, paplay on PATH; XDG_RUNTIME_DIR set.
 //
 // Detector: Goertzel at exact FFT bins. The bin index is round(N*f/rate) —
@@ -117,13 +119,13 @@ try {
   if (!rowA) fail(`processes() has no entry with pid ${a.pid} (paplay); libpulse clients resolve to pipewire-pulse's pid`);
   else if (!['paplay', 'pacat'].includes(rowA.executable)) fail(`pid ${a.pid} listed with executable ${rowA.executable}`);
 
-  // (3) control: nothing excluded, both present. Captured FIRST so (4) has its
-  // reference level for the surviving tone.
+  // (3) control: nothing excluded, both present. `deviceId` selects this sink's
+  // monitor. Captured FIRST so (4) has its reference level for the surviving tone.
   const ctl = await capture({ kind: 'system', deviceId: sinkName });
-  // (2) exclusion by the libpulse child's real pid. `deviceId` is ignored on
-  // the fan-in path a non-empty exclusion set takes (see header); it is kept
-  // here so that a failure is the real leak and not this sink losing scope.
-  const excl = await capture({ kind: 'system', deviceId: sinkName, excludePids: [a.pid] });
+  // (2) exclusion by the libpulse child's real pid. Linux reports device
+  // selection as ignored while exclusions are active, so only `excludePids`
+  // is requested. Fan-in still hears these players because they target this sink.
+  const excl = await capture({ kind: 'system', excludePids: [a.pid] });
   expect('exclude-A', excl, false);
   expect('control', ctl, true);
 

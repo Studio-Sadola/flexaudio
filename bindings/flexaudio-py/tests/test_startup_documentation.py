@@ -18,7 +18,7 @@ class StartupDocumentation(unittest.TestCase):
         ]
         for path in paths:
             with self.subTest(path=path):
-                text = (ROOT / path).read_text()
+                text = (ROOT / path).read_text(encoding="utf-8")
                 if path == "CHANGELOG.md":
                     text = text.split("## [0.5.2]", 1)[0]
                 self.assertFalse(
@@ -32,7 +32,7 @@ class StartupDocumentation(unittest.TestCase):
                 )
                 self.assertTrue("macOS" in text and "backend" in text.lower() and "HAL" in text,
                                 "The macOS enumeration gate must remain documented")
-        japanese = (ROOT / "README.ja.md").read_text()
+        japanese = (ROOT / "README.ja.md").read_text(encoding="utf-8")
         inventory = japanese.split("- `flexaudio::devices()", 1)[1].split("- `flexaudio::processes()", 1)[0]
         self.assertTrue("AppCapability" in inventory,
                         "Japanese Windows inventory docs must explain the absent consent check")
@@ -54,28 +54,28 @@ class StartupDocumentation(unittest.TestCase):
         ]
         for path, declaration, marker in declarations:
             with self.subTest(path=path):
-                text = (ROOT / path).read_text()
+                text = (ROOT / path).read_text(encoding="utf-8")
                 self.assertTrue(declaration in text, "Enumeration declaration is missing")
                 prefix = text.split(declaration, 1)[0]
                 self.assertTrue(marker in prefix, "Enumeration documentation anchor is missing")
                 doc = prefix[prefix.rfind(marker):]
                 for fact in ["never prompts", "Backend", "HAL", "undecided", "mandatory"]:
                     self.assertTrue(fact in doc, f"Enumeration contract omits {fact}")
-        tree = ast.parse((ROOT / "bindings/flexaudio-py/flexaudio.pyi").read_text())
+        tree = ast.parse((ROOT / "bindings/flexaudio-py/flexaudio.pyi").read_text(encoding="utf-8"))
         devices = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "devices")
         doc = ast.get_docstring(devices)
         for fact in ["never prompts", "Backend", "HAL", "undecided", "mandatory"]:
             self.assertTrue(fact in doc, f"Python enumeration contract omits {fact}")
 
     def test_public_open_poll_and_japanese_linux_contracts_are_explicit(self):
-        facade = (ROOT / "crates/flexaudio/src/lib.rs").read_text()
+        facade = (ROOT / "crates/flexaudio/src/lib.rs").read_text(encoding="utf-8")
         self.assertTrue("/// High-level entry point" in facade.split("pub fn open(", 1)[0],
                         "Facade open documentation anchor is missing")
         doc = facade.split("pub fn open(", 1)[0].rsplit("/// High-level entry point", 1)[-1]
         with self.subTest(surface="facade open"):
             self.assertTrue("30 seconds" in doc and "Backend" in doc and "HAL" in doc,
                             "Facade open must describe the bounded pre-HAL consent failure")
-        ffi = (ROOT / "crates/flexaudio-ffi/src/lib.rs").read_text()
+        ffi = (ROOT / "crates/flexaudio-ffi/src/lib.rs").read_text(encoding="utf-8")
         open_doc = ffi.split("pub unsafe extern \"C\" fn flexaudio_open(", 1)[0].rsplit("/// Open a stream", 1)[-1]
         with self.subTest(surface="C v1 open"):
             self.assertTrue("30 seconds" in open_doc and "Backend" in open_doc and "HAL" in open_doc,
@@ -86,12 +86,12 @@ class StartupDocumentation(unittest.TestCase):
                             "C v1 PCM poll must describe independence from event polling")
             self.assertTrue("FIFO" in poll_doc and "published" in poll_doc,
                             "C v1 poll must describe FIFO notice publication ordering")
-        japanese = (ROOT / "README.ja.md").read_text()
+        japanese = (ROOT / "README.ja.md").read_text(encoding="utf-8")
         linux = japanese.split("- **Linux:**", 1)[1].split("\n\n", 1)[0]
         with self.subTest(surface="Japanese Linux exclusions"):
             self.assertTrue("2 \u79d2" in linux,
                             "Japanese Linux exclusion rules must describe the two-second negotiation bound")
-        header = (ROOT / "crates/flexaudio-ffi/include/flexaudio.h").read_text()
+        header = (ROOT / "crates/flexaudio-ffi/include/flexaudio.h").read_text(encoding="utf-8")
         self.assertTrue("struct FlexStream *flexaudio_open(" in header, "C open declaration is missing")
         header_open = header.split("struct FlexStream *flexaudio_open(", 1)[0].rsplit("// Open a stream", 1)[-1]
         with self.subTest(surface="generated C open brief"):
@@ -105,7 +105,7 @@ class StartupDocumentation(unittest.TestCase):
                             "Generated C poll brief must preserve the pull/publication contract")
 
     def test_japanese_readme_covers_startup_and_decided_consent(self):
-        text = (ROOT / "README.ja.md").read_text()
+        text = (ROOT / "README.ja.md").read_text(encoding="utf-8")
         startup = next(
             (section for section in text.split("\n## ")
              if "StartupSamplesDropped {" in section),
@@ -120,7 +120,7 @@ class StartupDocumentation(unittest.TestCase):
         self.assertTrue("`Backend`" in text, "Japanese typed consent failure is missing")
 
     def test_napi_open_rustdoc_requires_decided_consent(self):
-        text = (ROOT / "crates/flexaudio-napi/src/lib.rs").read_text()
+        text = (ROOT / "crates/flexaudio-napi/src/lib.rs").read_text(encoding="utf-8")
         doc = text.split("/// Open and start a stream", 1)[1].split("#[napi", 1)[0]
         self.assertFalse("unanswered prompt proceeds with capture" in doc, "NAPI Rustdoc promises unsafe unanswered capture")
         self.assertFalse("Authorization is checked every 500 ms" in doc, "NAPI Rustdoc promises a nonexistent consent monitor")
@@ -139,7 +139,7 @@ class StartupDocumentation(unittest.TestCase):
                  r"|must drain[^.]*before retrying pending PCM")
         for path in paths:
             with self.subTest(path=path):
-                text = (ROOT / path).read_text()
+                text = (ROOT / path).read_text(encoding="utf-8")
                 self.assertIsNone(re.search(stale, text, re.DOTALL), "PCM must not wait for event polling")
                 self.assertIsNotNone(
                     re.search(r"PCM\s+(?:polling|polls)\s+(?:does|do)\s+not\s+wait for event polling", text),
@@ -147,7 +147,7 @@ class StartupDocumentation(unittest.TestCase):
                 )
 
     def test_napi_callback_order_excludes_other_advisories(self):
-        text = (ROOT / "crates/flexaudio-napi/index.d.ts").read_text()
+        text = (ROOT / "crates/flexaudio-napi/index.d.ts").read_text(encoding="utf-8")
         self.assertIsNotNone(re.search(r"[Rr]ecovered and other advisories[^.]*independent", text), "Callback ordering excludes independent advisories")
         self.assertTrue("before or after the startup notice" in text, "Independent callback order must be explicit")
 
