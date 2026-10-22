@@ -40,7 +40,7 @@
 mod cleanup;
 
 /// Internal shutdown injection fixtures, with no stability guarantee.
-#[cfg(all(target_os = "macos", feature = "test-support"))]
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub mod test_support;
 
 #[cfg(target_os = "macos")]

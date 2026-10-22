@@ -59,8 +59,8 @@ use device_info::{namespaced_devices, EnumState, NodeRecord};
 mod owner;
 mod readiness;
 use owner::{
-    finish_worker, poll_backend_event, push_backend_event, rollback_capture, rollback_worker,
-    BackendEvents,
+    finish_worker, poll_backend_event, push_backend_event, request_worker_stop, rollback_capture,
+    rollback_worker, BackendEvents,
 };
 use readiness::{negotiation_timeout_error, Readiness, NEGOTIATION_DEADLINE};
 mod watcher_failures;
@@ -701,14 +701,13 @@ impl PwSystemBackend {
     // Both stop entry points use this one retained teardown outcome.
     fn retain_shutdown_outcome(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        if let Some(tx) = self.stop_tx.take() {
-            #[allow(
-                clippy::let_underscore_must_use,
-                reason = "A disconnected stop receiver has already exited; the owner join still observes cleanup failures."
-            )]
-            let _ = tx.send(Terminate);
-        }
-        finish_worker(&mut self.handle, &mut self.shutdown, &self.events)
+        let stop_error = request_worker_stop(&mut self.stop_tx);
+        finish_worker(
+            &mut self.handle,
+            &mut self.shutdown,
+            &self.events,
+            stop_error,
+        )
     }
 }
 
@@ -721,14 +720,13 @@ impl PwProcessBackend {
     // Both stop entry points use this one retained teardown outcome.
     fn retain_shutdown_outcome(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        if let Some(tx) = self.stop_tx.take() {
-            #[allow(
-                clippy::let_underscore_must_use,
-                reason = "A disconnected stop receiver has already exited; the owner join still observes cleanup failures."
-            )]
-            let _ = tx.send(Terminate);
-        }
-        finish_worker(&mut self.handle, &mut self.shutdown, &self.events)
+        let stop_error = request_worker_stop(&mut self.stop_tx);
+        finish_worker(
+            &mut self.handle,
+            &mut self.shutdown,
+            &self.events,
+            stop_error,
+        )
     }
 }
 
@@ -2760,27 +2758,16 @@ impl PwDeviceWatcher {
     /// attached to the loop, which calls `main_loop.quit()` on the watcher thread and exits
     /// `run()`. Wait for cleanup to finish with `join()`, retaining pending events for polling.
     pub fn stop(&mut self) {
-        // Safe on duplicate stop or stop before start.
-        if !self.running.swap(false, Ordering::SeqCst) {
-            // Already stopped or not started. Join any leftover thread just in case.
-            finish_watch_worker(&mut self.handle, &mut self.shutdown, &self.events);
-            self.stop_tx = None;
-            return;
-        }
-
-        // Notify the watcher thread to stop (the receiver callback calls loop.quit()).
-        // Ignore failure (the receiver is gone because the thread has exited).
-        if let Some(tx) = self.stop_tx.take() {
-            #[allow(
-                clippy::let_underscore_must_use,
-                reason = "A disconnected stop receiver has already exited; the owner join still observes cleanup failures."
-            )]
-            let _ = tx.send(Terminate);
-        }
-
+        self.running.store(false, Ordering::SeqCst);
+        let stop_error = request_worker_stop(&mut self.stop_tx);
         // Wait for run() to exit and the thread to finish. On exit, Registry→Core→Context→MainLoop
         // are dropped in order, all on the watcher thread.
-        finish_watch_worker(&mut self.handle, &mut self.shutdown, &self.events);
+        finish_watch_worker(
+            &mut self.handle,
+            &mut self.shutdown,
+            &self.events,
+            stop_error,
+        );
     }
 
     /// Stop watching and return the retained capture and cleanup outcome.

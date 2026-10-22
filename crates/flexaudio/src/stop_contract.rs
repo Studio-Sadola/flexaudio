@@ -3,10 +3,10 @@ use crate::CaptureBackend;
 
 #[cfg(test)]
 macro_rules! stop_paths {
-    ($($(#[$meta:meta])* $path:ident($backend:ty)),* $(,)?) => {
+    ($($(#[$meta:meta])* $path:ident($backend:ty $(, $marker:ty)?)),* $(,)?) => {
         #[derive(Clone, Copy, Debug)]
         pub(crate) enum StopPath {
-            $($(#[$meta])* $path(fn(fn(&$backend)))),*
+            $($(#[$meta])* $path(fn(fn(&$backend $(, $marker)?)))),*
         }
         impl StopPath {
             fn name(&self) -> &'static str {
@@ -33,10 +33,10 @@ stop_paths! {
     #[cfg(target_os = "linux")] LinuxWatcher(flexaudio_os_linux::PwDeviceWatcher),
     #[cfg(target_os = "windows")] WindowsSystem(flexaudio_os_windows::WasapiSystemBackend),
     #[cfg(target_os = "windows")] WindowsProcess(flexaudio_os_windows::WasapiProcessBackend),
-    #[cfg(target_os = "macos")] MacSystem(flexaudio_os_macos::MacSystemBackend),
-    #[cfg(target_os = "macos")] MacProcess(flexaudio_os_macos::MacProcessBackend),
-    #[cfg(target_os = "macos")] MacTap(flexaudio_os_macos::MacSystemBackend),
-    #[cfg(target_os = "macos")] MacProbe(flexaudio_os_macos::MacSystemBackend),
+    #[cfg(target_os = "macos")] MacSystem(flexaudio_os_macos::MacSystemBackend, flexaudio_os_macos::test_support::SystemPath),
+    #[cfg(target_os = "macos")] MacProcess(flexaudio_os_macos::MacProcessBackend, flexaudio_os_macos::test_support::ProcessPath),
+    #[cfg(target_os = "macos")] MacTap(flexaudio_os_macos::MacSystemBackend, flexaudio_os_macos::test_support::TapPath),
+    #[cfg(target_os = "macos")] MacProbe(flexaudio_os_macos::MacSystemBackend, flexaudio_os_macos::test_support::ProbePath),
 }
 
 /// Only the built-in factory uses this bound; external backends remain unchanged.
@@ -56,13 +56,13 @@ pub(crate) fn registered<B: RegisteredBuiltin>(backend: B) -> B {
 }
 
 macro_rules! register {
-    ($($(#[$meta:meta])* $backend:ty => $($path:ident($fixture:path)),+;)+) => {
+    ($($(#[$meta:meta])* $backend:ty => $($path:ident $([$marker:ty])? ($fixture:path)),+;)+) => {
         $($(#[$meta])*
             impl RegisteredBuiltin for $backend {
                 #[cfg(test)]
                 const STOP_PATHS: &'static [StopPath] = &[$(StopPath::$path({
-                    // Check the runner against both Self and the path's backend.
-                    let fixture: fn(fn(&Self)) = $fixture;
+                    // Bind the runner to both the concrete backend and optional path identity.
+                    let fixture: fn(fn(&Self $(, $marker)?)) = $fixture;
                     fixture
                 })),+];
             }
@@ -95,11 +95,11 @@ register! {
     flexaudio_os_windows::WasapiProcessBackend => WindowsProcess(flexaudio_os_windows::test_support::check_process);
     #[cfg(target_os = "macos")]
     flexaudio_os_macos::MacSystemBackend =>
-        MacSystem(flexaudio_os_macos::test_support::check_system),
-        MacTap(flexaudio_os_macos::test_support::check_tap),
-        MacProbe(flexaudio_os_macos::test_support::check_probe);
+        MacSystem[flexaudio_os_macos::test_support::SystemPath](flexaudio_os_macos::test_support::check_system),
+        MacTap[flexaudio_os_macos::test_support::TapPath](flexaudio_os_macos::test_support::check_tap),
+        MacProbe[flexaudio_os_macos::test_support::ProbePath](flexaudio_os_macos::test_support::check_probe);
     #[cfg(target_os = "macos")]
-    flexaudio_os_macos::MacProcessBackend => MacProcess(flexaudio_os_macos::test_support::check_process);
+    flexaudio_os_macos::MacProcessBackend => MacProcess[flexaudio_os_macos::test_support::ProcessPath](flexaudio_os_macos::test_support::check_process);
 }
 
 #[cfg(test)]

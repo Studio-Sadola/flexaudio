@@ -7,7 +7,7 @@ use std::rc::Rc;
 use flexaudio_core::types::ProcessMode;
 use flexaudio_core::{ErrorContext, Event, Operation, ErrorKind, DefaultDeviceKind, AudioPath, LossReason, ShutdownReport};
 mod owner { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/owner.rs")); }
-use owner::{finish_worker, poll_backend_event, push_backend_event, rollback_capture, rollback_worker, BackendEvents};
+use owner::{finish_worker, poll_backend_event, push_backend_event, request_worker_stop, rollback_capture, rollback_worker, BackendEvents};
 mod watcher_queue { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/watcher_queue.rs")); }
 use watcher_queue::{lock_events, transition_default, WatchEventQueue, WatchEvents};
 mod discovery { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/discovery.rs")); }
@@ -31,7 +31,7 @@ mod capture_proxy {
 type CaptureLink = capture_proxy::CaptureProxy<pw::link::Link>;
 use pw::proxy::ProxyT;
 mod watcher_failures { include!(concat!(env!("ADAPTER_ROOT"), "/crates/flexaudio-os-linux/src/watcher_failures.rs")); }
-use watcher_failures::run_watcher_callback;
+use watcher_failures::{finish_watch_worker, run_watcher_callback};
 // LIVE_WATCHER_STATE
 use watcher_state::WatchState;
 
@@ -190,10 +190,20 @@ mod pw {
         }
     }
     pub mod channel {
-        pub struct Sender<T>(std::marker::PhantomData<T>);
+        pub struct Sender<T> {
+            failure: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            marker: std::marker::PhantomData<T>,
+        }
         pub struct Receiver<T>(std::marker::PhantomData<T>);
-        pub fn channel<T>() -> (Sender<T>, Receiver<T>) { (Sender(std::marker::PhantomData), Receiver(std::marker::PhantomData)) }
-        impl<T> Sender<T> { pub fn send(&self, _: T) -> std::result::Result<(), ()> { Ok(()) } }
+        pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+            (Sender { failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), marker: std::marker::PhantomData }, Receiver(std::marker::PhantomData))
+        }
+        impl<T> Sender<T> {
+            pub fn fail_sends(&self) { self.failure.store(true, std::sync::atomic::Ordering::SeqCst); }
+            pub fn send(&self, value: T) -> std::result::Result<(), T> {
+                if self.failure.load(std::sync::atomic::Ordering::SeqCst) { Err(value) } else { Ok(()) }
+            }
+        }
         impl<T> Receiver<T> { pub fn attach(&self, _: &super::super::FakeLoop, _: impl FnMut(T)) {} }
     }
     pub mod stream {
@@ -388,7 +398,23 @@ fn run_pw_process_loop(_: PidSelect, sink: RawSink, stop: pw::channel::Receiver<
 }
 impl ProcessOwner {
     // LIVE_PROCESS_START
+    // LIVE_PROCESS_STOP
+}
+struct SystemOwner {
+    shutdown: Option<ShutdownReport>, events: BackendEvents,
+    running: Arc<AtomicBool>, stop_tx: Option<pw::channel::Sender<Terminate>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+impl SystemOwner {
     // LIVE_SYSTEM_STOP
+}
+struct WatchOwner {
+    shutdown: Option<ShutdownReport>, events: WatchEventQueue,
+    running: Arc<AtomicBool>, stop_tx: Option<pw::channel::Sender<Terminate>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+impl WatchOwner {
+    // LIVE_WATCHER_STOP
 }
 impl flexaudio_core::CaptureBackend for ProcessOwner {
     fn native_format(&self) -> (u32, u16) { (48_000, 2) }
@@ -398,6 +424,85 @@ impl flexaudio_core::CaptureBackend for ProcessOwner {
     fn poll_event(&mut self) -> Option<Event> { ProcessOwner::poll_event(self) }
 }
 fn process_owner() -> ProcessOwner { ProcessOwner { shutdown: None, events: Arc::new(Mutex::new(Default::default())), running: Arc::new(AtomicBool::new(false)), target_pid: 42, mode: ProcessMode::Include, stop_tx: None, handle: None } }
+#[derive(Clone, Copy)]
+enum StopOwnerKind { System, Process, Watcher }
+enum StopOwner { System(SystemOwner), Process(ProcessOwner), Watcher(WatchOwner) }
+impl StopOwner {
+    fn stop(&mut self) {
+        match self {
+            Self::System(owner) => owner.stop(),
+            Self::Process(owner) => owner.stop(),
+            Self::Watcher(owner) => owner.stop(),
+        }
+    }
+    fn stop_checked(&mut self) -> Result<()> {
+        match self {
+            Self::System(owner) => owner.stop_checked(),
+            Self::Process(owner) => owner.stop_checked(),
+            Self::Watcher(owner) => owner.stop_checked(),
+        }
+    }
+    fn report(&self) -> &ShutdownReport {
+        match self {
+            Self::System(owner) => owner.shutdown.as_ref(),
+            Self::Process(owner) => owner.shutdown.as_ref(),
+            Self::Watcher(owner) => owner.shutdown.as_ref(),
+        }.expect("stop must immediately retain its report")
+    }
+}
+fn check_stop_delivery_and_join(kind: StopOwnerKind) {
+    for checked_first in [false, true] {
+        let (sender, receiver) = pw::channel::channel();
+        // This adapter injects a transport failure at send. Native PipeWire keeps
+        // both pipe descriptors alive, so receiver drop alone does not fail send.
+        sender.fail_sends();
+        drop(receiver);
+        let handle = Some(std::thread::spawn(|| panic!("injected join failure after failed stop delivery")));
+        let running = Arc::new(AtomicBool::new(true));
+        let mut owner = match kind {
+            StopOwnerKind::System => StopOwner::System(SystemOwner {
+                shutdown: None, events: Arc::new(Mutex::new(Default::default())),
+                running, stop_tx: Some(sender), handle,
+            }),
+            StopOwnerKind::Process => StopOwner::Process(ProcessOwner {
+                shutdown: None, events: Arc::new(Mutex::new(Default::default())),
+                running, stop_tx: Some(sender), handle, target_pid: 42, mode: ProcessMode::Include,
+            }),
+            StopOwnerKind::Watcher => StopOwner::Watcher(WatchOwner {
+                shutdown: None, events: Arc::new(Mutex::new(WatchEvents::default())),
+                running, stop_tx: Some(sender), handle,
+            }),
+        };
+        let expected = ShutdownReport::new(None, vec![
+            Error::Backend("PipeWire stop request could not be delivered".into())
+                .with_context(ErrorContext::new(Operation::Stop)),
+            Error::Backend("pipewire worker panicked".into())
+                .with_context(ErrorContext::new(Operation::Join)),
+        ]);
+        let first_result = if checked_first { Some(owner.stop_checked()) } else { owner.stop(); None };
+        assert_eq!(owner.report().cleanup().len(), 2, "stop delivery failure and join failure must both be retained");
+        assert_eq!(owner.report(), &expected, "stop and join causes must remain separate and ordered");
+        if let Some(result) = first_result { assert_eq!(result, expected.result()); }
+        assert_eq!(owner.stop_checked(), expected.result());
+        assert_eq!(owner.report(), &expected);
+        owner.stop();
+        assert_eq!(owner.report(), &expected);
+        assert_eq!(owner.stop_checked(), expected.result());
+        assert_eq!(owner.report(), &expected);
+    }
+}
+#[test]
+fn system_stop_delivery_and_join_failures_are_both_retained() {
+    check_stop_delivery_and_join(StopOwnerKind::System);
+}
+#[test]
+fn process_stop_delivery_and_join_failures_are_both_retained() {
+    check_stop_delivery_and_join(StopOwnerKind::Process);
+}
+#[test]
+fn watcher_stop_delivery_and_join_failures_are_both_retained() {
+    check_stop_delivery_and_join(StopOwnerKind::Watcher);
+}
 fn sink() -> RawSink { let (producer, _) = flexaudio_core::raw_ring(16); RawSink::new(producer, 48_000, 2) }
 #[test]
 fn pipewire_spawn_rollback() {

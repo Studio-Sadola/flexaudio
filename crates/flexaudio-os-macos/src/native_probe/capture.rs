@@ -150,7 +150,7 @@ pub(super) struct CaptureResources {
 }
 
 impl CaptureResources {
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn inject_cleanup(control: &ProbeControl) {
         drop(Self {
             cleanup: control.cleanup_diagnostics(),

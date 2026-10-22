@@ -27,6 +27,7 @@ pub(crate) fn finish_watch_worker(
     handle: &mut Option<JoinHandle<()>>,
     shutdown: &mut Option<ShutdownReport>,
     events: &WatchEventQueue,
+    stop_error: Option<Error>,
 ) {
     if shutdown.is_some() {
         return;
@@ -34,7 +35,7 @@ pub(crate) fn finish_watch_worker(
     let result = handle.take().map_or(Ok(()), crate::owner::join_worker);
     // Read after joining, before publishing a join failure as a watcher event.
     let primary = lock_events(events).terminal_error();
-    let cleanup: Vec<_> = result.err().into_iter().collect();
+    let cleanup: Vec<_> = stop_error.into_iter().chain(result.err()).collect();
     for error in &cleanup {
         fail_watcher(events, error.clone());
     }

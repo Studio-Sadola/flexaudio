@@ -1027,21 +1027,30 @@ impl WasapiSystemBackend {
 
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn check_stop_phase(phase: crate::test_support::Phase, observe: fn(&Self)) {
-        let mut backend = Self::new(true, None);
-        let expected = crate::test_support::prepare(
-            &mut backend.shutdown,
-            &mut backend.handle,
-            phase,
-            true,
-            backend.stop_flag.clone(),
-        );
-        backend.stop();
-        assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
-        assert_eq!(backend.stop_checked(), expected.result());
-        assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
-        backend.stop();
-        assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
-        assert_eq!(backend.stop_checked(), expected.result());
-        observe(&backend);
+        for checked_first in [false, true] {
+            let mut backend = Self::new(true, None);
+            let expected = crate::test_support::prepare(
+                &mut backend.shutdown,
+                &mut backend.handle,
+                phase,
+                true,
+                backend.stop_flag.clone(),
+            );
+            if checked_first {
+                assert_eq!(backend.stop_checked(), expected.result());
+            } else {
+                backend.stop();
+            }
+            assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
+            if !checked_first {
+                assert_eq!(backend.stop_checked(), expected.result());
+                assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
+            }
+            backend.stop();
+            assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
+            assert_eq!(backend.stop_checked(), expected.result());
+            assert_eq!(backend.shutdown.report.as_ref(), Some(&expected));
+            observe(&backend);
+        }
     }
 }

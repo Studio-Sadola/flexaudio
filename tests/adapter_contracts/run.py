@@ -99,6 +99,17 @@ def linux_source():
                 "    fn retain_shutdown_outcome(&mut self) {",
                 "}\n\nimpl PwProcessBackend",
             ),
+        "// LIVE_PROCESS_STOP": between(
+            source[marker_index(source, "impl CaptureBackend for PwProcessBackend"):],
+            "    fn stop(&mut self)", "}\n\nimpl Drop for PwProcessBackend",
+        ) + between(
+            source[marker_index(source, "impl PwProcessBackend {\n    /// Completed stop outcome"):],
+            "    fn retain_shutdown_outcome(&mut self) {", "}\n\nfn is_pulse_proxied",
+        ),
+        "// LIVE_WATCHER_STOP": between(
+            source[marker_index(source, "impl PwDeviceWatcher {"):],
+            "    pub fn stop(&mut self)", "}\n\nimpl Drop for PwDeviceWatcher",
+        ),
         "// LIVE_POLL": between(source[marker_index(source, "impl PwDeviceWatcher {"):], "    pub fn poll_event(", "    /// Stop watching"),
         "// LIVE_DEADLINE": between(source, "    let deadline = std::time::Instant::now();", "    // Build DeviceInfo values"),
         "// LIVE_REMOVE_CALLBACK": callback_expression(source, ".global_remove(move |id| {", "        .register();"),

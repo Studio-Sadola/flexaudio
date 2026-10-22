@@ -24,7 +24,7 @@ use capture::Capture;
 use io::{check, failed};
 use output::{default_device, Output};
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn inject_cleanup(control: &ProbeControl) {
     capture::CaptureResources::inject_cleanup(control);
 }

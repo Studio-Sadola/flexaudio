@@ -41,21 +41,21 @@ pub(crate) enum NativeCleanup {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn native_cleanup(operation: NativeCleanup, call: impl FnOnce() -> i32) -> i32 {
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(failing) = INJECTION.with(|injection| injection.get()) {
         return if operation == failing { -1 } else { 0 };
     }
-    #[cfg(not(feature = "test-support"))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let _ = operation;
     call()
 }
 
-#[cfg(all(target_os = "macos", feature = "test-support"))]
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 thread_local! {
     static INJECTION: std::cell::Cell<Option<NativeCleanup>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(all(target_os = "macos", feature = "test-support"))]
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub(crate) fn inject<T>(operation: NativeCleanup, run: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {

@@ -26,16 +26,22 @@ phases! {
     SystemTerminalAndJoin,
     /// System capture terminal event consumed before its owner join fails.
     SystemConsumedTerminalAndJoin,
+    /// Dropped system stop receiver with a retained terminal and failing owner join.
+    SystemDroppedReceiverAndJoin,
     /// Process capture owner join failure.
     ProcessJoin,
     /// Process capture terminal failure followed by a join failure.
     ProcessTerminalAndJoin,
     /// Process capture terminal event consumed before its owner join fails.
     ProcessConsumedTerminalAndJoin,
+    /// Dropped process stop receiver with a retained terminal and failing owner join.
+    ProcessDroppedReceiverAndJoin,
     /// Device watcher owner join failure.
     WatcherJoin,
     /// Device watcher terminal failure followed by a join failure.
     WatcherTerminalAndJoin,
+    /// Dropped watcher stop receiver with a retained terminal and failing owner join.
+    WatcherDroppedReceiverAndJoin,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,11 +56,15 @@ impl Phase {
         match self {
             Self::SystemJoin
             | Self::SystemTerminalAndJoin
-            | Self::SystemConsumedTerminalAndJoin => FixtureKind::System,
+            | Self::SystemConsumedTerminalAndJoin
+            | Self::SystemDroppedReceiverAndJoin => FixtureKind::System,
             Self::ProcessJoin
             | Self::ProcessTerminalAndJoin
-            | Self::ProcessConsumedTerminalAndJoin => FixtureKind::Process,
-            Self::WatcherJoin | Self::WatcherTerminalAndJoin => FixtureKind::Watcher,
+            | Self::ProcessConsumedTerminalAndJoin
+            | Self::ProcessDroppedReceiverAndJoin => FixtureKind::Process,
+            Self::WatcherJoin
+            | Self::WatcherTerminalAndJoin
+            | Self::WatcherDroppedReceiverAndJoin => FixtureKind::Watcher,
         }
     }
 }
@@ -128,28 +138,49 @@ fn capture_worker(events: BackendEvents, terminal: bool) -> JoinHandle<()> {
     handle
 }
 
+fn dropped_receiver_sender() -> pw::channel::Sender<Terminate> {
+    let (sender, receiver) = pw::channel::channel();
+    drop(receiver);
+    // PipeWire 0.10 keeps both pipe descriptors in shared channel state. Receiver
+    // drop alone does not make send fail or prove that the worker has exited.
+    assert!(sender.send(Terminate).is_ok());
+    sender
+}
+
 fn fixture(phase: Phase) -> (Fixture, bool, bool) {
     match phase {
-        Phase::SystemJoin | Phase::SystemTerminalAndJoin | Phase::SystemConsumedTerminalAndJoin => {
+        Phase::SystemJoin
+        | Phase::SystemTerminalAndJoin
+        | Phase::SystemConsumedTerminalAndJoin
+        | Phase::SystemDroppedReceiverAndJoin => {
             let terminal = !matches!(phase, Phase::SystemJoin);
             let consumed = matches!(phase, Phase::SystemConsumedTerminalAndJoin);
             let mut owner = PwSystemBackend::new(false, None);
             owner.handle = Some(capture_worker(owner.events.clone(), terminal));
+            if matches!(phase, Phase::SystemDroppedReceiverAndJoin) {
+                owner.stop_tx = Some(dropped_receiver_sender());
+            }
             owner.running.store(true, Ordering::SeqCst);
             (Fixture::System(owner), terminal, consumed)
         }
         Phase::ProcessJoin
         | Phase::ProcessTerminalAndJoin
-        | Phase::ProcessConsumedTerminalAndJoin => {
+        | Phase::ProcessConsumedTerminalAndJoin
+        | Phase::ProcessDroppedReceiverAndJoin => {
             let terminal = !matches!(phase, Phase::ProcessJoin);
             let consumed = matches!(phase, Phase::ProcessConsumedTerminalAndJoin);
             let mut owner = PwProcessBackend::new(1, ProcessMode::Include);
             owner.handle = Some(capture_worker(owner.events.clone(), terminal));
+            if matches!(phase, Phase::ProcessDroppedReceiverAndJoin) {
+                owner.stop_tx = Some(dropped_receiver_sender());
+            }
             owner.running.store(true, Ordering::SeqCst);
             (Fixture::Process(owner), terminal, consumed)
         }
-        Phase::WatcherJoin | Phase::WatcherTerminalAndJoin => {
-            let terminal = matches!(phase, Phase::WatcherTerminalAndJoin);
+        Phase::WatcherJoin
+        | Phase::WatcherTerminalAndJoin
+        | Phase::WatcherDroppedReceiverAndJoin => {
+            let terminal = !matches!(phase, Phase::WatcherJoin);
             let events = Arc::new(Mutex::new(WatchEvents::default()));
             let worker_events = events.clone();
             let handle = thread::spawn(move || {
@@ -162,7 +193,8 @@ fn fixture(phase: Phase) -> (Fixture, bool, bool) {
                 Fixture::Watcher(PwDeviceWatcher {
                     events,
                     running: Arc::new(AtomicBool::new(true)),
-                    stop_tx: None,
+                    stop_tx: matches!(phase, Phase::WatcherDroppedReceiverAndJoin)
+                        .then(dropped_receiver_sender),
                     handle: Some(handle),
                     shutdown: None,
                 }),

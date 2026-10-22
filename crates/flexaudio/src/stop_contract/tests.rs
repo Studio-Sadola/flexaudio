@@ -16,6 +16,17 @@ fn check_fixture<B>(fixture: fn(fn(&B)), path: &StopPath) {
     );
 }
 
+#[cfg(target_os = "macos")]
+fn check_marked_fixture<B, Marker>(fixture: fn(fn(&B, Marker)), path: &StopPath) {
+    OBSERVED.with(|count| count.set(0));
+    fixture(|_: &B, _: Marker| OBSERVED.with(|count| count.set(count.get() + 1)));
+    assert!(
+        OBSERVED.with(Cell::get) > 0,
+        "{} fixture did not observe its backend",
+        path.name()
+    );
+}
+
 #[test]
 fn registered_stop_paths_retain_injected_operation_failures() {
     // Stream owns the facade teardown but is not a factory CaptureBackend.
@@ -62,13 +73,13 @@ impl StopPath {
             #[cfg(target_os = "windows")]
             Self::WindowsProcess(fixture) => check_fixture(*fixture, self),
             #[cfg(target_os = "macos")]
-            Self::MacSystem(fixture) => check_fixture(*fixture, self),
+            Self::MacSystem(fixture) => check_marked_fixture(*fixture, self),
             #[cfg(target_os = "macos")]
-            Self::MacProcess(fixture) => check_fixture(*fixture, self),
+            Self::MacProcess(fixture) => check_marked_fixture(*fixture, self),
             #[cfg(target_os = "macos")]
-            Self::MacTap(fixture) => check_fixture(*fixture, self),
+            Self::MacTap(fixture) => check_marked_fixture(*fixture, self),
             #[cfg(target_os = "macos")]
-            Self::MacProbe(fixture) => check_fixture(*fixture, self),
+            Self::MacProbe(fixture) => check_marked_fixture(*fixture, self),
         }
     }
 }

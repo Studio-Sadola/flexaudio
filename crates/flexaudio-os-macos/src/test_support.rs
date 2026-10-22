@@ -87,6 +87,22 @@ impl Phase {
     }
 }
 
+/// System-owner fixture identity. Internal, with no stability guarantee.
+#[derive(Clone, Copy)]
+pub struct SystemPath;
+
+/// Process-owner fixture identity. Internal, with no stability guarantee.
+#[derive(Clone, Copy)]
+pub struct ProcessPath;
+
+/// Tap-release fixture identity. Internal, with no stability guarantee.
+#[derive(Clone, Copy)]
+pub struct TapPath;
+
+/// Probe-release fixture identity. Internal, with no stability guarantee.
+#[derive(Clone, Copy)]
+pub struct ProbePath;
+
 pub(crate) trait FixtureBackend: CaptureBackend {
     fn retained_report(&self) -> &ShutdownReport;
 }
@@ -199,7 +215,7 @@ fn assert_backend<B: FixtureBackend>(
     phase: Phase,
     primary: Option<Error>,
     checked_first: bool,
-    observe: fn(&B),
+    observe: impl Fn(&B),
 ) {
     let checked = if checked_first {
         Some(backend.stop_checked())
@@ -304,7 +320,7 @@ pub fn check(phase: Phase) {
 fn check_phase<B: FixtureBackend>(
     phase: Phase,
     construct: impl Fn(JoinHandle<Result<()>>, Arc<CleanupLedger>, Option<Error>) -> B,
-    observe: fn(&B),
+    observe: impl Fn(&B),
 ) {
     for primary in [None, Some(Error::DeviceLost)] {
         for checked_first in [false, true] {
@@ -317,7 +333,7 @@ fn check_phase<B: FixtureBackend>(
                     phase,
                     primary.clone(),
                     checked_first,
-                    observe,
+                    &observe,
                 );
             }
         }
@@ -327,35 +343,76 @@ fn check_phase<B: FixtureBackend>(
 fn check_path<B: FixtureBackend>(
     path: Path,
     construct: impl Fn(JoinHandle<Result<()>>, Arc<CleanupLedger>, Option<Error>) -> B,
-    observe: fn(&B),
+    observe: impl Fn(&B),
 ) {
     for &phase in Phase::ALL {
         if phase.path() == path {
-            check_phase(phase, &construct, observe);
+            check_phase(phase, &construct, &observe);
         }
     }
 }
 
 /// Check system owner phases and observe the same backends after retention assertions.
 /// Internal test API, with no stability guarantee.
-pub fn check_system(observe: fn(&MacSystemBackend)) {
-    check_path(Path::System, MacSystemBackend::shutdown_fixture, observe);
+pub fn check_system(observe: fn(&MacSystemBackend, SystemPath)) {
+    check_path(
+        Path::System,
+        MacSystemBackend::shutdown_fixture,
+        |backend| {
+            observe(backend, SystemPath);
+        },
+    );
 }
 
 /// Check process owner phases and observe the same backends after retention assertions.
 /// Internal test API, with no stability guarantee.
-pub fn check_process(observe: fn(&MacProcessBackend)) {
-    check_path(Path::Process, MacProcessBackend::shutdown_fixture, observe);
+pub fn check_process(observe: fn(&MacProcessBackend, ProcessPath)) {
+    check_path(
+        Path::Process,
+        MacProcessBackend::shutdown_fixture,
+        |backend| {
+            observe(backend, ProcessPath);
+        },
+    );
 }
 
 /// Check tap release phases and observe the system owners retaining their cleanup.
 /// Internal test API, with no stability guarantee.
-pub fn check_tap(observe: fn(&MacSystemBackend)) {
-    check_path(Path::Tap, MacSystemBackend::shutdown_fixture, observe);
+pub fn check_tap(observe: fn(&MacSystemBackend, TapPath)) {
+    check_path(Path::Tap, MacSystemBackend::shutdown_fixture, |backend| {
+        observe(backend, TapPath);
+    });
 }
 
 /// Check probe release phases and observe the system owners retaining their cleanup.
 /// Internal test API, with no stability guarantee.
-pub fn check_probe(observe: fn(&MacSystemBackend)) {
-    check_path(Path::Probe, MacSystemBackend::shutdown_fixture, observe);
+pub fn check_probe(observe: fn(&MacSystemBackend, ProbePath)) {
+    check_path(Path::Probe, MacSystemBackend::shutdown_fixture, |backend| {
+        observe(backend, ProbePath);
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_retains_each_injected_owner_phase() {
+        check_system(|_, _: SystemPath| {});
+    }
+
+    #[test]
+    fn process_retains_each_injected_owner_phase() {
+        check_process(|_, _: ProcessPath| {});
+    }
+
+    #[test]
+    fn tap_retains_each_injected_release_phase() {
+        check_tap(|_, _: TapPath| {});
+    }
+
+    #[test]
+    fn probe_retains_each_injected_release_phase() {
+        check_probe(|_, _: ProbePath| {});
+    }
 }

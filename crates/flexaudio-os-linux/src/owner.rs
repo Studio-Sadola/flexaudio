@@ -12,6 +12,17 @@ pub(crate) struct BackendEventQueue {
 
 pub(crate) type BackendEvents = Arc<Mutex<BackendEventQueue>>;
 
+pub(crate) fn request_worker_stop(
+    sender: &mut Option<crate::pw::channel::Sender<crate::Terminate>>,
+) -> Option<Error> {
+    sender.take().and_then(|sender| {
+        sender.send(crate::Terminate).err().map(|_| {
+            Error::Backend("PipeWire stop request could not be delivered".into())
+                .with_context(ErrorContext::new(Operation::Stop))
+        })
+    })
+}
+
 pub(crate) fn join_worker(handle: JoinHandle<()>) -> Result<()> {
     handle.join().map_err(|_| {
         Error::Backend("pipewire worker panicked".into())
@@ -58,12 +69,14 @@ pub(crate) fn finish_worker(
     handle: &mut Option<JoinHandle<()>>,
     shutdown: &mut Option<ShutdownReport>,
     events: &BackendEvents,
+    stop_error: Option<Error>,
 ) {
     if shutdown.is_some() {
         return;
     }
     let result = handle.take().map_or(Ok(()), join_worker);
-    if let Err(error) = &result {
+    let cleanup: Vec<_> = stop_error.into_iter().chain(result.err()).collect();
+    for error in &cleanup {
         push_backend_event(
             events,
             Event::ShutdownError {
@@ -76,15 +89,12 @@ pub(crate) fn finish_worker(
         .unwrap_or_else(|poison| poison.into_inner())
         .primary
         .clone();
-    *shutdown = Some(ShutdownReport::new(
-        primary,
-        result.err().into_iter().collect(),
-    ));
+    *shutdown = Some(ShutdownReport::new(primary, cleanup));
 }
 
 pub(crate) fn push_backend_event(events: &BackendEvents, event: Event) {
     let mut queue = events.lock().unwrap_or_else(|poison| poison.into_inner());
-    // At most one terminal failure and one cleanup failure per capture generation.
+    // Keep the first capture failure independently of all queued cleanup failures.
     if let Event::TerminalError { error } = &event {
         if queue.primary.is_some() {
             return;

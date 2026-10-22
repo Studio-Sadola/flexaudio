@@ -840,7 +840,7 @@ impl MacSystemBackend {
         )
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn shutdown_fixture(
         handle: JoinHandle<Result<()>>,
         cleanup: Arc<crate::cleanup::CleanupLedger>,
@@ -856,7 +856,7 @@ impl MacSystemBackend {
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 impl crate::test_support::FixtureBackend for MacSystemBackend {
     fn retained_report(&self) -> &ShutdownReport {
         self.shutdown.report().expect("shutdown report retained")

@@ -215,7 +215,7 @@ impl TapChain {
 }
 
 impl TapResources {
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn rollback_fixture(cleanup: &Arc<CleanupLedger>) -> Error {
         // SAFETY: test injection intercepts every native release of these inert IDs.
         unsafe {
@@ -229,7 +229,7 @@ impl TapResources {
         }
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn fixture(cleanup: Arc<CleanupLedger>) -> Self {
         Self {
             aggregate_id: 1,

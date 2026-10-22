@@ -184,7 +184,7 @@ pub(super) struct IoRegistration {
 }
 
 impl IoRegistration {
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn fixture(control: &ProbeControl) -> Self {
         Self {
             cleanup: control.cleanup_diagnostics(),
