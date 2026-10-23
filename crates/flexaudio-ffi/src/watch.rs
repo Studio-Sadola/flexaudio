@@ -219,20 +219,33 @@ pub unsafe extern "C" fn flexaudio_device_event_free(ev: *mut FlexDeviceEvent) {
 }
 
 /// Stop and release the watcher. NULL-safe.
+/// Pending terminal and shutdown failures are reported through `flexaudio_last_error`
+/// and `flexaudio_last_error_info_v2`, as for `flexaudio_free`.
 ///
 /// # Safety
 /// `w` must be a handle returned by `flexaudio_watch_devices`, or NULL. Do not use `w` after release.
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_watcher_free(w: *mut FlexWatcher) {
     guard_i32(|| {
+        clear_last_error();
         if !w.is_null() {
             if !crate::convert::valid_pointer(w) {
                 return crate::error::set_audio_error(flexaudio::Error::InvalidArg(
                     "invalid watcher handle".into(),
                 ));
             }
-            // Dropping DeviceWatcher calls stop().
-            drop(Box::from_raw(w));
+            let mut watcher = Box::from_raw(w);
+            watcher.inner.stop();
+            let mut failures = Vec::new();
+            while let Some(event) = watcher.inner.poll_event() {
+                if let DeviceEvent::TerminalError { error } = event {
+                    failures.push(error);
+                }
+            }
+            drop(watcher);
+            if let Err(error) = flexaudio::ShutdownReport::new(None, failures).result() {
+                return crate::error::set_audio_error(error);
+            }
         }
         code::FLEX_OK
     });
@@ -243,6 +256,19 @@ mod tests {
     use super::*;
     use flexaudio::{DeviceInfo, SourceKind};
     use std::ffi::CStr;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn watcher_free_retains_worker_join_failure_in_last_error() {
+        let watcher = Box::into_raw(Box::new(FlexWatcher {
+            inner: flexaudio::test_support::watcher_join_failure(),
+        }));
+        unsafe { flexaudio_watcher_free(watcher) };
+        let message = crate::error::last_error_ptr();
+        assert!(!message.is_null());
+        let message = unsafe { CStr::from_ptr(message) }.to_str().unwrap();
+        assert!(message.contains("join"), "{message}");
+    }
 
     /// One watch → poll → free cycle, or a typed startup failure without a panic.
     #[test]

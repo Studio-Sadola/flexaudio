@@ -184,6 +184,13 @@ fn owner_result(phase: Phase, cleanup: Arc<CleanupLedger>, exit: Exit) -> Result
                     Arc::new(AtomicBool::new(false)),
                 )
                 .with_cleanup_ledger(cleanup);
+                let (events, lifecycle) = std::sync::mpsc::channel();
+                let control = control.with_lifecycle(
+                    events,
+                    Arc::new(std::sync::Mutex::new(
+                        flexaudio_core::HelperStopReason::Cancelled,
+                    )),
+                );
                 let decision = GenerationProbe::default().on_silence(
                     &mut CleanupProbe {
                         cancel: phase == Phase::ProbeCleanupCancelled,
@@ -194,6 +201,17 @@ fn owner_result(phase: Phase, cleanup: Arc<CleanupLedger>, exit: Exit) -> Result
                     assert!(
                         decision.is_none(),
                         "cancelled probe must not publish a result"
+                    );
+                    assert!(control.cancelled());
+                    assert_eq!(
+                        lifecycle.try_iter().collect::<Vec<_>>(),
+                        [
+                            flexaudio_core::Event::SilenceProbeStarted,
+                            flexaudio_core::Event::SilenceProbeStopped {
+                                reason: flexaudio_core::HelperStopReason::Cancelled,
+                            },
+                        ],
+                        "cancelled cleanup must close the lifecycle without publishing evidence"
                     );
                 } else {
                     assert!(
@@ -306,17 +324,6 @@ fn assert_backend<B: FixtureBackend>(
 
 fn assert_native(status: Option<NativeStatus>, call: &'static str) {
     assert_eq!(status, Some(NativeStatus::OsStatus { call, value: -1 }));
-}
-
-/// Inject a failure at a real owner join or native cleanup dispatch and check retention.
-/// Each entry uses fresh owners, with and without a capture primary, for both stop APIs.
-pub fn check(phase: Phase) {
-    match phase.path() {
-        Path::Process => check_phase(phase, MacProcessBackend::shutdown_fixture, |_| {}),
-        Path::System | Path::Tap | Path::Probe => {
-            check_phase(phase, MacSystemBackend::shutdown_fixture, |_| {})
-        }
-    }
 }
 
 fn check_phase<B: FixtureBackend>(

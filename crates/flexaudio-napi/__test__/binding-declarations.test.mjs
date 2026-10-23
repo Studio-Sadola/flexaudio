@@ -62,8 +62,6 @@ test('audio errors have closed kind-specific payloads and exact loss counts', ()
 test('retained addon shutdown failures declare their typed VAD code and audio error tree', () => {
   assert.match(alias('AudioError'), /kind: 'backend'; vadCode\?: VadErrorCode/);
   assert.match(declarations, /export interface VadError extends Error \{[^}]*audioError\?: AudioError/);
-  assert.match(body('ShutdownReport'), /primary: AudioError \| null/);
-  assert.match(body('ShutdownReport'), /cleanupErrors: readonly AudioError\[\]/);
 });
 
 

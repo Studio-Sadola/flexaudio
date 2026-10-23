@@ -548,6 +548,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn declared_error_kinds_match_the_runtime_core_inventory() {
+        use std::collections::BTreeSet;
+        let expected: BTreeSet<_> = flexaudio_core::test_support::error_cases()
+            .into_iter()
+            .map(|(_, name, _)| name)
+            .collect();
+        let typescript = include_str!("../index.d.ts")
+            .split_once("export type AudioError =")
+            .unwrap()
+            .1
+            .split_once("\nexport ")
+            .unwrap()
+            .0;
+        let declared: BTreeSet<_> = typescript
+            .split("kind: ")
+            .skip(1)
+            .flat_map(|field| {
+                field
+                    .split([';', '}'])
+                    .next()
+                    .unwrap()
+                    .split('\'')
+                    .skip(1)
+                    .step_by(2)
+            })
+            .collect();
+        assert_eq!(
+            declared, expected,
+            "TypeScript AudioError kinds differ from core"
+        );
+        let python = include_str!("../../../bindings/flexaudio-py/flexaudio.pyi");
+        let dictionaries = python
+            .split_once("class _AudioErrorFields(")
+            .unwrap()
+            .1
+            .split_once("AudioErrorDict = Union[")
+            .unwrap()
+            .0;
+        let declared: BTreeSet<_> = dictionaries
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("kind: Literal["))
+            .flat_map(|literal| {
+                literal
+                    .split_once(']')
+                    .unwrap()
+                    .0
+                    .split('"')
+                    .skip(1)
+                    .step_by(2)
+            })
+            .collect();
+        assert_eq!(
+            declared, expected,
+            "Python AudioErrorDict kinds differ from core"
+        );
+        let property = python
+            .split_once("class AudioError:")
+            .unwrap()
+            .1
+            .split_once("def kind(self) -> Literal[")
+            .unwrap()
+            .1
+            .split_once(']')
+            .unwrap()
+            .0;
+        let declared: BTreeSet<_> = property.split('"').skip(1).step_by(2).collect();
+        assert_eq!(
+            declared, expected,
+            "Python AudioError.kind literals differ from core"
+        );
+    }
+
+    #[test]
     fn every_root_error_has_a_distinct_stable_code_and_payload() {
         let mut codes = std::collections::BTreeMap::<&str, Vec<ErrorKind>>::new();
         for (kind, name, error) in flexaudio_core::test_support::error_cases() {

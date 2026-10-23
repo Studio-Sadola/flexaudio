@@ -157,6 +157,8 @@ fn processes(py: Python<'_>) -> PyResult<Vec<marshal::PyProcessInfo>> {
 /// Python module `flexaudio`.
 #[pymodule]
 fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[cfg(feature = "test-faults")]
+    m.add_function(wrap_pyfunction!(_vad_error_codes, m)?)?;
     errors::register(m)?;
     // Functions.
     m.add_function(wrap_pyfunction!(capabilities::capabilities, m)?)?;
@@ -168,6 +170,8 @@ fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(processes, m)?)?;
     m.add_function(wrap_pyfunction!(stream::open, m)?)?;
     m.add_function(wrap_pyfunction!(watcher::watch_devices, m)?)?;
+    #[cfg(all(feature = "test-faults", target_os = "linux"))]
+    m.add_function(wrap_pyfunction!(watcher::_watcher_join_failure, m)?)?;
 
     // Stream and its returned data types.
     m.add_class::<stream::Stream>()?;
@@ -187,6 +191,18 @@ fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<encode::FlacEncoder>()?;
     m.add_class::<watcher::DeviceWatcher>()?;
     Ok(())
+}
+
+/// Runtime contract inventory; absent from release wheels.
+#[cfg(feature = "test-faults")]
+#[pyfunction]
+fn _vad_error_codes() -> Vec<&'static str> {
+    flexaudio_core::test_support::error_variant_cases()
+        .into_iter()
+        .filter_map(|(_, _, error)| error.vad_code().map(|code| code.as_str()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]

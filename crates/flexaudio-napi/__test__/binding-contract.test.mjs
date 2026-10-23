@@ -21,6 +21,34 @@ async function bridge(scenario) {
   await stream.stop();
   return chunks;
 }
+test('watcher stop delivers the real worker join failure to its callback',
+  { skip: process.platform !== 'linux' }, async () => {
+    const events = [];
+    const watcher = native.__watcherJoinFailure(event => events.push(event));
+    watcher.stop();
+    const deadline = performance.now() + 5000;
+    while (events.length === 0 && performance.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.ok(events.length > 0, 'watcher shutdown event must arrive within 5 seconds');
+    // Let duplicate notifications surface after the first delivery.
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'terminalError');
+    assert.match(events[0].error.message, /join/);
+  });
+test('chunk unref failure rejects stop and remains in shutdown cleanup', async () => {
+  const stream = native.__openMockStream(48000, 2, 0, () => {});
+  native.__failNextChunkUnref();
+  await assert.rejects(stream.stop(), /unref/);
+  const report = stream.shutdownReport();
+  assert.equal(report.primary, null);
+  assert.equal(report.cleanupErrors.length, 1);
+  assert.equal(report.cleanupErrors[0].kind, 'backend');
+  assert.match(report.cleanupErrors[0].message, /unref/);
+  await assert.rejects(stream.stop(), /unref/);
+  assert.equal(stream.shutdownReport().cleanupErrors.length, 1);
+});
 test('binding_contract_orphan_speech', async () => {
   const chunks = await bridge('orphan');
   assert.ok(chunks.some(c => c.secondary?.vadEvents?.some(e => e.type === 'segment')),

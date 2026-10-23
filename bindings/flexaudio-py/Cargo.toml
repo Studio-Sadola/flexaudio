@@ -25,9 +25,10 @@ crate-type = ["cdylib"]
 # build/test then work without it.
 extension-module = ["pyo3/extension-module"]
 # Device-free integration fixtures; never enabled for release wheels.
-test-faults = []
+test-faults = ["flexaudio/test-support", "dep:flexaudio-core"]
 
 [dependencies]
+flexaudio-core = { path = "../../crates/flexaudio-core", optional = true, features = ["test-support"] }
 flexaudio = { path = "../../crates/flexaudio" }
 
 # Add-ons linked directly to expose the Rust VAD / FLAC / denoise features to Python.

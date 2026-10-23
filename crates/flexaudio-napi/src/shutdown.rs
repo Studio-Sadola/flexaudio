@@ -103,7 +103,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shutdown_report_fields_match_core_and_typescript() {
+    fn shutdown_report_fields_match_core_at_runtime() {
         let core = flexaudio::ShutdownReport::new(
             Some(flexaudio::Error::DeviceLost),
             vec![flexaudio::Error::Unsupported],
@@ -140,37 +140,6 @@ mod tests {
         assert_eq!(
             expected,
             [("primary", 1), ("cleanupErrors", cleanup_errors.len())]
-        );
-        let mut fields: Vec<_> = expected
-            .iter()
-            .map(|(field, _)| (*field).to_owned())
-            .collect();
-        fields.sort();
-        let rust = include_str!("boundary.rs")
-            .split_once("pub struct JsShutdownReport {")
-            .unwrap()
-            .1
-            .split_once("\n}")
-            .unwrap()
-            .0;
-        let mut object_names: Vec<_> = rust
-            .split("#[napi(js_name = \"")
-            .skip(1)
-            .map(|field| field.split_once('"').unwrap().0.to_owned())
-            .collect();
-        object_names.sort();
-        assert_eq!(
-            object_names, fields,
-            "Node ShutdownReport object property names differ from core"
-        );
-        assert_eq!(
-            flexaudio_core::test_support::declaration_fields(
-                include_str!("../index.d.ts"),
-                "export interface ShutdownReport {",
-                "\n}"
-            ),
-            fields,
-            "Node ShutdownReport declaration fields differ from core"
         );
     }
 

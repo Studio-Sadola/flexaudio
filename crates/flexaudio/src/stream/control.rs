@@ -268,12 +268,15 @@ pub(super) fn stop_backend_reconciling_with_reason(
     }
 }
 
-/// Preserve only the additive helper notices of a rejected replacement. Its
-/// ordinary errors still follow the existing startup/rollback result path.
+/// Preserve helper lifecycle and failure notices from a rejected replacement.
+/// Its failures belong to rollback cleanup, never the active stream's primary.
 /// The caller has already stopped the backend. If its mailbox exceeds the
 /// bounded drain or panics, close every forwarded attempt with StartupFailed;
 /// the rejected backend is discarded, so no later native stop can be forwarded.
 pub(super) fn drain_replacement_lifecycle(shared: &SharedState, be: &mut Box<dyn CaptureBackend>) {
+    let record_failure = |error: Error| {
+        shared.record_cleanup(error.with_context(ErrorContext::new(Operation::Rollback)));
+    };
     let mut pending_probe = 0usize;
     let mut pending_keepalive = 0usize;
     let limit = MAX_BACKEND_EVENTS_PER_TICK * MAX_FINAL_EVENT_BATCHES;
@@ -293,17 +296,38 @@ pub(super) fn drain_replacement_lifecycle(shared: &SharedState, be: &mut Box<dyn
                 }
                 shared.push_event(event);
             }
-            Ok(Some(_)) => {}
+            Ok(Some(
+                Event::ShutdownError { error }
+                | Event::TerminalError { error }
+                | Event::RecoverableError { error },
+            )) => record_failure(error),
+            Ok(Some(Event::PermissionDenied { permission, detail })) => {
+                record_failure(Error::PermissionDenied { permission, detail });
+            }
+            Ok(Some(Event::DeviceLost)) => record_failure(Error::DeviceLost),
+            Ok(Some(Event::Error(_))) => record_failure(Error::Backend(
+                "backend reported a failure through a legacy error event".into(),
+            )),
+            // These describe the rejected backend's live state, not the restored source.
+            Ok(Some(
+                Event::StreamStalled
+                | Event::StreamRecovered
+                | Event::PermissionPending { .. }
+                | Event::SilenceWhileSourceActive { .. },
+            )) => {}
+            // Preserve observed loss/clipping and future notices without changing active
+            // capture state (in particular, do not trigger recovery or discontinuity).
+            Ok(Some(event)) => shared.push_event(event),
             Ok(None) => break,
             Err(_) => {
-                shared.record_cleanup(Error::Backend(
+                record_failure(Error::Backend(
                     "replacement backend panicked during final event drain".into(),
                 ));
                 break;
             }
         }
         if index + 1 == limit {
-            shared.record_cleanup(Error::Backend(
+            record_failure(Error::Backend(
                 "replacement backend event mailbox could not be reconciled".into(),
             ));
         }

@@ -1871,6 +1871,8 @@ int32_t flexaudio_watcher_poll(struct FlexWatcher *w, struct FlexDeviceEvent *ou
 void flexaudio_device_event_free(struct FlexDeviceEvent *ev);
 
 // Stop and release the watcher. NULL-safe.
+// Pending terminal and shutdown failures are reported through `flexaudio_last_error`
+// and `flexaudio_last_error_info_v2`, as for `flexaudio_free`.
 //
 // # Safety
 // `w` must be a handle returned by `flexaudio_watch_devices`, or NULL. Do not use `w` after release.

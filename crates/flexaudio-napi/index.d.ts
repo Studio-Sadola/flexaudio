@@ -265,7 +265,6 @@ export type AudioError = {
   | { kind: 'unsupported' }
   | { kind: 'ambiguousDeviceName' }
   | { kind: 'ignoredSettings' }
-  | { kind: 'unknown' }
 )
 
 export interface AudioException extends Error {

@@ -10,6 +10,7 @@ crate::stop_contract::phases! {
     IntakeJoin,
     WatchdogJoin,
     StopAndReplacementRollback,
+    ReplacementFinalFailures,
 }
 
 pub(crate) fn check_all(observe: fn(&Stream)) {
@@ -24,6 +25,24 @@ fn check(phase: Phase, observe: fn(&Stream)) {
             .with_context(ErrorContext::new(Operation::Stop))
             .with_context(ErrorContext::new(Operation::Stop));
         let (mut stream, primary, cleanup) = match phase {
+            Phase::ReplacementFinalFailures => {
+                let mut stream = stop_failure(StopPhase::Stop).unwrap();
+                assert!(stream
+                    .switch_backend(Box::new(FailedReplacementWithNotices::default()))
+                    .is_err());
+                assert!(stream.terminal_error().is_none());
+                (
+                    stream,
+                    None,
+                    vec![
+                        stop_cause.clone(),
+                        replacement_join_error()
+                            .with_context(ErrorContext::new(Operation::Rollback)),
+                        Error::Unsupported.with_context(ErrorContext::new(Operation::Rollback)),
+                        stop_cause.with_context(ErrorContext::new(Operation::Rollback)),
+                    ],
+                )
+            }
             Phase::StopAndReplacementRollback => {
                 let mut stream = stop_failure(StopPhase::Stop).unwrap();
                 assert!(stream.switch_backend(Box::new(FailedReplacement)).is_err());
@@ -92,6 +111,57 @@ fn check(phase: Phase, observe: fn(&Stream)) {
         assert_eq!(stream.shutdown_report(), Some(report.clone()));
         assert_eq!(stream.stop_checked(), report.result());
         observe(&stream);
+    }
+}
+
+#[test]
+fn rejected_replacement_join_notice_and_distinct_stop_failure_are_retained() {
+    check(Phase::ReplacementFinalFailures, |_| {});
+}
+
+fn replacement_join_error() -> Error {
+    Error::Backend("replacement worker panicked during join".into())
+        .with_context(ErrorContext::new(Operation::Join))
+}
+
+#[derive(Default)]
+struct FailedReplacementWithNotices {
+    worker: Option<thread::JoinHandle<()>>,
+    events: std::collections::VecDeque<Event>,
+}
+
+impl CaptureBackend for FailedReplacementWithNotices {
+    fn native_format(&self) -> (u32, u16) {
+        (48_000, 2)
+    }
+
+    fn start(&mut self, _sink: RawSink) -> Result<()> {
+        self.worker = Some(thread::spawn(|| {
+            panic!("injected replacement join failure")
+        }));
+        Err(Error::DeviceNotFound)
+    }
+
+    fn stop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                self.events.push_back(Event::ShutdownError {
+                    error: replacement_join_error(),
+                });
+                self.events.push_back(Event::TerminalError {
+                    error: Error::Unsupported,
+                });
+            }
+        }
+    }
+
+    fn stop_checked(&mut self) -> Result<()> {
+        self.stop();
+        Err(Error::DeviceLost.with_context(ErrorContext::new(Operation::Stop)))
+    }
+
+    fn poll_event(&mut self) -> Option<Event> {
+        self.events.pop_front()
     }
 }
 

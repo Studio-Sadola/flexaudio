@@ -44,6 +44,13 @@ pub struct DeviceWatcher {
 }
 
 impl DeviceWatcher {
+    #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+    pub(crate) fn failing_join_fixture() -> Self {
+        Self {
+            inner: Box::new(flexaudio_os_linux::test_support::watcher_join_failure()),
+        }
+    }
+
     /// Take the next hot-plug event, or return `None` without blocking.
     pub fn poll_event(&mut self) -> Option<DeviceEvent> {
         self.inner.poll_event()

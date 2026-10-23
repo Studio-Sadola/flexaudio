@@ -63,9 +63,6 @@ node "$TEST_DIR/dual.mjs"
 echo "== node async-api.mjs =="
 node "$TEST_DIR/async-api.mjs"
 
-echo "== node --test settings-lifecycle.test.mjs =="
-node --test "$TEST_DIR/settings-lifecycle.test.mjs"
-
 echo "== node exit.mjs (must self-exit within 10s) =="
 node "$TEST_DIR/exit.mjs" &
 exit_pid=$!

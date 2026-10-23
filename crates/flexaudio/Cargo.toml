@@ -14,7 +14,7 @@ documentation = "https://docs.rs/flexaudio"
 
 [features]
 # Internal fixtures only; no stability guarantee. Never enabled by default.
-test-support = []
+test-support = ["flexaudio-os-linux/test-support"]
 
 [dependencies]
 flexaudio-core = { path = "../flexaudio-core", version = "0.9.0" }

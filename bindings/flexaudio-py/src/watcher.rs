@@ -17,6 +17,8 @@ use crate::to_py_err;
 /// Create it with [`watch_devices`]. Call [`poll_event`](DeviceWatcher::poll_event) periodically to
 /// retrieve [`DeviceEvent`](PyDeviceEvent). Call `stop()` to stop it (drop also stops it).
 /// Supports the context manager protocol (`with`).
+/// Leaving the context raises any undrained terminal or shutdown failure. Dropping
+/// a watcher reports undrained failures through Python's `sys.unraisablehook`.
 ///
 /// The internal `flexaudio::DeviceWatcher` (`Box<dyn DeviceWatchBackend>`) is Send but not Sync,
 /// so it cannot meet pyclass's default Send+Sync requirements. Polling is single-threaded, so mark
@@ -43,15 +45,46 @@ impl DeviceWatcher {
         slf
     }
 
-    /// Stop when leaving the `with` block. Does not swallow exceptions (returns False).
+    /// Stop when leaving the `with` block and raise undrained shutdown failures.
     fn __exit__(
         &mut self,
         _exc_type: Option<Bound<'_, PyAny>>,
         _exc_value: Option<Bound<'_, PyAny>>,
         _traceback: Option<Bound<'_, PyAny>>,
-    ) -> bool {
+    ) -> PyResult<bool> {
+        self.finish().map(|()| false)
+    }
+}
+
+impl DeviceWatcher {
+    fn finish(&mut self) -> PyResult<()> {
         self.inner.stop();
-        false
+        let mut failures = Vec::new();
+        while let Some(event) = self.inner.poll_event() {
+            if let fa::DeviceEvent::TerminalError { error } = event {
+                failures.push(error);
+            }
+        }
+        fa::ShutdownReport::new(None, failures)
+            .result()
+            .map_err(to_py_err)
+    }
+}
+
+impl Drop for DeviceWatcher {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish() {
+            Python::attach(|py| error.write_unraisable(py, None));
+        }
+    }
+}
+
+/// Device-free watcher fixture; absent from release wheels.
+#[cfg(all(feature = "test-faults", target_os = "linux"))]
+#[pyfunction]
+pub fn _watcher_join_failure() -> DeviceWatcher {
+    DeviceWatcher {
+        inner: fa::test_support::watcher_join_failure(),
     }
 }
 

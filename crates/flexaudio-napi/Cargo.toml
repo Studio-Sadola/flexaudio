@@ -27,7 +27,7 @@ test = false
 
 [features]
 # Opt-in for device-free failure regressions; release workflows do not enable it.
-test-faults = ["flexaudio-vad/test-faults"]
+test-faults = ["flexaudio-vad/test-faults", "flexaudio/test-support"]
 
 [dependencies]
 flexaudio = { path = "../flexaudio" }

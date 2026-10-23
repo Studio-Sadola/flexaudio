@@ -261,6 +261,15 @@ pub fn check_process(observe: fn(&PwProcessBackend)) {
     });
 }
 
+/// Construct a device-free watcher whose real worker join fails on stop.
+#[doc(hidden)]
+pub fn watcher_join_failure() -> PwDeviceWatcher {
+    match fixture(Phase::WatcherJoin).0 {
+        Fixture::Watcher(watcher) => watcher,
+        _ => unreachable!("watcher phase must construct a watcher"),
+    }
+}
+
 /// Exercise every watcher phase and observe each tested concrete owner.
 /// This internal test entry has no stability guarantee and runs on Linux CI.
 pub fn check_watcher(observe: fn(&PwDeviceWatcher)) {

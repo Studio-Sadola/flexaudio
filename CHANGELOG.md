@@ -79,6 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve watcher teardown failures in C and Python error channels, Node callback unref failures in shutdown cleanup reports, and rejected replacement failure notices as rollback cleanup.
+
 - Shutdown errors now identify capture workers, replacement rollback, Windows clients/event handles and macOS probe IOProc roles so independent failures remain distinct during deduplication.
 - Stop reports retain Windows handle-close and session destructor failures,
   macOS probe cleanup even when capture is cancelled, and Linux and microphone

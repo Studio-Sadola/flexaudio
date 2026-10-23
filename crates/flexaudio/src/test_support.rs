@@ -1,6 +1,12 @@
 //! Internal backend injection for contract tests; no stability guarantee.
 use crate::{CaptureBackend, OpenOptions, Result, Stream, StreamConfig};
 
+/// Construct a device-free Linux watcher whose real worker join fails on stop.
+#[cfg(target_os = "linux")]
+pub fn watcher_join_failure() -> crate::DeviceWatcher {
+    crate::DeviceWatcher::failing_join_fixture()
+}
+
 /// Open through production validation and settings resolution with an injected backend.
 pub fn open(
     config: StreamConfig,

@@ -378,26 +378,55 @@ type ChunkTsfnWeakCell = Arc<OnceLock<Weak<ChunkTsfn>>>;
 
 /// Release the delivery TSFN's event-loop reference. After `stop()` settles, Node can exit
 /// even if a stream reference remains. Idempotent (subsequent calls are no-ops).
-fn unref_chunk_tsfn(tsfn: &ChunkTsfn, env: &Env) {
+fn unref_chunk_tsfn(tsfn: &ChunkTsfn, env: &Env, report: &FinalReport) {
     if tsfn.aborted() {
         return;
     }
     let mut tsfn = tsfn.clone();
-    #[allow(
-        clippy::let_underscore_must_use,
-        reason = "A closing Node environment may reject unref; it already owns TSFN destruction."
-    )]
-    let _ = tsfn.unref(env);
+    let result = tsfn.unref(env);
+    #[cfg(all(flexaudio_test_addon, feature = "test-faults"))]
+    // Complete the real unref so the fixture cannot keep Node alive, then inject
+    // the N-API operation failure at its Result boundary.
+    let result = result.and_then(|()| {
+        FAIL_NEXT_CHUNK_UNREF.with(|fail| {
+            if fail.replace(false) {
+                Err(NapiError::new(
+                    Status::GenericFailure,
+                    "injected unref failure",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    });
+    if let Err(error) = result {
+        record_cleanup_failure(
+            report,
+            flexaudio::Error::Backend(format!("chunk callback unref failed: {error}"))
+                .with_context(flexaudio::ErrorContext::new(flexaudio::Operation::Stop)),
+        );
+    }
 }
 
-fn unref_chunk_weak(cell: &OnceLock<Weak<ChunkTsfn>>, env: &Env) {
+fn unref_chunk_weak(cell: &OnceLock<Weak<ChunkTsfn>>, env: &Env, report: &FinalReport) {
     let Some(weak) = cell.get() else {
         return;
     };
     let Some(tsfn) = weak.upgrade() else {
         return;
     };
-    unref_chunk_tsfn(&tsfn, env);
+    unref_chunk_tsfn(&tsfn, env, report);
+}
+
+#[cfg(all(flexaudio_test_addon, feature = "test-faults"))]
+thread_local! {
+    static FAIL_NEXT_CHUNK_UNREF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(flexaudio_test_addon, feature = "test-faults"))]
+#[napi(js_name = "__failNextChunkUnref")]
+pub fn fail_next_chunk_unref() {
+    FAIL_NEXT_CHUNK_UNREF.with(|fail| fail.set(true));
 }
 
 fn make_user_chunk_cb(
@@ -450,7 +479,7 @@ fn call_ordered_event(
 
 /// TSFN that calls the user's `onChunk`. Chunks go to the user; `StopFlushed` resolves the
 /// deferred in the same queue (without calling the user's onChunk). The pump function is a no-op.
-/// After resolving, unref the chunk TSFN and release onChunk's `napi_ref`.
+/// Retain unref failures before resolving, then release onChunk's `napi_ref`.
 #[allow(clippy::too_many_arguments)]
 fn make_chunk_tsfn(
     env: &Env,
@@ -530,11 +559,11 @@ fn make_chunk_tsfn(
                         }
                         lifecycle.finish();
                     }
+                    unref_chunk_weak(&chunk_weak, &ctx.env, &report);
                     for deferred in take_stop_waiters(&stop_phase) {
                         settle_stop(ctx.env.raw(), deferred, &report);
                     }
-                    // Release the event-loop reference after termination and resolution (ordering contract).
-                    unref_chunk_weak(&chunk_weak, &ctx.env);
+                    // Queued chunks have drained; retain cleanup before settling stop.
                     user.release();
                     if let Some(callback) = &on_event {
                         callback.release();
@@ -556,8 +585,8 @@ fn make_chunk_tsfn(
 /// Used when the chunk TSFN is Closing (no onChunk calls remain to deliver).
 ///
 /// Unref from creation. The chunk TSFN holds the loop while alive, keeping settlement deliverable.
-/// Even here (when chunks are no longer usable), unref the chunk TSFN after resolving and
-/// release onChunk's `napi_ref`.
+/// Even here (when chunks are no longer usable), retain unref failures before resolving
+/// and release onChunk's `napi_ref`.
 fn make_settle_tsfn(
     env: &Env,
     stop_phase: Arc<Mutex<StopPhase>>,
@@ -570,10 +599,10 @@ fn make_settle_tsfn(
         env.create_function_from_closure("flexaudioStopSettle", |ctx| ctx.env.get_undefined())?;
     let mut tsfn = pump.create_threadsafe_function::<(), Unknown, _, ErrorStrategy::Fatal>(0, {
         move |ctx: ThreadSafeCallContext<()>| {
+            unref_chunk_weak(&chunk_weak, &ctx.env, &report);
             for deferred in take_stop_waiters(&stop_phase) {
                 settle_stop(ctx.env.raw(), deferred, &report);
             }
-            unref_chunk_weak(&chunk_weak, &ctx.env);
             user.release();
             if let Some(callback) = &on_event {
                 callback.release();
@@ -1786,8 +1815,8 @@ impl FlexStream {
             StopPhase::Stopped => {
                 drop(phase);
                 self.join_finished_bridge();
+                unref_chunk_tsfn(self.chunk_tsfn.as_ref(), &env, &self.report);
                 settle_stop(env.raw(), deferred, &self.report);
-                unref_chunk_tsfn(self.chunk_tsfn.as_ref(), &env);
                 return Ok(promise);
             }
             StopPhase::Stopping { waiters } => {
@@ -1807,10 +1836,10 @@ impl FlexStream {
             None => {
                 // No join handle (e.g. taken by Drop's reaper). Callbacks to deliver are being
                 // cleaned up through another path, or are gone. Resolve immediately on the JS thread.
+                unref_chunk_tsfn(self.chunk_tsfn.as_ref(), &env, &self.report);
                 for d in take_stop_waiters(&self.stop_phase) {
                     settle_stop(env.raw(), d, &self.report);
                 }
-                unref_chunk_tsfn(self.chunk_tsfn.as_ref(), &env);
             }
             Some(h) => self.spawn_stop_worker(h),
         }
@@ -2379,8 +2408,15 @@ pub fn watch_devices(
     env: Env,
     #[napi(ts_arg_type = "(event: JsDeviceEvent) => void")] on_event: DeviceTsfn,
 ) -> napi::Result<DeviceWatcherHandle> {
-    let mut watcher =
-        flexaudio::watch_devices().map_err(|error| boundary::throw_error(&env, error))?;
+    let watcher = flexaudio::watch_devices().map_err(|error| boundary::throw_error(&env, error))?;
+    bridge_device_watcher(&env, watcher, on_event)
+}
+
+fn bridge_device_watcher(
+    env: &Env,
+    mut watcher: flexaudio::DeviceWatcher,
+    on_event: DeviceTsfn,
+) -> napi::Result<DeviceWatcherHandle> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let thread_stop = stop_flag.clone();
     let retained_callback = on_event.clone();
@@ -2401,7 +2437,7 @@ pub fn watch_devices(
             forward_device_events(&mut watcher, &on_event);
         })
         .map_err(|error| {
-            boundary::throw_error(&env, flexaudio::core::spawn_error("device bridge", error))
+            boundary::throw_error(env, flexaudio::core::spawn_error("device bridge", error))
         })?;
 
     Ok(DeviceWatcherHandle {
@@ -2409,6 +2445,16 @@ pub fn watch_devices(
         handle: Some(handle),
         on_event: Some(retained_callback),
     })
+}
+
+#[cfg(all(flexaudio_test_addon, feature = "test-faults", target_os = "linux"))]
+#[napi(js_name = "__watcherJoinFailure")]
+pub fn watcher_join_failure(env: Env, on_event: DeviceTsfn) -> napi::Result<DeviceWatcherHandle> {
+    bridge_device_watcher(
+        &env,
+        flexaudio::test_support::watcher_join_failure(),
+        on_event,
+    )
 }
 
 /// Test-only capability marker; absent from builds without fault injection.

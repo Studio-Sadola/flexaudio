@@ -285,7 +285,7 @@ mod tests {
     /// Measurement helper for choosing thresholds (not normally run): prints the RMS ratio for
     /// each test signal. Run with `cargo test -p flexaudio-denoise -- --ignored --nocapture measure`.
     #[test]
-    #[ignore]
+    #[ignore = "manual RMS threshold calibration; prints measurements without assertions"]
     fn measure_rms_ratios() {
         let white = white_noise(96_000, 0.3);
         let fan = lowpass(&white, 0.1);
