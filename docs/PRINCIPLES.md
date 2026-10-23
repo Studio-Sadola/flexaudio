@@ -44,6 +44,8 @@ network access is unnecessary; the VAD model is embedded.
    interface rather than implement separate decisions.
 5. **Failures remain visible and typed.** Capture and cleanup failures must not
    disappear into silence; retained errors and `ShutdownReport` expose them.
+   Equal failure values may be kept once in `ShutdownReport`. The caller still
+   receives the failure. Failures that do not compare equal are kept separately.
 6. **Versions keep their promises.** Patches fix bugs and documentation; minors
    add or change features. The default and compatibility changes below are made
    together in 0.9, not scattered across minors. Only the removal of `pts_ns`
