@@ -169,7 +169,9 @@ impl ShutdownReport {
     pub fn new(primary: Option<Error>, cleanup: Vec<Error>) -> Self {
         Self { primary, cleanup }
     }
-    /// First capture failure; cleanup-only failures do not become capture failures.
+    /// First capture failure. Later capture failures that do not compare equal are
+    /// grouped with it as related causes of [`Error::Multiple`]; cleanup-only
+    /// failures do not become capture failures.
     pub fn primary(&self) -> Option<&Error> {
         self.primary.as_ref()
     }

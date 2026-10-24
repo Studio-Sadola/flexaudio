@@ -1,4 +1,5 @@
 // Shared checked worker cleanup and control-thread failure reporting.
+use flexaudio_core::terminal_causes::retain_terminal_cause;
 use flexaudio_core::{Error, ErrorContext, ErrorGroup, Event, Operation, Result, ShutdownReport};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -94,12 +95,12 @@ pub(crate) fn finish_worker(
 
 pub(crate) fn push_backend_event(events: &BackendEvents, event: Event) {
     let mut queue = events.lock().unwrap_or_else(|poison| poison.into_inner());
-    // Keep the first capture failure independently of all queued cleanup failures.
+    // The first capture failure is the one terminal event; later distinct causes
+    // stay related to it in the report, independently of queued cleanup failures.
     if let Event::TerminalError { error } = &event {
-        if queue.primary.is_some() {
+        if !retain_terminal_cause(&mut queue.primary, error.clone()) {
             return;
         }
-        queue.primary = Some(error.clone());
     }
     queue.pending.push_back(event);
 }
@@ -110,4 +111,53 @@ pub(crate) fn poll_backend_event(events: &BackendEvents) -> Option<Event> {
         .unwrap_or_else(|poison| poison.into_inner())
         .pending
         .pop_front()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn terminal(error: Error) -> Event {
+        Event::TerminalError { error }
+    }
+
+    #[test]
+    fn later_distinct_terminal_cause_is_retained_and_equal_cause_collapses() {
+        let events = BackendEvents::default();
+        let second = Error::Backend("b".into());
+        push_backend_event(&events, terminal(Error::DeviceLost));
+        push_backend_event(&events, terminal(Error::DeviceLost));
+        push_backend_event(&events, terminal(second.clone()));
+        push_backend_event(&events, terminal(second.clone()));
+        let mut shutdown = None;
+        finish_worker(&mut None, &mut shutdown, &events, None);
+        let expected = Error::Multiple(ErrorGroup::new(Error::DeviceLost, second, Vec::new()));
+        assert_eq!(
+            shutdown,
+            Some(ShutdownReport::new(Some(expected), Vec::new()))
+        );
+        assert_eq!(
+            poll_backend_event(&events),
+            Some(terminal(Error::DeviceLost))
+        );
+        assert_eq!(poll_backend_event(&events), None);
+    }
+
+    #[test]
+    fn equal_terminal_cause_is_kept_once() {
+        let events = BackendEvents::default();
+        push_backend_event(&events, terminal(Error::DeviceLost));
+        push_backend_event(&events, terminal(Error::DeviceLost));
+        let mut shutdown = None;
+        finish_worker(&mut None, &mut shutdown, &events, None);
+        assert_eq!(
+            shutdown,
+            Some(ShutdownReport::new(Some(Error::DeviceLost), Vec::new()))
+        );
+        assert_eq!(
+            poll_backend_event(&events),
+            Some(terminal(Error::DeviceLost))
+        );
+        assert_eq!(poll_backend_event(&events), None);
+    }
 }

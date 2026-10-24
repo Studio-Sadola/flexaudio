@@ -2,6 +2,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+use flexaudio_core::terminal_causes::retain_terminal_cause;
 use flexaudio_core::types::{Error, Result};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -37,11 +38,9 @@ impl TerminalFailure {
     }
 
     /// The first terminal cause owns the backend's remaining lifetime. Stop does not reset it.
+    /// Later causes that do not compare equal stay related to the first, in observation order.
     pub(crate) fn record(&self, cause: Error) {
-        let mut error = self.state();
-        if error.is_none() {
-            *error = Some(cause);
-        }
+        retain_terminal_cause(&mut self.state(), cause);
     }
 
     pub(crate) fn check_start(&self, running: bool) -> Result<StartAction> {
@@ -60,7 +59,7 @@ impl TerminalFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flexaudio_core::types::Permission;
+    use flexaudio_core::types::{ErrorGroup, Permission};
     use std::sync::Arc;
 
     fn denial() -> Error {
@@ -90,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_failure_survives_owner_join_and_keeps_first_typed_cause() {
+    fn owner_failure_survives_owner_join_and_keeps_first_typed_cause_primary() {
         let terminal = Arc::new(TerminalFailure::default());
         let owner = terminal.clone();
         let cause = denial();
@@ -98,9 +97,32 @@ mod tests {
         std::thread::spawn(move || owner.record(owner_cause))
             .join()
             .unwrap();
-        terminal.record(Error::Backend("later shutdown error".into()));
-        assert_eq!(terminal.check_start(true), Err(cause.clone()));
-        assert_eq!(terminal.check_start(false), Err(cause));
+        let later = Error::Backend("later shutdown error".into());
+        terminal.record(later.clone());
+        let expected = Error::Multiple(ErrorGroup::new(cause, later, Vec::new()));
+        assert_eq!(terminal.check_start(true), Err(expected.clone()));
+        assert_eq!(terminal.check_start(false), Err(expected));
+    }
+
+    #[test]
+    fn later_distinct_cause_is_retained_and_equal_cause_collapses() {
+        let terminal = TerminalFailure::default();
+        let later = Error::Backend("b".into());
+        for cause in [
+            Error::DeviceLost,
+            Error::DeviceLost,
+            later.clone(),
+            later.clone(),
+        ] {
+            terminal.record(cause);
+        }
+        let expected = Error::Multiple(ErrorGroup::new(Error::DeviceLost, later, Vec::new()));
+        assert_eq!(terminal.error(), Some(expected));
+
+        let terminal = TerminalFailure::default();
+        terminal.record(Error::DeviceLost);
+        terminal.record(Error::DeviceLost);
+        assert_eq!(terminal.error(), Some(Error::DeviceLost));
     }
 
     #[test]
@@ -119,7 +141,9 @@ mod tests {
             let expected =
                 cause.unwrap_or_else(|| Error::Backend("backend terminal state poisoned".into()));
             assert_eq!(terminal.check_start(true), Err(expected.clone()));
-            terminal.record(Error::Backend("later failure".into()));
+            let later = Error::Backend("later failure".into());
+            terminal.record(later.clone());
+            let expected = Error::Multiple(ErrorGroup::new(expected, later, Vec::new()));
             assert_eq!(terminal.check_start(false), Err(expected));
         }
     }

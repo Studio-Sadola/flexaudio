@@ -79,6 +79,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A later terminal capture failure that differs from the first is no longer
+  dropped: Stream, Linux and macOS reports keep it with the first as primary in
+  `Error::Multiple`, as Mix already did. Equal causes are kept once, and only
+  the first failure produces the terminal event.
 - Preserve watcher teardown failures in C and Python error channels, Node callback unref failures in shutdown cleanup reports, rejected replacement failure notices as rollback cleanup, final-stop event polling panics, capture failures first observed during Python or Node garbage collection or bridge unwinding, and implicit FLAC finalization failures in all bindings.
 - Node: if `stop()` or FLAC `finalize()` is forgotten, failures observed during
   garbage collection are delivered as a process warning

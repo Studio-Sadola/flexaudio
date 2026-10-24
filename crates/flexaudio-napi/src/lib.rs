@@ -170,13 +170,41 @@ fn settle_stop(env: sys::napi_env, deferred: SendDeferred, report: &FinalReport)
         .map(Some),
     };
     match exception {
-        Ok(Some(exception)) => {
-            let _ = unsafe { sys::napi_reject_deferred(env, deferred.0, exception.raw()) };
-        }
+        Ok(Some(exception)) => reject_stop(env, deferred, unsafe { exception.raw() }),
         Ok(None) => resolve_undefined(env, deferred),
         Err(error) => {
             reject_stop_fallback(env, deferred, error);
         }
+    }
+}
+
+/// Reject a stop waiter with its rich exception. N-API reports a pending JS
+/// exception before it consumes the deferred, so that refusal is retried once
+/// after clearing the exception. Any other refusal may already have released the
+/// deferred, so it is never reused; the retained report still holds the outcome.
+fn reject_stop(env: sys::napi_env, deferred: SendDeferred, exception: sys::napi_value) {
+    for _ in 0..2 {
+        let status = unsafe { sys::napi_reject_deferred(env, deferred.0, exception) };
+        if status != sys::Status::napi_pending_exception {
+            return;
+        }
+        let mut pending = ptr::null_mut();
+        if unsafe { sys::napi_get_and_clear_last_exception(env, &mut pending) }
+            != sys::Status::napi_ok
+        {
+            return;
+        }
+    }
+}
+
+/// Final notifications use unbounded queues, so a refused call means the JS
+/// environment is closing and no receiver remains. A stream has already written
+/// the report that the notice announces; a collected encoder has no remaining
+/// owner, so its finalize failure cannot reach JS once the environment closes.
+fn queue_final_notice(status: Status) {
+    match status {
+        Status::Ok => {}
+        _refused_without_receiver => {}
     }
 }
 
@@ -2153,7 +2181,7 @@ fn finish_gc_shutdown(report: &FinalReport, notify: &SettleTsfn, requested: bool
         .unwrap_or_else(lock_poisoned)
         .get_or_insert_with(shutdown::ShutdownReport::default)
         .gc_requested = true;
-    notify.call((), ThreadsafeFunctionCallMode::NonBlocking);
+    queue_final_notice(notify.call((), ThreadsafeFunctionCallMode::NonBlocking));
 }
 
 // ---------------------------------------------------------------------------
@@ -2650,8 +2678,10 @@ pub struct FlacEncoder {
 impl Drop for FlacEncoder {
     fn drop(&mut self) {
         if let Err(error) = self.inner.finalize_on_drop() {
-            self.cleanup
-                .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+            queue_final_notice(
+                self.cleanup
+                    .call(error, ThreadsafeFunctionCallMode::NonBlocking),
+            );
         }
     }
 }

@@ -194,7 +194,7 @@ impl SharedState {
 
     /// Returned stop failures and backend notices share one classification/publication path.
     pub(super) fn record_backend_cleanup(&self, error: Error) {
-        if self.terminal.error().as_ref() == Some(&error) {
+        if self.terminal.retains(&error) {
             return;
         }
         self.record_cleanup(error.with_context(ErrorContext::new(Operation::Stop)));

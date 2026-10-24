@@ -20,15 +20,24 @@ impl TerminalFailure {
         self.error.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Whether `error` is already retained as the primary or a related cause.
+    pub(super) fn retains(&self, error: &Error) -> bool {
+        self.error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|retained| {
+                flexaudio_core::terminal_causes::retains_terminal_cause(retained, error)
+            })
+    }
+
     /// Caller holds the delivery lock. Publish the cause before closing delivery.
     /// Returns true only for the first failure (one terminal event per stream).
+    /// Later causes that do not compare equal stay related to the first.
     pub(super) fn record(&self, cause: Error) -> bool {
         let mut error = self.error.lock().unwrap_or_else(|e| e.into_inner());
-        if error.is_some() {
-            return false;
-        }
-        *error = Some(cause);
+        let first = flexaudio_core::terminal_causes::retain_terminal_cause(&mut error, cause);
         self.failed.store(true, Ordering::SeqCst);
-        true
+        first
     }
 }

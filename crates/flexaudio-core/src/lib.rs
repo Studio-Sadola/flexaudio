@@ -67,6 +67,7 @@ pub use settings::{
     SettingsReport,
 };
 pub mod startup;
+pub mod terminal_causes;
 pub mod types;
 mod vad_error;
 

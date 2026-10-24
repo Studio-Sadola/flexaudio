@@ -22,31 +22,7 @@ impl State {
     // Reconciliation can observe the same child error at startup and shutdown.
     // Retain each distinct cause once in observation order through one path.
     fn retain_terminal(&mut self, error: Error) -> bool {
-        let Some(previous) = self.primary.take() else {
-            self.primary = Some(error);
-            return true;
-        };
-        if previous == error {
-            self.primary = Some(previous);
-            return false;
-        }
-        let (primary, mut related) = match previous {
-            Error::Multiple(group) => (
-                group.primary().clone(),
-                group.secondary().cloned().collect::<Vec<_>>(),
-            ),
-            primary => (primary, Vec::new()),
-        };
-        if error != primary && !related.contains(&error) {
-            related.push(error);
-        }
-        self.primary = Some(if related.is_empty() {
-            primary
-        } else {
-            let first = related.remove(0);
-            Error::Multiple(flexaudio_core::ErrorGroup::new(primary, first, related))
-        });
-        false
+        flexaudio_core::terminal_causes::retain_terminal_cause(&mut self.primary, error)
     }
 }
 

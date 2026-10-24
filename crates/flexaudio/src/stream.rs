@@ -71,6 +71,8 @@ mod permission_tests;
 mod recovery_tests;
 #[cfg(test)]
 mod startup_tests;
+#[cfg(test)]
+mod terminal_cause_tests;
 
 /// RawRing capacity in f32 samples. Keep it independent of native SR×ch and large enough to avoid
 /// drops on the RT path (about 0.5 seconds of 48k stereo headroom). The mix source's composite
