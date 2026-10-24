@@ -45,6 +45,8 @@ pub(super) struct ShutdownReport {
     pub core: Option<flexaudio::core::ShutdownReport>,
     pub attachment: Vec<VadFailure>,
     pub binding_cleanup: Vec<flexaudio::Error>,
+    pub gc_requested: bool,
+    pub gc_reported: bool,
 }
 
 impl ShutdownReport {
@@ -53,6 +55,8 @@ impl ShutdownReport {
             core,
             attachment: Vec::new(),
             binding_cleanup: Vec::new(),
+            gc_requested: false,
+            gc_reported: false,
         }
     }
 
@@ -96,6 +100,41 @@ impl ShutdownReport {
             Err(error) => boundary::js_error(env, &error).map(Some),
         }
     }
+}
+
+/// GC has no Promise caller. A failure first observed by GC teardown is delivered once as a
+/// `FlexaudioShutdownWarning` through `process.emitWarning` (never as an uncaught exception),
+/// matching Python's `sys.unraisablehook`. The warning carries `cause` (the error `stop()` would
+/// reject with), its `audioError`, and the full `shutdownReport`.
+pub(super) fn report_gc_failure(env: &Env, report: &FinalReport) {
+    let Some((error, retained)) = take_gc_failure(report) else {
+        return;
+    };
+    let message =
+        format!("flexaudio Stream was garbage-collected without stop(); shutdown failed: {error}");
+    gc_warning::emit(env, &message, |warning| {
+        warning.set_named_property("cause", boundary::js_error(env, &error)?)?;
+        warning.set_named_property("audioError", boundary::audio_error(&error))?;
+        warning.set_named_property("shutdownReport", retained)
+    });
+}
+
+/// Claim the one GC notification, releasing the lock before any JS runs.
+fn take_gc_failure(report: &FinalReport) -> Option<(flexaudio::Error, boundary::JsShutdownReport)> {
+    let mut report = report.lock().unwrap_or_else(lock_poisoned);
+    let report = report
+        .as_mut()
+        .filter(|report| report.gc_requested && !report.gc_reported)?;
+    let outcome = report.outcome();
+    let error = outcome.result().err().or_else(|| {
+        outcome.cleanup().split_first().and_then(|(first, rest)| {
+            flexaudio::ShutdownReport::new(Some(first.clone()), rest.to_vec())
+                .result()
+                .err()
+        })
+    })?;
+    report.gc_reported = true;
+    Some((error, report.to_js()))
 }
 
 #[cfg(test)]
@@ -156,6 +195,7 @@ mod tests {
             core: None,
             attachment: vec![attachment_failure()],
             binding_cleanup: Vec::new(),
+            ..ShutdownReport::default()
         };
         let js = report.to_js();
         assert!(
@@ -177,6 +217,7 @@ mod tests {
             )),
             attachment: vec![attachment_failure()],
             binding_cleanup: Vec::new(),
+            ..ShutdownReport::default()
         };
         let js = report.to_js();
         let Either::A(primary) = js.primary else {
@@ -196,6 +237,7 @@ mod tests {
                 stage: VadFailureStage::StopFlush,
             }],
             binding_cleanup: Vec::new(),
+            ..ShutdownReport::default()
         };
         let js = report.to_js();
         assert!(matches!(js.primary, Either::B(Null)));
@@ -209,6 +251,7 @@ mod tests {
             core: None,
             attachment: vec![attachment_failure()],
             binding_cleanup: Vec::new(),
+            ..ShutdownReport::default()
         };
         assert!(report.outcome().result().is_ok());
         report.binding_cleanup.push(flexaudio::Error::Backend(

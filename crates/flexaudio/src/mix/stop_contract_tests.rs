@@ -8,6 +8,7 @@ crate::stop_contract::phases! {
     MixerJoin,
     TerminalAndStop,
     RestorePrevious,
+    FinalPollPanic,
 }
 
 fn clean() -> Box<dyn CaptureBackend> {
@@ -28,6 +29,11 @@ fn check(phase: Phase, observe: fn(&CompositeBackend)) {
     for checked_first in [false, true] {
         let (mic, system) = match phase {
             Phase::MicrophoneStop => (failing_backend(StopPhase::Stop), clean()),
+            Phase::FinalPollPanic => (
+                Box::new(crate::stream::stop_contract_tests::FinalPollPanic::default())
+                    as Box<dyn CaptureBackend>,
+                clean(),
+            ),
             Phase::SystemStop => (clean(), failing_backend(StopPhase::Stop)),
             Phase::TerminalAndStop => (failing_backend(StopPhase::TerminalAndStop), clean()),
             Phase::MixerJoin | Phase::RestorePrevious => (clean(), clean()),
@@ -53,8 +59,23 @@ fn check(phase: Phase, observe: fn(&CompositeBackend)) {
         } else {
             MixLane::Microphone
         };
-        let primary = matches!(phase, Phase::TerminalAndStop)
-            .then(|| lane_error(Error::Unsupported, Operation::Normalize, lane));
+        let primary = if matches!(phase, Phase::FinalPollPanic) {
+            Some(lane_error(
+                Error::Backend("mix child panicked during final event drain".into()),
+                Operation::Stop,
+                lane,
+            ))
+        } else {
+            matches!(phase, Phase::TerminalAndStop)
+                .then(|| lane_error(Error::Unsupported, Operation::Normalize, lane))
+        };
+        if matches!(phase, Phase::FinalPollPanic) {
+            assert_eq!(report.primary(), primary.as_ref());
+            assert!(report.cleanup().is_empty());
+            assert_eq!(mix.stop_checked(), report.result());
+            observe(&mix);
+            continue;
+        }
         let cleanup = if matches!(phase, Phase::MixerJoin) {
             Error::Backend("mix worker panicked".into())
                 .with_context(ErrorContext::new(Operation::Join))
@@ -73,6 +94,11 @@ fn check(phase: Phase, observe: fn(&CompositeBackend)) {
         assert_eq!(mix.stop_checked(), report.result());
         observe(&mix);
     }
+}
+
+#[test]
+fn mix_final_poll_panic_is_retained_for_both_stop_orders() {
+    check(Phase::FinalPollPanic, |_| {});
 }
 
 fn check_restore(observe: fn(&CompositeBackend)) {

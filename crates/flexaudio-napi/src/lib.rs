@@ -27,6 +27,7 @@ use callback::UserCallback;
 pub use capabilities::capabilities;
 pub use devices::devices_with_namespaces;
 mod flac_encoder;
+mod gc_warning;
 mod lifecycle;
 mod settings;
 mod settings_owner;
@@ -92,7 +93,8 @@ const DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // TSFN aliases using ErrorStrategy::Fatal. `.call(value, mode)` accepts values directly
 // (CalleeHandled uses `.call(Result<T>, mode)` and requires wrapping in Result).
 type ChunkTsfn = ThreadsafeFunction<ChunkEmit, ErrorStrategy::Fatal>;
-type SettleTsfn = ThreadsafeFunction<(), ErrorStrategy::Fatal>;
+// Cloning an aborted napi-rs TSFN panics; Arc cloning is safe during GC teardown.
+type SettleTsfn = Arc<ThreadsafeFunction<(), ErrorStrategy::Fatal>>;
 type EventTsfn = ThreadsafeFunction<JsStreamEvent, ErrorStrategy::Fatal>;
 type EventCallbacks = (Option<EventTsfn>, Option<Arc<UserCallback>>);
 type DeviceTsfn = ThreadsafeFunction<JsDeviceEvent, ErrorStrategy::Fatal>;
@@ -568,6 +570,7 @@ fn make_chunk_tsfn(
                     if let Some(callback) = &on_event {
                         callback.release();
                     }
+                    shutdown::report_gc_failure(&ctx.env, &report);
                     Ok(Vec::<Unknown>::new())
                 }
             }
@@ -607,11 +610,12 @@ fn make_settle_tsfn(
             if let Some(callback) = &on_event {
                 callback.release();
             }
+            shutdown::report_gc_failure(&ctx.env, &report);
             Ok(Vec::<Unknown>::new())
         }
     })?;
     tsfn.unref(env)?;
-    Ok(tsfn)
+    Ok(Arc::new(tsfn))
 }
 
 /// Queue StopFlushed on the chunk TSFN. On failure (Closing / QueueFull, etc.), use the settlement TSFN.
@@ -1433,6 +1437,8 @@ impl PairingBridge {
 
 /// Recording stream handle (`FlexStream`). Internally, the bridge thread polls captured audio
 /// and sends chunks/events to JS through TSFN.
+/// If `stop()` is forgotten, failures first observed by GC teardown are delivered as a
+/// `FlexaudioShutdownWarning` through `process.on('warning')`, never as uncaught exceptions.
 #[napi]
 pub struct FlexStream {
     // Native reports are queried from Stream while running and retained here at shutdown.
@@ -1488,7 +1494,7 @@ impl FlexStream {
                     .take()
                     .expect("bridge owns acquired resources");
                 let mut stream =
-                    settings_owner::SettingsOwner::new(stream, thread_settings.clone());
+                    settings_owner::SettingsOwner::new(stream, thread_settings.clone(), bridge.report.clone());
                 loop {
                     // Process commands together in the same iteration as polling.
                     while let Ok(cmd) = cmd_rx.try_recv() {
@@ -2094,12 +2100,14 @@ impl Drop for FlexStream {
         // GC path. Do not block the JS thread (GC) with join. Set stop_flag and join the handle
         // on a reaper thread. Resources (bridge, TSFN, capture) are destroyed when the bridge exits.
         // No Promise waiters exist (no explicit stop).
-        self.stop_flag.store(true, Ordering::SeqCst);
+        let gc_requested = !self.stop_flag.swap(true, Ordering::SeqCst);
+        let notify = self.settle_tsfn.clone();
         if let Some(h) = self.take_join_handle() {
             if h.is_finished() {
                 if h.join().is_err() {
                     record_bridge_failure(&self.report, &self.terminal);
                 }
+                finish_gc_shutdown(&self.report, &notify, gc_requested);
                 return;
             }
             let report = self.report.clone();
@@ -2108,6 +2116,7 @@ impl Drop for FlexStream {
             let worker_handle = retained.clone();
             let worker_report = report.clone();
             let worker_terminal = terminal.clone();
+            let worker_notify = notify.clone();
             if let Err(error) = thread::Builder::new()
                 .name("flexaudio-napi-reaper".into())
                 .spawn(move || {
@@ -2117,6 +2126,7 @@ impl Drop for FlexStream {
                             record_bridge_failure(&worker_report, &worker_terminal);
                         }
                     }
+                    finish_gc_shutdown(&worker_report, &worker_notify, gc_requested);
                 })
             {
                 record_cleanup_failure(&report, flexaudio::core::spawn_error("GC reaper", error));
@@ -2125,9 +2135,25 @@ impl Drop for FlexStream {
                         record_bridge_failure(&report, &terminal);
                     }
                 }
+                finish_gc_shutdown(&report, &notify, gc_requested);
             }
+        } else {
+            finish_gc_shutdown(&self.report, &notify, gc_requested);
         }
     }
+}
+
+fn finish_gc_shutdown(report: &FinalReport, notify: &SettleTsfn, requested: bool) {
+    // Publish only after joining, so the notification includes reaper/join failures too.
+    if !requested {
+        return;
+    }
+    report
+        .lock()
+        .unwrap_or_else(lock_poisoned)
+        .get_or_insert_with(shutdown::ShutdownReport::default)
+        .gc_requested = true;
+    notify.call((), ThreadsafeFunctionCallMode::NonBlocking);
 }
 
 // ---------------------------------------------------------------------------
@@ -2618,6 +2644,16 @@ pub fn open_mock_stream(
 #[napi]
 pub struct FlacEncoder {
     inner: flac_encoder::RotatingFlacEncoder,
+    cleanup: ThreadsafeFunction<flac_encoder::EncoderError, ErrorStrategy::Fatal>,
+}
+
+impl Drop for FlacEncoder {
+    fn drop(&mut self) {
+        if let Err(error) = self.inner.finalize_on_drop() {
+            self.cleanup
+                .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+        }
+    }
 }
 
 #[napi]
@@ -2626,6 +2662,7 @@ impl FlacEncoder {
     /// `channels` must be 1..=2, `sampleRate` 1..=96000 Hz (otherwise InvalidArg).
     #[napi(factory)]
     pub fn create(
+        env: Env,
         path: String,
         sample_rate: u32,
         channels: u16,
@@ -2638,7 +2675,18 @@ impl FlacEncoder {
             split_seconds,
         )
         .map_err(encode_err)?;
-        Ok(Self { inner })
+        let pump = env.create_function_from_closure("flexaudioEncoderCleanup", |ctx| {
+            ctx.env.get_undefined()
+        })?;
+        let mut cleanup = pump.create_threadsafe_function(
+            0,
+            |ctx: ThreadSafeCallContext<flac_encoder::EncoderError>| -> napi::Result<Vec<Unknown>> {
+                report_gc_encoder_failure(&ctx.env, ctx.value);
+                Ok(Vec::new())
+            },
+        )?;
+        cleanup.unref(&env)?;
+        Ok(Self { inner, cleanup })
     }
 
     /// Append interleaved f32 (length must be a multiple of `channels`, otherwise InvalidArg).
@@ -2649,11 +2697,49 @@ impl FlacEncoder {
     }
 
     /// Finalize and close the file. Repeated successful calls are no-ops; failures remain errors.
-    /// Dropping still makes a best-effort close, but finalize reports write errors.
+    /// If finalize is forgotten, GC close failures are delivered as a `FlexaudioShutdownWarning`
+    /// through `process.on('warning')`; finalize returns them directly.
     #[napi]
     pub fn finalize(&mut self) -> napi::Result<()> {
         self.inner.finalize().map_err(encode_err)
     }
+}
+
+/// A forgotten `finalize()` has no caller: deliver the close failure as a process warning whose
+/// `cause` is the error `finalize()` would have thrown (never an uncaught exception).
+fn report_gc_encoder_failure(env: &Env, error: flac_encoder::EncoderError) {
+    let message = format!(
+        "flexaudio FlacEncoder was garbage-collected without finalize(); close failed: {}",
+        error.reason
+    );
+    gc_warning::emit(env, &message, |warning| {
+        // Same projection as a thrown finalize() error, including its `code`.
+        warning.set_named_property(
+            "cause",
+            napi::JsError::from(encode_err(error)).into_unknown(*env),
+        )
+    });
+}
+
+#[cfg(all(flexaudio_test_addon, feature = "test-faults", target_os = "linux"))]
+#[napi(js_name = "__dropFailingEncoder")]
+pub fn drop_failing_encoder(env: Env, explicit: bool) -> napi::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (_reader, writer) = std::io::pipe()
+        .map_err(|error| NapiError::new(Status::GenericFailure, error.to_string()))?;
+    let mut encoder = FlacEncoder::create(
+        env,
+        format!("/proc/self/fd/{}", writer.as_raw_fd()),
+        16000,
+        1,
+        None,
+    )?;
+    encoder.inner.write_chunk(&[0.0]).map_err(encode_err)?;
+    if explicit {
+        return encoder.finalize();
+    }
+    drop(encoder);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -350,8 +350,7 @@ pub unsafe extern "C" fn flexaudio_flac_finalize(f: *mut FlexFlac) -> i32 {
 /// Release a FLAC handle. NULL-safe.
 ///
 /// If freed without finalize, `FlexFlac` still makes a best-effort attempt to
-/// write remaining data and finalize the header on release (errors are swallowed; call
-/// `flexaudio_flac_finalize` first to detect them reliably).
+/// write remaining data and finalize the header on release. Failures set last_error.
 ///
 /// # Safety
 /// `f` must be a handle returned by `flexaudio_flac_create` (or NULL).
@@ -359,8 +358,15 @@ pub unsafe extern "C" fn flexaudio_flac_finalize(f: *mut FlexFlac) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn flexaudio_flac_free(f: *mut FlexFlac) {
     guard_i32(|| {
+        clear_last_error();
         if !f.is_null() {
-            drop(Box::from_raw(f));
+            let mut encoder = Box::from_raw(f);
+            if matches!(encoder.inner.state, EncoderState::Open) {
+                if let Err(error) = encoder.inner.finalize() {
+                    return flac_err(error);
+                }
+            }
+            drop(encoder);
         }
         code::FLEX_OK
     });
@@ -368,6 +374,24 @@ pub unsafe extern "C" fn flexaudio_flac_free(f: *mut FlexFlac) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn free_reports_real_finalize_seek_failure() {
+        use std::os::fd::AsRawFd;
+        let (_reader, writer) = std::io::pipe().unwrap();
+        let path = std::ffi::CString::new(format!("/proc/self/fd/{}", writer.as_raw_fd())).unwrap();
+        let encoder = unsafe { super::flexaudio_flac_create(path.as_ptr(), 16000, 1, 0) };
+        assert!(!encoder.is_null());
+        assert_eq!(
+            unsafe { super::flexaudio_flac_write(encoder, [0.0_f32].as_ptr(), 1) },
+            0
+        );
+        unsafe { super::flexaudio_flac_free(encoder) };
+        assert_eq!(
+            crate::error::last_audio_error().unwrap().addon_kind(),
+            Some(flexaudio::core::AddonErrorKind::FlacIo)
+        );
+    }
     use super::*;
     use std::ffi::CString;
     use std::fs;

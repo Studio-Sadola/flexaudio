@@ -86,6 +86,13 @@ pub(super) struct RotatingFlacEncoder {
 }
 
 impl RotatingFlacEncoder {
+    pub(super) fn finalize_on_drop(&mut self) -> Result<()> {
+        if matches!(self.state, FlacEncoderState::Open) {
+            self.finalize()
+        } else {
+            Ok(())
+        }
+    }
     /// Create a FLAC writer. Omitted/0 `splitSeconds` uses one file; at least 1 enables timed rotation.
     ///
     /// `channels` must be 1..=2, `sampleRate` 1..=96000 Hz (otherwise InvalidArg). When splitting,

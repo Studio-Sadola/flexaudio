@@ -121,6 +121,11 @@ fn drain_backend_events_locked(
         let event = match std::panic::catch_unwind(AssertUnwindSafe(|| be.poll_event())) {
             Ok(event) => event,
             Err(_) => {
+                if delivery.is_some() {
+                    shared.record_backend_cleanup(Error::Backend(
+                        "backend panicked during poll_event".into(),
+                    ));
+                }
                 shared.push_event(Event::RecoverableError {
                     error: Error::Backend("backend panicked during poll_event".into()),
                 });

@@ -79,7 +79,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Preserve watcher teardown failures in C and Python error channels, Node callback unref failures in shutdown cleanup reports, and rejected replacement failure notices as rollback cleanup.
+- Preserve watcher teardown failures in C and Python error channels, Node callback unref failures in shutdown cleanup reports, rejected replacement failure notices as rollback cleanup, final-stop event polling panics, capture failures first observed during Python or Node garbage collection or bridge unwinding, and implicit FLAC finalization failures in all bindings.
+- Node: if `stop()` or FLAC `finalize()` is forgotten, failures observed during
+  garbage collection are delivered as a process warning
+  (`process.on('warning')`, name `FlexaudioShutdownWarning`, code
+  `FLEXAUDIO_GC_SHUTDOWN`) carrying the typed error, `audioError` and full
+  `shutdownReport`, instead of an uncaught exception, matching Python's
+  `sys.unraisablehook`. Explicit `stop()` and `finalize()` are unchanged.
 
 - Shutdown errors now identify capture workers, replacement rollback, Windows clients/event handles and macOS probe IOProc roles so independent failures remain distinct during deduplication.
 - Stop reports retain Windows handle-close and session destructor failures,

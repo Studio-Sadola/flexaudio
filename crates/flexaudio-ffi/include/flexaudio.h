@@ -1303,8 +1303,7 @@ int32_t flexaudio_flac_finalize(struct FlexFlac *f);
 // Release a FLAC handle. NULL-safe.
 //
 // If freed without finalize, `FlexFlac` still makes a best-effort attempt to
-// write remaining data and finalize the header on release (errors are swallowed; call
-// `flexaudio_flac_finalize` first to detect them reliably).
+// write remaining data and finalize the header on release. Failures set last_error.
 //
 // # Safety
 // `f` must be a handle returned by `flexaudio_flac_create` (or NULL).

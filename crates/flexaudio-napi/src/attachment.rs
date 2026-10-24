@@ -214,6 +214,8 @@ impl PairingBridge {
         // Preserve cleanup causes recorded by bridge lifetime management.
         if let Some(previous) = retained.take() {
             report.binding_cleanup = previous.binding_cleanup;
+            report.gc_requested = previous.gc_requested;
+            report.gc_reported = previous.gc_reported;
         }
         report.attachment = failures;
         *retained = Some(report);
@@ -447,6 +449,7 @@ mod tests {
             core: stream.shutdown_report(),
             attachment: attachment.failures.clone(),
             binding_cleanup: Vec::new(),
+            ..shutdown::ShutdownReport::default()
         }
         .to_js();
         let Either::A(primary) = &report.primary else {

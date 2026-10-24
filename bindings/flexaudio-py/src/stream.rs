@@ -9,7 +9,7 @@ mod secondary_delivery;
 #[path = "stream_settings.rs"]
 mod settings_capture;
 #[path = "stream_stop.rs"]
-mod shutdown;
+pub(crate) mod shutdown;
 #[cfg(feature = "test-faults")]
 #[path = "stream_test_backend.rs"]
 mod test_backend;
@@ -30,6 +30,7 @@ const LIFECYCLE_EVENT_CAPACITY: usize = 256;
 ///
 /// `open(...)` returns after calling `start()`. The caller periodically invokes `poll_chunk` /
 /// `poll_event`. Stop with `stop()`; a context manager (`with`) calls stop from `__exit__`.
+/// Stop failures first observed during garbage collection reach `sys.unraisablehook`.
 ///
 /// Integrated addons:
 /// - Open with `denoise=True` to apply RNNoise to canonical capture before both output taps

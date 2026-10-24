@@ -159,6 +159,8 @@ fn processes(py: Python<'_>) -> PyResult<Vec<marshal::PyProcessInfo>> {
 fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "test-faults")]
     m.add_function(wrap_pyfunction!(_vad_error_codes, m)?)?;
+    #[cfg(feature = "test-faults")]
+    m.add_function(wrap_pyfunction!(stream::shutdown::_stream_stop_failure, m)?)?;
     errors::register(m)?;
     // Functions.
     m.add_function(wrap_pyfunction!(capabilities::capabilities, m)?)?;

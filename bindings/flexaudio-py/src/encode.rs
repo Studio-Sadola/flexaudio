@@ -54,8 +54,7 @@ enum EncoderState {
 ///
 /// Files are opened only when the first chunk arrives (lazy creation). If finalized without
 /// writing anything and without splitting, no empty file is created. If dropped without
-/// finalize, the underlying `FlacWriter` attempts to close the file; call finalize to reliably
-/// detect errors.
+/// finalize, cleanup failures are reported through `sys.unraisablehook`.
 #[pyclass(module = "flexaudio", name = "FlacEncoder")]
 pub struct FlacEncoder {
     // Base path corresponding to `--out` (numbered-file prefix when splitting; used as-is otherwise).
@@ -71,6 +70,16 @@ pub struct FlacEncoder {
     // Number of files opened so far, used to choose the next sequence number.
     files_opened: u64,
     state: EncoderState,
+}
+
+impl Drop for FlacEncoder {
+    fn drop(&mut self) {
+        if matches!(self.state, EncoderState::Open) {
+            if let Err(error) = self.finalize() {
+                Python::attach(|py| error.write_unraisable(py, None));
+            }
+        }
+    }
 }
 
 impl FlacEncoder {

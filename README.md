@@ -623,7 +623,13 @@ For Node.js, use bigint arithmetic for chunk `seq`, VAD `captureSample`,
 chunk-drop and loss counts. VAD event `seq` and `epoch`, and PTS, use number. Chunk interfaces require
 `frameIndex`, and event types are closed discriminated unions. Lifecycle getters
 `terminalError()` / `shutdownReport()` return `undefined` when absent. Callback
-exceptions surface as `uncaughtException`.
+exceptions surface as `uncaughtException`. If `stop()` or FLAC `finalize()` is
+forgotten, failures observed during garbage collection are delivered as a process
+warning, not an exception: listen with `process.on('warning')` for
+`name === 'FlexaudioShutdownWarning'` (`code` `FLEXAUDIO_GC_SHUTDOWN`). Its `cause`
+is the typed error the explicit call would have produced, and a stream warning
+also carries `audioError` and the full `shutdownReport`. Python reports the same
+case through `sys.unraisablehook`.
 
 For Python, core failures raise typed exceptions carrying `.audio_error`:
 `InvalidArgumentError` / `UnsupportedFormatError` are `ValueError` subclasses;

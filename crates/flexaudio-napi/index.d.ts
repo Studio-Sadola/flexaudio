@@ -296,6 +296,29 @@ export interface ShutdownReport {
   cleanupErrors: readonly AudioError[]
 }
 
+/** Delivered once through `process.on('warning')` when a FlexStream is garbage-collected
+ * without `stop()` and its teardown failed. It never becomes an uncaught exception. */
+export interface StreamShutdownWarning extends Error {
+  name: 'FlexaudioShutdownWarning'
+  code: 'FLEXAUDIO_GC_SHUTDOWN'
+  /** The error `stop()` would have rejected with. */
+  cause: AudioException
+  audioError: AudioError
+  /** Every retained failure, as `shutdownReport()` would return it. */
+  shutdownReport: ShutdownReport
+}
+
+/** Delivered through `process.on('warning')` when a FlacEncoder is released without
+ * `finalize()` and closing failed. It never becomes an uncaught exception. */
+export interface EncoderShutdownWarning extends Error {
+  name: 'FlexaudioShutdownWarning'
+  code: 'FLEXAUDIO_GC_SHUTDOWN'
+  /** The error `finalize()` would have thrown. */
+  cause: Error
+}
+
+export type FlexaudioShutdownWarning = StreamShutdownWarning | EncoderShutdownWarning
+
 /** Arrival gaps without reopen emit no event/DISCONTINUITY: frameIndex stays contiguous,
  * primary and secondary arrival labels can jump, and attached Vad keeps its epoch open.
  * Stall: >=2 s without consumed samples, checked every 250 ms; stalled, reopen,
@@ -662,6 +685,8 @@ export declare function watchDevices(onEvent: (event: JsDeviceEvent) => void): D
 /**
  * Recording stream handle (`FlexStream`). Internally, the bridge thread polls captured audio
  * and sends chunks/events to JS through TSFN.
+ * If `stop()` is forgotten, failures observed during GC are delivered once as a
+ * `StreamShutdownWarning` through `process.on('warning')`, never as an uncaught exception.
  */
 export declare class FlexStream {
   /** Snapshot at successful open/switch commit; available after stop. */
@@ -769,7 +794,8 @@ export declare class FlacEncoder {
   /**
    * Write out the remainder, finalize the header, and close the open file. Safe to call repeatedly
    * (subsequent calls are no-ops). Releasing `FlacEncoder` without calling this still makes a
-   * best-effort attempt to close the file, but call `finalize()` to detect write errors.
+   * close attempt; a failure observed during GC is delivered as an `EncoderShutdownWarning`
+   * through `process.on('warning')`, never as an uncaught exception.
    */
   finalize(): void
 }

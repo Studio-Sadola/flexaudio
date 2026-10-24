@@ -11,6 +11,7 @@ crate::stop_contract::phases! {
     WatchdogJoin,
     StopAndReplacementRollback,
     ReplacementFinalFailures,
+    FinalPollPanic,
 }
 
 pub(crate) fn check_all(observe: fn(&Stream)) {
@@ -25,6 +26,17 @@ fn check(phase: Phase, observe: fn(&Stream)) {
             .with_context(ErrorContext::new(Operation::Stop))
             .with_context(ErrorContext::new(Operation::Stop));
         let (mut stream, primary, cleanup) = match phase {
+            Phase::FinalPollPanic => {
+                let stream =
+                    Stream::open(StreamConfig::default(), Box::new(FinalPollPanic::default()))
+                        .unwrap();
+                (
+                    stream,
+                    None,
+                    vec![Error::Backend("backend panicked during poll_event".into())
+                        .with_context(ErrorContext::new(Operation::Stop))],
+                )
+            }
             Phase::ReplacementFinalFailures => {
                 let mut stream = stop_failure(StopPhase::Stop).unwrap();
                 assert!(stream
@@ -111,6 +123,35 @@ fn check(phase: Phase, observe: fn(&Stream)) {
         assert_eq!(stream.shutdown_report(), Some(report.clone()));
         assert_eq!(stream.stop_checked(), report.result());
         observe(&stream);
+    }
+}
+
+#[test]
+fn final_poll_panic_is_retained_for_both_stop_orders() {
+    check(Phase::FinalPollPanic, |_| {});
+}
+
+#[derive(Default)]
+pub(crate) struct FinalPollPanic {
+    stopped: bool,
+    panicked: bool,
+}
+
+impl CaptureBackend for FinalPollPanic {
+    fn native_format(&self) -> (u32, u16) {
+        (48_000, 2)
+    }
+    fn start(&mut self, _: RawSink) -> Result<()> {
+        Ok(())
+    }
+    fn stop(&mut self) {
+        self.stopped = true;
+    }
+    fn poll_event(&mut self) -> Option<Event> {
+        if self.stopped && !std::mem::replace(&mut self.panicked, true) {
+            panic!("injected final poll failure");
+        }
+        None
     }
 }
 

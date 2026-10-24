@@ -57,8 +57,50 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        let first_shutdown = self.shutdown.is_none();
         self.retain_shutdown_outcome();
+        if first_shutdown {
+            if let Some(report) = &self.shutdown {
+                // Isolated VAD failures do not fail explicit stop, but GC must
+                // still deliver their retained diagnostics before destroying them.
+                let failure = report.result().err().or_else(|| {
+                    report.cleanup().split_first().and_then(|(first, rest)| {
+                        fa::ShutdownReport::new(Some(first.clone()), rest.to_vec())
+                            .result()
+                            .err()
+                    })
+                });
+                if let Some(error) = failure {
+                    Python::attach(|py| to_py_err(error).write_unraisable(py, None));
+                }
+            }
+        }
     }
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+#[pyfunction]
+pub(crate) fn _stream_stop_failure() -> PyResult<Stream> {
+    let inner =
+        fa::test_support::stop_failure(fa::test_support::StopPhase::Stop).map_err(to_py_err)?;
+    Ok(Stream {
+        inner,
+        shutdown: None,
+        local_events: Default::default(),
+        lifecycle_events: Default::default(),
+        capture_events: Default::default(),
+        settings: Default::default(),
+        vad_tap: None,
+        vad_events: Vec::new(),
+        vad_origin: (0, 0),
+        vad_error: None,
+        vad_cleanup: Vec::new(),
+        secondary: None,
+        ready_secondary: Default::default(),
+        vad_secondary: false,
+        secondary_metadata: (0, 0, 0, 0),
+        ready_chunks: Default::default(),
+    })
 }
 
 #[cfg(test)]
@@ -68,25 +110,7 @@ mod tests {
     use pyo3::types::PyDict;
 
     fn fixture() -> Stream {
-        let inner = fa::test_support::stop_failure(fa::test_support::StopPhase::Stop).unwrap();
-        Stream {
-            inner,
-            shutdown: None,
-            local_events: Default::default(),
-            lifecycle_events: Default::default(),
-            capture_events: Default::default(),
-            settings: Default::default(),
-            vad_tap: None,
-            vad_events: Vec::new(),
-            vad_origin: (0, 0),
-            vad_error: None,
-            vad_cleanup: Vec::new(),
-            secondary: None,
-            ready_secondary: Default::default(),
-            vad_secondary: false,
-            secondary_metadata: (0, 0, 0, 0),
-            ready_chunks: Default::default(),
-        }
+        _stream_stop_failure().unwrap()
     }
     #[test]
     fn cleanup_only_failure_is_retained_and_context_body_remains_primary() {
