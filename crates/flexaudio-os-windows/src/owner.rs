@@ -121,12 +121,9 @@ impl OwnerShutdown {
             .cloned()
             .chain(self.cleanup.take())
             .collect();
-        let report = ShutdownReport::new(Some(error.clone()), cleanup);
+        let report = ShutdownReport::new(Some(error), cleanup);
         let result = report.result();
-        if self.report.is_none() {
-            self.events.push_back(Event::TerminalError { error });
-        }
-        self.retain(report);
+        self.retain(ShutdownReport::new(None, report.cleanup().to_vec()));
         result
     }
 
@@ -181,6 +178,21 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn failed_start_has_clean_shutdown_and_no_terminal_notice() {
+        let mut shutdown = OwnerShutdown::default();
+        assert_eq!(
+            shutdown.retain_start_failure(
+                Error::DeviceNotFound,
+                thread::spawn(|| ShutdownReport::new(None, Vec::new())),
+            ),
+            Err(Error::DeviceNotFound)
+        );
+        assert_eq!(shutdown.finish(None), Ok(()));
+        assert!(shutdown.report.as_ref().unwrap().primary().is_none());
+        assert!(shutdown.poll_event().is_none());
+    }
+
+    #[test]
     fn startup_failure_retains_join_cleanup() {
         let mut shutdown = OwnerShutdown::default();
         let worker = thread::spawn(|| panic!("injected startup owner panic"));
@@ -194,15 +206,10 @@ mod tests {
             shutdown.retain_start_failure(primary, worker),
             expected.result()
         );
-        assert_eq!(shutdown.report, Some(expected.clone()));
-        assert_eq!(shutdown.finish(None), expected.result());
-        assert_eq!(shutdown.report, Some(expected.clone()));
-        assert_eq!(
-            shutdown.poll_event(),
-            Some(Event::TerminalError {
-                error: expected.primary().unwrap().clone(),
-            })
-        );
+        let retained = ShutdownReport::new(None, expected.cleanup().to_vec());
+        assert_eq!(shutdown.report, Some(retained.clone()));
+        assert_eq!(shutdown.finish(None), retained.result());
+        assert_eq!(shutdown.report, Some(retained));
         assert_eq!(
             shutdown.poll_event(),
             Some(Event::ShutdownError {

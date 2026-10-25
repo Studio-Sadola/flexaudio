@@ -69,7 +69,7 @@ impl FlexStream {
             self.stop_vad_tap();
         }
         self.queue_secondary_input();
-        cleanup.extend(self.vad_cleanup.iter().cloned());
+        cleanup.extend(self.vad_state.cleanup_errors());
         let report = ShutdownReport::new(core.primary().cloned(), cleanup);
         self.shutdown = Some(report);
     }
@@ -92,8 +92,7 @@ mod tests {
             vad_tap: None,
             vad_events: Vec::new(),
             vad_origin: (0, 0),
-            vad_error: None,
-            vad_cleanup: Vec::new(),
+            vad_state: Default::default(),
             ready_chunks: Default::default(),
         };
         // The C caller receives both its legacy status and a separately owned typed report.

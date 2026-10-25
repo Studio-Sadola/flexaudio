@@ -223,11 +223,11 @@ function assertFailureOrder(log, before = log.length) {
   return event;
 }
 
-function assertVADReport(stream, code = 'Inference') {
+function assertVADReport(stream, code = 'Inference', count = 1) {
   const report = stream.shutdownReport();
   assert.equal(report.primary, null, 'an attached VAD-only failure is never the capture primary');
   const attachment = report.cleanupErrors.filter(error => typeof error.vadCode === 'string');
-  assert.equal(attachment.length, 1, 'the failure is retained once as a cleanup cause');
+  assert.equal(attachment.length, count, 'distinct failures are retained once as cleanup causes');
   assert.equal(attachment[0].vadCode, code);
   assert.equal(stream.terminalError(), undefined, 'terminalError means capture primary only');
 }
@@ -338,13 +338,31 @@ test('one failed reset at a real boundary stays failed until explicit flush succ
   const newOrigins = () => log.flatMap(entry => entry.kind === 'chunk' ? entry.events : [])
     .filter(event => event.type === 'epochStart' && event.epoch > failedEpoch);
   assert.equal(newOrigins().length, 0, 'a failed reset must not publish a new origin on later contiguous chunks');
-  assert.equal(log.filter(entry => entry.kind === 'event' && entry.event.type === 'vadFailed').length, 1,
-    'a failed reinitialization must not repeat the failure event');
+  assert.equal(log.filter(entry => entry.kind === 'event' && entry.event.type === 'vadFailed').length, 2,
+    'the distinct reset failure must be reported after the original failure');
   await stream.flushVad();
   await waitFor(() => newOrigins().length > 0, 'successful explicit flush must permit the next epochStart');
   assert.equal(newOrigins()[0].seq, 0);
   await stream.stop();
-  assertVADReport(stream);
+  assertVADReport(stream, 'Inference', 2);
+});
+
+test('flushVad rejects with the new reset failure and retains both failures', faultTests, async t => {
+  const log = [];
+  const stream = openVADMock(t, log, 3, 1);
+  await waitFor(() => failureIndex(log) >= 0, 'the initial model failure must be delivered');
+  await assert.rejects(stream.flushVad(), error => {
+    assert.equal(error.code, 'Inference');
+    assert.equal(error.audioError.secondary[0].addonKind, 'vadReset');
+    return true;
+  });
+  const failures = log.filter(entry => entry.kind === 'event' && entry.event.type === 'vadFailed');
+  assert.equal(failures.length, 2);
+  assert.equal(failures[0].event.error.contexts[0].operation, 'normalize');
+  assert.equal(failures[1].event.error.contexts[0].operation, 'flush');
+  assert.equal(failures[1].event.error.secondary[0].addonKind, 'vadReset');
+  await stream.stop();
+  assertVADReport(stream, 'Inference', 2);
 });
 
 test('attached primary and secondary close epochs before flush and stop settle',

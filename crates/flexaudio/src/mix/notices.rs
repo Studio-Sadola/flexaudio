@@ -46,11 +46,6 @@ impl Notices {
     pub(super) fn failed(&self) -> bool {
         self.failed.load(Ordering::SeqCst)
     }
-    pub(super) fn retain_primary(&self, error: Error) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.retain_terminal(error);
-        self.failed.store(true, Ordering::SeqCst);
-    }
     pub(super) fn fail(&self, error: Error) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.retain_terminal(error) {
@@ -153,8 +148,8 @@ mod tests {
         let notices = Notices::default();
         notices.fail(Error::DeviceLost);
         notices.fail(Error::Backend("second lane failed".into()));
-        notices.retain_primary(Error::InvalidState("third lane failed".into()));
-        notices.retain_primary(Error::DeviceLost);
+        notices.fail(Error::InvalidState("third lane failed".into()));
+        notices.fail(Error::DeviceLost);
         let report = notices.report();
         match report.primary().unwrap() {
             Error::Multiple(group) => {

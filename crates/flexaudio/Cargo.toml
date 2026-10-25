@@ -41,6 +41,7 @@ default-target = "x86_64-unknown-linux-gnu"
 targets = ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
 
 [dev-dependencies]
+flexaudio-core = { path = "../flexaudio-core", features = ["test-support"] }
 flexaudio-mic = { path = "../flexaudio-mic", features = ["test-support"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

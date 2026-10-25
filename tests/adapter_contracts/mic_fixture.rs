@@ -177,7 +177,7 @@ fn microphone_runtime_error_control() {
     assert!(backend.poll_event().is_none());
 }
 #[test]
-fn runtime_failure_closes_pcm_retains_first_cause_and_survives_stop() {
+fn runtime_failure_closes_pcm_retains_distinct_causes_and_survives_stop() {
     let (mut backend, stream, mut consumer) = callback_fixture();
     stream.error.borrow_mut()(stream_error("first native failure"));
     stream.error.borrow_mut()(stream_error("second native failure"));
@@ -188,9 +188,15 @@ fn runtime_failure_closes_pcm_retains_first_cause_and_survives_stop() {
         error: Error::Backend("microphone capture failed: first native failure".into()),
     }));
     assert!(backend.poll_event().is_none());
+    let expected = Error::Multiple(flexaudio_core::ErrorGroup::new(
+        Error::Backend("microphone capture failed: first native failure".into()),
+        Error::Backend("microphone capture failed: second native failure".into()),
+        Vec::new(),
+    ));
+    assert_eq!(backend.shutdown_report().unwrap().primary(), Some(&expected));
     let (producer, _) = flexaudio_core::raw_ring(16);
     assert_eq!(backend.start(RawSink::new(producer, 48_000, 1)),
-        Err(Error::Backend("microphone capture failed: first native failure".into())));
+        Err(expected));
 }
 #[test]
 fn microphone_duplicate_name() {
@@ -216,6 +222,21 @@ fn microphone_query_failure() {
 fn microphone_query_failure_control() {
     host(vec![], None);
     assert_eq!(list_devices().unwrap(), vec![]);
+}
+#[test]
+fn legacy_constructor_discovery_failure_is_only_returned_from_start() {
+    host(vec![], None);
+    let mut backend = CpalMicBackend::new(None);
+    assert_eq!(backend.native_format(), FALLBACK_FORMAT);
+    for _ in 0..2 {
+        assert!(backend.poll_event().is_none());
+        let (producer, _consumer) = flexaudio_core::raw_ring(16);
+        assert_eq!(backend.start(RawSink::new(producer, FALLBACK_FORMAT.0, FALLBACK_FORMAT.1)), Err(Error::DeviceNotFound));
+        assert!(backend.handle.is_none());
+        assert_eq!(backend.stop_checked(), Ok(()));
+        assert_eq!(backend.shutdown_report(), Some(&ShutdownReport::new(None, Vec::new())));
+        assert!(backend.poll_event().is_none());
+    }
 }
 #[test]
 fn microphone_config_failure() {
@@ -309,7 +330,7 @@ fn microphone_join_failure_control() {
     assert!(backend.poll_event().is_none());
 }
 #[test]
-fn failed_start_preserves_primary_join_cause_and_previous_shutdown_cleanup() {
+fn failed_start_returns_start_cause_and_preserves_only_shutdown_cleanup() {
     // The fixture owner exits by panic before readiness without any native calls.
     for previous_panics in [false, true] {
         let mut backend = owner_fixture(previous_panics);
@@ -329,12 +350,13 @@ fn failed_start_preserves_primary_join_cause_and_previous_shutdown_cleanup() {
             .with_context(ErrorContext::new(Operation::Join));
         assert_eq!(cleanup.last(), Some(&&join_error));
         let report = backend.shutdown_report().unwrap().clone();
-        assert_eq!(report.primary(), Some(group.primary()));
+        assert!(report.primary().is_none());
         assert_eq!(report.cleanup().iter().collect::<Vec<_>>(), cleanup);
-        assert_eq!(report.result(), Err(error.clone()));
+        let expected_stop = ShutdownReport::new(None, cleanup.iter().map(|error| (*error).clone()).collect()).result();
+        assert_eq!(report.result(), expected_stop);
         assert!(backend.handle.is_none());
         assert!(backend.stop_flag.load(Ordering::SeqCst));
-        assert_eq!(backend.stop_checked(), Err(error));
+        assert_eq!(backend.stop_checked(), expected_stop);
         assert_eq!(backend.shutdown_report(), Some(&report));
         backend.stop();
         assert_eq!(backend.shutdown_report(), Some(&report));

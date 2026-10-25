@@ -430,7 +430,7 @@ impl FlexStream {
         }
         let result = flush(self.vad_tap.as_mut().expect("enabled attachment"));
         let flush_error = result.as_ref().err().map(|failure| failure.error.clone());
-        self.accept_vad_tap(result, flexaudio::Operation::Flush);
+        self.accept_vad_tap(result, flexaudio_vad::VadAttachmentStage::RuntimeFlush);
         self.queue_vad_carrier();
         if let Some(error) = flush_error {
             return reject_tap(error);
@@ -441,26 +441,11 @@ impl FlexStream {
     pub(crate) fn accept_vad_tap(
         &mut self,
         result: Result<Vec<flexaudio_vad::AttachedVadEvent>, flexaudio_vad::VadTapFailure>,
-        operation: flexaudio::Operation,
+        stage: flexaudio_vad::VadAttachmentStage,
     ) {
-        match result {
-            Ok(events) => {
-                if matches!(
-                    operation,
-                    flexaudio::Operation::Normalize | flexaudio::Operation::Flush
-                ) {
-                    self.vad_error = None;
-                }
-                self.vad_events.extend(events);
-            }
-            Err(failure) => {
-                self.vad_events.extend(failure.terminal_events);
-                if self.vad_error.is_none() {
-                    self.vad_cleanup.push(failure.error.audio_error());
-                    self.vad_error = Some(failure.error);
-                }
-            }
-        }
+        let owner_failed = self.vad_tap.as_ref().is_some_and(|owner| owner.is_failed());
+        let (events, _) = self.vad_state.accept(result, stage, owner_failed);
+        self.vad_events.extend(events);
     }
     pub(crate) fn drain_vad_capture(&mut self) {
         if self.vad_tap.is_none() {
@@ -480,7 +465,7 @@ impl FlexStream {
                     chunk.pts_ns + (chunk.frames as i64 * 1_000_000_000 / 48_000),
                 );
             }
-            self.accept_vad_tap(result, flexaudio::Operation::Normalize);
+            self.accept_vad_tap(result, flexaudio_vad::VadAttachmentStage::Process);
         }
     }
     pub(crate) fn versioned_chunk(&mut self, chunk: FlexChunk) -> FlexChunkV2 {
@@ -560,7 +545,7 @@ impl FlexStream {
             .expect("canonical attachment preserves PCM processing");
         if let Some(tap) = self.vad_tap.as_mut() {
             let result = tap.stop();
-            self.accept_vad_tap(result, flexaudio::Operation::Stop);
+            self.accept_vad_tap(result, flexaudio_vad::VadAttachmentStage::StopFlush);
             self.queue_vad_carrier();
         }
     }
@@ -628,8 +613,7 @@ mod tests {
             vad_tap: None,
             vad_events: Vec::new(),
             vad_origin: (0, 0),
-            vad_error: None,
-            vad_cleanup: Vec::new(),
+            vad_state: Default::default(),
             ready_chunks: Default::default(),
         };
         let mut chunk = empty_carrier((0, 0));
@@ -706,8 +690,7 @@ mod tests {
                 vad_tap: Some(vad_tap),
                 vad_events: Vec::new(),
                 vad_origin: (0, 0),
-                vad_error: None,
-                vad_cleanup: Vec::new(),
+                vad_state: Default::default(),
                 ready_chunks: Default::default(),
             };
             for expected in [0, 960] {

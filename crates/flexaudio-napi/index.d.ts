@@ -309,7 +309,8 @@ export interface StreamShutdownWarning extends Error {
 }
 
 /** Delivered through `process.on('warning')` when a FlacEncoder is released without
- * `finalize()` and closing failed. It never becomes an uncaught exception. */
+ * `finalize()` and closing failed. The encoder warning carries `cause`; it has no
+ * `audioError` or `shutdownReport` fields. It never becomes an uncaught exception. */
 export interface EncoderShutdownWarning extends Error {
   name: 'FlexaudioShutdownWarning'
   code: 'FLEXAUDIO_GC_SHUTDOWN'

@@ -269,8 +269,7 @@ unsafe fn open_with_exclude_pids_using(
                     vad_tap: None,
                     vad_events: Vec::new(),
                     vad_origin: (0, 0),
-                    vad_error: None,
-                    vad_cleanup: Vec::new(),
+                    vad_state: Default::default(),
                     ready_chunks: std::collections::VecDeque::new(),
                     inner,
                 }))
@@ -302,7 +301,15 @@ pub unsafe extern "C" fn flexaudio_free(s: *mut FlexStream) {
             return v2::invalid();
         }
         let mut stream = Box::from_raw(s);
-        let result = stream.stop_binding();
+        let result = stream.stop_binding().and_then(|()| {
+            let report = stream.shutdown.as_ref().expect("completed C shutdown");
+            match report.cleanup().split_first() {
+                Some((first, rest)) => {
+                    flexaudio::ShutdownReport::new(Some(first.clone()), rest.to_vec()).result()
+                }
+                None => Ok(()),
+            }
+        });
         drop(stream);
         match result {
             Ok(()) => code::FLEX_OK,
@@ -1021,8 +1028,7 @@ mod permission_tests {
             vad_tap: None,
             vad_events: Vec::new(),
             vad_origin: (0, 0),
-            vad_error: None,
-            vad_cleanup: Vec::new(),
+            vad_state: Default::default(),
             ready_chunks: std::collections::VecDeque::new(),
             inner: denied_stream(),
         };
@@ -1061,8 +1067,7 @@ mod permission_tests {
             vad_tap: None,
             vad_events: Vec::new(),
             vad_origin: (0, 0),
-            vad_error: None,
-            vad_cleanup: Vec::new(),
+            vad_state: Default::default(),
             ready_chunks: std::collections::VecDeque::new(),
             inner,
         };

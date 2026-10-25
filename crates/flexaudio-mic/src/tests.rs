@@ -84,7 +84,7 @@ fn unavailable_runtime_device_uses_typed_device_lost_without_text_classification
 }
 
 #[test]
-fn runtime_mailbox_has_one_writer_and_one_delivery_per_generation() {
+fn runtime_mailbox_retains_four_writes_and_reports_concurrent_overflow() {
     let stop = Arc::new(AtomicBool::new(false));
     let mailbox = Arc::new(callback_mailbox::CallbackMailbox::new(stop.clone()));
     thread::scope(|scope| {
@@ -100,16 +100,79 @@ fn runtime_mailbox_has_one_writer_and_one_delivery_per_generation() {
         }
     });
     assert!(stop.load(Ordering::SeqCst));
-    let Some(callback_mailbox::CallbackFailure::Native(error)) = mailbox.take() else {
-        panic!("native CPAL cause must remain typed");
-    };
+    for _ in 0..4 {
+        assert_eq!(
+            mailbox.take(),
+            Some(Error::Backend(
+                "microphone capture failed: A backend-specific error has occurred: injected CPAL failure".into()
+            ))
+        );
+    }
     assert_eq!(
-        error.to_string(),
-        "A backend-specific error has occurred: injected CPAL failure"
+        mailbox.take(),
+        Some(Error::Backend(
+            "microphone callback failure mailbox full: 4 further callback failures were not retained"
+                .into()
+        ))
     );
     assert!(mailbox.take().is_none());
     mailbox.record(cpal::StreamError::DeviceNotAvailable);
+    assert_eq!(
+        mailbox.take(),
+        Some(Error::Backend(
+            "microphone callback failure mailbox full: 1 further callback failures were not retained"
+                .into()
+        ))
+    );
     assert!(mailbox.take().is_none());
+}
+
+#[test]
+fn callback_failures_retain_distinct_values_once_and_emit_one_terminal_event() {
+    flexaudio_core::test_support::assert_distinct_failures_retained(
+        Error::DeviceLost,
+        Error::Backend(
+            "microphone capture failed: A backend-specific error has occurred: second callback failure"
+                .into(),
+        ),
+        |first, _second| {
+            let mut backend = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
+            backend
+                .callback_errors
+                .record(cpal::StreamError::DeviceNotAvailable);
+            backend
+                .callback_errors
+                .record(cpal::StreamError::DeviceNotAvailable);
+            backend.callback_errors.record(cpal::StreamError::BackendSpecific {
+                err: cpal::BackendSpecificError {
+                    description: "second callback failure".into(),
+                },
+            });
+            assert_eq!(backend.poll_event(), Some(Event::TerminalError { error: first }));
+            assert!(backend.poll_event().is_none());
+            backend.stop_checked().expect_err("both callback failures must survive stop")
+        },
+    );
+}
+
+#[test]
+fn callback_overflow_is_retained_in_shutdown_report() {
+    let mut backend = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
+    for _ in 0..7 {
+        backend
+            .callback_errors
+            .record(cpal::StreamError::DeviceNotAvailable);
+    }
+    backend.stop();
+    let expected = Error::Multiple(flexaudio_core::ErrorGroup::new(
+        Error::DeviceLost,
+        Error::Backend(
+            "microphone callback failure mailbox full: 3 further callback failures were not retained"
+                .into(),
+        ),
+        Vec::new(),
+    ));
+    assert_eq!(backend.shutdown_report().unwrap().primary(), Some(&expected));
 }
 
 #[test]
@@ -352,12 +415,19 @@ fn infallible_constructor_retains_query_failure_before_start() {
         Error::Backend("input configuration query failed; reconnect the device and retry".into())
             .with_context(ErrorContext::new(Operation::Enumerate));
     let mut backend = CpalMicBackend::from_query_result(None, Err(cause.clone()));
-    assert_eq!(backend.terminal_error, Some(cause.clone()));
-    assert_eq!(
-        backend.poll_event(),
-        Some(Event::TerminalError { error: cause })
-    );
-    assert_eq!(backend.poll_event(), None);
+    assert!(backend.terminal_error.is_none());
+    assert_eq!(backend.query_error, Some(cause.clone()));
+    assert_eq!(backend.native_format(), FALLBACK_FORMAT);
+    for _ in 0..2 {
+        assert!(backend.poll_event().is_none());
+        let (producer, _consumer) = raw_ring(16);
+        assert_eq!(backend.start(RawSink::new(producer, FALLBACK_FORMAT.0, FALLBACK_FORMAT.1)), Err(cause.clone()));
+        assert!(backend.handle.is_none(), "cached query failure must prevent capture with a placeholder format");
+        assert_eq!(backend.stop_checked(), Ok(()));
+        assert_eq!(backend.shutdown_report(), Some(&ShutdownReport::new(None, Vec::new())));
+        assert!(backend.terminal_error.is_none());
+        assert!(backend.poll_event().is_none());
+    }
 }
 
 #[test]

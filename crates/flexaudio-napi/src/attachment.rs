@@ -9,8 +9,7 @@ pub(super) struct VadBridge {
     owner: CaptureVad,
     pub tap: VadTap,
     events: Vec<AttachedVadEvent>,
-    pub error: Option<VadTapError>,
-    failures: Vec<shutdown::VadFailure>,
+    pub(super) state: flexaudio_vad::VadAttachmentState,
     notifications: VecDeque<(shutdown::VadFailure, u32)>,
     /// Latest epoch published on the selected tap, for the failure notification.
     pub last_epoch: u32,
@@ -38,8 +37,7 @@ impl VadBridge {
             owner: CaptureVad::new(params, options)?,
             tap,
             events: Vec::new(),
-            error: None,
-            failures: Vec::new(),
+            state: Default::default(),
             notifications: VecDeque::new(),
             last_epoch: 0,
             last_frame_index: 0,
@@ -68,35 +66,13 @@ impl VadBridge {
         result: Result<Vec<AttachedVadEvent>, VadTapFailure>,
         stage: shutdown::VadFailureStage,
     ) {
-        match result {
-            Ok(events) => {
-                if matches!(
-                    stage,
-                    shutdown::VadFailureStage::Process | shutdown::VadFailureStage::RuntimeFlush
-                ) {
-                    self.error = None;
-                }
-                for event in &events {
-                    self.last_epoch = event.epoch();
-                }
-                self.events.extend(events);
-            }
-            Err(failure) => {
-                for event in &failure.terminal_events {
-                    self.last_epoch = event.epoch();
-                }
-                self.events.extend(failure.terminal_events);
-                if self.error.is_none() {
-                    let retained = shutdown::VadFailure {
-                        error: failure.error.clone(),
-                        stage,
-                    };
-                    self.notifications
-                        .push_back((retained.clone(), self.last_epoch));
-                    self.failures.push(retained);
-                    self.error = Some(failure.error);
-                }
-            }
+        let (events, failure) = self.state.accept(result, stage, self.owner.is_failed());
+        for event in &events {
+            self.last_epoch = event.epoch();
+        }
+        self.events.extend(events);
+        if let Some(failure) = failure {
+            self.notifications.push_back((failure, self.last_epoch));
         }
     }
 
@@ -149,7 +125,7 @@ impl VadBridge {
             }
             if let Some(chunk) = stream.poll_capture_ordered() {
                 self.process(chunk);
-                return match self.error.as_ref() {
+                return match self.state.latest_error() {
                     Some(error) => Err(error.audio_error()),
                     None => Ok(()),
                 };
@@ -187,6 +163,11 @@ impl PairingBridge {
         if stopping && std::mem::take(&mut attachment.inject_stop_failure) {
             attachment.owner.inject_failure();
         }
+        #[cfg(feature = "test-faults")]
+        if !stopping && attachment.reset_failures > 0 && attachment.owner.is_failed() {
+            attachment.reset_failures -= 1;
+            attachment.owner.inject_reset_failure();
+        }
         let result = if stopping {
             attachment.owner.stop()
         } else {
@@ -207,7 +188,7 @@ impl PairingBridge {
         let failures = self
             .attachment
             .as_ref()
-            .map(|owner| owner.failures.clone())
+            .map(|owner| owner.state.failures().to_vec())
             .unwrap_or_default();
         let mut retained = self.report.lock().unwrap_or_else(lock_poisoned);
         let mut report = shutdown::ShutdownReport::from_core(core);
@@ -331,13 +312,13 @@ pub(super) fn failure_event(
         permission: None,
         kind: "vadFailed".to_string(),
         count: None,
-        error: Some(
-            shutdown::VadFailure {
+        error: Some(boundary::audio_error(
+            &shutdown::VadFailure {
                 error: error.clone(),
                 stage,
             }
             .audio_error(),
-        ),
+        )),
         loss: None,
         message: None,
         epoch: Some(epoch),
@@ -386,6 +367,45 @@ pub(super) fn settle_flush(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "test-faults")]
+    #[test]
+    fn attachment_retains_distinct_reset_failure_and_flush_uses_latest() {
+        let mut bridge =
+            VadBridge::new(Default::default(), Default::default(), VadTap::Primary).unwrap();
+        bridge.owner.inject_failure();
+        let result = bridge.owner.process(&[0.2; 1920], 0, 0, false);
+        let first = result.as_ref().unwrap_err().error.clone();
+        bridge.accept(result, shutdown::VadFailureStage::Process);
+        bridge.owner.inject_reset_failure();
+        let result = bridge.owner.flush();
+        let second = result.as_ref().unwrap_err().error.clone();
+        assert_ne!(first, second);
+        bridge.accept(result, shutdown::VadFailureStage::RuntimeFlush);
+        assert_eq!(bridge.state.latest_error(), Some(&second));
+        let expected = [
+            shutdown::VadFailure {
+                error: first,
+                stage: shutdown::VadFailureStage::Process,
+            }
+            .audio_error(),
+            shutdown::VadFailure {
+                error: second,
+                stage: shutdown::VadFailureStage::RuntimeFlush,
+            }
+            .audio_error(),
+        ];
+        let report = shutdown::ShutdownReport {
+            attachment: bridge.state.failures().to_vec(),
+            ..Default::default()
+        }
+        .to_js();
+        assert_eq!(report.cleanup_errors.len(), 2);
+        assert_eq!(report.cleanup_errors[0].contexts[0].operation, "normalize");
+        assert_eq!(report.cleanup_errors[1].contexts[0].operation, "flush");
+        assert_eq!(bridge.state.cleanup_errors().collect::<Vec<_>>(), expected);
+        assert_eq!(bridge.notifications.len(), 2);
+    }
 
     #[test]
     fn shutdown_fixture_accepts_capture_before_terminal_stop() -> flexaudio::Result<()> {
@@ -447,7 +467,7 @@ mod tests {
         attachment.accept(finalization, shutdown::VadFailureStage::StopFlush);
         let report = shutdown::ShutdownReport {
             core: stream.shutdown_report(),
-            attachment: attachment.failures.clone(),
+            attachment: attachment.state.failures().to_vec(),
             binding_cleanup: Vec::new(),
             ..shutdown::ShutdownReport::default()
         }
@@ -563,7 +583,7 @@ mod tests {
                 })
             ));
             assert!(bridge.owner.stop().unwrap().is_empty());
-            assert!(bridge.error.is_none());
+            assert!(bridge.state.latest_error().is_none());
         }
     }
 

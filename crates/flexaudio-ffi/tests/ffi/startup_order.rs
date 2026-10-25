@@ -50,8 +50,7 @@ fn binding_stream(inner: flexaudio::Stream, vad_tap: Option<flexaudio_vad::VadTa
         vad_tap,
         vad_events: Vec::new(),
         vad_origin: (0, 0),
-        vad_error: None,
-        vad_cleanup: Vec::new(),
+        vad_state: Default::default(),
         ready_chunks: Default::default(),
     }
 }

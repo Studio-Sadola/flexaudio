@@ -436,10 +436,13 @@ pub(crate) unsafe fn capture_loop(
                     }
                     Ok(())
                 }));
-                capture
+                let released = capture
                     .ReleaseBuffer(frames)
-                    .map_err(|e| map_hr("IAudioCaptureClient::ReleaseBuffer", e))?;
-                pushed.map_err(|_| Error::Backend("WASAPI capture sink panicked".into()))??;
+                    .map_err(|e| map_hr("IAudioCaptureClient::ReleaseBuffer", e));
+                let pushed = pushed
+                    .map_err(|_| Error::Backend("WASAPI capture sink panicked".into()))
+                    .and_then(std::convert::identity);
+                crate::packet_outcome::combine_packet_outcomes(pushed, released)?;
                 // Service render during long capture drains as well as on event wakes.
                 session.service_keepalive()?;
             }

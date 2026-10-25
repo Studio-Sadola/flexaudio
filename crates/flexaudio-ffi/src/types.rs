@@ -233,8 +233,7 @@ pub struct FlexStream {
     pub(crate) vad_tap: Option<flexaudio_vad::VadTap>,
     pub(crate) vad_events: Vec<flexaudio_vad::AttachedVadEvent>,
     pub(crate) vad_origin: (u64, i64),
-    pub(crate) vad_error: Option<flexaudio_vad::VadTapError>,
-    pub(crate) vad_cleanup: Vec<flexaudio::Error>,
+    pub(crate) vad_state: flexaudio_vad::VadAttachmentState,
     pub(crate) ready_chunks: std::collections::VecDeque<crate::vad_integration::FlexChunkV2>,
 }
 

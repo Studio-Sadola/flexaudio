@@ -246,38 +246,53 @@ mod tests {
             Decision::Recoverable(CoreErrorDisposition::VanishedLink),
             Decision::Terminate,
         ] {
-            let (_, _, failure) = fixture();
-            let (tx, rx) = mpsc::channel();
-            let readiness = Readiness::new(tx, true);
-            let events = Arc::new(Mutex::new(Default::default()));
-            let quit = Cell::new(false);
-            let stopped = crate::capture_control::apply_core_outcome(
-                CoreOutcome {
-                    failure,
-                    decision,
-                    attempt: None,
-                },
-                &readiness,
-                &events,
-                || quit.set(true),
-            );
-            assert_eq!(stopped, decision == Decision::Terminate);
-            assert_eq!(quit.get(), stopped);
-            match decision {
-                Decision::Continue => assert!(poll_backend_event(&events).is_none()),
-                Decision::Recoverable(_) => {
-                    let Some(Event::RecoverableError { error }) = poll_backend_event(&events)
-                    else {
-                        panic!("expected recovery event");
-                    };
-                    assert_eq!(error.diagnostic_details(), ["PipeWire core error: id=5 sequence=21 status=-22; link-factory: unknown output port 52"]);
+            for started in [false, true] {
+                let (_, _, failure) = fixture();
+                let (tx, rx) = mpsc::channel();
+                let readiness = Readiness::new(tx, true);
+                if started {
+                    readiness.report_ready();
+                    assert_eq!(rx.try_recv(), Ok(Ok(())));
                 }
-                Decision::Terminate => {
-                    assert!(matches!(
-                        poll_backend_event(&events),
-                        Some(Event::TerminalError { .. })
-                    ));
-                    assert!(rx.try_recv().expect("startup failure").is_err());
+                let events = Arc::new(Mutex::new(Default::default()));
+                let quit = Cell::new(false);
+                let stopped = crate::capture_control::apply_core_outcome(
+                    CoreOutcome {
+                        failure,
+                        decision,
+                        attempt: None,
+                    },
+                    &readiness,
+                    &events,
+                    || quit.set(true),
+                );
+                assert_eq!(stopped, decision == Decision::Terminate);
+                assert_eq!(quit.get(), stopped);
+                match decision {
+                    Decision::Continue => assert!(poll_backend_event(&events).is_none()),
+                    Decision::Recoverable(_) => {
+                        let Some(Event::RecoverableError { error }) = poll_backend_event(&events)
+                        else {
+                            panic!("expected recovery event");
+                        };
+                        assert_eq!(error.diagnostic_details(), ["PipeWire core error: id=5 sequence=21 status=-22; link-factory: unknown output port 52"]);
+                    }
+                    Decision::Terminate => {
+                        let error = if started {
+                            assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+                            let Some(Event::TerminalError { error }) = poll_backend_event(&events)
+                            else {
+                                panic!(
+                                    "successful capture must publish its runtime terminal failure"
+                                );
+                            };
+                            error
+                        } else {
+                            rx.try_recv().expect("startup failure").unwrap_err()
+                        };
+                        assert_eq!(error.diagnostic_details(), ["PipeWire core error: id=5 sequence=21 status=-22; link-factory: unknown output port 52"]);
+                        assert!(poll_backend_event(&events).is_none());
+                    }
                 }
             }
         }

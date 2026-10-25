@@ -1,6 +1,26 @@
 //! Operation failures pass through the real facade teardown and report assembly.
 use super::*;
 use crate::test_support::{stop_failure, StopPhase};
+use std::sync::atomic::AtomicUsize;
+use std::time::Instant;
+
+#[test]
+fn distinct_failure_contract() {
+    flexaudio_core::test_support::assert_distinct_failures_retained(
+        Error::DeviceLost,
+        Error::Backend("later capture failure".into()),
+        |first, second| {
+            let stream = Stream::open(
+                StreamConfig::default(),
+                Box::new(crate::MockBackend::new(48_000, 2, 0.0)),
+            )
+            .unwrap();
+            stream.shared.fail_terminal(first);
+            stream.shared.fail_terminal(second);
+            stream.terminal_error().unwrap()
+        },
+    );
+}
 
 crate::stop_contract::phases! {
     BothJoins,
@@ -158,6 +178,141 @@ impl CaptureBackend for FinalPollPanic {
 #[test]
 fn rejected_replacement_join_notice_and_distinct_stop_failure_are_retained() {
     check(Phase::ReplacementFinalFailures, |_| {});
+}
+
+struct StartFailureSequence {
+    starts: Arc<AtomicUsize>,
+    failures: std::ops::RangeInclusive<usize>,
+}
+
+impl CaptureBackend for StartFailureSequence {
+    fn native_format(&self) -> (u32, u16) {
+        (48_000, 2)
+    }
+    fn start(&mut self, _: RawSink) -> Result<()> {
+        let attempt = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.failures.contains(&attempt) {
+            Err(Error::DeviceNotFound)
+        } else {
+            Ok(())
+        }
+    }
+    fn stop(&mut self) {}
+}
+
+fn mix_start_failure_sequence(
+    starts: Arc<AtomicUsize>,
+    failures: std::ops::RangeInclusive<usize>,
+) -> Box<dyn CaptureBackend> {
+    Box::new(crate::mix::CompositeBackend::new(
+        Box::new(StartFailureSequence { starts, failures }),
+        Box::new(StartFailureSequence {
+            starts: Arc::new(AtomicUsize::new(0)),
+            failures: 0..=0,
+        }),
+        1.0,
+        1.0,
+    ))
+}
+
+#[test]
+fn failed_initial_start_is_returned_once_without_shutdown_failure() {
+    let mut stream = Stream::open(
+        StreamConfig::default(),
+        mix_start_failure_sequence(Arc::new(AtomicUsize::new(0)), 1..=1),
+    )
+    .unwrap();
+    assert_eq!(
+        stream.start(),
+        Err(Error::DeviceNotFound.with_context(
+            ErrorContext::new(Operation::Start).with_lane(flexaudio_core::MixLane::Microphone),
+        ))
+    );
+    assert!(stream.stop_checked().is_ok());
+    assert!(stream.shutdown_report().unwrap().cleanup().is_empty());
+    assert!(stream.terminal_error().is_none());
+}
+
+#[test]
+fn failed_replacement_start_restores_capture_without_rollback_failure() {
+    let mut stream = Stream::open(
+        StreamConfig::default(),
+        Box::new(crate::MockBackend::new(48_000, 2, 0.0)),
+    )
+    .unwrap();
+    stream.start().unwrap();
+    assert_eq!(
+        stream
+            .switch_backend(mix_start_failure_sequence(
+                Arc::new(AtomicUsize::new(0)),
+                1..=1,
+            ))
+            .unwrap_err()
+            .root(),
+        &Error::DeviceNotFound
+    );
+    assert!(stream.terminal_error().is_none());
+    assert!(stream.stop_checked().is_ok());
+    assert!(stream.shutdown_report().unwrap().cleanup().is_empty());
+    while let Some(event) = stream.poll_event() {
+        assert!(!matches!(event, Event::TerminalError { .. }));
+    }
+}
+
+#[test]
+fn watchdog_retries_failed_starts_without_latching_or_polluting_shutdown() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    check_watchdog_start_failures(mix_start_failure_sequence(starts.clone(), 2..=3), starts);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn watchdog_retries_linux_readiness_failures_without_terminal_notice() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    check_watchdog_start_failures(
+        Box::new(flexaudio_os_linux::test_support::capture_start_failures(
+            starts.clone(),
+            2..=3,
+        )),
+        starts,
+    );
+}
+
+fn check_watchdog_start_failures(backend: Box<dyn CaptureBackend>, starts: Arc<AtomicUsize>) {
+    let mut stream = Stream::open(StreamConfig::default(), backend).unwrap();
+    stream.start().unwrap();
+    let idle = i64::try_from(STALL_THRESHOLD.as_nanos()).unwrap();
+    stream
+        .shared
+        .last_sample_ns
+        .store(monotonic_now_ns() - idle, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while starts.load(Ordering::SeqCst) < 4 {
+        assert!(
+            stream.terminal_error().is_none(),
+            "failed reopen latched terminal state"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "watchdog did not retry failed starts"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(stream.stop_checked().is_ok());
+    assert!(stream.shutdown_report().unwrap().cleanup().is_empty());
+    let events = std::iter::from_fn(|| stream.poll_event()).collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event,
+                Event::RecoverableError { error } if error.root() == &Error::DeviceNotFound
+            ))
+            .count(),
+        2
+    );
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, Event::TerminalError { .. })));
 }
 
 fn replacement_join_error() -> Error {

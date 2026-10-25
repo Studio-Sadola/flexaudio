@@ -68,6 +68,11 @@ mod windows_keeper;
 /// If no device exists at `start`, return [`Error::DeviceNotFound`].
 const FALLBACK_FORMAT: (u32, u16) = (48_000, 1);
 
+enum OwnerStopPhase {
+    Startup,
+    Runtime,
+}
+
 /// The only entry point that returns cpal's default host.
 ///
 /// On Windows, cpal 0.16's process-wide WASAPI enumerator depends on the COM lifetime of the
@@ -108,6 +113,8 @@ pub struct CpalMicBackend {
     event_tx: mpsc::Sender<Event>,
     /// A retained terminal failure prevents restarting this backend instance.
     terminal_error: Option<Error>,
+    /// Legacy construction cannot return discovery failure; only start returns it.
+    query_error: Option<Error>,
     /// Runtime failures are materialized on the control thread, never the callback.
     callback_errors: Arc<callback_mailbox::CallbackMailbox>,
     shutdown: Option<ShutdownReport>,
@@ -123,8 +130,8 @@ impl CpalMicBackend {
     ///   (id is a device name returned by [`list_devices`]).
     ///
     /// Query and cache the selected device's native format without requesting consent.
-    /// This legacy infallible constructor retains any query failure as a terminal
-    /// error and event; `start` returns that cause before opening capture. A failed
+    /// This legacy infallible constructor caches any query failure for `start` to
+    /// return before opening capture, without a terminal event or shutdown failure. A failed
     /// query leaves a compatibility placeholder in `native_format`, never a format
     /// used for capture. Prefer [`try_new`](Self::try_new) for checked discovery
     /// after consent. macOS undecided or denied access fails before native queries.
@@ -160,10 +167,7 @@ impl CpalMicBackend {
                 // The legacy constructor cannot return Result. Its placeholder
                 // format is never used for capture: retain the cause before start.
                 let mut backend = Self::with_format(device_id, FALLBACK_FORMAT);
-                backend.terminal_error = Some(error.clone());
-                backend
-                    .pending_events
-                    .push_back(Event::TerminalError { error });
+                backend.query_error = Some(error);
                 backend
             }
         }
@@ -182,6 +186,7 @@ impl CpalMicBackend {
             #[cfg(test)]
             event_tx: _event_tx,
             terminal_error: None,
+            query_error: None,
             callback_errors,
             shutdown: None,
             pending_events: VecDeque::new(),
@@ -197,6 +202,15 @@ impl CpalMicBackend {
         if self.shutdown.is_some() {
             return;
         }
+        let cleanup = self.stop_owner(OwnerStopPhase::Runtime);
+        self.shutdown = Some(ShutdownReport::new(
+            self.terminal_error.clone(),
+            cleanup.into_iter().collect(),
+        ));
+    }
+
+    /// Quiesce callbacks and publish runtime observations before owner cleanup.
+    fn stop_owner(&mut self, phase: OwnerStopPhase) -> Option<Error> {
         self.stop_flag.store(true, Ordering::SeqCst);
         let result = match self.handle.take() {
             Some(handle) => {
@@ -208,16 +222,16 @@ impl CpalMicBackend {
             }
             None => Ok(()),
         };
-        self.reconcile_events();
+        match phase {
+            OwnerStopPhase::Startup => {}
+            OwnerStopPhase::Runtime => self.reconcile_events(),
+        }
         if let Err(error) = &result {
             self.pending_events.push_back(Event::ShutdownError {
                 error: error.clone(),
             });
         }
-        self.shutdown = Some(ShutdownReport::new(
-            self.terminal_error.clone(),
-            result.err().into_iter().collect(),
-        ));
+        result.err()
     }
 
     fn complete_start(
@@ -228,39 +242,39 @@ impl CpalMicBackend {
         match readiness {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.retain_shutdown_outcome();
+                let current_cleanup = self.stop_owner(OwnerStopPhase::Startup);
                 if let Error::NativeFormatChanged { actual, .. } = &error {
                     self.native = *actual;
                 }
-                let current_cleanup = self
-                    .shutdown
-                    .take()
-                    .expect("rollback retains its report")
-                    .cleanup()
-                    .to_vec();
+                // A callback can fail while build/play is still rejecting startup.
+                // Return those observations with this attempt, without publishing
+                // runtime terminal state for a capture that never started.
+                let mut startup = Some(error);
+                while let Some(error) = self.callback_errors.take() {
+                    flexaudio_core::terminal_causes::retain_terminal_cause(&mut startup, error);
+                }
                 let mut cleanup = previous_shutdown
                     .map(|previous| previous.cleanup().to_vec())
                     .unwrap_or_default();
                 cleanup.extend(current_cleanup);
-                let report = ShutdownReport::new(Some(error), cleanup);
+                let report = ShutdownReport::new(startup, cleanup);
                 let result = report.result();
-                self.shutdown = Some(report);
+                self.shutdown = Some(ShutdownReport::new(None, report.cleanup().to_vec()));
                 result
             }
         }
     }
 
     fn retain_terminal(&mut self, event: &Event) {
-        if self.terminal_error.is_none() {
-            self.terminal_error = match event {
-                Event::PermissionDenied { permission, detail } => Some(Error::PermissionDenied {
-                    permission: *permission,
-                    detail: detail.clone(),
-                }),
-                Event::TerminalError { error } => Some(error.clone()),
-                _ => None,
-            };
-        }
+        let error = match event {
+            Event::PermissionDenied { permission, detail } => Error::PermissionDenied {
+                permission: *permission,
+                detail: detail.clone(),
+            },
+            Event::TerminalError { error } => error.clone(),
+            _ => return,
+        };
+        flexaudio_core::terminal_causes::retain_terminal_cause(&mut self.terminal_error, error);
     }
 
     fn reconcile_events(&mut self) {
@@ -268,21 +282,14 @@ impl CpalMicBackend {
             self.retain_terminal(&event);
             self.pending_events.push_back(event);
         }
-        if let Some(error) = self.callback_errors.take() {
-            let error = match error {
-                callback_mailbox::CallbackFailure::Native(
-                    cpal::StreamError::DeviceNotAvailable,
-                ) => Error::DeviceLost,
-                callback_mailbox::CallbackFailure::Native(cpal::StreamError::BackendSpecific {
-                    err,
-                }) => Error::Backend(format!("microphone capture failed: {err}")),
-                callback_mailbox::CallbackFailure::Panicked => Error::Backend(
-                    "microphone data callback panicked; reopen the stream and retry".into(),
-                ),
-            };
-            let event = Event::TerminalError { error };
-            self.retain_terminal(&event);
-            self.pending_events.push_back(event);
+        while let Some(error) = self.callback_errors.take() {
+            if flexaudio_core::terminal_causes::retain_terminal_cause(
+                &mut self.terminal_error,
+                error.clone(),
+            ) {
+                self.pending_events
+                    .push_back(Event::TerminalError { error });
+            }
         }
     }
 }
@@ -449,6 +456,9 @@ impl CaptureBackend for CpalMicBackend {
     fn start(&mut self, sink: RawSink) -> Result<()> {
         self.reconcile_events();
         if let Some(error) = self.terminal_error.as_ref() {
+            return Err(error.clone());
+        }
+        if let Some(error) = self.query_error.as_ref() {
             return Err(error.clone());
         }
         // Do nothing if the owner thread is already alive (safe for repeated start calls).

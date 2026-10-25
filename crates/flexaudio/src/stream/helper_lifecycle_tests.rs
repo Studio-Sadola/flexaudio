@@ -205,8 +205,10 @@ fn mix_forwards_pairs_through_failed_switch_and_stop() {
     let mut stream = Stream::open(StreamConfig::default(), mix(false)).unwrap();
     stream.start().unwrap();
     assert!(stream.switch_backend(mix(true)).is_err());
-    // The rejected composite's existing typed cleanup result remains authoritative.
-    assert!(stream.stop_checked().is_err());
+    // Rejected startup is returned to the switch caller; helper teardown succeeded.
+    assert!(stream.stop_checked().is_ok());
+    assert!(stream.shutdown_report().unwrap().cleanup().is_empty());
+    assert!(stream.terminal_error().is_none());
     assert_eq!(
         collect(&mut stream),
         [

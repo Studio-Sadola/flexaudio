@@ -140,7 +140,7 @@ def main():
     # cargo build's top-level rlibs identify the selected dependency versions.
     core = ROOT / "target/debug/libflexaudio_core.rlib"
     # Cargo checks freshness; a cached rlib may belong to an older checkout.
-    subprocess.run(["cargo", "build", "--locked", "--offline", *packages], cwd=ROOT, env=env, check=True)
+    subprocess.run(["cargo", "build", "--locked", "--offline", *packages, "--features", "test-support"], cwd=ROOT, env=env, check=True)
     source = {"mic": mic_source, "linux": linux_source}[package]()
     with tempfile.TemporaryDirectory(prefix="flexaudio-adapter-") as folder:
         rust = Path(folder) / "fixture.rs"

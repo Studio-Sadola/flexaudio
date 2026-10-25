@@ -39,6 +39,7 @@ use fa::{ProcessMode, SourceKind};
 
 mod capabilities;
 mod config;
+mod context_exit;
 mod denoise;
 mod device_namespace;
 mod encode;

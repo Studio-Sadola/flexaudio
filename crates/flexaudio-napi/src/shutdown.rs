@@ -1,44 +1,11 @@
 //! One retained outcome for core teardown and attached addon processing.
 use super::*;
-use flexaudio::core::{ErrorContext, Operation};
+#[cfg(test)]
 use flexaudio_vad::VadTapError;
+pub(super) use flexaudio_vad::{
+    VadAttachmentFailure as VadFailure, VadAttachmentStage as VadFailureStage,
+};
 use napi::bindgen_prelude::Null;
-
-#[derive(Clone)]
-pub(super) struct VadFailure {
-    pub error: VadTapError,
-    pub stage: VadFailureStage,
-}
-
-impl VadFailure {
-    /// Typed audio-error projection: a backend failure carrying the operation context and the
-    /// stable attachment code that names the addon cause. Diagnostics name the cause only, never
-    /// PCM, a device name or a secret.
-    pub(super) fn audio_error(&self) -> boundary::JsAudioError {
-        boundary::audio_error(
-            &self
-                .error
-                .audio_error()
-                .with_context(ErrorContext::new(self.stage.operation())),
-        )
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum VadFailureStage {
-    Process,
-    RuntimeFlush,
-    StopFlush,
-}
-
-impl VadFailureStage {
-    pub fn operation(self) -> Operation {
-        match self {
-            Self::Process => Operation::Normalize,
-            Self::RuntimeFlush | Self::StopFlush => Operation::Flush,
-        }
-    }
-}
 
 #[derive(Default)]
 pub(super) struct ShutdownReport {
@@ -72,12 +39,7 @@ impl ShutdownReport {
             .as_ref()
             .map(|report| report.cleanup().to_vec())
             .unwrap_or_default();
-        cleanup.extend(self.attachment.iter().map(|failure| {
-            failure
-                .error
-                .audio_error()
-                .with_context(ErrorContext::new(failure.stage.operation()))
-        }));
+        cleanup.extend(self.attachment.iter().map(VadFailure::audio_error));
         cleanup.extend(self.binding_cleanup.iter().cloned());
         flexaudio::core::ShutdownReport::new(primary, cleanup)
     }

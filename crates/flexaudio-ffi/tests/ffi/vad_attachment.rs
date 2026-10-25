@@ -27,8 +27,7 @@ fn fixture() -> FlexStream {
         vad_tap: Some(flexaudio_vad::VadTap::new(Default::default(), Default::default()).unwrap()),
         vad_events: Vec::new(),
         vad_origin: (0, 0),
-        vad_error: None,
-        vad_cleanup: Vec::new(),
+        vad_state: Default::default(),
         ready_chunks: Default::default(),
     }
 }
@@ -40,6 +39,55 @@ fn terminal() -> AttachedVadEvent {
             reason: EpochEndReason::Error,
         },
     })
+}
+
+#[test]
+fn attachment_retains_distinct_reset_failure_and_flush_uses_latest() {
+    let mut stream = fixture();
+    let owner = stream.vad_tap.as_mut().unwrap();
+    owner.inject_failure();
+    let result = owner.process(&[0.2; 1920], 0, 0, false);
+    let first = result.as_ref().unwrap_err().error.clone();
+    stream.accept_vad_tap(result, flexaudio_vad::VadAttachmentStage::Process);
+    stream.vad_tap.as_mut().unwrap().inject_reset_failure();
+    assert_eq!(
+        stream.flush_vad_tap_with(flexaudio_vad::VadTap::flush),
+        code::FLEX_FAILURE
+    );
+    let second = stream.vad_state.latest_error().unwrap().clone();
+    assert_ne!(first, second);
+    assert_eq!(crate::error::last_audio_error(), Some(second.audio_error()));
+    let expected: Vec<_> = [
+        (first, flexaudio_vad::VadAttachmentStage::Process),
+        (second, flexaudio_vad::VadAttachmentStage::RuntimeFlush),
+    ]
+    .into_iter()
+    .map(|(error, stage)| flexaudio_vad::VadAttachmentFailure { error, stage }.audio_error())
+    .collect();
+    assert_eq!(stream.stop_binding(), Ok(()));
+    assert_eq!(stream.shutdown.as_ref().unwrap().cleanup(), expected);
+}
+
+#[test]
+fn free_reports_a_vad_only_failure_first_observed_during_finalization() {
+    let mut stream = fixture();
+    stream.inner.start().unwrap();
+    let result = stream
+        .vad_tap
+        .as_mut()
+        .unwrap()
+        .process(&[0.2; 1920], 0, 0, false);
+    stream.accept_vad_tap(result, flexaudio_vad::VadAttachmentStage::Process);
+    stream.vad_tap.as_mut().unwrap().inject_failure();
+    assert!(stream.vad_state.failures().is_empty());
+    unsafe {
+        crate::flexaudio_free(Box::into_raw(Box::new(stream)));
+    }
+    assert!(!crate::flexaudio_last_error().is_null());
+    let error = crate::error::last_audio_error().expect("free must preserve VAD-only diagnostics");
+    assert_eq!(error.vad_code(), Some(flexaudio::VadErrorCode::Inference));
+    assert!(matches!(error, flexaudio::Error::Context { context, .. }
+        if context.operation() == flexaudio::Operation::Flush));
 }
 
 #[test]
@@ -181,8 +229,7 @@ fn capture_stream(sink: &Arc<Mutex<Option<flexaudio::core::backend::RawSink>>>) 
         vad_tap: Some(flexaudio_vad::VadTap::new(Default::default(), Default::default()).unwrap()),
         vad_events: Vec::new(),
         vad_origin: (0, 0),
-        vad_error: None,
-        vad_cleanup: Vec::new(),
+        vad_state: Default::default(),
         ready_chunks: Default::default(),
     }
 }
@@ -294,11 +341,16 @@ unsafe fn fail_attachment(
     );
     assert_eq!(frames, 960);
     assert_eq!(
-        stream.vad_error.as_ref().unwrap().audio_error().vad_code(),
+        stream
+            .vad_state
+            .latest_error()
+            .unwrap()
+            .audio_error()
+            .vad_code(),
         Some(flexaudio::VadErrorCode::Inference)
     );
     assert_eq!(
-        stream.vad_cleanup.len(),
+        stream.vad_state.failures().len(),
         1,
         "one real processor failure must retain exactly one cleanup cause"
     );
@@ -325,7 +377,7 @@ unsafe fn fail_attachment(
         0,
         "the contiguous push must not recover the failed attachment; flags={flags:#x}"
     );
-    assert!(stream.vad_error.is_some());
+    assert!(stream.vad_state.latest_error().is_some());
 }
 
 unsafe fn assert_vad_tap_shutdown(stream: &mut FlexStream) {
@@ -385,7 +437,7 @@ fn successful_flush_reinitializes_shared_owner_after_process_failure() {
             "a successful shared flush must resolve even after a process failure"
         );
         assert!(
-            stream.vad_error.is_none(),
+            stream.vad_state.latest_error().is_none(),
             "successful shared flush must clear the active failure"
         );
         sink.lock()
@@ -425,7 +477,7 @@ fn a_failed_attachment_reinitializes_at_the_next_discontinuity() {
                 .push(&[0.2; 1920], 60_000_000);
             poll_until(&mut stream, |chunk| has_start(chunk));
             assert!(
-                stream.vad_error.is_none(),
+                stream.vad_state.latest_error().is_none(),
                 "the shared owner must reinitialize at the discontinuity"
             );
             assert_vad_tap_shutdown(&mut stream);

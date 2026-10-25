@@ -85,13 +85,7 @@ impl OwnerShutdown {
     pub(crate) fn retain_startup_report(&mut self, report: ShutdownReport) -> Result<()> {
         let report = self.with_generation_cleanup(report);
         let result = report.result();
-        self.events.extend(
-            report
-                .primary()
-                .cloned()
-                .map(|error| Event::TerminalError { error }),
-        );
-        self.retain_report(report);
+        self.retain_report(ShutdownReport::new(None, report.cleanup().to_vec()));
         result
     }
 
@@ -145,6 +139,28 @@ mod tests {
     use flexaudio_core::HelperStopReason;
 
     #[test]
+    fn failed_start_has_clean_shutdown_and_no_terminal_notice() {
+        let mut shutdown = OwnerShutdown::default();
+        assert_eq!(
+            shutdown.retain_startup_report(ShutdownReport::new(
+                Some(Error::DeviceNotFound),
+                Vec::new(),
+            )),
+            Err(Error::DeviceNotFound)
+        );
+        let publication = PublicationGate::default();
+        shutdown.finish(
+            &publication,
+            &AtomicBool::new(false),
+            &TerminalFailure::default(),
+            None,
+        );
+        assert_eq!(shutdown.report().unwrap().result(), Ok(()));
+        assert!(shutdown.report().unwrap().primary().is_none());
+        assert!(shutdown.poll_event().is_none());
+    }
+
+    #[test]
     fn failed_restart_keeps_previous_report_and_returns_current_attempt() {
         for previous_primary in [None, Some(Error::DeviceLost)] {
             let mut shutdown = OwnerShutdown::default();
@@ -187,9 +203,6 @@ mod tests {
                 vec![
                     Event::ShutdownError {
                         error: previous.cleanup()[0].clone()
-                    },
-                    Event::TerminalError {
-                        error: Error::DeviceNotFound
                     },
                     Event::ShutdownError {
                         error: cleanup[0].clone()

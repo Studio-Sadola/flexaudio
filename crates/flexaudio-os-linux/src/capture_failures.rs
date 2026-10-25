@@ -37,13 +37,11 @@ impl CaptureCallbacks {
 }
 
 pub(crate) fn report_control_failure(readiness: &Readiness, events: &BackendEvents, error: Error) {
-    push_backend_event(
-        events,
-        Event::TerminalError {
-            error: error.clone(),
-        },
-    );
-    readiness.report_failure(error);
+    if readiness.is_started() {
+        push_backend_event(events, Event::TerminalError { error });
+    } else {
+        readiness.report_failure(error);
+    }
 }
 
 pub(crate) fn run_capture_callback(
@@ -72,7 +70,7 @@ pub(crate) fn report_bind_failure(
     diagnostics: &CaptureDiagnostics,
     error: Error,
 ) -> bool {
-    if !readiness.is_reported() {
+    if !readiness.is_started() {
         report_control_failure(readiness, events, error);
         true
     } else {
@@ -187,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_failure_is_terminal_before_readiness_and_observable_after() {
+    fn bind_failure_is_returned_before_readiness_and_observable_after() {
         for ready in [false, true] {
             let (tx, rx) = mpsc::channel();
             let readiness = Readiness::new(tx, true);
@@ -203,21 +201,18 @@ mod tests {
                 report_bind_failure(&readiness, &events, &diagnostics, error.clone()),
                 !ready
             );
-            let event = crate::owner::poll_backend_event(&events).unwrap();
             if ready {
-                assert_eq!(event, Event::RecoverableError { error });
+                assert_eq!(
+                    crate::owner::poll_backend_event(&events),
+                    Some(Event::RecoverableError { error })
+                );
                 assert_eq!(
                     diagnostics.drain().unwrap()[0].reason(),
                     flexaudio_core::LossReason::CallbackRejected
                 );
                 assert!(diagnostics.take_discontinuity());
             } else {
-                assert_eq!(
-                    event,
-                    Event::TerminalError {
-                        error: error.clone()
-                    }
-                );
+                assert!(crate::owner::poll_backend_event(&events).is_none());
                 assert_eq!(rx.recv().unwrap(), Err(error.clone()));
             }
         }
@@ -225,20 +220,43 @@ mod tests {
 
     #[test]
     fn callback_panic_reports_terminal_and_quits_without_exposing_panic_text() {
+        for started in [false, true] {
+            let (tx, rx) = mpsc::channel();
+            let readiness = Readiness::new(tx, true);
+            if started {
+                readiness.report_ready();
+                assert_eq!(rx.recv(), Ok(Ok(())));
+            }
+            let events = Arc::new(Mutex::new(Default::default()));
+            let quit = Cell::new(false);
+            run_capture_callback(
+                &readiness,
+                &events,
+                || quit.set(true),
+                || panic!("synthetic failure"),
+            );
+            assert!(quit.get());
+            if started {
+                assert!(
+                    matches!(crate::owner::poll_backend_event(&events), Some(Event::TerminalError { error }) if error.kind() == flexaudio_core::ErrorKind::Backend && !error.to_string().contains("synthetic failure"))
+                );
+            } else {
+                let error = rx.recv().unwrap().unwrap_err();
+                assert_eq!(error.kind(), flexaudio_core::ErrorKind::Backend);
+                assert!(!error.to_string().contains("synthetic failure"));
+                assert!(crate::owner::poll_backend_event(&events).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_readiness_cannot_publish_a_runtime_terminal_failure() {
         let (tx, rx) = mpsc::channel();
         let readiness = Readiness::new(tx, true);
-        let events = Arc::new(Mutex::new(Default::default()));
-        let quit = Cell::new(false);
-        run_capture_callback(
-            &readiness,
-            &events,
-            || quit.set(true),
-            || panic!("synthetic failure"),
-        );
-        assert!(quit.get());
-        assert!(rx.recv().unwrap().is_err());
-        assert!(
-            matches!(crate::owner::poll_backend_event(&events), Some(Event::TerminalError { error }) if error.kind() == flexaudio_core::ErrorKind::Backend && !error.to_string().contains("synthetic failure"))
-        );
+        let events = BackendEvents::default();
+        report_control_failure(&readiness, &events, Error::DeviceNotFound);
+        assert_eq!(rx.recv(), Ok(Err(Error::DeviceNotFound)));
+        report_control_failure(&readiness, &events, Error::DeviceLost);
+        assert!(crate::owner::poll_backend_event(&events).is_none());
     }
 }

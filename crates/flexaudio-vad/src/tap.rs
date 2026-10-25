@@ -349,7 +349,10 @@ impl VadTap {
             // Test-only: a failed reset stays failed and reports no second closure.
             self.state = State::Failed;
             return Err(Failure {
-                error: Error::Vad(crate::VadError::Inference),
+                error: Error::Cause {
+                    primary: Box::new(Error::Vad(crate::VadError::Inference)),
+                    source: crate::InferenceError::Reset("injected capture reset failure".into()),
+                },
                 terminal_events: std::mem::take(events),
             });
         }

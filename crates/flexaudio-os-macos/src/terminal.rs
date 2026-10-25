@@ -62,6 +62,20 @@ mod tests {
     use flexaudio_core::types::{ErrorGroup, Permission};
     use std::sync::Arc;
 
+    #[test]
+    fn distinct_failure_contract() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            Error::DeviceLost,
+            Error::Backend("later capture failure".into()),
+            |first, second| {
+                let terminal = TerminalFailure::default();
+                terminal.record(first);
+                terminal.record(second);
+                terminal.error().unwrap()
+            },
+        );
+    }
+
     fn denial() -> Error {
         Error::PermissionDenied {
             permission: Permission::SystemAudio,

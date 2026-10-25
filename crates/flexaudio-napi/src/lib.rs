@@ -1631,7 +1631,7 @@ impl FlexStream {
                                 let error = bridge
                                     .attachment
                                     .as_ref()
-                                    .and_then(|owner| owner.error.clone());
+                                    .and_then(|owner| owner.state.latest_error().cloned());
                                 bridge.on_chunk.call(
                                     ChunkEmit::VadFlushed(deferred, error),
                                     ThreadsafeFunctionCallMode::NonBlocking,

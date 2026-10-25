@@ -271,7 +271,7 @@ fn terminal_suppresses_tails_and_retains_final_losses_and_cleanup() {
 }
 
 #[test]
-fn startup_rollback_retains_primary_and_checked_cleanup() {
+fn startup_rollback_returns_start_error_and_retains_only_checked_cleanup() {
     let mut mic = Child::new(vec![]);
     mic.stop_error = true;
     let mut system = Child::new(vec![]);
@@ -284,12 +284,32 @@ fn startup_rollback_retains_primary_and_checked_cleanup() {
     let error = mix
         .start(RawSink::new(producer, SAMPLE_RATE, CHANNELS))
         .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::DeviceNotFound);
-    assert_eq!(context_lane(&error), Some(MixLane::SystemAudio));
-    assert_eq!(mix.shutdown.as_ref().unwrap().cleanup().len(), 2);
+    let cleanup = [MixLane::SystemAudio, MixLane::Microphone]
+        .map(|lane| {
+            lane_error(
+                Error::Backend("injected checked stop failure".into()),
+                Operation::Stop,
+                lane,
+            )
+        })
+        .to_vec();
+    assert_eq!(
+        Err(error),
+        ShutdownReport::new(
+            Some(lane_error(
+                Error::DeviceNotFound,
+                Operation::Start,
+                MixLane::SystemAudio,
+            )),
+            cleanup.clone(),
+        )
+        .result(),
+    );
     assert_eq!(mic_stops.load(Ordering::SeqCst), 1);
     assert_eq!(system_stops.load(Ordering::SeqCst), 1);
-    assert_eq!(mix.stop_checked().unwrap_err(), error);
+    let report = ShutdownReport::new(None, cleanup);
+    assert_eq!(mix.shutdown.as_ref(), Some(&report));
+    assert_eq!(mix.stop_checked(), report.result());
 }
 
 #[test]

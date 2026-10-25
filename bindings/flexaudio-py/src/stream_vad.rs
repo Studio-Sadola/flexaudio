@@ -19,7 +19,7 @@ impl Stream {
             .as_ref()
             .map(|_| ())
             .map_err(|failure| crate::vad::tap_error(failure.error.clone()));
-        self.accept_vad_tap(result, fa::Operation::Flush);
+        self.accept_vad_tap(result, flexaudio_vad::VadAttachmentStage::RuntimeFlush);
         self.vad_carrier();
         drained.and(flushed)
     }
@@ -27,30 +27,11 @@ impl Stream {
     pub(super) fn accept_vad_tap(
         &mut self,
         result: Result<Vec<flexaudio_vad::AttachedVadEvent>, flexaudio_vad::VadTapFailure>,
-        operation: fa::Operation,
+        stage: flexaudio_vad::VadAttachmentStage,
     ) {
-        match result {
-            Ok(events) => {
-                // Empty output is not proof of recovery. The shared owner's lifecycle
-                // is authoritative, including while normalization produces no event.
-                if matches!(operation, fa::Operation::Normalize | fa::Operation::Flush)
-                    && self
-                        .vad_tap
-                        .as_ref()
-                        .is_some_and(|owner| !owner.is_failed())
-                {
-                    self.vad_error = None;
-                }
-                self.vad_events.extend(events);
-            }
-            Err(failure) => {
-                self.vad_events.extend(failure.terminal_events);
-                if self.vad_error.is_none() {
-                    self.vad_cleanup.push(failure.error.audio_error());
-                    self.vad_error = Some(failure.error);
-                }
-            }
-        }
+        let owner_failed = self.vad_tap.as_ref().is_some_and(|owner| owner.is_failed());
+        let (events, _) = self.vad_state.accept(result, stage, owner_failed);
+        self.vad_events.extend(events);
     }
 
     pub(super) fn drain_capture(&mut self) {
@@ -71,7 +52,7 @@ impl Stream {
                     chunk.pts_ns + (chunk.frames as i64 * 1_000_000_000 / 48_000),
                 );
             }
-            self.accept_vad_tap(result, fa::Operation::Normalize);
+            self.accept_vad_tap(result, flexaudio_vad::VadAttachmentStage::Process);
         }
     }
 
@@ -118,6 +99,41 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn attachment_retains_distinct_reset_failure_and_flush_uses_latest() {
+        Python::initialize();
+        Python::attach(|py| {
+            let sink = Arc::new(Mutex::new(None));
+            let fenced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut stream = capture_stream(&sink, &fenced);
+            let owner = stream.vad_tap.as_mut().unwrap();
+            owner.inject_failure();
+            let result = owner.process(&[0.2; 1920], 0, 0, false);
+            let first = result.as_ref().unwrap_err().error.clone();
+            stream.accept_vad_tap(result, flexaudio_vad::VadAttachmentStage::Process);
+            stream.vad_tap.as_mut().unwrap().inject_reset_failure();
+            let error = stream.flush_vad().unwrap_err();
+            let second = stream.vad_state.latest_error().unwrap().clone();
+            assert_ne!(first, second);
+            let returned = error.value(py).getattr("audio_error").unwrap();
+            let returned = returned
+                .extract::<PyRef<'_, crate::errors::AudioError>>()
+                .unwrap();
+            assert_eq!(returned.0, second.audio_error());
+            let expected: Vec<_> = [
+                (first, flexaudio_vad::VadAttachmentStage::Process),
+                (second, flexaudio_vad::VadAttachmentStage::RuntimeFlush),
+            ]
+            .into_iter()
+            .map(|(error, stage)| {
+                flexaudio_vad::VadAttachmentFailure { error, stage }.audio_error()
+            })
+            .collect();
+            stream.stop().unwrap();
+            assert_eq!(stream.shutdown.as_ref().unwrap().cleanup(), expected);
+        });
+    }
 
     struct PushBackend(Arc<Mutex<Option<fa::core::backend::RawSink>>>);
     impl fa::CaptureBackend for PushBackend {
@@ -334,8 +350,7 @@ mod tests {
                 ),
                 vad_events: Vec::new(),
                 vad_origin: (0, 0),
-                vad_error: None,
-                vad_cleanup: Vec::new(),
+                vad_state: Default::default(),
                 secondary: None,
                 ready_secondary: Default::default(),
                 vad_secondary: false,
@@ -437,8 +452,7 @@ mod tests {
             ),
             vad_events: Vec::new(),
             vad_origin: (0, 0),
-            vad_error: None,
-            vad_cleanup: Vec::new(),
+            vad_state: Default::default(),
             secondary: None,
             ready_secondary: Default::default(),
             vad_secondary: false,
@@ -503,11 +517,16 @@ mod tests {
         );
         assert_eq!(second.frames, 960);
         assert_eq!(
-            stream.vad_error.as_ref().unwrap().audio_error().vad_code(),
+            stream
+                .vad_state
+                .latest_error()
+                .unwrap()
+                .audio_error()
+                .vad_code(),
             Some(fa::VadErrorCode::Inference)
         );
         assert_eq!(
-            stream.vad_cleanup.len(),
+            stream.vad_state.failures().len(),
             1,
             "one real processor failure must retain exactly one cleanup cause"
         );
@@ -537,7 +556,7 @@ mod tests {
         let flags = third.flags;
         let pts_ns = third.pts_ns;
         assert_eq!(flags & (fa::ChunkFlags::DISCONTINUITY | fa::ChunkFlags::RECOVERED).bits(), 0,
-            "the contiguous fixture must not recover while its producer is idle; flags={flags:#x}, pts_ns={pts_ns}, retained_failure={}", stream.vad_error.is_some());
+            "the contiguous fixture must not recover while its producer is idle; flags={flags:#x}, pts_ns={pts_ns}, retained_failure={}", stream.vad_state.latest_error().is_some());
         // Public PCM PTS follows capture arrival time after startup confirmation. The lease
         // keeps frame indices and VAD canonical epoch contiguous, but it does not
         // compact elapsed idle time. Bound the two intake arrivals by their real push/delivery
@@ -548,7 +567,7 @@ mod tests {
             (earliest_pts..=latest_pts).contains(&pts_ns),
             "third PCM PTS must preserve arrival time within observed publication bounds {earliest_pts}..={latest_pts} ns: pts_ns={pts_ns}, flags={flags:#x}"
         );
-        assert!(stream.vad_error.is_some());
+        assert!(stream.vad_state.latest_error().is_some());
     }
 
     fn assert_vad_tap_shutdown(py: Python<'_>, stream: &mut Stream) {
@@ -592,28 +611,28 @@ mod tests {
                 failure.is_err(),
                 "fault injection must latch the real owner"
             );
-            stream.accept_vad_tap(failure, fa::Operation::Normalize);
-            assert!(stream.vad_error.is_some());
+            stream.accept_vad_tap(failure, flexaudio_vad::VadAttachmentStage::Process);
+            assert!(stream.vad_state.latest_error().is_some());
             // An empty callback result is not proof that the authoritative session recovered.
             // Inject it at the existing result seam while the shared owner remains failed.
-            stream.accept_vad_tap(Ok(Vec::new()), fa::Operation::Normalize);
+            stream.accept_vad_tap(Ok(Vec::new()), flexaudio_vad::VadAttachmentStage::Process);
             assert!(
-                stream.vad_error.is_some(),
+                stream.vad_state.latest_error().is_some(),
                 "an empty success must not erase a latched shared-owner failure"
             );
             assert_eq!(
-                stream.vad_cleanup.len(),
+                stream.vad_state.failures().len(),
                 1,
                 "retain the original typed cause once"
             );
             assert_eq!(
-                stream.vad_cleanup[0].vad_code(),
+                stream.vad_state.failures()[0].audio_error().vad_code(),
                 Some(fa::VadErrorCode::Inference)
             );
             // Explicit successful recovery can clear the active failure while retaining cleanup.
             stream.flush_vad().expect("shared-owner recovery flush");
-            assert!(stream.vad_error.is_none());
-            assert_eq!(stream.vad_cleanup.len(), 1);
+            assert!(stream.vad_state.latest_error().is_none());
+            assert_eq!(stream.vad_state.failures().len(), 1);
             stream
                 .stop()
                 .expect("isolated attachment cleanup does not reject capture stop");
@@ -660,7 +679,7 @@ mod tests {
             fail_attachment(py, &mut stream, &sink, &fenced);
             stream.flush_vad()?;
             assert!(
-                stream.vad_error.is_none(),
+                stream.vad_state.latest_error().is_none(),
                 "successful shared flush must clear the active failure"
             );
             sink.lock()
@@ -699,7 +718,7 @@ mod tests {
                     .push(&[0.2; 1920], 60_000_000);
                 wait_for_epoch_start(py, &mut stream);
                 assert!(
-                    stream.vad_error.is_none(),
+                    stream.vad_state.latest_error().is_none(),
                     "the shared owner must recover only at a discontinuity"
                 );
                 assert_vad_tap_shutdown(py, &mut stream);
@@ -740,8 +759,7 @@ mod tests {
                 vad_tap: Some(vad_tap),
                 vad_events: Vec::new(),
                 vad_origin: (0, 0),
-                vad_error: None,
-                vad_cleanup: Vec::new(),
+                vad_state: Default::default(),
                 secondary: None,
                 ready_secondary: Default::default(),
                 vad_secondary: false,

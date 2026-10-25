@@ -8,6 +8,12 @@ pub(crate) fn fail_watcher(events: &WatchEventQueue, error: Error) {
     lock_events(events).fail(error);
 }
 
+pub(crate) fn startup_failure(events: &WatchEventQueue, fallback: String) -> Error {
+    lock_events(events).terminal_error().unwrap_or_else(|| {
+        Error::Backend(fallback).with_context(ErrorContext::new(Operation::Start))
+    })
+}
+
 pub(crate) fn run_watcher_callback(
     events: &WatchEventQueue,
     quit: impl FnOnce(),
@@ -57,6 +63,29 @@ mod tests {
         assert!(
             matches!(lock_events(&events).poll(), Some(flexaudio_core::DeviceEvent::TerminalError { error })
             if error.kind() == flexaudio_core::ErrorKind::Backend && !error.to_string().contains("synthetic failure"))
+        );
+    }
+
+    #[test]
+    fn failure_before_readiness_retains_the_recorded_worker_cause() {
+        let events = Arc::new(Mutex::new(WatchEvents::default()));
+        let recorded =
+            Error::Backend("PipeWire watcher worker panicked; restart device watching.".into())
+                .with_context(ErrorContext::new(Operation::Join));
+        fail_watcher(&events, recorded.clone());
+        assert_eq!(
+            startup_failure(&events, "watcher readiness channel disconnected".into()),
+            recorded
+        );
+    }
+
+    #[test]
+    fn failure_before_readiness_without_recorded_cause_uses_start_context() {
+        let events = Arc::new(Mutex::new(WatchEvents::default()));
+        assert_eq!(
+            startup_failure(&events, "watcher readiness channel disconnected".into()),
+            Error::Backend("watcher readiness channel disconnected".into())
+                .with_context(ErrorContext::new(Operation::Start))
         );
     }
 }

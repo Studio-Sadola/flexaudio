@@ -323,9 +323,6 @@ impl CaptureBackend for MacSystemBackend {
                 Ok(())
             }
             Ok(Err(e)) => {
-                if e.permission().is_some() {
-                    self.terminal.record(e.clone());
-                }
                 let report = ShutdownReport::new(
                     Some(e),
                     stop_owner(&self.publication, &self.stop_flag, Some(handle)),
@@ -860,5 +857,10 @@ impl MacSystemBackend {
 impl crate::test_support::FixtureBackend for MacSystemBackend {
     fn retained_report(&self) -> &ShutdownReport {
         self.shutdown.report().expect("shutdown report retained")
+    }
+    fn reject_start(&mut self) -> Result<()> {
+        let cleanup = stop_owner(&self.publication, &self.stop_flag, self.handle.take());
+        self.shutdown
+            .retain_startup_report(ShutdownReport::new(Some(Error::DeviceNotFound), cleanup))
     }
 }

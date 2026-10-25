@@ -211,7 +211,6 @@ impl CaptureBackend for CompositeBackend {
                 match start_child(&mut self.system, MixLane::SystemAudio, self.notices.clone()) {
                     Ok(system) => system,
                     Err(error) => {
-                        self.notices.retain_primary(error.clone());
                         self.set_helper_stop_reason(
                             flexaudio_core::HelperStopReason::StartupFailed,
                         );
@@ -245,7 +244,6 @@ impl CaptureBackend for CompositeBackend {
                 Err(error) => {
                     let error = Error::Backend(format!("spawn mix thread: {error}"))
                         .with_context(ErrorContext::new(Operation::Start));
-                    self.notices.retain_primary(error.clone());
                     self.set_helper_stop_reason(flexaudio_core::HelperStopReason::StartupFailed);
                     self.stop_producers();
                     if let Some((mut mic, mut system)) =
@@ -264,9 +262,10 @@ impl CaptureBackend for CompositeBackend {
             Ok(())
         })();
         if let Err(error) = started {
-            self.notices.retain_primary(error);
             self.set_helper_stop_reason(flexaudio_core::HelperStopReason::StartupFailed);
-            let result = self.stop_checked();
+            self.retain_shutdown_outcome();
+            let attempt = self.shutdown.as_ref().expect("rollback retained report");
+            let result = ShutdownReport::new(Some(error), attempt.cleanup().to_vec()).result();
             if let Some(previous_report) = previous_report {
                 // A failed acquisition keeps the previous primary and every newly
                 // observed cleanup, even when restoring the previous generation.

@@ -809,7 +809,9 @@ fn pipewire_link_refusal() {
     assert!(f.linked.borrow().is_empty(), "refused links must not leave partial routing");
     assert_eq!(error.kind(), ErrorKind::Backend);
     assert!(matches!(error, Error::Context { context, .. } if context.operation() == Operation::Link));
-    assert!(matches!(poll_backend_event(&f.events), Some(Event::TerminalError { error }) if error.kind() == ErrorKind::Backend));
+    assert!(f.readiness.is_reported(), "startup link refusal must reject readiness");
+    assert!(!f.readiness.is_started());
+    assert!(poll_backend_event(&f.events).is_none(), "startup link refusal is returned, not a runtime terminal event");
 }
 #[test]
 fn pipewire_link_refusal_control() {
@@ -932,6 +934,13 @@ fn monitor_start_result(timer_fails: bool, param: Option<spa::pod::Pod>) -> Resu
     if result.is_err() {
         assert!(!owner.running.load(Ordering::SeqCst));
         assert!(owner.handle.is_none());
+        assert_eq!(owner.stop_checked(), Ok(()), "rejected startup with clean rollback must leave a clean checked stop");
+        let report = owner.shutdown.as_ref().unwrap();
+        assert!(report.primary().is_none());
+        assert!(report.cleanup().is_empty());
+        while let Some(event) = owner.poll_event() {
+            assert!(!matches!(event, Event::TerminalError { .. }), "startup negotiation failure must not publish runtime terminality");
+        }
     }
     owner.stop();
     MONITOR_START.set(false); TIMER_FAILURE.set(false); NEGOTIATED.set(Some(spa::pod::Pod::negotiated()));

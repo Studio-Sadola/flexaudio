@@ -255,14 +255,7 @@ impl FlacEncoder {
                 return Err(error);
             }
             if let Some(body_error) = exc_value {
-                let note = format!("FlacEncoder close also failed: {error}");
-                if body_error.call_method1("add_note", (note,)).is_err() {
-                    // Python <3.11 has no add_note. Keep the body exception primary.
-                    let py = body_error.py();
-                    if !body_error.is(error.value(py)) {
-                        PyErr::from_value(body_error).set_context(py, Some(error));
-                    }
-                }
+                crate::context_exit::attach_cleanup_failure(body_error, error, "FlacEncoder close");
             }
         }
         Ok(false)

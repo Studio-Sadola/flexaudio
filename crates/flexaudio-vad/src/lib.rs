@@ -13,6 +13,7 @@
 
 #![warn(missing_docs)]
 
+mod attachment;
 mod capture_converter;
 mod infer;
 mod input_converter;
@@ -28,6 +29,7 @@ pub mod test_faults;
 mod types;
 mod whisper_cpp_segments;
 
+pub use attachment::{VadAttachmentFailure, VadAttachmentStage, VadAttachmentState};
 pub use flexaudio_core::VadErrorCode;
 pub use params::VadOptions;
 pub use resample::PcmFormat;

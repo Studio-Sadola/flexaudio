@@ -76,6 +76,54 @@ fn check_observed(phase: Phase, observe: impl Fn(&CpalMicBackend)) {
 /// Exercise every microphone phase and observe each tested concrete owner.
 /// This internal test entry has no stability guarantee and runs on every CI OS.
 pub fn check_all(observe: fn(&CpalMicBackend)) {
+    let mut owner = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
+    owner.handle = Some(thread::spawn(|| {}));
+    assert_eq!(
+        owner.complete_start(Err(Error::DeviceNotFound), None),
+        Err(Error::DeviceNotFound)
+    );
+    assert!(owner.stop_checked().is_ok());
+    assert!(owner.shutdown_report().unwrap().primary().is_none());
+    assert!(owner.poll_event().is_none());
+    observe(&owner);
+    for join_failure in [false, true] {
+        let mut owner = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
+        owner
+            .callback_errors
+            .record(cpal::StreamError::DeviceNotAvailable);
+        owner.handle = Some(thread::spawn(move || {
+            assert!(!join_failure, "injected failed-start owner panic");
+        }));
+        let result = owner
+            .complete_start(Err(Error::DeviceNotFound), None)
+            .unwrap_err();
+        assert_eq!(result.root(), &Error::DeviceNotFound);
+        let report = owner.shutdown_report().unwrap();
+        assert!(report.primary().is_none());
+        assert_eq!(report.cleanup().len(), usize::from(join_failure));
+        let startup = Error::Multiple(flexaudio_core::ErrorGroup::new(
+            Error::DeviceNotFound,
+            Error::DeviceLost,
+            Vec::new(),
+        ));
+        assert_eq!(
+            Err(result),
+            ShutdownReport::new(Some(startup), report.cleanup().to_vec()).result()
+        );
+        assert_eq!(owner.stop_checked().is_err(), join_failure);
+        while let Some(event) = owner.poll_event() {
+            assert!(!matches!(event, Event::TerminalError { .. }));
+        }
+        assert!(owner.terminal_error.is_none());
+        // A completed fixture owner takes the existing duplicate-start path,
+        // proving the rejected attempt cannot immediately reject the next start.
+        owner.handle = Some(thread::spawn(|| {}));
+        let (producer, _consumer) = flexaudio_core::raw_ring(16);
+        assert_eq!(owner.start(RawSink::new(producer, 48_000, 1)), Ok(()));
+        // The prior retained report intentionally bypasses a second owner join.
+        assert!(owner.stop_owner(OwnerStopPhase::Runtime).is_none());
+        observe(&owner);
+    }
     for &phase in Phase::ALL {
         check_observed(phase, observe);
     }
@@ -84,6 +132,11 @@ pub fn check_all(observe: fn(&CpalMicBackend)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callback_failure_during_rejected_start_is_returned_without_runtime_terminality() {
+        check_all(|_| {});
+    }
 
     #[test]
     fn microphone_shutdown_retains_primary_and_join_cleanup() {
@@ -103,9 +156,12 @@ mod tests {
             .shutdown_report()
             .expect("rollback retains its report")
             .clone();
-        assert_eq!(report.primary(), Some(&Error::DeviceLost));
+        assert!(report.primary().is_none());
         assert_eq!(report.cleanup(), &[first_cleanup.clone(), first_cleanup]);
-        assert_eq!(result, report.result());
+        assert_eq!(
+            result,
+            ShutdownReport::new(Some(Error::DeviceLost), report.cleanup().to_vec()).result()
+        );
         owner.stop();
         assert_eq!(owner.shutdown_report(), Some(&report));
         assert_eq!(owner.stop_checked(), report.result());

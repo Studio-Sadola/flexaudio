@@ -55,6 +55,8 @@ mod common;
 mod keepalive;
 #[cfg(any(target_os = "windows", test))]
 mod owner;
+#[cfg(any(target_os = "windows", test))]
+mod packet_outcome;
 #[cfg(target_os = "windows")]
 mod process;
 #[cfg(target_os = "windows")]

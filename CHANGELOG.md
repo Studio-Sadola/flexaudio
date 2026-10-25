@@ -79,6 +79,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Failed capture startup returns its cause only from `start()`, without a
+  terminal notice or shutdown primary. Rollback cleanup remains visible;
+  transient watchdog reopen failures continue to emit recoverable errors and
+  back off, and rejected source replacements leave healthy capture intact.
+- Retain distinct microphone callback failures in four preallocated slots and
+  report overflow counts. Preserve packet failures alongside Windows buffer
+  release failures and typed Linux watcher failures before readiness.
+- Attached VAD failure acceptance is shared across bindings: later distinct
+  failures and uniform operation context remain in shutdown reports, and flush
+  reports its newest failure. C free also exposes VAD-only finalization failures
+  through `last_error`.
 - A later terminal capture failure that differs from the first is no longer
   dropped: Stream, Linux and macOS reports keep it with the first as primary in
   `Error::Multiple`, as Mix already did. Equal causes are kept once, and only
@@ -87,9 +98,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Node: if `stop()` or FLAC `finalize()` is forgotten, failures observed during
   garbage collection are delivered as a process warning
   (`process.on('warning')`, name `FlexaudioShutdownWarning`, code
-  `FLEXAUDIO_GC_SHUTDOWN`) carrying the typed error, `audioError` and full
-  `shutdownReport`, instead of an uncaught exception, matching Python's
-  `sys.unraisablehook`. Explicit `stop()` and `finalize()` are unchanged.
+  `FLEXAUDIO_GC_SHUTDOWN`), instead of an uncaught exception, matching Python's
+  `sys.unraisablehook`. Stream warnings carry the typed `cause`, `audioError` and
+  full `shutdownReport`; encoder warnings carry only the error `cause` that
+  `finalize()` would have thrown. Explicit `stop()` and `finalize()` are unchanged.
+- Python stream and device-watcher context managers keep a body exception primary
+  when cleanup also fails, preserving its existing exception context. All Python
+  context managers use the same exception-note and safe context-chain fallback.
 
 - Shutdown errors now identify capture workers, replacement rollback, Windows clients/event handles and macOS probe IOProc roles so independent failures remain distinct during deduplication.
 - Stop reports retain Windows handle-close and session destructor failures,
@@ -98,9 +113,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserve observed cleanup. Rust, Node, Python and C stop paths expose the
   retained failure to their callers, including repeated stops.
 - After a failed microphone restart, `stop_checked()` and `shutdown_report()`
-  now report the new startup and join failures together with the previous
-  cleanup failures. They previously returned the earlier run's result, which
-  hid the join failure observed during the failed restart.
+  retain genuine join failures together with previous cleanup failures. The
+  startup error is returned by `start()` without becoming a shutdown failure.
 - Windows capture sessions publish native cleanup failures discovered during
   drop through the existing shutdown-error event channel, including sessions
   without a keepalive renderer.

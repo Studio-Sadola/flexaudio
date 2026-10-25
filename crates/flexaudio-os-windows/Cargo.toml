@@ -21,7 +21,7 @@ test-support = []
 # on other platforms, and the windows dependency is included only by the target-specific section below.
 # Pure functions for build-number handling still compile on non-Windows platforms.
 [dev-dependencies]
-flexaudio-core = { path = "../flexaudio-core", version = "0.9.0" }
+flexaudio-core = { path = "../flexaudio-core", version = "0.9.0", features = ["test-support"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 flexaudio-core = { path = "../flexaudio-core", version = "0.9.0" }

@@ -105,6 +105,7 @@ pub struct ProbePath;
 
 pub(crate) trait FixtureBackend: CaptureBackend {
     fn retained_report(&self) -> &ShutdownReport;
+    fn reject_start(&mut self) -> Result<()>;
 }
 
 // An inert native callback ID. Injection intercepts every release before the OS
@@ -354,6 +355,17 @@ fn check_path<B: FixtureBackend>(
     construct: impl Fn(JoinHandle<Result<()>>, Arc<CleanupLedger>, Option<Error>) -> B,
     observe: impl Fn(&B),
 ) {
+    if matches!(path, Path::System | Path::Process) {
+        let mut backend = construct(thread::spawn(|| Ok(())), Arc::default(), None);
+        assert_eq!(backend.reject_start(), Err(Error::DeviceNotFound));
+        assert_eq!(backend.stop_checked(), Ok(()));
+        assert_eq!(
+            backend.retained_report(),
+            &ShutdownReport::new(None, Vec::new())
+        );
+        assert!(backend.poll_event().is_none());
+        observe(&backend);
+    }
     for &phase in Phase::ALL {
         if phase.path() == path {
             check_phase(phase, &construct, &observe);

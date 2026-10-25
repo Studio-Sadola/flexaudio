@@ -3,6 +3,55 @@
 pub use crate::error_context::shutdown_fields;
 pub use crate::errors::error_cases;
 
+/// Inject two unequal failures at one recording point and verify ordered retention.
+/// The fixture supplies the real recording operation and its reconciled outcome.
+pub fn assert_distinct_failures_retained(
+    first: crate::Error,
+    second: crate::Error,
+    exercise: impl FnOnce(crate::Error, crate::Error) -> crate::Error,
+) {
+    assert_ne!(
+        first, second,
+        "the fixture must inject different failure values"
+    );
+    let retained = exercise(first.clone(), second.clone());
+    assert!(
+        crate::terminal_causes::retains_terminal_cause(&retained, &first),
+        "first failure lost: {retained:?}"
+    );
+    assert!(
+        crate::terminal_causes::retains_terminal_cause(&retained, &second),
+        "later distinct failure lost: {retained:?}"
+    );
+    match retained {
+        crate::Error::Multiple(group) => {
+            assert_eq!(group.primary(), &first, "observation order changed");
+            assert_eq!(group.secondary().next(), Some(&second));
+        }
+        error => panic!("distinct failures were not grouped: {error:?}"),
+    }
+}
+
+#[cfg(test)]
+mod retention_fixture_tests {
+    use super::*;
+
+    #[test]
+    fn distinct_failure_fixture_rejects_a_dropped_later_failure() {
+        let result = std::panic::catch_unwind(|| {
+            assert_distinct_failures_retained(
+                crate::Error::Backend("first fixture failure".into()),
+                crate::Error::Backend("second fixture failure".into()),
+                |first, _second| first,
+            );
+        });
+        assert!(
+            result.is_err(),
+            "the shared fixture must detect lost failures"
+        );
+    }
+}
+
 // Each list also generates an exhaustive match in the defining crate, so a new
 // typed cause cannot silently miss the shared binding fixtures.
 macro_rules! variant_inventory {

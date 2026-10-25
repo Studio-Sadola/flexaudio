@@ -21,6 +21,7 @@ pub(crate) fn negotiation_timeout_error() -> Error {
 pub(crate) struct Readiness {
     tx: mpsc::Sender<Result<()>>,
     sent: Cell<bool>,
+    started: Cell<bool>,
     target_present: Cell<bool>,
     registry_complete: Cell<bool>,
     control_pending: Cell<bool>,
@@ -32,6 +33,7 @@ impl Readiness {
         Self {
             tx,
             sent: Cell::new(false),
+            started: Cell::new(false),
             target_present: Cell::new(!process_capture),
             registry_complete: Cell::new(!process_capture),
             control_pending: Cell::new(false),
@@ -63,6 +65,7 @@ impl Readiness {
         let ready =
             self.format_ready.get() || (self.registry_complete.get() && !self.target_present.get());
         if ready && !self.control_pending.get() && !self.sent.replace(true) {
+            self.started.set(true);
             #[allow(
                 clippy::let_underscore_must_use,
                 reason = "A closed readiness receiver means the starter has already abandoned startup."
@@ -75,7 +78,7 @@ impl Readiness {
         if !self.sent.replace(true) {
             #[allow(
                 clippy::let_underscore_must_use,
-                reason = "The terminal failure is retained in the event ledger even if the starter has exited."
+                reason = "A closed readiness receiver means the starter has already abandoned startup."
             )]
             let _ = self.tx.send(Err(error));
         }
@@ -83,6 +86,10 @@ impl Readiness {
 
     pub(crate) fn is_reported(&self) -> bool {
         self.sent.get()
+    }
+
+    pub(crate) fn is_started(&self) -> bool {
+        self.started.get()
     }
 
     pub(crate) fn requires_negotiation(&self) -> bool {

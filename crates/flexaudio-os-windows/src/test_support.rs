@@ -61,6 +61,8 @@ phases! {
         Drop,
         /// Native startup failure with rollback and event-close cleanup.
         StartupRollback,
+        /// Native startup failure whose rollback succeeds.
+        StartupFailure,
     }
 }
 
@@ -118,7 +120,7 @@ struct InjectedClient {
 
 impl StreamClient for InjectedClient {
     fn start(&mut self) -> Result<()> {
-        if self.phase == Phase::StartupRollback && !self.render {
+        if matches!(self.phase, Phase::StartupRollback | Phase::StartupFailure) && !self.render {
             Err(start_error())
         } else {
             Ok(())
@@ -131,7 +133,7 @@ impl StreamClient for InjectedClient {
                 Err(stop_error(self.render))
             }
             Phase::StopPanics => panic!("injected client stop panic"),
-            Phase::Join | Phase::Close | Phase::BothCloses => Ok(()),
+            Phase::Join | Phase::Close | Phase::BothCloses | Phase::StartupFailure => Ok(()),
         }
     }
 
@@ -219,9 +221,9 @@ pub(crate) fn prepare(
     });
 
     let mut cleanup = Vec::new();
-    let primary = match phase {
+    let mut primary = match phase {
         Phase::TerminalAndStop => Some(Error::DeviceLost),
-        Phase::StartupRollback => Some(start_error()),
+        Phase::StartupRollback | Phase::StartupFailure => Some(start_error()),
         Phase::Stop
         | Phase::Join
         | Phase::Close
@@ -265,8 +267,9 @@ pub(crate) fn prepare(
             }
             cleanup.push(close_error("CloseHandle(capture)"));
         }
+        Phase::StartupFailure => {}
     }
-    if phase == Phase::StartupRollback {
+    if matches!(phase, Phase::StartupRollback | Phase::StartupFailure) {
         let error = ready_rx
             .recv()
             .expect("startup failure readiness")
@@ -276,6 +279,16 @@ pub(crate) fn prepare(
             shutdown.retain_start_failure(error, worker),
             ShutdownReport::new(primary.clone(), cleanup.clone()).result()
         );
+        primary = None;
+        if phase == Phase::StartupFailure {
+            assert_eq!(shutdown.result(), Ok(()));
+            while let Some(event) = shutdown.poll_event() {
+                assert!(!matches!(
+                    event,
+                    flexaudio_core::Event::TerminalError { .. }
+                ));
+            }
+        }
     } else {
         if phase != Phase::Join {
             ready_rx

@@ -58,11 +58,13 @@ mod device_info;
 use device_info::{namespaced_devices, EnumState, NodeRecord};
 mod owner;
 mod readiness;
+#[cfg(any(test, feature = "test-support"))]
+use owner::push_backend_event;
 use owner::{
-    finish_worker, poll_backend_event, push_backend_event, request_worker_stop, rollback_capture,
-    rollback_worker, BackendEvents,
+    finish_worker, poll_backend_event, request_worker_stop, rollback_capture, rollback_worker,
+    BackendEvents,
 };
-use readiness::{negotiation_timeout_error, Readiness, NEGOTIATION_DEADLINE};
+use readiness::{Readiness, NEGOTIATION_DEADLINE};
 mod watcher_failures;
 use watcher_failures::{fail_watcher, finish_watch_worker, run_watcher_callback};
 mod watcher_queue;
@@ -2163,16 +2165,8 @@ fn arm_negotiation_deadline<'a>(
                 if readiness_for_timer.is_reported() {
                     return;
                 }
-                // Store the typed error before the policy sends its channel failure. An absent
-                // target succeeds only after a complete registry snapshot and keeps watching.
-                if readiness_for_timer.requires_negotiation() {
-                    push_backend_event(
-                        &events_for_timer,
-                        Event::TerminalError {
-                            error: negotiation_timeout_error(),
-                        },
-                    );
-                }
+                // Startup failures travel only through readiness. An absent target succeeds
+                // after a complete registry snapshot and keeps watching.
                 if readiness_for_timer.deadline_expired() {
                     loop_for_timeout.quit();
                 }
@@ -2726,9 +2720,7 @@ impl PwDeviceWatcher {
                 // thread has already returned, so join it for cleanup.
                 running.store(false, Ordering::SeqCst);
                 Err(rollback_worker(
-                    lock_events(&events).terminal_error().unwrap_or_else(|| {
-                        Error::Backend(msg).with_context(ErrorContext::new(Operation::Start))
-                    }),
+                    watcher_failures::startup_failure(&events, msg),
                     handle,
                 ))
             }
@@ -2736,10 +2728,10 @@ impl PwDeviceWatcher {
                 // The thread exited without sending ready (e.g. an unexpected panic).
                 running.store(false, Ordering::SeqCst);
                 Err(rollback_worker(
-                    Error::Backend(
+                    watcher_failures::startup_failure(
+                        &events,
                         "pipewire watch thread terminated before signaling readiness".into(),
-                    )
-                    .with_context(ErrorContext::new(Operation::Start)),
+                    ),
                     handle,
                 ))
             }

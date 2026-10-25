@@ -4,6 +4,65 @@
 
 use crate::*;
 
+/// Inject startup failures through the real readiness, rollback and event owners.
+/// No native capture is opened. Internal fixture, with no stability guarantee.
+pub fn capture_start_failures(
+    starts: Arc<std::sync::atomic::AtomicUsize>,
+    failures: std::ops::RangeInclusive<usize>,
+) -> impl CaptureBackend {
+    struct StartupFailures {
+        owner: PwSystemBackend,
+        starts: Arc<std::sync::atomic::AtomicUsize>,
+        failures: std::ops::RangeInclusive<usize>,
+    }
+    impl CaptureBackend for StartupFailures {
+        fn native_format(&self) -> (u32, u16) {
+            self.owner.native_format()
+        }
+        fn start(&mut self, _: RawSink) -> Result<()> {
+            let attempt = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
+            let events = BackendEvents::default();
+            if self.failures.contains(&attempt) {
+                let (ready, result) = mpsc::channel();
+                let readiness = Readiness::new(ready, false);
+                capture_failures::report_control_failure(
+                    &readiness,
+                    &events,
+                    Error::DeviceNotFound,
+                );
+                let failure = result
+                    .recv()
+                    .expect("fixture readiness receiver")
+                    .expect_err("injected startup failure");
+                return Err(rollback_capture(
+                    failure,
+                    thread::spawn(|| {}),
+                    events,
+                    &mut self.owner.events,
+                    &mut self.owner.shutdown,
+                ));
+            }
+            self.owner.events = events;
+            self.owner.shutdown = None;
+            Ok(())
+        }
+        fn stop(&mut self) {
+            self.owner.stop();
+        }
+        fn stop_checked(&mut self) -> Result<()> {
+            self.owner.stop_checked()
+        }
+        fn poll_event(&mut self) -> Option<Event> {
+            self.owner.poll_event()
+        }
+    }
+    StartupFailures {
+        owner: PwSystemBackend::new(false, None),
+        starts,
+        failures,
+    }
+}
+
 macro_rules! phases {
     ($( $(#[$doc:meta])* $variant:ident, )*) => {
         /// Real owner operations selected for failure injection.
@@ -246,6 +305,20 @@ fn check_kind(kind: FixtureKind, observe: impl Fn(&Fixture)) {
 /// Exercise every system capture phase and observe each tested concrete owner.
 /// This internal test entry has no stability guarantee and runs on Linux CI.
 pub fn check_system(observe: fn(&PwSystemBackend)) {
+    let mut owner = PwSystemBackend::new(false, None);
+    assert_eq!(
+        rollback_capture(
+            Error::DeviceNotFound,
+            thread::spawn(|| {}),
+            BackendEvents::default(),
+            &mut owner.events,
+            &mut owner.shutdown,
+        ),
+        Error::DeviceNotFound
+    );
+    assert!(owner.stop_checked().is_ok());
+    assert!(owner.poll_event().is_none());
+    observe(&owner);
     check_kind(FixtureKind::System, |fixture| match fixture {
         Fixture::System(owner) => observe(owner),
         Fixture::Process(_) | Fixture::Watcher(_) => panic!("expected a system capture fixture"),
@@ -255,6 +328,20 @@ pub fn check_system(observe: fn(&PwSystemBackend)) {
 /// Exercise every process capture phase and observe each tested concrete owner.
 /// This internal test entry has no stability guarantee and runs on Linux CI.
 pub fn check_process(observe: fn(&PwProcessBackend)) {
+    let mut owner = PwProcessBackend::new(1, ProcessMode::Include);
+    assert_eq!(
+        rollback_capture(
+            Error::DeviceNotFound,
+            thread::spawn(|| {}),
+            BackendEvents::default(),
+            &mut owner.events,
+            &mut owner.shutdown,
+        ),
+        Error::DeviceNotFound
+    );
+    assert!(owner.stop_checked().is_ok());
+    assert!(owner.poll_event().is_none());
+    observe(&owner);
     check_kind(FixtureKind::Process, |fixture| match fixture {
         Fixture::Process(owner) => observe(owner),
         Fixture::System(_) | Fixture::Watcher(_) => panic!("expected a process capture fixture"),
@@ -316,7 +403,7 @@ mod tests {
             .shutdown_report()
             .expect("rollback retains its report")
             .clone();
-        assert_eq!(report.primary(), Some(&Error::DeviceLost));
+        assert!(report.primary().is_none());
         assert_eq!(
             report.cleanup(),
             &[
@@ -324,7 +411,10 @@ mod tests {
                 first_cleanup.with_context(ErrorContext::new(Operation::Rollback)),
             ]
         );
-        assert_eq!(Err(error), report.result());
+        assert_eq!(
+            Err(error),
+            ShutdownReport::new(Some(Error::DeviceLost), report.cleanup().to_vec()).result()
+        );
         owner.stop();
         assert_eq!(owner.shutdown_report(), Some(&report));
         assert_eq!(owner.stop_checked(), report.result());

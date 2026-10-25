@@ -233,11 +233,16 @@ impl Drop for Handle {
     }
 }
 unsafe fn open_mock(config: &FlexStreamConfigV3, sink: &Sink) -> Handle {
+    open_backend_mock(config, Box::new(Push(sink.clone())))
+}
+unsafe fn open_backend_mock(
+    config: &FlexStreamConfigV3,
+    backend: Box<dyn flexaudio::CaptureBackend>,
+) -> Handle {
     let mut out = ptr::null_mut();
     assert_eq!(
         open_with(config, &mut out, |config, _| flexaudio::Stream::open(
-            config,
-            Box::new(Push(sink.clone()))
+            config, backend
         )),
         0
     );
@@ -456,12 +461,23 @@ fn canonical_denoise_matches_facade_and_stop_flushes_both_taps() {
                 format.channels = channels;
                 config.secondary_output = &format;
                 let sink = Arc::new(Mutex::new(None));
-                let handle = open_mock(&config, &sink);
+                // Compare one capture generation on both sides, even when the
+                // polling wait exceeds the watchdog's stall interval under load.
+                let handle = open_backend_mock(
+                    &config,
+                    Box::new(HeldPush {
+                        sink: sink.clone(),
+                        fence: Arc::new(AtomicBool::new(false)),
+                    }),
+                );
                 assert_eq!(crate::flexaudio_start(handle.0), 0);
                 let facade_sink = Arc::new(Mutex::new(None));
                 let mut facade = flexaudio::Stream::open(
                     crate::convert::build_config(&base, Vec::new()).unwrap(),
-                    Box::new(Push(facade_sink.clone())),
+                    Box::new(HeldPush {
+                        sink: facade_sink.clone(),
+                        fence: Arc::new(AtomicBool::new(false)),
+                    }),
                 )
                 .unwrap();
                 facade.set_denoise(true);

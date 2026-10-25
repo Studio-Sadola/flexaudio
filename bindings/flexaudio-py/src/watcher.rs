@@ -17,8 +17,9 @@ use crate::to_py_err;
 /// Create it with [`watch_devices`]. Call [`poll_event`](DeviceWatcher::poll_event) periodically to
 /// retrieve [`DeviceEvent`](PyDeviceEvent). Call `stop()` to stop it (drop also stops it).
 /// Supports the context manager protocol (`with`).
-/// Leaving the context raises any undrained terminal or shutdown failure. Dropping
-/// a watcher reports undrained failures through Python's `sys.unraisablehook`.
+/// Leaving the context raises any undrained terminal or shutdown failure, or
+/// attaches it to an active body exception. Dropping a watcher reports undrained
+/// failures through Python's `sys.unraisablehook`.
 ///
 /// The internal `flexaudio::DeviceWatcher` (`Box<dyn DeviceWatchBackend>`) is Send but not Sync,
 /// so it cannot meet pyclass's default Send+Sync requirements. Polling is single-threaded, so mark
@@ -45,14 +46,21 @@ impl DeviceWatcher {
         slf
     }
 
-    /// Stop when leaving the `with` block and raise undrained shutdown failures.
+    /// Stop when leaving the `with` block, keeping an active body exception primary.
     fn __exit__(
         &mut self,
         _exc_type: Option<Bound<'_, PyAny>>,
-        _exc_value: Option<Bound<'_, PyAny>>,
+        exc_value: Option<Bound<'_, PyAny>>,
         _traceback: Option<Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
-        self.finish().map(|()| false)
+        if let Err(error) = self.finish() {
+            if let Some(body) = exc_value {
+                crate::context_exit::attach_cleanup_failure(body, error, "DeviceWatcher stop");
+            } else {
+                return Err(error);
+            }
+        }
+        Ok(false)
     }
 }
 

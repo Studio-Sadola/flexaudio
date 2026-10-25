@@ -57,12 +57,12 @@ pub(crate) fn rollback_capture(
         .map(|previous| previous.cleanup().to_vec())
         .unwrap_or_default();
     retained_cleanup.extend(cleanup);
-    let report = ShutdownReport::new(Some(primary), retained_cleanup);
-    let error = report
+    let attempt = ShutdownReport::new(Some(primary), retained_cleanup.clone());
+    let error = attempt
         .result()
         .expect_err("startup failure remains primary");
     *retained_events = events;
-    *shutdown = Some(report);
+    *shutdown = Some(ShutdownReport::new(None, retained_cleanup));
     error
 }
 
@@ -116,6 +116,22 @@ pub(crate) fn poll_backend_event(events: &BackendEvents) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinct_failure_contract() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            Error::DeviceLost,
+            Error::Backend("later capture failure".into()),
+            |first, second| {
+                let events = BackendEvents::default();
+                push_backend_event(&events, terminal(first));
+                push_backend_event(&events, terminal(second));
+                let mut shutdown = None;
+                finish_worker(&mut None, &mut shutdown, &events, None);
+                shutdown.unwrap().primary().unwrap().clone()
+            },
+        );
+    }
 
     fn terminal(error: Error) -> Event {
         Event::TerminalError { error }

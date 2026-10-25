@@ -613,8 +613,7 @@ fn stream(
         vad_tap: None,
         vad_events: Vec::new(),
         vad_origin: (0, 0),
-        vad_error: None,
-        vad_cleanup: Vec::new(),
+        vad_state: Default::default(),
         ready_chunks: VecDeque::new(),
     };
     assert_eq!(unsafe { crate::flexaudio_start(&mut stream) }, 0);
@@ -699,7 +698,7 @@ fn v2_checked_stop_retains_cleanup_without_capture_primary_and_emits_once() {
             error: flexaudio_vad::VadTapError::Conversion,
             terminal_events: Vec::new(),
         }),
-        fa::Operation::Normalize,
+        flexaudio_vad::VadAttachmentStage::Process,
     );
     unsafe {
         assert!(flexaudio_shutdown_report_v2(&stream).is_null());

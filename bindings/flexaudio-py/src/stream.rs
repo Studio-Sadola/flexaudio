@@ -56,8 +56,7 @@ pub struct Stream {
     vad_tap: Option<flexaudio_vad::VadTap>,
     vad_events: Vec<flexaudio_vad::AttachedVadEvent>,
     vad_origin: (u64, i64),
-    vad_error: Option<flexaudio_vad::VadTapError>,
-    vad_cleanup: Vec<fa::Error>,
+    vad_state: flexaudio_vad::VadAttachmentState,
     ready_chunks: std::collections::VecDeque<PyAudioChunk>,
 }
 
@@ -378,7 +377,7 @@ impl Stream {
         slf
     }
 
-    /// Keep an active body exception primary and attach any shutdown failure as context.
+    /// Keep an active body exception primary and retain any shutdown failure beside it.
     fn __exit__(
         &mut self,
         _exc_type: Option<Bound<'_, PyAny>>,
@@ -387,8 +386,7 @@ impl Stream {
     ) -> PyResult<bool> {
         if let Err(error) = self.stop() {
             if let Some(body) = exc_value {
-                let py = body.py();
-                body.setattr("__context__", error.value(py))?;
+                crate::context_exit::attach_cleanup_failure(body, error, "Stream stop");
             } else {
                 return Err(error);
             }
@@ -547,8 +545,7 @@ pub fn open(
         vad_tap,
         vad_events: Vec::new(),
         vad_origin: (0, 0),
-        vad_error: None,
-        vad_cleanup: Vec::new(),
+        vad_state: Default::default(),
         ready_chunks: std::collections::VecDeque::new(),
         inner: stream,
         shutdown: None,
@@ -631,8 +628,7 @@ mod tests {
                 vad_tap: None,
                 vad_events: Vec::new(),
                 vad_origin: (0, 0),
-                vad_error: None,
-                vad_cleanup: Vec::new(),
+                vad_state: Default::default(),
                 secondary: None,
                 ready_secondary: Default::default(),
                 vad_secondary: false,
@@ -707,8 +703,7 @@ else:
                     vad_tap: None,
                     vad_events: Vec::new(),
                     vad_origin: (0, 0),
-                    vad_error: None,
-                    vad_cleanup: Vec::new(),
+                    vad_state: Default::default(),
                     secondary: None,
                     ready_secondary: Default::default(),
                     vad_secondary: false,
@@ -837,8 +832,7 @@ mod repro_tests {
                 vad_tap: None,
                 vad_events: Vec::new(),
                 vad_origin: (0, 0),
-                vad_error: None,
-                vad_cleanup: Vec::new(),
+                vad_state: Default::default(),
                 secondary: None,
                 ready_secondary: Default::default(),
                 vad_secondary: false,

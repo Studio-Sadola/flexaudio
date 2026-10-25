@@ -40,10 +40,10 @@ impl Stream {
         }
         if let Some(vad_tap) = self.vad_tap.as_mut() {
             let result = vad_tap.stop();
-            self.accept_vad_tap(result, fa::Operation::Stop);
+            self.accept_vad_tap(result, flexaudio_vad::VadAttachmentStage::StopFlush);
             self.vad_carrier();
         }
-        cleanup.extend(self.vad_cleanup.iter().cloned());
+        cleanup.extend(self.vad_state.cleanup_errors());
         self.local_events.extend(
             cleanup[before..]
                 .iter()
@@ -93,8 +93,7 @@ pub(crate) fn _stream_stop_failure() -> PyResult<Stream> {
         vad_tap: None,
         vad_events: Vec::new(),
         vad_origin: (0, 0),
-        vad_error: None,
-        vad_cleanup: Vec::new(),
+        vad_state: Default::default(),
         secondary: None,
         ready_secondary: Default::default(),
         vad_secondary: false,
@@ -161,7 +160,10 @@ try:
         raise KeyError('body')
 except KeyError as body:
     assert str(body) == "'body'"
-    assert body.__context__.audio_error.kind == 'deviceLost'
+    if hasattr(body, '__notes__'):
+        assert any('device lost' in note for note in body.__notes__)
+    else:
+        assert body.__context__.audio_error.kind == 'deviceLost'
 else:
     raise AssertionError('body error was lost')
 "#

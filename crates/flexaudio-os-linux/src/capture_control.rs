@@ -114,6 +114,7 @@ pub(crate) fn apply_core_outcome(
 mod tests {
     use super::*;
     use crate::{link_error::CoreFailure, owner::poll_backend_event, proxy_release::RequestWindow};
+    use flexaudio_core::Error;
     use std::{
         cell::Cell,
         sync::{mpsc, Arc, Mutex},
@@ -182,6 +183,26 @@ mod tests {
                 message: "link-factory: unknown output port 52".into(),
             });
         }
+        fn start(&self) {
+            self.readiness.report_ready();
+            assert_eq!(self.result.try_recv(), Ok(Ok(())));
+        }
+        fn failure(&self, started: bool) -> Error {
+            let error = if started {
+                assert_eq!(self.result.try_recv(), Err(mpsc::TryRecvError::Empty));
+                let Some(Event::TerminalError { error }) = poll_backend_event(&self.events) else {
+                    panic!("successful capture must publish its runtime terminal failure");
+                };
+                error
+            } else {
+                self.result
+                    .try_recv()
+                    .expect("startup failure")
+                    .unwrap_err()
+            };
+            assert!(poll_backend_event(&self.events).is_none());
+            error
+        }
     }
 
     #[test]
@@ -228,38 +249,42 @@ mod tests {
     }
     #[test]
     fn surviving_link_target_terminates_with_original_error_after_barrier() {
-        let owner = Fixture::new();
-        owner.error(-22);
-        assert!(!owner.control.barrier(
-            99,
-            |_| panic!("unrelated barrier"),
-            || panic!("unrelated barrier")
-        ));
-        assert!(!owner.stopped.get());
-        assert!(owner.control.barrier(
-            100,
-            |_| panic!("fatal route must not retire before termination"),
-            || panic!("fatal route must not reconcile")
-        ));
-        assert!(owner.stopped.get());
-        assert!(owner.result.try_recv().expect("startup failure").is_err());
-        let Some(Event::TerminalError { error }) = poll_backend_event(&owner.events) else {
-            panic!("expected terminal failure");
-        };
-        assert_eq!(error.diagnostic_details(), ["PipeWire core error: id=5 sequence=21 status=-22; link-factory: unknown output port 52"]);
-        assert!(poll_backend_event(&owner.events).is_none());
+        for started in [false, true] {
+            let owner = Fixture::new();
+            if started {
+                owner.start();
+            }
+            owner.error(-22);
+            assert!(!owner.control.barrier(
+                99,
+                |_| panic!("unrelated barrier"),
+                || panic!("unrelated barrier")
+            ));
+            assert!(!owner.stopped.get());
+            assert!(owner.control.barrier(
+                100,
+                |_| panic!("fatal route must not retire before termination"),
+                || panic!("fatal route must not reconcile")
+            ));
+            assert!(owner.stopped.get());
+            let error = owner.failure(started);
+            assert_eq!(error.diagnostic_details(), ["PipeWire core error: id=5 sequence=21 status=-22; link-factory: unknown output port 52"]);
+            assert!(poll_backend_event(&owner.events).is_none());
+        }
     }
     #[test]
     fn permission_failure_terminates_without_scheduling_verification() {
-        let owner = Fixture::new();
-        owner.error(-13);
-        assert!(owner.stopped.get());
-        assert!(!owner.lifecycle.has_pending_errors());
-        assert!(owner.result.try_recv().expect("startup failure").is_err());
-        assert!(matches!(
-            poll_backend_event(&owner.events),
-            Some(Event::TerminalError { .. })
-        ));
+        for started in [false, true] {
+            let owner = Fixture::new();
+            if started {
+                owner.start();
+            }
+            owner.error(-13);
+            assert!(owner.stopped.get());
+            assert!(!owner.lifecycle.has_pending_errors());
+            let error = owner.failure(started);
+            assert_eq!(error.diagnostic_details(), ["PipeWire core error: id=5 sequence=21 status=-13; link-factory: unknown output port 52"]);
+        }
     }
     #[test]
     fn a_surviving_neighbor_still_requires_negotiation_after_benign_disappearance() {
@@ -323,32 +348,37 @@ mod tests {
 
     #[test]
     fn callback_panic_is_contained_and_terminates_through_the_shared_owner() {
-        let owner = Fixture::new();
-        owner
-            .control
-            .callbacks
-            .run(|| panic!("synthetic callback panic"));
-        assert!(owner.stopped.get());
-        assert!(owner.result.try_recv().expect("callback failure").is_err());
-        assert!(matches!(
-            poll_backend_event(&owner.events),
-            Some(Event::TerminalError { .. })
-        ));
+        for started in [false, true] {
+            let owner = Fixture::new();
+            if started {
+                owner.start();
+            }
+            owner
+                .control
+                .callbacks
+                .run(|| panic!("synthetic callback panic"));
+            assert!(owner.stopped.get());
+            let error = owner.failure(started);
+            assert_eq!(error.kind(), flexaudio_core::ErrorKind::Backend);
+            assert!(!error.to_string().contains("synthetic callback panic"));
+        }
     }
     #[test]
     fn verification_sync_failure_is_terminal_and_retains_the_original_tuple() {
-        let owner = Fixture::with_checkpoint(|| {
-            Err(flexaudio_core::Error::Backend(
-                "synthetic sync failure".into(),
-            ))
-        });
-        owner.error(-22);
-        assert!(owner.stopped.get());
-        assert!(!owner.lifecycle.has_pending_errors());
-        assert!(owner.result.try_recv().expect("startup failure").is_err());
-        let Some(Event::TerminalError { error }) = poll_backend_event(&owner.events) else {
-            panic!("expected terminal failure");
-        };
-        assert_eq!(error.diagnostic_details(), ["PipeWire core error: id=5 sequence=21 status=-22; link-factory: unknown output port 52"]);
+        for started in [false, true] {
+            let owner = Fixture::with_checkpoint(|| {
+                Err(flexaudio_core::Error::Backend(
+                    "synthetic sync failure".into(),
+                ))
+            });
+            if started {
+                owner.start();
+            }
+            owner.error(-22);
+            assert!(owner.stopped.get());
+            assert!(!owner.lifecycle.has_pending_errors());
+            let error = owner.failure(started);
+            assert_eq!(error.diagnostic_details(), ["PipeWire core error: id=5 sequence=21 status=-22; link-factory: unknown output port 52"]);
+        }
     }
 }
