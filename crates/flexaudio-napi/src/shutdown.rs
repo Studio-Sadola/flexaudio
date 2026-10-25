@@ -53,7 +53,43 @@ impl ShutdownReport {
     }
 
     /// One shared outcome contract decides both retained diagnostics and checked stop.
-    fn outcome(&self) -> flexaudio::core::ShutdownReport {
+    pub(super) fn outcome(&self) -> flexaudio::core::ShutdownReport {
+        fn new_cleanup(
+            primary: Option<&flexaudio::Error>,
+            cleanup: &[flexaudio::Error],
+            incoming: flexaudio::Error,
+        ) -> Option<flexaudio::Error> {
+            use flexaudio::core::terminal_causes::{retain_terminal_cause, retains_terminal_cause};
+            if primary.is_some_and(|error| retains_terminal_cause(error, &incoming))
+                || cleanup
+                    .iter()
+                    .any(|error| retains_terminal_cause(error, &incoming))
+            {
+                return None;
+            }
+            match incoming {
+                flexaudio::Error::Multiple(group) => {
+                    let mut changed = false;
+                    let mut remaining = Vec::new();
+                    for error in std::iter::once(group.primary()).chain(group.secondary()) {
+                        let retained = new_cleanup(primary, cleanup, error.clone());
+                        changed |= retained.as_ref() != Some(error);
+                        if let Some(error) = retained {
+                            remaining.push(error);
+                        }
+                    }
+                    if !changed {
+                        return Some(flexaudio::Error::Multiple(group));
+                    }
+                    let mut retained = None;
+                    for error in remaining {
+                        retain_terminal_cause(&mut retained, error);
+                    }
+                    retained
+                }
+                error => Some(error),
+            }
+        }
         let primary = self
             .core
             .as_ref()
@@ -64,8 +100,17 @@ impl ShutdownReport {
             .as_ref()
             .map(|report| report.cleanup().to_vec())
             .unwrap_or_default();
-        cleanup.extend(self.attachment.iter().map(VadFailure::audio_error));
-        cleanup.extend(self.binding_cleanup.iter().cloned());
+        // Failed early notifications may precede the facade snapshot of the same typed cause.
+        for error in self
+            .attachment
+            .iter()
+            .map(VadFailure::audio_error)
+            .chain(self.binding_cleanup.iter().cloned())
+        {
+            if let Some(error) = new_cleanup(primary.as_ref(), &cleanup, error) {
+                cleanup.push(error);
+            }
+        }
         flexaudio::core::ShutdownReport::new(primary, cleanup)
     }
 
@@ -94,6 +139,9 @@ impl ShutdownReport {
 /// matching Python's `sys.unraisablehook`. The warning carries `cause` (the error `stop()` would
 /// reject with), its `audioError`, and the full `shutdownReport`.
 pub(super) fn report_gc_failure(env: &Env, report: &FinalReport) {
+    if report_handed_off_gc_failure(report) {
+        return;
+    }
     let Some((error, retained, outcome)) = take_gc_failure(report) else {
         return;
     };
@@ -110,6 +158,29 @@ pub(super) fn report_gc_failure(env: &Env, report: &FinalReport) {
             warning.set_named_property("shutdownReport", retained)
         },
     );
+}
+
+fn report_handed_off_gc_failure(report: &FinalReport) -> bool {
+    let snapshot = {
+        let mut report = report.lock().unwrap_or_else(lock_poisoned);
+        report
+            .as_mut()
+            .filter(|report| report.gc_requested && report.gc_reported)
+            .map(|report| {
+                let outcome = report.outcome();
+                (report.delivered_report.replace(outcome.clone()), outcome)
+            })
+    };
+    let Some((previous, outcome)) = snapshot else {
+        return false;
+    };
+    // An earlier queue refusal handed ownership to the sink; later GC causes follow it.
+    flexaudio::core::report_drop_failures(
+        flexaudio::DropFailureOwner::Stream,
+        previous.as_ref(),
+        &outcome,
+    );
+    true
 }
 
 /// Claim the one GC notification, releasing the lock before any JS runs.
@@ -144,11 +215,10 @@ pub(super) fn report_unreachable_failure(report: &FinalReport, status: Status, r
     }
     let (previous, outcome) = {
         let mut report = report.lock().unwrap_or_else(lock_poisoned);
-        let Some(report) = report.as_mut() else {
-            return;
-        };
+        let report = report.get_or_insert_with(ShutdownReport::default);
         let outcome = report.outcome();
-        if outcome.primary().is_none() && outcome.cleanup().is_empty() {
+        if status == Status::Closing && outcome.primary().is_none() && outcome.cleanup().is_empty()
+        {
             // A clean teardown has no failure to rescue when its host has already closed.
             return;
         }
@@ -299,5 +369,80 @@ mod tests {
         assert!(mapped.vad_code.is_none());
         assert_eq!(mapped.secondary.len(), 1);
         assert_eq!(mapped.secondary[0].vad_code.as_deref(), Some("Inference"));
+    }
+
+    #[test]
+    fn entirely_new_cleanup_groups_preserve_their_original_shape() {
+        let nested = flexaudio::Error::Multiple(flexaudio::ErrorGroup::new(
+            flexaudio::Error::DeviceLost,
+            flexaudio::Error::Unsupported,
+            vec![],
+        ));
+        let incoming = flexaudio::Error::Multiple(flexaudio::ErrorGroup::new(
+            flexaudio::Error::DeviceNotFound,
+            nested,
+            vec![flexaudio::Error::Backend("new cleanup failure".into())],
+        ));
+        let report = ShutdownReport {
+            core: Some(flexaudio::ShutdownReport::new(
+                Some(flexaudio::Error::Backend("capture failure".into())),
+                vec![],
+            )),
+            binding_cleanup: vec![incoming.clone()],
+            ..ShutdownReport::default()
+        };
+        assert_eq!(report.outcome().cleanup(), &[incoming]);
+    }
+
+    #[test]
+    fn accepted_gc_notification_preserves_new_failures_after_an_earlier_sink_handoff() {
+        const CHILD: &str = "FLEXAUDIO_NAPI_GC_HANDOFF_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "shutdown::tests::accepted_gc_notification_preserves_new_failures_after_an_earlier_sink_handoff",
+                    "--exact",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let output = received.clone();
+        flexaudio::set_drop_failure_handler(Some(Box::new(move |failure| {
+            output.lock().unwrap().push(failure.clone());
+        })));
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            flexaudio::Error::DeviceLost,
+            flexaudio::Error::Backend("late GC cleanup failure".into()),
+            |first, second| {
+                let report = Arc::new(Mutex::new(Some(ShutdownReport::from_core(Some(
+                    flexaudio::ShutdownReport::new(Some(first.clone()), vec![]),
+                )))));
+                report_unreachable_failure(&report, Status::QueueFull, "stream event callback");
+                assert_eq!(received.lock().unwrap().len(), 1);
+                record_cleanup_failure(&report, second.clone());
+                report.lock().unwrap().as_mut().unwrap().gc_requested = true;
+                report_unreachable_failure(&report, Status::Ok, "GC shutdown notice");
+                // The accepted GC callback follows the same existing-sink branch as production.
+                assert!(report_handed_off_gc_failure(&report));
+                assert!(report_handed_off_gc_failure(&report));
+                let mut received = received.lock().unwrap();
+                assert_eq!(received.len(), 2, "equal snapshots must remain quiet");
+                let later = received.pop().unwrap();
+                assert!(later.report.primary().is_none());
+                assert_eq!(later.report.cleanup(), std::slice::from_ref(&second));
+                flexaudio::ShutdownReport::new(Some(first), later.report.cleanup().to_vec())
+                    .result()
+                    .unwrap_err()
+            },
+        );
+        flexaudio::set_drop_failure_handler(None);
     }
 }

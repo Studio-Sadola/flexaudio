@@ -61,8 +61,31 @@ enum Delivery {
 pub(super) struct LifecycleDelivery {
     queue: ThreadsafeFunction<Delivery, ErrorStrategy::Fatal>,
     handler: Mutex<Option<Arc<UserCallback>>>,
-    pending: Arc<AtomicUsize>,
-    waiting: Arc<AtomicBool>,
+    drain: Arc<LifecycleDrain>,
+    report: FinalReport,
+}
+
+#[derive(Default)]
+struct LifecycleDrain {
+    pending: AtomicUsize,
+    waiting: AtomicBool,
+}
+
+impl LifecycleDrain {
+    fn defer_stop(&self) -> bool {
+        if self.pending.load(Ordering::SeqCst) != 0 {
+            self.waiting.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn resume_if_drained(&self, post: impl FnOnce()) {
+        if self.pending.load(Ordering::SeqCst) == 0 && self.waiting.swap(false, Ordering::SeqCst) {
+            post();
+        }
+    }
 }
 
 pub(super) fn retain(env: &Env, function: &napi::JsFunction) -> napi::Result<Arc<UserCallback>> {
@@ -74,16 +97,18 @@ impl LifecycleDelivery {
         env: &Env,
         callback: Option<&napi::JsFunction>,
         chunk: ChunkTsfnWeakCell,
+        settle: stop_delivery::SettleWeakCell,
+        phase: Arc<Mutex<StopPhase>>,
+        report: FinalReport,
     ) -> napi::Result<Arc<Self>> {
-        let pending = Arc::new(AtomicUsize::new(0));
-        let waiting = Arc::new(AtomicBool::new(false));
+        let drain = Arc::new(LifecycleDrain::default());
         let pump = env.create_function_from_closure("flexaudioLifecyclePump", |ctx| {
             ctx.env.get_undefined()
         })?;
         let mut queue = pump
             .create_threadsafe_function::<Delivery, Unknown, _, ErrorStrategy::Fatal>(0, {
-                let pending = pending.clone();
-                let waiting = waiting.clone();
+                let drain = drain.clone();
+                let report = report.clone();
                 move |ctx: ThreadSafeCallContext<Delivery>| {
                     let result = match ctx.value {
                         Delivery::Release(callback) => {
@@ -104,19 +129,13 @@ impl LifecycleDelivery {
                                     unsafe { Function::from_napi_value(ctx.env.raw(), value)? };
                                 function.call(event).map(|_| ())
                             })();
-                            pending.fetch_sub(1, Ordering::SeqCst);
+                            drain.pending.fetch_sub(1, Ordering::SeqCst);
                             result
                         }
                     };
-                    if pending.load(Ordering::SeqCst) == 0 && waiting.swap(false, Ordering::SeqCst)
-                    {
-                        if let Some(chunk) = chunk.get().and_then(Weak::upgrade) {
-                            chunk.call(
-                                ChunkEmit::StopFlushed,
-                                ThreadsafeFunctionCallMode::NonBlocking,
-                            );
-                        }
-                    }
+                    drain.resume_if_drained(|| {
+                        stop_delivery::post_weak(&chunk, &settle, &phase, &report);
+                    });
                     result?;
                     Ok(Vec::<Unknown>::new())
                 }
@@ -125,22 +144,24 @@ impl LifecycleDelivery {
         Ok(Arc::new(Self {
             queue,
             handler: Mutex::new(callback.map(|f| retain(env, f)).transpose()?),
-            pending,
-            waiting,
+            drain,
+            report,
         }))
     }
 
     pub fn emit(&self, event: Event) {
         // These notices contain no failure payload; typed failures use the retained shutdown report.
         if let Some(handler) = self.handler.lock().unwrap_or_else(lock_poisoned).clone() {
-            self.pending.fetch_add(1, Ordering::SeqCst);
-            if self.queue.call(
+            self.drain.pending.fetch_add(1, Ordering::SeqCst);
+            let delivery = tsfn_delivery::call(
+                &self.queue,
                 Delivery::Event(handler, project(event)),
                 ThreadsafeFunctionCallMode::NonBlocking,
-            ) != Status::Ok
-            {
-                self.pending.fetch_sub(1, Ordering::SeqCst);
+            );
+            if delivery.is_err() {
+                self.drain.pending.fetch_sub(1, Ordering::SeqCst);
             }
+            failure_delivery::retain_queue_result(&self.report, delivery, "lifecycle notification");
         }
     }
 
@@ -156,20 +177,27 @@ impl LifecycleDelivery {
     }
 
     pub fn release(&self, handler: Arc<UserCallback>) {
-        self.queue.call(
+        match tsfn_delivery::call(
+            &self.queue,
             Delivery::Release(handler),
             ThreadsafeFunctionCallMode::NonBlocking,
-        );
+        ) {
+            Ok(()) => {}
+            Err(Status::Closing) => {
+                // The JS host is closing; UserCallback's finalizer still releases its reference.
+            }
+            Err(status) => {
+                record_cleanup_failure(
+                    &self.report,
+                    failure_delivery::queue_error("lifecycle callback release", status),
+                );
+            }
+        }
     }
 
     /// Called on JS after the bridge has stopped queueing lifecycle notifications.
     pub fn defer_stop(&self) -> bool {
-        if self.pending.load(Ordering::SeqCst) != 0 {
-            self.waiting.store(true, Ordering::SeqCst);
-            true
-        } else {
-            false
-        }
+        self.drain.defer_stop()
     }
 
     pub fn finish(&self) {
@@ -237,5 +265,102 @@ impl flexaudio::CaptureBackend for LifecycleMockBackend {
     }
     fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
+    }
+}
+
+#[cfg(test)]
+mod deferred_stop_tests {
+    use super::*;
+
+    #[test]
+    fn drained_lifecycle_rescues_failures_after_closed_or_expired_queues() {
+        const CHILD: &str = "FLEXAUDIO_NAPI_DEFERRED_STOP_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "lifecycle::deferred_stop_tests::drained_lifecycle_rescues_failures_after_closed_or_expired_queues",
+                    "--exact",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let output = received.clone();
+        flexaudio::set_drop_failure_handler(Some(Box::new(move |failure| {
+            output.lock().unwrap().push(failure.clone());
+        })));
+        for expired in [false, true] {
+            flexaudio_core::test_support::assert_distinct_failures_retained(
+                flexaudio::Error::DeviceLost,
+                failure_delivery::queue_error("stop chunk", Status::Closing),
+                |first, _second| {
+                    let report = Arc::new(Mutex::new(Some(shutdown::ShutdownReport::from_core(
+                        Some(flexaudio::ShutdownReport::new(Some(first), vec![])),
+                    ))));
+                    let phase = Mutex::new(StopPhase::Stopping { waiters: vec![] });
+                    let drain = LifecycleDrain::default();
+                    drain.pending.fetch_add(2, Ordering::SeqCst);
+                    assert!(drain.defer_stop());
+                    drain.pending.fetch_sub(1, Ordering::SeqCst);
+                    drain.resume_if_drained(|| panic!("one lifecycle notice is still pending"));
+                    assert!(received.lock().unwrap().is_empty());
+                    drain.pending.fetch_sub(1, Ordering::SeqCst);
+                    drain.resume_if_drained(|| {
+                        let chunk_owner = Arc::new(());
+                        let settle_owner = Arc::new(());
+                        let chunk = OnceLock::from(Arc::downgrade(&chunk_owner));
+                        let settle = OnceLock::from(Arc::downgrade(&settle_owner));
+                        let live_owners = if expired {
+                            drop((chunk_owner, settle_owner));
+                            None
+                        } else {
+                            Some((chunk_owner, settle_owner))
+                        };
+                        stop_delivery::post_weak_with(
+                            &chunk,
+                            &settle,
+                            |_, _| {
+                                assert!(!expired, "an expired queue must not be called");
+                                Err(Status::Closing)
+                            },
+                            |_, _| {
+                                assert!(!expired, "an expired queue must not be called");
+                                Err(Status::Closing)
+                            },
+                            &phase,
+                            &report,
+                        );
+                        drop(live_owners);
+                    });
+                    assert!(matches!(*phase.lock().unwrap(), StopPhase::Stopped));
+                    drain.resume_if_drained(|| panic!("deferred stop must resume only once"));
+                    let mut received = received.lock().unwrap();
+                    assert_eq!(
+                        received.len(),
+                        1,
+                        "deferred stop failure must reach its sink"
+                    );
+                    let failure = received.pop().unwrap();
+                    assert_eq!(failure.owner, flexaudio::DropFailureOwner::Stream);
+                    assert!(failure
+                        .report
+                        .cleanup()
+                        .contains(&failure_delivery::queue_error(
+                            "stop settlement",
+                            Status::Closing,
+                        )));
+                    failure.report.result().unwrap_err()
+                },
+            );
+        }
+        flexaudio::set_drop_failure_handler(None);
     }
 }

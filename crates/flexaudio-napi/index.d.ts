@@ -641,8 +641,12 @@ export declare function processes(): Promise<Array<JsProcessInfo>>
  * Open and start a stream, returning a `FlexStream` that sends chunks/events to callbacks.
  * Confirmed microphone/system-audio denial throws actionable permission guidance.
  * Supply onEvent for startupSamplesDropped, runtime denial and silenceWhileSourceActive
- * advisories. Without onEvent, terminalError() and stop() expose terminal failures
- * only; they do not expose advisories. macOS microphone authorization is checked
+ * advisories. terminalError() exposes capture-terminal failures. Refused failure-event
+ * delivery reaches the process failure receiver (stderr by default) and shutdown cleanup.
+ * Without onEvent, recoverable failures use that fallback; durable capture/shutdown
+ * failures remain available through ordinary stop/GC reporting. Unsubscribed advisories
+ * remain unavailable.
+ * macOS microphone authorization is checked
  * before any HAL format query. Bundled prompts wait at most 30 s; an unanswered
  * prompt throws a typed backend error without starting capture. Answer the prompt
  * and retry. Undecided consent without a nonempty NSMicrophoneUsageDescription

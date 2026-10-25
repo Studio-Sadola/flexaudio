@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "napi::threadsafe_function::ThreadsafeFunction::call", reason = "Use tsfn_delivery::call and handle its must-use Result." },
+    { path = "napi::threadsafe_function::ThreadsafeFunction::call_with_return_value", reason = "Direct TSFN delivery bypasses checked result handling." },
+]

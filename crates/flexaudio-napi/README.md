@@ -39,13 +39,31 @@ const stream = openStream(
   },
   (event) => {
     // event.type: 'chunkDropped' | 'stalled' | 'recovered' | 'permissionDenied'
-    //           | 'deviceLost' | 'error'
+    //           | 'deviceLost' | 'error' | 'recoverableError'
   },
 );
 
 // later:
 await stream.stop();
 ```
+
+Starting in 0.9, omitting the third `onEvent` callback reports recoverable failures
+to the process failure receiver, which writes to stderr by default. The shutdown
+report also retains those causes. Supply `onEvent` to handle, redirect or
+intentionally ignore `recoverableError` events; successfully delivered events do
+not use that fallback. If failure-event delivery is refused, the binding retains
+the original typed failure, records the delivery failure in shutdown cleanup,
+and routes both to the receiver.
+
+Custom Rust integrations can replace the process-wide receiver with
+`flexaudio::set_drop_failure_handler(Some(Box::new(handler)))` to handle, redirect
+or silence its output; passing `None` restores stderr. This is a Rust API; the npm
+package exposes no JavaScript receiver setter. JavaScript applications should
+supply `onEvent` to control recoverable-event handling.
+
+When `onEvent` is omitted, durable capture and shutdown failures still use ordinary
+`stop()`/GC reporting. `terminalError()` exposes capture-terminal failures only.
+Advisories without a subscriber remain unavailable.
 
 `stream.switchSource(options)` hot-swaps the input source without stopping.
 It applies only the stream configuration: `options.denoise` and `options.vad`

@@ -25,6 +25,7 @@ impl PairingBridge {
                 &self.on_chunk,
                 terminal,
                 self.lifecycle.as_deref(),
+                &self.report,
             );
             self.suppress_failed_pcm(stream);
             self.drain_capture(stream);
@@ -43,6 +44,7 @@ impl PairingBridge {
                 &self.on_chunk,
                 terminal,
                 self.lifecycle.as_deref(),
+                &self.report,
             ) {
                 break;
             }

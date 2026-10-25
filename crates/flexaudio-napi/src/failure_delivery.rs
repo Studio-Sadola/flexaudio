@@ -32,23 +32,49 @@ pub(super) fn report_failed(owner: DropFailureOwner, report: &ShutdownReport, de
 
 pub(super) fn device_event(
     event: flexaudio::DeviceEvent,
-    send: impl FnOnce(super::JsDeviceEvent) -> Status,
+    send: Option<impl FnOnce(super::JsDeviceEvent) -> Result<(), Status>>,
 ) -> bool {
     let failure = match &event {
         flexaudio::DeviceEvent::TerminalError { error } => Some(error.clone()),
         _ => None,
     };
-    let status = send(super::device_event_to_js(event));
-    if let Some(error) = failure.as_ref() {
-        report_rejected(
+    let result = send.map(|send| send(super::device_event_to_js(event)));
+    match (failure.as_ref(), result) {
+        (Some(error), Some(Err(status))) => report_rejected(
             DropFailureOwner::DeviceWatcher,
             &ShutdownReport::new(Some(error.clone()), Vec::new()),
             status,
             "device callback",
-        );
+        ),
+        (Some(error), None) => report_drop_failures(
+            DropFailureOwner::DeviceWatcher,
+            None,
+            &ShutdownReport::new(Some(error.clone()), Vec::new()),
+        ),
+        // A closed JavaScript host cannot consume an ordinary device delta.
+        (None, Some(Err(Status::Closing))) => {}
+        (None, Some(Err(status))) => report_rejected(
+            DropFailureOwner::DeviceWatcher,
+            &ShutdownReport::new(None, Vec::new()),
+            status,
+            "device callback",
+        ),
+        _ => {}
     }
-    // Ordinary device deltas contain no failure; an unavailable JS host cannot consume them.
     failure.is_some()
+}
+
+pub(super) fn retain_queue_result(
+    report: &super::FinalReport,
+    result: Result<(), Status>,
+    role: &str,
+) {
+    match result {
+        Ok(()) => {}
+        // Nonfailure payloads cannot be consumed after the JavaScript host has closed.
+        Err(Status::Closing) => {}
+        Err(status) => super::record_cleanup_failure(report, queue_error(role, status)),
+    }
 }
 
 #[cfg(test)]
@@ -87,7 +113,7 @@ mod tests {
                 |first, _second| {
                     assert!(device_event(
                         flexaudio::DeviceEvent::TerminalError { error: first },
-                        |_| status,
+                        Some(|_| Err(status)),
                     ));
                     let failure = received.lock().unwrap().pop().unwrap();
                     assert_eq!(failure.owner, DropFailureOwner::DeviceWatcher);
@@ -99,15 +125,35 @@ mod tests {
             flexaudio::DeviceEvent::TerminalError {
                 error: Error::DeviceLost
             },
-            |_| Status::Ok,
+            Some(|_| Ok(())),
         ));
         assert!(!device_event(
             flexaudio::DeviceEvent::Removed {
                 id: "device".into()
             },
-            |_| Status::Closing,
+            Some(|_| Err(Status::Closing)),
         ));
         assert!(received.lock().unwrap().is_empty());
+        assert!(!device_event(
+            flexaudio::DeviceEvent::Removed {
+                id: "device".into()
+            },
+            Some(|_| Err(Status::QueueFull)),
+        ));
+        let rejected_delta = received.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            rejected_delta.report.cleanup(),
+            &[queue_error("device callback", Status::QueueFull)]
+        );
+        assert!(device_event(
+            flexaudio::DeviceEvent::TerminalError {
+                error: Error::DeviceLost
+            },
+            None::<fn(super::super::JsDeviceEvent) -> Result<(), Status>>,
+        ));
+        let absent_receiver = received.lock().unwrap().pop().unwrap();
+        assert_eq!(absent_receiver.report.primary(), Some(&Error::DeviceLost));
+        assert!(absent_receiver.report.cleanup().is_empty());
         for status in [Status::Closing, Status::QueueFull] {
             flexaudio_core::test_support::assert_distinct_failures_retained(
                 Error::DeviceLost,
@@ -235,6 +281,54 @@ mod tests {
         );
         assert!(!clean.lock().unwrap().as_ref().unwrap().gc_reported);
         assert!(received.lock().unwrap().is_empty());
+        for initial in [
+            None,
+            Some(super::super::shutdown::ShutdownReport::default()),
+        ] {
+            let clean = Arc::new(Mutex::new(initial));
+            for status in [Status::QueueFull, Status::GenericFailure] {
+                for _attempt in 0..2 {
+                    super::super::shutdown::report_unreachable_failure(
+                        &clean,
+                        status,
+                        "GC shutdown notice",
+                    );
+                }
+                let mut received = received.lock().unwrap();
+                assert_eq!(received.len(), 1, "equal delivery retries must stay quiet");
+                let failure = received.pop().unwrap();
+                assert!(failure.report.primary().is_none());
+                assert_eq!(
+                    failure.report.cleanup(),
+                    &[queue_error("GC shutdown notice", status)]
+                );
+            }
+            assert_eq!(
+                clean.lock().unwrap().as_ref().unwrap().binding_cleanup,
+                vec![
+                    queue_error("GC shutdown notice", Status::QueueFull),
+                    queue_error("GC shutdown notice", Status::GenericFailure),
+                ]
+            );
+        }
         flexaudio::set_drop_failure_handler(None);
+    }
+
+    #[test]
+    fn ordinary_queue_refusals_retain_nonclosing_errors() {
+        let report = Arc::new(Mutex::new(None));
+        retain_queue_result(&report, Ok(()), "audio chunk");
+        retain_queue_result(&report, Err(Status::Closing), "audio chunk");
+        assert!(report.lock().unwrap().is_none());
+        retain_queue_result(&report, Err(Status::QueueFull), "audio chunk");
+        retain_queue_result(&report, Err(Status::GenericFailure), "audio chunk");
+        let report = report.lock().unwrap();
+        assert_eq!(
+            report.as_ref().unwrap().binding_cleanup,
+            vec![
+                queue_error("audio chunk", Status::QueueFull),
+                queue_error("audio chunk", Status::GenericFailure),
+            ]
+        );
     }
 }

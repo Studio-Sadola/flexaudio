@@ -16,6 +16,7 @@
 //! No network communication occurs at runtime (napi is only the N-API bridge).
 
 #![deny(clippy::let_underscore_must_use)]
+#![deny(clippy::disallowed_methods)]
 
 mod boundary;
 mod bridge_drain;
@@ -34,6 +35,9 @@ mod settings;
 mod settings_owner;
 mod settings_validation;
 mod shutdown;
+mod stop_delivery;
+mod stream_event_delivery;
+mod tsfn_delivery;
 use boundary::{device_event_to_js, event_to_js, to_napi_err, JsAudioError, JsAudioLoss};
 mod attachment;
 mod vad;
@@ -265,6 +269,7 @@ fn forward_stream_events(
     chunk_queue: &ChunkTsfn,
     terminal: &Mutex<Option<StreamTerminal>>,
     lifecycle: Option<&lifecycle::LifecycleDelivery>,
+    report: &FinalReport,
 ) -> bool {
     let mut released_startup = false;
     if let Some(error) = stream.terminal_error() {
@@ -295,13 +300,27 @@ fn forward_stream_events(
             // unbounded queue is owned by this bridge thread, so its notice is
             // queued before PCM on the same TSFN. If the queue is Closing,
             // subsequent PCM enqueues fail too; no callback can overtake it.
-            chunk_queue.call(
-                ChunkEmit::StartupDropped(Box::new(event_to_js(event))),
-                ThreadsafeFunctionCallMode::NonBlocking,
+            stream_event_delivery::deliver(None, report, "startup notice", || {
+                tsfn_delivery::call(
+                    chunk_queue,
+                    ChunkEmit::StartupDropped(Box::new(event_to_js(event))),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                )
+            });
+        } else {
+            stream_event_delivery::event(
+                event,
+                report,
+                callback.map(|callback| {
+                    |event| {
+                        tsfn_delivery::call(
+                            callback,
+                            event,
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                        )
+                    }
+                }),
             );
-        } else if let Some(callback) = callback {
-            // Failure payloads also remain in the stream report if this event queue closes.
-            callback.call(event_to_js(event), ThreadsafeFunctionCallMode::NonBlocking);
         }
     }
     released_startup
@@ -340,10 +359,12 @@ fn retain_stream_terminal(terminal: &Mutex<Option<StreamTerminal>>, error: flexa
 
 fn record_cleanup_failure(report: &FinalReport, error: flexaudio::Error) {
     let mut report = report.lock().unwrap_or_else(lock_poisoned);
-    report
+    let cleanup = &mut report
         .get_or_insert_with(shutdown::ShutdownReport::default)
-        .binding_cleanup
-        .push(error);
+        .binding_cleanup;
+    if !cleanup.contains(&error) {
+        cleanup.push(error);
+    }
 }
 
 fn record_bridge_failure(report: &FinalReport, terminal: &Mutex<Option<StreamTerminal>>) {
@@ -652,38 +673,7 @@ fn post_stop_flushed(
     phase: &Mutex<StopPhase>,
     report: &FinalReport,
 ) {
-    let st = chunk.call(
-        ChunkEmit::StopFlushed,
-        ThreadsafeFunctionCallMode::NonBlocking,
-    );
-    if st == Status::Ok {
-        return;
-    }
-    if st != Status::Closing {
-        // QueueFull, etc.: queue in Blocking mode on the same TSFN, after the queued onChunk calls.
-        let st_block = chunk.call(ChunkEmit::StopFlushed, ThreadsafeFunctionCallMode::Blocking);
-        if st_block == Status::Ok {
-            return;
-        }
-    }
-    let st2 = settle.call((), ThreadsafeFunctionCallMode::NonBlocking);
-    if st2 == Status::Ok {
-        return;
-    }
-    let final_status = if st2 != Status::Closing {
-        let st2b = settle.call((), ThreadsafeFunctionCallMode::Blocking);
-        if st2b == Status::Ok {
-            return;
-        }
-        st2b
-    } else {
-        st2
-    };
-    // Even the settlement TSFN failed = the JS event loop is no longer running (Node is exiting).
-    // Only then may the unresolved deferred be discarded. As long as JS is alive,
-    // the settle TSFN calls resolve_undefined on the JS thread.
-    let _ = take_stop_waiters(phase);
-    shutdown::report_unreachable_failure(report, final_status, "stop settlement");
+    stop_delivery::post(Some(chunk), Some(settle.as_ref()), phase, report);
 }
 
 /// Run `flexaudio::processes()` on the libuv thread pool.
@@ -1327,9 +1317,14 @@ impl PairingBridge {
             vad_events: None,
             secondary: None,
         };
-        self.on_chunk.call(
-            ChunkEmit::Chunk(Box::new(carrier)),
-            ThreadsafeFunctionCallMode::NonBlocking,
+        failure_delivery::retain_queue_result(
+            &self.report,
+            tsfn_delivery::call(
+                &self.on_chunk,
+                ChunkEmit::Chunk(Box::new(carrier)),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            ),
+            "stream terminator",
         );
     }
 
@@ -1424,9 +1419,14 @@ impl PairingBridge {
             secondary: Some(secondary),
         };
         self.last_emitted_primary_pts = carrier.pts_ns;
-        self.on_chunk.call(
-            ChunkEmit::Chunk(Box::new(carrier)),
-            ThreadsafeFunctionCallMode::NonBlocking,
+        failure_delivery::retain_queue_result(
+            &self.report,
+            tsfn_delivery::call(
+                &self.on_chunk,
+                ChunkEmit::Chunk(Box::new(carrier)),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            ),
+            "secondary envelope",
         );
     }
 
@@ -1476,9 +1476,14 @@ impl PairingBridge {
                 }
             }
             p.secondary = matched;
-            self.on_chunk.call(
-                ChunkEmit::Chunk(Box::new(p)),
-                ThreadsafeFunctionCallMode::NonBlocking,
+            failure_delivery::retain_queue_result(
+                &self.report,
+                tsfn_delivery::call(
+                    &self.on_chunk,
+                    ChunkEmit::Chunk(Box::new(p)),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                ),
+                "paired audio chunk",
             );
         }
     }
@@ -1579,6 +1584,7 @@ impl FlexStream {
                                         &bridge.on_chunk,
                                         &thread_terminal,
                                         bridge.lifecycle.as_deref(),
+                                        &bridge.report,
                                     );
                                     let r = if sw.mock_source {
                                         stream.switch_backend(lifecycle::mock_backend())
@@ -1653,9 +1659,36 @@ impl FlexStream {
                                     .attachment
                                     .as_ref()
                                     .and_then(|owner| owner.state.latest_error().cloned());
-                                bridge.on_chunk.call(
-                                    ChunkEmit::VadFlushed(deferred, error),
-                                    ThreadsafeFunctionCallMode::NonBlocking,
+                                let original = error
+                                    .as_ref()
+                                    .map(flexaudio_vad::VadTapError::audio_error);
+                                stream_event_delivery::deliver(
+                                    original,
+                                    &bridge.report,
+                                    "VAD flush settlement",
+                                    || {
+                                        match tsfn_delivery::call(
+                                            &bridge.on_chunk,
+                                            ChunkEmit::VadFlushed(deferred, error.clone()),
+                                            ThreadsafeFunctionCallMode::NonBlocking,
+                                        ) {
+                                            Err(status) if status != Status::Closing => {
+                                                record_cleanup_failure(
+                                                    &bridge.report,
+                                                    failure_delivery::queue_error(
+                                                        "VAD flush settlement",
+                                                        status,
+                                                    ),
+                                                );
+                                                tsfn_delivery::call(
+                                                    &bridge.on_chunk,
+                                                    ChunkEmit::VadFlushed(deferred, error),
+                                                    ThreadsafeFunctionCallMode::Blocking,
+                                                )
+                                            }
+                                            result => result,
+                                        }
+                                    },
                                 );
                             }
                         }
@@ -2206,8 +2239,11 @@ fn finish_gc_shutdown(report: &FinalReport, notify: &SettleTsfn, requested: bool
         .unwrap_or_else(lock_poisoned)
         .get_or_insert_with(shutdown::ShutdownReport::default)
         .gc_requested = true;
-    let status = notify.call((), ThreadsafeFunctionCallMode::NonBlocking);
-    shutdown::report_unreachable_failure(report, status, "GC shutdown notice");
+    if let Err(status) =
+        tsfn_delivery::call(notify.as_ref(), (), ThreadsafeFunctionCallMode::NonBlocking)
+    {
+        shutdown::report_unreachable_failure(report, status, "GC shutdown notice");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2236,11 +2272,15 @@ impl DeviceWatcherHandle {
                             flexaudio::core::Operation::Join,
                         )),
                     },
-                    |event| {
-                        self.on_event.as_ref().map_or(Status::Closing, |callback| {
-                            callback.call(event, ThreadsafeFunctionCallMode::NonBlocking)
-                        })
-                    },
+                    self.on_event.as_ref().map(|callback| {
+                        |event| {
+                            tsfn_delivery::call(
+                                callback,
+                                event,
+                                ThreadsafeFunctionCallMode::NonBlocking,
+                            )
+                        }
+                    }),
                 );
             }
         }
@@ -2310,8 +2350,12 @@ pub fn processes() -> AsyncTask<ProcessesTask> {
 /// Open and start a stream, returning a `FlexStream` that sends chunks/events to callbacks.
 /// Confirmed microphone/system-audio denial throws actionable permission guidance.
 /// Supply onEvent for startupSamplesDropped, runtime denial and silenceWhileSourceActive
-/// advisories. Without onEvent, terminalError() and stop() expose terminal failures
-/// only; they do not expose advisories. macOS microphone consent is checked
+/// advisories. terminalError() exposes capture-terminal failures. Refused failure-event
+/// delivery reaches the process failure receiver (stderr by default) and shutdown cleanup.
+/// Without onEvent, recoverable failures use that fallback; durable capture/shutdown
+/// failures remain available through ordinary stop/GC reporting. Unsubscribed advisories
+/// remain unavailable.
+/// macOS microphone consent is checked
 /// before any HAL query. Bundled prompts wait at most 30 s; an unanswered prompt
 /// throws a typed Backend error without starting capture. Answer the prompt and retry.
 /// Undecided consent without a nonempty NSMicrophoneUsageDescription fails immediately;
@@ -2415,10 +2459,14 @@ pub fn open_stream(
     let user = make_user_chunk_cb(&env, &on_chunk)?;
     let (on_event, event_callback) = make_stream_event_callbacks(&env, on_event)?;
     let chunk_weak: ChunkTsfnWeakCell = Arc::new(OnceLock::new());
+    let settle_weak: stop_delivery::SettleWeakCell = Arc::new(OnceLock::new());
     let lifecycle = lifecycle::LifecycleDelivery::new(
         &env,
         options.on_lifecycle_event.as_ref(),
         chunk_weak.clone(),
+        settle_weak.clone(),
+        stop_phase.clone(),
+        report.clone(),
     )?;
     let on_chunk = make_chunk_tsfn(
         &env,
@@ -2438,6 +2486,12 @@ pub fn open_stream(
         report.clone(),
         event_callback,
     )?;
+    settle_weak.set(Arc::downgrade(&settle_tsfn)).map_err(|_| {
+        NapiError::new(
+            Status::GenericFailure,
+            "stop settlement owner was initialized twice",
+        )
+    })?;
     let bridge = PairingBridge {
         settings: mock_source.then_some(settings),
         lifecycle: Some(lifecycle),
@@ -2473,9 +2527,12 @@ pub fn open_stream(
 fn forward_device_events(watcher: &mut flexaudio::DeviceWatcher, callback: &DeviceTsfn) -> bool {
     let mut failed = false;
     while let Some(event) = watcher.poll_event() {
-        failed |= failure_delivery::device_event(event, |event| {
-            callback.call(event, ThreadsafeFunctionCallMode::NonBlocking)
-        });
+        failed |= failure_delivery::device_event(
+            event,
+            Some(|event| {
+                tsfn_delivery::call(callback, event, ThreadsafeFunctionCallMode::NonBlocking)
+            }),
+        );
     }
     failed
 }
@@ -2704,15 +2761,18 @@ impl Drop for FlacEncoder {
         if let Err(error) = self.inner.finalize_on_drop() {
             let report =
                 flexaudio::ShutdownReport::new(Some(error.audio_error.clone()), Vec::new());
-            let status = self
-                .cleanup
-                .call(error, ThreadsafeFunctionCallMode::NonBlocking);
-            failure_delivery::report_rejected(
-                flexaudio::DropFailureOwner::FlacWriter,
-                &report,
-                status,
-                "encoder GC notice",
-            );
+            if let Err(status) = tsfn_delivery::call(
+                &self.cleanup,
+                error,
+                ThreadsafeFunctionCallMode::NonBlocking,
+            ) {
+                failure_delivery::report_rejected(
+                    flexaudio::DropFailureOwner::FlacWriter,
+                    &report,
+                    status,
+                    "encoder GC notice",
+                );
+            }
         }
     }
 }

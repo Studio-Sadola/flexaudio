@@ -213,14 +213,22 @@ impl PairingBridge {
             return;
         }
         while let Some((failure, epoch)) = owner.notifications.pop_front() {
-            // owner.state retains this typed cause; final teardown rescues unreachable reports.
-            self.on_chunk.call(
-                ChunkEmit::VadFailed {
-                    error: failure.error,
-                    stage: failure.stage,
-                    epoch,
+            let original = failure.audio_error();
+            stream_event_delivery::deliver(
+                Some(original),
+                &self.report,
+                "VAD failure notice",
+                || {
+                    tsfn_delivery::call(
+                        &self.on_chunk,
+                        ChunkEmit::VadFailed {
+                            error: failure.error,
+                            stage: failure.stage,
+                            epoch,
+                        },
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                    )
                 },
-                ThreadsafeFunctionCallMode::NonBlocking,
             );
         }
     }
@@ -256,9 +264,14 @@ impl PairingBridge {
                 carrier.secondary = Some(secondary);
             }
         }
-        self.on_chunk.call(
-            ChunkEmit::Chunk(Box::new(carrier)),
-            ThreadsafeFunctionCallMode::NonBlocking,
+        failure_delivery::retain_queue_result(
+            &self.report,
+            tsfn_delivery::call(
+                &self.on_chunk,
+                ChunkEmit::Chunk(Box::new(carrier)),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            ),
+            "VAD event carrier",
         );
     }
 }
