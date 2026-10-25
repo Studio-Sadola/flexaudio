@@ -142,7 +142,7 @@ impl CaptureBackend for MockBackend {
 
 impl Drop for MockBackend {
     fn drop(&mut self) {
-        self.stop();
+        self.shutdown.retain_drop(&self.running, &mut self.handle);
     }
 }
 
@@ -277,7 +277,7 @@ impl CaptureBackend for StallableMockBackend {
 
 impl Drop for StallableMockBackend {
     fn drop(&mut self) {
-        self.stop();
+        self.shutdown.retain_drop(&self.running, &mut self.handle);
     }
 }
 
@@ -421,7 +421,7 @@ impl Drop for PanickingMockBackend {
     fn drop(&mut self) {
         // Do not panic from Drop (to avoid a double panic leading to abort). Just make sure the
         // feed thread stops. PanicMode::Stop panics only on an explicit `stop()` call.
-        self.shutdown.retain(&self.running, &mut self.handle);
+        self.shutdown.retain_drop(&self.running, &mut self.handle);
     }
 }
 
@@ -551,7 +551,7 @@ impl CaptureBackend for StallThenPanicOnReopenBackend {
 
 impl Drop for StallThenPanicOnReopenBackend {
     fn drop(&mut self) {
-        self.shutdown.retain(&self.running, &mut self.handle);
+        self.shutdown.retain_drop(&self.running, &mut self.handle);
     }
 }
 
@@ -563,6 +563,17 @@ struct MockShutdown {
 }
 
 impl MockShutdown {
+    fn retain_drop(&mut self, running: &AtomicBool, handle: &mut Option<JoinHandle<()>>) {
+        let previous = self.report.clone();
+        self.retain(running, handle);
+        if let Some(report) = &self.report {
+            flexaudio_core::report_drop_failures(
+                flexaudio_core::DropFailureOwner::MockCapture,
+                previous.as_ref(),
+                report,
+            );
+        }
+    }
     fn retain(&mut self, running: &AtomicBool, handle: &mut Option<JoinHandle<()>>) {
         running.store(false, Ordering::SeqCst);
         if self.report.is_some() {
@@ -588,6 +599,28 @@ impl MockShutdown {
             .expect("completed mock shutdown")
             .result()
     }
+}
+
+#[cfg(test)]
+pub(crate) fn drop_failure_fixtures() {
+    macro_rules! exercise {
+        ($construct:expr) => {{
+            let mut backend = $construct;
+            backend.handle = Some(thread::spawn(|| {
+                panic!("injected implicit generator join failure")
+            }));
+            drop(backend);
+        }};
+    }
+    exercise!(MockBackend::new(48_000, 2, 0.0));
+    exercise!(StallableMockBackend::new(48_000, 2, 0.0, Duration::ZERO));
+    exercise!(PanickingMockBackend::new(48_000, 2, 0.0, PanicMode::Stop));
+    exercise!(StallThenPanicOnReopenBackend::new(
+        48_000,
+        2,
+        0.0,
+        Duration::ZERO
+    ));
 }
 
 #[cfg(test)]

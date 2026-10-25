@@ -22,7 +22,7 @@ async function bridge(scenario) {
   return chunks;
 }
 test('watcher stop delivers the real worker join failure to its callback',
-  { skip: process.platform !== 'linux' }, async () => {
+  { skip: process.platform !== 'linux' && 'the PipeWire watcher join fixture requires Linux' }, async () => {
     const events = [];
     const watcher = native.__watcherJoinFailure(event => events.push(event));
     watcher.stop();
@@ -154,12 +154,26 @@ test('optional lifecycle getters return undefined until a report is retained', a
 
 test('binding_contract_reaper_failure_control', () => {
   const output = spawnSync(process.execPath, ['-e', `
+    const assert = require('node:assert/strict');
     const native = require(process.argv[1]);
     const stream = native.__bindingContractBridge('reaper', () => {});
-    setTimeout(async () => { await stream.stop(); console.log('stop resolved despite reaper spawn failure'); }, 100);
+    setTimeout(async () => {
+      await assert.rejects(stream.stop(), error => {
+        assert.equal(error.code, 'FLEX_FAILURE');
+        assert.equal(error.audioError.kind, 'backend');
+        assert.match(error.message, /stop worker/);
+        return true;
+      });
+      const report = stream.shutdownReport();
+      assert.equal(report.primary, null);
+      assert.equal(report.cleanupErrors.length, 1);
+      assert.equal(report.cleanupErrors[0].kind, 'backend');
+      assert.match(report.cleanupErrors[0].message, /stop worker/);
+      console.log('stop settled and retained the reaper spawn failure');
+    }, 100);
   `, addonPath], { encoding: 'utf8', timeout: 10000 });
   assert.equal(output.status, 0, output.stderr);
-  assert.match(output.stdout, /stop resolved despite reaper spawn failure/);
+  assert.match(output.stdout, /stop settled and retained the reaper spawn failure/);
 });
 
 

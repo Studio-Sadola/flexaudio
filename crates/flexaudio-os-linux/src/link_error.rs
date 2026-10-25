@@ -261,6 +261,7 @@ mod tests {
                         failure,
                         decision,
                         attempt: None,
+                        checkpoint_error: None,
                     },
                     &readiness,
                     &events,

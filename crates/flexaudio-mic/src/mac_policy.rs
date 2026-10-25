@@ -65,6 +65,7 @@ struct Prompt {
 impl Prompt {
     fn complete(&self, result: Result<bool>) {
         if let Ok(mut state) = self.state.lock() {
+            // Native completion only carries a bool, and request submission has one error outcome.
             if state.result.is_none() {
                 state.result = Some(result);
                 self.changed.notify_all();

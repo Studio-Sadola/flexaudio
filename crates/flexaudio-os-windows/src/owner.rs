@@ -6,6 +6,9 @@ use std::thread::JoinHandle;
 
 use flexaudio_core::{Error, ErrorContext, Event, Operation, Result, ShutdownReport};
 
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) static DROP_FAILURE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// Cleanup observed by resources in one capture generation, including Drop.
 #[derive(Clone, Default)]
 pub(crate) struct CleanupLedger(Arc<Mutex<Vec<Error>>>);
@@ -99,6 +102,7 @@ impl OwnerShutdown {
     }
 
     pub(crate) fn finish(&mut self, handle: Option<JoinHandle<ShutdownReport>>) -> Result<()> {
+        // Successful startup resets the report before storing a new handle; repeats have no owner.
         if self.report.is_none() {
             let report = handle
                 .map(join_owner)
@@ -123,6 +127,7 @@ impl OwnerShutdown {
             .collect();
         let report = ShutdownReport::new(Some(error), cleanup);
         let result = report.result();
+        // Startup's primary reaches start() through this result; only cleanup belongs to shutdown.
         self.retain(ShutdownReport::new(None, report.cleanup().to_vec()));
         result
     }

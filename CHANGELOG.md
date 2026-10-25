@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Rust `set_drop_failure_handler` installs a process-wide typed receiver for
+  failures first observed during implicit shutdown or after bounded queries
+  time out. `DropFailure` identifies the owner and retains its `ShutdownReport`.
+  The default writes each failure to stderr; receiver panics fall back to stderr.
 - Rust `validate_open` exposes the same device-independent argument validation
   and strict preflight used by open, allowing model loading before backend access.
 - The non-default `test-support` feature is internal and test-only, with no
@@ -79,6 +83,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Retain distinct discovery, startup, bridge, legacy-event and shutdown failures
+  together instead of overwriting the first cause. Timed-out queries route late
+  failures to the process-wide Rust receiver. FLAC output closes exactly once,
+  including after write failure, and retains a separate native close failure.
+- Python exception notes retain the typed cleanup exception in the context
+  chain. Node retains stop-worker spawn failures in its shutdown report.
 - Failed capture startup returns its cause only from `start()`, without a
   terminal notice or shutdown primary. Rollback cleanup remains visible;
   transient watchdog reopen failures continue to emit recoverable errors and

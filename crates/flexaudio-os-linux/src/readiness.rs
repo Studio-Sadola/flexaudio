@@ -75,6 +75,7 @@ impl Readiness {
     }
 
     pub(crate) fn report_failure(&self, error: Error) {
+        // This channel announces startup once; the control owner retains later failures in rollback.
         if !self.sent.replace(true) {
             #[allow(
                 clippy::let_underscore_must_use,
@@ -168,10 +169,17 @@ mod tests {
         let error = Error::UnsupportedFormat("synthetic layout; retry".into())
             .with_context(ErrorContext::new(Operation::Link))
             .with_diagnostic_detail("synthetic daemon detail".into());
-        readiness.report_failure(error.clone());
+        let events = crate::owner::BackendEvents::default();
+        crate::capture_failures::report_control_failure(&readiness, &events, error.clone());
         assert_eq!(rx.recv().unwrap(), Err(error.clone()));
-        readiness.report_failure(Error::DeviceLost);
+        crate::capture_failures::report_control_failure(&readiness, &events, Error::DeviceLost);
         assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert_eq!(
+            crate::owner::poll_backend_event(&events),
+            Some(flexaudio_core::Event::ShutdownError {
+                error: Error::DeviceLost
+            })
+        );
         assert_eq!(error.kind(), flexaudio_core::ErrorKind::UnsupportedFormat);
         assert_eq!(error.diagnostic_details(), ["synthetic daemon detail"]);
     }

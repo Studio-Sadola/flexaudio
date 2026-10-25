@@ -34,6 +34,7 @@ impl Stream {
                 cleanup.push(cause.with_context(fa::ErrorContext::new(fa::Operation::Flush)));
             }
         } else {
+            // poll_processed_chunk would only return this same latched primary before doing work.
             self.ready_chunks.retain(|chunk| chunk.samples().is_empty());
             self.ready_secondary
                 .retain(|chunk| chunk.chunk.samples.is_empty());

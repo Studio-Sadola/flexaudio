@@ -6,11 +6,26 @@
 
 use crate::{Error, ErrorGroup};
 
+/// Preserve an untrusted legacy payload without exposing it in safe Display.
+/// Internal adapter support; no stability guarantee.
+#[doc(hidden)]
+pub fn legacy_capture_error(detail: String) -> Error {
+    Error::Backend("backend reported a failure through a legacy error event".into())
+        .with_diagnostic_detail(detail)
+}
+
 /// Retain `error` beside the terminal failure already held in `retained`.
 ///
 /// Returns `true` only when `error` became the first retained cause, so the
 /// caller can publish exactly one terminal notification per capture.
 pub fn retain_terminal_cause(retained: &mut Option<Error>, error: Error) -> bool {
+    if let Error::Multiple(group) = error {
+        let first = retain_terminal_cause(retained, group.primary().clone());
+        for cause in group.secondary() {
+            retain_terminal_cause(retained, cause.clone());
+        }
+        return first;
+    }
     let Some(previous) = retained.take() else {
         *retained = Some(error);
         return true;
@@ -45,7 +60,10 @@ pub fn retains_terminal_cause(retained: &Error, error: &Error) -> bool {
     }
     match retained {
         Error::Multiple(group) => {
-            group.primary() == error || group.secondary().any(|cause| cause == error)
+            retains_terminal_cause(group.primary(), error)
+                || group
+                    .secondary()
+                    .any(|cause| retains_terminal_cause(cause, error))
         }
         _ => false,
     }
@@ -54,6 +72,22 @@ pub fn retains_terminal_cause(retained: &Error, error: &Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newer_aggregate_snapshots_merge_without_hiding_distinct_causes() {
+        crate::test_support::assert_distinct_failures_retained(
+            Error::DeviceLost,
+            Error::Unsupported,
+            |first, second| {
+                let mut retained = Some(first.clone());
+                assert!(!retain_terminal_cause(
+                    &mut retained,
+                    Error::Multiple(ErrorGroup::new(first, second, vec![]))
+                ));
+                retained.unwrap()
+            },
+        );
+    }
 
     #[test]
     fn later_distinct_causes_join_the_first_and_equal_causes_collapse() {

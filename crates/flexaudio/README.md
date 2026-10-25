@@ -16,6 +16,14 @@ stream.stop();
 # Ok::<(), flexaudio::Error>(())
 ```
 
+Use `stop_checked()` to handle capture and cleanup failures directly; the
+completed `ShutdownReport` remains available from `shutdown_report()`. Failures
+first observed during Drop reach the process-wide `set_drop_failure_handler`
+receiver as a typed `DropFailure` with an owner kind and report. The default
+writes one line per failure to stderr; a handler panic falls back to stderr.
+Explicitly stopped owners do not report the same failures again during Drop.
+Late failures from bounded queries whose callers timed out use the same receiver.
+
 ## Capability matrix
 
 In 0.9, `AudioChunk`, `DeviceInfo` and `StreamConfig` are `#[non_exhaustive]`.

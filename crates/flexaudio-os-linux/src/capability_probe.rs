@@ -43,6 +43,22 @@ fn timeout() -> Availability {
     unknown("PipeWire capability probe timed out; check the audio session and retry")
 }
 
+// The receiver may time out while a result is already buffered. Its owner, rather
+// than send() alone, must report a failure whenever no caller consumes the result.
+struct ProbeOutcome(Option<Availability>);
+
+impl Drop for ProbeOutcome {
+    fn drop(&mut self) {
+        if let Some(Availability::Unknown { error }) = self.0.take() {
+            flexaudio_core::report_drop_failures(
+                flexaudio_core::DropFailureOwner::CapabilityProbe,
+                None,
+                &flexaudio_core::ShutdownReport::new(Some(error), Vec::new()),
+            );
+        }
+    }
+}
+
 fn bounded(
     flight: Arc<AtomicBool>,
     bound: Duration,
@@ -63,8 +79,9 @@ fn bounded(
                 .unwrap_or_else(|_| unknown("PipeWire capability probe worker panicked"));
             // Release the slot before publishing a completed result.
             drop(guard);
-            #[allow(clippy::let_underscore_must_use, reason = "A timed-out capability caller no longer needs the completed probe notification.")]
-            let _ = tx.send(result);
+            if let Err(error) = tx.send(ProbeOutcome(Some(result))) {
+                drop(error);
+            }
         });
     if let Err(error) = worker {
         return Availability::Unknown {
@@ -72,7 +89,7 @@ fn bounded(
         };
     }
     match rx.recv_timeout(bound) {
-        Ok(result) => result,
+        Ok(mut result) => result.0.take().expect("worker publishes one probe outcome"),
         Err(mpsc::RecvTimeoutError::Timeout) => timeout(),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             unknown("PipeWire capability probe worker exited without a result")
@@ -199,9 +216,10 @@ fn try_connect_and_sync() -> flexaudio_core::Result<Availability> {
             }
         })
         .error(move |id, _seq, code, message| {
-            failure_for_callback
-                .borrow_mut()
-                .get_or_insert_with(|| crate::discovery::core_error(id, code, message));
+            crate::discovery::record_failure(
+                &failure_for_callback,
+                crate::discovery::core_error(id, code, message),
+            );
         })
         .register();
 
@@ -217,7 +235,11 @@ fn try_connect_and_sync() -> flexaudio_core::Result<Availability> {
             .iterate(pw::loop_::Timeout::Finite(remaining))
             < 0
         {
-            return Ok(unknown("PipeWire capability loop iteration failed"));
+            crate::discovery::record_failure(
+                &failure,
+                Error::Backend("PipeWire capability loop iteration failed".into()),
+            );
+            break;
         }
     }
     if let Some(error) = failure.take() {
@@ -230,6 +252,78 @@ fn try_connect_and_sync() -> flexaudio_core::Result<Availability> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn abandoned_probe_reports_late_and_buffered_failures() {
+        const CHILD: &str = "FLEXAUDIO_LATE_PROBE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "capability_probe::tests::abandoned_probe_reports_late_and_buffered_failures"
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        let (sink_tx, sink_rx) = mpsc::channel();
+        flexaudio_core::set_drop_failure_handler(Some(Box::new(move |failure| {
+            sink_tx.send(failure.clone()).unwrap();
+        })));
+        let Availability::Unknown {
+            error: expected_timeout,
+        } = timeout()
+        else {
+            unreachable!()
+        };
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            expected_timeout,
+            Error::DeviceLost,
+            |_first, second| {
+                let (release_tx, release_rx) = mpsc::channel();
+                let returned = bounded(
+                    Arc::new(AtomicBool::new(false)),
+                    Duration::from_millis(1),
+                    move || {
+                        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                        Availability::Unknown { error: second }
+                    },
+                );
+                let Availability::Unknown { error } = returned else {
+                    panic!("expected timeout")
+                };
+                release_tx.send(()).unwrap();
+                let failure = sink_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert_eq!(
+                    failure.owner,
+                    flexaudio_core::DropFailureOwner::CapabilityProbe
+                );
+                let mut retained = Some(error);
+                flexaudio_core::terminal_causes::retain_terminal_cause(
+                    &mut retained,
+                    failure.report.result().unwrap_err(),
+                );
+                retained.unwrap()
+            },
+        );
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(ProbeOutcome(Some(Availability::Unknown {
+            error: Error::DeviceNotFound,
+        })))
+        .unwrap_or_else(|_| panic!("buffer result"));
+        drop(rx);
+        assert_eq!(
+            sink_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .report
+                .primary(),
+            Some(&Error::DeviceNotFound)
+        );
+        flexaudio_core::set_drop_failure_handler(None);
+    }
 
     struct TestDirectory(PathBuf);
 

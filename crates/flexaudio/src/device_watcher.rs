@@ -24,6 +24,9 @@ trait DeviceWatchBackend: Send {
     fn poll_event(&mut self) -> Option<DeviceEvent>;
     /// Stop monitoring; calling stop twice or before start must be safe.
     fn stop(&mut self);
+    fn shutdown_report(&self) -> Option<&flexaudio_core::ShutdownReport> {
+        None
+    }
 }
 
 /// Watcher that reports device and default-device changes through a pull interface.
@@ -65,7 +68,15 @@ impl DeviceWatcher {
 
 impl Drop for DeviceWatcher {
     fn drop(&mut self) {
+        let previous = self.inner.shutdown_report().cloned();
         self.stop();
+        if let Some(report) = self.inner.shutdown_report() {
+            flexaudio_core::report_drop_failures(
+                flexaudio_core::DropFailureOwner::DeviceWatcher,
+                previous.as_ref(),
+                report,
+            );
+        }
     }
 }
 
@@ -92,6 +103,9 @@ impl DeviceWatchBackend for flexaudio_os_linux::PwDeviceWatcher {
     }
     fn stop(&mut self) {
         flexaudio_os_linux::PwDeviceWatcher::stop(self)
+    }
+    fn shutdown_report(&self) -> Option<&flexaudio_core::ShutdownReport> {
+        flexaudio_os_linux::PwDeviceWatcher::shutdown_report(self)
     }
 }
 

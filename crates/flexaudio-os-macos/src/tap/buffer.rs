@@ -12,6 +12,7 @@ pub(super) struct BufferReport {
     diagnostics: CaptureDiagnostics,
     advertised: (u32, u16),
     actual_channels: AtomicU32,
+    reported: AtomicBool,
     busy: AtomicBool,
 }
 
@@ -28,6 +29,7 @@ impl BufferReport {
             diagnostics: sink.diagnostics(),
             advertised: (sink.native_rate(), sink.native_channels()),
             actual_channels: AtomicU32::new(0),
+            reported: AtomicBool::new(false),
             busy: AtomicBool::new(false),
         }
     }
@@ -51,13 +53,11 @@ impl BufferReport {
     }
 
     fn channels_changed(&self, channels: u32) {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "Only the first observed format mismatch owns the diagnostic; later mismatches must not replace it."
-        )]
-        let _ =
-            self.actual_channels
-                .compare_exchange(0, channels, Ordering::AcqRel, Ordering::Acquire);
+        // The serialized callback stops decoding after this mismatch; no later format is queried.
+        let _first_mismatch = self
+            .actual_channels
+            .compare_exchange(0, channels, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
     }
 
     pub(super) fn failed(&self) -> bool {
@@ -66,8 +66,8 @@ impl BufferReport {
 
     /// Only the owner/control thread materializes an allocated error.
     pub(super) fn take_error(&self) -> Option<Error> {
-        let channels = self.actual_channels.swap(0, Ordering::AcqRel);
-        if channels == 0 {
+        let channels = self.actual_channels.load(Ordering::Acquire);
+        if channels == 0 || self.reported.swap(true, Ordering::AcqRel) {
             None
         } else {
             let error = if channels > 2 {
@@ -98,6 +98,11 @@ pub(super) unsafe fn push_buffer_list(
     observations: &SampleMailbox,
     report: &BufferReport,
 ) {
+    // A latched format failure ends decoding, even while its owner drains the error.
+    if report.failed() {
+        observations.invalidate();
+        return;
+    }
     if list.is_null() {
         report.malformed(observations);
         return;
@@ -183,4 +188,36 @@ pub(super) unsafe fn push_buffer_list(
     }
     let delivered = sink.push(&scratch[..total], now_ns());
     observations.observe(&scratch[..total], delivered);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn draining_a_format_failure_keeps_later_native_buffers_unexamined() {
+        let (producer, _consumer) = flexaudio_core::raw_ring(1);
+        let mut sink = RawSink::new(producer, 48_000, 2);
+        let report = BufferReport::new(&sink);
+        let observations = SampleMailbox::default();
+        report.channels_changed(1);
+        assert!(report.take_error().is_some());
+        assert!(
+            report.failed(),
+            "draining must not reopen the callback gate"
+        );
+        assert!(report.diagnostics.drain().unwrap().is_empty());
+        // SAFETY: The failure gate returns before dereferencing the pointer.
+        unsafe {
+            push_buffer_list(
+                &mut sink,
+                &mut Vec::new(),
+                std::ptr::null(),
+                &observations,
+                &report,
+            );
+        }
+        assert!(report.diagnostics.drain().unwrap().is_empty());
+        assert!(report.take_error().is_none());
+    }
 }

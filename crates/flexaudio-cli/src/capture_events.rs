@@ -19,7 +19,9 @@ impl CaptureEventReporter {
         }
         match event {
             Event::TerminalError { error } | Event::ShutdownError { error } => Err(error),
-            Event::Error(_) => Err(Error::Backend("legacy capture failure".into())),
+            Event::Error(detail) => {
+                Err(Error::Backend("legacy capture failure".into()).with_diagnostic_detail(detail))
+            }
             Event::PermissionDenied { permission, detail } => {
                 Err(Error::PermissionDenied { permission, detail })
             }
@@ -154,49 +156,147 @@ pub(super) fn drain_capture_events(
 ) -> Result<(), String> {
     let mut reporter = CaptureEventReporter::default();
     let mut failure = None;
+    let mut stopped = false;
     loop {
         let Some(event) = stream.poll_event() else {
-            if failure.is_none() {
+            if !stopped {
                 if let Some(error) = stream.terminal_error() {
-                    failure = Some(error);
-                    let _ = stream.stop_checked();
+                    retain_failure(&mut failure, error);
+                    if let Err(error) = stream.stop_checked() {
+                        retain_failure(&mut failure, error);
+                    }
+                    stopped = true;
                     // Teardown may append diagnostics even without a terminal event.
                     continue;
                 }
             }
             break;
         };
-        if super::lifecycle_json::route(&event, lifecycle_events, &mut std::io::stderr().lock())
-            .map_err(|error| format!("Failed to write lifecycle JSON: {error}"))?
+        match super::lifecycle_json::route(&event, lifecycle_events, &mut std::io::stderr().lock())
         {
-            continue;
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => retain_failure(
+                &mut failure,
+                Error::Backend("failed to write lifecycle JSON".into())
+                    .with_diagnostic_detail(error.to_string()),
+            ),
         }
         if let Err(error) = reporter.report(event) {
-            if failure.is_none() {
-                failure = Some(error);
+            retain_failure(&mut failure, error);
+            if !stopped {
                 // Stop once, then continue through events produced by teardown.
-                let _ = stream.stop_checked();
-            } else {
-                eprintln!("Related failure: {}", super::describe_error(error));
+                if let Err(error) = stream.stop_checked() {
+                    retain_failure(&mut failure, error);
+                }
+                stopped = true;
             }
         }
     }
     reporter.flush();
     if let Some(error) = stream.terminal_error() {
-        failure = Some(error);
+        retain_failure(&mut failure, error);
     }
     if let Some(report) = stream.shutdown_report() {
         if let Err(error) = report.result() {
-            return Err(super::describe_error(error));
+            retain_failure(&mut failure, error);
         }
     }
-    failure.map_or(Ok(()), |error| Err(super::describe_error(error)))
+    failure.map_or(Ok(()), |error| Err(failure_message(error)))
+}
+
+fn retain_failure(retained: &mut Option<Error>, error: Error) {
+    if let Error::Multiple(group) = error {
+        for error in std::iter::once(group.primary()).chain(group.secondary()) {
+            retain_failure(retained, error.clone());
+        }
+    } else {
+        flexaudio::core::terminal_causes::retain_terminal_cause(retained, error);
+    }
+}
+
+fn failure_message(error: Error) -> String {
+    if let Error::Multiple(group) = error {
+        std::iter::once(group.primary())
+            .chain(group.secondary())
+            .map(|error| failure_message(error.clone()))
+            .collect::<Vec<_>>()
+            .join("\nRelated failure: ")
+    } else {
+        super::describe_error(error)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::num::NonZeroU64;
+
+    #[test]
+    fn distinct_reporter_and_shutdown_failures_are_both_returned() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            Error::DeviceLost,
+            Error::Backend("later shutdown failure".into()),
+            |first, second| {
+                let mut retained = None;
+                retain_failure(&mut retained, first);
+                retain_failure(&mut retained, second.clone());
+                retain_failure(
+                    &mut retained,
+                    Error::Multiple(flexaudio::ErrorGroup::new(
+                        Error::DeviceLost,
+                        second,
+                        vec![],
+                    )),
+                );
+                let error = retained.unwrap();
+                let message = failure_message(error.clone());
+                assert!(message.contains("input device was lost"));
+                assert!(message.contains("later shutdown failure"));
+                error
+            },
+        );
+    }
+
+    #[test]
+    fn capture_drain_returns_capture_and_later_stop_failure() {
+        struct FailsOnStop {
+            event: Option<Event>,
+        }
+        impl flexaudio::CaptureBackend for FailsOnStop {
+            fn native_format(&self) -> (u32, u16) {
+                (48_000, 2)
+            }
+            fn start(&mut self, _sink: flexaudio::core::RawSink) -> Result<(), Error> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+            fn stop_checked(&mut self) -> Result<(), Error> {
+                Err(Error::Backend("later checked shutdown failure".into()))
+            }
+            fn poll_event(&mut self) -> Option<Event> {
+                self.event.take()
+            }
+        }
+        let mut stream = Stream::open(
+            flexaudio::StreamConfig::default(),
+            Box::new(FailsOnStop {
+                event: Some(Event::TerminalError {
+                    error: Error::DeviceLost,
+                }),
+            }),
+        )
+        .unwrap();
+        stream.start().unwrap();
+        // Reconcile the native mailbox synchronously before testing the final CLI drain.
+        stream.stop();
+        let message = drain_capture_events(&mut stream, false).unwrap_err();
+        assert!(message.contains("input device was lost"), "{message}");
+        assert!(
+            message.contains("later checked shutdown failure"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn loss_coalescing_preserves_path_format_and_unknown_counts() {

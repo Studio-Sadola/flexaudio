@@ -19,6 +19,7 @@ pub(crate) struct CoreOutcome {
     pub(crate) failure: CoreFailure,
     pub(crate) decision: Decision,
     pub(crate) attempt: Option<LinkAttempt>,
+    pub(crate) checkpoint_error: Option<Error>,
 }
 
 pub(crate) struct ProxyLifecycle {
@@ -59,6 +60,15 @@ impl ProxyLifecycle {
     }
     pub(crate) fn checkpoint(&self) -> Result<i32> {
         (self.checkpoint)()
+    }
+    fn release_checkpoint(&self) -> Option<i32> {
+        match self.checkpoint() {
+            Ok(sequence) => Some(sequence),
+            Err(error) => {
+                self.callbacks.cleanup_failure(error);
+                None
+            }
+        }
     }
     pub(crate) fn observe(&self, id: u32) {
         self.dormant_sources.borrow_mut().remove(&id);
@@ -157,6 +167,7 @@ impl ProxyLifecycle {
             })
             .cloned();
         let mut decision = decide(&failure, released, attempt.as_ref(), false);
+        let mut checkpoint_error = None;
         if decision == Decision::Continue {
             match (self.checkpoint(), attempt.as_ref()) {
                 (Ok(checkpoint), Some(attempt)) => {
@@ -164,13 +175,18 @@ impl ProxyLifecycle {
                         .borrow_mut()
                         .push((checkpoint, failure.clone(), attempt.clone()))
                 }
-                _ => decision = Decision::Terminate,
+                (Err(error), _) => {
+                    checkpoint_error = Some(error);
+                    decision = Decision::Terminate;
+                }
+                (Ok(_), None) => decision = Decision::Terminate,
             }
         }
         CoreOutcome {
             failure,
             decision,
             attempt,
+            checkpoint_error,
         }
     }
     pub(crate) fn resolve_errors(&self, checkpoint: i32) -> Vec<CoreOutcome> {
@@ -179,7 +195,7 @@ impl ProxyLifecycle {
         let mut index = 0;
         while index < pending.len() {
             if pending[index].0 == checkpoint {
-                let (_, failure, attempt) = pending.swap_remove(index);
+                let (_, failure, attempt) = pending.remove(index);
                 let decision = decide(&failure, false, Some(&attempt), true);
                 // A verified source with no output ports may remain registered. Do
                 // not require it to negotiate until a new output port announces activity.
@@ -197,6 +213,7 @@ impl ProxyLifecycle {
                     failure,
                     decision,
                     attempt: Some(attempt),
+                    checkpoint_error: None,
                 });
             } else {
                 index += 1;
@@ -205,13 +222,16 @@ impl ProxyLifecycle {
         ready
     }
     fn released(&self, proxy_id: u32, before: Option<i32>, creation: Option<RequestWindow>) {
-        if let Ok(after) = self.checkpoint() {
-            self.retired.borrow_mut().push((after, proxy_id, creation));
-            if let Some(before) = before {
-                self.pending
-                    .borrow_mut()
-                    .expect_destroy(proxy_id, RequestWindow { before, after });
+        match self.checkpoint() {
+            Ok(after) => {
+                self.retired.borrow_mut().push((after, proxy_id, creation));
+                if let Some(before) = before {
+                    self.pending
+                        .borrow_mut()
+                        .expect_destroy(proxy_id, RequestWindow { before, after });
+                }
             }
+            Err(error) => self.callbacks.cleanup_failure(error),
         }
         // A failed sync supplies no destroy evidence, so errors remain fatal.
     }
@@ -266,12 +286,9 @@ impl<P: ProxyT> Drop for CaptureProxy<P> {
         // server removal arrived, dropping the proxy is local-only: do not invent
         // destroy evidence for that case. Bracket actual requests against id reuse.
         if !self.release.removed.get() {
-            self.release.before.set(
-                self.release
-                    .owner
-                    .upgrade()
-                    .and_then(|owner| owner.checkpoint().ok()),
-            );
+            if let Some(owner) = self.release.owner.upgrade() {
+                self.release.before.set(owner.release_checkpoint());
+            }
         }
     }
 }
@@ -301,6 +318,29 @@ mod tests {
     use super::*;
     use crate::{capture_error::CoreErrorDisposition, readiness::Readiness};
     use std::sync::{mpsc, Arc, Mutex};
+
+    #[test]
+    fn release_checkpoint_failures_survive_checked_worker_cleanup() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            Error::DeviceLost,
+            Error::Backend("destroy checkpoint failed".into()),
+            |first, second| {
+                let (tx, _rx) = mpsc::channel();
+                let events = crate::owner::BackendEvents::default();
+                let callbacks =
+                    CaptureCallbacks::new(Rc::new(Readiness::new(tx, true)), events.clone(), || {});
+                let failures = RefCell::new(std::collections::VecDeque::from([first, second]));
+                let owner = ProxyLifecycle::with_checkpoint(callbacks, move || {
+                    Err(failures.borrow_mut().pop_front().unwrap())
+                });
+                assert_eq!(owner.release_checkpoint(), None);
+                owner.released(5, None, None);
+                let mut shutdown = None;
+                crate::owner::finish_worker(&mut None, &mut shutdown, &events, None);
+                shutdown.unwrap().result().unwrap_err()
+            },
+        );
+    }
 
     #[test]
     fn queued_link_verification_survives_proxy_release_acknowledgement() {

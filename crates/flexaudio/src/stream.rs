@@ -100,6 +100,9 @@ const BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// Configure it with [`open`](Self::open) and start capture with [`start`](Self::start).
 /// Consumers call [`poll_chunk`](Self::poll_chunk) / [`poll_event`](Self::poll_event) without
 /// blocking. [`stop`](Self::stop) joins all threads.
+/// Use [`stop_checked`](Self::stop_checked) to inspect capture and cleanup failures.
+/// Failures first observed when dropping without an explicit stop reach the
+/// process-wide [`crate::set_drop_failure_handler`] receiver (stderr by default).
 pub struct Stream {
     config: StreamConfig,
     open_options: OpenOptions,
@@ -422,7 +425,15 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        let previous = self.shutdown.clone();
         self.stop();
+        if let Some(report) = &self.shutdown {
+            flexaudio_core::report_drop_failures(
+                flexaudio_core::DropFailureOwner::Stream,
+                previous.as_ref(),
+                report,
+            );
+        }
     }
 }
 

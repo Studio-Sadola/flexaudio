@@ -50,6 +50,7 @@ impl FlexStream {
                         Ok(Some(chunk)) => chunks.push(chunk),
                         Ok(None) => break,
                         Err(error) => {
+                            // The current canonical poll only returns Ok; no later work runs here.
                             cleanup.push(
                                 error
                                     .audio_error()
@@ -65,7 +66,8 @@ impl FlexStream {
                 }
             }
         } else {
-            // Capture primary suppresses PCM while closing attached event epochs.
+            // Capture primary suppresses PCM: no further PCM processing is attempted.
+            // Attached event epochs still close through their separately retained stop result.
             self.stop_vad_tap();
         }
         self.queue_secondary_input();

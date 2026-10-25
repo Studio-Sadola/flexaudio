@@ -23,6 +23,7 @@ use flacenc::error::{Verified, Verify};
 use flacenc::source::{Context, Fill, FrameBuf};
 
 use crate::error::{EncodeError, Result};
+use crate::output::{FileOutput, Output};
 
 /// Block size per frame (samples per channel), matching flacenc's default.
 const BLOCK_SIZE: usize = 4096;
@@ -55,12 +56,6 @@ fn enc_err(e: impl std::fmt::Display) -> EncodeError {
     EncodeError::Encoder(e.to_string())
 }
 
-trait Output: Write + Seek + Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe {}
-impl<T: Write + Seek + Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe> Output
-    for T
-{
-}
-
 #[derive(Debug)]
 enum WriterState {
     Open,
@@ -79,6 +74,7 @@ enum FailureCause {
     },
     Unsupported(String),
     Encoder(String),
+    Audio(flexaudio_core::Error),
 }
 
 impl FailureCause {
@@ -91,6 +87,7 @@ impl FailureCause {
             },
             EncodeError::Unsupported(message) => Self::Unsupported(message),
             EncodeError::Encoder(message) => Self::Encoder(message),
+            EncodeError::Audio(error) => Self::Audio(error),
         }
     }
 
@@ -106,6 +103,7 @@ impl FailureCause {
             }),
             Self::Unsupported(message) => EncodeError::Unsupported(message.clone()),
             Self::Encoder(message) => EncodeError::Encoder(message.clone()),
+            Self::Audio(error) => EncodeError::Audio(error.clone()),
         }
     }
 }
@@ -118,10 +116,12 @@ impl FailureCause {
 ///
 /// Dropping an open writer without calling finalize still attempts to close the file
 /// (writing remaining samples and finalizing the header). Drop never retries a failed
-/// writer and never panics; call finalize to detect errors.
+/// writer and never panics. Newly observed failures reach the process-wide
+/// `flexaudio_core::set_drop_failure_handler` receiver (stderr by default).
 pub struct FlacWriter {
     // Unbuffered output avoids BufWriter retrying buffered bytes when a failed writer drops.
     file: Box<dyn Output>,
+    closed: bool,
     config: Verified<EncoderConfig>,
     /// Stream information accumulated for the final header values.
     stream_info: StreamInfo,
@@ -156,7 +156,11 @@ impl FlacWriter {
             )));
         }
 
-        Self::with_output(sample_rate, channels, Box::new(File::create(path)?))
+        Self::with_output(
+            sample_rate,
+            channels,
+            Box::new(FileOutput::new(File::create(path)?)),
+        )
     }
 
     fn with_output(sample_rate: u32, channels: u16, file: Box<dyn Output>) -> Result<Self> {
@@ -175,6 +179,7 @@ impl FlacWriter {
 
         let mut writer = FlacWriter {
             file,
+            closed: false,
             config,
             stream_info,
             frame_buf,
@@ -218,7 +223,8 @@ impl FlacWriter {
     ///
     /// Consumes `self`, so the type prevents further calls to
     /// [`write_chunk`](FlacWriter::write_chunk). Drop makes a best-effort attempt at the same
-    /// operation, but only finalize reports write errors, so finalize is recommended.
+    /// operation and reports newly observed failures through the process-wide Drop
+    /// receiver; finalize is recommended for handling errors at the call site.
     pub fn finalize(mut self) -> Result<()> {
         self.finish()
     }
@@ -227,12 +233,26 @@ impl FlacWriter {
         match &self.state {
             WriterState::Open => Ok(()),
             WriterState::Finalized => Err(EncodeError::Unsupported("writer is finalized".into())),
+            // A partial frame/header cannot be retried safely, so no later I/O is attempted.
             WriterState::Failed(error) => Err(error.error()),
         }
     }
 
     fn latch(&mut self, result: Result<()>) -> Result<()> {
-        if let Err(error) = result {
+        if let Err(mut error) = result {
+            // Close immediately after failure, without retrying any partial frame/header.
+            if let Err(close) = self.close_output() {
+                let close = EncodeError::Io(close).audio_error().with_context(
+                    flexaudio_core::ErrorContext::new(flexaudio_core::Operation::Stop),
+                );
+                let report =
+                    flexaudio_core::ShutdownReport::new(Some(error.audio_error()), vec![close]);
+                error = EncodeError::Audio(
+                    report
+                        .result()
+                        .expect_err("encoding failure remains primary"),
+                );
+            }
             self.state = WriterState::Failed(FailureCause::capture(error));
             return self.check_open();
         }
@@ -243,8 +263,18 @@ impl FlacWriter {
         self.check_open()?;
         let result = self.finish_inner();
         self.latch(result)?;
+        let result = self.close_output().map_err(EncodeError::Io);
+        self.latch(result)?;
         self.state = WriterState::Finalized;
         Ok(())
+    }
+
+    fn close_output(&mut self) -> std::io::Result<()> {
+        if std::mem::replace(&mut self.closed, true) {
+            return Ok(());
+        }
+        // A failed close may already release the descriptor; it must never be retried.
+        self.file.close()
     }
 
     /// Encode and write all full blocks from pending samples.
@@ -316,7 +346,7 @@ impl FlacWriter {
         // Overwrite the placeholder header at the start with the final header of the same length.
         let header = self.header_bytes()?;
         // Publish the FLAC magic last. Until that commit succeeds, even permanently failed
-        // output cannot look finalized. File is unbuffered; no fallible work follows commit.
+        // output cannot look finalized. No fallible header work follows commit.
         self.file.flush()?;
         self.file.rewind()?;
         self.file.write_all(b"FAIL")?;
@@ -351,9 +381,36 @@ impl FlacWriter {
 impl Drop for FlacWriter {
     fn drop(&mut self) {
         if matches!(self.state, WriterState::Open) {
-            // Best effort; swallow errors. Call finalize to detect them.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.finish()));
+            let failure =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.finish())) {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error.audio_error()),
+                    Err(_) => {
+                        let primary = flexaudio_core::Error::Backend(
+                            "FLAC writer panicked during finalization".into(),
+                        );
+                        let cleanup = self
+                            .close_output()
+                            .err()
+                            .map(|error| EncodeError::Io(error).audio_error())
+                            .into_iter()
+                            .collect();
+                        Some(
+                            flexaudio_core::ShutdownReport::new(Some(primary), cleanup)
+                                .result()
+                                .expect_err("finalization panic remains primary"),
+                        )
+                    }
+                };
+            if let Some(error) = failure {
+                flexaudio_core::report_drop_failures(
+                    flexaudio_core::DropFailureOwner::FlacWriter,
+                    None,
+                    &flexaudio_core::ShutdownReport::new(None, vec![error]),
+                );
+            }
         }
+        // Failed writers were already closed by latch; no later file work is attempted.
     }
 }
 
@@ -375,6 +432,63 @@ mod tests {
     use super::*;
     use std::io::{Cursor, SeekFrom};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn implicit_finalization_failure_reaches_drop_receiver() {
+        const CHILD: &str = "FLEXAUDIO_FLAC_DROP_RECEIVER_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "writer::tests::implicit_finalization_failure_reaches_drop_receiver",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let output = received.clone();
+        flexaudio_core::set_drop_failure_handler(Some(Box::new(move |failure| {
+            output.lock().unwrap().push(failure.clone());
+        })));
+        let mut writer = FlacWriter::with_output(
+            48_000,
+            1,
+            Box::new(FaultOutput {
+                data: Arc::new(Mutex::new(Cursor::new(Vec::new()))),
+                calls: Arc::new(Mutex::new(0)),
+                fail_at: 2,
+                partial: false,
+                fail_flush_at: usize::MAX,
+                flushes: 0,
+            }),
+        )
+        .unwrap();
+        writer.write_chunk(&[0.25]).unwrap();
+        drop(writer);
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0].owner,
+            flexaudio_core::DropFailureOwner::FlacWriter
+        );
+        assert!(matches!(
+            received[0].report.cleanup()[0].root(),
+            flexaudio_core::Error::Addon {
+                kind: flexaudio_core::AddonErrorKind::FlacIo,
+                ..
+            }
+        ));
+        flexaudio_core::set_drop_failure_handler(None);
+    }
 
     struct FaultOutput {
         data: Arc<Mutex<Cursor<Vec<u8>>>>,
@@ -413,6 +527,72 @@ mod tests {
         fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
             self.data.lock().unwrap().seek(position)
         }
+    }
+    impl Output for FaultOutput {
+        fn close(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct CloseFailure {
+        inner: FaultOutput,
+        closes: Arc<Mutex<usize>>,
+    }
+    impl Write for CloseFailure {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    impl Seek for CloseFailure {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+    impl Output for CloseFailure {
+        fn close(&mut self) -> std::io::Result<()> {
+            *self.closes.lock().unwrap() += 1;
+            Err(std::io::Error::other("injected distinct close failure"))
+        }
+    }
+
+    #[test]
+    fn failed_write_retains_a_distinct_close_failure_and_never_retries_close() {
+        let first = EncodeError::Io(std::io::Error::other("injected first failure")).audio_error();
+        let second = EncodeError::Io(std::io::Error::other("injected distinct close failure"))
+            .audio_error()
+            .with_context(flexaudio_core::ErrorContext::new(
+                flexaudio_core::Operation::Stop,
+            ));
+        flexaudio_core::test_support::assert_distinct_failures_retained(first, second, |_, _| {
+            let closes = Arc::new(Mutex::new(0));
+            let mut writer = FlacWriter::with_output(
+                48_000,
+                1,
+                Box::new(CloseFailure {
+                    inner: FaultOutput {
+                        data: Arc::new(Mutex::new(Cursor::new(Vec::new()))),
+                        calls: Arc::new(Mutex::new(0)),
+                        fail_at: 2,
+                        partial: false,
+                        fail_flush_at: usize::MAX,
+                        flushes: 0,
+                    },
+                    closes: closes.clone(),
+                }),
+            )
+            .unwrap();
+            let error = writer
+                .write_chunk(&vec![0.25; BLOCK_SIZE])
+                .unwrap_err()
+                .audio_error();
+            assert_eq!(*closes.lock().unwrap(), 1);
+            assert_eq!(writer.finalize().unwrap_err().audio_error(), error);
+            assert_eq!(*closes.lock().unwrap(), 1);
+            error
+        });
     }
 
     #[test]

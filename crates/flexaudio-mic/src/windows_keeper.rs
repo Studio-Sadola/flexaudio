@@ -24,6 +24,7 @@ static KEEPER_READY: OnceLock<std::result::Result<(), String>> = OnceLock::new()
 /// access violation. Call this before every cpal entry point to keep the first initialization
 /// thread alive until process exit.
 pub(super) fn ensure() -> Result<()> {
+    // The process-wide native enumerator cannot be reinitialized, so no later attempt is made.
     match KEEPER_READY.get_or_init(start_keeper) {
         Ok(()) => Ok(()),
         Err(message) => Err(Error::Backend(message.clone())),

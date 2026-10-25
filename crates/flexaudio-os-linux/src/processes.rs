@@ -88,6 +88,7 @@ enum SnapshotError {
         cause: BindCause,
     },
     Incomplete,
+    Retained(Error),
 }
 
 // Preserve the typed variants supplied by pipewire-rs, which exposes no errno
@@ -163,6 +164,7 @@ impl std::fmt::Display for SnapshotError {
                 "pipewire registry sync did not complete within {} ms",
                 LIST_DEADLINE.as_millis()
             ),
+            Self::Retained(error) => write!(f, "{error}"),
         }
     }
 }
@@ -170,6 +172,7 @@ impl std::fmt::Display for SnapshotError {
 impl SnapshotError {
     fn into_core(self) -> Error {
         match self {
+            Self::Retained(error) => error,
             Self::Core {
                 object_id,
                 code,
@@ -184,9 +187,20 @@ impl SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
-/// Preserve the first cause even if later events or the deadline also fail.
+/// Preserve every distinct failure dispatched before the loop exits.
 fn record_failure(failure: &RefCell<Option<SnapshotError>>, error: SnapshotError) {
-    failure.borrow_mut().get_or_insert(error);
+    let mut failure = failure.borrow_mut();
+    *failure = Some(match failure.take() {
+        None => error,
+        Some(previous) => {
+            let mut retained = Some(previous.into_core());
+            flexaudio_core::terminal_causes::retain_terminal_cause(
+                &mut retained,
+                error.into_core(),
+            );
+            SnapshotError::Retained(retained.expect("both failures are retained"))
+        }
+    });
 }
 
 /// Guard the FFI boundary without silently discarding a failed callback.
@@ -527,6 +541,9 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, SnapshotError> {
         main_loop.run();
     }
 
+    if timed_out.get() {
+        record_failure(&failure, SnapshotError::Incomplete);
+    }
     finish_snapshot(
         done.get() && !timed_out.get(),
         failure.take(),
@@ -540,14 +557,16 @@ fn finish_snapshot(
     failure: Option<SnapshotError>,
     mut collected: RegistrySnapshot,
 ) -> std::result::Result<RegistrySnapshot, SnapshotError> {
-    if let Some(error) = failure {
+    let failure = RefCell::new(failure);
+    if !complete && failure.borrow().is_none() {
+        record_failure(&failure, SnapshotError::Incomplete);
+    }
+    // An earlier callback failure stops the loop; no further wait or deadline is attempted.
+    for error in collected.bind_failures.drain(..) {
+        record_failure(&failure, error);
+    }
+    if let Some(error) = failure.take() {
         return Err(error);
-    }
-    if !complete {
-        return Err(SnapshotError::Incomplete);
-    }
-    if !collected.bind_failures.is_empty() {
-        return Err(collected.bind_failures.remove(0));
     }
     Ok(collected)
 }
@@ -816,22 +835,54 @@ mod tests {
     }
 
     #[test]
-    fn collection_failure_preserves_first_cause() {
-        let failure = RefCell::new(None);
-        record_failure(
-            &failure,
+    fn collection_failure_retains_distinct_callback_cause() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
             SnapshotError::Query {
                 operation: "registry sync",
                 cause: "permission denied".into(),
+            }
+            .into_core(),
+            SnapshotError::Callback {
+                callback: "node info",
+                cause: "callback rejected".into(),
+            }
+            .into_core(),
+            |first, _second| {
+                let failure = RefCell::new(None);
+                record_failure(&failure, SnapshotError::Retained(first));
+                run_callback(&failure, "node info", || panic!("later failure"));
+                finish_snapshot(true, failure.take(), RegistrySnapshot::default())
+                    .unwrap_err()
+                    .into_core()
             },
         );
-        run_callback(&failure, "node info", || panic!("later failure"));
-        assert_eq!(
-            finish_snapshot(true, failure.take(), RegistrySnapshot::default()).unwrap_err(),
-            SnapshotError::Query {
-                operation: "registry sync",
-                cause: "permission denied".into()
-            }
+    }
+
+    #[test]
+    fn snapshot_retains_all_surviving_bind_failures() {
+        let first = SnapshotError::Bind {
+            node_id: 11,
+            cause: BindCause::CreationFailed,
+        };
+        let second = SnapshotError::Bind {
+            node_id: 12,
+            cause: BindCause::WrongProxyType,
+        };
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            first.into_core(),
+            second.into_core(),
+            |first, second| {
+                let snapshot = RegistrySnapshot {
+                    bind_failures: vec![
+                        SnapshotError::Retained(first),
+                        SnapshotError::Retained(second),
+                    ],
+                    ..RegistrySnapshot::default()
+                };
+                finish_snapshot(true, None, snapshot)
+                    .unwrap_err()
+                    .into_core()
+            },
         );
     }
 
@@ -926,19 +977,26 @@ mod bind_tests {
     }
 
     #[test]
-    fn surviving_node_bind_failure_rejects_collection_with_first_cause() {
+    fn surviving_node_bind_failures_reject_collection_and_retain_each_cause() {
         let mut snapshot = RegistrySnapshot::default();
         snapshot.record_bind_failure(7, pw::Error::NoMemory);
         snapshot.record_bind_failure(8, pw::Error::WrongProxyType);
-        let error = finish_snapshot(true, None, snapshot).unwrap_err();
-        assert_eq!(
-            error,
+        let error = finish_snapshot(true, None, snapshot)
+            .unwrap_err()
+            .into_core();
+        flexaudio_core::test_support::assert_distinct_failures_retained(
             SnapshotError::Bind {
                 node_id: 7,
-                cause: BindCause::NoMemory
+                cause: BindCause::NoMemory,
             }
+            .into_core(),
+            SnapshotError::Bind {
+                node_id: 8,
+                cause: BindCause::WrongProxyType,
+            }
+            .into_core(),
+            |_, _| error.clone(),
         );
-        let error = error.into_core();
         assert_eq!(error.kind(), flexaudio_core::ErrorKind::Backend);
         assert!(error.to_string().contains("registry.bind for node 7"));
         assert!(error

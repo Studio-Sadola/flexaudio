@@ -5,6 +5,73 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Instant;
 
 #[test]
+fn drop_routes_new_failures_and_suppresses_explicit_stop_duplicates() {
+    const CHILD: &str = "FLEXAUDIO_DROP_RECEIVER_TEST";
+    if let Some(mode) = std::env::var_os(CHILD) {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let output = received.clone();
+        match mode.to_str().unwrap() {
+            "handler" => crate::set_drop_failure_handler(Some(Box::new(move |failure| {
+                output.lock().unwrap().push(failure.clone());
+            }))),
+            "panic" => {
+                crate::set_drop_failure_handler(Some(Box::new(|_| panic!("receiver failed"))))
+            }
+            "default" => crate::set_drop_failure_handler(None),
+            _ => panic!("unknown child mode"),
+        }
+        drop(stop_failure(StopPhase::Stop).unwrap());
+        if mode == "handler" {
+            let failures = received.lock().unwrap();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].owner, crate::DropFailureOwner::Stream);
+            assert_eq!(failures[0].report.cleanup()[0].root(), &Error::DeviceLost);
+            drop(failures);
+            let mut stream = stop_failure(StopPhase::Stop).unwrap();
+            assert!(stream.stop_checked().is_err());
+            drop(stream);
+            assert_eq!(received.lock().unwrap().len(), 1);
+            #[cfg(target_os = "linux")]
+            {
+                drop(crate::DeviceWatcher::failing_join_fixture());
+                let failures = received.lock().unwrap();
+                assert_eq!(failures.len(), 2);
+                assert_eq!(failures[1].owner, crate::DropFailureOwner::DeviceWatcher);
+            }
+            let before = received.lock().unwrap().len();
+            crate::mock::drop_failure_fixtures();
+            let failures = received.lock().unwrap();
+            assert_eq!(failures.len(), before + 4);
+            for failure in &failures[before..] {
+                assert_eq!(failure.owner, crate::DropFailureOwner::MockCapture);
+                assert!(failure.report.result().is_err());
+            }
+        }
+        crate::set_drop_failure_handler(None);
+        return;
+    }
+    for mode in ["handler", "default", "panic"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["stream::stop_contract_tests::drop_routes_new_failures_and_suppresses_explicit_stop_duplicates", "--exact", "--nocapture"])
+            .env(CHILD, mode)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{mode}: {stderr}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        if mode != "handler" {
+            assert!(
+                stderr.contains("flexaudio Stream implicit shutdown: device lost"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
 fn distinct_failure_contract() {
     flexaudio_core::test_support::assert_distinct_failures_retained(
         Error::DeviceLost,

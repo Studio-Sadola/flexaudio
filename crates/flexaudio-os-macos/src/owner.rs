@@ -11,6 +11,9 @@ use crate::cleanup::CleanupLedger;
 use crate::probe::PublicationGate;
 use crate::terminal::TerminalFailure;
 
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) static DROP_FAILURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) fn join_owner(handle: JoinHandle<Result<()>>) -> Result<()> {
     match handle.join() {
         Ok(result) => result.map_err(|error| match error {
@@ -85,6 +88,7 @@ impl OwnerShutdown {
     pub(crate) fn retain_startup_report(&mut self, report: ShutdownReport) -> Result<()> {
         let report = self.with_generation_cleanup(report);
         let result = report.result();
+        // Startup's primary reaches start() through this result; only cleanup belongs to shutdown.
         self.retain_report(ShutdownReport::new(None, report.cleanup().to_vec()));
         result
     }
@@ -120,6 +124,7 @@ impl OwnerShutdown {
         terminal: &TerminalFailure,
         handle: Option<JoinHandle<Result<()>>>,
     ) {
+        // Successful startup resets the report before storing a new handle; repeats have no owner.
         if self.report.is_none() {
             let cleanup = stop_owner(publication, stop, handle);
             let report =

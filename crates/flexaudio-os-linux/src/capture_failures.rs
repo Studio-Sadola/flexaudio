@@ -34,11 +34,17 @@ impl CaptureCallbacks {
         report_control_failure(&self.readiness, &self.events, error);
         self.quit();
     }
+    pub(crate) fn cleanup_failure(&self, error: Error) {
+        push_backend_event(&self.events, Event::ShutdownError { error });
+    }
 }
 
 pub(crate) fn report_control_failure(readiness: &Readiness, events: &BackendEvents, error: Error) {
     if readiness.is_started() {
         push_backend_event(events, Event::TerminalError { error });
+    } else if readiness.is_reported() {
+        // Readiness publishes once; rollback delivers later dispatched startup failures.
+        push_backend_event(events, Event::ShutdownError { error });
     } else {
         readiness.report_failure(error);
     }
@@ -250,13 +256,33 @@ mod tests {
     }
 
     #[test]
-    fn rejected_readiness_cannot_publish_a_runtime_terminal_failure() {
+    fn rejected_readiness_delivers_later_distinct_failure_through_rollback() {
         let (tx, rx) = mpsc::channel();
         let readiness = Readiness::new(tx, true);
         let events = BackendEvents::default();
         report_control_failure(&readiness, &events, Error::DeviceNotFound);
         assert_eq!(rx.recv(), Ok(Err(Error::DeviceNotFound)));
         report_control_failure(&readiness, &events, Error::DeviceLost);
-        assert!(crate::owner::poll_backend_event(&events).is_none());
+        assert_eq!(
+            crate::owner::poll_backend_event(&events),
+            Some(Event::ShutdownError {
+                error: Error::DeviceLost
+            })
+        );
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            Error::DeviceNotFound,
+            Error::DeviceLost,
+            |first, _second| {
+                let mut retained_events = BackendEvents::default();
+                let mut shutdown = None;
+                crate::owner::rollback_capture(
+                    first,
+                    std::thread::spawn(|| {}),
+                    events,
+                    &mut retained_events,
+                    &mut shutdown,
+                )
+            },
+        );
     }
 }

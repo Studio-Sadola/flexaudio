@@ -1,4 +1,45 @@
 // Failure steps for authoritative device inventory queries.
+pub(crate) fn record_failure(
+    failure: &std::cell::RefCell<Option<flexaudio_core::Error>>,
+    error: flexaudio_core::Error,
+) {
+    flexaudio_core::terminal_causes::retain_terminal_cause(&mut failure.borrow_mut(), error);
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use flexaudio_core::Error;
+
+    #[test]
+    fn discovery_callbacks_retain_distinct_failures() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            EnumerationFailure::Callback.error(),
+            EnumerationFailure::Deadline.error(),
+            |first, second| {
+                let failure = std::cell::RefCell::new(None);
+                record_failure(&failure, first);
+                record_failure(&failure, second);
+                failure.take().unwrap()
+            },
+        );
+    }
+
+    #[test]
+    fn capability_core_callbacks_retain_distinct_failures() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            core_error(1, -5, "first server failure"),
+            Error::DeviceLost,
+            |first, second| {
+                let failure = std::cell::RefCell::new(None);
+                record_failure(&failure, first);
+                record_failure(&failure, second);
+                failure.take().unwrap()
+            },
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) enum EnumerationFailure {

@@ -10,6 +10,9 @@
 #![deny(clippy::let_underscore_must_use)]
 
 pub use flexaudio_core as core;
+pub use flexaudio_core::{
+    set_drop_failure_handler, DropFailure, DropFailureHandler, DropFailureOwner,
+};
 
 mod capabilities;
 #[cfg(test)]

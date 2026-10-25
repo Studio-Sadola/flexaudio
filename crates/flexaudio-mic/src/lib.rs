@@ -521,7 +521,15 @@ impl CaptureBackend for CpalMicBackend {
 
 impl Drop for CpalMicBackend {
     fn drop(&mut self) {
+        let previous = self.shutdown.clone();
         self.stop();
+        if let Some(report) = &self.shutdown {
+            flexaudio_core::report_drop_failures(
+                flexaudio_core::DropFailureOwner::Microphone,
+                previous.as_ref(),
+                report,
+            );
+        }
     }
 }
 

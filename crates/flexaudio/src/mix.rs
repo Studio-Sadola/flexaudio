@@ -94,7 +94,9 @@ impl CompositeBackend {
     fn child_event(&mut self, lane: MixLane, event: Event) -> Option<Event> {
         let error = match event {
             Event::TerminalError { error } => Some(error),
-            Event::Error(_) => Some(Error::Backend("legacy mix child failure".into())),
+            Event::Error(detail) => Some(
+                Error::Backend("legacy mix child failure".into()).with_diagnostic_detail(detail),
+            ),
             Event::PermissionDenied { permission, detail } => {
                 Some(Error::PermissionDenied { permission, detail })
             }
@@ -334,7 +336,15 @@ impl CaptureBackend for CompositeBackend {
 
 impl Drop for CompositeBackend {
     fn drop(&mut self) {
+        let previous = self.shutdown.clone();
         self.stop();
+        if let Some(report) = &self.shutdown {
+            flexaudio_core::report_drop_failures(
+                flexaudio_core::DropFailureOwner::Mix,
+                previous.as_ref(),
+                report,
+            );
+        }
     }
 }
 

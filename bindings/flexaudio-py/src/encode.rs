@@ -84,6 +84,7 @@ impl Drop for FlacEncoder {
 
 impl FlacEncoder {
     /// Retain the first failure, including its Python exception identity.
+    // check_open prevents later frame/header I/O; the failed writer already closed its file.
     fn fail(&mut self, error: PyErr) -> PyErr {
         Python::attach(|py| match &self.state {
             EncoderState::Failed(first) => first.clone_ref(py),

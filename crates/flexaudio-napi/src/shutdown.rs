@@ -17,6 +17,29 @@ pub(super) struct ShutdownReport {
 }
 
 impl ShutdownReport {
+    /// Reconcile a newer facade snapshot without discarding previously retained causes.
+    pub(super) fn retain_core(&mut self, incoming: flexaudio::ShutdownReport) {
+        let mut primary = self
+            .core
+            .as_ref()
+            .and_then(|report| report.primary())
+            .cloned();
+        let mut cleanup = self
+            .core
+            .as_ref()
+            .map(|report| report.cleanup().to_vec())
+            .unwrap_or_default();
+        if let Some(error) = incoming.primary() {
+            flexaudio::core::terminal_causes::retain_terminal_cause(&mut primary, error.clone());
+        }
+        for error in incoming.cleanup() {
+            if !cleanup.contains(error) {
+                cleanup.push(error.clone());
+            }
+        }
+        self.core = Some(flexaudio::ShutdownReport::new(primary, cleanup));
+    }
+
     pub fn from_core(core: Option<flexaudio::core::ShutdownReport>) -> Self {
         Self {
             core,

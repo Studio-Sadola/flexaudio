@@ -139,3 +139,21 @@ fn grouped_stop_result_with_both_terminal_causes_adds_no_cleanup() {
     assert!(report.cleanup().is_empty());
     assert_one_terminal_event(&mut stream);
 }
+
+#[test]
+fn distinct_legacy_payloads_survive_final_drain() {
+    flexaudio_core::test_support::assert_distinct_failures_retained(
+        flexaudio_core::terminal_causes::legacy_capture_error("first legacy failure".into()),
+        flexaudio_core::terminal_causes::legacy_capture_error("second legacy failure".into()),
+        |_, _| {
+            let backend = TwoFailures {
+                events: VecDeque::from([Event::Error("first legacy failure".into())]),
+                final_events: VecDeque::from([Event::Error("second legacy failure".into())]),
+                stop_result: Ok(()),
+            };
+            let mut stream = Stream::open(StreamConfig::default(), Box::new(backend)).unwrap();
+            stream.start().unwrap();
+            stream.stop_checked().unwrap_err()
+        },
+    );
+}

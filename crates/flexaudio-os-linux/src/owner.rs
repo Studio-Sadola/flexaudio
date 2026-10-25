@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 pub(crate) struct BackendEventQueue {
     pending: VecDeque<Event>,
     primary: Option<Error>,
+    cleanup: Vec<Error>,
 }
 
 pub(crate) type BackendEvents = Arc<Mutex<BackendEventQueue>>;
@@ -56,6 +57,14 @@ pub(crate) fn rollback_capture(
         .take()
         .map(|previous| previous.cleanup().to_vec())
         .unwrap_or_default();
+    retained_cleanup.extend(
+        events
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .cleanup
+            .iter()
+            .cloned(),
+    );
     retained_cleanup.extend(cleanup);
     let attempt = ShutdownReport::new(Some(primary), retained_cleanup.clone());
     let error = attempt
@@ -85,12 +94,11 @@ pub(crate) fn finish_worker(
             },
         );
     }
-    let primary = events
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .primary
-        .clone();
-    *shutdown = Some(ShutdownReport::new(primary, cleanup));
+    let queue = events.lock().unwrap_or_else(|poison| poison.into_inner());
+    *shutdown = Some(ShutdownReport::new(
+        queue.primary.clone(),
+        queue.cleanup.clone(),
+    ));
 }
 
 pub(crate) fn push_backend_event(events: &BackendEvents, event: Event) {
@@ -101,6 +109,12 @@ pub(crate) fn push_backend_event(events: &BackendEvents, event: Event) {
         if !retain_terminal_cause(&mut queue.primary, error.clone()) {
             return;
         }
+    }
+    if let Event::ShutdownError { error } = &event {
+        if queue.cleanup.contains(error) {
+            return;
+        }
+        queue.cleanup.push(error.clone());
     }
     queue.pending.push_back(event);
 }

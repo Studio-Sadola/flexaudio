@@ -278,7 +278,7 @@ fn forward_stream_events(
 ) -> bool {
     let mut released_startup = false;
     if let Some(error) = stream.terminal_error() {
-        *terminal.lock().unwrap_or_else(lock_poisoned) = Some(StreamTerminal(error));
+        retain_stream_terminal(terminal, error);
     }
     while let Some(event) = stream.poll_event() {
         if lifecycle::is_lifecycle(&event) {
@@ -288,14 +288,16 @@ fn forward_stream_events(
             continue;
         }
         if let Event::PermissionDenied { permission, detail } = &event {
-            *terminal.lock().unwrap_or_else(lock_poisoned) =
-                Some(StreamTerminal(flexaudio::Error::PermissionDenied {
+            retain_stream_terminal(
+                terminal,
+                flexaudio::Error::PermissionDenied {
                     permission: *permission,
                     detail: detail.clone(),
-                }));
+                },
+            );
         }
         if let Event::TerminalError { error } = &event {
-            *terminal.lock().unwrap_or_else(lock_poisoned) = Some(StreamTerminal(error.clone()));
+            retain_stream_terminal(terminal, error.clone());
         }
         if matches!(event, Event::StartupSamplesDropped { .. }) {
             released_startup = true;
@@ -338,6 +340,13 @@ impl std::fmt::Display for StreamTerminal {
 type TerminalError = Arc<Mutex<Option<StreamTerminal>>>;
 type FinalReport = Arc<Mutex<Option<shutdown::ShutdownReport>>>;
 
+fn retain_stream_terminal(terminal: &Mutex<Option<StreamTerminal>>, error: flexaudio::Error) {
+    let mut terminal = terminal.lock().unwrap_or_else(lock_poisoned);
+    let mut retained = terminal.take().map(|StreamTerminal(error)| error);
+    flexaudio::core::terminal_causes::retain_terminal_cause(&mut retained, error);
+    *terminal = retained.map(StreamTerminal);
+}
+
 fn record_cleanup_failure(report: &FinalReport, error: flexaudio::Error) {
     let mut report = report.lock().unwrap_or_else(lock_poisoned);
     report
@@ -350,15 +359,9 @@ fn record_bridge_failure(report: &FinalReport, terminal: &Mutex<Option<StreamTer
     let terminal = terminal.lock().unwrap_or_else(lock_poisoned).clone();
     {
         let mut report = report.lock().unwrap_or_else(lock_poisoned);
-        if report.is_none() {
-            let mut retained = shutdown::ShutdownReport::default();
-            if let Some(StreamTerminal(error)) = terminal {
-                retained.core = Some(flexaudio::core::ShutdownReport::new(
-                    Some(error),
-                    Vec::new(),
-                ));
-            }
-            *report = Some(retained);
+        let retained = report.get_or_insert_with(shutdown::ShutdownReport::default);
+        if let Some(StreamTerminal(error)) = terminal {
+            retained.retain_core(flexaudio::ShutdownReport::new(Some(error), Vec::new()));
         }
     }
     record_cleanup_failure(
@@ -715,6 +718,24 @@ fn encode_err(err: flac_encoder::EncoderError) -> NapiError {
         flac_encoder::ErrorKind::Failure => Status::GenericFailure,
     };
     NapiError::new(status, err.reason)
+}
+
+fn encoder_exception(env: &Env, error: flac_encoder::EncoderError) -> napi::Result<JsObject> {
+    let audio_error = boundary::audio_error(&error.audio_error);
+    let error = encode_err(error);
+    let code = error.status.as_ref().to_owned();
+    let mut exception = env.create_error(error)?;
+    exception.set_named_property("code", code)?;
+    exception.set_named_property("audioError", audio_error)?;
+    Ok(exception)
+}
+
+fn throw_encoder_error(env: &Env, error: flac_encoder::EncoderError) -> NapiError {
+    let reason = error.reason.clone();
+    match encoder_exception(env, error).and_then(|exception| env.throw(exception)) {
+        Ok(()) => NapiError::new(Status::PendingException, reason),
+        Err(error) => error,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1769,7 +1790,11 @@ impl FlexStream {
                     post_stop_flushed(tsfn.as_ref(), &settle, &phase);
                 }
             });
-        if worker.is_err() {
+        if let Err(error) = worker {
+            record_cleanup_failure(
+                &self.report,
+                flexaudio::core::spawn_error("stop worker", error),
+            );
             self.inner.lock().unwrap_or_else(lock_poisoned).handle =
                 pending.lock().unwrap_or_else(lock_poisoned).take();
         }
@@ -2704,7 +2729,7 @@ impl FlacEncoder {
             channels,
             split_seconds,
         )
-        .map_err(encode_err)?;
+        .map_err(|error| throw_encoder_error(&env, error))?;
         let pump = env.create_function_from_closure("flexaudioEncoderCleanup", |ctx| {
             ctx.env.get_undefined()
         })?;
@@ -2722,16 +2747,20 @@ impl FlacEncoder {
     /// Append interleaved f32 (length must be a multiple of `channels`, otherwise InvalidArg).
     /// Reaching the split threshold finalizes the current file; the next chunk opens the next file.
     #[napi]
-    pub fn write_chunk(&mut self, samples: Float32Array) -> napi::Result<()> {
-        self.inner.write_chunk(&samples).map_err(encode_err)
+    pub fn write_chunk(&mut self, env: Env, samples: Float32Array) -> napi::Result<()> {
+        self.inner
+            .write_chunk(&samples)
+            .map_err(|error| throw_encoder_error(&env, error))
     }
 
     /// Finalize and close the file. Repeated successful calls are no-ops; failures remain errors.
     /// If finalize is forgotten, GC close failures are delivered as a `FlexaudioShutdownWarning`
     /// through `process.on('warning')`; finalize returns them directly.
     #[napi]
-    pub fn finalize(&mut self) -> napi::Result<()> {
-        self.inner.finalize().map_err(encode_err)
+    pub fn finalize(&mut self, env: Env) -> napi::Result<()> {
+        self.inner
+            .finalize()
+            .map_err(|error| throw_encoder_error(&env, error))
     }
 }
 
@@ -2744,10 +2773,8 @@ fn report_gc_encoder_failure(env: &Env, error: flac_encoder::EncoderError) {
     );
     gc_warning::emit(env, &message, |warning| {
         // Same projection as a thrown finalize() error, including its `code`.
-        warning.set_named_property(
-            "cause",
-            napi::JsError::from(encode_err(error)).into_unknown(*env),
-        )
+        warning.set_named_property("audioError", boundary::audio_error(&error.audio_error))?;
+        warning.set_named_property("cause", encoder_exception(env, error)?)
     });
 }
 
@@ -2766,7 +2793,7 @@ pub fn drop_failing_encoder(env: Env, explicit: bool) -> napi::Result<()> {
     )?;
     encoder.inner.write_chunk(&[0.0]).map_err(encode_err)?;
     if explicit {
-        return encoder.finalize();
+        return encoder.finalize(env);
     }
     drop(encoder);
     Ok(())
@@ -2838,6 +2865,47 @@ mod tests {
 
     use super::*;
     use flexaudio_encode::EncodeError;
+
+    #[test]
+    fn terminal_snapshot_retains_two_distinct_failures() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            flexaudio::Error::DeviceLost,
+            flexaudio::Error::Backend("later terminal event".into()),
+            |first, second| {
+                let terminal = Mutex::new(None);
+                retain_stream_terminal(&terminal, first);
+                retain_stream_terminal(&terminal, second);
+                terminal.into_inner().unwrap().unwrap().0
+            },
+        );
+    }
+
+    #[test]
+    fn bridge_failure_reconciles_terminal_with_an_existing_report() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            flexaudio::Error::DeviceLost,
+            flexaudio::Error::Backend("later retained terminal".into()),
+            |first, second| {
+                let report = Arc::new(Mutex::new(Some(shutdown::ShutdownReport::from_core(Some(
+                    flexaudio::ShutdownReport::new(Some(first), Vec::new()),
+                )))));
+                let terminal = Mutex::new(Some(StreamTerminal(second)));
+                record_bridge_failure(&report, &terminal);
+                let report = report.lock().unwrap();
+                // The bridge cleanup cause is also retained separately from capture causes.
+                assert_eq!(report.as_ref().unwrap().binding_cleanup.len(), 1);
+                report
+                    .as_ref()
+                    .unwrap()
+                    .core
+                    .as_ref()
+                    .unwrap()
+                    .primary()
+                    .unwrap()
+                    .clone()
+            },
+        );
+    }
 
     // --- source kind round trip ---
 

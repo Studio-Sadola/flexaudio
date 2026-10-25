@@ -15,6 +15,9 @@ pub enum EncodeError {
     /// An internal FLAC encoder error with a description.
     #[error("encoder error: {0}")]
     Encoder(String),
+    /// A typed encoding/cleanup failure, including distinct related failures.
+    #[error("{0}")]
+    Audio(flexaudio_core::Error),
 }
 
 /// Result type used throughout flexaudio-encode.
@@ -29,6 +32,7 @@ impl EncodeError {
             Self::Io(_) => Kind::FlacIo,
             Self::Unsupported(_) => Kind::FlacUnsupported,
             Self::Encoder(_) => Kind::FlacEncoder,
+            Self::Audio(error) => return error.clone(),
         };
         Error::Addon {
             kind,

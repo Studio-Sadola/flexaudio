@@ -3,9 +3,8 @@ use pyo3::prelude::*;
 
 pub(crate) fn attach_cleanup_failure(body: Bound<'_, PyAny>, error: PyErr, operation: &str) {
     let note = format!("{operation} also failed: {error}");
-    if body.call_method1("add_note", (note,)).is_ok() {
-        return;
-    }
+    // Notes aid display, while the context chain retains the typed exception itself.
+    let _note_result = body.call_method1("add_note", (note,));
 
     // Python <3.11 has no add_note, and subclasses may reject it. Use the
     // exception API rather than user-overridable attribute assignment.
@@ -39,6 +38,57 @@ pub(crate) fn attach_cleanup_failure(body: Bound<'_, PyAny>, error: PyErr, opera
 mod tests {
     use super::*;
     use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
+
+    #[test]
+    fn successful_note_keeps_both_distinct_typed_failures() {
+        Python::initialize();
+        Python::attach(|py| {
+            let body = crate::to_py_err(::flexaudio::Error::DeviceLost);
+            let cleanup = crate::to_py_err(::flexaudio::Error::Backend("cleanup failed".into()));
+            attach_cleanup_failure(
+                body.value(py).clone().into_any(),
+                cleanup.clone_ref(py),
+                "Stop",
+            );
+            let retained = body.context(py).expect("typed cleanup context");
+            assert!(retained.value(py).is(cleanup.value(py)));
+            let audio = retained.value(py).getattr("audio_error").unwrap();
+            let audio = audio
+                .extract::<PyRef<'_, crate::errors::AudioError>>()
+                .unwrap();
+            assert_eq!(
+                audio.0,
+                ::flexaudio::Error::Backend("cleanup failed".into())
+            );
+        });
+    }
+
+    #[test]
+    fn encoder_error_preserves_distinct_write_and_close_causes() {
+        Python::initialize();
+        Python::attach(|py| {
+            flexaudio_core::test_support::assert_distinct_failures_retained(
+                ::flexaudio::Error::Backend("write failed".into()),
+                ::flexaudio::Error::Backend("close failed".into()),
+                |first, second| {
+                    let mut retained = Some(first);
+                    ::flexaudio::core::terminal_causes::retain_terminal_cause(
+                        &mut retained,
+                        second,
+                    );
+                    let error = crate::encode_err_to_py(flexaudio_encode::EncodeError::Audio(
+                        retained.unwrap(),
+                    ));
+                    let value = error.value(py).getattr("audio_error").unwrap();
+                    value
+                        .extract::<PyRef<'_, crate::errors::AudioError>>()
+                        .unwrap()
+                        .0
+                        .clone()
+                },
+            );
+        });
+    }
 
     #[test]
     fn cleanup_note_preserves_existing_context() {

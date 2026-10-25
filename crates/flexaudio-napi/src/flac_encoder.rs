@@ -15,24 +15,35 @@ pub(super) enum ErrorKind {
 pub(super) struct EncoderError {
     pub(super) kind: ErrorKind,
     pub(super) reason: String,
+    pub(super) audio_error: flexaudio::Error,
 }
 
 impl EncoderError {
     fn new(kind: ErrorKind, reason: impl Into<String>) -> Self {
+        let reason = reason.into();
         Self {
             kind,
-            reason: reason.into(),
+            audio_error: match kind {
+                ErrorKind::InvalidArgument => flexaudio::Error::InvalidArg(reason.clone()),
+                ErrorKind::Failure => flexaudio::Error::InvalidState(reason.clone()),
+            },
+            reason,
         }
     }
 }
 
 impl From<EncodeError> for EncoderError {
     fn from(error: EncodeError) -> Self {
+        let audio_error = error.audio_error();
         let kind = match error {
             EncodeError::Unsupported(_) => ErrorKind::InvalidArgument,
             _ => ErrorKind::Failure,
         };
-        Self::new(kind, error.to_string())
+        Self {
+            kind,
+            reason: error.to_string(),
+            audio_error,
+        }
     }
 }
 
@@ -159,6 +170,7 @@ impl RotatingFlacEncoder {
     }
 
     fn ensure_open(&self) -> Result<()> {
+        // Failed encoders attempt no more frame/header I/O; the failed file is already closed.
         match &self.state {
             FlacEncoderState::Open => Ok(()),
             FlacEncoderState::Finalized => Err(EncoderError::new(
@@ -224,6 +236,20 @@ impl RotatingFlacEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn encoder_snapshot_preserves_distinct_write_and_close_causes() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            flexaudio::Error::Backend("write failed".into()),
+            flexaudio::Error::Backend("close failed".into()),
+            |first, second| {
+                let mut retained = Some(first);
+                flexaudio::core::terminal_causes::retain_terminal_cause(&mut retained, second);
+                let error = EncoderError::from(EncodeError::Audio(retained.unwrap()));
+                error.audio_error
+            },
+        );
+    }
+
     #[test]
     fn flac_encoder_finalize_never_reopens_destination() {
         let path =

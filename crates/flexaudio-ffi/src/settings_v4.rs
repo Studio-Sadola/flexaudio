@@ -181,9 +181,14 @@ pub unsafe extern "C" fn flexaudio_settings_item_v4(
         let Some(entry) = settings.entries.get(index) else {
             return invalid("settings index out of bounds");
         };
-        let (requested, effective) = match (entry.requested.view(), entry.effective.view()) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Err(status), _) | (_, Err(status)) => return status,
+        // Stop before projecting the second value if the first rejects a future unknown variant.
+        let requested = match entry.requested.view() {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let effective = match entry.effective.view() {
+            Ok(value) => value,
+            Err(status) => return status,
         };
         out.write(FlexSettingResolutionV4 {
             setting: entry.setting.as_ptr(),

@@ -176,7 +176,7 @@ impl WasapiSystemBackend {
             .unwrap_or(FALLBACK_FORMAT),
             // Invalid requests are rejected by `start`; never use classic loopback.
             Ok(Some(_)) | Err(_) => {
-                self.query_error.replace(None);
+                // An earlier query failure still belongs to the next checked start.
                 PROCESS_LOOPBACK_FORMAT
             }
         });
@@ -475,17 +475,16 @@ impl CaptureBackend for WasapiSystemBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
-        let exclude_root = self.exclude_root()?;
+        let request = self.exclude_root();
         // Safe on duplicate start: do nothing if the thread is already running.
         if self.handle.is_some() {
-            return Ok(());
+            return request.map(|_| ());
         }
-        if let Some(error) = self.pending_error.take() {
-            return Err(error);
-        }
-        if let Some(error) = self.query_error.borrow_mut().take() {
-            return Err(error);
-        }
+        let exclude_root = crate::format::check_start_failures(
+            &mut self.pending_error,
+            &self.query_error,
+            request,
+        )?;
         if exclude_root.is_some() {
             verify_format(
                 PROCESS_LOOPBACK_FORMAT,
@@ -578,7 +577,15 @@ impl CaptureBackend for WasapiSystemBackend {
 
 impl Drop for WasapiSystemBackend {
     fn drop(&mut self) {
+        let previous = self.shutdown.report.clone();
         self.stop();
+        if let Some(report) = &self.shutdown.report {
+            flexaudio_core::report_drop_failures(
+                flexaudio_core::DropFailureOwner::SystemCapture,
+                previous.as_ref(),
+                report,
+            );
+        }
     }
 }
 
@@ -717,6 +724,39 @@ unsafe fn setup_system_loopback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_drop_reports_new_failures_and_checked_stop_suppresses_duplicates() {
+        let _guard = crate::owner::DROP_FAILURE_TEST_LOCK.lock().unwrap();
+        let cause = Error::Backend("injected public system Drop failure".into());
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let notices = received.clone();
+        let expected = cause.clone();
+        flexaudio_core::set_drop_failure_handler(Some(Box::new(move |failure| {
+            if failure.report.cleanup().contains(&expected) {
+                notices.lock().unwrap().push(failure.clone());
+            }
+        })));
+        for checked in [false, true] {
+            let mut backend = WasapiSystemBackend::new(false, None);
+            let error = cause.clone();
+            backend.handle = Some(thread::spawn(move || {
+                ShutdownReport::new(None, vec![error])
+            }));
+            if checked {
+                assert_eq!(backend.stop_checked(), Err(cause.clone()));
+            }
+            drop(backend);
+        }
+        flexaudio_core::set_drop_failure_handler(None);
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0].owner,
+            flexaudio_core::DropFailureOwner::SystemCapture
+        );
+        assert_eq!(received[0].report.result(), Err(cause));
+    }
     use flexaudio_core::raw_ring;
 
     #[test]
@@ -1021,6 +1061,7 @@ impl WasapiSystemBackend {
         let joined_owner = handle.is_some();
         let result = self.shutdown.finish(handle);
         if joined_owner {
+            // Startup consumes the previous pending error before creating this owner.
             self.pending_error = result.as_ref().err().cloned();
         }
     }

@@ -354,6 +354,31 @@ fn legacy_failure_is_terminal_with_lane_and_safe_message() {
 }
 
 #[test]
+fn two_distinct_legacy_child_failures_survive_shutdown() {
+    let cause = |detail: &str| {
+        lane_error(
+            Error::Backend("legacy mix child failure".into()).with_diagnostic_detail(detail.into()),
+            Operation::Normalize,
+            MixLane::SystemAudio,
+        )
+    };
+    flexaudio_core::test_support::assert_distinct_failures_retained(
+        cause("first legacy child failure"),
+        cause("second legacy child failure"),
+        |_, _| {
+            let system = Child::new(vec![
+                Event::Error("first legacy child failure".into()),
+                Event::Error("second legacy child failure".into()),
+            ]);
+            let mut mix =
+                CompositeBackend::new(Box::new(Child::new(vec![])), Box::new(system), 1.0, 1.0);
+            start(&mut mix);
+            mix.stop_checked().unwrap_err()
+        },
+    );
+}
+
+#[test]
 fn failed_restart_preserves_previous_shutdown_report_and_events() {
     struct FailsSecondStart {
         attempts: usize,

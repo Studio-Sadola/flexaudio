@@ -21,19 +21,39 @@ pub(crate) fn native_format_from_source(
 }
 
 /// Legacy format getters cannot return errors. Keep the query cause until a
-/// later successful query or checked start, rather than silently using the cache.
+/// checked start, rather than silently using the cache. A successful retry must
+/// not erase failures that the legacy getter could not return.
 pub(crate) fn retain_format_query(
     failure: &std::cell::RefCell<Option<Error>>,
     queried: Result<(u32, u16)>,
 ) -> Option<(u32, u16)> {
     match queried {
-        Ok(format) => {
-            failure.replace(None);
-            Some(format)
-        }
+        Ok(format) => Some(format),
         Err(error) => {
-            failure.replace(Some(error));
+            flexaudio_core::terminal_causes::retain_terminal_cause(
+                &mut failure.borrow_mut(),
+                error,
+            );
             None
+        }
+    }
+}
+
+/// Return every failure already observed before attempting native startup.
+pub(crate) fn check_start_failures<T>(
+    pending: &mut Option<Error>,
+    queried: &std::cell::RefCell<Option<Error>>,
+    request: Result<T>,
+) -> Result<T> {
+    let mut retained = pending.take();
+    if let Some(error) = queried.borrow_mut().take() {
+        flexaudio_core::terminal_causes::retain_terminal_cause(&mut retained, error);
+    }
+    match request {
+        Ok(value) => retained.map_or(Ok(value), Err),
+        Err(error) => {
+            flexaudio_core::terminal_causes::retain_terminal_cause(&mut retained, error);
+            Err(retained.expect("failed request is retained"))
         }
     }
 }
@@ -161,15 +181,55 @@ mod query_tests {
     use super::*;
 
     #[test]
-    fn native_format_query_failure_is_retained_until_success() {
+    fn native_format_query_failure_survives_success_until_checked_start() {
         let failure = std::cell::RefCell::new(None);
         let cause = Error::Backend("native query unavailable; retry capture".into());
         assert_eq!(retain_format_query(&failure, Err(cause.clone())), None);
-        assert_eq!(*failure.borrow(), Some(cause));
+        assert_eq!(*failure.borrow(), Some(cause.clone()));
         assert_eq!(
             retain_format_query(&failure, Ok((44_100, 2))),
             Some((44_100, 2))
         );
+        assert_eq!(
+            check_start_failures(&mut None, &failure, Ok(())),
+            Err(cause)
+        );
         assert!(failure.borrow().is_none());
+    }
+
+    #[test]
+    fn distinct_format_query_failures_survive_a_successful_retry() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            Error::DeviceNotFound,
+            Error::Backend("later format query failure".into()),
+            |first, second| {
+                let failure = std::cell::RefCell::new(None);
+                assert!(retain_format_query(&failure, Err(first)).is_none());
+                assert!(retain_format_query(&failure, Err(second)).is_none());
+                assert!(retain_format_query(&failure, Ok((48_000, 2))).is_some());
+                check_start_failures(&mut None, &failure, Ok(())).unwrap_err()
+            },
+        );
+    }
+
+    #[test]
+    fn startup_retains_pending_query_and_invalid_request_failures() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            Error::DeviceLost,
+            Error::Backend("format query failed".into()),
+            |first, second| {
+                let invalid = Error::InvalidArg("invalid exclusion request".into());
+                let error = check_start_failures::<()>(
+                    &mut Some(first),
+                    &std::cell::RefCell::new(Some(second)),
+                    Err(invalid.clone()),
+                )
+                .unwrap_err();
+                assert!(flexaudio_core::terminal_causes::retains_terminal_cause(
+                    &error, &invalid
+                ));
+                error
+            },
+        );
     }
 }

@@ -3,8 +3,9 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-for (const mode of ['implicit', 'implicit-throwing', 'explicit', ...(process.platform === 'linux' ? ['encoder', 'encoder-explicit'] : [])]) {
-  test(`GC stop reports a warning once only after ${mode} shutdown`, () => {
+for (const mode of ['implicit', 'implicit-throwing', 'explicit', 'encoder', 'encoder-explicit']) {
+  test(`GC stop reports a warning once only after ${mode} shutdown`,
+    { skip: mode.startsWith('encoder') && process.platform !== 'linux' && 'the encoder failure fixture requires Linux /proc/self/fd pipes' }, () => {
     const result = spawnSync(process.execPath,
       ['--expose-gc', fileURLToPath(new URL('./gc-stop.mjs', import.meta.url)), mode],
       { encoding: 'utf8', timeout: 10000 });

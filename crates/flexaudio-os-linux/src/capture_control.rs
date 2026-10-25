@@ -41,17 +41,26 @@ impl CaptureControl {
         let released = self.lifecycle.acknowledge(sequence);
         let outcomes = self.lifecycle.resolve_errors(sequence);
         let resolved = !outcomes.is_empty();
+        let mut stopped = false;
         for outcome in outcomes {
             let attempt = outcome.attempt.clone();
             if self.apply(outcome) {
-                return true;
+                stopped = true;
+                continue;
+            }
+            // Once termination is latched, route mutation is not attempted; queued causes still report.
+            if stopped {
+                continue;
             }
             if let Some(attempt) = attempt {
                 if let Err(error) = retire(&attempt) {
                     self.callbacks.fail(error);
-                    return true;
+                    stopped = true;
                 }
             }
+        }
+        if stopped {
+            return true;
         }
         if released || resolved {
             // Reconciliation already reports its typed failure before stopping capture.
@@ -86,20 +95,24 @@ pub(crate) fn apply_core_outcome(
         link_error::Decision::Recoverable(disposition) => disposition,
         link_error::Decision::Terminate => capture_error::CoreErrorDisposition::Fatal,
     };
-    let phase = if readiness.is_reported() {
+    let phase = if readiness.is_started() {
         capture_error::CapturePhase::Running
     } else {
         capture_error::CapturePhase::Setup
     };
     let failure = outcome.failure;
-    let error = capture_error::core_error(
+    let mut error = Some(capture_error::core_error(
         failure.id,
         failure.sequence,
         failure.status,
         &failure.message,
         phase,
         disposition,
-    );
+    ));
+    if let Some(checkpoint_error) = outcome.checkpoint_error {
+        flexaudio_core::terminal_causes::retain_terminal_cause(&mut error, checkpoint_error);
+    }
+    let error = error.expect("native error is always retained");
     if outcome.decision == link_error::Decision::Terminate {
         capture_failures::report_control_failure(readiness, events, error);
         quit();
@@ -379,6 +392,87 @@ mod tests {
             assert!(!owner.lifecycle.has_pending_errors());
             let error = owner.failure(started);
             assert_eq!(error.diagnostic_details(), ["PipeWire core error: id=5 sequence=21 status=-22; link-factory: unknown output port 52"]);
+            assert!(flexaudio_core::terminal_causes::retains_terminal_cause(
+                &error,
+                &Error::Backend("synthetic sync failure".into())
+            ));
         }
+    }
+
+    #[test]
+    fn native_failure_and_failed_verification_checkpoint_are_both_returned() {
+        let native = capture_error::core_error(
+            5,
+            21,
+            -22,
+            "link-factory: unknown output port 52",
+            capture_error::CapturePhase::Setup,
+            capture_error::CoreErrorDisposition::Fatal,
+        );
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            native,
+            Error::DeviceLost,
+            |_first, second| {
+                let owner = Fixture::with_checkpoint(move || Err(second.clone()));
+                owner.error(-22);
+                owner.failure(false)
+            },
+        );
+    }
+
+    #[test]
+    fn one_verification_barrier_retains_distinct_queued_native_failures() {
+        let failure = |id, sequence| {
+            capture_error::core_error(
+                id,
+                sequence,
+                -22,
+                "link-factory: unknown output port 52",
+                capture_error::CapturePhase::Setup,
+                capture_error::CoreErrorDisposition::Fatal,
+            )
+        };
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            failure(5, 21),
+            failure(6, 31),
+            |_first, _second| {
+                let owner = Fixture::with_checkpoint(|| Ok(100));
+                owner
+                    .lifecycle
+                    .link_attempt(
+                        6,
+                        RequestWindow {
+                            before: 30,
+                            after: 32,
+                        },
+                        51,
+                        52,
+                        61,
+                        62,
+                    )
+                    .unwrap();
+                owner.error(-22);
+                owner.control.error(CoreFailure {
+                    id: 6,
+                    sequence: 31,
+                    status: -22,
+                    message: "link-factory: unknown output port 52".into(),
+                });
+                assert!(owner.control.barrier(
+                    100,
+                    |_| panic!("fatal route must not retire"),
+                    || panic!("fatal route must not reconcile")
+                ));
+                let first = owner.result.recv().unwrap().unwrap_err();
+                let mut retained_events = BackendEvents::default();
+                crate::owner::rollback_capture(
+                    first,
+                    std::thread::spawn(|| {}),
+                    owner.events,
+                    &mut retained_events,
+                    &mut None,
+                )
+            },
+        );
     }
 }

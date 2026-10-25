@@ -367,7 +367,15 @@ impl CaptureBackend for PwSystemBackend {
 
 impl Drop for PwSystemBackend {
     fn drop(&mut self) {
+        let previous = self.shutdown.clone();
         self.stop();
+        if let Some(report) = &self.shutdown {
+            flexaudio_core::report_drop_failures(
+                flexaudio_core::DropFailureOwner::SystemCapture,
+                previous.as_ref(),
+                report,
+            );
+        }
     }
 }
 
@@ -593,7 +601,15 @@ impl CaptureBackend for PwProcessBackend {
 
 impl Drop for PwProcessBackend {
     fn drop(&mut self) {
+        let previous = self.shutdown.clone();
         self.stop();
+        if let Some(report) = &self.shutdown {
+            flexaudio_core::report_drop_failures(
+                flexaudio_core::DropFailureOwner::ProcessCapture,
+                previous.as_ref(),
+                report,
+            );
+        }
     }
 }
 
@@ -1818,6 +1834,7 @@ fn setup_pw_process(
                     readiness_for_sync.registry_synchronized();
                     return;
                 }
+                // A failed sync is reported below as a typed startup failure, not treated as success.
                 let next = core_weak.upgrade().and_then(|core| core.sync(0).ok());
                 match next {
                     Some(next) => pending.set(next.seq()),
@@ -2422,6 +2439,7 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
                         if meta_name != "default" {
                             return;
                         }
+                        // Default identity is optional metadata: a bind failure leaves defaults unknown.
                         let Some(metadata) = flexaudio_core::inventory::optional(
                             registry_for_global
                                 .bind::<pw::metadata::Metadata, _>(global)
@@ -2450,9 +2468,10 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
                                 }))
                                 .is_err()
                                 {
-                                    failure_for_meta.borrow_mut().get_or_insert_with(|| {
-                                        EnumerationFailure::Callback.error()
-                                    });
+                                    discovery::record_failure(
+                                        &failure_for_meta,
+                                        EnumerationFailure::Callback.error(),
+                                    );
                                 }
                                 0
                             })
@@ -2465,9 +2484,10 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
                 }
             }));
             if result.is_err() {
-                failure_for_global
-                    .borrow_mut()
-                    .get_or_insert_with(|| EnumerationFailure::Callback.error());
+                discovery::record_failure(
+                    &failure_for_global,
+                    EnumerationFailure::Callback.error(),
+                );
             }
         })
         .register();
@@ -2512,9 +2532,10 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
                         // Without the core the second sync cannot be issued, so
                         // enumeration is incomplete. Do not report completion;
                         // quit so the wait loop stops instead of waiting forever.
-                        failure_for_cb
-                            .borrow_mut()
-                            .get_or_insert_with(|| EnumerationFailure::CoreGone.error());
+                        discovery::record_failure(
+                            &failure_for_cb,
+                            EnumerationFailure::CoreGone.error(),
+                        );
                         aborted_for_cb.set(true);
                         loop_for_cb.quit();
                         return;
@@ -2524,9 +2545,10 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
                         Err(_) => {
                             // The second sync was refused: enumeration did not
                             // complete, so `done` stays unset. Quit the wait loop.
-                            failure_for_cb
-                                .borrow_mut()
-                                .get_or_insert_with(|| EnumerationFailure::SecondSync.error());
+                            discovery::record_failure(
+                                &failure_for_cb,
+                                EnumerationFailure::SecondSync.error(),
+                            );
                             aborted_for_cb.set(true);
                             loop_for_cb.quit();
                         }
@@ -2545,9 +2567,7 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
     let _error_listener = core
         .add_listener_local()
         .error(move |id, _seq, code, message| {
-            failure_for_core
-                .borrow_mut()
-                .get_or_insert_with(|| discovery::core_error(id, code, message));
+            discovery::record_failure(&failure_for_core, discovery::core_error(id, code, message));
             aborted_for_core.set(true);
             loop_for_core.quit();
         })
@@ -2563,6 +2583,7 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
         let elapsed_ms = deadline.elapsed().as_millis();
         if elapsed_ms >= ENUMERATE_DEADLINE_MS {
             // Deadline exceeded; stop waiting for a completion that may never arrive.
+            discovery::record_failure(&failure, EnumerationFailure::Deadline.error());
             break;
         }
         let remaining =
@@ -2572,9 +2593,7 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
             .iterate(pw::loop_::Timeout::Finite(remaining))
             < 0
         {
-            failure
-                .borrow_mut()
-                .get_or_insert_with(|| EnumerationFailure::Iterate.error());
+            discovery::record_failure(&failure, EnumerationFailure::Iterate.error());
             aborted.set(true);
         }
     }
@@ -2582,7 +2601,8 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
     if let Some(failure) = failure.take() {
         return Err(failure);
     }
-    if !done.get() || aborted.get() {
+    // An explicit abort already has its cause; the deadline is not awaited after it.
+    if !done.get() {
         return Err(EnumerationFailure::Deadline.error());
     }
 
@@ -2779,7 +2799,15 @@ impl PwDeviceWatcher {
 
 impl Drop for PwDeviceWatcher {
     fn drop(&mut self) {
+        let previous = self.shutdown.clone();
         self.stop();
+        if let Some(report) = &self.shutdown {
+            flexaudio_core::report_drop_failures(
+                flexaudio_core::DropFailureOwner::DeviceWatcher,
+                previous.as_ref(),
+                report,
+            );
+        }
     }
 }
 
@@ -2972,6 +3000,7 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                             if meta_name != "default" {
                                 return;
                             }
+                            // Default identity is optional metadata: a bind failure leaves defaults unknown.
                             let Some(metadata) = flexaudio_core::inventory::optional(
                                 registry_for_global
                                     .bind::<pw::metadata::Metadata, _>(global)
@@ -3172,6 +3201,78 @@ fn enqueue_event(events: &WatchEventQueue, ev: DeviceEvent) {
 mod tests {
     use super::*;
     use flexaudio_core::raw_ring::raw_ring;
+
+    #[test]
+    fn public_owner_drops_report_terminal_and_join_failures_once() {
+        const CHILD: &str = "FLEXAUDIO_LINUX_DROP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::public_owner_drops_report_terminal_and_join_failures_once"
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        flexaudio_core::set_drop_failure_handler(Some(Box::new(move |failure| {
+            tx.send(failure.clone()).unwrap();
+        })));
+        let worker = || {
+            Some(std::thread::spawn(|| {
+                panic!("injected shutdown join failure")
+            }))
+        };
+        let mut system = PwSystemBackend::new(false, None);
+        push_backend_event(
+            &system.events,
+            Event::TerminalError {
+                error: Error::DeviceLost,
+            },
+        );
+        system.handle = worker();
+        drop(system);
+        let mut process = PwProcessBackend::new(42, ProcessMode::Include);
+        push_backend_event(
+            &process.events,
+            Event::TerminalError {
+                error: Error::DeviceLost,
+            },
+        );
+        process.handle = worker();
+        drop(process);
+        let events = WatchEventQueue::default();
+        watcher_failures::fail_watcher(&events, Error::DeviceLost);
+        let watcher = PwDeviceWatcher {
+            events,
+            running: Arc::new(AtomicBool::new(true)),
+            stop_tx: None,
+            handle: worker(),
+            shutdown: None,
+        };
+        drop(watcher);
+        for owner in [
+            flexaudio_core::DropFailureOwner::SystemCapture,
+            flexaudio_core::DropFailureOwner::ProcessCapture,
+            flexaudio_core::DropFailureOwner::DeviceWatcher,
+        ] {
+            let failure = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            assert_eq!(failure.owner, owner);
+            assert_eq!(failure.report.primary(), Some(&Error::DeviceLost));
+            assert_eq!(failure.report.cleanup().len(), 1);
+            let error = failure.report.result().unwrap_err();
+            flexaudio_core::test_support::assert_distinct_failures_retained(
+                failure.report.primary().unwrap().clone(),
+                failure.report.cleanup()[0].clone(),
+                |_, _| error,
+            );
+        }
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        flexaudio_core::set_drop_failure_handler(None);
+    }
 
     #[test]
     fn pipewire_enumeration_assigns_node_namespace_to_each_collected_node() {

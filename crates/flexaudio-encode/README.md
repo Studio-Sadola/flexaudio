@@ -52,7 +52,10 @@ writer.finalize()?;
   dither). 1–2 channels, sample rates up to 96 kHz.
 - `finalize()` is recommended: it reports I/O errors and rewrites the header
   with the final sample count and MD5. Dropping the writer without finalizing
-  closes the file on a best-effort basis (errors are swallowed).
+  attempts finalization and checked file close. Failures first observed there
+  reach `flexaudio_core::set_drop_failure_handler` (one stderr line per failure
+  by default). A failed write closes the output immediately, retaining a
+  distinct close failure with the write failure; frame/header work is never retried.
 - Encoding runs synchronously on the calling thread.
 
 ## Install

@@ -146,13 +146,9 @@ fn drain_backend_events_locked(
                 );
                 return MailboxDrain::Terminal;
             }
-            Some(Event::Error(_)) => {
-                // Built-in producers use typed errors with safe library-authored explanations.
-                // A third-party backend's legacy string has no provenance or private-detail
-                // slot, so discard it rather than placing arbitrary text in a Display payload.
-                let error = Error::Backend(
-                    "backend reported a failure through a legacy error event".into(),
-                );
+            Some(Event::Error(detail)) => {
+                // Keep distinct legacy causes in opt-in diagnostics, never safe Display.
+                let error = flexaudio_core::terminal_causes::legacy_capture_error(detail);
                 if let Some(delivery) = delivery {
                     shared.fail_terminal_locked(error, delivery);
                 } else {
@@ -310,9 +306,11 @@ pub(super) fn drain_replacement_lifecycle(shared: &SharedState, be: &mut Box<dyn
                 record_failure(Error::PermissionDenied { permission, detail });
             }
             Ok(Some(Event::DeviceLost)) => record_failure(Error::DeviceLost),
-            Ok(Some(Event::Error(_))) => record_failure(Error::Backend(
-                "backend reported a failure through a legacy error event".into(),
-            )),
+            Ok(Some(Event::Error(detail))) => {
+                record_failure(flexaudio_core::terminal_causes::legacy_capture_error(
+                    detail,
+                ));
+            }
             // These describe the rejected backend's live state, not the restored source.
             Ok(Some(
                 Event::StreamStalled

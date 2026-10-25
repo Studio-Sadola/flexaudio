@@ -46,6 +46,7 @@ enum EncoderState {
 }
 
 enum StoredFailure {
+    Audio(flexaudio::Error),
     Io {
         kind: std::io::ErrorKind,
         message: String,
@@ -57,6 +58,7 @@ enum StoredFailure {
 impl StoredFailure {
     fn capture(error: &EncodeError) -> Self {
         match error {
+            EncodeError::Audio(error) => Self::Audio(error.clone()),
             EncodeError::Io(error) => Self::Io {
                 message: error.to_string(),
                 kind: error.kind(),
@@ -69,6 +71,7 @@ impl StoredFailure {
 
     fn error(&self) -> EncodeError {
         match self {
+            Self::Audio(error) => EncodeError::Audio(error.clone()),
             Self::Io { kind, message } => {
                 EncodeError::Io(std::io::Error::new(*kind, message.clone()))
             }
@@ -191,6 +194,7 @@ impl RotatingFlac {
 
     /// Write any remaining data, finalize and close the current file. Further writes are rejected.
     fn finalize(&mut self) -> Result<(), EncodeError> {
+        // A failed writer has already closed its file and attempts no more frame/header I/O.
         match &self.state {
             EncoderState::Failed(error) => return Err(error.error()),
             EncoderState::Finalized => return Ok(()),
@@ -604,6 +608,21 @@ mod addon_cause_tests {
 #[cfg(test)]
 mod error_projection_tests {
     use super::*;
+
+    #[test]
+    fn sticky_encoder_snapshot_preserves_distinct_write_and_close_causes() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            flexaudio::Error::Backend("write failed".into()),
+            flexaudio::Error::Backend("close failed".into()),
+            |first, second| {
+                let mut retained = Some(first);
+                flexaudio::core::terminal_causes::retain_terminal_cause(&mut retained, second);
+                let failure = StoredFailure::capture(&EncodeError::Audio(retained.unwrap()));
+                assert_eq!(flac_err(failure.error()), code::FLEX_FAILURE);
+                crate::error::last_audio_error().unwrap()
+            },
+        );
+    }
     #[test]
     fn typed_flac_create_preserves_argument_and_addon_causes() {
         for (path, rate, channels, addon) in [

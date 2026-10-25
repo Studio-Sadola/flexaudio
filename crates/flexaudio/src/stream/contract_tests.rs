@@ -314,8 +314,8 @@ fn legacy_failure_is_terminal_and_cleanup_does_not_replace_the_primary() {
     let result = stream.stop_checked().unwrap_err();
     assert_eq!(
         stream.terminal_error(),
-        Some(Error::Backend(
-            "backend reported a failure through a legacy error event".into()
+        Some(flexaudio_core::terminal_causes::legacy_capture_error(
+            "legacy capture failure".into()
         ))
     );
     assert!(matches!(result, Error::Multiple(group) if group.secondary().count() == 1));
@@ -346,8 +346,7 @@ fn legacy_backend_payload_is_sanitized_across_terminal_and_shutdown_paths() {
         stream.start().unwrap();
         let result = stream.stop_checked().unwrap_err();
         assert_eq!(result.kind(), ErrorKind::Backend);
-        let expected =
-            Error::Backend("backend reported a failure through a legacy error event".into());
+        let expected = flexaudio_core::terminal_causes::legacy_capture_error(private.into());
         assert_eq!(result, expected);
         assert_eq!(
             result.to_string(),
@@ -355,7 +354,8 @@ fn legacy_backend_payload_is_sanitized_across_terminal_and_shutdown_paths() {
         );
         assert!(!result.to_string().contains(private));
         let terminal = stream.terminal_error().unwrap();
-        assert_eq!(terminal.root(), &expected);
+        assert_eq!(terminal.root(), expected.root());
+        assert_eq!(terminal.diagnostic_details(), vec![private]);
         assert_eq!(terminal.to_string(), expected.to_string());
         assert_eq!(stream.shutdown_report().unwrap().primary(), Some(&terminal));
         assert_eq!(

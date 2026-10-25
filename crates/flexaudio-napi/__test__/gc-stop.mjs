@@ -30,6 +30,8 @@ function assertEncoderWarning(warning) {
   assert.ok(warning.cause instanceof Error);
   assert.equal(warning.cause.code, 'GenericFailure');
   assert.match(warning.cause.message, /seek/i);
+  assert.equal(warning.cause.audioError.addonKind, 'flacIo');
+  assert.equal(warning.audioError.addonKind, 'flacIo');
 }
 
 async function checkCleanup() {

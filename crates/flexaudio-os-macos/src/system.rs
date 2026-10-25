@@ -372,7 +372,15 @@ impl CaptureBackend for MacSystemBackend {
 
 impl Drop for MacSystemBackend {
     fn drop(&mut self) {
+        let previous = self.shutdown.report().cloned();
         self.stop();
+        if let Some(report) = self.shutdown.report() {
+            flexaudio_core::report_drop_failures(
+                flexaudio_core::DropFailureOwner::SystemCapture,
+                previous.as_ref(),
+                report,
+            );
+        }
     }
 }
 
@@ -529,6 +537,39 @@ pub(crate) fn run_tap_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_drop_reports_new_failures_and_checked_stop_suppresses_duplicates() {
+        let _guard = crate::owner::DROP_FAILURE_TEST_LOCK.lock().unwrap();
+        let cause = Error::Backend("injected public system Drop failure".into())
+            .with_context(ErrorContext::new(Operation::Stop));
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let notices = received.clone();
+        let expected = cause.clone();
+        flexaudio_core::set_drop_failure_handler(Some(Box::new(move |failure| {
+            if failure.report.cleanup().contains(&expected) {
+                notices.lock().unwrap().push(failure.clone());
+            }
+        })));
+        for checked in [false, true] {
+            let mut backend = MacSystemBackend::new(false, None);
+            backend.handle = Some(thread::spawn(|| {
+                Err(Error::Backend("injected public system Drop failure".into()))
+            }));
+            if checked {
+                assert_eq!(backend.stop_checked(), Err(cause.clone()));
+            }
+            drop(backend);
+        }
+        flexaudio_core::set_drop_failure_handler(None);
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0].owner,
+            flexaudio_core::DropFailureOwner::SystemCapture
+        );
+        assert_eq!(received[0].report.result(), Err(cause));
+    }
 
     #[test]
     fn silence_probe_defaults_on_and_can_be_disabled() {

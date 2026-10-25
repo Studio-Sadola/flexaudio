@@ -152,6 +152,22 @@ fn enum_flight() -> &'static EnumFlight {
 #[cfg(test)]
 static ENUM_SPAWN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+// A buffered reply can outlive its timed-out receiver even when send succeeds.
+// Taking the result transfers responsibility to the caller; otherwise Drop reports it.
+struct QueryOutcome<T>(Option<Result<T>>);
+
+impl<T> Drop for QueryOutcome<T> {
+    fn drop(&mut self) {
+        if let Some(Err(error)) = self.0.take() {
+            flexaudio_core::report_drop_failures(
+                flexaudio_core::DropFailureOwner::ProcessQuery,
+                None,
+                &flexaudio_core::ShutdownReport::new(Some(error), Vec::new()),
+            );
+        }
+    }
+}
+
 /// Run `job` on a dedicated thread and return [`Error::Backend`] if no result arrives within `timeout`.
 ///
 /// OS queries cannot be canceled by the caller. Only one can run at a time (single-flight).
@@ -175,7 +191,7 @@ where
 
     // Capacity-one synchronous channel. The sender will not block if the receiver has timed
     // out and gone away; one value fits in the buffer without a receiver.
-    let (tx, rx) = mpsc::sync_channel::<Result<T>>(1);
+    let (tx, rx) = mpsc::sync_channel::<QueryOutcome<T>>(1);
     let spawn = thread::Builder::new()
         .name("flexaudio-processes".into())
         .spawn(move || {
@@ -187,8 +203,9 @@ where
             // Clear the marker before sending the result so the next call can start as soon as
             // recv returns instead of still appearing busy.
             drop(guard);
-            #[allow(clippy::let_underscore_must_use, reason = "Enumeration may finish after the caller times out; the expired receiver needs no response.")]
-            let _ = tx.send(result);
+            if let Err(error) = tx.send(QueryOutcome(Some(result))) {
+                drop(error);
+            }
         });
     if let Err(e) = spawn {
         flight.end();
@@ -200,7 +217,7 @@ where
     ENUM_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
 
     match rx.recv_timeout(timeout) {
-        Ok(result) => result,
+        Ok(mut result) => result.0.take().expect("worker publishes one query outcome"),
         Err(RecvTimeoutError::Timeout) => Err(Error::Backend(format!(
             "process enumeration timed out after {} ms",
             timeout.as_millis()
@@ -220,6 +237,64 @@ mod tests {
 
     /// Serialize unit tests so they do not contend for the same single-flight slot.
     static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn abandoned_query_reports_late_and_buffered_failures() {
+        const CHILD: &str = "FLEXAUDIO_LATE_QUERY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "processes::tests::abandoned_query_reports_late_and_buffered_failures"
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        let (sink_tx, sink_rx) = mpsc::channel();
+        flexaudio_core::set_drop_failure_handler(Some(Box::new(move |failure| {
+            sink_tx.send(failure.clone()).unwrap();
+        })));
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            Error::Backend("process enumeration timed out after 1 ms".into()),
+            Error::DeviceLost,
+            |_first, second| {
+                let (release_tx, release_rx) = mpsc::channel();
+                let error = run_bounded(Duration::from_millis(1), move || -> Result<()> {
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    Err(second)
+                })
+                .unwrap_err();
+                release_tx.send(()).unwrap();
+                let failure = sink_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert_eq!(
+                    failure.owner,
+                    flexaudio_core::DropFailureOwner::ProcessQuery
+                );
+                let mut retained = Some(error);
+                flexaudio_core::terminal_causes::retain_terminal_cause(
+                    &mut retained,
+                    failure.report.result().unwrap_err(),
+                );
+                retained.unwrap()
+            },
+        );
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(QueryOutcome::<()>(Some(Err(Error::DeviceNotFound))))
+            .unwrap_or_else(|_| panic!("buffer result"));
+        drop(rx);
+        assert_eq!(
+            sink_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .report
+                .primary(),
+            Some(&Error::DeviceNotFound)
+        );
+        flexaudio_core::set_drop_failure_handler(None);
+    }
 
     fn wait_until_idle() {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);

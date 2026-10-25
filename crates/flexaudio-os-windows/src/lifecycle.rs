@@ -78,6 +78,7 @@ impl KeepaliveLifecycle {
 
 impl Drop for KeepaliveLifecycle {
     fn drop(&mut self) {
+        // This is lifecycle phase metadata; typed failures remain in the cleanup ledger/report.
         let reason = if std::thread::panicking() && !self.startup_complete {
             HelperStopReason::StartupFailed
         } else if std::thread::panicking() {
@@ -193,6 +194,7 @@ impl<C: StreamClient, K: StreamClient> Session<C, K> {
     }
 
     pub(crate) fn set_stop_reason(&mut self, reason: HelperStopReason) {
+        // Only the final lifecycle phase is stored here; errors have a separate durable ledger.
         if let Some(lifecycle) = self.lifecycle.as_mut() {
             lifecycle.reason = Some(reason);
         }

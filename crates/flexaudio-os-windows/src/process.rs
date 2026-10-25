@@ -291,7 +291,15 @@ impl CaptureBackend for WasapiProcessBackend {
 
 impl Drop for WasapiProcessBackend {
     fn drop(&mut self) {
+        let previous = self.shutdown.report.clone();
         self.stop();
+        if let Some(report) = &self.shutdown.report {
+            flexaudio_core::report_drop_failures(
+                flexaudio_core::DropFailureOwner::ProcessCapture,
+                previous.as_ref(),
+                report,
+            );
+        }
     }
 }
 
@@ -485,6 +493,39 @@ fn map_process_activation_err(ctx: &'static str, e: windows::core::Error) -> Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_drop_reports_new_failures_and_checked_stop_suppresses_duplicates() {
+        let _guard = crate::owner::DROP_FAILURE_TEST_LOCK.lock().unwrap();
+        let cause = Error::Backend("injected public process Drop failure".into());
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let notices = received.clone();
+        let expected = cause.clone();
+        flexaudio_core::set_drop_failure_handler(Some(Box::new(move |failure| {
+            if failure.report.cleanup().contains(&expected) {
+                notices.lock().unwrap().push(failure.clone());
+            }
+        })));
+        for checked in [false, true] {
+            let mut backend = WasapiProcessBackend::new(1, ProcessMode::Include);
+            let error = cause.clone();
+            backend.handle = Some(thread::spawn(move || {
+                ShutdownReport::new(None, vec![error])
+            }));
+            if checked {
+                assert_eq!(backend.stop_checked(), Err(cause.clone()));
+            }
+            drop(backend);
+        }
+        flexaudio_core::set_drop_failure_handler(None);
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0].owner,
+            flexaudio_core::DropFailureOwner::ProcessCapture
+        );
+        assert_eq!(received[0].report.result(), Err(cause));
+    }
     use flexaudio_core::raw_ring;
     // `ProcessMode` is available through `super::*` via the parent module's `use`.
 
@@ -661,6 +702,7 @@ impl WasapiProcessBackend {
         let joined_owner = handle.is_some();
         let result = self.shutdown.finish(handle);
         if joined_owner {
+            // Startup consumes the previous pending error before creating this owner.
             self.pending_error = result.as_ref().err().cloned();
         }
     }

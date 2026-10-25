@@ -10,7 +10,8 @@
 //! frames/chunk. [`OutputFormat`] can change the external rate/channels (the Normalizer's second
 //! stage resamples; e.g. 16k/1ch gives 320 frames/chunk). Output chunks remain 20 ms regardless of rate.
 //!
-//! The public API has no callbacks. RT threads only push; consumers poll.
+//! Capture delivery has no callbacks. RT threads only push; consumers poll.
+//! Implicit shutdown failures have a separate process-wide receiver.
 //! The RT path never blocks (DROP_OLDEST / overflow drop when full). PTS comes from the device
 //! and gaps are detected.
 //!
@@ -41,6 +42,11 @@ pub use capabilities::{
 pub mod chunk_ring;
 pub mod clock;
 pub mod diagnostics;
+mod drop_failure;
+pub use drop_failure::{
+    report_drop_failures, set_drop_failure_handler, DropFailure, DropFailureHandler,
+    DropFailureOwner,
+};
 pub mod error_context;
 mod error_equality;
 mod helper_stop_reason;

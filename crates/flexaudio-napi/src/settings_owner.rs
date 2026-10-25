@@ -43,8 +43,8 @@ impl Drop for SettingsOwner {
         {
             let mut report = self.shutdown.lock().unwrap_or_else(lock_poisoned);
             let report = report.get_or_insert_with(shutdown::ShutdownReport::default);
-            if report.core.is_none() {
-                report.core = self.stream.shutdown_report();
+            if let Some(core) = self.stream.shutdown_report() {
+                report.retain_core(core);
             }
         }
         if let Some(report) = self.stream.effective_settings() {
@@ -56,6 +56,36 @@ impl Drop for SettingsOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_reconciles_shutdown_even_when_a_core_report_already_exists() {
+        let first = flexaudio::Error::Backend("previous bridge snapshot".into());
+        let report: FinalReport =
+            Arc::new(Mutex::new(Some(shutdown::ShutdownReport::from_core(Some(
+                flexaudio::ShutdownReport::new(Some(first.clone()), Vec::new()),
+            )))));
+        let mut stream =
+            flexaudio::test_support::stop_failure(flexaudio::test_support::StopPhase::Stop)
+                .unwrap();
+        stream.stop();
+        let second = stream.shutdown_report().unwrap().cleanup()[0].clone();
+        drop(SettingsOwner::new(
+            stream,
+            Arc::new(Mutex::new(None)),
+            report.clone(),
+        ));
+        let report = report.lock().unwrap();
+        let core = report.as_ref().unwrap().core.as_ref().unwrap();
+        assert_eq!(core.primary(), Some(&first));
+        assert_eq!(core.cleanup(), std::slice::from_ref(&second));
+        let failure = core.result().unwrap_err();
+        assert!(flexaudio::core::terminal_causes::retains_terminal_cause(
+            &failure, &first
+        ));
+        assert!(flexaudio::core::terminal_causes::retains_terminal_cause(
+            &failure, &second
+        ));
+    }
 
     #[test]
     fn owner_unwind_retains_real_backend_stop_failure() {

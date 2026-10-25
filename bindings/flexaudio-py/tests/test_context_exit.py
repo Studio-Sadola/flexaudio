@@ -31,15 +31,13 @@ def test_context_exit_preserves_body_and_existing_context(
     assert caught.value is body
     assert str(body) == "body failure"
     if not reject_notes and hasattr(body, "__notes__"):
-        assert body.__context__ is previous
         assert any(failure in note for note in body.__notes__)
+    if previous is not None:
+        assert body.__context__ is previous
+        cleanup = previous.__context__
     else:
-        if previous is not None:
-            assert body.__context__ is previous
-            cleanup = previous.__context__
-        else:
-            cleanup = body.__context__
-        assert isinstance(cleanup, RuntimeError)
-        assert cleanup.audio_error.kind == (
-            "deviceLost" if fixture == "_stream_stop_failure" else "backend")
-        assert failure in str(cleanup)
+        cleanup = body.__context__
+    assert isinstance(cleanup, RuntimeError)
+    assert cleanup.audio_error.kind == (
+        "deviceLost" if fixture == "_stream_stop_failure" else "backend")
+    assert failure in str(cleanup)
