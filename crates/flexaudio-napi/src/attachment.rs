@@ -197,6 +197,7 @@ impl PairingBridge {
             report.binding_cleanup = previous.binding_cleanup;
             report.gc_requested = previous.gc_requested;
             report.gc_reported = previous.gc_reported;
+            report.delivered_report = previous.delivered_report;
         }
         report.attachment = failures;
         *retained = Some(report);
@@ -212,6 +213,7 @@ impl PairingBridge {
             return;
         }
         while let Some((failure, epoch)) = owner.notifications.pop_front() {
+            // owner.state retains this typed cause; final teardown rescues unreachable reports.
             self.on_chunk.call(
                 ChunkEmit::VadFailed {
                     error: failure.error,

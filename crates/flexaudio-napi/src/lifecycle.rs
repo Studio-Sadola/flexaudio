@@ -131,6 +131,7 @@ impl LifecycleDelivery {
     }
 
     pub fn emit(&self, event: Event) {
+        // These notices contain no failure payload; typed failures use the retained shutdown report.
         if let Some(handler) = self.handler.lock().unwrap_or_else(lock_poisoned).clone() {
             self.pending.fetch_add(1, Ordering::SeqCst);
             if self.queue.call(

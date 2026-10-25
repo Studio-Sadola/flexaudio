@@ -224,6 +224,25 @@ impl PublicationGate {
         Ok(true)
     }
 
+    /// Preserve diagnostic failures if stop or a poisoned gate prevents publication.
+    pub(crate) fn publish_probe_decision(
+        &self,
+        control: &ProbeControl,
+        decision: ProbeDecision,
+        publish: impl FnOnce(ProbeDecision),
+    ) -> Result<bool, PublicationError> {
+        let failure = match &decision {
+            ProbeDecision::Advisory { error, .. } => error.clone(),
+            // Unpublished permission evidence is not a confirmed capture denial.
+            ProbeDecision::Denied { .. } => None,
+        };
+        let result = self.when_active(control, || publish(decision));
+        if !matches!(result, Ok(true)) {
+            control.cleanup_ledger.extend(failure);
+        }
+        result
+    }
+
     /// Report poisoning through a terminal event while retaining stop ordering.
     /// Recovering is safe because the mutex payload is unit; this path never
     /// resumes capture or pretends the preceding publication succeeded.
@@ -328,12 +347,28 @@ impl GenerationProbe {
         // Native owners have completed teardown. Retain their failures before
         // cancellation suppresses probe-result publication.
         let mut errors = control.cleanup.take();
-        control.cleanup_ledger.extend(errors.iter().cloned());
         // Stop wins even when requested during native teardown after collecting a result.
         if control.cancelled() {
+            let timeout_outcome = matches!(outcome, ProbeOutcome::TimedOut);
+            // Cancelled is lifecycle-only; the native operation observed no deadline failure.
+            let timed_out = timeout_outcome
+                || (!matches!(outcome, ProbeOutcome::Cancelled) && control.timed_out());
+            if let ProbeOutcome::Failed { error } | ProbeOutcome::Inconclusive { error } = outcome {
+                // Suppress late notices, while the typed failure still reaches checked shutdown.
+                errors.insert(0, error);
+            }
+            if timed_out {
+                if timeout_outcome {
+                    errors.insert(0, timeout_error());
+                } else {
+                    errors.push(timeout_error());
+                }
+            }
+            control.cleanup_ledger.extend(errors);
             lifecycle.reason = control.cancellation_reason();
             return None;
         }
+        control.cleanup_ledger.extend(errors.iter().cloned());
         if matches!(outcome, ProbeOutcome::Cancelled) {
             lifecycle.reason = HelperStopReason::Cancelled;
             return None;

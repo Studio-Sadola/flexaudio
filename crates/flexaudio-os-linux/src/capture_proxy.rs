@@ -155,6 +155,15 @@ impl ProxyLifecycle {
     pub(crate) fn has_pending_errors(&self) -> bool {
         !self.errors.borrow().is_empty()
     }
+    pub(crate) fn drain_unverified_errors(&self) {
+        // Verification is no longer attempted after the worker exits. Keep every
+        // observed native failure as cleanup instead of inferring a benign result.
+        let pending = std::mem::take(&mut *self.errors.borrow_mut());
+        for (_, failure, _) in pending {
+            self.callbacks
+                .cleanup_failure(failure.unverified_shutdown_error());
+        }
+    }
     pub(crate) fn handle_error(&self, failure: CoreFailure) -> CoreOutcome {
         let released = crate::capture_error::destroy_target(&failure.message)
             .is_some_and(|id| self.pending.borrow().was_released(id, failure.sequence));
@@ -237,6 +246,13 @@ impl ProxyLifecycle {
     }
 }
 
+impl Drop for ProxyLifecycle {
+    fn drop(&mut self) {
+        // Also cover setup failure and owners dropped before a worker loop runs.
+        self.drain_unverified_errors();
+    }
+}
+
 pub(crate) struct CaptureProxy<P: ProxyT> {
     // Field order: remove the callback, drop the proxy, then record the destroy's end barrier.
     _listener: ProxyListener,
@@ -310,6 +326,7 @@ impl Drop for ReleaseOnDrop {
         if let Some(owner) = self.owner.upgrade() {
             owner.released(self.proxy_id, self.before.get(), self.creation);
         }
+        // Without the lifecycle owner, the loop has ended and no sync is attempted.
     }
 }
 

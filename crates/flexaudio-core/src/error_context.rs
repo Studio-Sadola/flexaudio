@@ -154,6 +154,28 @@ pub struct ShutdownReport {
     cleanup: Vec<Error>,
 }
 
+pub(crate) fn is_vad_only(error: &Error) -> bool {
+    match error {
+        Error::Vad { .. } => true,
+        Error::Addon { kind, .. } => match kind {
+            crate::AddonErrorKind::VadModelLoad
+            | crate::AddonErrorKind::VadInference
+            | crate::AddonErrorKind::VadInvalidConfig
+            | crate::AddonErrorKind::VadInvalidFormat
+            | crate::AddonErrorKind::VadResample
+            | crate::AddonErrorKind::VadReset => true,
+            crate::AddonErrorKind::FlacIo
+            | crate::AddonErrorKind::FlacUnsupported
+            | crate::AddonErrorKind::FlacEncoder => false,
+        },
+        Error::Context { source, .. } | Error::Diagnostic { source, .. } => is_vad_only(source),
+        Error::Multiple(group) => {
+            is_vad_only(group.primary()) && group.secondary().all(is_vad_only)
+        }
+        _ => false,
+    }
+}
+
 /// Internal field inventory and cardinalities, with no stability guarantee.
 /// The exhaustive destructure makes new fields a compile error until represented.
 #[cfg(any(test, feature = "test-support"))]
@@ -184,7 +206,8 @@ impl ShutdownReport {
     pub fn result(&self) -> Result<()> {
         let first = match self.primary.as_ref() {
             Some(primary) => primary,
-            None => match self.cleanup.iter().find(|error| error.vad_code().is_none()) {
+            // A VAD primary does not make the group's independent cleanup causes nonfatal.
+            None => match self.cleanup.iter().find(|error| !is_vad_only(error)) {
                 Some(error) => error,
                 None => return Ok(()),
             },
@@ -211,6 +234,160 @@ impl ShutdownReport {
 mod vad_tests {
     use super::*;
     use crate::VadErrorCode;
+
+    #[test]
+    fn mixed_cleanup_group_retains_vad_and_capture_failures() {
+        crate::test_support::assert_distinct_failures_retained(
+            Error::Vad {
+                code: VadErrorCode::Inference,
+            },
+            Error::DeviceLost,
+            |first, second| {
+                let mixed = Error::Multiple(ErrorGroup::new(first, second, Vec::new()));
+                ShutdownReport::new(None, vec![mixed])
+                    .result()
+                    .expect_err("a non-VAD cleanup cause must fail stop")
+            },
+        );
+    }
+
+    #[test]
+    fn nested_and_wrapped_mixed_cleanup_groups_fail_stop_without_losing_structure() {
+        let vad = Error::Vad {
+            code: VadErrorCode::Inference,
+        };
+        let nested = Error::Multiple(ErrorGroup::new(
+            vad.clone(),
+            Error::DeviceLost.with_context(ErrorContext::new(Operation::Stop)),
+            Vec::new(),
+        ));
+        let mixed = Error::Multiple(ErrorGroup::new(vad, nested, Vec::new()));
+        for error in [
+            mixed.clone(),
+            mixed
+                .clone()
+                .with_context(ErrorContext::new(Operation::Join)),
+            mixed
+                .with_diagnostic_detail("retained native cleanup diagnostic".into())
+                .with_context(ErrorContext::new(Operation::Stop)),
+        ] {
+            let report = ShutdownReport::new(None, vec![error.clone()]);
+            assert_eq!(report.result(), Err(error.clone()));
+            assert_eq!(report.cleanup(), &[error]);
+        }
+    }
+
+    #[test]
+    fn nested_and_wrapped_vad_only_cleanup_groups_remain_nonfatal() {
+        let inference = Error::Vad {
+            code: VadErrorCode::Inference,
+        }
+        .with_context(ErrorContext::new(Operation::Flush));
+        let conversion = Error::Vad {
+            code: VadErrorCode::Conversion,
+        }
+        .with_diagnostic_detail("retained VAD diagnostic".into());
+        let nested = Error::Multiple(ErrorGroup::new(inference.clone(), conversion, Vec::new()));
+        let error = Error::Multiple(ErrorGroup::new(inference, nested, Vec::new()))
+            .with_context(ErrorContext::new(Operation::Stop));
+        let report = ShutdownReport::new(None, vec![error.clone()]);
+        assert_eq!(report.result(), Ok(()));
+        assert_eq!(report.cleanup(), &[error]);
+    }
+
+    #[test]
+    fn vad_addon_causes_remain_isolated_but_flac_and_device_causes_fail_stop() {
+        use crate::AddonErrorKind;
+        for kind in [
+            AddonErrorKind::VadModelLoad,
+            AddonErrorKind::VadInference,
+            AddonErrorKind::VadInvalidConfig,
+            AddonErrorKind::VadInvalidFormat,
+            AddonErrorKind::VadResample,
+            AddonErrorKind::VadReset,
+            AddonErrorKind::FlacIo,
+            AddonErrorKind::FlacUnsupported,
+            AddonErrorKind::FlacEncoder,
+        ] {
+            let isolated = match kind {
+                AddonErrorKind::VadModelLoad
+                | AddonErrorKind::VadInference
+                | AddonErrorKind::VadInvalidConfig
+                | AddonErrorKind::VadInvalidFormat
+                | AddonErrorKind::VadResample
+                | AddonErrorKind::VadReset => true,
+                AddonErrorKind::FlacIo
+                | AddonErrorKind::FlacUnsupported
+                | AddonErrorKind::FlacEncoder => false,
+            };
+            let error = Error::Multiple(ErrorGroup::new(
+                Error::Vad {
+                    code: VadErrorCode::Inference,
+                },
+                Error::Addon {
+                    kind,
+                    message: "injected addon cause".into(),
+                }
+                .with_context(ErrorContext::new(Operation::Flush)),
+                Vec::new(),
+            ));
+            let report = ShutdownReport::new(None, vec![error.clone()]);
+            assert_eq!(report.result().is_ok(), isolated, "{kind:?}");
+            assert_eq!(report.cleanup(), std::slice::from_ref(&error));
+            let capture = Error::Multiple(ErrorGroup::new(
+                Error::DeviceNotFound,
+                error.clone(),
+                Vec::new(),
+            ));
+            assert_eq!(capture.to_string().contains("related failure"), !isolated);
+            let with_device =
+                Error::Multiple(ErrorGroup::new(error, Error::DeviceLost, Vec::new()));
+            assert!(ShutdownReport::new(None, vec![with_device])
+                .result()
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn display_includes_non_vad_causes_inside_wrapped_and_nested_related_groups() {
+        let vad = Error::Vad {
+            code: VadErrorCode::Inference,
+        };
+        let mixed = Error::Multiple(ErrorGroup::new(vad.clone(), Error::DeviceLost, Vec::new()));
+        for related in [
+            mixed.clone(),
+            mixed
+                .clone()
+                .with_context(ErrorContext::new(Operation::Stop)),
+            mixed
+                .clone()
+                .with_diagnostic_detail("private native cleanup diagnostic".into()),
+            Error::Multiple(ErrorGroup::new(vad, mixed, Vec::new())),
+        ] {
+            let error =
+                Error::Multiple(ErrorGroup::new(Error::DeviceNotFound, related, Vec::new()));
+            let message = error.to_string();
+            assert!(message.contains("device lost"), "{message}");
+            assert!(!message.contains("private native cleanup diagnostic"));
+        }
+    }
+
+    #[test]
+    fn display_still_excludes_wrapped_vad_only_related_groups() {
+        let related = Error::Multiple(ErrorGroup::new(
+            Error::Vad {
+                code: VadErrorCode::Inference,
+            },
+            Error::Vad {
+                code: VadErrorCode::Conversion,
+            },
+            Vec::new(),
+        ))
+        .with_context(ErrorContext::new(Operation::Flush))
+        .with_diagnostic_detail("private VAD diagnostic".into());
+        let error = Error::Multiple(ErrorGroup::new(Error::DeviceNotFound, related, Vec::new()));
+        assert_eq!(error.to_string(), "device not found");
+    }
 
     #[test]
     fn vad_only_shutdown_succeeds_and_retains_the_typed_cause() {

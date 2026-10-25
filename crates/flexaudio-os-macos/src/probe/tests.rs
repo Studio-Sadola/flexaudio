@@ -157,6 +157,102 @@ fn stop_after_probe_evidence_wins_over_every_outcome() {
 }
 
 #[test]
+fn cancellation_retains_the_probe_failure_and_distinct_native_cleanup_failure() {
+    struct CancelAfterCleanup {
+        outcome: Option<ProbeOutcome>,
+        cleanup: Error,
+    }
+    impl Probe for CancelAfterCleanup {
+        fn run(&mut self, control: &ProbeControl) -> ProbeOutcome {
+            control.cleanup.0.lock().unwrap().push(self.cleanup.clone());
+            control.cancellation.store(true, Ordering::Release);
+            self.outcome.take().unwrap()
+        }
+    }
+    for outcome_kind in ["failed", "inconclusive", "timed-out"] {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            if outcome_kind == "timed-out" {
+                timeout_error()
+            } else {
+                Error::Backend("probe failed before cancellation".into())
+            },
+            Error::Backend("native probe cleanup failed during cancellation".into()),
+            |first, second| {
+                let (control, _) = control();
+                let outcome = match outcome_kind {
+                    "failed" => ProbeOutcome::Failed { error: first },
+                    "inconclusive" => ProbeOutcome::Inconclusive { error: first },
+                    "timed-out" => ProbeOutcome::TimedOut,
+                    _ => unreachable!("fixture lists every outcome"),
+                };
+                let mut probe = CancelAfterCleanup {
+                    outcome: Some(outcome),
+                    cleanup: second,
+                };
+                assert_eq!(
+                    GenerationProbe::default().on_silence(&mut probe, &control),
+                    None
+                );
+                flexaudio_core::ShutdownReport::new(None, control.cleanup_ledger.take())
+                    .result()
+                    .expect_err("cancelled diagnostic failures must reach shutdown")
+            },
+        );
+    }
+}
+
+#[test]
+fn native_cancellation_without_failure_does_not_invent_a_timeout() {
+    let (control, clock) = control();
+    let mut probe = fake(ProbeOutcome::Cancelled);
+    probe.cancel = true;
+    probe.advance = Some(clock);
+    assert_eq!(
+        GenerationProbe::default().on_silence(&mut probe, &control),
+        None
+    );
+    assert!(control.cleanup_ledger.take().is_empty());
+}
+
+#[test]
+fn rejected_publication_retains_distinct_probe_failures_without_a_late_event() {
+    for poisoned in [false, true] {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            Error::Backend("probe setup failed before publication".into()),
+            Error::Backend("probe cleanup failed before publication".into()),
+            |first, second| {
+                let (control, _) = control();
+                let gate = PublicationGate::default();
+                if poisoned {
+                    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _guard = gate.0.lock().unwrap();
+                        panic!("injected publication gate poisoning");
+                    }))
+                    .is_err());
+                } else {
+                    gate.cancel(&control.cancellation).unwrap();
+                }
+                let decision = advisory_failures(vec![first, second]);
+                let result = gate.publish_probe_decision(&control, decision, |_| {
+                    panic!("a rejected probe decision must not publish an event")
+                });
+                assert_eq!(
+                    result,
+                    if poisoned {
+                        Err(PublicationError::Poisoned)
+                    } else {
+                        Ok(false)
+                    }
+                );
+                flexaudio_core::ShutdownReport::new(None, control.cleanup_ledger.take())
+                    .result()
+                    .expect_err("unpublished failures must reach shutdown")
+            },
+        );
+    }
+}
+
+#[test]
 fn expired_deadline_never_starts_probe_or_accepts_late_evidence() {
     let (control, clock) = control();
     *clock.0.lock().unwrap() = control.deadline();

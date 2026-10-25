@@ -14,6 +14,7 @@ pub(super) struct ShutdownReport {
     pub binding_cleanup: Vec<flexaudio::Error>,
     pub gc_requested: bool,
     pub gc_reported: bool,
+    pub delivered_report: Option<flexaudio::ShutdownReport>,
 }
 
 impl ShutdownReport {
@@ -47,6 +48,7 @@ impl ShutdownReport {
             binding_cleanup: Vec::new(),
             gc_requested: false,
             gc_reported: false,
+            delivered_report: None,
         }
     }
 
@@ -92,20 +94,32 @@ impl ShutdownReport {
 /// matching Python's `sys.unraisablehook`. The warning carries `cause` (the error `stop()` would
 /// reject with), its `audioError`, and the full `shutdownReport`.
 pub(super) fn report_gc_failure(env: &Env, report: &FinalReport) {
-    let Some((error, retained)) = take_gc_failure(report) else {
+    let Some((error, retained, outcome)) = take_gc_failure(report) else {
         return;
     };
     let message =
         format!("flexaudio Stream was garbage-collected without stop(); shutdown failed: {error}");
-    gc_warning::emit(env, &message, |warning| {
-        warning.set_named_property("cause", boundary::js_error(env, &error)?)?;
-        warning.set_named_property("audioError", boundary::audio_error(&error))?;
-        warning.set_named_property("shutdownReport", retained)
-    });
+    gc_warning::emit(
+        env,
+        &message,
+        flexaudio::DropFailureOwner::Stream,
+        &outcome,
+        |warning| {
+            warning.set_named_property("cause", boundary::js_error(env, &error)?)?;
+            warning.set_named_property("audioError", boundary::audio_error(&error))?;
+            warning.set_named_property("shutdownReport", retained)
+        },
+    );
 }
 
 /// Claim the one GC notification, releasing the lock before any JS runs.
-fn take_gc_failure(report: &FinalReport) -> Option<(flexaudio::Error, boundary::JsShutdownReport)> {
+fn take_gc_failure(
+    report: &FinalReport,
+) -> Option<(
+    flexaudio::Error,
+    boundary::JsShutdownReport,
+    flexaudio::ShutdownReport,
+)> {
     let mut report = report.lock().unwrap_or_else(lock_poisoned);
     let report = report
         .as_mut()
@@ -119,7 +133,42 @@ fn take_gc_failure(report: &FinalReport) -> Option<(flexaudio::Error, boundary::
         })
     })?;
     report.gc_reported = true;
-    Some((error, report.to_js()))
+    report.delivered_report = Some(outcome.clone());
+    Some((error, report.to_js(), outcome))
+}
+
+/// Once every JS queue refuses teardown, the process receiver owns the retained failures.
+pub(super) fn report_unreachable_failure(report: &FinalReport, status: Status, role: &str) {
+    if status == Status::Ok {
+        return;
+    }
+    let (previous, outcome) = {
+        let mut report = report.lock().unwrap_or_else(lock_poisoned);
+        let Some(report) = report.as_mut() else {
+            return;
+        };
+        let outcome = report.outcome();
+        if outcome.primary().is_none() && outcome.cleanup().is_empty() {
+            // A clean teardown has no failure to rescue when its host has already closed.
+            return;
+        }
+        // Different roles/statuses are distinct observed failures; identical retries collapse.
+        let delivery = failure_delivery::queue_error(role, status);
+        if !report.binding_cleanup.contains(&delivery) {
+            report.binding_cleanup.push(delivery);
+        }
+        let outcome = report.outcome();
+        let previous = report.delivered_report.replace(outcome.clone());
+        // Claim synchronously dispatched failures under the ownership lock, then release it
+        // before invoking a receiver that may inspect this stream. Later cleanup remains new.
+        report.gc_reported = true;
+        (previous, outcome)
+    };
+    flexaudio::core::report_drop_failures(
+        flexaudio::DropFailureOwner::Stream,
+        previous.as_ref(),
+        &outcome,
+    );
 }
 
 #[cfg(test)]

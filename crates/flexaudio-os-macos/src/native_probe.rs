@@ -173,10 +173,9 @@ impl Probe for NativeProbe {
     fn run(&mut self, control: &ProbeControl) -> ProbeOutcome {
         // The backend owner is a Rust thread without an ambient Foundation pool.
         // Drain convenience-method temporaries only after all probe owners finish teardown.
+        // The generation policy suppresses cancelled publication after retaining failures.
         objc2::rc::autoreleasepool(|_| match Self::execute(control) {
-            Ok(outcome) => outcome,
-            Err(_) if control.cancelled() => ProbeOutcome::Cancelled,
-            Err(outcome) => outcome,
+            Ok(outcome) | Err(outcome) => outcome,
         })
     }
 }

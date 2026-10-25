@@ -696,7 +696,16 @@ struct ProcessKeep {
     _links: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, Vec<CaptureLink>>>>,
     _core_listener: pw::core::Listener,
     _bound_nodes: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u32, BoundNode>>>,
+    proxy_lifecycle: std::rc::Rc<capture_proxy::ProxyLifecycle>,
     _core: pw::core::CoreRc,
+}
+
+impl Drop for ProcessKeep {
+    fn drop(&mut self) {
+        // All loop exits, including startup rollback and unwinding, transfer
+        // parked native failures before the worker's joined report is read.
+        self.proxy_lifecycle.drain_unverified_errors();
+    }
 }
 
 /// PID and protocol provenance collected from a Client global.
@@ -1865,6 +1874,7 @@ fn setup_pw_process(
             _links: linked,
             _core_listener,
             _bound_nodes: bound_nodes,
+            proxy_lifecycle,
             _core: core,
         },
     ))

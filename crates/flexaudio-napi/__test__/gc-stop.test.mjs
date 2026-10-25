@@ -13,5 +13,10 @@ for (const mode of ['implicit', 'implicit-throwing', 'explicit', 'encoder', 'enc
     assert.equal(result.status, 0, result.stdout + result.stderr);
     // The child must reach its end: the warning never killed the process.
     assert.match(result.stdout, /gc-stop: ok/, result.stdout + result.stderr);
+    if (mode === 'implicit-throwing') {
+      assert.match(result.stderr, /implicit shutdown:.*device lost/);
+      assert.match(result.stderr, /implicit shutdown:.*VAD failed/);
+      assert.match(result.stderr, /shutdown warning delivery failed/);
+    }
   });
 }

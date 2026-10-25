@@ -83,6 +83,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve deferred native failures through teardown, keep mixed VAD/non-VAD
+  cleanup failures fatal, and route failed final Node deliveries to the typed sink.
 - Retain distinct discovery, startup, bridge, legacy-event and shutdown failures
   together instead of overwriting the first cause. Timed-out queries route late
   failures to the process-wide Rust receiver. FLAC output closes exactly once,

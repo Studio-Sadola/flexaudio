@@ -475,4 +475,134 @@ mod tests {
             },
         );
     }
+
+    #[test]
+    fn worker_exit_before_verification_retains_all_parked_native_failures() {
+        let failures = [
+            CoreFailure {
+                id: 5,
+                sequence: 21,
+                status: -22,
+                message: "link-factory: unknown output port 52".into(),
+            },
+            CoreFailure {
+                id: 6,
+                sequence: 25,
+                status: -22,
+                message: "link-factory: unknown output port 53".into(),
+            },
+        ];
+        for started in [false, true] {
+            for panicking in [false, true] {
+                flexaudio_core::test_support::assert_distinct_failures_retained(
+                    failures[0].unverified_shutdown_error(),
+                    failures[1].unverified_shutdown_error(),
+                    |_first, _second| {
+                        let (tx, rx) = mpsc::channel();
+                        let injected = failures.clone();
+                        let worker = std::thread::spawn(move || {
+                            let owner = Fixture::with_checkpoint(|| Ok(100));
+                            if started {
+                                owner.start();
+                            }
+                            owner
+                                .lifecycle
+                                .link_attempt(
+                                    6,
+                                    RequestWindow {
+                                        before: 24,
+                                        after: 26,
+                                    },
+                                    51,
+                                    53,
+                                    61,
+                                    62,
+                                )
+                                .unwrap();
+                            for failure in injected {
+                                owner.control.error(failure);
+                            }
+                            assert!(owner.lifecycle.has_pending_errors());
+                            assert!(!owner.stopped.get());
+                            tx.send(owner.events.clone()).unwrap();
+                            if panicking {
+                                panic!("injected worker exit before verification");
+                            }
+                            // Destroy the real lifecycle owner without delivering either reply.
+                            drop(owner);
+                        });
+                        let events = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+                        let mut report = None;
+                        crate::owner::finish_worker(&mut Some(worker), &mut report, &events, None);
+                        let report = report.unwrap();
+                        assert!(report.primary().is_none());
+                        assert_eq!(report.cleanup().len(), if panicking { 3 } else { 2 });
+                        for (error, expected) in report.cleanup().iter().zip([
+                            "Unverified PipeWire core error: id=5 sequence=21 status=-22; link-factory: unknown output port 52",
+                            "Unverified PipeWire core error: id=6 sequence=25 status=-22; link-factory: unknown output port 53",
+                        ]) {
+                            assert_eq!(error.diagnostic_details(), [expected]);
+                            let Error::Diagnostic { source, .. } = error else { panic!("native diagnostic retained"); };
+                            let Error::Context { context, .. } = source.as_ref() else { panic!("typed stop context retained"); };
+                            assert_eq!(context.operation(), flexaudio_core::Operation::Stop);
+                            assert!(!error.to_string().contains("unknown output port"));
+                        }
+                        report
+                            .result()
+                            .expect_err("unverified native failures must fail checked stop")
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn teardown_drains_only_unverified_failures_once() {
+        let owner = Fixture::new();
+        owner.start();
+        owner
+            .lifecycle
+            .link_attempt(
+                6,
+                RequestWindow {
+                    before: 30,
+                    after: 32,
+                },
+                51,
+                52,
+                61,
+                62,
+            )
+            .unwrap();
+        owner.error(-22);
+        let pending = CoreFailure {
+            id: 6,
+            sequence: 31,
+            status: -22,
+            message: "link-factory: unknown output port 52".into(),
+        };
+        owner.control.error(pending.clone());
+        owner.lifecycle.remove(52);
+        assert!(!owner.control.barrier(100, |_| Ok(()), || Ok(())));
+        assert!(owner.lifecycle.has_pending_errors());
+        let events = owner.events.clone();
+        owner.lifecycle.drain_unverified_errors();
+        assert!(!owner.lifecycle.has_pending_errors());
+        owner.lifecycle.drain_unverified_errors();
+        drop(owner);
+        let mut report = None;
+        crate::owner::finish_worker(&mut None, &mut report, &events, None);
+        let report = report.unwrap();
+        assert_eq!(report.cleanup(), &[pending.unverified_shutdown_error()]);
+        assert!(report.result().is_err());
+        assert!(matches!(
+            poll_backend_event(&events),
+            Some(Event::RecoverableError { .. })
+        ));
+        assert!(matches!(
+            poll_backend_event(&events),
+            Some(Event::ShutdownError { .. })
+        ));
+        assert!(poll_backend_event(&events).is_none());
+    }
 }

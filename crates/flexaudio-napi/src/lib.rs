@@ -22,6 +22,7 @@ mod bridge_drain;
 mod callback;
 mod capabilities;
 mod devices;
+mod failure_delivery;
 use bridge_drain::start_bridge_stream;
 use callback::UserCallback;
 pub use capabilities::capabilities;
@@ -197,17 +198,6 @@ fn reject_stop(env: sys::napi_env, deferred: SendDeferred, exception: sys::napi_
     }
 }
 
-/// Final notifications use unbounded queues, so a refused call means the JS
-/// environment is closing and no receiver remains. A stream has already written
-/// the report that the notice announces; a collected encoder has no remaining
-/// owner, so its finalize failure cannot reach JS once the environment closes.
-fn queue_final_notice(status: Status) {
-    match status {
-        Status::Ok => {}
-        _refused_without_receiver => {}
-    }
-}
-
 /// Shared settlement policy, also tested with injected native-allocation failures.
 fn reject_with_fallback<T, E>(
     rich: Result<T, E>,
@@ -310,6 +300,7 @@ fn forward_stream_events(
                 ThreadsafeFunctionCallMode::NonBlocking,
             );
         } else if let Some(callback) = callback {
+            // Failure payloads also remain in the stream report if this event queue closes.
             callback.call(event_to_js(event), ThreadsafeFunctionCallMode::NonBlocking);
         }
     }
@@ -396,7 +387,7 @@ where
                     *report = Some(shutdown::ShutdownReport::default());
                 }
             }
-            post_stop_flushed(&chunk, &settle, &phase);
+            post_stop_flushed(&chunk, &settle, &phase, &report);
         })
         .map_err(|error| flexaudio::core::spawn_error("bridge", error))
 }
@@ -655,7 +646,12 @@ fn make_settle_tsfn(
 /// The chunk TSFN uses `max_queue_size=0` (unbounded), so QueueFull is normally impossible. If it
 /// occurs, settlement uses a separate queue and could resolve before onChunk. Retry on the same
 /// queue in Blocking mode to preserve order; fall back to settlement only if that also fails.
-fn post_stop_flushed(chunk: &ChunkTsfn, settle: &SettleTsfn, phase: &Mutex<StopPhase>) {
+fn post_stop_flushed(
+    chunk: &ChunkTsfn,
+    settle: &SettleTsfn,
+    phase: &Mutex<StopPhase>,
+    report: &FinalReport,
+) {
     let st = chunk.call(
         ChunkEmit::StopFlushed,
         ThreadsafeFunctionCallMode::NonBlocking,
@@ -674,16 +670,20 @@ fn post_stop_flushed(chunk: &ChunkTsfn, settle: &SettleTsfn, phase: &Mutex<StopP
     if st2 == Status::Ok {
         return;
     }
-    if st2 != Status::Closing {
+    let final_status = if st2 != Status::Closing {
         let st2b = settle.call((), ThreadsafeFunctionCallMode::Blocking);
         if st2b == Status::Ok {
             return;
         }
-    }
+        st2b
+    } else {
+        st2
+    };
     // Even the settlement TSFN failed = the JS event loop is no longer running (Node is exiting).
     // Only then may the unresolved deferred be discarded. As long as JS is alive,
     // the settle TSFN calls resolve_undefined on the JS thread.
     let _ = take_stop_waiters(phase);
+    shutdown::report_unreachable_failure(report, final_status, "stop settlement");
 }
 
 /// Run `flexaudio::processes()` on the libuv thread pool.
@@ -1787,7 +1787,7 @@ impl FlexStream {
                     StopPhase::Stopping { .. }
                 );
                 if needs_flush {
-                    post_stop_flushed(tsfn.as_ref(), &settle, &phase);
+                    post_stop_flushed(tsfn.as_ref(), &settle, &phase, &report);
                 }
             });
         if let Err(error) = worker {
@@ -2206,7 +2206,8 @@ fn finish_gc_shutdown(report: &FinalReport, notify: &SettleTsfn, requested: bool
         .unwrap_or_else(lock_poisoned)
         .get_or_insert_with(shutdown::ShutdownReport::default)
         .gc_requested = true;
-    queue_final_notice(notify.call((), ThreadsafeFunctionCallMode::NonBlocking));
+    let status = notify.call((), ThreadsafeFunctionCallMode::NonBlocking);
+    shutdown::report_unreachable_failure(report, status, "GC shutdown notice");
 }
 
 // ---------------------------------------------------------------------------
@@ -2226,21 +2227,21 @@ impl DeviceWatcherHandle {
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
             if h.join().is_err() {
-                if let Some(callback) = &self.on_event {
-                    callback.call(
-                        device_event_to_js(DeviceEvent::TerminalError {
-                            error: flexaudio::Error::Backend(
-                                "device bridge worker panicked; restart device watching".into(),
-                            )
-                            .with_context(
-                                flexaudio::core::ErrorContext::new(
-                                    flexaudio::core::Operation::Join,
-                                ),
-                            ),
-                        }),
-                        ThreadsafeFunctionCallMode::NonBlocking,
-                    );
-                }
+                failure_delivery::device_event(
+                    DeviceEvent::TerminalError {
+                        error: flexaudio::Error::Backend(
+                            "device bridge worker panicked; restart device watching".into(),
+                        )
+                        .with_context(flexaudio::core::ErrorContext::new(
+                            flexaudio::core::Operation::Join,
+                        )),
+                    },
+                    |event| {
+                        self.on_event.as_ref().map_or(Status::Closing, |callback| {
+                            callback.call(event, ThreadsafeFunctionCallMode::NonBlocking)
+                        })
+                    },
+                );
             }
         }
         self.on_event.take();
@@ -2472,11 +2473,9 @@ pub fn open_stream(
 fn forward_device_events(watcher: &mut flexaudio::DeviceWatcher, callback: &DeviceTsfn) -> bool {
     let mut failed = false;
     while let Some(event) = watcher.poll_event() {
-        failed |= matches!(event, DeviceEvent::TerminalError { .. });
-        callback.call(
-            device_event_to_js(event),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
+        failed |= failure_delivery::device_event(event, |event| {
+            callback.call(event, ThreadsafeFunctionCallMode::NonBlocking)
+        });
     }
     failed
 }
@@ -2703,9 +2702,16 @@ pub struct FlacEncoder {
 impl Drop for FlacEncoder {
     fn drop(&mut self) {
         if let Err(error) = self.inner.finalize_on_drop() {
-            queue_final_notice(
-                self.cleanup
-                    .call(error, ThreadsafeFunctionCallMode::NonBlocking),
+            let report =
+                flexaudio::ShutdownReport::new(Some(error.audio_error.clone()), Vec::new());
+            let status = self
+                .cleanup
+                .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+            failure_delivery::report_rejected(
+                flexaudio::DropFailureOwner::FlacWriter,
+                &report,
+                status,
+                "encoder GC notice",
             );
         }
     }
@@ -2771,11 +2777,18 @@ fn report_gc_encoder_failure(env: &Env, error: flac_encoder::EncoderError) {
         "flexaudio FlacEncoder was garbage-collected without finalize(); close failed: {}",
         error.reason
     );
-    gc_warning::emit(env, &message, |warning| {
-        // Same projection as a thrown finalize() error, including its `code`.
-        warning.set_named_property("audioError", boundary::audio_error(&error.audio_error))?;
-        warning.set_named_property("cause", encoder_exception(env, error)?)
-    });
+    let report = flexaudio::ShutdownReport::new(Some(error.audio_error.clone()), Vec::new());
+    gc_warning::emit(
+        env,
+        &message,
+        flexaudio::DropFailureOwner::FlacWriter,
+        &report,
+        |warning| {
+            // Same projection as a thrown finalize() error, including its `code`.
+            warning.set_named_property("audioError", boundary::audio_error(&error.audio_error))?;
+            warning.set_named_property("cause", encoder_exception(env, error)?)
+        },
+    );
 }
 
 #[cfg(all(flexaudio_test_addon, feature = "test-faults", target_os = "linux"))]

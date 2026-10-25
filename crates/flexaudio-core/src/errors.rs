@@ -257,7 +257,7 @@ impl fmt::Display for Error {
                 write!(f, "{}", group.primary())?;
                 // Isolated VAD causes remain in the structured group and shutdown cleanup
                 // report. They do not change the capture primary's diagnostic message.
-                for error in group.secondary().filter(|error| error.vad_code().is_none()) { write!(f, "; related failure: {error}")?; }
+                for error in group.secondary().filter(|error| !crate::error_context::is_vad_only(error)) { write!(f, "; related failure: {error}")?; }
                 Ok(())
             }
         }

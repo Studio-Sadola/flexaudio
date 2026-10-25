@@ -56,6 +56,21 @@ pub(crate) struct CoreFailure {
     pub(crate) message: String,
 }
 
+impl CoreFailure {
+    pub(crate) fn unverified_shutdown_error(&self) -> flexaudio_core::Error {
+        flexaudio_core::Error::Backend(
+            "PipeWire capture link failure remained unverified at shutdown; retry capture.".into(),
+        )
+        .with_context(flexaudio_core::ErrorContext::new(
+            flexaudio_core::Operation::Stop,
+        ))
+        .with_diagnostic_detail(format!(
+            "Unverified PipeWire core error: id={} sequence={} status={}; {}",
+            self.id, self.sequence, self.status, self.message
+        ))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Decision {
     Continue,

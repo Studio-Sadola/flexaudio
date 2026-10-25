@@ -11,30 +11,27 @@ pub(super) const WARNING_NAME: &str = "FlexaudioShutdownWarning";
 pub(super) const WARNING_CODE: &str = "FLEXAUDIO_GC_SHUTDOWN";
 
 /// Emit a typed warning `Error`. `attach` adds the typed fields an explicit stop/finalize
-/// would have delivered. Delivery never throws: if the typed warning cannot be built, a plain
-/// warning with the same name, code and message is emitted; if that also fails, the pending
-/// exception is cleared because no further channel exists.
+/// would have delivered. If construction or delivery fails, the original typed report and
+/// delivery error reach the process receiver. Pending JS exceptions are cleared before returning.
 pub(super) fn emit(
     env: &Env,
     message: &str,
+    owner: flexaudio::DropFailureOwner,
+    report: &flexaudio::ShutdownReport,
     attach: impl FnOnce(&mut JsObject) -> napi::Result<()>,
 ) {
     let warning = build(env, message).and_then(|mut warning| {
         attach(&mut warning)?;
         Ok(warning)
     });
-    let warning = match warning {
-        Ok(warning) => Ok(warning),
-        Err(_) => {
-            clear_pending_exception(env);
-            build(env, message)
-        }
-    };
-    if warning
-        .and_then(|warning| call_emit_warning(env, warning))
-        .is_err()
-    {
+    if let Err(error) = warning.and_then(|warning| call_emit_warning(env, warning)) {
         clear_pending_exception(env);
+        failure_delivery::report_failed(
+            owner,
+            report,
+            failure_delivery::queue_error("shutdown warning", error.status)
+                .with_diagnostic_detail(error.reason),
+        );
     }
 }
 

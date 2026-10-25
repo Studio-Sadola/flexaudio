@@ -477,7 +477,7 @@ pub(crate) fn run_tap_thread(
             let decision = generation_probe.on_silence(&mut NativeProbe::new(), &control);
             let mut terminal = false;
             if let Some(decision) = decision {
-                let published = publication.when_active(&control, || {
+                let published = publication.publish_probe_decision(&control, decision, |decision| {
                     let event = match decision {
                         ProbeDecision::Denied { detail } => {
                             // Close native delivery before publishing denial. Teardown
