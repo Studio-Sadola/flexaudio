@@ -290,11 +290,12 @@ fn signed_position(value: u64) -> i64 {
 /// Convert [`Event`] to `FlexEvent`. Put `Error` messages in last_error (`FlexEvent` itself
 /// carries only the kind and count).
 pub fn event_to_c(ev: Event) -> FlexEvent {
+    let failure = ev.failure().map(std::borrow::Cow::into_owned);
     match ev {
-        Event::TerminalError { error }
-        | Event::RecoverableError { error }
-        | Event::ShutdownError { error } => {
-            crate::error::set_audio_error(error);
+        Event::TerminalError { .. }
+        | Event::RecoverableError { .. }
+        | Event::ShutdownError { .. } => {
+            crate::error::set_audio_error(failure.expect("typed failure event"));
             FlexEvent {
                 kind: FlexEventKind::Error as i32,
                 count: 0,
@@ -322,11 +323,8 @@ pub fn event_to_c(ev: Event) -> FlexEvent {
                 count: 0,
             }
         }
-        Event::PermissionDenied { permission, detail } => {
-            crate::error::set_audio_error(flexaudio::Error::PermissionDenied {
-                permission,
-                detail,
-            });
+        Event::PermissionDenied { .. } => {
+            crate::error::set_audio_error(failure.expect("permission denial event"));
             FlexEvent {
                 kind: FlexEventKind::PermissionDenied as i32,
                 count: 0,
@@ -344,9 +342,7 @@ pub fn event_to_c(ev: Event) -> FlexEvent {
             count: 0,
         },
         Event::Error(_) => {
-            crate::error::set_audio_error(flexaudio::Error::Backend(
-                "legacy capture failure".into(),
-            ));
+            crate::error::set_audio_error(failure.expect("legacy failure event"));
             FlexEvent {
                 kind: FlexEventKind::Error as i32,
                 count: 0,
@@ -360,7 +356,11 @@ pub fn event_to_c(ev: Event) -> FlexEvent {
             }
         }
         _ => {
-            set_last_error("unknown event".to_string());
+            if let Some(error) = failure {
+                crate::error::set_audio_error(error);
+            } else {
+                set_last_error("unknown event".to_string());
+            }
             FlexEvent {
                 kind: FlexEventKind::Unknown as i32,
                 count: 0,
@@ -554,8 +554,17 @@ mod tests {
         let message = unsafe { CStr::from_ptr(crate::error::last_error_ptr()) }
             .to_str()
             .unwrap();
-        assert_eq!(message, "backend error: legacy capture failure");
+        assert_eq!(
+            message,
+            "backend error: backend reported a failure through a legacy error event"
+        );
         assert!(!message.contains("secret diagnostic"));
+        let retained = last_audio_error().expect("legacy typed failure");
+        assert_eq!(retained.kind(), flexaudio::ErrorKind::Backend);
+        assert_eq!(
+            retained.diagnostic_details(),
+            vec!["secret diagnostic must stay private"]
+        );
     }
 
     // Build FlexConfig for tests (NULL strings = defaults, numeric 0 = sentinel).

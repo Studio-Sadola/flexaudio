@@ -2816,8 +2816,12 @@ mod reproduction_tests {
             "normalizer push failed: secret-token",
         ] {
             let error = report_capture_event(flexaudio::Event::Error(message.into())).unwrap_err();
+            assert_eq!(error.diagnostic_details(), [message]);
             let displayed = describe_error(error);
-            assert!(displayed.contains("legacy capture failure"));
+            assert_eq!(
+                displayed,
+                "Stream failed: backend error: backend reported a failure through a legacy error event"
+            );
             assert!(!displayed.contains("secret-token"));
             report_capture_event(flexaudio::Event::RecoverableError {
                 error: Error::Backend("normalizer push failed: recoverable warning".into()),

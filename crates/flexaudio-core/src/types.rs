@@ -720,6 +720,47 @@ pub enum Event {
     Clipped,
 }
 
+impl Event {
+    /// Return the typed failure represented by this event, if any.
+    ///
+    /// Terminal, recoverable and shutdown errors borrow their original payload,
+    /// including contexts, diagnostics and related causes. Permission denial,
+    /// device loss and legacy string errors produce an owned error. Legacy text
+    /// remains diagnostic detail and is excluded from the error's safe display.
+    /// Lifecycle notifications, audio-loss reports and other advisories return
+    /// `None`. This projection does not change event delivery or recovery policy.
+    pub fn failure(&self) -> Option<std::borrow::Cow<'_, Error>> {
+        use std::borrow::Cow;
+        match self {
+            Self::TerminalError { error }
+            | Self::RecoverableError { error }
+            | Self::ShutdownError { error } => Some(Cow::Borrowed(error)),
+            Self::PermissionDenied { permission, detail } => {
+                Some(Cow::Owned(Error::PermissionDenied {
+                    permission: *permission,
+                    detail: detail.clone(),
+                }))
+            }
+            Self::DeviceLost => Some(Cow::Owned(Error::DeviceLost)),
+            Self::Error(detail) => Some(Cow::Owned(crate::terminal_causes::legacy_capture_error(
+                detail.clone(),
+            ))),
+            Self::SilenceProbeStarted
+            | Self::SilenceProbeStopped { .. }
+            | Self::ClassicLoopbackKeepaliveStarted
+            | Self::ClassicLoopbackKeepaliveStopped { .. }
+            | Self::StartupSamplesDropped { .. }
+            | Self::ChunkDropped { .. }
+            | Self::StreamStalled
+            | Self::StreamRecovered
+            | Self::PermissionPending { .. }
+            | Self::SilenceWhileSourceActive { .. }
+            | Self::AudioLoss { .. }
+            | Self::Clipped => None,
+        }
+    }
+}
+
 /// Result type used throughout flexaudio-core.
 pub type Result<T> = std::result::Result<T, Error>;
 

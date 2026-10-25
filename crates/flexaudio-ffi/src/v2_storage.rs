@@ -143,6 +143,7 @@ pub struct FlexEventV2 {
 }
 impl FlexEventV2 {
     pub(crate) fn new(event: Event) -> Self {
+        let failure = event.failure().map(std::borrow::Cow::into_owned);
         let mut out = Self {
             startup_frames: None,
             startup_reason: None,
@@ -163,13 +164,7 @@ impl FlexEventV2 {
             Event::PermissionDenied { permission: p, .. } => {
                 out.kind = 3;
                 out.permission = Some(permission(p));
-                out.message = Some(cstring(
-                    Error::PermissionDenied {
-                        permission: p,
-                        detail: String::new(),
-                    }
-                    .to_string(),
-                ));
+                out.message = failure.map(|error| cstring(error.to_string()));
             }
             Event::DeviceLost => out.kind = 4,
             Event::Error(_) => {
@@ -191,17 +186,17 @@ impl FlexEventV2 {
                 out.kind = FLEX_EVENT_KIND_AUDIO_LOSS;
                 out.loss = Some(loss_record(loss));
             }
-            Event::ShutdownError { error } => {
+            Event::ShutdownError { .. } => {
                 out.kind = FLEX_EVENT_KIND_SHUTDOWN_ERROR;
-                out.error = Some(FlexErrorInfoV2::new(error));
+                out.error = failure.map(FlexErrorInfoV2::new);
             }
-            Event::TerminalError { error } => {
+            Event::TerminalError { .. } => {
                 out.kind = FLEX_EVENT_KIND_TERMINAL_ERROR;
-                out.error = Some(FlexErrorInfoV2::new(error));
+                out.error = failure.map(FlexErrorInfoV2::new);
             }
-            Event::RecoverableError { error } => {
+            Event::RecoverableError { .. } => {
                 out.kind = FLEX_EVENT_KIND_RECOVERABLE_ERROR;
-                out.error = Some(FlexErrorInfoV2::new(error));
+                out.error = failure.map(FlexErrorInfoV2::new);
             }
             Event::StartupSamplesDropped { frames, reason } => {
                 out.kind = FLEX_EVENT_KIND_STARTUP_SAMPLES_DROPPED;
@@ -211,7 +206,10 @@ impl FlexEventV2 {
                 });
             }
             Event::Clipped => out.kind = FLEX_EVENT_KIND_CLIPPED,
-            _ => out.message = Some(cstring("unknown stream event")),
+            _ => {
+                out.error = failure.map(FlexErrorInfoV2::new);
+                out.message = Some(cstring("unknown stream event"));
+            }
         }
         out
     }

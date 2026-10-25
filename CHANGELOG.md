@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Rust `Event::failure()` returns a typed failure from every failure-bearing event.
+  Modern error payloads are borrowed; legacy variants synthesize owned errors,
+  retaining legacy diagnostic text without exposing it in safe error display.
 - Rust `set_drop_failure_handler` installs a process-wide typed receiver for
   failures first observed during implicit shutdown or after bounded queries
   time out. `DropFailure` identifies the owner and retains its `ShutdownReport`.
@@ -90,6 +93,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Node Promise resolution and rejection retain native settlement failures beside
+  the original shutdown outcome and route undeliverable failures to the typed
+  process receiver. Only safe pending-exception refusals retry a deferred.
 - Node queue delivery uses one checked, must-use boundary. Direct TSFN delivery
   is denied by Clippy, and rejected failure notifications retain their typed causes.
 - Preserve deferred native failures through teardown, keep mixed VAD/non-VAD

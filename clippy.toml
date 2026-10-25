@@ -1,4 +1,6 @@
 disallowed-methods = [
     { path = "napi::threadsafe_function::ThreadsafeFunction::call", reason = "Use tsfn_delivery::call and handle its must-use Result." },
     { path = "napi::threadsafe_function::ThreadsafeFunction::call_with_return_value", reason = "Direct TSFN delivery bypasses checked result handling." },
+    { path = "napi_sys::napi_resolve_deferred", reason = "Use the checked promise_settlement boundary and handle refusal." },
+    { path = "napi_sys::napi_reject_deferred", reason = "Use the checked promise_settlement boundary and handle refusal." },
 ]

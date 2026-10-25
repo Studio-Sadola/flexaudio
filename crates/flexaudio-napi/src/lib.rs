@@ -31,6 +31,8 @@ pub use devices::devices_with_namespaces;
 mod flac_encoder;
 mod gc_warning;
 mod lifecycle;
+mod promise_settlement;
+use promise_settlement::{create_js_promise, settle_stop, SendDeferred};
 mod settings;
 mod settings_owner;
 mod settings_validation;
@@ -120,12 +122,6 @@ enum ChunkEmit {
     StopFlushed,
 }
 
-/// `napi_deferred` is a raw pointer. Created on the JS thread and resolved through TSFN.
-#[derive(Clone, Copy)]
-struct SendDeferred(sys::napi_deferred);
-unsafe impl Send for SendDeferred {}
-unsafe impl Sync for SendDeferred {}
-
 /// Completion coordination for `stop()`. Waiters are deferred values from `napi_create_promise`.
 enum StopPhase {
     Running,
@@ -142,114 +138,6 @@ fn lock_poisoned<T>(
     p: std::sync::PoisonError<std::sync::MutexGuard<T>>,
 ) -> std::sync::MutexGuard<T> {
     p.into_inner()
-}
-
-fn create_js_promise(env: &Env) -> napi::Result<(SendDeferred, JsObject)> {
-    let mut deferred = ptr::null_mut();
-    let mut promise = ptr::null_mut();
-    check_status!(unsafe { sys::napi_create_promise(env.raw(), &mut deferred, &mut promise) })?;
-    Ok((SendDeferred(deferred), unsafe {
-        JsObject::from_raw_unchecked(env.raw(), promise)
-    }))
-}
-
-fn resolve_undefined(env: sys::napi_env, deferred: SendDeferred) {
-    let mut undefined = ptr::null_mut();
-    let _ = unsafe { sys::napi_get_undefined(env, &mut undefined) };
-    let _ = unsafe { sys::napi_resolve_deferred(env, deferred.0, undefined) };
-}
-
-/// Settle on the JS thread after delivery has drained. Terminal failures reject
-/// every waiter, including subsequent stop calls.
-fn settle_stop(env: sys::napi_env, deferred: SendDeferred, report: &FinalReport) {
-    // A completed report is the sole authority for every stop waiter.
-    let retained = report.lock().unwrap_or_else(lock_poisoned);
-    // SAFETY: settlement is called only on the live JS thread.
-    let js_env = unsafe { Env::from_raw(env) };
-    let exception = match retained.as_ref() {
-        Some(report) => report.exception(&js_env),
-        None => boundary::js_error(
-            &js_env,
-            &flexaudio::Error::InvalidState("shutdown report missing".into()),
-        )
-        .map(Some),
-    };
-    match exception {
-        Ok(Some(exception)) => reject_stop(env, deferred, unsafe { exception.raw() }),
-        Ok(None) => resolve_undefined(env, deferred),
-        Err(error) => {
-            reject_stop_fallback(env, deferred, error);
-        }
-    }
-}
-
-/// Reject a stop waiter with its rich exception. N-API reports a pending JS
-/// exception before it consumes the deferred, so that refusal is retried once
-/// after clearing the exception. Any other refusal may already have released the
-/// deferred, so it is never reused; the retained report still holds the outcome.
-fn reject_stop(env: sys::napi_env, deferred: SendDeferred, exception: sys::napi_value) {
-    for _ in 0..2 {
-        let status = unsafe { sys::napi_reject_deferred(env, deferred.0, exception) };
-        if status != sys::Status::napi_pending_exception {
-            return;
-        }
-        let mut pending = ptr::null_mut();
-        if unsafe { sys::napi_get_and_clear_last_exception(env, &mut pending) }
-            != sys::Status::napi_ok
-        {
-            return;
-        }
-    }
-}
-
-/// Shared settlement policy, also tested with injected native-allocation failures.
-fn reject_with_fallback<T, E>(
-    rich: Result<T, E>,
-    fallback: impl FnOnce(E) -> T,
-    reject: impl FnOnce(T),
-) {
-    reject(match rich {
-        Ok(value) => value,
-        Err(error) => fallback(error),
-    });
-}
-
-/// Native allocation failure cannot safely be forced in a live Node environment;
-/// the shared settlement policy is fault-injected independently of N-API.
-fn reject_stop_fallback(env: sys::napi_env, deferred: SendDeferred, error: NapiError) {
-    let js_env = unsafe { Env::from_raw(env) };
-    reject_with_fallback(
-        js_env
-            .create_error(error)
-            .map(|error| unsafe { error.raw() }),
-        |_| {
-            let mut pending = false;
-            let _ = unsafe { sys::napi_is_exception_pending(env, &mut pending) };
-            if pending {
-                let mut exception = ptr::null_mut();
-                let _ = unsafe { sys::napi_get_and_clear_last_exception(env, &mut exception) };
-            }
-            let message = b"flexaudio stop failed while creating its error";
-            let mut text = ptr::null_mut();
-            let status = unsafe {
-                sys::napi_create_string_utf8(env, message.as_ptr().cast(), message.len(), &mut text)
-            };
-            let mut plain = ptr::null_mut();
-            if status == sys::Status::napi_ok
-                && unsafe { sys::napi_create_error(env, ptr::null_mut(), text, &mut plain) }
-                    == sys::Status::napi_ok
-            {
-                return plain;
-            }
-            if text.is_null() {
-                let _ = unsafe { sys::napi_get_undefined(env, &mut text) };
-            }
-            text
-        },
-        |value| {
-            let _ = unsafe { sys::napi_reject_deferred(env, deferred.0, value) };
-        },
-    );
 }
 
 fn terminal_event(error: flexaudio::Error) -> JsStreamEvent {
@@ -515,6 +403,7 @@ fn call_ordered_event(
         return Ok(());
     }
     let mut value = ptr::null_mut();
+    // A lookup refusal propagates to the callback caller; no parked failure payload is consumed.
     check_status!(unsafe { sys::napi_get_reference_value(env.raw(), refer, &mut value) })?;
     let function: Function<JsStreamEvent, Unknown> =
         unsafe { Function::from_napi_value(env.raw(), value)? };
@@ -567,6 +456,7 @@ fn make_chunk_tsfn(
                         return Ok(Vec::<Unknown>::new());
                     }
                     let mut value = ptr::null_mut();
+                    // Lookup failure propagates to the JS callback; addon causes remain in FinalReport.
                     check_status!(unsafe {
                         sys::napi_get_reference_value(ctx.env.raw(), refer, &mut value)
                     })?;
@@ -578,7 +468,7 @@ fn make_chunk_tsfn(
                     Ok(Vec::<Unknown>::new())
                 }
                 ChunkEmit::VadFlushed(deferred, error) => {
-                    attachment::settle_flush(&ctx.env, deferred, error)?;
+                    promise_settlement::settle_flush(&ctx.env, deferred, error, &report);
                     Ok(Vec::<Unknown>::new())
                 }
                 ChunkEmit::VadFailed {
@@ -3587,16 +3477,6 @@ mod reproduction_bridge;
 #[cfg(test)]
 mod silent_failure_binding_tests {
     use super::*;
-    #[test]
-    fn silent_failure_failed_error_creation_still_rejects_once() {
-        let mut rejected = Vec::new();
-        reject_with_fallback(
-            Err::<&str, _>(()),
-            |_| "plain fallback",
-            |value| rejected.push(value),
-        );
-        assert_eq!(rejected, ["plain fallback"]);
-    }
     #[test]
     fn silent_failure_secondary_tail_keeps_last_timeline_counters() {
         let metadata = SecondaryCarrierMetadata {

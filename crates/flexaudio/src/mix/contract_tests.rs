@@ -348,7 +348,11 @@ fn legacy_failure_is_terminal_with_lane_and_safe_message() {
     assert_eq!(context_lane(&error), Some(MixLane::SystemAudio));
     assert_eq!(
         error.to_string(),
-        "backend error: legacy mix child failure during normalize (system audio)"
+        "backend error: backend reported a failure through a legacy error event during normalize (system audio)"
+    );
+    assert_eq!(
+        error.diagnostic_details(),
+        ["private device /private/user/name"]
     );
     assert!(mix.stop_checked().is_err());
 }
@@ -357,7 +361,8 @@ fn legacy_failure_is_terminal_with_lane_and_safe_message() {
 fn two_distinct_legacy_child_failures_survive_shutdown() {
     let cause = |detail: &str| {
         lane_error(
-            Error::Backend("legacy mix child failure".into()).with_diagnostic_detail(detail.into()),
+            Error::Backend("backend reported a failure through a legacy error event".into())
+                .with_diagnostic_detail(detail.into()),
             Operation::Normalize,
             MixLane::SystemAudio,
         )

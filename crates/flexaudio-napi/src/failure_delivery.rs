@@ -9,6 +9,22 @@ pub(super) fn queue_error(role: &str, status: Status) -> Error {
         .with_context(ErrorContext::new(Operation::Flush))
 }
 
+pub(super) fn report_stream_failure(report: &super::FinalReport, error: Error) {
+    let (previous, outcome) = {
+        let mut report = report.lock().unwrap_or_else(super::lock_poisoned);
+        let retained = report.get_or_insert_with(super::shutdown::ShutdownReport::default);
+        if !retained.binding_cleanup.contains(&error) {
+            retained.binding_cleanup.push(error);
+        }
+        let outcome = retained.outcome();
+        let previous = retained.delivered_report.replace(outcome.clone());
+        retained.gc_reported = true;
+        (previous, outcome)
+    };
+    // A receiver may inspect this stream, so invoke it only after releasing ownership.
+    report_drop_failures(DropFailureOwner::Stream, previous.as_ref(), &outcome);
+}
+
 pub(super) fn report_rejected(
     owner: DropFailureOwner,
     report: &ShutdownReport,

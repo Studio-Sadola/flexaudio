@@ -310,6 +310,7 @@ impl PyStreamEvent {
     }
 }
 pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
+    let failure = ev.failure().map(std::borrow::Cow::into_owned);
     let mut result = PyStreamEvent {
         frames: None,
         reason: None,
@@ -321,16 +322,16 @@ pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
         loss: None,
     };
     result.kind = match ev {
-        Event::TerminalError { error } => {
-            result.error = Some(crate::errors::AudioError(error));
+        Event::TerminalError { .. } => {
+            result.error = failure.map(crate::errors::AudioError);
             "terminalError"
         }
-        Event::RecoverableError { error } => {
-            result.error = Some(crate::errors::AudioError(error));
+        Event::RecoverableError { .. } => {
+            result.error = failure.map(crate::errors::AudioError);
             "recoverableError"
         }
-        Event::ShutdownError { error } => {
-            result.error = Some(crate::errors::AudioError(error));
+        Event::ShutdownError { .. } => {
+            result.error = failure.map(crate::errors::AudioError);
             "shutdownError"
         }
         Event::AudioLoss { loss } => {
@@ -354,9 +355,9 @@ pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
             result.message = Some(format!("Recording permission is pending. {}", permission.guidance()));
             "permissionPending"
         }
-        Event::PermissionDenied { permission, detail } => {
+        Event::PermissionDenied { permission, .. } => {
             result.permission = Some(permission.as_str().into());
-            result.message = Some(fa::Error::PermissionDenied { permission, detail }.to_string());
+            result.message = failure.map(|error| error.to_string());
             "permissionDenied"
         }
         Event::SilenceWhileSourceActive { .. } => {
@@ -369,6 +370,7 @@ pub(crate) fn event_to_py(ev: Event) -> PyStreamEvent {
             "error"
         }
         _ => {
+            result.error = failure.map(crate::errors::AudioError);
             result.message = Some("unknown event".into());
             "unknown"
         }

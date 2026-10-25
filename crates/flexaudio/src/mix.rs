@@ -93,20 +93,18 @@ impl CompositeBackend {
 
     fn child_event(&mut self, lane: MixLane, event: Event) -> Option<Event> {
         let error = match event {
-            Event::TerminalError { error } => Some(error),
-            Event::Error(detail) => Some(
-                Error::Backend("legacy mix child failure".into()).with_diagnostic_detail(detail),
-            ),
-            Event::PermissionDenied { permission, detail } => {
-                Some(Error::PermissionDenied { permission, detail })
-            }
-            Event::RecoverableError { ref error }
-                if matches!(
-                    error.kind(),
-                    ErrorKind::PermissionDenied | ErrorKind::NativeFormatChanged
-                ) =>
+            event @ (Event::TerminalError { .. }
+            | Event::Error(_)
+            | Event::PermissionDenied { .. }) => event.failure().map(|error| error.into_owned()),
+            event @ Event::RecoverableError { .. }
+                if event.failure().is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        ErrorKind::PermissionDenied | ErrorKind::NativeFormatChanged
+                    )
+                }) =>
             {
-                Some(error.clone())
+                event.failure().map(|error| error.into_owned())
             }
             Event::AudioLoss { loss } => {
                 let loss = if matches!(loss.path(), AudioPath::Capture { lane: None }) {
@@ -121,9 +119,12 @@ impl CompositeBackend {
                 };
                 return Some(Event::AudioLoss { loss });
             }
-            Event::ShutdownError { error } => {
-                self.notices
-                    .cleanup(lane_error(error, Operation::Stop, lane));
+            event @ Event::ShutdownError { .. } => {
+                self.notices.cleanup(lane_error(
+                    event.failure().expect("cleanup failure event").into_owned(),
+                    Operation::Stop,
+                    lane,
+                ));
                 return None;
             }
             event => return Some(event),

@@ -1,40 +1,11 @@
 //! Retain stream failure payloads when an optional JavaScript receiver is unavailable.
 
 use super::{event_to_js, failure_delivery, lock_poisoned, shutdown, FinalReport, JsStreamEvent};
-use flexaudio::core::{report_drop_failures, terminal_causes::legacy_capture_error};
+use flexaudio::core::report_drop_failures;
 use flexaudio::{DropFailureOwner, Error, Event};
 use napi::Status;
 
 const EVENT_ROLE: &str = "stream event callback";
-
-fn event_failure(event: &Event) -> Option<Error> {
-    match event {
-        Event::PermissionDenied { permission, detail } => Some(Error::PermissionDenied {
-            permission: *permission,
-            detail: detail.clone(),
-        }),
-        Event::DeviceLost => Some(Error::DeviceLost),
-        Event::Error(detail) => Some(legacy_capture_error(detail.clone())),
-        Event::TerminalError { error }
-        | Event::RecoverableError { error }
-        | Event::ShutdownError { error } => Some(error.clone()),
-        // Lifecycle reasons and loss/advisory notices contain no original Error payload.
-        Event::SilenceProbeStarted
-        | Event::SilenceProbeStopped { .. }
-        | Event::ClassicLoopbackKeepaliveStarted
-        | Event::ClassicLoopbackKeepaliveStopped { .. }
-        | Event::StartupSamplesDropped { .. }
-        | Event::ChunkDropped { .. }
-        | Event::StreamStalled
-        | Event::StreamRecovered
-        | Event::PermissionPending { .. }
-        | Event::SilenceWhileSourceActive { .. }
-        | Event::AudioLoss { .. }
-        | Event::Clipped => None,
-        // Event is non-exhaustive across the crate boundary; unknown variants have no projection.
-        _ => None,
-    }
-}
 
 fn retain_failure(report: &FinalReport, error: Error) {
     let mut report = report.lock().unwrap_or_else(lock_poisoned);
@@ -85,9 +56,12 @@ pub(super) fn event(
     send: Option<impl FnOnce(JsStreamEvent) -> Result<(), Status>>,
 ) {
     match send {
-        Some(send) => deliver(event_failure(&event), report, EVENT_ROLE, || {
-            send(event_to_js(event))
-        }),
+        Some(send) => deliver(
+            event.failure().map(std::borrow::Cow::into_owned),
+            report,
+            EVENT_ROLE,
+            || send(event_to_js(event)),
+        ),
         None => {
             if let Event::RecoverableError { error } = event {
                 report_without_receiver(report, error);
@@ -100,7 +74,9 @@ pub(super) fn event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flexaudio::core::terminal_causes::{retain_terminal_cause, retains_terminal_cause};
+    use flexaudio::core::terminal_causes::{
+        legacy_capture_error, retain_terminal_cause, retains_terminal_cause,
+    };
     use flexaudio::{HelperStopReason, Permission, ShutdownReport, VadErrorCode};
     use std::sync::{Arc, Mutex};
 
@@ -228,7 +204,7 @@ mod tests {
                         original,
                         failure_delivery::queue_error(EVENT_ROLE, status),
                         |first, _second| {
-                            assert_eq!(event_failure(&event), Some(first));
+                            assert_eq!(event.failure().as_deref(), Some(&first));
                             let retained = report();
                             super::event(event, &retained, Some(|event: JsStreamEvent| {
                                 assert_eq!(event.kind, kind);
@@ -396,7 +372,7 @@ mod tests {
             }
             assert_eq!(notices().len(), 12);
             for event in notices() {
-                assert_eq!(event_failure(&event), None);
+                assert_eq!(event.failure(), None);
                 let retained = report();
                 super::event(event, &retained, Some(|_| Err(Status::Closing)));
                 assert!(retained.lock().unwrap().is_none());

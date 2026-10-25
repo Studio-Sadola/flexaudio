@@ -18,6 +18,7 @@ impl JsReference {
     fn release(&self) {
         let refer: sys::napi_ref = self.refer.swap(ptr::null_mut(), Ordering::SeqCst).cast();
         if !refer.is_null() {
+            // Reference release carries no parked failure payload; JS owns the finalizer lifetime.
             let _ = unsafe { sys::napi_delete_reference(self.env, refer) };
         }
     }
@@ -49,6 +50,7 @@ pub(super) struct UserCallback {
 impl UserCallback {
     pub fn retain(env: &Env, function: &impl NapiRaw) -> napi::Result<Arc<Self>> {
         let mut refer = ptr::null_mut();
+        // No callback is owned yet; failed reference creation propagates to the JS caller.
         check_status!(unsafe {
             sys::napi_create_reference(env.raw(), function.raw(), 1, &mut refer)
         })?;

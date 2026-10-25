@@ -125,13 +125,6 @@ impl ShutdownReport {
             cleanup_errors: report.cleanup().iter().map(boundary::audio_error).collect(),
         }
     }
-
-    pub fn exception(&self, env: &Env) -> napi::Result<Option<JsObject>> {
-        match self.outcome().result() {
-            Ok(()) => Ok(None),
-            Err(error) => boundary::js_error(env, &error).map(Some),
-        }
-    }
 }
 
 /// GC has no Promise caller. A failure first observed by GC teardown is delivered once as a

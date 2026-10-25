@@ -1,6 +1,142 @@
 use super::*;
 
 #[test]
+fn event_failure_projects_every_failure_bearing_variant() {
+    let typed = Error::Backend("typed event failure".into());
+    let cases = [
+        (
+            Event::TerminalError {
+                error: typed.clone(),
+            },
+            typed.clone(),
+        ),
+        (
+            Event::RecoverableError {
+                error: typed.clone(),
+            },
+            typed.clone(),
+        ),
+        (
+            Event::ShutdownError {
+                error: typed.clone(),
+            },
+            typed,
+        ),
+        (
+            Event::PermissionDenied {
+                permission: Permission::Microphone,
+                detail: "permission detail".into(),
+            },
+            Error::PermissionDenied {
+                permission: Permission::Microphone,
+                detail: "permission detail".into(),
+            },
+        ),
+        (Event::DeviceLost, Error::DeviceLost),
+        (
+            Event::Error("legacy event detail".into()),
+            crate::terminal_causes::legacy_capture_error("legacy event detail".into()),
+        ),
+    ];
+    for (event, expected) in cases {
+        assert_eq!(event.failure().as_deref(), Some(&expected), "{event:?}");
+    }
+}
+
+#[test]
+fn event_failure_borrows_modern_payloads_and_preserves_wrapped_cause_identity() {
+    let wrapped = Error::Multiple(ErrorGroup::new(
+        Error::DeviceLost,
+        Error::Unsupported,
+        Vec::new(),
+    ))
+    .with_context(ErrorContext::new(Operation::Stop))
+    .with_diagnostic_detail("retained event diagnostic".into());
+    let constructors: [fn(Error) -> Event; 3] = [
+        |error| Event::TerminalError { error },
+        |error| Event::RecoverableError { error },
+        |error| Event::ShutdownError { error },
+    ];
+    for construct in constructors {
+        let event = construct(wrapped.clone());
+        let source = match &event {
+            Event::TerminalError { error }
+            | Event::RecoverableError { error }
+            | Event::ShutdownError { error } => error,
+            _ => panic!("fixture must construct a modern failure event"),
+        };
+        let Some(std::borrow::Cow::Borrowed(failure)) = event.failure() else {
+            panic!("modern failure payload must be borrowed");
+        };
+        assert!(std::ptr::eq(failure, source));
+        assert_eq!(failure, &wrapped);
+    }
+}
+
+#[test]
+fn event_failure_synthesizes_legacy_errors_without_discarding_diagnostics() {
+    let denied = Event::PermissionDenied {
+        permission: Permission::SystemAudio,
+        detail: "retained permission detail".into(),
+    };
+    assert!(matches!(denied.failure(), Some(std::borrow::Cow::Owned(
+        Error::PermissionDenied { permission: Permission::SystemAudio, detail }
+    )) if detail == "retained permission detail"));
+    assert!(matches!(
+        Event::DeviceLost.failure(),
+        Some(std::borrow::Cow::Owned(Error::DeviceLost))
+    ));
+    let legacy = Event::Error("retained legacy detail".into());
+    let Some(std::borrow::Cow::Owned(error)) = legacy.failure() else {
+        panic!("legacy failure must synthesize an owned typed error");
+    };
+    assert_eq!(
+        error,
+        crate::terminal_causes::legacy_capture_error("retained legacy detail".into())
+    );
+    assert_eq!(error.diagnostic_details(), ["retained legacy detail"]);
+    assert!(!error.to_string().contains("retained legacy detail"));
+}
+
+#[test]
+fn event_failure_excludes_every_current_nonfailure_variant() {
+    let events = [
+        Event::SilenceProbeStarted,
+        Event::SilenceProbeStopped {
+            reason: crate::HelperStopReason::StreamStopped,
+        },
+        Event::ClassicLoopbackKeepaliveStarted,
+        Event::ClassicLoopbackKeepaliveStopped {
+            reason: crate::HelperStopReason::Cancelled,
+        },
+        Event::StartupSamplesDropped {
+            frames: 1,
+            reason: crate::startup::StartupDropReason::OutOfRange,
+        },
+        Event::ChunkDropped { count: 1 },
+        Event::StreamStalled,
+        Event::StreamRecovered,
+        Event::PermissionPending {
+            permission: Permission::Microphone,
+            detail: "pending consent".into(),
+        },
+        Event::SilenceWhileSourceActive {
+            detail: "silence advisory".into(),
+        },
+        Event::AudioLoss {
+            loss: AudioLoss::raw_overflow(None, None, 48_000, 2).unwrap(),
+        },
+        Event::Clipped,
+    ];
+    for event in events {
+        assert!(
+            event.failure().is_none(),
+            "nonfailure projected as an error: {event:?}"
+        );
+    }
+}
+
+#[test]
 fn stream_constructor_preserves_defaults_for_each_source() {
     for kind in [
         SourceKind::Mic,

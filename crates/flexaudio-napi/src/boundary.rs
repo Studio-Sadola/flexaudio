@@ -384,6 +384,7 @@ fn loss_to_js(loss: AudioLoss) -> Option<JsAudioLoss> {
 }
 
 pub(super) fn event_to_js(event: Event) -> JsStreamEvent {
+    let failure = event.failure().map(std::borrow::Cow::into_owned);
     let mut result = JsStreamEvent {
         kind: String::new(),
         frames: None,
@@ -408,9 +409,9 @@ pub(super) fn event_to_js(event: Event) -> JsStreamEvent {
             result.message = Some(detail);
             "permissionPending"
         }
-        Event::PermissionDenied { permission, detail } => {
+        Event::PermissionDenied { permission, .. } => {
             result.permission = Some(permission.as_str().into());
-            result.message = Some(Error::PermissionDenied { permission, detail }.to_string());
+            result.message = failure.as_ref().map(ToString::to_string);
             "permissionDenied"
         }
         Event::SilenceWhileSourceActive { detail } => {
@@ -421,16 +422,16 @@ pub(super) fn event_to_js(event: Event) -> JsStreamEvent {
             result.message = Some("legacy capture failure".into());
             "error"
         }
-        Event::TerminalError { error } => {
-            result.error = Some(audio_error(&error));
+        Event::TerminalError { .. } => {
+            result.error = failure.as_ref().map(audio_error);
             "terminalError"
         }
-        Event::RecoverableError { error } => {
-            result.error = Some(audio_error(&error));
+        Event::RecoverableError { .. } => {
+            result.error = failure.as_ref().map(audio_error);
             "recoverableError"
         }
-        Event::ShutdownError { error } => {
-            result.error = Some(audio_error(&error));
+        Event::ShutdownError { .. } => {
+            result.error = failure.as_ref().map(audio_error);
             "shutdownError"
         }
         Event::AudioLoss { loss } => match loss_to_js(loss) {
@@ -451,6 +452,7 @@ pub(super) fn event_to_js(event: Event) -> JsStreamEvent {
         Event::Clipped => "clipped",
         _ => {
             result.message = Some("unknown stream event diagnostic".into());
+            result.error = failure.as_ref().map(audio_error);
             "unknown"
         }
     }

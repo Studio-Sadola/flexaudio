@@ -17,18 +17,22 @@ impl CaptureEventReporter {
         if super::lifecycle_json::project(&event).is_some() {
             return Ok(());
         }
-        match event {
-            Event::TerminalError { error } | Event::ShutdownError { error } => Err(error),
-            Event::Error(detail) => {
-                Err(Error::Backend("legacy capture failure".into()).with_diagnostic_detail(detail))
-            }
-            Event::PermissionDenied { permission, detail } => {
-                Err(Error::PermissionDenied { permission, detail })
-            }
+        // These failures remain warnings; classification does not choose recovery policy.
+        match &event {
             Event::RecoverableError { error } => {
                 eprintln!("Warning: {error}; capture and retries may continue");
-                Ok(())
+                return Ok(());
             }
+            Event::DeviceLost => {
+                eprintln!("Warning: capture device lost; waiting for recovery");
+                return Ok(());
+            }
+            _ => {}
+        }
+        if let Some(error) = event.failure() {
+            return Err(error.into_owned());
+        }
+        match event {
             Event::AudioLoss { loss } => {
                 self.add_loss(loss);
                 Ok(())
@@ -59,10 +63,6 @@ impl CaptureEventReporter {
             }
             Event::StreamRecovered => {
                 eprintln!("Capture recovered");
-                Ok(())
-            }
-            Event::DeviceLost => {
-                eprintln!("Warning: capture device lost; waiting for recovery");
                 Ok(())
             }
             _ => {

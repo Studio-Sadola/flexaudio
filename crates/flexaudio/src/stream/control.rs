@@ -146,36 +146,15 @@ fn drain_backend_events_locked(
                 );
                 return MailboxDrain::Terminal;
             }
-            Some(Event::Error(detail)) => {
-                // Keep distinct legacy causes in opt-in diagnostics, never safe Display.
-                let error = flexaudio_core::terminal_causes::legacy_capture_error(detail);
-                if let Some(delivery) = delivery {
-                    shared.fail_terminal_locked(error, delivery);
-                } else {
-                    shared.fail_terminal(error);
-                }
-                shared.stop_backend_owned(
-                    be,
-                    delivery,
-                    flexaudio_core::HelperStopReason::RuntimeFailed,
-                );
-                return MailboxDrain::Terminal;
-            }
-            Some(Event::RecoverableError { error }) if is_terminal_kind(&error) => {
-                // Confirmed denial/format invalidation cannot become advisory through a wrapper.
-                if let Some(delivery) = delivery {
-                    shared.fail_terminal_locked(error, delivery);
-                } else {
-                    shared.fail_terminal(error);
-                }
-                shared.stop_backend_owned(
-                    be,
-                    delivery,
-                    flexaudio_core::HelperStopReason::RuntimeFailed,
-                );
-                return MailboxDrain::Terminal;
-            }
-            Some(Event::TerminalError { error }) => {
+            Some(event)
+                if matches!(&event, Event::Error(_) | Event::TerminalError { .. })
+                    || matches!(&event, Event::RecoverableError { error } if is_terminal_kind(error)) =>
+            {
+                // Recovery policy stays local; the shared projection preserves the typed cause.
+                let error = event
+                    .failure()
+                    .expect("terminal failure event")
+                    .into_owned();
                 if let Some(delivery) = delivery {
                     shared.fail_terminal_locked(error, delivery);
                 } else {
@@ -189,7 +168,9 @@ fn drain_backend_events_locked(
                 );
                 return MailboxDrain::Terminal;
             }
-            Some(Event::ShutdownError { error }) => shared.record_backend_cleanup(error),
+            Some(event @ Event::ShutdownError { .. }) => shared.record_backend_cleanup(
+                event.failure().expect("cleanup failure event").into_owned(),
+            ),
             Some(Event::AudioLoss { loss }) => {
                 if matches!(
                     loss.path(),
@@ -297,20 +278,6 @@ pub(super) fn drain_replacement_lifecycle(shared: &SharedState, be: &mut Box<dyn
                 }
                 shared.push_event(event);
             }
-            Ok(Some(
-                Event::ShutdownError { error }
-                | Event::TerminalError { error }
-                | Event::RecoverableError { error },
-            )) => record_failure(error),
-            Ok(Some(Event::PermissionDenied { permission, detail })) => {
-                record_failure(Error::PermissionDenied { permission, detail });
-            }
-            Ok(Some(Event::DeviceLost)) => record_failure(Error::DeviceLost),
-            Ok(Some(Event::Error(detail))) => {
-                record_failure(flexaudio_core::terminal_causes::legacy_capture_error(
-                    detail,
-                ));
-            }
             // These describe the rejected backend's live state, not the restored source.
             Ok(Some(
                 Event::StreamStalled
@@ -320,7 +287,13 @@ pub(super) fn drain_replacement_lifecycle(shared: &SharedState, be: &mut Box<dyn
             )) => {}
             // Preserve observed loss/clipping and future notices without changing active
             // capture state (in particular, do not trigger recovery or discontinuity).
-            Ok(Some(event)) => shared.push_event(event),
+            Ok(Some(event)) => {
+                if let Some(error) = event.failure().map(|error| error.into_owned()) {
+                    record_failure(error);
+                } else {
+                    shared.push_event(event);
+                }
+            }
             Ok(None) => break,
             Err(_) => {
                 record_failure(Error::Backend(

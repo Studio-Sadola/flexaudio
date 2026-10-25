@@ -362,23 +362,6 @@ pub(super) fn error_code(error: &VadTapError) -> &'static str {
     error.code().as_str()
 }
 
-pub(super) fn settle_flush(
-    env: &Env,
-    deferred: SendDeferred,
-    error: Option<VadTapError>,
-) -> napi::Result<()> {
-    match error {
-        None => resolve_undefined(env.raw(), deferred),
-        Some(error) => {
-            let error = js_error(env, &error)?;
-            check_status!(unsafe {
-                sys::napi_reject_deferred(env.raw(), deferred.0, error.raw())
-            })?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
