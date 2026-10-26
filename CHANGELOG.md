@@ -39,13 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Node.js 0.9.0 reports recoverable failures to the process failure receiver when
-  `onEvent` is omitted; these failures were previously silent. The default receiver
-  writes to stderr. Migration: supply `onEvent` to handle, redirect or intentionally
-  ignore those events. Custom Rust integrations can instead configure the
-  process-wide receiver with the Rust API
-  `flexaudio::set_drop_failure_handler`. The npm package exposes no JavaScript
-  receiver setter.
 - CI replaces the source-text stop guard with registered, exhaustive failure
   injection fixtures and denied must-use Result discards in the eight capture
   and binding crates. Binding error-kind checks use the core runtime inventory

@@ -116,6 +116,15 @@ Event-first callers can drain the ordinary FIFO event queue before PCM to observ
 the notice first; PCM-only callers can omit event polling. C v1 projects
 the notice as `Unknown`, while C v2 retains its native frame count and reason.
 
+The application chooses whether to consume ordinary events with
+`flexaudio_poll_event` or `flexaudio_poll_event_v2`. Queued events, including
+recoverable failures, remain available after `flexaudio_stop`; unread events are
+discarded by `flexaudio_free`. Unread recoverable events have no separate
+error-reporting fallback. Terminal capture and stop/cleanup failures retain their
+existing stop status, `flexaudio_shutdown_report_v2` and `flexaudio_last_error`
+routes regardless of event polling; `flexaudio_last_error_info_v2` provides the
+typed error. Inspect a retained shutdown report before freeing the stream.
+
 ## Exclude Playback by PID
 
 Use the extended entry points without changing the `FlexConfig` layout:
@@ -448,8 +457,11 @@ absent. Borrow its stable typed code with `flexaudio_error_vad_code_v2` on
 the cleanup error. The next discontinuity or a successful explicit flush
 reinitializes the shared session before a new origin is published.
 
-`flexaudio_free` always stops and releases a live stream, including unread PCM
-and VAD events. Stop and drain first when final outputs are needed. Event kind 9
+`flexaudio_free` always stops and releases a live stream, including unread PCM,
+ordinary/recoverable events and VAD events. Stop alone retains queued events for
+draining. Free still reports terminal or stop/cleanup failure through
+`flexaudio_last_error` and `flexaudio_last_error_info_v2`, independently of event
+polling. Stop and drain first when final outputs are needed. Event kind 9
 is reserved; it is never reused. `permissionPending` remains for custom backends.
 VAD status codes occupy a distinct range starting at -100.
 

@@ -229,6 +229,14 @@ shutdown. Checked `stop()` raises any capture or cleanup failure, including on
 repeat calls. During context exit an active body exception remains primary and
 receives the cleanup failure as its exception context.
 
+The application chooses whether to consume ordinary events with `poll_event()`.
+Queued events, including recoverable failures, remain available after `stop()`;
+unread events are discarded when the stream handle is destroyed. Unread
+recoverable events do not have a separate error-reporting fallback. Terminal
+capture and stop/cleanup failures retain the `terminal_error()`, `stop()` and
+`shutdown_report()` routes above regardless of event polling. Failures first
+observed during implicit shutdown reach `sys.unraisablehook`.
+
 `samples` may be a Python `list`, an `array.array`, or a NumPy `ndarray`.
 
 ## License

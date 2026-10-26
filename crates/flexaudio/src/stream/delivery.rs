@@ -196,6 +196,17 @@ impl Stream {
     /// Startup notices enter this FIFO before their generation's first chunk is published.
     /// PCM polling never requires event polling; the ordered push adapter claims its
     /// boundary only when this chronological FIFO delivers the corresponding notice.
+    ///
+    /// Consuming events is an application choice. Stopping with [`stop`](Self::stop)
+    /// or [`stop_checked`](Self::stop_checked) preserves unread events for polling
+    /// while this handle remains alive. Dropping the stream discards unread events;
+    /// it does not forward the event queue to another receiver.
+    ///
+    /// Capture-terminal and stop/cleanup failures remain independently available
+    /// through [`terminal_error`](Self::terminal_error),
+    /// [`stop_checked`](Self::stop_checked), and [`shutdown_report`](Self::shutdown_report).
+    /// Failures discovered during implicit shutdown still reach the process-wide
+    /// [`crate::set_drop_failure_handler`] receiver (stderr by default).
     pub fn poll_event(&mut self) -> Option<Event> {
         let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
         let event = events.pop_front()?;

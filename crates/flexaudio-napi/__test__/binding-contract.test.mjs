@@ -350,13 +350,16 @@ for (const processing of [true, false]) {
   }
 }
 
-test('core capture primary, core cleanup and final VAD failure are all retained', async () => {
+test('without onEvent, terminal errors and all shutdown causes remain observable', async () => {
   const stream = native.__bindingContractBridge('attachment-flush-primary', () => {});
   for (let index = 0; index < 2; index++) {
     await assert.rejects(stream.stop(), error => {
       assert.equal(error.code, 'FLEX_UNSUPPORTED_FORMAT');
       const report = stream.shutdownReport();
       assert.equal(report.primary.kind, 'unsupportedFormat');
+      const terminal = stream.terminalError();
+      assert.equal(terminal.type, 'terminalError');
+      assert.deepEqual(terminal.error, report.primary);
       assert.deepEqual(report.cleanupErrors.map(cause => cause.kind), ['deviceLost', 'backend']);
       assert.equal(report.cleanupErrors[1].vadCode, 'Inference');
       assert.deepEqual(error.audioError.secondary, report.cleanupErrors);

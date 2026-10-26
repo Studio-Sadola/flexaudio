@@ -2240,11 +2240,13 @@ pub fn processes() -> AsyncTask<ProcessesTask> {
 /// Open and start a stream, returning a `FlexStream` that sends chunks/events to callbacks.
 /// Confirmed microphone/system-audio denial throws actionable permission guidance.
 /// Supply onEvent for startupSamplesDropped, runtime denial and silenceWhileSourceActive
-/// advisories. terminalError() exposes capture-terminal failures. Refused failure-event
-/// delivery reaches the process failure receiver (stderr by default) and shutdown cleanup.
-/// Without onEvent, recoverable failures use that fallback; durable capture/shutdown
-/// failures remain available through ordinary stop/GC reporting. Unsubscribed advisories
-/// remain unavailable.
+/// advisories. Event subscription is optional: without onEvent, ordinary/recoverable
+/// events are discarded, with no stderr, process-receiver or shutdown-report fallback.
+/// Unread events are discarded when the handle is destroyed. Actual refused delivery
+/// to a supplied callback retains the original typed failure and delivery failure in
+/// shutdown cleanup and the process failure receiver (stderr by default).
+/// Terminal capture and stop/cleanup failures remain available through stop(),
+/// terminalError(), shutdownReport() and existing GC reporting regardless of subscription.
 /// macOS microphone consent is checked
 /// before any HAL query. Bundled prompts wait at most 30 s; an unanswered prompt
 /// throws a typed Backend error without starting capture. Answer the prompt and retry.

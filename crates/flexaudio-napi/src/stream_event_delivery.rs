@@ -1,8 +1,7 @@
-//! Retain stream failure payloads when an optional JavaScript receiver is unavailable.
+//! Retain stream failure payloads when an attempted JavaScript delivery is refused.
 
 use super::{event_to_js, failure_delivery, lock_poisoned, shutdown, FinalReport, JsStreamEvent};
-use flexaudio::core::report_drop_failures;
-use flexaudio::{DropFailureOwner, Error, Event};
+use flexaudio::{Error, Event};
 use napi::Status;
 
 const EVENT_ROLE: &str = "stream event callback";
@@ -13,20 +12,6 @@ fn retain_failure(report: &FinalReport, error: Error) {
     if !retained.binding_cleanup.contains(&error) {
         retained.binding_cleanup.push(error);
     }
-}
-
-fn report_without_receiver(report: &FinalReport, error: Error) {
-    retain_failure(report, error);
-    let (previous, outcome) = {
-        let mut report = report.lock().unwrap_or_else(lock_poisoned);
-        let retained = report.get_or_insert_with(shutdown::ShutdownReport::default);
-        let outcome = retained.outcome();
-        let previous = retained.delivered_report.replace(outcome.clone());
-        retained.gc_reported = true;
-        (previous, outcome)
-    };
-    // No N-API operation was attempted, so only the original failure is reported.
-    report_drop_failures(DropFailureOwner::Stream, previous.as_ref(), &outcome);
 }
 
 /// Send a payload once, retaining actual queue failures beside its original typed cause.
@@ -49,26 +34,23 @@ pub(super) fn deliver(
     shutdown::report_unreachable_failure(report, status, role);
 }
 
-/// Forward supported events, rescuing refused failures and unsubscribed recoverable errors.
+/// Forward subscribed events, retaining original failures when delivery is refused.
 pub(super) fn event(
     event: Event,
     report: &FinalReport,
     send: Option<impl FnOnce(JsStreamEvent) -> Result<(), Status>>,
 ) {
-    match send {
-        Some(send) => deliver(
-            event.failure().map(std::borrow::Cow::into_owned),
-            report,
-            EVENT_ROLE,
-            || send(event_to_js(event)),
-        ),
-        None => {
-            if let Event::RecoverableError { error } = event {
-                report_without_receiver(report, error);
-            }
-            // Durable failures already reach stop/GC through the facade report; no call failed.
-        }
-    }
+    let Some(send) = send else {
+        // Omitting onEvent opts out of unread events, including recoverable failures.
+        // Durable terminal/shutdown failures still reach the caller through stop/GC.
+        return;
+    };
+    deliver(
+        event.failure().map(std::borrow::Cow::into_owned),
+        report,
+        EVENT_ROLE,
+        || send(event_to_js(event)),
+    );
 }
 
 #[cfg(test)]
@@ -77,7 +59,7 @@ mod tests {
     use flexaudio::core::terminal_causes::{
         legacy_capture_error, retain_terminal_cause, retains_terminal_cause,
     };
-    use flexaudio::{HelperStopReason, Permission, ShutdownReport, VadErrorCode};
+    use flexaudio::{DropFailureOwner, HelperStopReason, Permission, ShutdownReport, VadErrorCode};
     use std::sync::{Arc, Mutex};
 
     type Sink = Arc<Mutex<Vec<flexaudio::DropFailure>>>;
@@ -254,16 +236,12 @@ mod tests {
     }
 
     #[test]
-    fn absent_callback_rescues_only_recoverable_failures_without_claiming_durable_gc_reports() {
-        isolated("stream_event_delivery::tests::absent_callback_rescues_only_recoverable_failures_without_claiming_durable_gc_reports", |received| {
-            for (event, original, _) in failures() {
-                let recoverable = matches!(event, Event::RecoverableError { .. });
+    fn absent_callback_opts_out_without_mutating_reports_or_claiming_durable_gc_reports() {
+        isolated("stream_event_delivery::tests::absent_callback_opts_out_without_mutating_reports_or_claiming_durable_gc_reports", |received| {
+            for (event, _original, _) in failures() {
                 let retained = report();
-                super::event(event, &retained, None::<Sender>);
-                if recoverable {
-                    let failure = received.lock().unwrap().pop().unwrap();
-                    assert_eq!(failure.report, ShutdownReport::new(None, vec![original]));
-                } else {
+                for _attempt in 0..2 {
+                    super::event(event.clone(), &retained, None::<Sender>);
                     assert!(retained.lock().unwrap().is_none());
                     assert!(received.lock().unwrap().is_empty());
                 }
@@ -293,11 +271,11 @@ mod tests {
             for _ in 0..2 {
                 event(Event::RecoverableError { error: Error::DeviceLost }, &retained, None::<Sender>);
             }
-            assert_eq!(received.lock().unwrap().len(), 1);
-            received.lock().unwrap().clear();
+            assert!(received.lock().unwrap().is_empty());
+            assert!(retained.lock().unwrap().is_none());
             event(Event::RecoverableError { error: Error::DeviceLost }, &retained, Some(|_| Err(Status::Closing)));
             let failure = received.lock().unwrap().pop().unwrap();
-            assert_eq!(failure.report.cleanup(), &[failure_delivery::queue_error(EVENT_ROLE, Status::Closing)]);
+            assert_eq!(failure.report.cleanup(), &[Error::DeviceLost, failure_delivery::queue_error(EVENT_ROLE, Status::Closing)]);
         });
     }
 

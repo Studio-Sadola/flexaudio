@@ -217,6 +217,9 @@ impl Stream {
     }
 
     /// Return an event if one is available. Otherwise return `None` (non-blocking).
+    /// Event consumption is optional; stop retains queued events for later polling.
+    /// Unread ordinary/recoverable events are discarded when the handle is destroyed.
+    /// Terminal and cleanup failures retain their stop/report/unraisable routes regardless.
     fn poll_event(&mut self) -> Option<PyStreamEvent> {
         self.route_events();
         self.capture_events
