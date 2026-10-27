@@ -38,17 +38,8 @@ fn project(event: Event) -> JsLifecycleEvent {
     };
     JsLifecycleEvent {
         kind: kind.into(),
-        reason: reason.map(|r| {
-            use flexaudio::HelperStopReason::*;
-            match r {
-                SignalObserved | PermissionDenied | Inconclusive | TimedOut | StreamStopped
-                | SourceSwitched | Recovery | StartupFailed | RuntimeFailed | Cancelled => {
-                    r.as_str()
-                }
-                _ => "unknown",
-            }
-            .into()
-        }),
+        // as_str is exhaustive in the crate that defines the non-exhaustive enum.
+        reason: reason.map(|reason| reason.as_str().into()),
         message: None,
     }
 }
@@ -280,6 +271,21 @@ impl flexaudio::CaptureBackend for LifecycleMockBackend {
 #[cfg(test)]
 mod deferred_stop_tests {
     use super::*;
+
+    #[test]
+    fn every_core_helper_stop_reason_projects_without_an_unknown_fallback() {
+        for reason in flexaudio_core::test_support::helper_stop_reasons() {
+            for event in [
+                Event::SilenceProbeStopped { reason },
+                Event::ClassicLoopbackKeepaliveStopped { reason },
+            ] {
+                let projected = project(event);
+                assert_eq!(projected.reason.as_deref(), Some(reason.as_str()));
+                assert_ne!(projected.reason.as_deref(), Some("unknown"));
+                assert_ne!(projected.reason.as_deref(), Some(""));
+            }
+        }
+    }
 
     #[test]
     fn drained_lifecycle_rescues_failures_after_closed_or_expired_queues() {

@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-for (const mode of ['implicit', 'implicit-throwing', 'explicit', 'encoder', 'encoder-explicit']) {
+for (const mode of ['implicit', 'implicit-throwing', 'explicit', 'explicit-after-bridge', 'encoder', 'encoder-explicit']) {
   test(`GC stop reports a warning once only after ${mode} shutdown`,
     { skip: mode.startsWith('encoder') && process.platform !== 'linux' && 'the encoder failure fixture requires Linux /proc/self/fd pipes' }, () => {
     const result = spawnSync(process.execPath,

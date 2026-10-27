@@ -1,8 +1,10 @@
 //! Typed domain projections at the Node boundary. Messages never classify failures.
 use super::*;
+#[cfg(any(test, all(flexaudio_test_addon, feature = "test-faults")))]
+use flexaudio::core::Operation;
 use flexaudio::core::{
     AudioLoss, AudioPath, Error, ErrorContext, ErrorKind, LossReason, MixLane, NativeStatus,
-    Operation, OutputTap,
+    OutputTap,
 };
 use napi::bindgen_prelude::Null;
 
@@ -229,18 +231,8 @@ fn lane_name(lane: MixLane) -> Option<&'static str> {
 }
 
 fn context_to_js(context: ErrorContext) -> JsErrorContext {
-    let operation = match context.operation() {
-        Operation::Enumerate => "enumerate",
-        Operation::Start => "start",
-        Operation::Normalize => "normalize",
-        Operation::Flush => "flush",
-        Operation::Reopen => "reopen",
-        Operation::Rollback => "rollback",
-        Operation::Stop => "stop",
-        Operation::Join => "join",
-        Operation::Link => "link",
-        _ => "unknown",
-    };
+    // Display is exhaustive in the crate that defines the non-exhaustive enum.
+    let operation = context.operation().to_string();
     let lane = context
         .lane()
         .and_then(lane_name)
@@ -262,7 +254,7 @@ fn context_to_js(context: ErrorContext) -> JsErrorContext {
         _ => Either::B(Null),
     };
     JsErrorContext {
-        operation: operation.into(),
+        operation,
         lane,
         native_status,
     }
@@ -561,6 +553,16 @@ pub(super) fn fixture_error(kind: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_core_operation_projects_without_an_unknown_fallback() {
+        for operation in flexaudio_core::test_support::operations() {
+            let projected = context_to_js(ErrorContext::new(operation));
+            assert_eq!(projected.operation, operation.to_string());
+            assert_ne!(projected.operation, "unknown", "operation: {operation:?}");
+            assert!(!projected.operation.is_empty());
+        }
+    }
 
     #[test]
     fn declared_error_kinds_match_the_runtime_core_inventory() {

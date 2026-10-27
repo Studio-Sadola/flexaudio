@@ -39,7 +39,8 @@ async function checkCleanup() {
   const mode = process.argv[2];
   // emitWarning itself throws: delivery must still stay non-fatal.
   const throwing = mode === 'implicit-throwing';
-  const explicit = mode === 'explicit';
+  const explicit = mode === 'explicit' || mode === 'explicit-after-bridge';
+  const endedBridge = mode === 'explicit-after-bridge';
   const encoder = mode.startsWith('encoder');
   const finalized = mode === 'encoder-explicit';
   const quiet = explicit || finalized;
@@ -59,14 +60,44 @@ async function checkCleanup() {
     };
   }
   try {
-    let stream = encoder ? null : native.__bindingContractBridge('attachment-flush-cleanup', () => {});
+    function openEndedBridge() {
+      const onChunk = () => {};
+      return {
+        stream: native.__bindingContractBridge('panic', onChunk),
+        callback: new WeakRef(onChunk),
+      };
+    }
+    const ended = endedBridge ? openEndedBridge() : null;
+    let stream = endedBridge ? ended.stream
+      : encoder ? null : native.__bindingContractBridge('attachment-flush-cleanup', () => {});
+    if (endedBridge) {
+      const deadline = performance.now() + 5000;
+      let released = false;
+      do {
+        // StopFlushed releases the native onChunk reference after changing the phase to Stopped.
+        // Collection therefore proves the early Stopped branch will run, without a timing race.
+        await delay(10);
+        global.gc();
+        released = ended.callback.deref() === undefined;
+      } while (!released && performance.now() < deadline);
+      assert.ok(released, 'StopFlushed must release onChunk before explicit stop');
+      ended.stream = null;
+    }
     if (encoder) {
       if (finalized) assert.throws(() => native.__dropFailingEncoder(true), /seek/i);
       else native.__dropFailingEncoder(false);
     }
     if (explicit) {
-      await assert.rejects(stream.stop(), error => error.audioError.kind === 'deviceLost');
+      await assert.rejects(stream.stop(), error => {
+        if (endedBridge) {
+          assert.match(error.message, /bridge failure/);
+          assert.equal(error.audioError.kind, 'backend');
+          return true;
+        }
+        return error.audioError.kind === 'deviceLost';
+      });
     }
+    const stoppedStream = endedBridge ? new WeakRef(stream) : null;
     stream = null;
     const deadline = performance.now() + (quiet ? 200 : 5000);
     do {
@@ -74,6 +105,9 @@ async function checkCleanup() {
       await delay(10);
     } while (performance.now() < deadline && (quiet || warnings.length === 0));
     await delay(50);
+    if (endedBridge) {
+      assert.equal(stoppedStream.deref(), undefined, 'the explicitly stopped stream must be collected');
+    }
     assert.deepEqual(uncaught, [], 'a GC-observed failure must never become an uncaught exception');
     assert.equal(warnings.length, quiet ? 0 : 1);
     if (!quiet) {

@@ -1823,6 +1823,8 @@ impl FlexStream {
     #[napi(ts_return_type = "Promise<void>")]
     pub fn stop(&self, env: Env) -> napi::Result<JsObject> {
         let (deferred, promise) = create_js_promise(&env)?;
+        // Every returned stop Promise is an explicit request, including an already-ended bridge.
+        self.stop_flag.store(true, Ordering::SeqCst);
         // This is the JS thread. If the TSFN is already closed, no join handle remains, or phase is
         // Stopped, napi_resolve_deferred can be called here.
         let mut phase = self.stop_phase.lock().unwrap_or_else(lock_poisoned);
@@ -1846,7 +1848,6 @@ impl FlexStream {
         }
         drop(phase);
 
-        self.stop_flag.store(true, Ordering::SeqCst);
         match self.take_join_handle() {
             None => {
                 // No join handle (e.g. taken by Drop's reaper). Callbacks to deliver are being

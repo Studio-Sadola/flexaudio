@@ -252,11 +252,12 @@ fn assert_backend<B: FixtureBackend>(
         !report.cleanup().is_empty(),
         "observed cleanup failure must be retained"
     );
-    let expected_count = if phase == Phase::ProbeIoProc { 2 } else { 1 };
+    // ProbeIoProc destruction retries during Drop with the same call and status;
+    // equal failure values are retained once, rather than once per attempt.
     assert_eq!(
         report.cleanup().len(),
-        expected_count,
-        "cleanup attempts must be retained exactly once"
+        1,
+        "each distinct cleanup failure must be retained exactly once"
     );
     for error in report.cleanup() {
         let Error::Context { context, .. } = error else {
@@ -435,5 +436,49 @@ mod tests {
     #[test]
     fn probe_retains_each_injected_release_phase() {
         check_probe(|_, _: ProbePath| {});
+    }
+
+    #[test]
+    fn probe_ioproc_retry_observes_equal_failure_values() {
+        let cleanup = Arc::new(CleanupLedger::default());
+        owner_result(Phase::ProbeIoProc, cleanup.clone(), Exit::Drop).unwrap();
+        let expected =
+            Error::Backend("self-probe capture IOProc destruction failed; retry capture".into())
+                .with_context(
+                    flexaudio_core::ErrorContext::new(Operation::Stop).with_native_status(
+                        NativeStatus::OsStatus {
+                            call: "capture IOProc destruction",
+                            value: -1,
+                        },
+                    ),
+                );
+        assert_eq!(cleanup.take(), [expected.clone(), expected]);
+    }
+
+    #[test]
+    fn probe_shutdown_report_retains_distinct_native_cleanup_failures() {
+        let cleanup = Arc::new(CleanupLedger::default());
+        let control = ProbeControl::new(
+            Instant::now() + PROBE_TIMEOUT,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_cleanup_ledger(cleanup.clone());
+        let native = control.cleanup_diagnostics();
+        native.record_native("capture IOProc stop", -50);
+        native.record_native("capture IOProc destruction", -51);
+        drop(control);
+        let expected = cleanup.take();
+        assert_eq!(expected.len(), 2);
+        assert_ne!(expected[0], expected[1]);
+        cleanup.extend(expected.clone());
+        let mut backend =
+            MacSystemBackend::shutdown_fixture(thread::spawn(|| Ok(())), cleanup, None);
+        let returned = backend.stop_checked().unwrap_err();
+        assert_eq!(backend.retained_report().cleanup(), expected);
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            expected[0].clone(),
+            expected[1].clone(),
+            |_, _| returned,
+        );
     }
 }

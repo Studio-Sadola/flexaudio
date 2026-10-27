@@ -55,8 +55,10 @@ mod retention_fixture_tests {
 // Each list also generates an exhaustive match in the defining crate, so a new
 // typed cause cannot silently miss the shared binding fixtures.
 macro_rules! variant_inventory {
-    ($name:ident, $ty:ident, [$($variant:ident),+ $(,)?]) => {
-        fn $name() -> Vec<crate::$ty> {
+    ($vis:vis $name:ident, $ty:ident, [$($variant:ident),+ $(,)?]) => {
+        /// Every variant, checked exhaustively inside its defining crate.
+        /// Internal test support only; no stability guarantee.
+        $vis fn $name() -> Vec<crate::$ty> {
             fn covered(value: crate::$ty) {
                 match value { $(crate::$ty::$variant => ()),+ }
             }
@@ -68,6 +70,30 @@ macro_rules! variant_inventory {
         }
     };
 }
+
+variant_inventory!(
+    pub operations,
+    Operation,
+    [
+        Enumerate, Start, Normalize, Flush, Reopen, Rollback, Stop, Join, Link,
+    ]
+);
+variant_inventory!(
+    pub helper_stop_reasons,
+    HelperStopReason,
+    [
+        SignalObserved,
+        PermissionDenied,
+        Inconclusive,
+        TimedOut,
+        StreamStopped,
+        SourceSwitched,
+        Recovery,
+        StartupFailed,
+        RuntimeFailed,
+        Cancelled,
+    ]
+);
 
 variant_inventory!(
     addon_kinds,
