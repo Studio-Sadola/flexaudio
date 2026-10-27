@@ -45,7 +45,7 @@ pub mod diagnostics;
 mod drop_failure;
 pub use drop_failure::{
     report_drop_failures, set_drop_failure_handler, DropFailure, DropFailureHandler,
-    DropFailureOwner,
+    DropFailureOwner, ShutdownReceipt,
 };
 pub mod error_context;
 mod error_equality;

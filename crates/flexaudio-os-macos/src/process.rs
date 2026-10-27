@@ -58,6 +58,7 @@ pub struct MacProcessBackend {
     /// Handle for the thread that owns the tap chain (`Some` after start).
     handle: Option<JoinHandle<Result<()>>>,
     shutdown: OwnerShutdown,
+    receipt: flexaudio_core::ShutdownReceipt,
     /// Owner-thread notifications for the current capture generation.
     events: Option<mpsc::Receiver<Event>>,
     /// Native format `(rate, channels)`. Cache the fallback because the actual format is determined
@@ -77,6 +78,7 @@ impl MacProcessBackend {
             terminal: Arc::new(TerminalFailure::default()),
             handle: None,
             shutdown: OwnerShutdown::default(),
+            receipt: flexaudio_core::ShutdownReceipt::default(),
             events: None,
             native: FALLBACK_FORMAT,
         }
@@ -105,35 +107,36 @@ impl CaptureBackend for MacProcessBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
-        if self.terminal.check_start(self.handle.is_some())? == StartAction::AlreadyRunning {
-            return Ok(());
-        }
+        let result = (|| {
+            if self.terminal.check_start(self.handle.is_some())? == StartAction::AlreadyRunning {
+                return Ok(());
+            }
 
-        let target_pid = i32::try_from(self.target_pid)
-            .ok()
-            .filter(|pid| *pid > 0)
-            .ok_or_else(|| Error::InvalidArg("target_pid must be in 1..=i32::MAX".into()))?;
+            let target_pid = i32::try_from(self.target_pid)
+                .ok()
+                .filter(|pid| *pid > 0)
+                .ok_or_else(|| Error::InvalidArg("target_pid must be in 1..=i32::MAX".into()))?;
 
-        // Version gate: Process Tap requires macOS 14.4 or later. Check the OS version before
-        // creating the tap; return the typed Error::UnsupportedOsVersion instead of converting a
-        // raw OSStatus into a Backend error.
-        crate::version::ensure_process_tap_supported()?;
+            // Version gate: Process Tap requires macOS 14.4 or later. Check the OS version before
+            // creating the tap; return the typed Error::UnsupportedOsVersion instead of converting a
+            // raw OSStatus into a Backend error.
+            crate::version::ensure_process_tap_supported()?;
 
-        self.stop_flag.store(false, Ordering::SeqCst);
-        self.publication
-            .set_stop_reason(flexaudio_core::HelperStopReason::StreamStopped);
+            self.stop_flag.store(false, Ordering::SeqCst);
+            self.publication
+                .set_stop_reason(flexaudio_core::HelperStopReason::StreamStopped);
 
-        let stop_flag = self.stop_flag.clone();
-        let silence_probe = self.silence_probe;
-        let publication = self.publication.clone();
-        let terminal = self.terminal.clone();
-        let cleanup = self.shutdown.cleanup.clone();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
-        let (event_tx, event_rx) = mpsc::channel();
-        // ProcessMode is Copy, so it can be moved directly into the closure.
-        let mode = self.mode;
+            let stop_flag = self.stop_flag.clone();
+            let silence_probe = self.silence_probe;
+            let publication = self.publication.clone();
+            let terminal = self.terminal.clone();
+            let cleanup = self.shutdown.cleanup.clone();
+            let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+            let (event_tx, event_rx) = mpsc::channel();
+            // ProcessMode is Copy, so it can be moved directly into the closure.
+            let mode = self.mode;
 
-        let handle = thread::Builder::new()
+            let handle = thread::Builder::new()
             .name("flexaudio-macos-process".into())
             .spawn(move || {
                 // PID-to-AudioObjectID conversion calls CoreAudio, so do it on the owner thread.
@@ -175,32 +178,46 @@ impl CaptureBackend for MacProcessBackend {
                 flexaudio_core::spawn_error("Core Audio capture owner", error)
             })?;
 
-        match ready_rx.recv() {
-            Ok(Ok(())) => {
-                self.handle = Some(handle);
-                self.shutdown.retain_lifecycle(self.events.as_ref());
-                self.shutdown.reset();
-                self.events = Some(event_rx);
-                Ok(())
-            }
-            Ok(Err(e)) => {
-                let report = ShutdownReport::new(
-                    Some(e),
-                    stop_owner(&self.publication, &self.stop_flag, Some(handle)),
-                );
-                self.shutdown.retain_startup_report(report)
-            }
-            Err(_) => {
-                let report = ShutdownReport::new(
-                    Some(
-                        Error::Backend("capture owner exited before reporting readiness".into())
+            match ready_rx.recv() {
+                Ok(Ok(())) => {
+                    self.handle = Some(handle);
+                    self.shutdown.retain_lifecycle(self.events.as_ref());
+                    if let Some(report) = self.shutdown.report() {
+                        self.receipt.report_unobserved(
+                            flexaudio_core::DropFailureOwner::ProcessCapture,
+                            report,
+                        );
+                    }
+                    self.shutdown.reset();
+                    self.receipt = flexaudio_core::ShutdownReceipt::default();
+                    self.events = Some(event_rx);
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    let report = ShutdownReport::new(
+                        Some(e),
+                        stop_owner(&self.publication, &self.stop_flag, Some(handle)),
+                    );
+                    self.shutdown.retain_startup_report(report)
+                }
+                Err(_) => {
+                    let report = ShutdownReport::new(
+                        Some(
+                            Error::Backend(
+                                "capture owner exited before reporting readiness".into(),
+                            )
                             .with_context(ErrorContext::new(Operation::Start)),
-                    ),
-                    stop_owner(&self.publication, &self.stop_flag, Some(handle)),
-                );
-                self.shutdown.retain_startup_report(report)
+                        ),
+                        stop_owner(&self.publication, &self.stop_flag, Some(handle)),
+                    );
+                    self.shutdown.retain_startup_report(report)
+                }
             }
+        })();
+        if let Err(error) = &result {
+            self.receipt.acknowledge_error(error);
         }
+        result
     }
 
     fn stop(&mut self) {
@@ -212,35 +229,43 @@ impl CaptureBackend for MacProcessBackend {
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.retain_shutdown_outcome();
-        self.shutdown
-            .report()
-            .expect("completed owner shutdown")
-            .result()
+        let result = {
+            self.retain_shutdown_outcome();
+            self.shutdown
+                .report()
+                .expect("completed owner shutdown")
+                .result()
+        };
+        if let Err(error) = &result {
+            self.receipt.acknowledge_error(error);
+        }
+        result
     }
 
     fn poll_event(&mut self) -> Option<Event> {
-        self.shutdown
-            .poll_lifecycle()
-            .or_else(|| {
-                self.events
-                    .as_ref()
-                    .and_then(|events| events.try_recv().ok())
-            })
-            .or_else(|| self.shutdown.poll_event())
+        let result = {
+            self.shutdown
+                .poll_lifecycle()
+                .or_else(|| {
+                    self.events
+                        .as_ref()
+                        .and_then(|events| events.try_recv().ok())
+                })
+                .or_else(|| self.shutdown.poll_event())
+        };
+        if let Some(error) = result.as_ref().and_then(Event::failure) {
+            self.receipt.acknowledge_error(&error);
+        }
+        result
     }
 }
 
 impl Drop for MacProcessBackend {
     fn drop(&mut self) {
-        let previous = self.shutdown.report().cloned();
         self.stop();
         if let Some(report) = self.shutdown.report() {
-            flexaudio_core::report_drop_failures(
-                flexaudio_core::DropFailureOwner::ProcessCapture,
-                previous.as_ref(),
-                report,
-            );
+            self.receipt
+                .report_unobserved(flexaudio_core::DropFailureOwner::ProcessCapture, report);
         }
     }
 }

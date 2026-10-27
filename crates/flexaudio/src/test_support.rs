@@ -23,7 +23,8 @@ pub fn switch(
     options: OpenOptions,
     backend: Box<dyn CaptureBackend>,
 ) -> Result<()> {
-    stream.switch_source_using(config, None, Some(options), |_, _| Ok(backend))
+    let result = stream.switch_source_using(config, None, Some(options), |_, _| Ok(backend));
+    stream.handoff_result(result)
 }
 
 /// The failing operation, selected before constructing a fresh fixture.

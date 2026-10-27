@@ -43,7 +43,7 @@ impl Stream {
         // Delivery is already held: inspect the recorded cause without acquiring
         // backend in reverse order. Only terminal_error() waits for OS shutdown.
         if let Some(error) = self.shared.terminal.error() {
-            return Err(error);
+            return self.handoff_result(Err(error));
         }
         // Advance the generation only if actually paused (resume on an unpaused stream must not add
         // an unnecessary DISCONTINUITY).
@@ -156,6 +156,12 @@ impl Stream {
     /// stopping capture; audio delivery is gated immediately when failure is recorded.
     /// Create a new stream after changing OS settings and restarting the app.
     pub fn terminal_error(&self) -> Option<Error> {
+        let error = self.terminal_error_inner()?;
+        self.shutdown_receipt.acknowledge_error(&error);
+        Some(error)
+    }
+
+    pub(super) fn terminal_error_inner(&self) -> Option<Error> {
         if !self.shared.terminal.is_failed() {
             return None;
         }
@@ -205,12 +211,15 @@ impl Stream {
     /// Capture-terminal and stop/cleanup failures remain independently available
     /// through [`terminal_error`](Self::terminal_error),
     /// [`stop_checked`](Self::stop_checked), and [`shutdown_report`](Self::shutdown_report).
-    /// Failures discovered during implicit shutdown still reach the process-wide
+    /// Retained failures not handed to the caller still reach the process-wide
     /// [`crate::set_drop_failure_handler`] receiver (stderr by default).
     pub fn poll_event(&mut self) -> Option<Event> {
         let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
         let event = events.pop_front()?;
         self.shared.retire_event(&event);
+        if let Some(error) = event.failure() {
+            self.shutdown_receipt.acknowledge_error(&error);
+        }
         Some(event)
     }
 

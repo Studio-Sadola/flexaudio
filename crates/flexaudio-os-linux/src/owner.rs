@@ -14,6 +14,19 @@ pub(crate) struct BackendEventQueue {
 
 pub(crate) type BackendEvents = Arc<Mutex<BackendEventQueue>>;
 
+/// A successful new generation retires the old report without losing unread failures.
+pub(crate) fn retire_shutdown_report(
+    shutdown: &mut Option<ShutdownReport>,
+    receipt: &mut flexaudio_core::ShutdownReceipt,
+    owner: flexaudio_core::DropFailureOwner,
+) {
+    if let Some(report) = shutdown.as_ref() {
+        receipt.report_unobserved(owner, report);
+    }
+    *shutdown = None;
+    *receipt = Default::default();
+}
+
 pub(crate) fn request_worker_stop(
     sender: &mut Option<crate::pw::channel::Sender<crate::Terminate>>,
 ) -> Option<Error> {
@@ -49,7 +62,13 @@ pub(crate) fn rollback_capture(
     events: BackendEvents,
     retained_events: &mut BackendEvents,
     shutdown: &mut Option<ShutdownReport>,
+    receipt: &flexaudio_core::ShutdownReceipt,
+    owner: flexaudio_core::DropFailureOwner,
 ) -> Error {
+    // Failed acquisition replaces the old terminal/mailbox; hand unread old failures off first.
+    if let Some(previous) = shutdown.as_ref() {
+        receipt.report_unobserved(owner, previous);
+    }
     let cleanup = join_worker(handle)
         .err()
         .map(|error| error.with_context(ErrorContext::new(Operation::Rollback)));

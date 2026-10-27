@@ -101,7 +101,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// Consumers call [`poll_chunk`](Self::poll_chunk) / [`poll_event`](Self::poll_event) without
 /// blocking. [`stop`](Self::stop) joins all threads.
 /// Use [`stop_checked`](Self::stop_checked) to inspect capture and cleanup failures.
-/// Failures first observed when dropping without an explicit stop reach the
+/// Failures not handed to the caller before dropping reach the
 /// process-wide [`crate::set_drop_failure_handler`] receiver (stderr by default).
 pub struct Stream {
     config: StreamConfig,
@@ -132,6 +132,7 @@ pub struct Stream {
     /// Whether started (prevents duplicate start calls).
     started: bool,
     shutdown: Option<ShutdownReport>,
+    shutdown_receipt: flexaudio_core::ShutdownReceipt,
 }
 
 /// State shared by the intake thread, watchdog thread, and main thread.
@@ -277,6 +278,14 @@ fn stop_backend_catching(be: &mut Box<dyn CaptureBackend>) -> Result<()> {
 }
 
 impl Stream {
+    /// Only API boundaries acknowledge a returned failure; internal transitions retain ownership.
+    pub(crate) fn handoff_result<T>(&self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            self.shutdown_receipt.acknowledge_error(error);
+        }
+        result
+    }
+
     /// Open a stream from the configuration and backend (capture has not started yet).
     ///
     /// The fixed contract assumes `config.chunk_ms` is 20ms. `ring_capacity_chunks` sets the chunk
@@ -361,6 +370,7 @@ impl Stream {
             watchdog: None,
             started: false,
             shutdown: None,
+            shutdown_receipt: flexaudio_core::ShutdownReceipt::default(),
         })
     }
 
@@ -425,14 +435,10 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        let previous = self.shutdown.clone();
         self.stop();
         if let Some(report) = &self.shutdown {
-            flexaudio_core::report_drop_failures(
-                flexaudio_core::DropFailureOwner::Stream,
-                previous.as_ref(),
-                report,
-            );
+            self.shutdown_receipt
+                .report_unobserved(flexaudio_core::DropFailureOwner::Stream, report);
         }
     }
 }

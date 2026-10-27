@@ -44,6 +44,8 @@ trait DeviceWatchBackend: Send {
 pub struct DeviceWatcher {
     /// OS-specific watcher (persistent PipeWire monitoring on Linux; Noop elsewhere).
     inner: Box<dyn DeviceWatchBackend>,
+    shutdown: Option<flexaudio_core::ShutdownReport>,
+    shutdown_receipt: flexaudio_core::ShutdownReceipt,
 }
 
 impl DeviceWatcher {
@@ -51,31 +53,69 @@ impl DeviceWatcher {
     pub(crate) fn failing_join_fixture() -> Self {
         Self {
             inner: Box::new(flexaudio_os_linux::test_support::watcher_join_failure()),
+            shutdown: None,
+            shutdown_receipt: flexaudio_core::ShutdownReceipt::default(),
         }
     }
 
     /// Take the next hot-plug event, or return `None` without blocking.
     pub fn poll_event(&mut self) -> Option<DeviceEvent> {
-        self.inner.poll_event()
+        let event = self.inner.poll_event()?;
+        if let DeviceEvent::TerminalError { error } = &event {
+            self.shutdown_receipt.acknowledge_error(error);
+        }
+        Some(event)
     }
 
     /// Stop producers and retain pending events for [`poll_event`](Self::poll_event) to drain.
     /// Safe to call twice or before any events have been delivered. Also called on drop.
+    /// Unread failures reach the process-wide failure receiver when the watcher is dropped.
     pub fn stop(&mut self) {
-        self.inner.stop();
+        self.retain_shutdown_outcome();
+    }
+
+    /// Stop monitoring and return capture and cleanup failures, retaining the same outcome
+    /// for repeated calls. Returned failures are not reported again during Drop.
+    pub fn stop_checked(&mut self) -> flexaudio_core::Result<()> {
+        self.retain_shutdown_outcome();
+        let result = self
+            .shutdown
+            .as_ref()
+            .expect("completed watcher shutdown")
+            .result();
+        if let Err(error) = &result {
+            self.shutdown_receipt.acknowledge_error(error);
+        }
+        result
+    }
+
+    /// Completed shutdown outcome, or `None` before monitoring has stopped.
+    /// Reading the report hands its failures to the caller and suppresses their Drop fallback.
+    pub fn shutdown_report(&self) -> Option<flexaudio_core::ShutdownReport> {
+        let report = self.shutdown.clone()?;
+        self.shutdown_receipt.acknowledge(&report);
+        Some(report)
+    }
+
+    fn retain_shutdown_outcome(&mut self) {
+        if self.shutdown.is_none() {
+            self.inner.stop();
+            self.shutdown = Some(
+                self.inner
+                    .shutdown_report()
+                    .cloned()
+                    .unwrap_or_else(|| flexaudio_core::ShutdownReport::new(None, Vec::new())),
+            );
+        }
     }
 }
 
 impl Drop for DeviceWatcher {
     fn drop(&mut self) {
-        let previous = self.inner.shutdown_report().cloned();
         self.stop();
-        if let Some(report) = self.inner.shutdown_report() {
-            flexaudio_core::report_drop_failures(
-                flexaudio_core::DropFailureOwner::DeviceWatcher,
-                previous.as_ref(),
-                report,
-            );
+        if let Some(report) = &self.shutdown {
+            self.shutdown_receipt
+                .report_unobserved(flexaudio_core::DropFailureOwner::DeviceWatcher, report);
         }
     }
 }
@@ -128,12 +168,138 @@ pub(crate) fn watch_devices() -> flexaudio_core::types::Result<DeviceWatcher> {
 fn watcher_from_start(
     start: flexaudio_core::Result<Box<dyn DeviceWatchBackend>>,
 ) -> flexaudio_core::Result<DeviceWatcher> {
-    start.map(|inner| DeviceWatcher { inner })
+    start.map(|inner| DeviceWatcher {
+        inner,
+        shutdown: None,
+        shutdown_receipt: flexaudio_core::ShutdownReceipt::default(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FailedWatcher {
+        report: Option<flexaudio_core::ShutdownReport>,
+        event: Option<DeviceEvent>,
+    }
+    impl DeviceWatchBackend for FailedWatcher {
+        fn poll_event(&mut self) -> Option<DeviceEvent> {
+            self.event.take()
+        }
+        fn stop(&mut self) {
+            if self.report.is_none() {
+                self.report = Some(flexaudio_core::ShutdownReport::new(
+                    Some(flexaudio_core::Error::DeviceLost),
+                    vec![flexaudio_core::Error::Unsupported],
+                ));
+                self.event = Some(DeviceEvent::TerminalError {
+                    error: flexaudio_core::Error::DeviceLost,
+                });
+            }
+        }
+        fn shutdown_report(&self) -> Option<&flexaudio_core::ShutdownReport> {
+            self.report.as_ref()
+        }
+    }
+    fn failed_watcher() -> DeviceWatcher {
+        watcher_from_start(Ok(Box::new(FailedWatcher {
+            report: None,
+            event: None,
+        })))
+        .unwrap()
+    }
+
+    #[test]
+    fn watcher_checked_report_and_polled_handoffs_suppress_only_delivered_failures() {
+        const CHILD: &str = "FLEXAUDIO_WATCHER_RECEIPT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["device_watcher::tests::watcher_checked_report_and_polled_handoffs_suppress_only_delivered_failures", "--exact"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = observed.clone();
+        crate::set_drop_failure_handler(Some(Box::new(move |failure| {
+            output.lock().unwrap().push(failure.clone())
+        })));
+        let mut watcher = failed_watcher();
+        assert!(watcher.shutdown_report().is_none());
+        watcher.stop();
+        watcher.stop();
+        drop(watcher);
+        assert_eq!(observed.lock().unwrap().len(), 1);
+        let mut watcher = failed_watcher();
+        let first = watcher.stop_checked();
+        assert!(first.is_err());
+        assert_eq!(watcher.stop_checked(), first);
+        drop(watcher);
+        assert_eq!(observed.lock().unwrap().len(), 1);
+        let mut watcher = failed_watcher();
+        watcher.stop();
+        let first = watcher.shutdown_report().unwrap();
+        assert_eq!(watcher.shutdown_report(), Some(first));
+        drop(watcher);
+        assert_eq!(observed.lock().unwrap().len(), 1);
+        let mut watcher = failed_watcher();
+        watcher.stop();
+        assert!(matches!(
+            watcher.poll_event(),
+            Some(DeviceEvent::TerminalError { .. })
+        ));
+        drop(watcher);
+        let failures = observed.lock().unwrap();
+        assert_eq!(failures.len(), 2);
+        assert_eq!(
+            failures[0].owner,
+            flexaudio_core::DropFailureOwner::DeviceWatcher
+        );
+        assert_eq!(
+            failures[0].report.primary(),
+            Some(&flexaudio_core::Error::DeviceLost)
+        );
+        assert_eq!(
+            failures[0].report.cleanup(),
+            &[flexaudio_core::Error::Unsupported]
+        );
+        assert_eq!(
+            failures[1].report,
+            flexaudio_core::ShutdownReport::new(None, vec![flexaudio_core::Error::Unsupported])
+        );
+        drop(failures);
+        #[cfg(target_os = "linux")]
+        {
+            // Exercise the public reproduction fixture's real worker-join teardown as well.
+            let mut watcher = crate::test_support::watcher_join_failure();
+            watcher.stop();
+            watcher.stop();
+            drop(watcher);
+            assert_eq!(observed.lock().unwrap().len(), 3);
+            assert!(observed.lock().unwrap()[2].report.result().is_err());
+            let mut watcher = crate::test_support::watcher_join_failure();
+            let first = watcher.stop_checked();
+            assert!(first.is_err());
+            assert_eq!(watcher.stop_checked(), first);
+            drop(watcher);
+            assert_eq!(observed.lock().unwrap().len(), 3);
+            let mut watcher = crate::test_support::watcher_join_failure();
+            watcher.stop();
+            let report = watcher.shutdown_report().unwrap();
+            assert!(report.result().is_err());
+            assert_eq!(watcher.shutdown_report(), Some(report));
+            drop(watcher);
+            assert_eq!(observed.lock().unwrap().len(), 3);
+        }
+        crate::set_drop_failure_handler(None);
+    }
 
     /// [`DeviceWatcher`] is `Send` and can be transferred between threads.
     #[test]
@@ -147,11 +313,18 @@ mod tests {
     fn noop_watcher_yields_nothing() {
         let mut w = DeviceWatcher {
             inner: Box::new(NoopWatcher),
+            shutdown: None,
+            shutdown_receipt: flexaudio_core::ShutdownReceipt::default(),
         };
         assert!(w.poll_event().is_none());
         assert!(w.poll_event().is_none());
         w.stop();
         w.stop();
+        assert_eq!(w.stop_checked(), Ok(()));
+        assert_eq!(
+            w.shutdown_report(),
+            Some(flexaudio_core::ShutdownReport::new(None, Vec::new()))
+        );
         assert!(w.poll_event().is_none());
     }
 
@@ -211,6 +384,8 @@ mod repro_tests {
         // Linux startup. Exercise the same facade wrapper and pull interface.
         let mut watcher = DeviceWatcher {
             inner: Box::new(NoopWatcher),
+            shutdown: None,
+            shutdown_receipt: flexaudio_core::ShutdownReceipt::default(),
         };
         assert!(watcher.poll_event().is_none());
         watcher.stop();

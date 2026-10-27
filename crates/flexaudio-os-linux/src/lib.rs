@@ -169,6 +169,7 @@ pub struct PwSystemBackend {
     /// Handle for the PipeWire loop thread. Set to `Some` by `start`.
     handle: Option<JoinHandle<()>>,
     shutdown: Option<ShutdownReport>,
+    shutdown_receipt: flexaudio_core::ShutdownReceipt,
     events: BackendEvents,
 }
 
@@ -199,6 +200,7 @@ impl PwSystemBackend {
             stop_tx: None,
             handle: None,
             shutdown: None,
+            shutdown_receipt: Default::default(),
             events: Arc::new(Mutex::new(Default::default())),
         }
     }
@@ -221,7 +223,11 @@ impl PwSystemBackend {
     }
 
     /// Completed stop outcome, retained independently of event polling.
+    /// Returning the report hands its failures to the caller, suppressing their Drop fallback.
     pub fn shutdown_report(&self) -> Option<&ShutdownReport> {
+        if let Some(report) = &self.shutdown {
+            self.shutdown_receipt.acknowledge(report);
+        }
         self.shutdown.as_ref()
     }
 }
@@ -301,11 +307,15 @@ impl CaptureBackend for PwSystemBackend {
             })?;
 
         // Wait for setup. Treat thread exit without a ready message (recv error) as failure.
-        match ready_rx.recv() {
+        let result = match ready_rx.recv() {
             Ok(Ok(())) => {
                 // Setup succeeded. Keep the stop sender and thread handle.
+                owner::retire_shutdown_report(
+                    &mut self.shutdown,
+                    &mut self.shutdown_receipt,
+                    flexaudio_core::DropFailureOwner::SystemCapture,
+                );
                 self.events = generation_events;
-                self.shutdown = None;
                 self.stop_tx = Some(stop_tx);
                 self.handle = Some(handle);
                 Ok(())
@@ -329,6 +339,8 @@ impl CaptureBackend for PwSystemBackend {
                     generation_events,
                     &mut self.events,
                     &mut self.shutdown,
+                    &self.shutdown_receipt,
+                    flexaudio_core::DropFailureOwner::SystemCapture,
                 ))
             }
             Err(_) => {
@@ -343,9 +355,15 @@ impl CaptureBackend for PwSystemBackend {
                     generation_events,
                     &mut self.events,
                     &mut self.shutdown,
+                    &self.shutdown_receipt,
+                    flexaudio_core::DropFailureOwner::SystemCapture,
                 ))
             }
+        };
+        if let Err(error) = &result {
+            self.shutdown_receipt.acknowledge_error(error);
         }
+        result
     }
 
     fn stop(&mut self) {
@@ -354,27 +372,32 @@ impl CaptureBackend for PwSystemBackend {
 
     fn stop_checked(&mut self) -> Result<()> {
         self.retain_shutdown_outcome();
-        self.shutdown
+        let result = self
+            .shutdown
             .as_ref()
             .expect("stop retains its report")
-            .result()
+            .result();
+        if let Err(error) = &result {
+            self.shutdown_receipt.acknowledge_error(error);
+        }
+        result
     }
 
     fn poll_event(&mut self) -> Option<Event> {
-        poll_backend_event(&self.events)
+        let event = poll_backend_event(&self.events)?;
+        if let Some(error) = event.failure() {
+            self.shutdown_receipt.acknowledge_error(&error);
+        }
+        Some(event)
     }
 }
 
 impl Drop for PwSystemBackend {
     fn drop(&mut self) {
-        let previous = self.shutdown.clone();
         self.stop();
         if let Some(report) = &self.shutdown {
-            flexaudio_core::report_drop_failures(
-                flexaudio_core::DropFailureOwner::SystemCapture,
-                previous.as_ref(),
-                report,
-            );
+            self.shutdown_receipt
+                .report_unobserved(flexaudio_core::DropFailureOwner::SystemCapture, report);
         }
     }
 }
@@ -465,6 +488,7 @@ pub struct PwProcessBackend {
     /// Handle for the PipeWire loop thread. Set to `Some` by `start`.
     handle: Option<JoinHandle<()>>,
     shutdown: Option<ShutdownReport>,
+    shutdown_receipt: flexaudio_core::ShutdownReceipt,
     events: BackendEvents,
 }
 
@@ -483,6 +507,7 @@ impl PwProcessBackend {
             stop_tx: None,
             handle: None,
             shutdown: None,
+            shutdown_receipt: Default::default(),
             events: Arc::new(Mutex::new(Default::default())),
         }
     }
@@ -539,12 +564,16 @@ impl CaptureBackend for PwProcessBackend {
             })?;
 
         // Wait for setup. Treat thread exit without sending ready as failure.
-        match ready_rx.recv() {
+        let result = match ready_rx.recv() {
             Ok(Ok(())) => {
                 // Format negotiation succeeded, or a complete snapshot confirmed no target.
                 // Registry callbacks continue linking eligible targets as they appear.
+                owner::retire_shutdown_report(
+                    &mut self.shutdown,
+                    &mut self.shutdown_receipt,
+                    flexaudio_core::DropFailureOwner::ProcessCapture,
+                );
                 self.events = generation_events;
-                self.shutdown = None;
                 self.stop_tx = Some(stop_tx);
                 self.handle = Some(handle);
                 Ok(())
@@ -562,6 +591,8 @@ impl CaptureBackend for PwProcessBackend {
                     generation_events,
                     &mut self.events,
                     &mut self.shutdown,
+                    &self.shutdown_receipt,
+                    flexaudio_core::DropFailureOwner::ProcessCapture,
                 ))
             }
             Err(_) => {
@@ -577,9 +608,15 @@ impl CaptureBackend for PwProcessBackend {
                     generation_events,
                     &mut self.events,
                     &mut self.shutdown,
+                    &self.shutdown_receipt,
+                    flexaudio_core::DropFailureOwner::ProcessCapture,
                 ))
             }
+        };
+        if let Err(error) = &result {
+            self.shutdown_receipt.acknowledge_error(error);
         }
+        result
     }
 
     fn stop(&mut self) {
@@ -588,27 +625,32 @@ impl CaptureBackend for PwProcessBackend {
 
     fn stop_checked(&mut self) -> Result<()> {
         self.retain_shutdown_outcome();
-        self.shutdown
+        let result = self
+            .shutdown
             .as_ref()
             .expect("stop retains its report")
-            .result()
+            .result();
+        if let Err(error) = &result {
+            self.shutdown_receipt.acknowledge_error(error);
+        }
+        result
     }
 
     fn poll_event(&mut self) -> Option<Event> {
-        poll_backend_event(&self.events)
+        let event = poll_backend_event(&self.events)?;
+        if let Some(error) = event.failure() {
+            self.shutdown_receipt.acknowledge_error(&error);
+        }
+        Some(event)
     }
 }
 
 impl Drop for PwProcessBackend {
     fn drop(&mut self) {
-        let previous = self.shutdown.clone();
         self.stop();
         if let Some(report) = &self.shutdown {
-            flexaudio_core::report_drop_failures(
-                flexaudio_core::DropFailureOwner::ProcessCapture,
-                previous.as_ref(),
-                report,
-            );
+            self.shutdown_receipt
+                .report_unobserved(flexaudio_core::DropFailureOwner::ProcessCapture, report);
         }
     }
 }
@@ -740,7 +782,11 @@ impl PwSystemBackend {
 
 impl PwProcessBackend {
     /// Completed stop outcome, retained independently of event polling.
+    /// Returning the report hands its failures to the caller, suppressing their Drop fallback.
     pub fn shutdown_report(&self) -> Option<&ShutdownReport> {
+        if let Some(report) = &self.shutdown {
+            self.shutdown_receipt.acknowledge(report);
+        }
         self.shutdown.as_ref()
     }
 
@@ -2695,6 +2741,7 @@ pub struct PwDeviceWatcher {
     /// Handle for the watcher thread. Set to `Some` by [`start`](Self::start).
     handle: Option<JoinHandle<()>>,
     shutdown: Option<ShutdownReport>,
+    shutdown_receipt: flexaudio_core::ShutdownReceipt,
 }
 
 impl PwDeviceWatcher {
@@ -2744,6 +2791,7 @@ impl PwDeviceWatcher {
                 stop_tx: Some(stop_tx),
                 handle: Some(handle),
                 shutdown: None,
+                shutdown_receipt: Default::default(),
             }),
             Ok(Err(msg)) => {
                 // Setup failed (PipeWire unavailable, connection/registry failure, etc.). The
@@ -2771,7 +2819,11 @@ impl PwDeviceWatcher {
     /// Pop the next hot-plug event from the queue, or return `None` if empty.
     /// Poisoned queues are salvaged and emit rescan before any retained deltas.
     pub fn poll_event(&mut self) -> Option<DeviceEvent> {
-        lock_events(&self.events).poll()
+        let event = lock_events(&self.events).poll()?;
+        if let DeviceEvent::TerminalError { error } = &event {
+            self.shutdown_receipt.acknowledge_error(error);
+        }
+        Some(event)
     }
 
     /// Stop watching (safe on duplicate stop or stop before start).
@@ -2779,6 +2831,8 @@ impl PwDeviceWatcher {
     /// As with [`PwSystemBackend::stop`], sending `Terminate` invokes the receiver callback
     /// attached to the loop, which calls `main_loop.quit()` on the watcher thread and exits
     /// `run()`. Wait for cleanup to finish with `join()`, retaining pending events for polling.
+    /// This unit-returning method does not acknowledge failures; poll them, read the report,
+    /// or use [`stop_checked`](Self::stop_checked) before Drop to receive them directly.
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         let stop_error = request_worker_stop(&mut self.stop_tx);
@@ -2795,28 +2849,33 @@ impl PwDeviceWatcher {
     /// Stop watching and return the retained capture and cleanup outcome.
     pub fn stop_checked(&mut self) -> Result<()> {
         self.stop();
-        self.shutdown
+        let result = self
+            .shutdown
             .as_ref()
             .expect("stop retains its report")
-            .result()
+            .result();
+        if let Err(error) = &result {
+            self.shutdown_receipt.acknowledge_error(error);
+        }
+        result
     }
 
     /// Completed stop outcome, retained independently of event polling.
+    /// Returning the report hands its failures to the caller, suppressing their Drop fallback.
     pub fn shutdown_report(&self) -> Option<&ShutdownReport> {
+        if let Some(report) = &self.shutdown {
+            self.shutdown_receipt.acknowledge(report);
+        }
         self.shutdown.as_ref()
     }
 }
 
 impl Drop for PwDeviceWatcher {
     fn drop(&mut self) {
-        let previous = self.shutdown.clone();
         self.stop();
         if let Some(report) = &self.shutdown {
-            flexaudio_core::report_drop_failures(
-                flexaudio_core::DropFailureOwner::DeviceWatcher,
-                previous.as_ref(),
-                report,
-            );
+            self.shutdown_receipt
+                .report_unobserved(flexaudio_core::DropFailureOwner::DeviceWatcher, report);
         }
     }
 }
@@ -3262,6 +3321,7 @@ mod tests {
             stop_tx: None,
             handle: worker(),
             shutdown: None,
+            shutdown_receipt: Default::default(),
         };
         drop(watcher);
         for owner in [
@@ -4499,6 +4559,7 @@ mod silent_failure_tests {
             stop_tx: None,
             handle: Some(thread::spawn(|| panic!("synthetic watcher failure"))),
             shutdown: None,
+            shutdown_receipt: Default::default(),
         };
         watcher.stop();
         watcher.stop();

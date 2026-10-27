@@ -471,6 +471,8 @@ mod tests {
                     owner.events,
                     &mut retained_events,
                     &mut None,
+                    &flexaudio_core::ShutdownReceipt::default(),
+                    flexaudio_core::DropFailureOwner::ProcessCapture,
                 )
             },
         );

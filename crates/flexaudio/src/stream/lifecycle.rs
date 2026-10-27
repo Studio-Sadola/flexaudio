@@ -61,7 +61,9 @@ impl Stream {
                 .secondary_producer
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = secondary_producer;
-            return Err(with_cleanup(error, cleanup));
+            let error = with_cleanup(error, cleanup);
+            self.shutdown_receipt.acknowledge_error(&error);
+            return Err(error);
         }
 
         // Intake takes its own snapshot when scheduled, since this format hint
@@ -93,7 +95,9 @@ impl Stream {
                     .with_context(ErrorContext::new(Operation::Start));
                 self.retain_shutdown_outcome();
                 let cleanup = cleanup_error_since(&self.shared, old_cleanup_count);
-                return Err(with_cleanup(primary, cleanup));
+                let error = with_cleanup(primary, cleanup);
+                self.shutdown_receipt.acknowledge_error(&error);
+                return Err(error);
             }
         };
         self.worker = Some(worker);
@@ -111,12 +115,16 @@ impl Stream {
                     .with_context(ErrorContext::new(Operation::Start));
                 self.retain_shutdown_outcome();
                 let cleanup = cleanup_error_since(&self.shared, old_cleanup_count);
-                return Err(with_cleanup(primary, cleanup));
+                let error = with_cleanup(primary, cleanup);
+                self.shutdown_receipt.acknowledge_error(&error);
+                return Err(error);
             }
         };
         self.watchdog = Some(watchdog);
 
-        if previous_report.is_some() {
+        if let Some(report) = &previous_report {
+            self.shutdown_receipt
+                .report_unobserved(flexaudio_core::DropFailureOwner::Stream, report);
             // Clear only the previous completed outcome; retain this attempt's observations.
             self.shared
                 .cleanup
@@ -140,6 +148,7 @@ impl Stream {
             }
         }
         self.started = true;
+        self.shutdown_receipt = flexaudio_core::ShutdownReceipt::default();
         self.shutdown = None;
         Ok(())
     }
@@ -148,6 +157,8 @@ impl Stream {
     ///
     /// Safe for reentry and repeated stop calls. After stop, drain chunks already buffered in the
     /// ring with [`poll_chunk`](Self::poll_chunk).
+    /// Failures remain available through checked stop and the shutdown report; unread failures
+    /// reach the process-wide failure receiver when the stream is dropped.
     pub fn stop(&mut self) {
         self.retain_shutdown_outcome();
     }
@@ -156,10 +167,15 @@ impl Stream {
     /// Repeated calls return the identical outcome without duplicate events, joins or tails.
     pub fn stop_checked(&mut self) -> Result<()> {
         self.retain_shutdown_outcome();
-        self.shutdown
+        let result = self
+            .shutdown
             .as_ref()
             .expect("completed stream shutdown")
-            .result()
+            .result();
+        if let Err(error) = &result {
+            self.shutdown_receipt.acknowledge_error(error);
+        }
+        result
     }
 
     // Explicit stop, checked stop and startup rollback share this retained report.
@@ -212,7 +228,10 @@ impl Stream {
     }
 
     /// Completed shutdown outcome, or None while capture has not finished shutting down.
+    /// Reading the report hands its failures to the caller and suppresses their Drop fallback.
     pub fn shutdown_report(&self) -> Option<ShutdownReport> {
-        self.shutdown.clone()
+        let report = self.shutdown.clone()?;
+        self.shutdown_receipt.acknowledge(&report);
+        Some(report)
     }
 }

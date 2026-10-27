@@ -14,11 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Rust `DeviceWatcher::stop_checked()` and `shutdown_report()` expose retained
+  teardown outcomes independently of polling, with identical repeated results.
 - Rust `Event::failure()` returns a typed failure from every failure-bearing event.
   Modern error payloads are borrowed; legacy variants synthesize owned errors,
   retaining legacy diagnostic text without exposing it in safe error display.
 - Rust `set_drop_failure_handler` installs a process-wide typed receiver for
-  failures first observed during implicit shutdown or after bounded queries
+  failures left unread at Drop or observed after bounded queries
   time out. `DropFailure` identifies the owner and retains its `ShutdownReport`.
   The default writes each failure to stderr; receiver panics fall back to stderr.
 - Rust `validate_open` exposes the same device-independent argument validation
@@ -86,6 +88,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Rust Drop fallback tracks failures actually handed to callers rather than
+  merely retained internally. Plain `stop()` followed by Drop reports unread
+  failures once; checked errors, returned failure events and public report reads
+  suppress repeats without hiding later distinct failures.
 - Node error-conversion failures preserve the original typed cause through the
   process receiver. Conversion status remains diagnostic context on that cause;
   ordinary queue and warning delivery failures retain their independent causes.

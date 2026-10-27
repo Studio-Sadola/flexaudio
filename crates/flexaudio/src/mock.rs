@@ -122,6 +122,7 @@ impl CaptureBackend for MockBackend {
             })?;
 
         self.handle = Some(handle);
+        self.shutdown.retire();
         self.shutdown = MockShutdown::default();
         Ok(())
     }
@@ -136,7 +137,7 @@ impl CaptureBackend for MockBackend {
     }
 
     fn poll_event(&mut self) -> Option<flexaudio_core::Event> {
-        self.shutdown.events.pop_front()
+        self.shutdown.poll_event()
     }
 }
 
@@ -257,6 +258,7 @@ impl CaptureBackend for StallableMockBackend {
             })?;
 
         self.handle = Some(handle);
+        self.shutdown.retire();
         self.shutdown = MockShutdown::default();
         Ok(())
     }
@@ -271,7 +273,7 @@ impl CaptureBackend for StallableMockBackend {
     }
 
     fn poll_event(&mut self) -> Option<flexaudio_core::Event> {
-        self.shutdown.events.pop_front()
+        self.shutdown.poll_event()
     }
 }
 
@@ -394,6 +396,7 @@ impl CaptureBackend for PanickingMockBackend {
             })?;
 
         self.handle = Some(handle);
+        self.shutdown.retire();
         self.shutdown = MockShutdown::default();
         Ok(())
     }
@@ -413,7 +416,7 @@ impl CaptureBackend for PanickingMockBackend {
     }
 
     fn poll_event(&mut self) -> Option<flexaudio_core::Event> {
-        self.shutdown.events.pop_front()
+        self.shutdown.poll_event()
     }
 }
 
@@ -531,6 +534,7 @@ impl CaptureBackend for StallThenPanicOnReopenBackend {
             })?;
 
         self.handle = Some(handle);
+        self.shutdown.retire();
         self.shutdown = MockShutdown::default();
         Ok(())
     }
@@ -545,7 +549,7 @@ impl CaptureBackend for StallThenPanicOnReopenBackend {
     }
 
     fn poll_event(&mut self) -> Option<flexaudio_core::Event> {
-        self.shutdown.events.pop_front()
+        self.shutdown.poll_event()
     }
 }
 
@@ -559,20 +563,21 @@ impl Drop for StallThenPanicOnReopenBackend {
 #[derive(Default)]
 struct MockShutdown {
     report: Option<crate::ShutdownReport>,
+    receipt: flexaudio_core::ShutdownReceipt,
     events: std::collections::VecDeque<flexaudio_core::Event>,
 }
 
 impl MockShutdown {
-    fn retain_drop(&mut self, running: &AtomicBool, handle: &mut Option<JoinHandle<()>>) {
-        let previous = self.report.clone();
-        self.retain(running, handle);
+    fn retire(&self) {
         if let Some(report) = &self.report {
-            flexaudio_core::report_drop_failures(
-                flexaudio_core::DropFailureOwner::MockCapture,
-                previous.as_ref(),
-                report,
-            );
+            self.receipt
+                .report_unobserved(flexaudio_core::DropFailureOwner::MockCapture, report);
         }
+    }
+
+    fn retain_drop(&mut self, running: &AtomicBool, handle: &mut Option<JoinHandle<()>>) {
+        self.retain(running, handle);
+        self.retire();
     }
     fn retain(&mut self, running: &AtomicBool, handle: &mut Option<JoinHandle<()>>) {
         running.store(false, Ordering::SeqCst);
@@ -594,10 +599,23 @@ impl MockShutdown {
     }
 
     fn result(&self) -> Result<()> {
-        self.report
+        let result = self
+            .report
             .as_ref()
             .expect("completed mock shutdown")
-            .result()
+            .result();
+        if let Err(error) = &result {
+            self.receipt.acknowledge_error(error);
+        }
+        result
+    }
+
+    fn poll_event(&mut self) -> Option<flexaudio_core::Event> {
+        let event = self.events.pop_front()?;
+        if let Some(error) = event.failure() {
+            self.receipt.acknowledge_error(&error);
+        }
+        Some(event)
     }
 }
 
@@ -675,3 +693,101 @@ stop_fixture!(
     StallThenPanicOnReopenBackend,
     StallThenPanicOnReopenBackend::new(48_000, 2, 0.0, Duration::ZERO)
 );
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn plain_stop_keeps_mock_failure_for_drop_but_typed_handoffs_do_not_repeat() {
+        const CHILD: &str = "FLEXAUDIO_MOCK_SHUTDOWN_RECEIPT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "mock::receipt_tests::plain_stop_keeps_mock_failure_for_drop_but_typed_handoffs_do_not_repeat",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = received.clone();
+        crate::set_drop_failure_handler(Some(Box::new(move |failure| {
+            output.lock().unwrap().push(failure.clone());
+        })));
+        for handoff in ["plain", "checked", "event"] {
+            macro_rules! exercise {
+                ($construct:expr) => {{
+                    let mut backend = $construct;
+                    backend.handle = Some(thread::spawn(|| panic!("injected mock join failure")));
+                    backend.stop();
+                    backend.stop();
+                    match handoff {
+                        "plain" => {}
+                        "checked" => assert!(backend.stop_checked().is_err()),
+                        "event" => assert!(matches!(
+                            backend.poll_event(),
+                            Some(flexaudio_core::Event::ShutdownError { .. })
+                        )),
+                        _ => unreachable!(),
+                    }
+                    drop(backend);
+                    let failures = std::mem::take(&mut *received.lock().unwrap());
+                    if handoff == "plain" {
+                        assert_eq!(failures.len(), 1);
+                        assert_eq!(failures[0].owner, crate::DropFailureOwner::MockCapture);
+                        assert_eq!(failures[0].report.cleanup().len(), 1);
+                        assert_eq!(
+                            failures[0].report.cleanup()[0],
+                            crate::Error::Backend("mock capture owner panicked".into())
+                                .with_context(crate::ErrorContext::new(crate::Operation::Join))
+                        );
+                    } else {
+                        assert!(failures.is_empty(), "{handoff}: {failures:?}");
+                    }
+                }};
+            }
+            exercise!(MockBackend::new(48_000, 2, 0.0));
+            exercise!(StallableMockBackend::new(48_000, 2, 0.0, Duration::ZERO));
+            exercise!(PanickingMockBackend::new(48_000, 2, 0.0, PanicMode::Start));
+            exercise!(StallThenPanicOnReopenBackend::new(
+                48_000,
+                2,
+                0.0,
+                Duration::ZERO
+            ));
+        }
+        // Restart the real generator with an in-memory sink; retirement must precede reset.
+        for checked in [false, true] {
+            let mut backend = MockBackend::new(48_000, 2, 0.0);
+            backend.handle = Some(thread::spawn(|| panic!("injected old generator failure")));
+            backend.stop();
+            let snapshot = backend.shutdown.report.clone().unwrap();
+            if checked {
+                assert!(backend.stop_checked().is_err());
+            }
+            let (producer, _consumer) = flexaudio_core::raw_ring(128);
+            backend.start(RawSink::new(producer, 48_000, 2)).unwrap();
+            assert!(backend.shutdown.report.is_none());
+            let failures = std::mem::take(&mut *received.lock().unwrap());
+            if checked {
+                assert!(failures.is_empty());
+            } else {
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].report, snapshot);
+            }
+            backend.stop_checked().unwrap();
+            drop(backend);
+            assert!(received.lock().unwrap().is_empty());
+        }
+        crate::set_drop_failure_handler(None);
+    }
+}

@@ -2,7 +2,7 @@
 
 use crate::{terminal_causes::retains_terminal_cause, Error, ShutdownReport};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Kind of owner that discovered a failure during implicit shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,13 +30,13 @@ pub enum DropFailureOwner {
     CapabilityProbe,
 }
 
-/// Typed failures first observed after an owner can no longer return them.
+/// Typed failures that an owner can no longer hand to its caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DropFailure {
     /// Owner that performed implicit cleanup (or an abandoned bounded query).
     pub owner: DropFailureOwner,
-    /// Newly observed failures, excluding values already retained before Drop.
+    /// Failures not previously handed to a caller or this receiver.
     pub report: ShutdownReport,
 }
 
@@ -45,14 +45,56 @@ pub type DropFailureHandler = dyn Fn(&DropFailure) + Send + Sync + 'static;
 
 static HANDLER: RwLock<Option<Arc<DropFailureHandler>>> = RwLock::new(None);
 
-/// Replace the process-wide receiver for failures first observed during Drop.
+/// Tracks failures actually handed to a caller or the process receiver.
+/// Internal cross-crate lifecycle support; no stability guarantee.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ShutdownReceipt {
+    handed_off: Mutex<Option<Error>>,
+}
+
+impl ShutdownReceipt {
+    /// Acknowledge only the typed failure returned to a caller.
+    pub fn acknowledge_error(&self, error: &Error) {
+        let mut handed_off = self.handed_off.lock().unwrap_or_else(|e| e.into_inner());
+        crate::terminal_causes::retain_terminal_cause(&mut handed_off, error.clone());
+    }
+
+    /// Acknowledge a complete report handed to a caller or retained by its parent owner.
+    pub fn acknowledge(&self, report: &ShutdownReport) {
+        let mut handed_off = self.handed_off.lock().unwrap_or_else(|e| e.into_inner());
+        for error in report.primary().into_iter().chain(report.cleanup()) {
+            crate::terminal_causes::retain_terminal_cause(&mut handed_off, error.clone());
+        }
+    }
+
+    /// Route only failures not previously handed off, claiming them before invoking the receiver.
+    pub fn report_unobserved(&self, owner: DropFailureOwner, report: &ShutdownReport) {
+        let previous = {
+            let mut handed_off = self.handed_off.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = handed_off
+                .clone()
+                .map(|error| ShutdownReport::new(Some(error), Vec::new()));
+            for error in report.primary().into_iter().chain(report.cleanup()) {
+                crate::terminal_causes::retain_terminal_cause(&mut handed_off, error.clone());
+            }
+            previous
+        };
+        // Receiver code may inspect its owner; never invoke it while holding the receipt lock.
+        report_drop_failures(owner, previous.as_ref(), report);
+    }
+}
+
+/// Replace the process-wide receiver for failures left unread during Drop.
 ///
 /// `None` restores the default: one line per failure on stderr. The receiver
 /// also receives late failures from bounded queries whose caller timed out.
 /// It runs synchronously on the owner/worker thread, without holding the global
 /// lock. A receiver panic is caught and the failures fall back to stderr.
-/// Explicit stop/finalize calls keep returning their own errors and do not
-/// report the same values again during Drop.
+/// Checked stop/finalize errors, returned failure events, and public shutdown
+/// report reads hand their failures to the caller and suppress repeated Drop
+/// reporting. A plain `stop()` with no returned error leaves unread failures
+/// eligible for the Drop receiver.
 pub fn set_drop_failure_handler(handler: Option<Box<DropFailureHandler>>) {
     let previous = {
         let mut slot = HANDLER.write().unwrap_or_else(|poison| poison.into_inner());
@@ -165,6 +207,64 @@ fn deliver(failure: &DropFailure, handler: Option<&DropFailureHandler>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_retains_distinct_handoffs_and_reports_only_unread_causes() {
+        const CHILD: &str = "FLEXAUDIO_SHUTDOWN_RECEIPT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["drop_failure::tests::receipt_retains_distinct_handoffs_and_reports_only_unread_causes", "--exact"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let receipt = Arc::new(ShutdownReceipt::default());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let output = observed.clone();
+        let inspect = receipt.clone();
+        set_drop_failure_handler(Some(Box::new(move |failure| {
+            // The receiver may inspect or acknowledge its owner's receipt without deadlocking.
+            assert!(inspect.handed_off.try_lock().is_ok());
+            output.lock().unwrap().push(failure.report.clone());
+        })));
+        receipt.acknowledge_error(&Error::DeviceLost);
+        let report = ShutdownReport::new(Some(Error::DeviceLost), vec![Error::Unsupported]);
+        receipt.report_unobserved(DropFailureOwner::Stream, &report);
+        receipt.report_unobserved(DropFailureOwner::Stream, &report);
+        let later = ShutdownReport::new(
+            Some(Error::DeviceLost),
+            vec![Error::Unsupported, Error::DeviceNotFound],
+        );
+        receipt.report_unobserved(DropFailureOwner::Stream, &later);
+        receipt.acknowledge(&later);
+        receipt.report_unobserved(DropFailureOwner::Stream, &later);
+        set_drop_failure_handler(None);
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [
+                ShutdownReport::new(None, vec![Error::Unsupported]),
+                ShutdownReport::new(None, vec![Error::DeviceNotFound]),
+            ]
+        );
+        crate::test_support::assert_distinct_failures_retained(
+            Error::DeviceLost,
+            Error::Unsupported,
+            |first, second| {
+                let receipt = ShutdownReceipt::default();
+                receipt.acknowledge_error(&first);
+                receipt.acknowledge_error(&second);
+                receipt.acknowledge_error(&first);
+                receipt.handed_off.into_inner().unwrap().unwrap()
+            },
+        );
+    }
 
     #[test]
     fn default_and_panicking_handler_never_unwind() {

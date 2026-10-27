@@ -34,16 +34,24 @@ pub fn capture_start_failures(
                     .recv()
                     .expect("fixture readiness receiver")
                     .expect_err("injected startup failure");
-                return Err(rollback_capture(
+                let error = rollback_capture(
                     failure,
                     thread::spawn(|| {}),
                     events,
                     &mut self.owner.events,
                     &mut self.owner.shutdown,
-                ));
+                    &self.owner.shutdown_receipt,
+                    flexaudio_core::DropFailureOwner::SystemCapture,
+                );
+                self.owner.shutdown_receipt.acknowledge_error(&error);
+                return Err(error);
             }
+            owner::retire_shutdown_report(
+                &mut self.owner.shutdown,
+                &mut self.owner.shutdown_receipt,
+                flexaudio_core::DropFailureOwner::SystemCapture,
+            );
             self.owner.events = events;
-            self.owner.shutdown = None;
             Ok(())
         }
         fn stop(&mut self) {
@@ -256,6 +264,7 @@ fn fixture(phase: Phase) -> (Fixture, bool, bool) {
                         .then(dropped_receiver_sender),
                     handle: Some(handle),
                     shutdown: None,
+                    shutdown_receipt: Default::default(),
                 }),
                 terminal,
                 false,
@@ -313,6 +322,8 @@ pub fn check_system(observe: fn(&PwSystemBackend)) {
             BackendEvents::default(),
             &mut owner.events,
             &mut owner.shutdown,
+            &owner.shutdown_receipt,
+            flexaudio_core::DropFailureOwner::SystemCapture,
         ),
         Error::DeviceNotFound
     );
@@ -336,6 +347,8 @@ pub fn check_process(observe: fn(&PwProcessBackend)) {
             BackendEvents::default(),
             &mut owner.events,
             &mut owner.shutdown,
+            &owner.shutdown_receipt,
+            flexaudio_core::DropFailureOwner::ProcessCapture,
         ),
         Error::DeviceNotFound
     );
@@ -371,6 +384,182 @@ mod tests {
     use super::*;
 
     #[test]
+    fn owner_drop_reports_only_failures_without_a_typed_handoff() {
+        const CHILD: &str = "FLEXAUDIO_LINUX_SHUTDOWN_RECEIPT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "test_support::tests::owner_drop_reports_only_failures_without_a_typed_handoff",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let output = received.clone();
+        flexaudio_core::set_drop_failure_handler(Some(Box::new(move |failure| {
+            output.lock().unwrap().push(failure.clone());
+        })));
+        for phase in [
+            Phase::SystemTerminalAndJoin,
+            Phase::ProcessTerminalAndJoin,
+            Phase::WatcherTerminalAndJoin,
+        ] {
+            for handoff in ["plain", "checked", "report", "events"] {
+                let mut owner = fixture(phase).0;
+                owner.stop();
+                owner.stop();
+                let snapshot = match &owner {
+                    Fixture::System(owner) => owner.shutdown.clone(),
+                    Fixture::Process(owner) => owner.shutdown.clone(),
+                    Fixture::Watcher(owner) => owner.shutdown.clone(),
+                }
+                .unwrap();
+                match handoff {
+                    "plain" => {}
+                    "checked" => assert_eq!(owner.stop_checked(), snapshot.result()),
+                    "report" => assert_eq!(owner.report(), &snapshot),
+                    "events" => match &mut owner {
+                        Fixture::System(owner) => while owner.poll_event().is_some() {},
+                        Fixture::Process(owner) => while owner.poll_event().is_some() {},
+                        Fixture::Watcher(owner) => while owner.poll_event().is_some() {},
+                    },
+                    _ => unreachable!(),
+                }
+                drop(owner);
+                let failures = std::mem::take(&mut *received.lock().unwrap());
+                if handoff == "plain" {
+                    assert_eq!(failures.len(), 1);
+                    assert_eq!(failures[0].report, snapshot);
+                    flexaudio_core::test_support::assert_distinct_failures_retained(
+                        snapshot.primary().unwrap().clone(),
+                        snapshot.cleanup()[0].clone(),
+                        |_, _| failures[0].report.result().unwrap_err(),
+                    );
+                } else {
+                    assert!(failures.is_empty(), "{handoff}: {failures:?}");
+                }
+            }
+        }
+        // Returning capture A before shutdown must not acknowledge the later join failure B.
+        for phase in [
+            Phase::SystemConsumedTerminalAndJoin,
+            Phase::ProcessConsumedTerminalAndJoin,
+        ] {
+            let mut owner = fixture(phase).0;
+            owner.consume_terminal();
+            owner.stop();
+            drop(owner);
+            let failures = std::mem::take(&mut *received.lock().unwrap());
+            assert_eq!(failures.len(), 1);
+            assert!(failures[0].report.primary().is_none());
+            assert_eq!(failures[0].report.cleanup().len(), 1);
+            assert_eq!(
+                failures[0].report.cleanup()[0],
+                Error::Backend("pipewire worker panicked".into())
+                    .with_context(ErrorContext::new(Operation::Join)),
+            );
+        }
+        // Use the same retirement helper as successful native startup, without opening PipeWire.
+        for phase in [Phase::SystemTerminalAndJoin, Phase::ProcessTerminalAndJoin] {
+            for checked in [false, true] {
+                let mut owner = fixture(phase).0;
+                owner.stop();
+                if checked {
+                    assert!(owner.stop_checked().is_err());
+                }
+                let snapshot = match &owner {
+                    Fixture::System(owner) => owner.shutdown.clone(),
+                    Fixture::Process(owner) => owner.shutdown.clone(),
+                    Fixture::Watcher(_) => unreachable!(),
+                }
+                .unwrap();
+                match &mut owner {
+                    Fixture::System(owner) => owner::retire_shutdown_report(
+                        &mut owner.shutdown,
+                        &mut owner.shutdown_receipt,
+                        flexaudio_core::DropFailureOwner::SystemCapture,
+                    ),
+                    Fixture::Process(owner) => owner::retire_shutdown_report(
+                        &mut owner.shutdown,
+                        &mut owner.shutdown_receipt,
+                        flexaudio_core::DropFailureOwner::ProcessCapture,
+                    ),
+                    Fixture::Watcher(_) => unreachable!(),
+                }
+                let failures = std::mem::take(&mut *received.lock().unwrap());
+                if checked {
+                    assert!(failures.is_empty());
+                } else {
+                    assert_eq!(failures.len(), 1);
+                    assert_eq!(failures[0].report, snapshot);
+                }
+                // Equal values observed in the new generation require a fresh handoff.
+                match &mut owner {
+                    Fixture::System(owner) => {
+                        assert!(owner.shutdown.is_none());
+                        owner.shutdown = Some(snapshot.clone());
+                    }
+                    Fixture::Process(owner) => {
+                        assert!(owner.shutdown.is_none());
+                        owner.shutdown = Some(snapshot.clone());
+                    }
+                    Fixture::Watcher(_) => unreachable!(),
+                }
+                drop(owner);
+                let failures = std::mem::take(&mut *received.lock().unwrap());
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].report, snapshot);
+            }
+        }
+        // Failed restart returns B without retiring the stopped generation's unread A silently.
+        for checked in [false, true] {
+            let mut owner = fixture(Phase::SystemTerminalAndJoin).0;
+            owner.stop();
+            if checked {
+                assert!(owner.stop_checked().is_err());
+            }
+            let Fixture::System(mut owner) = owner else {
+                unreachable!()
+            };
+            let previous = owner.shutdown.clone().unwrap();
+            assert_eq!(previous.primary(), Some(&Error::DeviceLost));
+            let returned = rollback_capture(
+                Error::Unsupported,
+                thread::spawn(|| {}),
+                BackendEvents::default(),
+                &mut owner.events,
+                &mut owner.shutdown,
+                &owner.shutdown_receipt,
+                flexaudio_core::DropFailureOwner::SystemCapture,
+            );
+            owner.shutdown_receipt.acknowledge_error(&returned);
+            assert_eq!(
+                Err(returned),
+                ShutdownReport::new(Some(Error::Unsupported), previous.cleanup().to_vec()).result(),
+            );
+            let failures = std::mem::take(&mut *received.lock().unwrap());
+            if checked {
+                assert!(failures.is_empty());
+            } else {
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].report, previous);
+            }
+            drop(owner);
+            assert!(received.lock().unwrap().is_empty());
+        }
+        flexaudio_core::set_drop_failure_handler(None);
+    }
+
+    #[test]
     fn system_shutdown_retains_primary_and_join_cleanup() {
         check_system(|_| {});
     }
@@ -398,6 +587,8 @@ mod tests {
             Arc::new(Mutex::new(Default::default())),
             &mut owner.events,
             &mut owner.shutdown,
+            &owner.shutdown_receipt,
+            flexaudio_core::DropFailureOwner::SystemCapture,
         );
         let report = owner
             .shutdown_report()

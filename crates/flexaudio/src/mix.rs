@@ -64,6 +64,7 @@ pub(crate) struct CompositeBackend {
     mic_owned: bool,
     system_owned: bool,
     shutdown: Option<ShutdownReport>,
+    receipt: flexaudio_core::ShutdownReceipt,
     poll_system_first: bool,
     poll_notices: bool,
 }
@@ -86,6 +87,7 @@ impl CompositeBackend {
             mic_owned: false,
             system_owned: false,
             shutdown: None,
+            receipt: flexaudio_core::ShutdownReceipt::default(),
             poll_system_first: false,
             poll_notices: false,
         }
@@ -198,98 +200,115 @@ impl CaptureBackend for CompositeBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
-        if self.mixer.is_some() {
-            return Ok(());
-        }
-        let previous_report = self.shutdown.take();
-        let previous_notices = std::mem::replace(&mut self.notices, Arc::new(Notices::default()));
-        for event in previous_notices.take_lifecycle() {
-            self.notices.queue_final(event);
-        }
-        self.stopping = Arc::new(AtomicBool::new(false));
-        let started = (|| {
-            let mut mic = start_child(&mut self.mic, MixLane::Microphone, self.notices.clone())?;
-            self.mic_owned = true;
-            let system =
-                match start_child(&mut self.system, MixLane::SystemAudio, self.notices.clone()) {
-                    Ok(system) => system,
-                    Err(error) => {
-                        self.set_helper_stop_reason(
-                            flexaudio_core::HelperStopReason::StartupFailed,
-                        );
-                        self.stop_producers();
-                        if let Err(error) = mic.losses() {
-                            self.notices.cleanup(error);
-                        }
-                        return Err(error);
-                    }
-                };
-            self.system_owned = true;
-            let stopping = self.stopping.clone();
-            let notices = self.notices.clone();
-            let mic_gain = self.mic_gain;
-            let system_gain = self.system_gain;
-            // Retain consumers outside the spawn closure until the worker owns
-            // them, so failed spawn rollback can still drain final diagnostics.
-            let lanes = Arc::new(Mutex::new(Some((mic, system))));
-            let worker_lanes = lanes.clone();
-            let mixer = match thread::Builder::new()
-                .name("flexaudio-mix".into())
-                .spawn(move || {
-                    let (mic, system) = worker_lanes
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .take()
-                        .expect("mixer lanes have one owner");
-                    run_mixer(mic, system, mic_gain, system_gain, sink, stopping, notices)
-                }) {
-                Ok(mixer) => mixer,
-                Err(error) => {
-                    let error = Error::Backend(format!("spawn mix thread: {error}"))
-                        .with_context(ErrorContext::new(Operation::Start));
-                    self.set_helper_stop_reason(flexaudio_core::HelperStopReason::StartupFailed);
-                    self.stop_producers();
-                    if let Some((mut mic, mut system)) =
-                        lanes.lock().unwrap_or_else(|e| e.into_inner()).take()
+        let result = (|| {
+            if self.mixer.is_some() {
+                return Ok(());
+            }
+            let previous_report = self.shutdown.take();
+            let previous_notices =
+                std::mem::replace(&mut self.notices, Arc::new(Notices::default()));
+            for event in previous_notices.take_lifecycle() {
+                self.notices.queue_final(event);
+            }
+            self.stopping = Arc::new(AtomicBool::new(false));
+            let started = (|| {
+                let mut mic =
+                    start_child(&mut self.mic, MixLane::Microphone, self.notices.clone())?;
+                self.mic_owned = true;
+                let system =
+                    match start_child(&mut self.system, MixLane::SystemAudio, self.notices.clone())
                     {
-                        for lane in [&mut mic, &mut system] {
-                            if let Err(error) = lane.losses() {
+                        Ok(system) => system,
+                        Err(error) => {
+                            self.set_helper_stop_reason(
+                                flexaudio_core::HelperStopReason::StartupFailed,
+                            );
+                            self.stop_producers();
+                            if let Err(error) = mic.losses() {
                                 self.notices.cleanup(error);
                             }
+                            return Err(error);
                         }
+                    };
+                self.system_owned = true;
+                let stopping = self.stopping.clone();
+                let notices = self.notices.clone();
+                let mic_gain = self.mic_gain;
+                let system_gain = self.system_gain;
+                // Retain consumers outside the spawn closure until the worker owns
+                // them, so failed spawn rollback can still drain final diagnostics.
+                let lanes = Arc::new(Mutex::new(Some((mic, system))));
+                let worker_lanes = lanes.clone();
+                let mixer =
+                    match thread::Builder::new()
+                        .name("flexaudio-mix".into())
+                        .spawn(move || {
+                            let (mic, system) = worker_lanes
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .take()
+                                .expect("mixer lanes have one owner");
+                            run_mixer(mic, system, mic_gain, system_gain, sink, stopping, notices)
+                        }) {
+                        Ok(mixer) => mixer,
+                        Err(error) => {
+                            let error = Error::Backend(format!("spawn mix thread: {error}"))
+                                .with_context(ErrorContext::new(Operation::Start));
+                            self.set_helper_stop_reason(
+                                flexaudio_core::HelperStopReason::StartupFailed,
+                            );
+                            self.stop_producers();
+                            if let Some((mut mic, mut system)) =
+                                lanes.lock().unwrap_or_else(|e| e.into_inner()).take()
+                            {
+                                for lane in [&mut mic, &mut system] {
+                                    if let Err(error) = lane.losses() {
+                                        self.notices.cleanup(error);
+                                    }
+                                }
+                            }
+                            return Err(error);
+                        }
+                    };
+                self.mixer = Some(mixer);
+                Ok(())
+            })();
+            if let Err(error) = started {
+                self.set_helper_stop_reason(flexaudio_core::HelperStopReason::StartupFailed);
+                self.retain_shutdown_outcome();
+                let attempt = self.shutdown.as_ref().expect("rollback retained report");
+                let result = ShutdownReport::new(Some(error), attempt.cleanup().to_vec()).result();
+                if let Some(previous_report) = previous_report {
+                    // A failed acquisition keeps the previous primary and every newly
+                    // observed cleanup, even when restoring the previous generation.
+                    let attempt = self.shutdown.as_ref().expect("rollback retained report");
+                    let mut cleanup = previous_report.cleanup().to_vec();
+                    cleanup.extend_from_slice(attempt.cleanup());
+                    for error in attempt.cleanup() {
+                        previous_notices.cleanup(error.clone());
                     }
-                    return Err(error);
+                    self.shutdown = Some(ShutdownReport::new(
+                        previous_report.primary().cloned(),
+                        cleanup,
+                    ));
+                    for event in self.notices.take_lifecycle() {
+                        previous_notices.queue_final(event);
+                    }
+                    self.notices = previous_notices;
                 }
-            };
-            self.mixer = Some(mixer);
+                return result;
+            }
+            if let Some(report) = &previous_report {
+                self.receipt
+                    .report_unobserved(flexaudio_core::DropFailureOwner::Mix, report);
+            }
+            self.receipt = flexaudio_core::ShutdownReceipt::default();
             Ok(())
         })();
-        if let Err(error) = started {
-            self.set_helper_stop_reason(flexaudio_core::HelperStopReason::StartupFailed);
-            self.retain_shutdown_outcome();
-            let attempt = self.shutdown.as_ref().expect("rollback retained report");
-            let result = ShutdownReport::new(Some(error), attempt.cleanup().to_vec()).result();
-            if let Some(previous_report) = previous_report {
-                // A failed acquisition keeps the previous primary and every newly
-                // observed cleanup, even when restoring the previous generation.
-                let attempt = self.shutdown.as_ref().expect("rollback retained report");
-                let mut cleanup = previous_report.cleanup().to_vec();
-                cleanup.extend_from_slice(attempt.cleanup());
-                for error in attempt.cleanup() {
-                    previous_notices.cleanup(error.clone());
-                }
-                self.shutdown = Some(ShutdownReport::new(
-                    previous_report.primary().cloned(),
-                    cleanup,
-                ));
-                for event in self.notices.take_lifecycle() {
-                    previous_notices.queue_final(event);
-                }
-                self.notices = previous_notices;
-            }
-            return result;
+        if let Err(error) = &result {
+            self.receipt.acknowledge_error(error);
         }
-        Ok(())
+        result
     }
 
     fn stop(&mut self) {
@@ -302,49 +321,57 @@ impl CaptureBackend for CompositeBackend {
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.retain_shutdown_outcome();
-        self.shutdown
-            .as_ref()
-            .expect("completed mix shutdown")
-            .result()
+        let result = {
+            self.retain_shutdown_outcome();
+            self.shutdown
+                .as_ref()
+                .expect("completed mix shutdown")
+                .result()
+        };
+        if let Err(error) = &result {
+            self.receipt.acknowledge_error(error);
+        }
+        result
     }
 
     fn poll_event(&mut self) -> Option<Event> {
-        // Old-generation final notices precede a new child's lifecycle mailbox.
-        if let Some(event) = self.notices.poll_lifecycle() {
-            return Some(event);
-        }
-        if let Some(event) = self.notices.take_terminal() {
-            return Some(event);
-        }
-        self.poll_notices = !self.poll_notices;
-        if self.poll_notices {
-            if let Some(event) = self.notices.poll() {
+        let result = (|| {
+            // Old-generation final notices precede a new child's lifecycle mailbox.
+            if let Some(event) = self.notices.poll_lifecycle() {
                 return Some(event);
             }
+            if let Some(event) = self.notices.take_terminal() {
+                return Some(event);
+            }
+            self.poll_notices = !self.poll_notices;
+            if self.poll_notices {
+                if let Some(event) = self.notices.poll() {
+                    return Some(event);
+                }
+            }
+            self.poll_system_first = !self.poll_system_first;
+            let (first, second) = if self.poll_system_first {
+                (MixLane::SystemAudio, MixLane::Microphone)
+            } else {
+                (MixLane::Microphone, MixLane::SystemAudio)
+            };
+            self.poll_child(first)
+                .or_else(|| self.poll_child(second))
+                .or_else(|| self.notices.poll())
+        })();
+        if let Some(error) = result.as_ref().and_then(Event::failure) {
+            self.receipt.acknowledge_error(&error);
         }
-        self.poll_system_first = !self.poll_system_first;
-        let (first, second) = if self.poll_system_first {
-            (MixLane::SystemAudio, MixLane::Microphone)
-        } else {
-            (MixLane::Microphone, MixLane::SystemAudio)
-        };
-        self.poll_child(first)
-            .or_else(|| self.poll_child(second))
-            .or_else(|| self.notices.poll())
+        result
     }
 }
 
 impl Drop for CompositeBackend {
     fn drop(&mut self) {
-        let previous = self.shutdown.clone();
         self.stop();
         if let Some(report) = &self.shutdown {
-            flexaudio_core::report_drop_failures(
-                flexaudio_core::DropFailureOwner::Mix,
-                previous.as_ref(),
-                report,
-            );
+            self.receipt
+                .report_unobserved(flexaudio_core::DropFailureOwner::Mix, report);
         }
     }
 }

@@ -118,6 +118,7 @@ pub struct CpalMicBackend {
     /// Runtime failures are materialized on the control thread, never the callback.
     callback_errors: Arc<callback_mailbox::CallbackMailbox>,
     shutdown: Option<ShutdownReport>,
+    receipt: flexaudio_core::ShutdownReceipt,
     pending_events: VecDeque<Event>,
 }
 
@@ -189,12 +190,16 @@ impl CpalMicBackend {
             query_error: None,
             callback_errors,
             shutdown: None,
+            receipt: flexaudio_core::ShutdownReceipt::default(),
             pending_events: VecDeque::new(),
         }
     }
 
     /// Completed stop outcome, retained independently of event polling.
     pub fn shutdown_report(&self) -> Option<&ShutdownReport> {
+        if let Some(report) = &self.shutdown {
+            self.receipt.acknowledge(report);
+        }
         self.shutdown.as_ref()
     }
 
@@ -240,7 +245,18 @@ impl CpalMicBackend {
         previous_shutdown: Option<ShutdownReport>,
     ) -> Result<()> {
         match readiness {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(report) = &previous_shutdown {
+                    self.receipt
+                        .report_unobserved(flexaudio_core::DropFailureOwner::Microphone, report);
+                }
+                // Pending failures belong to the retired owner.
+                // New capture callbacks remain in the fresh mailbox until reconciliation.
+                self.pending_events
+                    .retain(|event| event.failure().is_none());
+                self.receipt = flexaudio_core::ShutdownReceipt::default();
+                Ok(())
+            }
             Err(error) => {
                 let current_cleanup = self.stop_owner(OwnerStopPhase::Startup);
                 if let Error::NativeFormatChanged { actual, .. } = &error {
@@ -454,51 +470,57 @@ impl CaptureBackend for CpalMicBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
-        self.reconcile_events();
-        if let Some(error) = self.terminal_error.as_ref() {
-            return Err(error.clone());
-        }
-        if let Some(error) = self.query_error.as_ref() {
-            return Err(error.clone());
-        }
-        // Do nothing if the owner thread is already alive (safe for repeated start calls).
-        if self.handle.is_some() {
-            return Ok(());
-        }
-        // Each owner receives a fresh stop flag and callback mailbox, so old
-        // callback failures cannot close PCM on a later generation.
-        self.stop_flag = Arc::new(AtomicBool::new(false));
-        self.callback_errors = Arc::new(callback_mailbox::CallbackMailbox::new(
-            self.stop_flag.clone(),
-        ));
+        let result = (|| {
+            self.reconcile_events();
+            if let Some(error) = self.terminal_error.as_ref() {
+                return Err(error.clone());
+            }
+            if let Some(error) = self.query_error.as_ref() {
+                return Err(error.clone());
+            }
+            // Do nothing if the owner thread is already alive (safe for repeated start calls).
+            if self.handle.is_some() {
+                return Ok(());
+            }
+            // Each owner receives a fresh stop flag and callback mailbox, so old
+            // callback failures cannot close PCM on a later generation.
+            self.stop_flag = Arc::new(AtomicBool::new(false));
+            self.callback_errors = Arc::new(callback_mailbox::CallbackMailbox::new(
+                self.stop_flag.clone(),
+            ));
 
-        let stop_flag = self.stop_flag.clone();
-        // cpal::Device is !Send, so pass only the device_id string and resolve it on the thread.
-        let device_id = self.device_id.clone();
-        let callback_errors = self.callback_errors.clone();
-        // Ready channel reports build/play success or failure from the owner thread to start().
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+            let stop_flag = self.stop_flag.clone();
+            // cpal::Device is !Send, so pass only the device_id string and resolve it on the thread.
+            let device_id = self.device_id.clone();
+            let callback_errors = self.callback_errors.clone();
+            // Ready channel reports build/play success or failure from the owner thread to start().
+            let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
 
-        let handle = thread::Builder::new()
-            .name("flexaudio-mic-cpal".into())
-            .spawn(move || {
-                capture_owner::run(sink, device_id, stop_flag, ready_tx, callback_errors);
-            })
-            .map_err(|e| {
-                self.stop_flag.store(true, Ordering::SeqCst);
-                flexaudio_core::spawn_error("CPAL microphone capture owner", e)
-            })?;
-        self.handle = Some(handle);
-        let previous_shutdown = self.shutdown.take();
+            let handle = thread::Builder::new()
+                .name("flexaudio-mic-cpal".into())
+                .spawn(move || {
+                    capture_owner::run(sink, device_id, stop_flag, ready_tx, callback_errors);
+                })
+                .map_err(|e| {
+                    self.stop_flag.store(true, Ordering::SeqCst);
+                    flexaudio_core::spawn_error("CPAL microphone capture owner", e)
+                })?;
+            self.handle = Some(handle);
+            let previous_shutdown = self.shutdown.take();
 
-        // Wait for the owner thread to build and play the stream.
-        let readiness = ready_rx.recv().unwrap_or_else(|_| {
-            Err(
-                Error::Backend("cpal mic thread exited before reporting readiness".into())
-                    .with_context(ErrorContext::new(Operation::Start)),
-            )
-        });
-        self.complete_start(readiness, previous_shutdown)
+            // Wait for the owner thread to build and play the stream.
+            let readiness = ready_rx.recv().unwrap_or_else(|_| {
+                Err(
+                    Error::Backend("cpal mic thread exited before reporting readiness".into())
+                        .with_context(ErrorContext::new(Operation::Start)),
+                )
+            });
+            self.complete_start(readiness, previous_shutdown)
+        })();
+        if let Err(error) = &result {
+            self.receipt.acknowledge_error(error);
+        }
+        result
     }
 
     fn stop(&mut self) {
@@ -506,29 +528,37 @@ impl CaptureBackend for CpalMicBackend {
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.retain_shutdown_outcome();
-        self.shutdown
-            .as_ref()
-            .expect("stop retains its report")
-            .result()
+        let result = {
+            self.retain_shutdown_outcome();
+            self.shutdown
+                .as_ref()
+                .expect("stop retains its report")
+                .result()
+        };
+        if let Err(error) = &result {
+            self.receipt.acknowledge_error(error);
+        }
+        result
     }
 
     fn poll_event(&mut self) -> Option<Event> {
-        self.reconcile_events();
-        self.pending_events.pop_front()
+        let result = {
+            self.reconcile_events();
+            self.pending_events.pop_front()
+        };
+        if let Some(error) = result.as_ref().and_then(Event::failure) {
+            self.receipt.acknowledge_error(&error);
+        }
+        result
     }
 }
 
 impl Drop for CpalMicBackend {
     fn drop(&mut self) {
-        let previous = self.shutdown.clone();
         self.stop();
         if let Some(report) = &self.shutdown {
-            flexaudio_core::report_drop_failures(
-                flexaudio_core::DropFailureOwner::Microphone,
-                previous.as_ref(),
-                report,
-            );
+            self.receipt
+                .report_unobserved(flexaudio_core::DropFailureOwner::Microphone, report);
         }
     }
 }

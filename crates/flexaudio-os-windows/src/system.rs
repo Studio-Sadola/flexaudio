@@ -102,6 +102,7 @@ pub struct WasapiSystemBackend {
     /// Last failed checked format query, retained across the legacy format getter.
     query_error: RefCell<Option<Error>>,
     shutdown: OwnerShutdown,
+    receipt: flexaudio_core::ShutdownReceipt,
     /// Last queried format, refreshed before constructing each classic-loopback sink.
     /// While running, retain the format with which that sink was configured.
     native: Cell<(u32, u16)>,
@@ -134,6 +135,7 @@ impl WasapiSystemBackend {
             pending_error: None,
             query_error: RefCell::new(None),
             shutdown: OwnerShutdown::default(),
+            receipt: flexaudio_core::ShutdownReceipt::default(),
             native: Cell::new(if exclude_self {
                 PROCESS_LOOPBACK_FORMAT
             } else {
@@ -475,83 +477,96 @@ impl CaptureBackend for WasapiSystemBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
-        let request = self.exclude_root();
-        // Safe on duplicate start: do nothing if the thread is already running.
-        if self.handle.is_some() {
-            return request.map(|_| ());
-        }
-        let exclude_root = crate::format::check_start_failures(
-            &mut self.pending_error,
-            &self.query_error,
-            request,
-        )?;
-        if exclude_root.is_some() {
-            verify_format(
-                PROCESS_LOOPBACK_FORMAT,
-                (sink.native_rate(), sink.native_channels()),
+        let result = (|| {
+            let request = self.exclude_root();
+            // Safe on duplicate start: do nothing if the thread is already running.
+            if self.handle.is_some() {
+                return request.map(|_| ());
+            }
+            let exclude_root = crate::format::check_start_failures(
+                &mut self.pending_error,
+                &self.query_error,
+                request,
             )?;
+            if exclude_root.is_some() {
+                verify_format(
+                    PROCESS_LOOPBACK_FORMAT,
+                    (sink.native_rate(), sink.native_channels()),
+                )?;
+            }
+            // Reset the flag so start can run again after a previous stop.
+            self.stop_flag.store(false, Ordering::SeqCst);
+            self.shutdown.cleanup = CleanupLedger::default();
+            let cleanup = self.shutdown.cleanup.clone();
+
+            let stop_flag = self.stop_flag.clone();
+            let device_id = self.device_id.clone();
+            let helper_stop_reason = self.helper_stop_reason.clone();
+            *helper_stop_reason
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                flexaudio_core::HelperStopReason::StreamStopped;
+            let keepalive = KeepaliveConfig {
+                enabled: self.classic_loopback_keepalive,
+                stop_reason: helper_stop_reason,
+                cleanup,
+            };
+            // Channel for synchronously returning setup status (COM init through successful Start).
+            let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+            let (event_tx, event_rx) = mpsc::channel();
+
+            let handle = thread::Builder::new()
+                .name("flexaudio-wasapi-system".into())
+                .spawn(move || {
+                    run_system_thread(
+                        exclude_root,
+                        device_id,
+                        keepalive,
+                        sink,
+                        stop_flag,
+                        ready_tx,
+                        event_tx,
+                    )
+                })
+                .map_err(|error| {
+                    self.stop_flag.store(true, Ordering::SeqCst);
+                    flexaudio_core::spawn_error("WASAPI system capture owner", error)
+                })?;
+
+            match ready_rx.recv() {
+                Ok(Ok(())) => {
+                    self.handle = Some(handle);
+                    if let Some(report) = &self.shutdown.report {
+                        self.receipt.report_unobserved(
+                            flexaudio_core::DropFailureOwner::SystemCapture,
+                            report,
+                        );
+                    }
+                    self.shutdown.reset(event_rx);
+                    self.receipt = flexaudio_core::ShutdownReceipt::default();
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    self.shutdown.retain_capture_events(event_rx);
+                    // Setup failed. Join because the thread exits just after sending ready.
+                    self.stop_flag.store(true, Ordering::SeqCst);
+                    self.shutdown.retain_start_failure(e, handle)
+                }
+                Err(_) => {
+                    self.shutdown.retain_capture_events(event_rx);
+                    self.stop_flag.store(true, Ordering::SeqCst);
+                    self.shutdown.retain_start_failure(
+                        Error::Backend("capture owner exited before reporting readiness".into())
+                            .with_context(ErrorContext::new(Operation::Start)),
+                        handle,
+                    )
+                }
+            }
+        })();
+        if let Err(error) = &result {
+            self.receipt.acknowledge_error(error);
         }
-        // Reset the flag so start can run again after a previous stop.
-        self.stop_flag.store(false, Ordering::SeqCst);
-        self.shutdown.cleanup = CleanupLedger::default();
-        let cleanup = self.shutdown.cleanup.clone();
-
-        let stop_flag = self.stop_flag.clone();
-        let device_id = self.device_id.clone();
-        let helper_stop_reason = self.helper_stop_reason.clone();
-        *helper_stop_reason
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) =
-            flexaudio_core::HelperStopReason::StreamStopped;
-        let keepalive = KeepaliveConfig {
-            enabled: self.classic_loopback_keepalive,
-            stop_reason: helper_stop_reason,
-            cleanup,
-        };
-        // Channel for synchronously returning setup status (COM init through successful Start).
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
-        let (event_tx, event_rx) = mpsc::channel();
-
-        let handle = thread::Builder::new()
-            .name("flexaudio-wasapi-system".into())
-            .spawn(move || {
-                run_system_thread(
-                    exclude_root,
-                    device_id,
-                    keepalive,
-                    sink,
-                    stop_flag,
-                    ready_tx,
-                    event_tx,
-                )
-            })
-            .map_err(|error| {
-                self.stop_flag.store(true, Ordering::SeqCst);
-                flexaudio_core::spawn_error("WASAPI system capture owner", error)
-            })?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => {
-                self.handle = Some(handle);
-                self.shutdown.reset(event_rx);
-                Ok(())
-            }
-            Ok(Err(e)) => {
-                self.shutdown.retain_capture_events(event_rx);
-                // Setup failed. Join because the thread exits just after sending ready.
-                self.stop_flag.store(true, Ordering::SeqCst);
-                self.shutdown.retain_start_failure(e, handle)
-            }
-            Err(_) => {
-                self.shutdown.retain_capture_events(event_rx);
-                self.stop_flag.store(true, Ordering::SeqCst);
-                self.shutdown.retain_start_failure(
-                    Error::Backend("capture owner exited before reporting readiness".into())
-                        .with_context(ErrorContext::new(Operation::Start)),
-                    handle,
-                )
-            }
-        }
+        result
     }
 
     fn stop(&mut self) {
@@ -566,25 +581,31 @@ impl CaptureBackend for WasapiSystemBackend {
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.retain_shutdown_outcome();
-        self.shutdown.result()
+        let result = {
+            self.retain_shutdown_outcome();
+            self.shutdown.result()
+        };
+        if let Err(error) = &result {
+            self.receipt.acknowledge_error(error);
+        }
+        result
     }
 
     fn poll_event(&mut self) -> Option<Event> {
-        self.shutdown.poll_event()
+        let result = self.shutdown.poll_event();
+        if let Some(error) = result.as_ref().and_then(Event::failure) {
+            self.receipt.acknowledge_error(&error);
+        }
+        result
     }
 }
 
 impl Drop for WasapiSystemBackend {
     fn drop(&mut self) {
-        let previous = self.shutdown.report.clone();
         self.stop();
         if let Some(report) = &self.shutdown.report {
-            flexaudio_core::report_drop_failures(
-                flexaudio_core::DropFailureOwner::SystemCapture,
-                previous.as_ref(),
-                report,
-            );
+            self.receipt
+                .report_unobserved(flexaudio_core::DropFailureOwner::SystemCapture, report);
         }
     }
 }

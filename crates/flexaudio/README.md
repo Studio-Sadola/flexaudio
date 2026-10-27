@@ -18,10 +18,12 @@ stream.stop();
 
 Use `stop_checked()` to handle capture and cleanup failures directly; the
 completed `ShutdownReport` remains available from `shutdown_report()`. Failures
-first observed during Drop reach the process-wide `set_drop_failure_handler`
+left unread when an owner is dropped reach the process-wide `set_drop_failure_handler`
 receiver as a typed `DropFailure` with an owner kind and report. The default
 writes one line per failure to stderr; a handler panic falls back to stderr.
-Explicitly stopped owners do not report the same failures again during Drop.
+Plain `stop()` retains failures without handing them to the caller, so Drop still
+reports them once. Returned checked errors, failure events and public report reads
+acknowledge only the failures actually handed off and suppress their Drop fallback.
 Late failures from bounded queries whose callers timed out use the same receiver.
 
 ## Capability matrix
@@ -47,6 +49,8 @@ Use `AudioChunk::new(data, frames)`, `DeviceInfo::new(id, name, source_kind)` or
   `devices()`. Microphone and default-microphone changes are not reported: CPAL
   microphone IDs cannot be resolved from PipeWire nodes. Windows/macOS return a
   no-op watcher.
+  `DeviceWatcher::stop_checked()` returns the retained outcome identically on
+  repeated calls; `shutdown_report()` returns the completed report after stop.
   Discovery returns a complete inventory or an error, including when PipeWire is
   unavailable. Linux microphone entries use only CPAL device-name IDs; PipeWire
   source-node IDs are omitted because the microphone backend cannot open them.

@@ -3,6 +3,56 @@ use super::*;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 
+#[test]
+fn successful_restart_reports_unread_cleanup_and_resets_receipt() {
+    const CHILD: &str = "FLEXAUDIO_MIX_RESTART_RECEIPT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "mix::contract_tests::successful_restart_reports_unread_cleanup_and_resets_receipt",
+                "--exact",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let output = received.clone();
+    flexaudio_core::set_drop_failure_handler(Some(Box::new(move |failure| {
+        output.lock().unwrap().push(failure.clone());
+    })));
+    for acknowledged in [false, true] {
+        received.lock().unwrap().clear();
+        let mut mic = Child::new(vec![]);
+        mic.stop_error = true;
+        let mut mix = CompositeBackend::new(Box::new(mic), Box::new(Child::new(vec![])), 1.0, 1.0);
+        let _first_capture = start(&mut mix);
+        mix.stop();
+        let previous = mix.shutdown.clone().unwrap();
+        if acknowledged {
+            assert_eq!(mix.stop_checked(), previous.result());
+        }
+        let _second_capture = start(&mut mix);
+        assert_eq!(received.lock().unwrap().len(), usize::from(!acknowledged));
+        mix.stop();
+        drop(mix);
+        let failures = received.lock().unwrap();
+        assert_eq!(failures.len(), 1 + usize::from(!acknowledged));
+        for failure in failures.iter() {
+            assert_eq!(failure.owner, flexaudio_core::DropFailureOwner::Mix);
+            assert_eq!(failure.report, previous);
+        }
+    }
+    flexaudio_core::set_drop_failure_handler(None);
+}
+
 struct Child {
     events: VecDeque<Event>,
     stops: Arc<AtomicUsize>,

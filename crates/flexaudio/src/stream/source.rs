@@ -105,7 +105,8 @@ impl Stream {
     /// tests in another crate (`tests/integration.rs`) to call this with a MockBackend.
     #[doc(hidden)]
     pub fn switch_backend(&mut self, new_backend: Box<dyn CaptureBackend>) -> Result<()> {
-        self.switch_backend_inner(new_backend, None, None)
+        let result = self.switch_backend_inner(new_backend, None, None);
+        self.handoff_result(result)
     }
 
     /// Publish a backend and its denoise setting as one capture generation.
@@ -115,7 +116,8 @@ impl Stream {
         new_backend: Box<dyn CaptureBackend>,
         denoise: bool,
     ) -> Result<()> {
-        self.switch_backend_inner(new_backend, Some(denoise), None)
+        let result = self.switch_backend_inner(new_backend, Some(denoise), None);
+        self.handoff_result(result)
     }
 
     fn switch_backend_inner(
@@ -124,7 +126,7 @@ impl Stream {
         denoise: Option<bool>,
         microphone: Option<bool>,
     ) -> Result<()> {
-        if let Some(error) = self.terminal_error() {
+        if let Some(error) = self.terminal_error_inner() {
             return Err(error);
         }
         if !self.started {
@@ -273,7 +275,8 @@ impl Stream {
     /// - New backend start fails → [`switch_backend`](Self::switch_backend) restores the old source
     ///   and returns the error.
     pub fn switch_source(&mut self, new_config: StreamConfig) -> Result<()> {
-        self.switch_source_inner(new_config, None, None)
+        let result = self.switch_source_inner(new_config, None, None);
+        self.handoff_result(result)
     }
 
     /// Switch source and retain new options only after the backend switch succeeds.
@@ -285,7 +288,8 @@ impl Stream {
         config: StreamConfig,
         options: OpenOptions,
     ) -> Result<()> {
-        self.switch_source_inner(config, None, Some(options))
+        let result = self.switch_source_inner(config, None, Some(options));
+        self.handoff_result(result)
     }
 
     /// Switch source, options, and denoise atomically with the new capture generation.
@@ -298,7 +302,8 @@ impl Stream {
         options: OpenOptions,
         denoise: bool,
     ) -> Result<()> {
-        self.switch_source_inner(config, Some(denoise), Some(options))
+        let result = self.switch_source_inner(config, Some(denoise), Some(options));
+        self.handoff_result(result)
     }
 
     /// Switch source and apply denoise atomically with the new capture generation.
@@ -308,7 +313,8 @@ impl Stream {
         new_config: StreamConfig,
         denoise: bool,
     ) -> Result<()> {
-        self.switch_source_inner(new_config, Some(denoise), None)
+        let result = self.switch_source_inner(new_config, Some(denoise), None);
+        self.handoff_result(result)
     }
 
     fn switch_source_inner(
@@ -327,7 +333,7 @@ impl Stream {
         options: Option<OpenOptions>,
         build: impl FnOnce(&StreamConfig, &OpenOptions) -> Result<Box<dyn CaptureBackend>>,
     ) -> Result<()> {
-        if let Some(error) = self.terminal_error() {
+        if let Some(error) = self.terminal_error_inner() {
             return Err(error);
         }
         if !self.started {

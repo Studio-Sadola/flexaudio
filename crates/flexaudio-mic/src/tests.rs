@@ -2,6 +2,73 @@ use super::*;
 use flexaudio_core::raw_ring;
 
 #[test]
+fn successful_restart_reports_unread_cleanup_and_resets_receipt() {
+    const CHILD: &str = "FLEXAUDIO_MIC_RESTART_RECEIPT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "tests::successful_restart_reports_unread_cleanup_and_resets_receipt",
+                "--exact",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let output = received.clone();
+    flexaudio_core::set_drop_failure_handler(Some(Box::new(move |failure| {
+        output.lock().unwrap().push(failure.clone());
+    })));
+    for acknowledged in [false, true] {
+        received.lock().unwrap().clear();
+        let mut owner = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
+        owner.handle = Some(thread::spawn(|| panic!("injected microphone join failure")));
+        owner.stop();
+        let previous = owner.shutdown.clone().unwrap();
+        if acknowledged {
+            assert_eq!(owner.stop_checked(), previous.result());
+        }
+        let retired = owner.shutdown.take();
+        owner.pending_events.push_back(Event::StreamRecovered);
+        owner.stop_flag = Arc::new(AtomicBool::new(false));
+        owner.callback_errors = Arc::new(callback_mailbox::CallbackMailbox::new(
+            owner.stop_flag.clone(),
+        ));
+        owner
+            .callback_errors
+            .record(cpal::StreamError::DeviceNotAvailable);
+        // Exercise readiness completion without opening a native audio device.
+        owner.complete_start(Ok(()), retired).unwrap();
+        assert_eq!(received.lock().unwrap().len(), usize::from(!acknowledged));
+        assert_eq!(owner.poll_event(), Some(Event::StreamRecovered));
+        assert_eq!(
+            owner.poll_event(),
+            Some(Event::TerminalError {
+                error: Error::DeviceLost,
+            })
+        );
+        assert!(owner.poll_event().is_none());
+        owner.handle = Some(thread::spawn(|| panic!("injected microphone join failure")));
+        owner.stop();
+        drop(owner);
+        let failures = received.lock().unwrap();
+        assert_eq!(failures.len(), 1 + usize::from(!acknowledged));
+        for failure in failures.iter() {
+            assert_eq!(failure.owner, flexaudio_core::DropFailureOwner::Microphone);
+            assert_eq!(failure.report, previous);
+        }
+    }
+    flexaudio_core::set_drop_failure_handler(None);
+}
+
+#[test]
 fn legacy_constructor_keeps_windows_capture_check_before_its_single_format_query() {
     let source = include_str!("lib.rs");
     let constructor = source
@@ -172,7 +239,10 @@ fn callback_overflow_is_retained_in_shutdown_report() {
         ),
         Vec::new(),
     ));
-    assert_eq!(backend.shutdown_report().unwrap().primary(), Some(&expected));
+    assert_eq!(
+        backend.shutdown_report().unwrap().primary(),
+        Some(&expected)
+    );
 }
 
 #[test]
@@ -421,10 +491,19 @@ fn infallible_constructor_retains_query_failure_before_start() {
     for _ in 0..2 {
         assert!(backend.poll_event().is_none());
         let (producer, _consumer) = raw_ring(16);
-        assert_eq!(backend.start(RawSink::new(producer, FALLBACK_FORMAT.0, FALLBACK_FORMAT.1)), Err(cause.clone()));
-        assert!(backend.handle.is_none(), "cached query failure must prevent capture with a placeholder format");
+        assert_eq!(
+            backend.start(RawSink::new(producer, FALLBACK_FORMAT.0, FALLBACK_FORMAT.1)),
+            Err(cause.clone())
+        );
+        assert!(
+            backend.handle.is_none(),
+            "cached query failure must prevent capture with a placeholder format"
+        );
         assert_eq!(backend.stop_checked(), Ok(()));
-        assert_eq!(backend.shutdown_report(), Some(&ShutdownReport::new(None, Vec::new())));
+        assert_eq!(
+            backend.shutdown_report(),
+            Some(&ShutdownReport::new(None, Vec::new()))
+        );
         assert!(backend.terminal_error.is_none());
         assert!(backend.poll_event().is_none());
     }

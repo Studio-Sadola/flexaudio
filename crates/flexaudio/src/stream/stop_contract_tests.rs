@@ -72,6 +72,197 @@ fn drop_routes_new_failures_and_suppresses_explicit_stop_duplicates() {
 }
 
 #[test]
+fn plain_stop_drop_reports_unread_failures_but_checked_and_report_handoffs_do_not() {
+    const CHILD: &str = "FLEXAUDIO_STREAM_RECEIPT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["stream::stop_contract_tests::plain_stop_drop_reports_unread_failures_but_checked_and_report_handoffs_do_not", "--exact"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let output = observed.clone();
+    crate::set_drop_failure_handler(Some(Box::new(move |failure| {
+        output.lock().unwrap().push(failure.clone())
+    })));
+    let mut stream = stop_failure(StopPhase::Stop).unwrap();
+    stream.stop();
+    stream.stop();
+    assert!(observed.lock().unwrap().is_empty());
+    drop(stream);
+    assert_eq!(observed.lock().unwrap().len(), 1);
+    let mut stream = stop_failure(StopPhase::Stop).unwrap();
+    let first = stream.stop_checked();
+    assert!(first.is_err());
+    assert_eq!(stream.stop_checked(), first);
+    drop(stream);
+    assert_eq!(observed.lock().unwrap().len(), 1);
+    let mut stream = stop_failure(StopPhase::Stop).unwrap();
+    assert!(stream.shutdown_report().is_none());
+    stream.stop();
+    let first = stream.shutdown_report().unwrap();
+    assert!(first.result().is_err());
+    assert_eq!(stream.shutdown_report(), Some(first));
+    drop(stream);
+    assert_eq!(observed.lock().unwrap().len(), 1);
+    let mut stream = stop_failure(StopPhase::Stop).unwrap();
+    stream.stop();
+    while stream.poll_event().is_some() {}
+    drop(stream);
+    assert_eq!(observed.lock().unwrap().len(), 1);
+    let mut stream = stop_failure(StopPhase::TerminalAndStop).unwrap();
+    stream.stop();
+    assert_eq!(stream.terminal_error(), Some(Error::Unsupported));
+    drop(stream);
+    let failures = observed.lock().unwrap();
+    assert_eq!(failures.len(), 2);
+    assert!(failures[1].report.primary().is_none());
+    assert_eq!(failures[1].report.cleanup()[0].root(), &Error::DeviceLost);
+    drop(failures);
+    let mut stream = Stream::open(
+        StreamConfig::default(),
+        Box::new(crate::MockBackend::new(48_000, 2, 0.0)),
+    )
+    .unwrap();
+    let vad = Error::Vad {
+        code: flexaudio_core::VadErrorCode::Inference,
+    };
+    stream.shared.record_cleanup(vad.clone());
+    assert_eq!(stream.stop_checked(), Ok(()));
+    drop(stream);
+    assert_eq!(observed.lock().unwrap().len(), 3);
+    assert_eq!(observed.lock().unwrap()[2].report.cleanup(), &[vad]);
+    struct FailedStart;
+    impl CaptureBackend for FailedStart {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 2)
+        }
+        fn start(&mut self, _: RawSink) -> Result<()> {
+            Err(Error::Unsupported)
+        }
+        fn stop(&mut self) {}
+        fn stop_checked(&mut self) -> Result<()> {
+            Err(Error::DeviceLost)
+        }
+    }
+    let mut stream = Stream::open(StreamConfig::default(), Box::new(FailedStart)).unwrap();
+    let error = stream.start().unwrap_err();
+    assert_eq!(error.root(), &Error::Unsupported);
+    drop(stream);
+    assert_eq!(
+        observed.lock().unwrap().len(),
+        3,
+        "startup rollback already reached start()'s caller"
+    );
+    crate::set_drop_failure_handler(None);
+}
+
+#[test]
+fn returned_resume_and_switch_failures_acknowledge_only_the_returned_cause() {
+    const CHILD: &str = "FLEXAUDIO_STREAM_RESULT_RECEIPT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["stream::stop_contract_tests::returned_resume_and_switch_failures_acknowledge_only_the_returned_cause", "--exact"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let output = observed.clone();
+    crate::set_drop_failure_handler(Some(Box::new(move |failure| {
+        output.lock().unwrap().push(failure.clone())
+    })));
+    let stream = stop_failure(StopPhase::Stop).unwrap();
+    stream.shared.fail_terminal(Error::Unsupported);
+    assert_eq!(stream.resume(), Err(Error::Unsupported));
+    drop(stream);
+    let mut stream = stop_failure(StopPhase::TerminalAndStop).unwrap();
+    assert_eq!(
+        stream.switch_backend(Box::new(crate::MockBackend::new(48_000, 2, 0.0))),
+        Err(Error::Unsupported)
+    );
+    drop(stream);
+    crate::set_drop_failure_handler(None);
+    let failures = observed.lock().unwrap();
+    assert_eq!(failures.len(), 2);
+    for failure in failures.iter() {
+        assert!(failure.report.primary().is_none());
+        assert_eq!(failure.report.cleanup().len(), 1);
+        assert_eq!(failure.report.cleanup()[0].root(), &Error::DeviceLost);
+    }
+}
+
+#[test]
+fn successful_start_reports_only_unread_retired_shutdown_failures() {
+    const CHILD: &str = "FLEXAUDIO_STREAM_RETIRED_RECEIPT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["stream::stop_contract_tests::successful_start_reports_only_unread_retired_shutdown_failures", "--exact"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    struct FirstStop(bool);
+    impl CaptureBackend for FirstStop {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 2)
+        }
+        fn start(&mut self, _: RawSink) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) {}
+        fn stop_checked(&mut self) -> Result<()> {
+            if std::mem::replace(&mut self.0, false) {
+                Err(Error::Unsupported)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let output = observed.clone();
+    crate::set_drop_failure_handler(Some(Box::new(move |failure| {
+        output.lock().unwrap().push(failure.clone())
+    })));
+    for checked in [false, true] {
+        let mut stream = Stream::open(StreamConfig::default(), Box::new(FirstStop(true))).unwrap();
+        if checked {
+            assert!(stream.stop_checked().is_err());
+        } else {
+            stream.stop();
+        }
+        stream.start().unwrap();
+        assert_eq!(observed.lock().unwrap().len(), 1);
+        stream.stop_checked().unwrap();
+        drop(stream);
+        assert_eq!(observed.lock().unwrap().len(), 1);
+    }
+    crate::set_drop_failure_handler(None);
+    assert_eq!(
+        observed.lock().unwrap()[0].report.cleanup()[0].root(),
+        &Error::Unsupported
+    );
+}
+
+#[test]
 fn distinct_failure_contract() {
     flexaudio_core::test_support::assert_distinct_failures_retained(
         Error::DeviceLost,

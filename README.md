@@ -387,13 +387,17 @@ The facade crate `flexaudio` re-exports everything you need:
   A stopped stream is spent (`start()` returns `InvalidState`); open a new stream
   to capture again. This lifecycle rule already applied in 0.4.
   Repeated stop does not repeat teardown or duplicate events.
-- Rust failures first observed during implicit shutdown reach a process-wide
+- Rust failures left unread when an owner is dropped reach a process-wide
   receiver, including capture streams, device watchers and FLAC writers. By
   default each failure writes one line to stderr. Install
   `set_drop_failure_handler(Some(Box::new(|failure| { /* inspect failure.report */ })))`
   to receive the typed `DropFailure` with its `DropFailureOwner` and
   `ShutdownReport`; pass `None` to restore stderr. Receiver panics are caught
-  and fall back to stderr. Explicit stop/finalize errors are not reported again.
+  and fall back to stderr. Plain `stop()` retains failures but does not hand
+  them to the caller: `stop(); drop(owner)` still reports unread failures once.
+  A returned checked-stop/finalize error, failure event, terminal error, or public
+  `shutdown_report()` read acknowledges only the failures actually handed off;
+  those values are not reported again during Drop.
   Late failures from bounded queries that already timed out use this receiver too.
 - `Stream::poll_chunk` / `Stream::poll_event` — pull `AudioChunk`s and `Event`s.
 - `Stream::terminal_error() -> Option<Error>` — inspect a stored terminal failure,
@@ -429,6 +433,9 @@ The facade crate `flexaudio` re-exports everything you need:
   Linux startup failure returns an error; later daemon, callback,
   or shutdown failures produce `DeviceEvent::TerminalError { error }`. A later
   stop/join failure can emit another notification with accumulated causes.
+  `DeviceWatcher::stop_checked()` returns the retained outcome, identically on
+  repeated calls; `shutdown_report()` returns `None` before stop and a cloned
+  completed report afterward, including a clean report for no-op watchers.
   Node.js/Python expose `terminalError` with a typed `error`; C v2 exposes device
   event kind 6 and `flexaudio_device_event_error_v2`. C v1 polling returns the
   root negative error code and sets last_error. Windows/macOS currently

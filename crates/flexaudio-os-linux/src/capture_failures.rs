@@ -281,6 +281,8 @@ mod tests {
                     events,
                     &mut retained_events,
                     &mut shutdown,
+                    &flexaudio_core::ShutdownReceipt::default(),
+                    flexaudio_core::DropFailureOwner::SystemCapture,
                 )
             },
         );

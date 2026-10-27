@@ -185,6 +185,7 @@ pub struct WasapiProcessBackend {
     /// Runtime failure reported once by the next start (watchdog reopen).
     pending_error: Option<Error>,
     shutdown: OwnerShutdown,
+    receipt: flexaudio_core::ShutdownReceipt,
     /// Fixed native format `(48000, 2)`.
     native: (u32, u16),
 }
@@ -199,6 +200,7 @@ impl WasapiProcessBackend {
             handle: None,
             pending_error: None,
             shutdown: OwnerShutdown::default(),
+            receipt: flexaudio_core::ShutdownReceipt::default(),
             native: (NATIVE_RATE, NATIVE_CHANNELS),
         }
     }
@@ -220,59 +222,75 @@ impl CaptureBackend for WasapiProcessBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
-        if self.handle.is_some() {
-            return Ok(());
-        }
-        if let Some(error) = self.pending_error.take() {
-            return Err(error);
-        }
-        if self.target_pid == 0 {
-            return Err(Error::InvalidArg("target_pid must be positive".into()));
-        }
-        crate::format::verify_format(self.native, (sink.native_rate(), sink.native_channels()))?;
-        self.stop_flag.store(false, Ordering::SeqCst);
-        self.shutdown.cleanup = CleanupLedger::default();
-        let cleanup = self.shutdown.cleanup.clone();
-
-        let stop_flag = self.stop_flag.clone();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
-        let (event_tx, event_rx) = mpsc::channel();
-        let target_pid = self.target_pid;
-        let mode = self.mode;
-
-        let handle = thread::Builder::new()
-            .name("flexaudio-wasapi-process".into())
-            .spawn(move || {
-                run_process_thread(
-                    target_pid, mode, sink, stop_flag, ready_tx, event_tx, cleanup,
-                )
-            })
-            .map_err(|error| {
-                self.stop_flag.store(true, Ordering::SeqCst);
-                flexaudio_core::spawn_error("WASAPI process capture owner", error)
-            })?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => {
-                self.handle = Some(handle);
-                self.shutdown.reset(event_rx);
-                Ok(())
+        let result = (|| {
+            if self.handle.is_some() {
+                return Ok(());
             }
-            Ok(Err(e)) => {
-                self.shutdown.retain_capture_events(event_rx);
-                self.stop_flag.store(true, Ordering::SeqCst);
-                self.shutdown.retain_start_failure(e, handle)
+            if let Some(error) = self.pending_error.take() {
+                return Err(error);
             }
-            Err(_) => {
-                self.shutdown.retain_capture_events(event_rx);
-                self.stop_flag.store(true, Ordering::SeqCst);
-                self.shutdown.retain_start_failure(
-                    Error::Backend("capture owner exited before reporting readiness".into())
-                        .with_context(ErrorContext::new(Operation::Start)),
-                    handle,
-                )
+            if self.target_pid == 0 {
+                return Err(Error::InvalidArg("target_pid must be positive".into()));
             }
+            crate::format::verify_format(
+                self.native,
+                (sink.native_rate(), sink.native_channels()),
+            )?;
+            self.stop_flag.store(false, Ordering::SeqCst);
+            self.shutdown.cleanup = CleanupLedger::default();
+            let cleanup = self.shutdown.cleanup.clone();
+
+            let stop_flag = self.stop_flag.clone();
+            let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+            let (event_tx, event_rx) = mpsc::channel();
+            let target_pid = self.target_pid;
+            let mode = self.mode;
+
+            let handle = thread::Builder::new()
+                .name("flexaudio-wasapi-process".into())
+                .spawn(move || {
+                    run_process_thread(
+                        target_pid, mode, sink, stop_flag, ready_tx, event_tx, cleanup,
+                    )
+                })
+                .map_err(|error| {
+                    self.stop_flag.store(true, Ordering::SeqCst);
+                    flexaudio_core::spawn_error("WASAPI process capture owner", error)
+                })?;
+
+            match ready_rx.recv() {
+                Ok(Ok(())) => {
+                    self.handle = Some(handle);
+                    if let Some(report) = &self.shutdown.report {
+                        self.receipt.report_unobserved(
+                            flexaudio_core::DropFailureOwner::ProcessCapture,
+                            report,
+                        );
+                    }
+                    self.shutdown.reset(event_rx);
+                    self.receipt = flexaudio_core::ShutdownReceipt::default();
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    self.shutdown.retain_capture_events(event_rx);
+                    self.stop_flag.store(true, Ordering::SeqCst);
+                    self.shutdown.retain_start_failure(e, handle)
+                }
+                Err(_) => {
+                    self.shutdown.retain_capture_events(event_rx);
+                    self.stop_flag.store(true, Ordering::SeqCst);
+                    self.shutdown.retain_start_failure(
+                        Error::Backend("capture owner exited before reporting readiness".into())
+                            .with_context(ErrorContext::new(Operation::Start)),
+                        handle,
+                    )
+                }
+            }
+        })();
+        if let Err(error) = &result {
+            self.receipt.acknowledge_error(error);
         }
+        result
     }
 
     fn stop(&mut self) {
@@ -280,25 +298,31 @@ impl CaptureBackend for WasapiProcessBackend {
     }
 
     fn stop_checked(&mut self) -> Result<()> {
-        self.retain_shutdown_outcome();
-        self.shutdown.result()
+        let result = {
+            self.retain_shutdown_outcome();
+            self.shutdown.result()
+        };
+        if let Err(error) = &result {
+            self.receipt.acknowledge_error(error);
+        }
+        result
     }
 
     fn poll_event(&mut self) -> Option<Event> {
-        self.shutdown.poll_event()
+        let result = self.shutdown.poll_event();
+        if let Some(error) = result.as_ref().and_then(Event::failure) {
+            self.receipt.acknowledge_error(&error);
+        }
+        result
     }
 }
 
 impl Drop for WasapiProcessBackend {
     fn drop(&mut self) {
-        let previous = self.shutdown.report.clone();
         self.stop();
         if let Some(report) = &self.shutdown.report {
-            flexaudio_core::report_drop_failures(
-                flexaudio_core::DropFailureOwner::ProcessCapture,
-                previous.as_ref(),
-                report,
-            );
+            self.receipt
+                .report_unobserved(flexaudio_core::DropFailureOwner::ProcessCapture, report);
         }
     }
 }
