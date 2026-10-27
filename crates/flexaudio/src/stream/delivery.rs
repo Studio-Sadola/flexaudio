@@ -59,7 +59,7 @@ impl Stream {
         self.shared.paused.load(Ordering::SeqCst)
     }
 
-    /// Change input gain (linear multiplier). 1.0 = unchanged, 2.0 ≈ +6 dB, 0.0 = silence.
+    /// Change input gain (linear multiplier). 1.0 = unchanged, 2.0 approx. +6 dB, 0.0 = silence.
     ///
     /// May be called at any time during recording; takes effect from the next completed chunk (20 ms
     /// granularity). Samples are clamped to `-1.0..=1.0` after multiplication. At 1.0, samples are
@@ -128,7 +128,7 @@ impl Stream {
     ///
     /// Secondary chunks are generated only when `config.secondary_output` is `Some`; otherwise this
     /// always returns `None`. Secondary PTS values use the same zero-based recording clock as the
-    /// primary [`AudioChunk`], but are independent and lag the primary by 20–60 ms due to group delay
+    /// primary [`AudioChunk`], but are independent and lag the primary by 20-60 ms due to group delay
     /// in the secondary Stage2 resampler. Match primary and secondary by `pts_ns` (time), since each
     /// tap has its own `seq` counter.
     pub fn poll_secondary(&mut self) -> Option<SecondaryChunk> {

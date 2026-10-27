@@ -147,14 +147,14 @@ def main(api: GitHub | None = None, env: Mapping[str, str] | None = None) -> Non
             raise ValueError("Current run is not the expected tag-push npm run")
         current_attempt = current_run.get("run_attempt")
         if type(current_attempt) is not int or current_attempt != 1 or env.get("GITHUB_RUN_ATTEMPT") != "1":
-            raise ValueError("original tag-push run was re-run; resealing is forbidden — cut a new patch version")
+            raise ValueError("original tag-push run was re-run; resealing is forbidden \u2014 cut a new patch version")
         run_id = api.original_run(sha, tag, current_run=current_run)
     else:
         run_id = api.original_run(sha, tag)
     attempt = api.get(f"/actions/runs/{run_id}").get("run_attempt")
     if (type(attempt) is not int or attempt != 1 or
             (event == "push" and env.get("GITHUB_RUN_ATTEMPT") != "1")):
-        raise ValueError("original tag-push run was re-run; resealing is forbidden — cut a new patch version")
+        raise ValueError("original tag-push run was re-run; resealing is forbidden \u2014 cut a new patch version")
     if event == "push" and (str(run_id) != env["GITHUB_RUN_ID"] or sha != env["GITHUB_SHA"]):
         raise ValueError("Only the original tag-push run may build this release")
     with Path(env["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:

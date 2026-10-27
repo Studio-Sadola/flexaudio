@@ -170,11 +170,11 @@ impl OutputStage {
             return Ok(());
         }
 
-        // Channel conversion: stereo → out_channels.
+        // Channel conversion: stereo -> out_channels.
         self.ch_scratch.clear();
         match self.out_channels {
             1 => {
-                // stereo → mono (L/R average).
+                // stereo -> mono (L/R average).
                 for f in 0..frames {
                     let l = inner_stereo[f * 2];
                     let r = inner_stereo[f * 2 + 1];
@@ -188,7 +188,7 @@ impl OutputStage {
             _ => unreachable!("output channel count validated by constructor"),
         }
 
-        // Sample-rate conversion: 48000 → out_sample_rate. On passthrough, copy ch_scratch directly to output.
+        // Sample-rate conversion: 48000 -> out_sample_rate. On passthrough, copy ch_scratch directly to output.
         match &mut self.resampler {
             None => {
                 out_buf.extend_from_slice(&self.ch_scratch);

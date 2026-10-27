@@ -15,7 +15,7 @@ cpp_compat = false
 
 header = """
 /*
- * flexaudio C API — pull-based audio capture bindings.
+ * flexaudio C API -- pull-based audio capture bindings.
  *
  * This header is generated from crates/flexaudio-ffi by cbindgen. Do not edit by hand;
  * regenerate it after changing the Rust ABI.

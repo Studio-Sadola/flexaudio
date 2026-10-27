@@ -1,13 +1,13 @@
-//! flexaudio-os-windows — Windows backend: WASAPI system loopback / process
+//! flexaudio-os-windows - Windows backend: WASAPI system loopback / process
 //! loopback (windows-rs 0.54, Windows build 20348 or later).
 //!
 //! Provides two [`CaptureBackend`](flexaudio_core::backend::CaptureBackend) implementations:
 //!
-//! - [`WasapiSystemBackend`] — classic render-endpoint loopback
+//! - [`WasapiSystemBackend`] - classic render-endpoint loopback
 //!   (`AUDCLNT_STREAMFLAGS_LOOPBACK`) to capture system audio output (the mix playing on that endpoint).
-//!   Select an output endpoint with `device_id` (`None` uses the default). Equivalent to Linux’s
+//!   Select an output endpoint with `device_id` (`None` uses the default). Equivalent to Linux's
 //!   [`PwSystemBackend`](../flexaudio_os_linux). List output endpoints with [`list_output_devices`].
-//! - [`WasapiProcessBackend`] — `ActivateAudioInterfaceAsync` + process loopback
+//! - [`WasapiProcessBackend`] - `ActivateAudioInterfaceAsync` + process loopback
 //!   (`AUDIOCLIENT_ACTIVATION_PARAMS`) to capture audio from a specific PID (its process tree).
 //!   `exclude_self` reverses this to capture all system audio except that tree.
 //!
@@ -30,7 +30,7 @@
 #![warn(missing_docs)]
 #![deny(clippy::let_underscore_must_use)]
 
-/// Build number → process-loopback availability. Decoupled from OS calls so it can be
+/// Build number -> process-loopback availability. Decoupled from OS calls so it can be
 /// unit-tested on non-Windows platforms.
 mod version;
 

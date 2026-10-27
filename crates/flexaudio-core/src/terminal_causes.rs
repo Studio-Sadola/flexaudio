@@ -4,7 +4,30 @@
 //! equal to any retained cause joins it as a related cause of
 //! [`Error::Multiple`], in observation order. Equal causes are kept once.
 
-use crate::{Error, ErrorGroup};
+use crate::{Error, ErrorGroup, ShutdownReport};
+
+/// Merge retained shutdown observations without replacing either report's primary failure.
+/// Previous causes keep their order; unequal incoming primary and cleanup causes remain typed.
+/// Internal cross-crate lifecycle support; no stability guarantee.
+#[doc(hidden)]
+pub fn merge_shutdown_reports(
+    previous: Option<&ShutdownReport>,
+    incoming: &ShutdownReport,
+) -> ShutdownReport {
+    let mut primary = previous.and_then(ShutdownReport::primary).cloned();
+    if let Some(error) = incoming.primary() {
+        retain_terminal_cause(&mut primary, error.clone());
+    }
+    let mut cleanup = previous
+        .map(|report| report.cleanup().to_vec())
+        .unwrap_or_default();
+    for error in incoming.cleanup() {
+        if !cleanup.contains(error) {
+            cleanup.push(error.clone());
+        }
+    }
+    ShutdownReport::new(primary, cleanup)
+}
 
 /// Preserve an untrusted legacy payload without exposing it in safe Display.
 /// Internal adapter support; no stability guarantee.
@@ -72,6 +95,43 @@ pub fn retains_terminal_cause(retained: &Error, error: &Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_merge_preserves_distinct_primaries_cleanup_and_repeat_identity() {
+        let previous = ShutdownReport::new(Some(Error::DeviceLost), vec![Error::Unsupported]);
+        let incoming = ShutdownReport::new(
+            Some(Error::DeviceNotFound),
+            vec![
+                Error::Unsupported,
+                Error::Vad {
+                    code: crate::VadErrorCode::Inference,
+                },
+            ],
+        );
+        let merged = merge_shutdown_reports(Some(&previous), &incoming);
+        crate::test_support::assert_distinct_failures_retained(
+            Error::DeviceLost,
+            Error::DeviceNotFound,
+            |_, _| merged.primary().unwrap().clone(),
+        );
+        assert_eq!(merged.cleanup(), incoming.cleanup());
+        assert_eq!(merge_shutdown_reports(Some(&merged), &incoming), merged);
+        assert_eq!(merge_shutdown_reports(None, &incoming), incoming);
+        let startup = ShutdownReport::new(
+            Some(Error::InvalidState("startup refused".into())),
+            Vec::new(),
+        );
+        let returned = merge_shutdown_reports(Some(&startup), &incoming)
+            .result()
+            .unwrap_err();
+        assert!(retains_terminal_cause(&returned, &Error::DeviceNotFound));
+        assert!(retains_terminal_cause(
+            &returned,
+            &Error::Vad {
+                code: crate::VadErrorCode::Inference
+            }
+        ));
+    }
 
     #[test]
     fn newer_aggregate_snapshots_merge_without_hiding_distinct_causes() {

@@ -27,7 +27,7 @@ zeros and empty flags; supply timeline values and meters when producing audio.
 See the [design principles](docs/PRINCIPLES.md) for the maintainer's target state and promises.
 
 `flexaudio` provides one unified API for capturing audio from **microphones**,
-**system output (loopback)**, **individual processes**, and a **microphone + system mix** — across **Linux**,
+**system output (loopback)**, **individual processes**, and a **microphone + system mix** -- across **Linux**,
 **Windows**, and **macOS**. It normalizes every source to an interleaved
 `f32` stream at an output format you choose, and hands you chunks plus
 device/stream events through a simple poll loop.
@@ -49,14 +49,14 @@ stream.stop();
 
 ## Capability matrix (the "9 cells")
 
-Three capture sources × three operating systems. ✅ = implemented and verified,
-— = not available on that platform.
+Three capture sources * three operating systems. Yes = implemented and verified,
+-- = not available on that platform.
 
 | Source              | Linux            | Windows           | macOS                       |
 |---------------------|------------------|-------------------|-----------------------------|
-| **Microphone**      | ✅ (cpal/ALSA)   | ✅ (cpal/WASAPI)  | ✅ (cpal/CoreAudio)         |
-| **System output**   | ✅ (PipeWire)    | ✅ (WASAPI loopback) | ✅ (CoreAudio process taps) |
-| **Per-process**     | ✅ (PipeWire)    | ✅ (WASAPI process loopback) | ✅ (CoreAudio process taps) |
+| **Microphone**      | Yes (cpal/ALSA)   | Yes (cpal/WASAPI)  | Yes (cpal/CoreAudio)         |
+| **System output**   | Yes (PipeWire)    | Yes (WASAPI loopback) | Yes (CoreAudio process taps) |
+| **Per-process**     | Yes (PipeWire)    | Yes (WASAPI process loopback) | Yes (CoreAudio process taps) |
 
 - **Microphone** works on all platforms via [`cpal`].
 - **System / per-process** capture uses the native OS backend selected at
@@ -76,13 +76,13 @@ Three capture sources × three operating systems. ✅ = implemented and verified
 
 These are the capture interfaces; standalone add-ons are separate. Attached VAD
 always processes the shared canonical capture branch; primary/secondary selects
-which output carries its events. — = not exposed.
+which output carries its events. -- = not exposed.
 
 | Feature | Rust | Node | Python | C | CLI |
 |---|---|---|---|---|---|
-| Delivery model | Poll | Callbacks over internal polling | Poll | Poll | Internal polling → stdout/WAV |
-| Secondary output tap | Yes | Yes (`chunk.secondary`) | Yes (`poll_secondary`, f32/s16) | Yes (v3, f32/s16) | — |
-| Attached VAD (primary/secondary) | Canonical capture via `VadTap` | Primary or secondary carrier | Primary or secondary carrier | Primary (v2/v3) or secondary (v3) carrier | — |
+| Delivery model | Poll | Callbacks over internal polling | Poll | Poll | Internal polling -> stdout/WAV |
+| Secondary output tap | Yes | Yes (`chunk.secondary`) | Yes (`poll_secondary`, f32/s16) | Yes (v3, f32/s16) | -- |
+| Attached VAD (primary/secondary) | Canonical capture via `VadTap` | Primary or secondary carrier | Primary or secondary carrier | Primary (v2/v3) or secondary (v3) carrier | -- |
 | Denoise | Canonical 48 kHz; any output rate | Any output rate | Any output rate | Any output rate (v1-v5) | `--denoise`; any output rate |
 | Ring capacity (default 50 chunks) | `ring_capacity_chunks` | `ringCapacityChunks` | `ring_capacity_chunks` | v4 `ring_capacity_chunks` | `--ring-capacity-chunks` |
 | Source switching | `switch_source` | `switchSource`; retains add-on settings | `switch_source` | `flexaudio_switch_source` | `--sources` schedule |
@@ -380,9 +380,9 @@ stream.stop();
 
 The facade crate `flexaudio` re-exports everything you need:
 
-- `flexaudio::open(StreamConfig) -> Result<Stream>` — pick a backend by source +
+- `flexaudio::open(StreamConfig) -> Result<Stream>` -- pick a backend by source +
   OS and build a (not-yet-started) capture stream.
-- `Stream::start` / `Stream::stop` — control capture. `stop_checked()` returns
+- `Stream::start` / `Stream::stop` -- control capture. `stop_checked()` returns
   capture and cleanup failures; `shutdown_report()` retains the completed outcome.
   A stopped stream is spent (`start()` returns `InvalidState`); open a new stream
   to capture again. This lifecycle rule already applied in 0.4.
@@ -399,13 +399,13 @@ The facade crate `flexaudio` re-exports everything you need:
   `shutdown_report()` read acknowledges only the failures actually handed off;
   those values are not reported again during Drop.
   Late failures from bounded queries that already timed out use this receiver too.
-- `Stream::poll_chunk` / `Stream::poll_event` — pull `AudioChunk`s and `Event`s.
-- `Stream::terminal_error() -> Option<Error>` — inspect a stored terminal failure,
+- `Stream::poll_chunk` / `Stream::poll_event` -- pull `AudioChunk`s and `Event`s.
+- `Stream::terminal_error() -> Option<Error>` -- inspect a stored terminal failure,
   including after stop. `Stream::resume()` returns `Result<()>`.
-- `Stream::switch_source` — hot-swap the input source without stopping the
+- `Stream::switch_source` -- hot-swap the input source without stopping the
   stream (chunk `seq` stays continuous; the first chunk after a switch carries a
   discontinuity flag).
-- `flexaudio::devices() -> Result<Vec<DeviceInfo>>` — enumerate microphones
+- `flexaudio::devices() -> Result<Vec<DeviceInfo>>` -- enumerate microphones
   (CPAL, all platforms) and system output endpoints (Linux: PipeWire sinks;
   Windows: active render endpoints; macOS: output devices) in one list.
   Linux microphone IDs are CPAL IDs; PipeWire Audio/Source nodes are not advertised
@@ -420,13 +420,13 @@ The facade crate `flexaudio` re-exports everything you need:
   [Failure reporting](#failure-reporting-in-054).
   Windows enumeration does not preflight microphone permission; native enumeration
   proceeds. Microphone capture retains its separate existing permission preflight.
-- `flexaudio::processes() -> Result<Vec<ProcessInfo>>` — list audio output
+- `flexaudio::processes() -> Result<Vec<ProcessInfo>>` -- list audio output
   session/stream owners on Linux/Windows and Core Audio processes on macOS,
   including input-only processes (see
   [Listing capturable processes](#listing-capturable-processes)). Idle/stopped
   processes are included; use `is_output_active` to check current playback and
   `pid` as `target_pid` for per-process capture.
-- `flexaudio::watch_devices() -> Result<DeviceWatcher>` — pull-style device
+- `flexaudio::watch_devices() -> Result<DeviceWatcher>` -- pull-style device
   notifications. Linux reports PipeWire system output additions, removals and
   default changes using the same output IDs as `devices()`. Microphone changes
   are not reported: CPAL microphone IDs cannot be resolved from PipeWire nodes.
@@ -481,7 +481,7 @@ To preserve identical segmentation, migrate with
 `maxSpeechMs = trunc(seconds) * 1000` (for example, 30.9 seconds becomes 30000 ms).
 
 Standalone Node.js `process(samples, inputSampleRate?, inputChannels?)` defaults
-to 16000 Hz and one channel. Standalone conversion accepts 8000–192000 Hz and
+to 16000 Hz and one channel. Standalone conversion accepts 8000-192000 Hz and
 positive channel counts. Python uses `input_sample_rate` and `input_channels`
 with the same defaults. Rust uses `process_pcm(samples,
 input_sample_rate, input_channels)` for converted input and `process(samples)` for
@@ -838,26 +838,26 @@ if let Some(p) = target {
 | `pid` | `application.process.id` for pulse-proxied streams; `pipewire.sec.pid` for native clients (the same resolution the capture backend uses) | `IAudioSessionControl2::GetProcessId` | `kAudioProcessPropertyPID` |
 | `name` | `application.name` of the node, else of the client | Image file name without `.exe` | Executable name |
 | `executable` | Basename of `/proc/<pid>/exe`, falling back to `/proc/<pid>/comm` when `exe` is unreadable | Basename of the process image | Basename from `proc_pidpath` |
-| `bundle_id` | — | — | `kAudioProcessPropertyBundleID` |
+| `bundle_id` | -- | -- | `kAudioProcessPropertyBundleID` |
 | `is_output_active` | Node state is `Running` | Session state is `Active` | `kAudioProcessPropertyIsRunningOutput` |
 | Requirement | A running PipeWire session | Windows build 20348 or later (Windows 11 / Windows Server 2022) | macOS 14.4+, otherwise `Error::UnsupportedOsVersion` |
 
 `name` is always non-empty (falling back to the executable, the bundle ID, then
 `pid <N>`); `executable`, `bundle_id`, and `is_output_active` are `None` when the
 OS does not expose them. Names are self-reported by applications and are for
-display only — the PID is the key.
+display only -- the PID is the key.
 
 How to read the result:
 
-- `Ok(non-empty)` — per-process capture is available, and there are audio output
+- `Ok(non-empty)` -- per-process capture is available, and there are audio output
   session/stream owners (Linux/Windows) or Core Audio processes (macOS, including
   input-only processes). Idle/stopped processes are listed; use
   `is_output_active` to check current playback.
-- `Ok(empty)` — per-process capture is available, but no such process exists
+- `Ok(empty)` -- per-process capture is available, but no such process exists
   right now (this is **not** "nothing is playing").
-- `Err(..)` — per-process capture is not available here (Linux: PipeWire is not
-  reachable → `Error::Backend`; macOS before 14.4 or Windows build before 20348
-  → `Error::UnsupportedOsVersion`; other OSes → `Error::Unsupported`),
+- `Err(..)` -- per-process capture is not available here (Linux: PipeWire is not
+  reachable -> `Error::Backend`; macOS before 14.4 or Windows build before 20348
+  -> `Error::UnsupportedOsVersion`; other OSes -> `Error::Unsupported`),
   permission was denied (`Error::PermissionDenied`), the OS did not answer
   in time, or a previous enumeration is still in progress (`Error::Backend`).
 
@@ -1015,8 +1015,8 @@ The workspace pins MSRV via `rust-version` in each crate.
 
 flexaudio follows [Semantic Versioning](https://semver.org/). While the crate is
 in the **0.x** series, the public API is **not yet stable**: per SemVer, a bump
-of the **minor** version (`0.2 → 0.3`) may contain breaking changes, while
-**patch** bumps (`0.2.0 → 0.2.1`) are backward-compatible. Pin to `0.9` to opt
+of the **minor** version (`0.2 -> 0.3`) may contain breaking changes, while
+**patch** bumps (`0.2.0 -> 0.2.1`) are backward-compatible. Pin to `0.9` to opt
 into compatible updates only. See [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
@@ -1025,21 +1025,21 @@ into compatible updates only. See [`CHANGELOG.md`](CHANGELOG.md).
 
 | Crate | crates.io | Description |
 |-------|-----------|-------------|
-| `flexaudio` | ✅ | Facade: unified `open()` / `devices()` / `processes()` / `watch_devices()`. |
-| `flexaudio-core` | ✅ | Source-agnostic stream engine, types, resampling/normalizer. |
-| `flexaudio-mic` | ✅ | Microphone backend (cpal), all platforms. |
-| `flexaudio-os-linux` | ✅ | PipeWire system / per-process backend (Linux). |
-| `flexaudio-os-windows` | ✅ | WASAPI loopback / process backend (Windows). |
-| `flexaudio-os-macos` | ✅ | Core Audio process-tap backend (macOS). |
-| `flexaudio-vad` | ✅ | Silero VAD add-on (offline, embedded model). |
-| `flexaudio-encode` | ✅ | Streaming FLAC encoding (flacenc). |
-| `flexaudio-denoise` | ✅ | RNNoise noise suppression (nnnoiseless). |
-| `flexaudio-cli` | — | Reference CLI / streaming capture tool. |
-| `flexaudio-napi` | — (npm) | Node.js N-API addon (published on npm as `@studio-sadola/flexaudio`). |
-| `flexaudio-ffi` | — | C ABI (pull-based capture, VAD / FLAC / denoise, `flexaudio_processes`). |
-| `bindings/flexaudio-py` | — | PyO3 Python binding (`open` / `devices` / `processes` / add-ons). |
+| `flexaudio` | Yes | Facade: unified `open()` / `devices()` / `processes()` / `watch_devices()`. |
+| `flexaudio-core` | Yes | Source-agnostic stream engine, types, resampling/normalizer. |
+| `flexaudio-mic` | Yes | Microphone backend (cpal), all platforms. |
+| `flexaudio-os-linux` | Yes | PipeWire system / per-process backend (Linux). |
+| `flexaudio-os-windows` | Yes | WASAPI loopback / process backend (Windows). |
+| `flexaudio-os-macos` | Yes | Core Audio process-tap backend (macOS). |
+| `flexaudio-vad` | Yes | Silero VAD add-on (offline, embedded model). |
+| `flexaudio-encode` | Yes | Streaming FLAC encoding (flacenc). |
+| `flexaudio-denoise` | Yes | RNNoise noise suppression (nnnoiseless). |
+| `flexaudio-cli` | -- | Reference CLI / streaming capture tool. |
+| `flexaudio-napi` | -- (npm) | Node.js N-API addon (published on npm as `@studio-sadola/flexaudio`). |
+| `flexaudio-ffi` | -- | C ABI (pull-based capture, VAD / FLAC / denoise, `flexaudio_processes`). |
+| `bindings/flexaudio-py` | -- | PyO3 Python binding (`open` / `devices` / `processes` / add-ons). |
 
-The nine crates marked ✅ are published on crates.io. The workspace has 13 members:
+The nine crates marked Yes are published on crates.io. The workspace has 13 members:
 
 | Workspace member |
 |---|
@@ -1061,7 +1061,7 @@ The nine crates marked ✅ are published on crates.io. The workspace has 13 memb
 
 ## License
 
-[MIT](LICENSE) © 2026 tubome / Studio Sadola.
+[MIT](LICENSE) (c) 2026 tubome / Studio Sadola.
 
 This project bundles / links third-party software (Silero VAD model and
 pure-Rust tract inference for VAD, RNNoise via nnnoiseless for denoise,

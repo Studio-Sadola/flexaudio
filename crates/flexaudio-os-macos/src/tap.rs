@@ -1,12 +1,12 @@
-//! Shared implementation for the Process Tap chain. Creates a `CATapDescription` → process tap →
-//! private aggregate device → IOProc(block) → start. [`TapChain`] drops them in reverse order.
+//! Shared implementation for the Process Tap chain. Creates a `CATapDescription` -> process tap ->
+//! private aggregate device -> IOProc(block) -> start. [`TapChain`] drops them in reverse order.
 //!
 //! Both the system and process backends use [`build_tap_chain`] and select INCLUDE/EXCLUDE with
 //! `TapKind`. The chain itself is shared.
 //!
 //! # Teardown order
-//! `AudioDeviceStop` → `AudioDeviceDestroyIOProcID` →
-//! Destroy `AudioHardwareDestroyAggregateDevice` → `AudioHardwareDestroyProcessTap`, then drop
+//! `AudioDeviceStop` -> `AudioDeviceDestroyIOProcID` ->
+//! Destroy `AudioHardwareDestroyAggregateDevice` -> `AudioHardwareDestroyProcessTap`, then drop
 //! the block (`RcBlock`) and `CATapDescription` (`Retained`). The [`TapChain`] field declaration
 //! order and `Drop` implementation enforce this sequence.
 
@@ -65,7 +65,7 @@ pub(crate) enum TapKind {
 /// A constructed tap chain. `Drop` tears it down in reverse order.
 ///
 /// Match Rust's field drop order (declaration order), and use `Drop` to explicitly release OS
-/// resources in Stop → IOProc → aggregate → tap order before dropping `RcBlock` /
+/// resources in Stop -> IOProc -> aggregate -> tap order before dropping `RcBlock` /
 /// `Retained<CATapDescription>`.
 // `_block`'s `RcBlock<dyn Fn(...)>` mirrors CoreAudio's five-argument IOProc block signature,
 // which is complex. A type alias would not improve readability, so allow this lint here, as in
@@ -261,12 +261,12 @@ fn object_ids_to_nsarray(ids: &[AudioObjectID]) -> Retained<NSArray<NSNumber>> {
     NSArray::from_retained_slice(&numbers)
 }
 
-/// Convert a `&CStr` key (`kAudio…Key` exported by objc2-core-audio) to an `NSString` key.
+/// Convert a `&CStr` key (`kAudio...Key` exported by objc2-core-audio) to an `NSString` key.
 fn cstr_key(key: &std::ffi::CStr) -> Retained<NSString> {
     NSString::from_str(key.to_str().unwrap_or(""))
 }
 
-/// Build the process tap → aggregate device → IOProc → start chain.
+/// Build the process tap -> aggregate device -> IOProc -> start chain.
 ///
 /// `sink` is moved into the IOProc block and receives [`RawSink::push`] calls from the RT
 /// callback. On success, returns [`TapChain`] (drop releases all resources in reverse order). On
@@ -361,10 +361,10 @@ pub(crate) unsafe fn build_tap_chain(
     let report_for_block = buffer_report.clone();
     let sink_cell = RefCell::new(sink);
 
-    // Preallocate the largest expected planar→interleaved scratch buffer during setup (outside
+    // Preallocate the largest expected planar->interleaved scratch buffer during setup (outside
     // RT). This avoids the first or growth heap allocation in the IOProc. Estimate capacity from
-    // the tap's native format (or FALLBACK if unavailable) for about 100 ms of frames × channels.
-    // IOProc buffers are usually 10–20 ms. Larger-than-capacity buffers are dropped and invalidate
+    // the tap's native format (or FALLBACK if unavailable) for about 100 ms of frames * channels.
+    // IOProc buffers are usually 10-20 ms. Larger-than-capacity buffers are dropped and invalidate
     // health observations rather than allocating on the RT path. Move it into a `RefCell<Vec<f32>>` owned
     // only by the block; do not use thread_local, so it stays alive with the block even when the
     // owner and RT threads differ.

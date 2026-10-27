@@ -208,7 +208,7 @@ function readDelayImportNames(image) {
   throw new PeError(`delay-import table is not terminated within ${MAX_DELAY_DESCRIPTORS} entries`);
 }
 
-/** Read the headers for one image (DOS → PE → COFF → optional header → section table). */
+/** Read the headers for one image (DOS -> PE -> COFF -> optional header -> section table). */
 function parseImage(buf) {
   need(buf, 0, 0x40, 'DOS header');
   if (u16(buf, 0) !== 0x5a4d) throw new PeError('missing "MZ" signature (not a PE image)');

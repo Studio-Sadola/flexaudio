@@ -100,7 +100,7 @@ pub(crate) fn current_os_version() -> Result<flexaudio_core::OsVersion> {
 /// [`Error::UnsupportedOsVersion`] before 14.4, or `Ok(())` when supported.
 ///
 /// Each backend calls this before creating a tap (a CoreAudio call). This makes failures on older
-/// OS versions return the typed `UnsupportedOsVersion` instead of raw `OSStatus` → `Error::Backend`.
+/// OS versions return the typed `UnsupportedOsVersion` instead of raw `OSStatus` -> `Error::Backend`.
 #[cfg(target_os = "macos")]
 pub(crate) fn ensure_process_tap_supported() -> Result<()> {
     let version = current_os_version()?;

@@ -1,4 +1,4 @@
-//! flexaudio-encode — an add-on that compresses recording chunks into FLAC files as they arrive.
+//! flexaudio-encode -- an add-on that compresses recording chunks into FLAC files as they arrive.
 //!
 //! It accepts interleaved `&[f32]` samples and shares typed failures with `flexaudio-core`.
 //! Encoding uses the pure Rust `flacenc` crate, with no system libraries or runtime

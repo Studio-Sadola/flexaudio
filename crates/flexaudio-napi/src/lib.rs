@@ -1,4 +1,4 @@
-//! flexaudio-napi — Node.js (N-API) addon.
+//! flexaudio-napi -- Node.js (N-API) addon.
 //!
 //! Bindings for Node.js apps to use flexaudio in-process. Low-latency
 //! streaming recordings are delivered to Node through callbacks.
@@ -73,7 +73,7 @@ use flexaudio::{
 // Core types for the three addons. Import aliases to avoid the `#[napi]` wrappers (Vad / Denoiser).
 use flexaudio_denoise::{DenoiseError, Denoiser as CoreDenoiser};
 
-/// pts window for pairing the secondary tap (60ms = 3 chunks). The secondary trails by 20–60ms,
+/// pts window for pairing the secondary tap (60ms = 3 chunks). The secondary trails by 20-60ms,
 /// so this window matches timestamps even with a delay of up to 3 chunks.
 const PAIR_WINDOW_NS: i64 = 60_000_000;
 /// Width of a 20ms chunk in ns.
@@ -312,7 +312,7 @@ where
 /// (inserted later because the TSFN does not exist at creation time).
 ///
 /// If the callback holds a Strong reference, napi-rs 2.16's `ThreadsafeFunction::clone` only
-/// clones the Handle's Arc, creating a cycle: TSFN → callback → slot → TSFN.
+/// clones the Handle's Arc, creating a cycle: TSFN -> callback -> slot -> TSFN.
 /// Finalization (and release of onChunk's `napi_ref`) never occurs.
 type ChunkTsfnWeakCell = Arc<OnceLock<Weak<ChunkTsfn>>>;
 
@@ -593,7 +593,7 @@ impl Task for ProcessesTask {
     }
 }
 
-/// DenoiseError → napi::Error. Both variants indicate invalid arguments: InvalidArg.
+/// DenoiseError -> napi::Error. Both variants indicate invalid arguments: InvalidArg.
 fn denoise_err(err: DenoiseError) -> NapiError {
     NapiError::new(Status::InvalidArg, err.to_string())
 }
@@ -668,7 +668,7 @@ pub struct JsDeviceInfo {
 pub struct JsProcessInfo {
     /// OS process ID (nonzero). Pass to `openStream` as `processId`.
     pub pid: u32,
-    /// Display name (always nonempty). OS-reported name → executable name → bundle ID → `"pid <N>"`.
+    /// Display name (always nonempty). OS-reported name -> executable name -> bundle ID -> `"pid <N>"`.
     pub name: String,
     /// Executable basename (e.g. `firefox` / `chrome.exe`). Present only when available.
     pub executable: Option<String>,
@@ -707,7 +707,7 @@ pub struct JsAudioChunk {
     pub vad_events: Option<Vec<vad::JsVadEvent>>,
     /// Timestamp-matched secondary tap chunk (only with `secondaryOutput`). Delivered as a pair in
     /// the same callback (`primary.secondary` in `onChunk(primary)`, not a second argument). It is
-    /// `undefined` when the secondary has not arrived. Match primary↔secondary by `ptsNs` (time);
+    /// `undefined` when the secondary has not arrived. Match primary<->secondary by `ptsNs` (time);
     /// `seq` is independent for each tap.
     pub secondary: Option<JsSecondaryChunk>,
 }
@@ -717,7 +717,7 @@ pub struct JsAudioChunk {
 /// `data` is a typed array matching `encoding` (`Int16Array` for `'s16'`,
 /// `Float32Array` for `'f32'`). Sample values use host native endianness. Serialization to s16le
 /// wire format is the receiver's (consumer's) responsibility. `ptsNs` uses the same recording-zero
-/// clock as the primary but is independent, trailing by 20–60ms due to secondary Stage2 resampler group delay.
+/// clock as the primary but is independent, trailing by 20-60ms due to secondary Stage2 resampler group delay.
 #[napi(object, object_from_js = false)]
 pub struct JsSecondaryChunk {
     pub data: Either<Int16Array, Float32Array>,
@@ -1346,7 +1346,7 @@ impl PairingBridge {
         );
     }
 
-    /// Match primary↔secondary within the pts window and call `onChunk(primary)` with `primary.secondary`.
+    /// Match primary<->secondary within the pts window and call `onChunk(primary)` with `primary.secondary`.
     ///
     /// Rules: for primary `P`, inspect secondary FIFO head `S`. Discard overly old secondaries (orphans);
     /// pop and pair those within the window; if absent/newer than the window, deliver primary only with
@@ -1639,7 +1639,11 @@ impl FlexStream {
                 // Stop can discover a pending backend denial. The shared drain
                 // forwards it and suppresses failed PCM before accepting the tail.
                 bridge.drain_stream(&mut stream, on_event.as_ref(), &thread_terminal);
-                if stream.terminal_error().is_none() {
+                let capture_terminal = stream.terminal_error();
+                if let Some(error) = &capture_terminal {
+                    retain_stream_terminal(&thread_terminal, error.clone());
+                }
+                if capture_terminal.is_none() {
                     while let Some(secondary) = bridge.secondary_fifo.pop_front() {
                         bridge.emit_secondary_envelope(secondary);
                     }
@@ -1649,7 +1653,7 @@ impl FlexStream {
                     // Deliver the one vadFailed notification (if not already sent)
                     // before stop() settles; the retained report carries it afterwards.
                     bridge.report_attachment_failure();
-                } else if stream.terminal_error().is_none() {
+                } else if capture_terminal.is_none() {
                     bridge.emit_terminator();
                 }
                 // Publish completion only after core and addon teardown are both known.
@@ -1914,7 +1918,7 @@ impl FlexStream {
         {
             return Err(boundary::throw_error(&env, error));
         }
-        // As in openStream, build_config converts options → StreamConfig.
+        // As in openStream, build_config converts options -> StreamConfig.
         let mock_source = options.kind == "mock";
         if mock_source && !self.mock_source {
             return Err(boundary::throw_error(&env, flexaudio::Error::InvalidArg(
@@ -2041,10 +2045,10 @@ impl FlexStream {
 
     /// Change input gain (linear multiplier). 1.0=unchanged, 2.0=about +6dB, 0.0=silence. Callable
     /// any time during recording; takes effect on the next chunk (20ms granularity). Multiplied samples
-    /// are clamped to ±1.0. Throws unless finite and nonnegative, or if `stop()` has already completed.
+    /// are clamped to +/-1.0. Throws unless finite and nonnegative, or if `stop()` has already completed.
     #[napi]
     pub fn set_gain(&self, gain: f64) -> napi::Result<()> {
-        // Validate after f64→f32 conversion (also rejects huge values that become infinity in f32).
+        // Validate after f64->f32 conversion (also rejects huge values that become infinity in f32).
         let gain = gain as f32;
         if !gain.is_finite() || gain < 0.0 {
             return Err(NapiError::new(
@@ -2249,7 +2253,7 @@ pub fn devices(env: Env) -> napi::Result<Vec<JsDeviceInfo>> {
 /// capture (`openStream({ kind: 'process', processId })`). Excludes the calling process itself.
 /// Stopped/Idle sessions are included. Use `isOutputActive` to check whether audio is playing.
 ///
-/// Sorted by active output (`isOutputActive: true`) first → display name → pid, with each pid
+/// Sorted by active output (`isOutputActive: true`) first -> display name -> pid, with each pid
 /// deduplicated. Read-only, with no permission prompts. Returns within 3 seconds even if the OS
 /// does not respond. Runs on the libuv thread pool without blocking the JS event loop.
 ///
@@ -2671,9 +2675,9 @@ pub fn open_mock_stream(
 
 /// Writer that incrementally saves recording chunks to FLAC files with lossless compression.
 ///
-/// When `splitSeconds` is at least 1, reaching `splitSeconds × sampleRate` written frames closes
+/// When `splitSeconds` is at least 1, reaching `splitSeconds * sampleRate` written frames closes
 /// the current file and rotates to the next, using three-digit sequence numbers such as
-/// `name-001.flac, name-002.flac, …` (same convention as CLI WAV splitting). Boundaries advance
+/// `name-001.flac, name-002.flac, ...` (same convention as CLI WAV splitting). Boundaries advance
 /// at chunk granularity when the threshold is reached, so each file may exceed the specified duration
 /// by up to one chunk; chunks are never split and no data is dropped. Omitted/0 `splitSeconds` uses one file.
 #[napi]
@@ -2825,7 +2829,7 @@ impl Denoiser {
         Ok(Denoiser { inner })
     }
 
-    /// Suppress noise in arbitrary-length interleaved f32 (±1.0 normalized, 48kHz, length a multiple of
+    /// Suppress noise in arbitrary-length interleaved f32 (+/-1.0 normalized, 48kHz, length a multiple of
     /// channels), returning a **new array** (copied because in-place processing is awkward in napi).
     /// A length not divisible by channels yields InvalidArg.
     #[napi]
@@ -2858,10 +2862,10 @@ mod tests {
     //! Only pure conversion from Rust values to JS intermediate representations is checked here:
     //! - `parse_source_kind` / `source_kind_str` (round trip)
     //! - `parse_process_mode` (default/explicit/unknown)
-    //! - `build_config` (OpenOptions → StreamConfig defaults and mapping)
-    //! - `to_napi_err` (flexaudio::Error → napi string and Status)
+    //! - `build_config` (OpenOptions -> StreamConfig defaults and mapping)
+    //! - `to_napi_err` (flexaudio::Error -> napi string and Status)
     //! - `event_to_js` / `device_event_to_js` (kind strings and payload)
-    //! - `chunk_to_js` (seq u64 → BigInt, data, frames, peak/rms)
+    //! - `chunk_to_js` (seq u64 -> BigInt, data, frames, peak/rms)
     //!
     //! `Float32Array::new(Vec)` and `BigInt::from(u64)` populate pure Rust fields; values can be
     //! read back through `Deref<[f32]>` / `get_u64()` without a JS runtime (napi 2.16).
@@ -3320,13 +3324,13 @@ mod tests {
         assert_eq!(changed.source_kind.as_deref(), Some("system"));
     }
 
-    // seq u64 → BigInt conversion (pure marshaling logic).
+    // seq u64 -> BigInt conversion (pure marshaling logic).
     //
     // Full `chunk_to_js` cannot be tested here because it creates `Float32Array`. In napi
     // 2.16, `Float32Array`'s `Drop` unconditionally references `napi_call_threadsafe_function`,
     // preventing linkage in the cdylib unit test binary (no Node host) and breaking
     // `cargo test -p flexaudio-napi`. Therefore test only JS-runtime-independent
-    // seq→BigInt conversion with the same logic (`BigInt::from(u64)` + `get_u64`).
+    // seq->BigInt conversion with the same logic (`BigInt::from(u64)` + `get_u64`).
     // The data/Float32Array path is covered by Node E2E (`__openMockStream`).
 
     #[test]

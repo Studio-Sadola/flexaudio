@@ -50,7 +50,6 @@ impl Stream {
             // Permission denial already closes delivery and stops the backend
             // in open_backend_once. Other failures still need startup cleanup.
             self.retain_shutdown_outcome();
-            let cleanup = cleanup_error_since(&self.shared, old_cleanup_count);
             *self
                 .shared
                 .chunk_producer
@@ -61,8 +60,8 @@ impl Stream {
                 .secondary_producer
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = secondary_producer;
-            let error = with_cleanup(error, cleanup);
-            self.shutdown_receipt.acknowledge_error(&error);
+            let error =
+                self.retain_start_failure(error, previous_report.as_ref(), old_cleanup_count);
             return Err(error);
         }
 
@@ -93,10 +92,8 @@ impl Stream {
             Err(error) => {
                 let primary = Error::Backend(format!("spawn intake thread: {error}"))
                     .with_context(ErrorContext::new(Operation::Start));
-                self.retain_shutdown_outcome();
-                let cleanup = cleanup_error_since(&self.shared, old_cleanup_count);
-                let error = with_cleanup(primary, cleanup);
-                self.shutdown_receipt.acknowledge_error(&error);
+                let error =
+                    self.retain_start_failure(primary, previous_report.as_ref(), old_cleanup_count);
                 return Err(error);
             }
         };
@@ -113,10 +110,8 @@ impl Stream {
             Err(error) => {
                 let primary = Error::Backend(format!("spawn watchdog thread: {error}"))
                     .with_context(ErrorContext::new(Operation::Start));
-                self.retain_shutdown_outcome();
-                let cleanup = cleanup_error_since(&self.shared, old_cleanup_count);
-                let error = with_cleanup(primary, cleanup);
-                self.shutdown_receipt.acknowledge_error(&error);
+                let error =
+                    self.retain_start_failure(primary, previous_report.as_ref(), old_cleanup_count);
                 return Err(error);
             }
         };
@@ -176,6 +171,37 @@ impl Stream {
             self.shutdown_receipt.acknowledge_error(error);
         }
         result
+    }
+
+    fn retain_start_failure(
+        &mut self,
+        startup: Error,
+        previous: Option<&ShutdownReport>,
+        first_cleanup: usize,
+    ) -> Error {
+        self.retain_shutdown_outcome();
+        let current = self
+            .shutdown
+            .as_ref()
+            .expect("startup rollback retained report");
+        let attempt = ShutdownReport::new(
+            current.primary().cloned(),
+            current
+                .cleanup()
+                .iter()
+                .skip(first_cleanup)
+                .cloned()
+                .collect(),
+        );
+        let retained = flexaudio_core::terminal_causes::merge_shutdown_reports(previous, current);
+        self.shutdown = Some(retained);
+        let startup = ShutdownReport::new(Some(startup), Vec::new());
+        let error =
+            flexaudio_core::terminal_causes::merge_shutdown_reports(Some(&startup), &attempt)
+                .result()
+                .expect_err("startup failure remains primary");
+        self.shutdown_receipt.acknowledge_error(&error);
+        error
     }
 
     // Explicit stop, checked stop and startup rollback share this retained report.

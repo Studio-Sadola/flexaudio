@@ -1,6 +1,6 @@
 //! Windows build-number gate. Process loopback requires build 20348 or later.
 //!
-//! The decision logic (build number → supported or not) is a pure function separate from OS
+//! The decision logic (build number -> supported or not) is a pure function separate from OS
 //! calls, so it can be unit-tested on non-Windows systems. Read the actual version with
 //! `RtlGetVersion` (ntdll), which is not affected by compatibility mode.
 

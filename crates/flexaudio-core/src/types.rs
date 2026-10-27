@@ -240,8 +240,8 @@ impl DeviceInfo {
 pub struct ProcessInfo {
     /// OS process ID. Key passed to [`StreamConfig::target_pid`]. Always nonzero.
     pub pid: u32,
-    /// Human-readable display name (never empty). Chosen in this order: OS-reported name (such as PipeWire `application.name`) →
-    /// executable name → bundle ID → `"pid <N>"`. Unreadable optional metadata stays unknown.
+    /// Human-readable display name (never empty). Chosen in this order: OS-reported name (such as PipeWire `application.name`) ->
+    /// executable name -> bundle ID -> `"pid <N>"`. Unreadable optional metadata stays unknown.
     pub name: String,
     /// Executable basename (for example, `firefox` or `chrome.exe`). `Some` only when the OS provides it.
     /// Linux tries `/proc/<pid>/exe` and falls back to `/proc/<pid>/comm` if it cannot be read.
@@ -368,8 +368,8 @@ pub enum ProcessMode {
 /// is a pass-through.
 ///
 /// `sample_rate` is the target rate for down/up-sampling (with rubato antialiasing).
-/// `channels` is 1 (mono) or 2 (stereo). stereo→mono averages L/R;
-/// mono→stereo duplicates the channel.
+/// `channels` is 1 (mono) or 2 (stereo). stereo->mono averages L/R;
+/// mono->stereo duplicates the channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputFormat {
     /// Output sample rate (Hz).
@@ -429,7 +429,7 @@ impl Default for OutputFormat {
 /// Process-source PID handling is controlled by [`mode`](Self::mode). System-source
 /// exclusion is controlled by [`exclude_pids`](Self::exclude_pids) and
 /// [`exclude_self`](Self::exclude_self), with effective set
-/// `exclude_pids ∪ {this process if exclude_self}`. The system side of [`SourceKind::Mix`]
+/// `exclude_pids union {this process if exclude_self}`. The system side of [`SourceKind::Mix`]
 /// uses the same exclusion set; microphone and process sources ignore both exclusion fields.
 /// The four `mix_*` fields apply only to [`SourceKind::Mix`] and are ignored for other sources.
 #[derive(Debug, Clone, PartialEq)]
@@ -472,7 +472,7 @@ pub struct StreamConfig {
     /// Additional process IDs whose playback is excluded from a system capture.
     /// Applies only to a system source and the system side of [`SourceKind::Mix`];
     /// microphone and process sources ignore it. The effective exclusion set is
-    /// `exclude_pids ∪ {this process if exclude_self}`. Every PID must be a positive
+    /// `exclude_pids union {this process if exclude_self}`. Every PID must be a positive
     /// integer; zero is rejected.
     ///
     /// On Linux, every listed PID is excluded. Pulse-proxied streams (including
@@ -510,7 +510,7 @@ pub struct StreamConfig {
     ///
     /// Cannot be changed with `Stream::switch_source` (fixed when opened).
     pub secondary_output: Option<OutputFormat>,
-    /// Input gain at start (linear multiplier). 1.0 = unchanged, 2.0 ≈ +6 dB, 0.0 = silence. Default 1.0.
+    /// Input gain at start (linear multiplier). 1.0 = unchanged, 2.0 approx. +6 dB, 0.0 = silence. Default 1.0.
     /// Must be finite and >= 0.0 (otherwise open returns [`Error::InvalidArg`]).
     /// Change it at runtime with `Stream::set_gain`.
     pub gain: f32,
@@ -522,7 +522,7 @@ pub struct StreamConfig {
     pub mix_system_device_id: Option<String>,
     /// Pre-mix linear gain for the mic side of [`SourceKind::Mix`]. Default 1.0. Ignored except for
     /// `Mix`. Existing [`gain`](Self::gain) is global and applied after mixing
-    /// (final value ≈ clamp(clamp(mic×mix_mic_gain + sys×mix_system_gain) × gain)).
+    /// (final value approx. clamp(clamp(mic*mix_mic_gain + sys*mix_system_gain) * gain)).
     pub mix_mic_gain: f32,
     /// Pre-mix linear gain for the system side of [`SourceKind::Mix`]. Default 1.0. Ignored except for
     /// `Mix`. See [`gain`](Self::gain) for the global post-mix multiplier.

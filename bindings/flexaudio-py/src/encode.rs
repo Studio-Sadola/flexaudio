@@ -49,7 +49,7 @@ enum EncoderState {
 /// and finalizes when leaving the `with` block.
 ///
 /// With `split_seconds>0`, the current file is finalized and the next numbered file is opened
-/// whenever the written frame count reaches `split_seconds × sample_rate`. Each file may be up
+/// whenever the written frame count reaches `split_seconds * sample_rate`. Each file may be up
 /// to one chunk longer than the requested duration. Chunks are never split or dropped.
 ///
 /// Files are opened only when the first chunk arrives (lazy creation). If finalized without
@@ -61,7 +61,7 @@ pub struct FlacEncoder {
     base: PathBuf,
     sample_rate: u32,
     channels: u16,
-    // Frame threshold per file (split_seconds × sample_rate). 0 means no splitting.
+    // Frame threshold per file (split_seconds * sample_rate). 0 means no splitting.
     frames_per_file: u64,
     // Writer for the current file (created lazily; None after rotation or before writing).
     writer: Option<FlacWriter>,
@@ -188,7 +188,7 @@ impl FlacEncoder {
     /// Append interleaved f32 samples. The length must be a multiple of `channels` (otherwise
     /// `ValueError` is raised). `samples` can be a list, array.array, or NumPy array. Empty input is a no-op.
     ///
-    /// If the frame count reaches `split_seconds × sample_rate` after writing, the current file
+    /// If the frame count reaches `split_seconds * sample_rate` after writing, the current file
     /// is finalized and rotation to the next numbered file happens immediately.
     fn write_chunk(&mut self, samples: Vec<f32>) -> PyResult<()> {
         self.check_open()?;
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn frames_per_file_reflects_split_seconds() {
-        // split_seconds × sample_rate is the threshold; 0 means no splitting.
+        // split_seconds * sample_rate is the threshold; 0 means no splitting.
         let enc = FlacEncoder::new(PathBuf::from("x.flac"), 48_000, 2, 0).unwrap();
         assert_eq!(enc.frames_per_file, 0);
 

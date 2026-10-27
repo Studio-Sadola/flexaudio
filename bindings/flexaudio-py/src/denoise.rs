@@ -11,7 +11,7 @@ use crate::denoise_err_to_py;
 
 /// Streaming noise suppressor.
 ///
-/// **Requires 48 kHz**: Input must be interleaved f32 normalized to ±1.0 at 48 kHz because
+/// **Requires 48 kHz**: Input must be interleaved f32 normalized to +/-1.0 at 48 kHz because
 /// RNNoise only supports fixed frames at 48 kHz. Stereo channels are processed independently.
 ///
 /// Latency: Output trails input by 480 samples per channel (10 ms at 48 kHz). The first 480
@@ -31,7 +31,7 @@ impl Denoiser {
         Ok(Denoiser { inner })
     }
 
-    /// Suppress noise in any-length interleaved samples (normalized to ±1.0 at 48 kHz) and return them.
+    /// Suppress noise in any-length interleaved samples (normalized to +/-1.0 at 48 kHz) and return them.
     ///
     /// Length must be a multiple of the channel count, or `ValueError` is raised. Partial frames
     /// carry over to the next call, so input can be split and passed in consecutive chunks.

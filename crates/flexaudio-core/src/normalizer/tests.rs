@@ -8,7 +8,7 @@ fn default_out() -> OutputFormat {
 
 // --- Value-check helpers (verify amplitude and frequency preservation) ---
 
-/// RMS of a sample sequence (linear). For a sine wave, this is A/√2 for amplitude A.
+/// RMS of a sample sequence (linear). For a sine wave, this is A/sqrt(2) for amplitude A.
 fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;

@@ -23,7 +23,7 @@ including their copyright notices. A crate may appear under multiple texts.
 
 ## License texts
 
-### Apache-2.0 — Apache License 2.0
+### Apache-2.0 -- Apache License 2.0
 
 Used by:
 
@@ -236,7 +236,7 @@ Used by:
 
 ````
 
-### Apache-2.0 — Apache License 2.0
+### Apache-2.0 -- Apache License 2.0
 
 Used by:
 
@@ -449,7 +449,7 @@ Used by:
 
 ````
 
-### Apache-2.0 — Apache License 2.0
+### Apache-2.0 -- Apache License 2.0
 
 Used by:
 
@@ -663,7 +663,7 @@ limitations under the License.
 
 ````
 
-### BSD-3-Clause — BSD 3-Clause "New" or "Revised" License
+### BSD-3-Clause -- BSD 3-Clause "New" or "Revised" License
 
 Used by:
 
@@ -705,7 +705,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ````
 
-### ISC — ISC License
+### ISC -- ISC License
 
 Used by:
 
@@ -727,7 +727,7 @@ THIS SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -764,7 +764,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -801,7 +801,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -837,7 +837,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -872,7 +872,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -906,7 +906,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -951,7 +951,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -981,7 +981,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1016,7 +1016,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1056,7 +1056,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1093,7 +1093,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1129,7 +1129,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1165,7 +1165,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1195,7 +1195,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1225,7 +1225,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1254,7 +1254,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1291,7 +1291,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1326,7 +1326,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1361,7 +1361,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1398,7 +1398,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1433,7 +1433,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1468,7 +1468,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1503,7 +1503,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1538,7 +1538,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1572,7 +1572,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1607,7 +1607,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1642,7 +1642,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1677,7 +1677,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1712,7 +1712,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1747,7 +1747,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1782,7 +1782,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1818,7 +1818,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1853,7 +1853,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1888,7 +1888,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1923,7 +1923,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1958,7 +1958,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -1986,7 +1986,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2022,7 +2022,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2057,7 +2057,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2092,7 +2092,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2127,7 +2127,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2163,7 +2163,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2202,7 +2202,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2230,7 +2230,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2261,7 +2261,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2301,7 +2301,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2336,7 +2336,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2371,7 +2371,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2406,7 +2406,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2442,7 +2442,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2479,7 +2479,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2512,7 +2512,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2543,7 +2543,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2574,7 +2574,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2605,7 +2605,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2636,7 +2636,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2667,7 +2667,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2698,7 +2698,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2729,7 +2729,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2760,7 +2760,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2799,7 +2799,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2859,7 +2859,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2890,7 +2890,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2921,7 +2921,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2956,7 +2956,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -2990,7 +2990,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -3019,7 +3019,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -3090,7 +3090,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -3123,7 +3123,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -3137,7 +3137,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -3168,7 +3168,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -3202,7 +3202,7 @@ THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -3233,7 +3233,7 @@ THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -3266,7 +3266,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -3298,7 +3298,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -3330,7 +3330,7 @@ THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -3361,7 +3361,7 @@ SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -3400,7 +3400,7 @@ DEALINGS IN THE SOFTWARE.
 
 ````
 
-### MIT — MIT License
+### MIT -- MIT License
 
 Used by:
 
@@ -3430,7 +3430,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ````
 
-### MPL-2.0 — Mozilla Public License 2.0
+### MPL-2.0 -- Mozilla Public License 2.0
 
 Used by:
 
@@ -3817,7 +3817,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
 
 ````
 
-### Unicode-3.0 — Unicode License v3
+### Unicode-3.0 -- Unicode License v3
 
 Used by:
 
@@ -3866,7 +3866,7 @@ authorization of the copyright holder.
 
 ````
 
-### Zlib — zlib License
+### Zlib -- zlib License
 
 Used by:
 
@@ -3897,14 +3897,14 @@ the following restrictions:
 
 ## Non-crate components
 
-### Silero VAD model — `silero_vad_openvino_16k.onnx`
+### Silero VAD model -- `silero_vad_openvino_16k.onnx`
 
 `flexaudio-vad` embeds the Silero VAD ONNX model
 (`crates/flexaudio-vad/assets/silero_vad_openvino_16k.onnx`) into the compiled artifact via
 `include_bytes!`. The model weights are therefore present in every binary that
 links `flexaudio-vad`, and this notice MUST be reproduced in distributions.
 
-  - Project: Silero VAD — https://github.com/snakers4/silero-vad
+  - Project: Silero VAD -- https://github.com/snakers4/silero-vad
   - Copyright (c) 2020-present Silero Team
   - License: MIT
 
@@ -3947,7 +3947,7 @@ SOFTWARE.
 
 The embedded `flexaudio-vad` implementation ports segmentation processing from
 whisper.cpp pin `85a69493a601d4ff5a834064f7b7bac250bd8739` (function
-`whisper_vad_segments_from_probs`, lines 5211–5444). The upstream source notes
+`whisper_vad_segments_from_probs`, lines 5211-5444). The upstream source notes
 the Silero lineage of its silence split rule. This notice covers the adapted
 segmentation implementation.
 

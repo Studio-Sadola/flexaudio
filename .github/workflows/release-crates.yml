@@ -2,10 +2,10 @@
 #
 # === What the maintainer must set up ===
 #  - Default (token) auth: add a repository secret named CARGO_REGISTRY_TOKEN
-#    (Settings → Secrets and variables → Actions → New repository secret).
+#    (Settings -> Secrets and variables -> Actions -> New repository secret).
 #    Generate the token at https://crates.io/settings/tokens with the
 #    "publish-new" + "publish-update" scopes.
-#  - Alternative (no token) — crates.io Trusted Publishing via OIDC:
+#  - Alternative (no token) -- crates.io Trusted Publishing via OIDC:
 #    register this repo + workflow as a Trusted Publisher for each crate at
 #    https://crates.io/crates/<name>/settings, then use the OIDC exchange shown
 #    in the commented block below instead of CARGO_REGISTRY_TOKEN. That needs
@@ -206,7 +206,7 @@ jobs:
             if already_published "${crate}" "${VERSION}"; then
               # Idempotent re-runs: treat an already-published version as success
               # (not an error), so re-triggering the tag does not fail.
-              echo "${crate}@${VERSION} already published — skipping."
+              echo "${crate}@${VERSION} already published -- skipping."
               echo "::endgroup::"
               continue
             fi
@@ -214,7 +214,7 @@ jobs:
             if [ "${DRY_RUN}" = "true" ]; then
               # cargo publish --dry-run resolves deps against the live index, so a
               # crate that depends on another *workspace* crate fails ("no matching
-              # package") until that dep is actually published — a chicken-and-egg
+              # package") until that dep is actually published -- a chicken-and-egg
               # cargo can't solve in a dry run. So in dry-run we only package the
               # leaf crates (no workspace deps); the dependent crates are exercised
               # for real at publish time, where wait_for_index makes each dep

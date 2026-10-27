@@ -672,6 +672,53 @@ fn unsuccessful_start_preserves_previous_outcome_and_successful_retry_clears_it(
 }
 
 #[test]
+fn failed_start_returns_the_primary_observed_while_rolling_back() {
+    struct FailedStartWithTerminal {
+        stopped: bool,
+        reported: bool,
+    }
+    impl CaptureBackend for FailedStartWithTerminal {
+        fn native_format(&self) -> (u32, u16) {
+            (48_000, 2)
+        }
+        fn start(&mut self, _: RawSink) -> Result<()> {
+            Err(Error::DeviceNotFound)
+        }
+        fn stop(&mut self) {
+            self.stopped = true;
+        }
+        fn poll_event(&mut self) -> Option<Event> {
+            if self.stopped && !std::mem::replace(&mut self.reported, true) {
+                Some(Event::TerminalError {
+                    error: Error::Unsupported,
+                })
+            } else {
+                None
+            }
+        }
+    }
+    let mut stream = Stream::open(
+        StreamConfig::default(),
+        Box::new(FailedStartWithTerminal {
+            stopped: false,
+            reported: false,
+        }),
+    )
+    .unwrap();
+    let returned = stream.start().unwrap_err();
+    assert_eq!(returned.root(), &Error::DeviceNotFound);
+    assert!(flexaudio_core::terminal_causes::retains_terminal_cause(
+        &returned,
+        &Error::Unsupported
+    ));
+    assert_eq!(
+        stream.shutdown_report().unwrap().primary(),
+        Some(&Error::Unsupported)
+    );
+    assert_eq!(stream.stop_checked(), Err(Error::Unsupported));
+}
+
+#[test]
 fn failed_start_drains_realtime_rejections_without_pcm() {
     struct Failed;
     impl CaptureBackend for Failed {

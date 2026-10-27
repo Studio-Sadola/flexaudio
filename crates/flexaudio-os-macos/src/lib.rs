@@ -1,4 +1,4 @@
-//! flexaudio-os-macos — macOS backend using Core Audio Process Taps
+//! flexaudio-os-macos - macOS backend using Core Audio Process Taps
 //! (objc2-core-audio, macOS 14.4+).
 //!
 //! Captures all system audio output ([`MacSystemBackend`]) or a specific process
@@ -6,7 +6,7 @@
 //! monitor.
 //!
 //! # Architecture
-//! The tap chain (`CATapDescription` → process tap → private aggregate device → IOProc block →
+//! The tap chain (`CATapDescription` -> process tap -> private aggregate device -> IOProc block ->
 //! start) lives in the [`tap`] module. Both backends use the same chain, switching the `TapKind`
 //! between INCLUDE and EXCLUDE. `!Send` ObjC objects (`Retained<CATapDescription>` / `RcBlock` /
 //! `TapChain`) stay on the backend's dedicated thread; only the `Send` state (stop flag,

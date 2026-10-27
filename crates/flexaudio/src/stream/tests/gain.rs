@@ -9,7 +9,7 @@ use super::*;
 /// the actual post-gain level).
 #[test]
 fn gain_scales_samples_and_meters() {
-    // (gain, expected peak range). Sine amplitude 0.5 × gain.
+    // (gain, expected peak range). Sine amplitude 0.5 * gain.
     for (gain, lo, hi) in [(2.0f32, 0.95f32, 1.0f32), (0.5, 0.2, 0.3)] {
         let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
         let mut config = StreamConfig::default();
@@ -78,8 +78,8 @@ fn set_gain_takes_effect_mid_stream() {
     }
 }
 
-/// Samples are clamped to ±1.0 even at high gain. With sine amplitude 0.5 × gain 100, samples
-/// would reach 50 without clamping, but all stay within ±1.0 and the peak is exactly 1.0.
+/// Samples are clamped to +/-1.0 even at high gain. With sine amplitude 0.5 * gain 100, samples
+/// would reach 50 without clamping, but all stay within +/-1.0 and the peak is exactly 1.0.
 #[test]
 fn gain_clamps_to_unit_range() {
     let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
@@ -95,7 +95,7 @@ fn gain_clamps_to_unit_range() {
     for c in &chunks {
         assert!(
             c.data.iter().all(|&x| (-1.0..=1.0).contains(&x)),
-            "samples should not exceed ±1.0"
+            "samples should not exceed \u{b1}1.0"
         );
         max_peak = max_peak.max(c.peak);
     }

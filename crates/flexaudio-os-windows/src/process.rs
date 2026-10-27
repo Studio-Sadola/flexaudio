@@ -1,4 +1,4 @@
-//! [`WasapiProcessBackend`] — per-process WASAPI loopback.
+//! [`WasapiProcessBackend`] - per-process WASAPI loopback.
 //!
 //! Capture audio for a PID and its process tree with `ActivateAudioInterfaceAsync` and
 //! `AUDIOCLIENT_ACTIVATION_PARAMS` (process loopback). `mode` [`ProcessMode::Include`] captures
@@ -60,9 +60,9 @@ const NATIVE_CHANNELS: u16 = 2;
 /// named externally, so use a layout-matched mirror and pass it with `transmute`.
 ///
 /// The layout matches the measured raw `PROPVARIANT_0_0` / `PROPVARIANT_0_0_0` from windows-core
-/// 0.54: `vt: u16` + `wReserved1/2/3: u16 ×3` (8 bytes, aligned to the value union boundary) + a
+/// 0.54: `vt: u16` + `wReserved1/2/3: u16 *3` (8 bytes, aligned to the value union boundary) + a
 /// 16-byte value union. The union (`PROPVARIANT_0_0_0`) includes `CAUB` / `BLOB` / `CAFILETIME` and
-/// other “u32 count + pointer” types, so it is 16 bytes on x64. The whole PROPVARIANT is 8+16=24
+/// other "u32 count + pointer" types, so it is 16 bytes on x64. The whole PROPVARIANT is 8+16=24
 /// bytes. The VT_BLOB union starts with `BLOB { cbSize: u32, pBlobData: *mut u8 }`; x64 adds 4 bytes
 /// of padding after cbSize (offset 8) for pointer alignment, placing pBlobData at offset 16.
 #[repr(C)]
@@ -87,7 +87,7 @@ const VT_BLOB_U16: u16 = 65;
 // Also compare against the size of `PROPVARIANT` itself (a thin wrapper over raw imp::PROPVARIANT,
 // so it should have the same size).
 //
-// This mirror's 24-byte layout assumes 64-bit pointers (the value union's “u32 count + pointer”
+// This mirror's 24-byte layout assumes 64-bit pointers (the value union's "u32 count + pointer"
 // type is 16 bytes). On 32-bit targets, 4-byte pointers change PROPVARIANT size/alignment/padding,
 // causing the const assertions below to fail at build time. flexaudio supports only 64-bit Windows
 // (x86_64 / aarch64).
@@ -571,7 +571,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<PROPVARIANT>(), 24);
     }
 
-    /// `start` → `stop` does not panic regardless of device or target PID availability.
+    /// `start` -> `stop` does not panic regardless of device or target PID availability.
     /// `Err` is acceptable for an invalid target PID or unsupported OS; a panic is not.
     #[test]
     fn start_then_stop_tolerates_missing_target() {

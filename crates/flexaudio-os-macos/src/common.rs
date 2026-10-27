@@ -1,10 +1,10 @@
-//! Shared helpers for the macOS backend: PID → AudioObjectID conversion, a thin wrapper around
+//! Shared helpers for the macOS backend: PID -> AudioObjectID conversion, a thin wrapper around
 //! `AudioObjectGetPropertyData`, reading `(rate, channels)` and float status from ASBD, converting
 //! `OSStatus` to [`Error`], and a monotonic clock.
 //!
 //! Both [`MacSystemBackend`](crate::MacSystemBackend) and
 //! [`MacProcessBackend`](crate::MacProcessBackend) run the [`tap`](crate::tap) chain (process tap
-//! → aggregate device → IOProc). They differ only in how they create [`CATapDescription`]
+//! -> aggregate device -> IOProc). They differ only in how they create [`CATapDescription`]
 //! (INCLUDE = mixdown / EXCLUDE = global), so tap creation, aggregation, IOProc, and teardown are
 //! shared.
 
@@ -56,10 +56,10 @@ pub(crate) fn map_os_status_at(operation: Operation, call: &'static str, status:
     // 'who?' = kAudioHardwareUnknownPropertyError, '!obj' = kAudioHardwareBadObjectError,
     // 'nope' = kAudioHardwareIllegalOperationError, 'stop' = kAudioHardwareNotRunningError,
     // '!dev' = kAudioHardwareBadDeviceError.
-    const ILLEGAL_OPERATION: i32 = 0x6e6f7065; // 'nope' — common when TCC denies access
+    const ILLEGAL_OPERATION: i32 = 0x6e6f7065; // 'nope' - common when TCC denies access
     const NOT_RUNNING: i32 = 0x73746f70; // 'stop'
     const BAD_OBJECT: i32 = 0x216f626a; // '!obj'
-    const BAD_DEVICE: i32 = 0x21646576; // '!dev' — requested device is missing or invalid
+    const BAD_DEVICE: i32 = 0x21646576; // '!dev' - requested device is missing or invalid
 
     let error = match status {
         // 'nope' (illegal operation) can also mean tap/aggregate creation was denied due to
@@ -204,7 +204,7 @@ pub(crate) fn translate_pid_to_object(pid: i32) -> Result<AudioObjectID, Error> 
 ///
 /// If the list changes size between the size query and data read, it may return
 /// `kAudioHardwareBadPropertySizeError`, so retry transient failures a few times. Pass the exact
-/// allocated buffer size to `GetPropertyData`: element count × element size in bytes.
+/// allocated buffer size to `GetPropertyData`: element count * element size in bytes.
 ///
 /// On failure, return the raw `OSStatus`. The caller decides whether to treat it as empty or
 /// convert it to a typed error with [`map_os_status`] (device enumeration treats it as empty;
@@ -247,7 +247,7 @@ fn read_system_object_list_once(selector: u32) -> Result<Vec<AudioObjectID>, i32
     }
     let mut ids: Vec<AudioObjectID> = vec![0; count];
     let mut data_size = (count * elem) as u32;
-    // SAFETY: `ids` has space for `count` elements. `data_size` is element count × element size.
+    // SAFETY: `ids` has space for `count` elements. `data_size` is element count * element size.
     let status = unsafe {
         AudioObjectGetPropertyData(
             kAudioObjectSystemObject as AudioObjectID,

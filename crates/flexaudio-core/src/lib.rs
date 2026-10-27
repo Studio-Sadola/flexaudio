@@ -1,4 +1,4 @@
-//! flexaudio-core — OS-independent core.
+//! flexaudio-core -- OS-independent core.
 //!
 //! The OS-independent part of the desktop audio capture abstraction library `flexaudio`.
 //! Provides ring buffers, sample-rate conversion, channel mixing, 20 ms chunking, clock normalization,

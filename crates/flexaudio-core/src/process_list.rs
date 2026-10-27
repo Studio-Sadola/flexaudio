@@ -5,7 +5,7 @@
 //!
 //! 1. Drop PID 0 and the excluded PID (the caller's process by default).
 //! 2. Merge entries with the same PID (active output wins if any entry is active).
-//! 3. Ensure the display name is non-empty (reported name → executable name → bundle ID → `pid <N>`).
+//! 3. Ensure the display name is non-empty (reported name -> executable name -> bundle ID -> `pid <N>`).
 //! 4. Sort active entries first, then by display name (case-insensitive), then PID for stable results.
 
 use std::collections::BTreeMap;
@@ -66,7 +66,7 @@ fn merge_into(kept: &mut ProcessInfo, other: ProcessInfo) {
     kept.is_output_active = merge_activity(kept.is_output_active, other.is_output_active);
 }
 
-/// Choose a display name (reported name → executable name → bundle ID → `pid <N>`).
+/// Choose a display name (reported name -> executable name -> bundle ID -> `pid <N>`).
 fn display_name(info: &ProcessInfo) -> String {
     let own = info.name.trim();
     if !own.is_empty() {
@@ -81,7 +81,7 @@ fn display_name(info: &ProcessInfo) -> String {
 /// Normalize the raw process list by merging duplicates, excluding PIDs, filling display names, and sorting.
 ///
 /// Pass `Some(pid)` as `exclude_pid` to drop that PID (the facade passes the caller's own
-/// `std::process::id()`). PID 0 is always dropped; it means “not a process” on every OS and
+/// `std::process::id()`). PID 0 is always dropped; it means "not a process" on every OS and
 /// cannot be used as `target_pid`.
 pub fn normalize_process_list(raw: Vec<ProcessInfo>, exclude_pid: Option<u32>) -> Vec<ProcessInfo> {
     let mut by_pid: BTreeMap<u32, ProcessInfo> = BTreeMap::new();

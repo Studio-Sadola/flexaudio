@@ -71,7 +71,7 @@ class ReleaseVersionTests(unittest.TestCase):
                 self.assertIn('flexaudio = "0.2"', result.stderr)
 
     def test_invalid_tags_and_versions(self) -> None:
-        for tag in ("0.3.0", "v0.3", "v0.3.0-rc.1", "v0.3.0\n", "v０.3.0", "v0.3.0;echo bad"):
+        for tag in ("0.3.0", "v0.3", "v0.3.0-rc.1", "v0.3.0\n", "v\uff10.3.0", "v0.3.0;echo bad"):
             with self.subTest(tag=tag):
                 self.assert_failure(self.run_gate("--tag", tag), "Release tag must match")
         for version in ("", "v0.3.0", "0.3.0+meta", "0.3.0\n", "$(echo bad)"):

@@ -5,10 +5,10 @@ Windows audio capture backend for the `flexaudio` workspace, built on WASAPI via
 
 Provides two `CaptureBackend` implementations:
 
-- **`WasapiSystemBackend`** — classic WASAPI loopback
+- **`WasapiSystemBackend`** -- classic WASAPI loopback
   (`AUDCLNT_STREAMFLAGS_LOOPBACK`) that records the full system output mix (all
   audio flowing to the default render endpoint).
-- **`WasapiProcessBackend`** — process-tree loopback via
+- **`WasapiProcessBackend`** -- process-tree loopback via
   `ActivateAudioInterfaceAsync` + `AUDIOCLIENT_ACTIVATION_PARAMS`, which captures
   audio from a specific PID (and its child processes). Setting `ProcessMode::Exclude`
   inverts the filter to capture all system audio except that process tree.
@@ -30,4 +30,4 @@ The crate compiles as an empty stub on non-Windows targets
 
 ## License
 
-[MIT](LICENSE) © 2026 tubome / Studio Sadola.
+[MIT](LICENSE) (c) 2026 tubome / Studio Sadola.

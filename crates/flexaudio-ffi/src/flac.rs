@@ -3,7 +3,7 @@
 //! [`FlexFlac`] is an opaque handle that streams recording chunks (interleaved f32) to files while
 //! compressing them losslessly. It drives [`flexaudio_encode::FlacWriter`] internally. When
 //! `split_seconds` is set, it rotates to numbered files (`name-001.flac`,
-//! `name-002.flac`, …) each time the written frame count reaches the threshold, matching the CLI's `--split-seconds` behavior.
+//! `name-002.flac`, ...) each time the written frame count reaches the threshold, matching the CLI's `--split-seconds` behavior.
 //!
 //! It follows the crate-wide conventions: guards catch panics, NULL is checked, and failures set last_error.
 
@@ -24,7 +24,7 @@ const MAX_SAMPLE_RATE: u32 = 96_000;
 /// Create the path for the `index`th split recording file (1-based; pure function).
 ///
 /// For `rec.flac`, insert a zero-padded three-digit sequence before the extension, as in
-/// `rec-001.flac, rec-002.flac, …`. The number grows naturally beyond 999. If there is no extension,
+/// `rec-001.flac, rec-002.flac, ...`. The number grows naturally beyond 999. If there is no extension,
 /// append the number to the path. Preserve the parent directory (same rule as CLI `split_file_path`).
 fn split_file_path(base: &Path, index: u64) -> PathBuf {
     let stem = base
@@ -100,7 +100,7 @@ struct RotatingFlac {
     base: PathBuf,
     sample_rate: u32,
     channels: u16,
-    /// Frame threshold per file (`split_seconds × rate`). 0 = no splitting.
+    /// Frame threshold per file (`split_seconds * rate`). 0 = no splitting.
     frames_per_file: u64,
     /// Current writer (created lazily; None after rotation or before writing).
     writer: Option<FlacWriter>,
@@ -280,7 +280,7 @@ pub unsafe extern "C" fn flexaudio_flac_create(
     })
 }
 
-/// Append interleaved f32 (length = frame count × channel count).
+/// Append interleaved f32 (length = frame count * channel count).
 ///
 /// `len` must be a multiple of the channel count (otherwise InvalidArg). `len=0` is a no-op.
 /// Writing to a finalized handle returns `FLEX_INVALID_STATE`.
@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn rotating_frames_per_file_reflects_split_seconds() {
-        // split_seconds × rate = frame threshold per file. 0 means no splitting.
+        // split_seconds * rate = frame threshold per file. 0 means no splitting.
         let r = RotatingFlac::new(PathBuf::from("x.flac"), 48_000, 2, 5);
         assert_eq!(r.frames_per_file, 5 * 48_000);
         let single = RotatingFlac::new(PathBuf::from("x.flac"), 48_000, 2, 0);
@@ -526,10 +526,10 @@ mod tests {
         remove_test_file(&f2);
         let cpath = CString::new(base.to_str().unwrap()).unwrap();
 
-        // split_seconds=1 at 48 kHz mono → 48000 frames per file.
+        // split_seconds=1 at 48 kHz mono -> 48000 frames per file.
         let f = unsafe { flexaudio_flac_create(cpath.as_ptr(), 48_000, 1, 1) };
         assert!(!f.is_null());
-        // Write exactly to the threshold → file-001 closes and the sequence advances.
+        // Write exactly to the threshold -> file-001 closes and the sequence advances.
         let block = vec![0.0f32; 48_000];
         assert_eq!(
             unsafe { flexaudio_flac_write(f, block.as_ptr(), block.len()) },

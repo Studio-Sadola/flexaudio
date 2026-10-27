@@ -35,7 +35,7 @@ export interface JsDeviceInfo {
 export interface JsProcessInfo {
   /** OS process ID (nonzero). Pass to `openStream` as `processId`. */
   pid: number
-  /** Display name (always nonempty). OS-reported name → executable name → bundle ID → `"pid <N>"`. */
+  /** Display name (always nonempty). OS-reported name -> executable name -> bundle ID -> `"pid <N>"`. */
   name: string
   /** Executable basename; unreadable optional metadata (including access denied) stays absent. */
   executable?: string
@@ -205,7 +205,7 @@ export interface VadError extends Error {
 export declare class Vad {
   constructor(params?: VadOptions)
   /** Normalized [-1,1] interleaved float32 PCM; defaults to 16000 Hz, mono.
-   * Rates of 8000–192000 Hz and positive channel counts are converted internally. Events use the input timeline in
+   * Rates of 8000-192000 Hz and positive channel counts are converted internally. Events use the input timeline in
    * milliseconds, compensated for converter group delay. Finite converter overshoot
    * is clipped to [-1,1]; invalid source PCM and nonfinite converter output are rejected.
    * Input is not retained. */
@@ -618,7 +618,7 @@ export type LifecycleEvent =
  * capture (`openStream({ kind: 'process', processId })`). Excludes the calling process itself.
  * Stopped/Idle sessions are included. Use `isOutputActive` to check whether audio is playing.
  *
- * Sorted by active output (`isOutputActive: true`) first → display name → pid, with each pid
+ * Sorted by active output (`isOutputActive: true`) first -> display name -> pid, with each pid
  * deduplicated. Read-only, with no permission prompts. Returns within 3 seconds even if the OS
  * does not respond. Runs on the libuv thread pool without blocking the JS event loop.
  *
@@ -749,7 +749,7 @@ export declare class FlexStream {
   /**
    * Change input gain (linear multiplier). 1.0=unchanged, 2.0=about +6dB, 0.0=silence. Callable
    * any time during recording; takes effect on the next chunk (20ms granularity). Multiplied samples
-   * are clamped to ±1.0. Throws unless finite and nonnegative, or if `stop()` has already completed.
+   * are clamped to +/-1.0. Throws unless finite and nonnegative, or if `stop()` has already completed.
    */
   setGain(gain: number): void
   /** Whether currently paused. Throws if `stop()` has already completed. */
@@ -777,9 +777,9 @@ export declare class DeviceWatcherHandle {
 /**
  * Writer that incrementally saves recording chunks to FLAC files with lossless compression.
  *
- * When `splitSeconds` is at least 1, reaching `splitSeconds × sampleRate` written frames closes
+ * When `splitSeconds` is at least 1, reaching `splitSeconds * sampleRate` written frames closes
  * the current file and rotates to the next, using three-digit sequence numbers such as
- * `name-001.flac, name-002.flac, …` (same convention as CLI WAV splitting). Boundaries advance
+ * `name-001.flac, name-002.flac, ...` (same convention as CLI WAV splitting). Boundaries advance
  * at chunk granularity when the threshold is reached, so each file may exceed the specified duration
  * by up to one chunk; chunks are never split and no data is dropped. Omitted/0 `splitSeconds` uses one file.
  */
@@ -821,7 +821,7 @@ export declare class Denoiser {
    */
   constructor(channels: number)
   /**
-   * Suppress noise in arbitrary-length interleaved f32 (±1.0 normalized, 48kHz, length a multiple of
+   * Suppress noise in arbitrary-length interleaved f32 (+/-1.0 normalized, 48kHz, length a multiple of
    * channels), returning a **new array** (copied because in-place processing is awkward in napi).
    * A length not divisible by channels yields InvalidArg.
    */

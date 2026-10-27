@@ -1,8 +1,8 @@
 //! The [`CaptureBackend`] trait implemented by OS backends, and the [`RawSink`] handle used
 //! by backends to pass raw frames to the core.
 //!
-//! The facade layer wires the path (backend → [`RawRing`](mod@crate::raw_ring) → [`Normalizer`](crate::normalizer)
-//! → [`ChunkRing`](mod@crate::chunk_ring)). This module only defines backend contract types.
+//! The facade layer wires the path (backend -> [`RawRing`](mod@crate::raw_ring) -> [`Normalizer`](crate::normalizer)
+//! -> [`ChunkRing`](mod@crate::chunk_ring)). This module only defines backend contract types.
 
 use crate::raw_ring::RawProducer;
 use crate::types::{Event, Result};

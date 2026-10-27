@@ -277,20 +277,27 @@ impl CaptureBackend for CompositeBackend {
                 self.set_helper_stop_reason(flexaudio_core::HelperStopReason::StartupFailed);
                 self.retain_shutdown_outcome();
                 let attempt = self.shutdown.as_ref().expect("rollback retained report");
-                let result = ShutdownReport::new(Some(error), attempt.cleanup().to_vec()).result();
+                let startup = ShutdownReport::new(Some(error), Vec::new());
+                let result = flexaudio_core::terminal_causes::merge_shutdown_reports(
+                    Some(&startup),
+                    attempt,
+                )
+                .result();
                 if let Some(previous_report) = previous_report {
                     // A failed acquisition keeps the previous primary and every newly
                     // observed cleanup, even when restoring the previous generation.
                     let attempt = self.shutdown.as_ref().expect("rollback retained report");
-                    let mut cleanup = previous_report.cleanup().to_vec();
-                    cleanup.extend_from_slice(attempt.cleanup());
+                    let retained = flexaudio_core::terminal_causes::merge_shutdown_reports(
+                        Some(&previous_report),
+                        attempt,
+                    );
+                    if let Some(error) = attempt.primary() {
+                        previous_notices.fail(error.clone());
+                    }
                     for error in attempt.cleanup() {
                         previous_notices.cleanup(error.clone());
                     }
-                    self.shutdown = Some(ShutdownReport::new(
-                        previous_report.primary().cloned(),
-                        cleanup,
-                    ));
+                    self.shutdown = Some(retained);
                     for event in self.notices.take_lifecycle() {
                         previous_notices.queue_final(event);
                     }

@@ -35,15 +35,15 @@ Use `AudioChunk::new(data, frames)`, `DeviceInfo::new(id, name, source_kind)` or
 
 | Source            | Linux         | Windows               | macOS                 |
 |-------------------|---------------|-----------------------|-----------------------|
-| Microphone        | ✅ cpal/ALSA  | ✅ cpal/WASAPI        | ✅ cpal/CoreAudio     |
-| System output     | ✅ PipeWire   | ✅ WASAPI loopback    | ✅ CoreAudio taps     |
-| Per-process       | ✅ PipeWire   | ✅ WASAPI process     | ✅ CoreAudio taps     |
+| Microphone        | Yes cpal/ALSA  | Yes cpal/WASAPI        | Yes cpal/CoreAudio     |
+| System output     | Yes PipeWire   | Yes WASAPI loopback    | Yes CoreAudio taps     |
+| Per-process       | Yes PipeWire   | Yes WASAPI process     | Yes CoreAudio taps     |
 
 ## Highlights
 
 - `open(StreamConfig)` selects the right backend by source + OS.
-- `Stream::poll_chunk` / `poll_event` — simple pull loop; no callbacks required.
-- `Stream::switch_source` — hot-swap source without stopping the stream.
+- `Stream::poll_chunk` / `poll_event` -- simple pull loop; no callbacks required.
+- `Stream::switch_source` -- hot-swap source without stopping the stream.
 - `devices()` enumerates devices; `watch_devices()` reports Linux PipeWire system
   output additions, removals and default changes using the same output IDs as
   `devices()`. Microphone and default-microphone changes are not reported: CPAL
@@ -181,5 +181,5 @@ Rust **1.85**.
 
 ## License
 
-[MIT](LICENSE) © 2026 tubome / Studio Sadola. Third-party notices:
+[MIT](LICENSE) (c) 2026 tubome / Studio Sadola. Third-party notices:
 [`THIRD_PARTY_NOTICES.md`](https://github.com/Studio-Sadola/flexaudio/blob/v0.9.0/THIRD_PARTY_NOTICES.md).

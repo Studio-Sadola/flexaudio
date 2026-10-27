@@ -3,7 +3,7 @@
 //! The embedded model supports only 16 kHz (inputs `input` `[1,576]` f32 and `state` `[2,1,128]`
 //! f32, with no `sr` input). Other source formats are converted to 16 kHz before inference.
 //!
-//! Build the plan (`into_optimized` → `into_runnable`) once at startup and reuse it for each frame.
+//! Build the plan (`into_optimized` -> `into_runnable`) once at startup and reuse it for each frame.
 //! Carry the `[2,1,128]` state and 64-sample context across frames.
 
 use std::io::Cursor;

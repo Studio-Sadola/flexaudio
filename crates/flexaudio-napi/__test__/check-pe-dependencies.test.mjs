@@ -54,7 +54,7 @@ const INVALID_DLL_NAMES = [
   'a\\b.dll',
   'line\nbreak.dll',
   'tab\tname.dll',
-  'café.dll',
+  'caf\u00e9.dll',
   'fullwidth\uFF0Edll',
   `${'a'.repeat(256)}.dll`,
 ];

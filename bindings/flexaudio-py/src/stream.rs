@@ -132,7 +132,7 @@ impl Stream {
 
     /// Change input gain (linear multiplier). 1.0 leaves audio unchanged, 2.0 is about +6dB, and 0.0
     /// is silence. May be called during recording and takes effect from the next chunk (20ms
-    /// granularity). Samples are clamped to ±1.0 after multiplication. Must be finite and >= 0, or
+    /// granularity). Samples are clamped to +/-1.0 after multiplication. Must be finite and >= 0, or
     /// `ValueError` is raised.
     fn set_gain(&self, gain: f32) -> PyResult<()> {
         self.inner.set_gain(gain).map_err(to_py_err)

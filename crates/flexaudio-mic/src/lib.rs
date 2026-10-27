@@ -1,4 +1,4 @@
-//! flexaudio-mic — cross-platform microphone input backend using cpal.
+//! flexaudio-mic - cross-platform microphone input backend using cpal.
 //!
 //! [`CpalMicBackend`] implements [`CaptureBackend`]. It reads raw interleaved `f32` frames
 //! from an input device through cpal and pushes them to [`RawSink`] without blocking. It is
@@ -126,8 +126,8 @@ impl CpalMicBackend {
     /// Create a microphone backend.
     ///
     /// `device_id`:
-    /// - `None` → default input device (`host.default_input_device()`).
-    /// - `Some(id)` → unique device in `host.input_devices()` where `device.name()? == id`
+    /// - `None` -> default input device (`host.default_input_device()`).
+    /// - `Some(id)` -> unique device in `host.input_devices()` where `device.name()? == id`
     ///   (id is a device name returned by [`list_devices`]).
     ///
     /// Query and cache the selected device's native format without requesting consent.
@@ -269,13 +269,16 @@ impl CpalMicBackend {
                 while let Some(error) = self.callback_errors.take() {
                     flexaudio_core::terminal_causes::retain_terminal_cause(&mut startup, error);
                 }
-                let mut cleanup = previous_shutdown
-                    .map(|previous| previous.cleanup().to_vec())
-                    .unwrap_or_default();
-                cleanup.extend(current_cleanup);
-                let report = ShutdownReport::new(startup, cleanup);
-                let result = report.result();
-                self.shutdown = Some(ShutdownReport::new(None, report.cleanup().to_vec()));
+                let retained = flexaudio_core::terminal_causes::merge_shutdown_reports(
+                    previous_shutdown.as_ref(),
+                    &ShutdownReport::new(None, current_cleanup.into_iter().collect()),
+                );
+                let result = flexaudio_core::terminal_causes::merge_shutdown_reports(
+                    Some(&ShutdownReport::new(startup, Vec::new())),
+                    &retained,
+                )
+                .result();
+                self.shutdown = Some(retained);
                 result
             }
         }
@@ -318,8 +321,8 @@ impl Default for CpalMicBackend {
 
 /// Resolve the input device for `device_id` from the cpal host.
 ///
-/// - `None` → `host.default_input_device()` (or [`Error::DeviceNotFound`] if unavailable).
-/// - `Some(id)` → Return the unique name match, or reject ambiguous selection.
+/// - `None` -> `host.default_input_device()` (or [`Error::DeviceNotFound`] if unavailable).
+/// - `Some(id)` -> Return the unique name match, or reject ambiguous selection.
 ///
 /// Query failures return Backend; DeviceNotFound means a complete lookup had no match.
 fn resolve_input_device(host: &cpal::Host, device_id: Option<&str>) -> Result<Device> {
@@ -565,7 +568,7 @@ impl Drop for CpalMicBackend {
 
 /// Maximum expected block duration (seconds) used to preallocate scratch for RT conversion callbacks.
 ///
-/// Estimate the maximum frames per callback as native sample rate × channels × this duration,
+/// Estimate the maximum frames per callback as native sample rate * channels * this duration,
 /// then allocate during stream setup. Hardware blocks are usually a few to tens of ms, so a
 /// one-second allocation avoids growth (and RT allocation) during steady state. If a larger
 /// block arrives, [`fill_scratch`] grows once with `reserve` and retains that capacity without
@@ -625,8 +628,8 @@ fn build_stream(
     let native_errors = callback_errors.clone();
     let err_fn = move |error: cpal::StreamError| native_errors.record(error);
 
-    // Preallocate conversion scratch for the maximum block size (native sample rate × channels
-    // × MAX_SCRATCH_SECONDS). This avoids first-use/growth allocations in RT callbacks during
+    // Preallocate conversion scratch for the maximum block size (native sample rate * channels
+    // * MAX_SCRATCH_SECONDS). This avoids first-use/growth allocations in RT callbacks during
     // steady state (xrun risk). Allocate at least one item.
     let scratch_cap = (config.sample_rate.0 as usize)
         .saturating_mul(config.channels as usize)

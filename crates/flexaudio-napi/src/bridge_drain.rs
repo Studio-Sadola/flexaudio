@@ -27,7 +27,7 @@ impl PairingBridge {
                 self.lifecycle.as_deref(),
                 &self.report,
             );
-            self.suppress_failed_pcm(stream);
+            self.suppress_failed_pcm(stream, terminal);
             self.drain_capture(stream);
             while let Some(chunk) = stream.poll_chunk_ordered() {
                 self.on_primary(chunk);
@@ -49,11 +49,16 @@ impl PairingBridge {
                 break;
             }
         }
-        self.suppress_failed_pcm(stream);
+        self.suppress_failed_pcm(stream, terminal);
     }
 
-    fn suppress_failed_pcm(&mut self, stream: &flexaudio::Stream) {
-        if stream.terminal_error().is_some() {
+    fn suppress_failed_pcm(
+        &mut self,
+        stream: &flexaudio::Stream,
+        terminal: &Mutex<Option<StreamTerminal>>,
+    ) {
+        if let Some(error) = stream.terminal_error() {
+            retain_stream_terminal(terminal, error);
             self.primary_fifo.clear();
             self.secondary_fifo.clear();
         }

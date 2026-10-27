@@ -1,7 +1,7 @@
 //! Conversion helpers between C ABI types and flexaudio types.
 //!
-//! Split conversions into small functions: `FlexConfig` → [`StreamConfig`],
-//! [`AudioChunk`] → `FlexChunk`, [`Event`] → `FlexEvent`, and [`DeviceInfo`] →
+//! Split conversions into small functions: `FlexConfig` -> [`StreamConfig`],
+//! [`AudioChunk`] -> `FlexChunk`, [`Event`] -> `FlexEvent`, and [`DeviceInfo`] ->
 //! `FlexDeviceInfo`. Follow napi's `build_config` / `chunk_to_js` / `event_to_js` approach
 //! (sentinel values select defaults, and ring_capacity_chunks is not exposed, using the
 //! `StreamConfig::default()` value instead).
@@ -68,7 +68,7 @@ pub(crate) unsafe fn copy_exclude_pids(
     Ok(owned)
 }
 
-/// Resolve output format in `FlexConfig`, including sentinel values (0 → default).
+/// Resolve output format in `FlexConfig`, including sentinel values (0 -> default).
 ///
 /// Resolve output defaults for stream construction and denoise channel validation.
 pub(crate) fn resolve_output(config: &FlexConfig) -> OutputFormat {
@@ -226,9 +226,9 @@ pub unsafe fn build_config(
         } else {
             config.chunk_ms
         };
-        // gain 0.0 is a sentinel for default 1.0 (same convention as output_rate 0→48000).
+        // gain 0.0 is a sentinel for default 1.0 (same convention as output_rate 0->48000).
         // To mute at runtime, use flexaudio_set_gain(s, 0.0). Mix side gains use the same
-        // convention (0.0 sentinel → 1.0; muting one side before mixing is not currently supported).
+        // convention (0.0 sentinel -> 1.0; muting one side before mixing is not currently supported).
         config_value.gain = gain_or_default(config.gain);
         config_value.mix_mic_device_id = mix_mic_device_id;
         config_value.mix_system_device_id = mix_system_device_id;
@@ -621,7 +621,7 @@ mod tests {
         assert!(!cfg.exclude_self);
         // gain sentinel 0 also selects default 1.0.
         assert_eq!(cfg.gain, 1.0);
-        // Mix-specific fields use defaults for sentinels too (NULL → None / 0.0 → 1.0).
+        // Mix-specific fields use defaults for sentinels too (NULL -> None / 0.0 -> 1.0).
         assert_eq!(cfg.mix_mic_device_id, None);
         assert_eq!(cfg.mix_system_device_id, None);
         assert_eq!(cfg.mix_mic_gain, 1.0);
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn build_config_maps_gain_sentinel_and_explicit() {
-        // 0.0 is a sentinel for default 1.0 (same convention as output_rate 0→48000).
+        // 0.0 is a sentinel for default 1.0 (same convention as output_rate 0->48000).
         let c = make_config(FlexSourceKind::Mic as i32);
         let cfg = unsafe { build_config(&c, Vec::new()) }.unwrap();
         assert_eq!(cfg.gain, 1.0);

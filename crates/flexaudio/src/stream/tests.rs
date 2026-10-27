@@ -56,7 +56,7 @@ fn open_err(result: Result<Stream>, ctx: &str) -> Error {
     }
 }
 
-// --- RawRing overflow → DISCONTINUITY ---
+// --- RawRing overflow -> DISCONTINUITY ---
 
 /// Test-only mock backend that overflows RawRing. On start, each burst keeps pushing twice the
 /// ring capacity, guaranteeing overflow.

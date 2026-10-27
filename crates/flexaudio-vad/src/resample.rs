@@ -22,7 +22,7 @@ pub struct PcmFormat {
 }
 
 impl PcmFormat {
-    /// Validate supported PCM input rates (8,000–192,000 Hz) and nonzero channels.
+    /// Validate supported PCM input rates (8,000-192,000 Hz) and nonzero channels.
     pub fn validate(self) -> Result<(), crate::InferenceError> {
         if self.channels == 0 {
             return Err(crate::InferenceError::InvalidFormat(
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn downmix_quad_is_channel_average() {
-        let src = [1.0, 2.0, 3.0, 4.0]; // One 4-channel frame → average 2.5.
+        let src = [1.0, 2.0, 3.0, 4.0]; // One 4-channel frame -> average 2.5.
         let mut out = Vec::new();
         downmix_to_mono(&src, 4, &mut out);
         assert_eq!(out, vec![2.5]);
@@ -399,7 +399,7 @@ mod tests {
             "frequency shifted after resampling to 16k: crossings={crossings}"
         );
 
-        // Amplitude: a sine wave's RMS is amp/√2 ≈ 0.3536.
+        // Amplitude: a sine wave's RMS is amp/sqrt(2) approx. 0.3536.
         let got = rms(mid);
         let expect = amp / std::f32::consts::SQRT_2;
         assert!(

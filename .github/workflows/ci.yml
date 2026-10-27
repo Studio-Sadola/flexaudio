@@ -4,14 +4,14 @@ name: CI
 # `dtolnay/rust-toolchain@stable` can turn CI red after an upstream update, even when no code changed.
 # This happened on 2026-09-21: Clippy 1.98 added a new lint.
 #
-# ⚠️ GitHub Actions `uses:` does not support expressions or environment variables (the GitHub Docs
+# Warning: GitHub Actions `uses:` does not support expressions or environment variables (the GitHub Docs
 # "Context availability" table has no `jobs.<job_id>.steps.uses` row, but does have one for `steps.with`).
 # Therefore, write the version directly in each `uses: dtolnay/rust-toolchain@<version>` entry.
 # The same version appears several times in this file; the `toolchain-pin-guard` job
 # (.github/scripts/check-toolchain-pins.py) fails on mismatches.
 #
 # The MSRV job intentionally pins different versions (1.85.0 / 1.91.0) because its purpose is to
-# use each crate’s declared `rust-version`.
+# use each crate's declared `rust-version`.
 
 on:
   push:
@@ -225,7 +225,7 @@ jobs:
       # `-D warnings`) so the same bug is caught consistently across platforms.
       - name: Clippy (deny warnings, Windows-exclusive crates)
         run: cargo clippy -p flexaudio-os-windows -p flexaudio -p flexaudio-mic --all-targets -- -D warnings
-      # cpal 0.16’s WASAPI backend creates a process-wide `IMMDeviceEnumerator` on the first STA thread,
+      # cpal 0.16's WASAPI backend creates a process-wide `IMMDeviceEnumerator` on the first STA thread,
       # but COM cleanup is thread-local. If a short-lived thread enumerates first, the next cpal call
       # can cause an access violation. flexaudio-mic avoids this upstream bug by initializing first on
       # a long-lived keeper thread; the Windows tests below guard against regressions.
@@ -405,7 +405,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
-          # Install the target’s std library so cross can check platform-specific crates.
+          # Install the target's std library so cross can check platform-specific crates.
           # `cross check` does not need a linker, so Linux can check them.
           targets: aarch64-apple-darwin, x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
@@ -450,12 +450,12 @@ jobs:
           cargo build
           -p flexaudio-ffi -p flexaudio-napi -p flexaudio-vad -p flexaudio-py
 
-  # ⚠️ This is not a gate. It reports upstream stable changes as an early warning, not a blocker.
+  # Warning: This is not a gate. It reports upstream stable changes as an early warning, not a blocker.
   # With `continue-on-error: true`, a failure here leaves CI green (the failure remains visible in Checks).
   # Use it to decide whether to update the gate version (1.98.1). It runs the same Clippy and tests as
   # the Linux gate (same crate list), so the diff shows what changed upstream.
   preview-upstream-stable:
-    name: "Preview: upstream Rust stable (NOT a gate — advance warning only)"
+    name: "Preview: upstream Rust stable (NOT a gate -- advance warning only)"
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -488,7 +488,7 @@ jobs:
           -p flexaudio-encode -p flexaudio-denoise
           -p flexaudio-ffi
 
-  # Check that the gate’s pinned toolchain versions match. Since `uses:` cannot use expressions,
+  # Check that the gate's pinned toolchain versions match. Since `uses:` cannot use expressions,
   # the version is repeated and a gate is needed to catch mismatches.
   # Exclude MSRV jobs based on the declared `rust-version` from cargo metadata, not a list of job names.
   # This keeps working as more crates declare an MSRV.

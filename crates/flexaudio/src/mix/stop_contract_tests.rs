@@ -139,6 +139,96 @@ fn failed_start_has_clean_shutdown_and_no_terminal_notice() {
 }
 
 #[test]
+fn failed_start_retains_final_poll_primary_when_restoring_previous_report() {
+    struct FinalPollWithCleanup(crate::stream::stop_contract_tests::FinalPollPanic);
+    impl CaptureBackend for FinalPollWithCleanup {
+        fn native_format(&self) -> (u32, u16) {
+            self.0.native_format()
+        }
+        fn start(&mut self, sink: RawSink) -> Result<()> {
+            self.0.start(sink)
+        }
+        fn stop(&mut self) {
+            self.0.stop();
+        }
+        fn stop_checked(&mut self) -> Result<()> {
+            self.stop();
+            Err(Error::AmbiguousDeviceName)
+        }
+        fn poll_event(&mut self) -> Option<Event> {
+            self.0.poll_event()
+        }
+    }
+    for cleanup_failure in [false, true] {
+        for previous in [
+            None,
+            Some(ShutdownReport::new(None, Vec::new())),
+            Some(ShutdownReport::new(
+                Some(Error::Unsupported),
+                vec![Error::DeviceLost],
+            )),
+        ] {
+            let mic: Box<dyn CaptureBackend> = if cleanup_failure {
+                Box::new(FinalPollWithCleanup(Default::default()))
+            } else {
+                Box::new(crate::stream::stop_contract_tests::FinalPollPanic::default())
+            };
+            let mut mix = CompositeBackend::new(mic, Box::new(FailsStart), 1.0, 1.0);
+            if let Some(report) = &previous {
+                // The clean case is the public stop-before-start reproduction.
+                assert_eq!(mix.stop_checked(), Ok(()));
+                mix.shutdown = Some(report.clone());
+            }
+            let (producer, _consumer) = flexaudio_core::raw_ring(4096);
+            let returned = mix.start(RawSink::new(producer, 48_000, 2)).unwrap_err();
+            let attempt_primary = lane_error(
+                Error::Backend("mix child panicked during final event drain".into()),
+                Operation::Stop,
+                MixLane::Microphone,
+            );
+            assert_eq!(returned.root(), &Error::DeviceNotFound);
+            assert!(flexaudio_core::terminal_causes::retains_terminal_cause(
+                &returned,
+                &attempt_primary
+            ));
+            let report = mix.shutdown.clone().unwrap();
+            assert!(flexaudio_core::terminal_causes::retains_terminal_cause(
+                report.primary().unwrap(),
+                &attempt_primary
+            ));
+            if let Some(previous) = &previous {
+                if let Some(error) = previous.primary() {
+                    assert!(flexaudio_core::terminal_causes::retains_terminal_cause(
+                        report.primary().unwrap(),
+                        error
+                    ));
+                }
+            }
+            let mut expected_cleanup = previous
+                .as_ref()
+                .map(|report| report.cleanup().to_vec())
+                .unwrap_or_default();
+            if cleanup_failure {
+                let cleanup = lane_error(
+                    Error::AmbiguousDeviceName,
+                    Operation::Stop,
+                    MixLane::Microphone,
+                );
+                assert!(flexaudio_core::terminal_causes::retains_terminal_cause(
+                    &returned, &cleanup
+                ));
+                expected_cleanup.push(cleanup);
+            }
+            assert_eq!(report.cleanup(), expected_cleanup);
+            assert_eq!(mix.stop_checked(), report.result());
+            assert_eq!(mix.stop_checked(), report.result());
+            mix.stop();
+            assert_eq!(mix.shutdown, Some(report));
+        }
+    }
+}
+
+#[test]
 fn distinct_failure_contract() {
     flexaudio_core::test_support::assert_distinct_failures_retained(
         Error::DeviceLost,

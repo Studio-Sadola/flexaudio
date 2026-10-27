@@ -1,9 +1,9 @@
-//! [`MacProcessBackend`] — Process Tap loopback for an individual process.
+//! [`MacProcessBackend`] - Process Tap loopback for an individual process.
 //!
 //! Converts the target PID to an `AudioObjectID` and uses [`ProcessMode`] to select INCLUDE or EXCLUDE.
-//! - [`ProcessMode::Include`] (default) → `initStereoMixdownOfProcesses([objectID])`
+//! - [`ProcessMode::Include`] (default) -> `initStereoMixdownOfProcesses([objectID])`
 //!   (captures only the target PID).
-//! - [`ProcessMode::Exclude`] → `initStereoGlobalTapButExcludeProcesses([objectID])`
+//! - [`ProcessMode::Exclude`] -> `initStereoGlobalTapButExcludeProcesses([objectID])`
 //!   (captures all system audio except the target PID).
 //!
 //! `mode` applies only to process sources and is not combined with `exclude_self` on system sources
@@ -358,7 +358,7 @@ mod tests {
         assert_eq!(backend.mode(), ProcessMode::Include);
     }
 
-    /// `start` → `stop` does not panic, whether or not the target PID exists.
+    /// `start` -> `stop` does not panic, whether or not the target PID exists.
     /// An `Err` is allowed for a missing PID or unapproved TCC; a panic is not.
     #[test]
     fn start_then_stop_tolerates_missing_target() {

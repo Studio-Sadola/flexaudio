@@ -12,9 +12,9 @@ make other stream operations thread-safe.
 
 In addition to core capture, this exposes three add-ons to C:
 
-- **VAD** (voice activity detection; Silero VAD / ONNX) — `flexaudio_vad_*`
-- **FLAC** (streaming lossless compression of recording chunks, with rotation) — `flexaudio_flac_*`
-- **denoise** (noise suppression with RNNoise) — `flexaudio_denoise_*`
+- **VAD** (voice activity detection; Silero VAD / ONNX) -- `flexaudio_vad_*`
+- **FLAC** (streaming lossless compression of recording chunks, with rotation) -- `flexaudio_flac_*`
+- **denoise** (noise suppression with RNNoise) -- `flexaudio_denoise_*`
 
 Denoise uses `FlexConfig.denoise`; VAD attaches through `FlexStreamConfigV2.vad`.
 Device connection, disconnection, and default-device changes (hotplug) are available through
@@ -294,7 +294,7 @@ use v4 with `strict = 2` to permit the ignored request.
 ### VAD
 
 The generic VAD section below describes standalone sessions and capture
-attachment. Standalone input accepts rates of 8000–192000 Hz and positive channel counts,
+attachment. Standalone input accepts rates of 8000-192000 Hz and positive channel counts,
 converts internally to mono16k, and reports integer milliseconds on the input
 timeline with converter group delay compensated. After raw input validation,
 finite resampler overshoot is clipped internally to [-1, 1].
@@ -303,7 +303,7 @@ finite resampler overshoot is clipped internally to [-1, 1].
 
 This streams lossless compression of interleaved f32 samples (you can pass flexaudio's
 canonical 48 kHz / stereo format directly). When `split_seconds` is 1 or greater, files rotate
-at that interval with sequential names such as `rec-001.flac`, `rec-002.flac`, … (0 creates a
+at that interval with sequential names such as `rec-001.flac`, `rec-002.flac`, ... (0 creates a
 single file).
 
 ```c
@@ -320,7 +320,7 @@ FlexFlac *split = flexaudio_flac_create("rec.flac", 48000, 2, 300);
 ### denoise
 
 This applies in-place noise suppression to interleaved f32 samples (48 kHz, normalized to
-±1.0). The output is delayed by 480 samples per channel, so the beginning is silent for that
++/-1.0). The output is delayed by 480 samples per channel, so the beginning is silent for that
 duration (streaming latency).
 
 ```c

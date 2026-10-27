@@ -460,7 +460,7 @@ jobs:
               cd "$dir"
               PACKAGE_SPEC="$(node -e 'const p = require("./package.json"); process.stdout.write(`${p.name}@${p.version}`)')"
               if npm view "$PACKAGE_SPEC" version >/dev/null 2>&1; then
-                echo "$PACKAGE_SPEC already published — skipping."
+                echo "$PACKAGE_SPEC already published -- skipping."
               else
                 npm publish --ignore-scripts --access public --provenance
               fi
@@ -469,7 +469,7 @@ jobs:
           # ...then the main package that depends on them.
           PACKAGE_SPEC="$(node -e 'const p = require("./package.json"); process.stdout.write(`${p.name}@${p.version}`)')"
           if npm view "$PACKAGE_SPEC" version >/dev/null 2>&1; then
-            echo "$PACKAGE_SPEC already published — skipping."
+            echo "$PACKAGE_SPEC already published -- skipping."
           else
             npm publish --ignore-scripts --access public --provenance
           fi
@@ -479,7 +479,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "dry_run=true → validate every package's packaging, do not publish."
+          echo "dry_run=true -> validate every package's packaging, do not publish."
           # --dry-run is a local pack/simulation (no auth, no upload). Let it fail
           # loudly so packaging problems are caught here instead of at real publish.
           for dir in npm/*/; do

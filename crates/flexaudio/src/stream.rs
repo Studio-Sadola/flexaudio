@@ -8,12 +8,12 @@
 //! # Thread layout
 //! - Backend RT thread: only pushes raw frames through [`RawSink`] to
 //!   [`RawRing`](mod@flexaudio_core::raw_ring) (non-blocking).
-//! - Intake/processing thread (one, normal priority): pops RawRing → normalizes to
-//!   48k/stereo/20ms → assigns monotonically increasing `seq` → pushes to
+//! - Intake/processing thread (one, normal priority): pops RawRing -> normalizes to
+//!   48k/stereo/20ms -> assigns monotonically increasing `seq` -> pushes to
 //!   [`ChunkRing`](mod@flexaudio_core::chunk_ring) (DROP_OLDEST). Updates the last sample processing
 //!   time in `AtomicI64`.
 //! - Watchdog thread (one, ~250ms tick): if samples stop arriving for long enough, treats the stream
-//!   as stalled and reopens the backend with exponential backoff (250ms→5s, with jitter). Fires
+//!   as stalled and reopens the backend with exponential backoff (250ms->5s, with jitter). Fires
 //!   [`Event::StreamStalled`] on a stall and [`Event::StreamRecovered`] on recovery, and marks the
 //!   first post-recovery chunk with [`ChunkFlags::RECOVERED`] | [`ChunkFlags::DISCONTINUITY`].
 
@@ -74,7 +74,7 @@ mod startup_tests;
 #[cfg(test)]
 mod terminal_cause_tests;
 
-/// RawRing capacity in f32 samples. Keep it independent of native SR×ch and large enough to avoid
+/// RawRing capacity in f32 samples. Keep it independent of native SR*ch and large enough to avoid
 /// drops on the RT path (about 0.5 seconds of 48k stereo headroom). The mix source's composite
 /// backend (`mix.rs`) uses the same capacity for its child rings.
 pub(crate) const RAW_RING_SAMPLES: usize = 48_000;
@@ -186,7 +186,7 @@ struct SharedState {
     ///
     /// Unchanged when the watchdog reopens the same backend, but updated to the new backend's value
     /// when [`Stream::switch_source`] changes the source (native SR/ch commonly differ between
-    /// mic↔system/process). On a generation change, the intake thread rereads this and rebuilds the
+    /// mic<->system/process). On a generation change, the intake thread rereads this and rebuilds the
     /// native-dependent first stage of [`Normalizer`].
     native_format: Mutex<(u32, u16)>,
 
@@ -209,7 +209,7 @@ struct SharedState {
     /// after `pause()` returns.
     delivery: Mutex<()>,
 
-    /// Generation for each actual pause→resume transition. Each tap observes it under the delivery
+    /// Generation for each actual pause->resume transition. Each tap observes it under the delivery
     /// lock and marks its first chunk enqueued after a change with DISCONTINUITY.
     resume_generation: AtomicU64,
 
@@ -459,7 +459,7 @@ fn apply_epoch(shared: &SharedState, raw_pts: i64) -> i64 {
 }
 
 /// Apply input gain (linear multiplier) to a completed chunk's `data`. At 1.0, leave samples
-/// untouched (byte-for-byte passthrough). Otherwise multiply each sample and clamp to ±1.0.
+/// untouched (byte-for-byte passthrough). Otherwise multiply each sample and clamp to +/-1.0.
 fn apply_gain(data: &mut [f32], gain: f32) -> bool {
     let mut clipped = false;
     if gain != 1.0 {
@@ -517,12 +517,12 @@ fn peak_rms(data: &[f32]) -> (f32, f32) {
     (peak, rms)
 }
 
-/// Add slight time-based jitter (about ±12.5%) to the backoff, without using `rand`.
+/// Add slight time-based jitter (about +/-12.5%) to the backoff, without using `rand`.
 fn jittered_backoff(base: Duration) -> Duration {
     let base_ns = base.as_nanos() as u64;
     // Use the low bits of monotonic nanoseconds as a pseudo-random source.
     let entropy = monotonic_now_ns() as u64;
-    // Range: ±(base/8).
+    // Range: +/-(base/8).
     let span = (base_ns / 8).max(1);
     let delta = (entropy % (2 * span)) as i64 - span as i64;
     let result = base_ns as i64 + delta;
@@ -560,25 +560,6 @@ fn with_cleanup(primary: Error, cleanup: Option<Error>) -> Error {
     match cleanup {
         Some(error) => Error::Multiple(ErrorGroup::new(primary, error, Vec::new())),
         None => primary,
-    }
-}
-
-fn cleanup_error_since(shared: &SharedState, first: usize) -> Option<Error> {
-    let mut errors = shared
-        .cleanup
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .into_iter()
-        .skip(first);
-    match (errors.next(), errors.next()) {
-        (None, _) => None,
-        (Some(error), None) => Some(error),
-        (Some(primary), Some(first)) => Some(Error::Multiple(ErrorGroup::new(
-            primary,
-            first,
-            errors.collect(),
-        ))),
     }
 }
 

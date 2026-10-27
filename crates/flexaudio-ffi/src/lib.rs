@@ -1,4 +1,4 @@
-//! flexaudio-ffi — C ABI public layer (cbindgen → flexaudio.h). Pull-based API.
+//! flexaudio-ffi -- C ABI public layer (cbindgen -> flexaudio.h). Pull-based API.
 //!
 //! The third way for a C app to use flexaudio in-process (the first is the CLI pipe, the
 //! second is the N-API addon). Unlike napi, this uses no bridge thread or callbacks; the caller
@@ -434,7 +434,7 @@ pub unsafe extern "C" fn flexaudio_is_paused(s: *const FlexStream) -> bool {
 
 /// Change the input gain (linear multiplier): 1.0 leaves it unchanged, 2.0 is about +6 dB,
 /// and 0.0 is silent. Can be called during recording; it takes effect on the next chunk (20 ms
-/// granularity). Samples are clamped to ±1.0 after multiplication. Must be finite and at least
+/// granularity). Samples are clamped to +/-1.0 after multiplication. Must be finite and at least
 /// 0, or FLEX_INVALID_ARG is returned.
 ///
 /// # Safety

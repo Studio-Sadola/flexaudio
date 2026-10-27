@@ -343,7 +343,8 @@ fn failed_start_returns_start_cause_and_preserves_only_shutdown_cleanup() {
         let Error::Multiple(group) = &error else { panic!("start and join failures must both survive") };
         assert!(matches!(group.primary(), Error::Context { context, .. } if context.operation() == Operation::Start));
         let cleanup: Vec<_> = group.secondary().collect();
-        assert_eq!(cleanup.len(), previous_report.cleanup().len() + 1);
+        // Both fixture generations produce the same join failure, so it is retained once.
+        assert_eq!(cleanup.len(), 1);
         assert_eq!(&cleanup[..previous_report.cleanup().len()], previous_report.cleanup().iter().collect::<Vec<_>>().as_slice());
         assert!(cleanup.iter().all(|error| matches!(error, Error::Context { context, .. } if context.operation() == Operation::Join)));
         let join_error = Error::Backend("microphone capture owner panicked".into())

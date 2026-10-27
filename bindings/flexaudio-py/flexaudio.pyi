@@ -788,7 +788,7 @@ class VadRuntimeError(RuntimeError):
 class Vad:
     """Accepts float sequences or contiguous 1-D native float32 buffers.
 
-    Input defaults to mono16k. Rates of 8000–192000 Hz and positive channel counts are converted internally;
+    Input defaults to mono16k. Rates of 8000-192000 Hz and positive channel counts are converted internally;
     event milliseconds use the input timeline with converter group delay compensated.
     After raw input validation, finite resampler overshoot is clipped internally to [-1, 1].
     max_speech_ms=0 or values above 100000000 use the effectively unbounded

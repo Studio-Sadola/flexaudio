@@ -87,7 +87,15 @@ impl OwnerShutdown {
     /// Return this startup attempt's outcome while retaining earlier generation diagnostics.
     pub(crate) fn retain_startup_report(&mut self, report: ShutdownReport) -> Result<()> {
         let report = self.with_generation_cleanup(report);
-        let result = report.result();
+        let retained = flexaudio_core::terminal_causes::merge_shutdown_reports(
+            self.report.as_ref(),
+            &ShutdownReport::new(None, report.cleanup().to_vec()),
+        );
+        let result = flexaudio_core::terminal_causes::merge_shutdown_reports(
+            Some(&ShutdownReport::new(report.primary().cloned(), Vec::new())),
+            &retained,
+        )
+        .result();
         // Startup's primary reaches start() through this result; only cleanup belongs to shutdown.
         self.retain_report(ShutdownReport::new(None, report.cleanup().to_vec()));
         result
@@ -107,14 +115,10 @@ impl OwnerShutdown {
                 .cloned()
                 .map(|error| Event::ShutdownError { error }),
         );
-        self.report = Some(match self.report.take() {
-            Some(previous) => {
-                let mut cleanup = previous.cleanup().to_vec();
-                cleanup.extend(report.cleanup().iter().cloned());
-                ShutdownReport::new(previous.primary().cloned(), cleanup)
-            }
-            None => report,
-        });
+        self.report = Some(flexaudio_core::terminal_causes::merge_shutdown_reports(
+            self.report.as_ref(),
+            &report,
+        ));
     }
 
     pub(crate) fn finish(
@@ -192,13 +196,20 @@ mod tests {
                 })),
             );
             let attempt = ShutdownReport::new(Some(Error::DeviceNotFound), cleanup.clone());
+            let mut returned_primary = Some(Error::DeviceNotFound);
+            if let Some(primary) = &previous_primary {
+                flexaudio_core::terminal_causes::retain_terminal_cause(
+                    &mut returned_primary,
+                    primary.clone(),
+                );
+            }
+            let expected_cleanup = [previous.cleanup(), cleanup.as_slice()].concat();
             assert_eq!(
                 shutdown.retain_startup_report(attempt.clone()),
-                attempt.result()
+                ShutdownReport::new(returned_primary, expected_cleanup.clone()).result()
             );
             let retained = shutdown.report().unwrap().clone();
             assert_eq!(retained.primary(), previous_primary.as_ref());
-            let expected_cleanup = [previous.cleanup(), cleanup.as_slice()].concat();
             assert_eq!(retained.cleanup(), expected_cleanup.as_slice());
             assert_eq!(retained.cleanup().len(), 2);
             shutdown.finish(&publication, &stop, &terminal, None);
@@ -219,6 +230,25 @@ mod tests {
             assert!(shutdown.report().unwrap().cleanup().is_empty());
             assert!(shutdown.report().unwrap().primary().is_none());
         }
+    }
+
+    #[test]
+    fn failed_restart_returns_previous_primary_beside_the_new_start_error() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            Error::DeviceNotFound,
+            Error::DeviceLost,
+            |startup, previous| {
+                let mut shutdown = OwnerShutdown {
+                    report: Some(ShutdownReport::new(Some(previous.clone()), Vec::new())),
+                    ..OwnerShutdown::default()
+                };
+                let result = shutdown
+                    .retain_startup_report(ShutdownReport::new(Some(startup), Vec::new()))
+                    .unwrap_err();
+                assert_eq!(shutdown.report().unwrap().primary(), Some(&previous));
+                result
+            },
+        );
     }
 
     #[test]

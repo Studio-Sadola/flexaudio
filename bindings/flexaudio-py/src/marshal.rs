@@ -141,7 +141,7 @@ pub(crate) fn process_info_to_py(info: ProcessInfo) -> PyProcessInfo {
 ///
 /// `vad_events` contains [`VadEvent`](PyVadEvent) events finalized for this chunk when integrated
 /// VAD (`open(..., vad=...)`) is enabled (empty when disabled or no events). When denoise is enabled,
-/// `data` already contains denoised audio (order: denoise → VAD).
+/// `data` already contains denoised audio (order: denoise -> VAD).
 ///
 /// `peak` / `rms` describe the final delivered float samples after denoise and gain,
 /// before any integer encoding.

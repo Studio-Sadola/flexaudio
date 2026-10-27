@@ -43,7 +43,7 @@ fn pts_delta_is_about_20ms_between_chunks() {
         pts_list.len()
     );
 
-    // 20ms = 20_000_000 ns. Allow ±5% (1e6 ns).
+    // 20ms = 20_000_000 ns. Allow +/-5% (1e6 ns).
     for w in pts_list.windows(2) {
         let delta = w[1] - w[0];
         assert!(

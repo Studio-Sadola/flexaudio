@@ -59,10 +59,10 @@ the notice first; PCM-only callers can omit event polling.
 
 ### Sources
 
-- `flexaudio.open("mic")` — microphone input.
-- `flexaudio.open("system")` — full system output loopback. Pass
+- `flexaudio.open("mic")` -- microphone input.
+- `flexaudio.open("system")` -- full system output loopback. Pass
   `exclude_self=True` to drop this process's own playback.
-- `flexaudio.open("process", process_id=<pid>)` — a single process's output.
+- `flexaudio.open("process", process_id=<pid>)` -- a single process's output.
   Pass `mode="exclude"` to capture everything *except* that process.
 
 To find a `process_id`, list the processes that have an audio output
@@ -168,7 +168,7 @@ default strict mode; `strict=False` permits ignoring it.
 The same building blocks are available as independent classes.
 
 ```python
-# Voice activity detection over PCM (mono/stereo, 8000–192000 Hz).
+# Voice activity detection over PCM (mono/stereo, 8000-192000 Hz).
 vad = flexaudio.Vad(threshold=0.5, min_silence_ms=100)
 for ev in vad.process(samples, input_sample_rate=48000, input_channels=2):
     print(ev.type)
@@ -246,12 +246,12 @@ MIT.
 This binding statically links the following flexaudio add-ons, which embed
 their models/tables and require no runtime files or network access:
 
-- **flexaudio-vad** — uses pure-Rust [tract](https://github.com/snipsco/tract)
+- **flexaudio-vad** -- uses pure-Rust [tract](https://github.com/snipsco/tract)
   (MIT OR Apache-2.0) and the embedded [Silero VAD](https://github.com/snakers4/silero-vad)
   model (MIT).
-- **flexaudio-encode** — uses [flacenc](https://github.com/yotarok/flacenc-rs)
+- **flexaudio-encode** -- uses [flacenc](https://github.com/yotarok/flacenc-rs)
   (Apache-2.0) for pure-Rust FLAC encoding.
-- **flexaudio-denoise** — uses [nnnoiseless](https://github.com/jneem/nnnoiseless)
+- **flexaudio-denoise** -- uses [nnnoiseless](https://github.com/jneem/nnnoiseless)
   (BSD-3-Clause), a Rust port of RNNoise with embedded model weights.
 
 ### Generic VAD
@@ -259,7 +259,7 @@ their models/tables and require no runtime files or network access:
 `Vad` runs embedded Silero v6 on normalized float32, with
 segmentation matching whisper.cpp pin `85a69493a601d4ff5a834064f7b7bac250bd8739`.
 `process(samples, input_sample_rate=16000, input_channels=1)` accepts input rates
-of 8000–192000 Hz and positive channel counts, and converts to mono16k internally. Event
+of 8000-192000 Hz and positive channel counts, and converts to mono16k internally. Event
 times use the input timeline, compensated for converter group delay. After raw
 input validation, finite resampler overshoot is clipped internally to [-1, 1]. It accepts
 a sequence or a contiguous one-dimensional native float32 buffer;

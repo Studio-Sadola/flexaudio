@@ -157,7 +157,7 @@ mod tests {
             .expect("rollback retains its report")
             .clone();
         assert!(report.primary().is_none());
-        assert_eq!(report.cleanup(), &[first_cleanup.clone(), first_cleanup]);
+        assert_eq!(report.cleanup(), &[first_cleanup]);
         assert_eq!(
             result,
             ShutdownReport::new(Some(Error::DeviceLost), report.cleanup().to_vec()).result()
@@ -165,5 +165,30 @@ mod tests {
         owner.stop();
         assert_eq!(owner.shutdown_report(), Some(&report));
         assert_eq!(owner.stop_checked(), report.result());
+    }
+
+    #[test]
+    fn failed_restart_keeps_previous_primary_and_new_start_error_distinct() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            Error::Unsupported,
+            Error::DeviceLost,
+            |startup, previous| {
+                let mut owner = CpalMicBackend::with_format(None, FALLBACK_FORMAT);
+                let old_cleanup = Error::Backend("previous capture cleanup failure".into());
+                let old = ShutdownReport::new(Some(previous.clone()), vec![old_cleanup.clone()]);
+                owner.handle = Some(thread::spawn(|| panic!("failed restart join failure")));
+                let result = owner.complete_start(Err(startup), Some(old)).unwrap_err();
+                let retained = owner.shutdown_report().unwrap();
+                assert_eq!(retained.primary(), Some(&previous));
+                assert_eq!(retained.cleanup()[0], old_cleanup);
+                assert_eq!(retained.cleanup().len(), 2);
+                for error in retained.cleanup() {
+                    assert!(flexaudio_core::terminal_causes::retains_terminal_cause(
+                        &result, error
+                    ));
+                }
+                result
+            },
+        );
     }
 }

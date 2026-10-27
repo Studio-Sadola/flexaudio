@@ -156,7 +156,7 @@ fn start_composite(
 const VALUE_TOL: f32 = 1e-4;
 
 /// Minimum sample count to consider a value "actually observed": one internal-form
-/// chunk (960 frames × 2 channels). Set the existence floor as an absolute count,
+/// chunk (960 frames * 2 channels). Set the existence floor as an absolute count,
 /// not a fraction of all samples. A fraction (for example, 25%) can fail in a
 /// scheduler-dependent way when a large starvation-fill burst (up to the 48k-sample
 /// FIFO limit) inflates the denominator.
@@ -237,7 +237,7 @@ fn assert_only_allowed_values(
 }
 
 /// Mixing two DC sources with known amplitudes (0.2 and 0.3) at mic_gain=1.0 and
-/// system_gain=2.0 yields 0.2×1.0 + 0.3×2.0 = 0.8 (48 kHz/stereo children make
+/// system_gain=2.0 yields 0.2*1.0 + 0.3*2.0 = 0.8 (48 kHz/stereo children make
 /// every stage pass-through, so values are deterministic).
 #[test]
 fn mix_sums_two_sources_with_gains() {
@@ -273,7 +273,7 @@ fn mix_sums_two_sources_with_gains() {
     );
 }
 
-/// A mix that exceeds ±1.0 (0.8 + 0.8 = 1.6) is clamped to 1.0.
+/// A mix that exceeds +/-1.0 (0.8 + 0.8 = 1.6) is clamped to 1.0.
 #[test]
 fn mix_clamps_sum() {
     let mic = Box::new(ConstBackend::new(0.8, None));
@@ -487,7 +487,7 @@ fn drift_controller_moves_toward_lagging_side() {
     );
 }
 
-/// No matter how large the level difference is, r is capped at 1.0 ± 500 ppm.
+/// No matter how large the level difference is, r is capped at 1.0 +/- 500 ppm.
 #[test]
 fn drift_controller_clamps_at_ratio_limit() {
     let mut c = DriftController::new();
@@ -581,7 +581,7 @@ fn stitcher_unity_ratio_is_passthrough() {
 fn stitcher_interpolates_between_frames() {
     let mut st = LinearStitcher::new();
     let mut fifo: Vec<f32> = (0..5).flat_map(|f| [f as f32, f as f32 * 10.0]).collect();
-    // span = 4, floor(4 / 1.25) = 3 → 3 + 1 = 4 frames can be produced.
+    // span = 4, floor(4 / 1.25) = 3 -> 3 + 1 = 4 frames can be produced.
     assert_eq!(st.producible(5, 1.25), 4);
     let mut out = Vec::new();
     st.pull(&mut fifo, 1.25, 4, &mut out);
@@ -598,7 +598,7 @@ fn stitcher_interpolates_between_frames() {
             out[k * 2 + 1]
         );
     }
-    // floor(0 + 4×1.25) = 5, so all frames are consumed and phase returns to 0.
+    // floor(0 + 4*1.25) = 5, so all frames are consumed and phase returns to 0.
     assert!(
         fifo.is_empty(),
         "should be fully consumed: {} remaining",
@@ -665,7 +665,7 @@ struct DriftSimOutcome {
 }
 
 /// Synchronous simulation without threads. Each tick is 20 ms. Supply DC to mic at
-/// unity rate (960 frames/tick) and to system at (1 + ppm×1e-6) rate, simulating
+/// unity rate (960 frames/tick) and to system at (1 + ppm*1e-6) rate, simulating
 /// elapsed time through sample counts, then drive mix_and_push directly in a loop.
 /// It is fully deterministic and independent of threads and wall-clock time.
 ///
@@ -748,11 +748,11 @@ fn mix_drift_sim_plus_300ppm_stays_bounded() {
     let uncorrected = run_drift_sim(300.0, 60, true);
 
     // Self-check: without correction, system levels grow monotonically each second
-    // (+300 ppm ≈ +28.8 samples/second).
+    // (+300 ppm approx. +28.8 samples/second).
     for (i, w) in uncorrected.system_backlog.windows(2).enumerate() {
         assert!(
             w[1] > w[0],
-            "levels should grow monotonically without correction: second {i}, {} → {}",
+            "levels should grow monotonically without correction: second {i}, {} \u{2192} {}",
             w[0],
             w[1]
         );
@@ -810,7 +810,7 @@ fn mix_drift_sim_minus_300ppm_no_steady_zero_fill() {
     for (i, w) in uncorrected.mic_backlog.windows(2).enumerate() {
         assert!(
             w[1] > w[0],
-            "mic levels should grow monotonically without correction: second {i}, {} → {}",
+            "mic levels should grow monotonically without correction: second {i}, {} \u{2192} {}",
             w[0],
             w[1]
         );

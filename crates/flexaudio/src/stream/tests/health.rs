@@ -1,7 +1,7 @@
 //! Offline health regressions.
 use super::*;
 
-// --- Watchdog: detect stall → auto-recover → RECOVERED ---
+// --- Watchdog: detect stall -> auto-recover -> RECOVERED ---
 
 /// End-to-end verification with a bounded burst: the first session stops receiving data,
 /// the watchdog detects a stall after STALL_THRESHOLD, reopens the backend, and marks the first
@@ -217,7 +217,7 @@ fn backend_panic_in_stop_does_not_kill_process() {
 /// RecoverableError through `open_backend_once`'s Err.
 #[test]
 fn backend_panic_on_watchdog_reopen_surfaces_event_error() {
-    // Feed for 300 ms → stall → panic during watchdog reopen.
+    // Feed for 300 ms -> stall -> panic during watchdog reopen.
     let backend = Box::new(StallThenPanicOnReopenBackend::new(
         48_000,
         2,
@@ -227,7 +227,7 @@ fn backend_panic_on_watchdog_reopen_surfaces_event_error() {
     let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
     stream.start().expect("start");
 
-    // Wait long enough for stall detection (>=2s) and a reopen attempt (panic → RecoverableError), up to 8 s.
+    // Wait long enough for stall detection (>=2s) and a reopen attempt (panic -> RecoverableError), up to 8 s.
     let mut saw_stalled = false;
     let mut saw_reopen_error = false;
     let deadline = Instant::now() + Duration::from_secs(8);

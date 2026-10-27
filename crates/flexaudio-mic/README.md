@@ -18,4 +18,4 @@ supports (Linux, Windows, macOS).
 
 ## License
 
-[MIT](LICENSE) © 2026 tubome / Studio Sadola.
+[MIT](LICENSE) (c) 2026 tubome / Studio Sadola.

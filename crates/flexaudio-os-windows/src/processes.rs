@@ -1,7 +1,7 @@
 //! Enumerate recordable processes ([`list_processes`]) from WASAPI audio sessions.
 //!
 //! For every active render endpoint,
-//! `IMMDevice::Activate(IAudioSessionManager2)` → `GetSessionEnumerator` →
+//! `IMMDevice::Activate(IAudioSessionManager2)` -> `GetSessionEnumerator` ->
 //! read `GetProcessId` / `GetState` from each `IAudioSessionControl2` and return processes with
 //! audio sessions. Exclude system sound sessions (`IsSystemSoundsSession == S_OK`), expired sessions,
 //! and PID 0.

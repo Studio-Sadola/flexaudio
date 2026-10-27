@@ -42,7 +42,7 @@ fn stereo_test_signal(rate: u32) -> Vec<f32> {
 ///
 /// - Sample counts match.
 /// - Quantized values match exactly (deterministic).
-/// - Quantization error relative to the original f32 is at most ±1/32768 + ε.
+/// - Quantization error relative to the original f32 is at most +/-1/32768 + epsilon.
 fn assert_roundtrip(path: &PathBuf, signal: &[f32], rate: u32, channels: u32) {
     let mut reader = claxon::FlacReader::open(path).unwrap();
     let info = reader.streaminfo();
@@ -80,14 +80,14 @@ fn roundtrip_stereo_sine_and_constant() {
     let signal = stereo_test_signal(rate);
 
     let mut writer = FlacWriter::create(&path, rate, 2).unwrap();
-    // Feed small pieces like flexaudio's 20 ms chunks (960 frames × 2ch = 1920 elements).
-    // 1920 does not align with the block boundary (4096×2=8192), exercising the remainder path.
+    // Feed small pieces like flexaudio's 20 ms chunks (960 frames * 2ch = 1920 elements).
+    // 1920 does not align with the block boundary (4096*2=8192), exercising the remainder path.
     for chunk in signal.chunks(960 * 2) {
         writer.write_chunk(chunk).unwrap();
     }
     writer.finalize().unwrap();
 
-    // 48000 frames = 4096×11 + 2944, leaving a partial final frame.
+    // 48000 frames = 4096*11 + 2944, leaving a partial final frame.
     assert_roundtrip(&path, &signal, rate, 2);
 }
 
@@ -150,7 +150,7 @@ fn empty_stream_is_valid_flac() {
     let info = reader.streaminfo();
     assert_eq!(info.sample_rate, 48_000);
     assert_eq!(info.channels, 2);
-    // In FLAC, a total sample count of 0 means “unknown,” so claxon returns None.
+    // In FLAC, a total sample count of 0 means "unknown," so claxon returns None.
     assert_eq!(info.samples, None);
     assert_eq!(reader.samples().count(), 0);
 }
@@ -172,7 +172,7 @@ fn drop_without_finalize_closes_best_effort() {
 #[test]
 fn compresses_below_90_percent_of_raw_pcm() {
     // One second of a sine wave. A loose sanity check that compression brings it below
-    // 90% of raw 16-bit PCM (sample count × 2 bytes); sine waves compress much better in practice.
+    // 90% of raw 16-bit PCM (sample count * 2 bytes); sine waves compress much better in practice.
     let rate = 48_000u32;
     let path = tmp_path("compression.flac");
     let signal = stereo_test_signal(rate);

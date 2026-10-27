@@ -1,4 +1,4 @@
-//! [`WasapiSystemBackend`] — WASAPI loopback for system audio output.
+//! [`WasapiSystemBackend`] - WASAPI loopback for system audio output.
 //!
 //! `exclude_self == false` (default): Capture the mix sent to the render endpoint
 //! with `AUDCLNT_STREAMFLAGS_LOOPBACK` (classic loopback), equivalent to Linux's
@@ -66,7 +66,7 @@ const PROCESS_LOOPBACK_FORMAT: (u32, u16) = (48_000, 2);
 /// A [`CaptureBackend`] that captures system audio output.
 ///
 /// `exclude_self == false` (default): Initialize COM on a dedicated thread,
-/// `MMDeviceEnumerator` → `GetDefaultAudioEndpoint(eRender, eConsole)` →
+/// `MMDeviceEnumerator` -> `GetDefaultAudioEndpoint(eRender, eConsole)` ->
 /// obtain `IAudioClient`, and initialize classic loopback with
 /// `AUDCLNT_STREAMFLAGS_LOOPBACK`. Forward packets to [`RawSink::push`] using
 /// event-driven capture.
@@ -889,7 +889,7 @@ mod tests {
 
         // Idempotence: clearing the list drops back out of the exclude path.
         // `native` is recomputed by `query_native_format`, which needs COM and a
-        // render endpoint, so its exact value is environment-dependent here —
+        // render endpoint, so its exact value is environment-dependent here -
         // only the root (pure) is asserted; the format restoration is covered by
         // the same code path as `new`.
         let cleared = WasapiSystemBackend::new(false, None)
@@ -927,7 +927,7 @@ mod tests {
         }
     }
 
-    /// `start` → `stop` does not panic on the classic loopback path, with or without a device.
+    /// `start` -> `stop` does not panic on the classic loopback path, with or without a device.
     /// `Err` is acceptable if no render endpoint exists or it cannot be opened.
     #[test]
     fn start_then_stop_tolerates_missing_endpoint() {
@@ -1052,7 +1052,7 @@ mod tests {
         }
     }
 
-    /// `start` → `stop` does not panic on the `exclude_self == true` process
+    /// `start` -> `stop` does not panic on the `exclude_self == true` process
     /// loopback EXCLUDE path. `Err` is acceptable on unsupported OS versions or
     /// if activation fails.
     #[test]

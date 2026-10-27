@@ -39,7 +39,7 @@ pub(crate) const PROCESS_ENUM_TIMEOUT: Duration = Duration::from_secs(3);
 ///   is the basename of `/proc/<pid>/exe`, falling back to `/proc/<pid>/comm`. `is_output_active`
 ///   reflects whether the node is Running.
 /// - **Windows (WASAPI)**: Enumerates audio sessions on all active render endpoints
-///   (`IAudioSessionManager2` → `IAudioSessionEnumerator` → `IAudioSessionControl2`). System
+///   (`IAudioSessionManager2` -> `IAudioSessionEnumerator` -> `IAudioSessionControl2`). System
 ///   audio and expired sessions are excluded. The display name is the process image name
 ///   without its extension; `is_output_active` reflects whether the session is Active.
 ///   Enumeration and capture require Windows build 20348 or later (Windows 11 / Windows

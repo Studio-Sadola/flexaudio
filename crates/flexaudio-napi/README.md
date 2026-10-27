@@ -8,7 +8,7 @@ microphone, system output (loopback), per-process capture, and mic + system mix 
 Three offline audio add-ons are compiled into the same binary and exposed to
 JavaScript: **voice activity detection** (Silero VAD on pure-Rust tract),
 **noise suppression** (RNNoise via nnnoiseless), and streaming **FLAC** encoding. They run fully
-offline — no model files to ship, no network at runtime.
+offline -- no model files to ship, no network at runtime.
 
 > This package is published on npm as `@studio-sadola/flexaudio`.
 > It is the **npm** package for flexaudio (the Rust crate `flexaudio-napi`).
@@ -153,14 +153,14 @@ current playback. Pass `pid` as `processId` for per-process capture:
 const { processes, openStream } = require('@studio-sadola/flexaudio');
 
 const list = await processes();
-// [{ pid: 4242, name: 'Firefox', executable: 'firefox', isOutputActive: true }, …]
+// [{ pid: 4242, name: 'Firefox', executable: 'firefox', isOutputActive: true }, ...]
 // bundleId is set on macOS only; executable / isOutputActive are undefined when
 // the OS does not expose them. The calling process is never listed.
 
 const target = list[0];
 if (target) {
   const stream = openStream({ kind: 'process', processId: target.pid }, (chunk) => {});
-  // …
+  // ...
   await stream.stop();
 }
 ```
@@ -270,7 +270,7 @@ persistent hardware identities.
 
 `onChunk` is called with **one** argument, the primary chunk. When
 `secondaryOutput` is set, the paired secondary chunk travels **inside** it as
-`chunk.secondary` — it is not a second callback argument. VAD events ride on the
+`chunk.secondary` -- it is not a second callback argument. VAD events ride on the
 chunk of the tap selected by `vad.tap`. Do not block synchronously inside
 `onChunk` (defer heavy work); blocking stalls terminator delivery and delays
 `stop()` resolving.
@@ -323,7 +323,7 @@ VAD / noise suppression can also be wired into a live `openStream`.
 ```js
 const { Vad, Denoiser, FlacEncoder, openStream } = require('@studio-sadola/flexaudio');
 
-// VAD: feed 8000–192000 Hz PCM; it resamples internally to the VAD rate (16 kHz).
+// VAD: feed 8000-192000 Hz PCM; it resamples internally to the VAD rate (16 kHz).
 const vad = new Vad({ threshold: 0.5, minSilenceMs: 100 });
 for (const ev of [...vad.process(samples, 48000, 2), ...vad.finish()]) {
   if (ev.type === 'segment') console.log(ev.startMs, ev.endMs);
@@ -334,7 +334,7 @@ const dn = new Denoiser(1);
 const clean = dn.process(samples);   // same length as input (one-frame delay)
 const tail = dn.flush();             // final 480 samples/ch when you're done
 
-// FLAC: streaming encode. splitSeconds > 0 rotates into meeting-001.flac, -002…
+// FLAC: streaming encode. splitSeconds > 0 rotates into meeting-001.flac, -002...
 const flac = FlacEncoder.create('meeting.flac', 48000, 2, /* splitSeconds */ 600);
 flac.writeChunk(samples);
 flac.finalize();
@@ -342,7 +342,7 @@ flac.finalize();
 
 Integrated into a recording, `denoise` rewrites the delivered/stored audio and
 `vad` attaches its events to each chunk (as `chunk.vadEvents`), applied in the
-order denoise → VAD:
+order denoise -> VAD:
 
 ```js
 const stream = openStream(
@@ -451,7 +451,7 @@ macOS 14.4 or later.
 
 ## License
 
-[MIT](LICENSE) © 2026 tubome / Studio Sadola. This package redistributes native code
+[MIT](LICENSE) (c) 2026 tubome / Studio Sadola. This package redistributes native code
 and bundled assets: the embedded Silero VAD model (built-in VAD add-on), the
 pure-Rust tract inference crates, and RNNoise via nnnoiseless with embedded
 weights (noise suppression).

@@ -6,8 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 > **0.x stability note:** while in the `0.x` series the public API is not yet
-> stable. Per SemVer, a **minor** bump (`0.2 → 0.3`) may include breaking
-> changes; **patch** bumps (`0.2.0 → 0.2.1`) remain backward-compatible. Pin to
+> stable. Per SemVer, a **minor** bump (`0.2 -> 0.3`) may include breaking
+> changes; **patch** bumps (`0.2.0 -> 0.2.1`) remain backward-compatible. Pin to
 > `0.9` to receive only compatible updates.
 
 ## [Unreleased]
@@ -88,6 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Failed startup rollback preserves independently observed primary and cleanup
+  failures when restoring an earlier shutdown report, and returns those attempt
+  failures beside the startup error.
 - Rust Drop fallback tracks failures actually handed to callers rather than
   merely retained internally. Plain `stop()` followed by Drop reports unread
   failures once; checked errors, returned failure events and public report reads
@@ -828,7 +831,7 @@ Pin to `0.5` for compatible patch updates and apply these migration notes:
 
 - VAD `process`, `process_pcm`, `reset`, and `flush` now return typed errors instead
   of substituting silence or empty events. Inference/conversion execution failures
-  require a successful reset; setup failures preserve existing state. PCM input validates nonzero channels and 8,000–192,000 Hz before mutation.
+  require a successful reset; setup failures preserve existing state. PCM input validates nonzero channels and 8,000-192,000 Hz before mutation.
 - Added `Vad::converted_sample_position()` to anchor timestamps using actual
   cumulative converted samples. N-API uses it instead of rounding each chunk;
   Python, N-API, and C VAD callers propagate failures with their original cause.
@@ -910,10 +913,10 @@ Pin to `0.5` for compatible patch updates and apply these migration notes:
   hosts render audio from a helper process, so excluding the addon's own pid
   was not enough on Linux and macOS. Linux excludes every listed pid. macOS:
   every pid is added to the tap's exclude list,
-  resolved to its Core Audio process object once at capture start — a helper
+  resolved to its Core Audio process object once at capture start -- a helper
   that has not yet rendered audio has no object and is not excluded, so open
   the capture while the app is already playing or reopen it when a helper
-  appears. Windows: one process tree — `exclude_self` wins, otherwise the first
+  appears. Windows: one process tree -- `exclude_self` wins, otherwise the first
   pid; any other listed pid is rejected with `Error::InvalidArg`.
 - **Microphone + system mix:** `SourceKind::Mix` combines both inputs, with
   independent device selection and pre-mix gains plus a global post-mix gain.
@@ -935,8 +938,8 @@ Pin to `0.5` for compatible patch updates and apply these migration notes:
 - **N-API `processes()` is async:** it returns `Promise<JsProcessInfo[]>`.
   Rejection uses the same error type and message as the former thrown error.
 - **N-API `FlexStream.stop()` is async:** it returns `Promise<void>`. The
-  promise resolves only after every `onChunk` queued before stop — including
-  the last PCM and the `frames:0` terminator — has been delivered to JS. Do
+  promise resolves only after every `onChunk` queued before stop -- including
+  the last PCM and the `frames:0` terminator -- has been delivered to JS. Do
   not block synchronously inside `onChunk`, or terminator delivery and
   `stop()` resolution can stall.
 - **Exclusion is fail-closed.** Windows rejects any listed PID different from the
@@ -1014,8 +1017,8 @@ Pin to `0.5` for compatible patch updates and apply these migration notes:
   `..Default::default()`.
 - **N-API chunk delivery:** `onChunk` receives **one** argument. With
   `secondaryOutput` set, the paired secondary chunk is `chunk.secondary` (it is
-  `undefined` on rounds where it has not arrived yet) — it is **not** a second
-  callback argument. Code written as `(primary, secondary) => …` always sees
+  `undefined` on rounds where it has not arrived yet) -- it is **not** a second
+  callback argument. Code written as `(primary, secondary) => ...` always sees
   `secondary === undefined`. VAD events ride on the chunk of the tap chosen by
   `vadTap`: `chunk.vadEvents` for `'primary'`, `chunk.secondary?.vadEvents` for
   `'secondary'`.
@@ -1031,7 +1034,7 @@ Pin to `0.5` for compatible patch updates and apply these migration notes:
 
 ## [0.2.0] - 2026-06-17
 
-The first Rust workspace release — a ground-up Rust rewrite of the earlier prototype.
+The first Rust workspace release -- a ground-up Rust rewrite of the earlier prototype.
 
 ### Added
 

@@ -58,9 +58,9 @@ struct OutputNode {
 struct RegistrySnapshot {
     /// Client global id -> PID and protocol provenance.
     client_pid: HashMap<u32, ClientEntry>,
-    /// Client global ID → that Client's `application.name`.
+    /// Client global ID -> that Client's `application.name`.
     client_name: HashMap<u32, String>,
-    /// Node global ID → application output node.
+    /// Node global ID -> application output node.
     nodes: HashMap<u32, OutputNode>,
     /// Bind failures in arrival order; removal events retire only vanished entries.
     bind_failures: Vec<SnapshotError>,
@@ -296,7 +296,7 @@ fn non_empty(value: Option<&str>) -> Option<String> {
 /// Create, use, and drop the `!Send` `MainLoop`/`Context`/`Core`/`Registry`/`Node` proxies only
 /// inside this function. The facade calls it from a dedicated thread.
 ///
-/// Wait for completion with the same two-phase sync→done barrier as `enumerate_pw` (phase 1 collects
+/// Wait for completion with the same two-phase sync->done barrier as `enumerate_pw` (phase 1 collects
 /// all globals; phase 2 waits for info/state from bound nodes). A deadline timer also guarantees the
 /// loop exits.
 fn collect_snapshot() -> std::result::Result<RegistrySnapshot, SnapshotError> {
@@ -444,7 +444,7 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, SnapshotError> {
         })
         .register();
 
-    // Two-phase sync→done barrier (same as enumerate_pw).
+    // Two-phase sync->done barrier (same as enumerate_pw).
     let done = Rc::new(Cell::new(false));
     let stage = Rc::new(Cell::new(0u8));
     let pending = core.sync(0).map_err(|e| SnapshotError::Query {
@@ -471,7 +471,7 @@ fn collect_snapshot() -> std::result::Result<RegistrySnapshot, SnapshotError> {
                 let seq = seq.seq();
                 match stage_for_cb.get() {
                     0 if seq == pending_for_cb.get() => {
-                        // Phase 1 complete (all globals collected) → phase 2 waits for bound node info.
+                        // Phase 1 complete (all globals collected) -> phase 2 waits for bound node info.
                         stage_for_cb.set(1);
                         let second = core_weak.upgrade().map(|core| core.sync(0));
                         match second {

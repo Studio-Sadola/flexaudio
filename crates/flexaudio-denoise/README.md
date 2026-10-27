@@ -2,12 +2,12 @@
 
 **Offline noise suppression for Rust**, powered by [RNNoise] via the pure-Rust
 [nnnoiseless] port. The model weights are embedded in the library, so denoising
-runs **fully offline** — no model file to ship and no network access at runtime.
+runs **fully offline** -- no model file to ship and no network access at runtime.
 It targets stationary microphone noise such as fans, air conditioning, and
 keyboard rumble.
 
 This crate is independent of `flexaudio-core`: it consumes plain interleaved
-`&[f32]` samples (±1.0 normalized, 48 kHz), so you can pair it with any audio
+`&[f32]` samples (+/-1.0 normalized, 48 kHz), so you can pair it with any audio
 source. The i16-range scaling that nnnoiseless expects is handled internally.
 
 ## Latency & carry-over semantics
@@ -28,7 +28,7 @@ independent of call granularity:
 use flexaudio_denoise::{Denoiser, FRAME_SIZE};
 
 let mut dn = Denoiser::new(1).unwrap(); // 1 = mono, 2 = stereo interleaved
-let mut chunk = vec![0.0f32; 1000];     // ±1.0 normalized, 48 kHz
+let mut chunk = vec![0.0f32; 1000];     // +/-1.0 normalized, 48 kHz
 dn.process(&mut chunk).unwrap();        // in place, delayed by 480 samples
 let tail = dn.flush();                  // the remaining 480 samples/ch
 assert_eq!(tail.len(), FRAME_SIZE);
@@ -51,7 +51,7 @@ sink.write(&dn.flush());
 
 ## License & third-party notices
 
-[MIT](LICENSE) © 2026 tubome / Studio Sadola.
+[MIT](LICENSE) (c) 2026 tubome / Studio Sadola.
 
 This crate depends on [nnnoiseless] (**BSD-3-Clause**), a pure-Rust port of
 Xiph's [RNNoise] (also BSD-3-Clause), and embeds its RNNoise model weights in

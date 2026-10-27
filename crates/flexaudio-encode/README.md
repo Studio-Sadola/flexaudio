@@ -1,7 +1,7 @@
 # flexaudio-encode
 
 **Streaming FLAC recording sink for Rust.** Feed interleaved `f32` audio chunks
-as they arrive and they are compressed losslessly to a `.flac` file on the fly —
+as they arrive and they are compressed losslessly to a `.flac` file on the fly --
 a 3-hour meeting recording that would be ~2 GB as WAV lands at roughly a third
 to a half of that, bit-exact at 16-bit. Encoding is pure Rust ([flacenc]), runs
 **fully offline**, and memory usage stays constant no matter how long the
@@ -49,7 +49,7 @@ writer.finalize()?;
 ## Notes
 
 - Samples are quantized from `f32` to 16-bit (simple rounding with clamping, no
-  dither). 1–2 channels, sample rates up to 96 kHz.
+  dither). 1-2 channels, sample rates up to 96 kHz.
 - `finalize()` is recommended: it reports I/O errors and rewrites the header
   with the final sample count and MD5. Dropping the writer without finalizing
   attempts finalization and checked file close. Failures first observed there
@@ -66,7 +66,7 @@ cargo add flexaudio-encode
 
 ## License & third-party notices
 
-[MIT](LICENSE) © 2026 tubome / Studio Sadola.
+[MIT](LICENSE) (c) 2026 tubome / Studio Sadola.
 
 This crate links [flacenc] (**Apache-2.0**), a pure-Rust FLAC encoder; binaries
 embedding this crate include flacenc code under Apache-2.0 terms. Tests

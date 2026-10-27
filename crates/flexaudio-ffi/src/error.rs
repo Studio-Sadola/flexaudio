@@ -13,7 +13,7 @@ use std::ptr;
 
 /// FFI function return codes. Zero means success; negative values indicate errors.
 ///
-/// Only `poll_*` uses positive 1 for “available” and 0 for “none”; errors remain negative.
+/// Only `poll_*` uses positive 1 for "available" and 0 for "none"; errors remain negative.
 /// The C header uses names such as `FLEX_OK` to avoid collisions in the C namespace.
 pub mod code {
     /// Strict validation rejected ignored capture settings.

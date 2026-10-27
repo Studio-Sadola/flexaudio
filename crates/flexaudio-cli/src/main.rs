@@ -1,4 +1,4 @@
-//! flexaudio-cli — reference capture CLI.
+//! flexaudio-cli -- reference capture CLI.
 //!
 //! Captures N seconds from the default microphone or another source, collects chunks in the
 //! output format (default: 48000 Hz / stereo 2ch / interleaved f32), and writes a 16-bit PCM WAV.
@@ -64,8 +64,8 @@
 //! Use `--split-seconds <N>` (default 0 = no splitting) to record WAV files in numbered N-second
 //! segments. With `--out rec.wav`, files are named `rec-001.wav, rec-002.wav, ...` (three-digit
 //! zero-padded index before the extension; the width grows naturally from file 1000 onward). Boundaries
-//! use 20 ms chunk granularity: a new file starts when written frames reach `N × output sample
-//! rate`, so each file can be up to one chunk (±20 ms) longer than requested. Chunks are never
+//! use 20 ms chunk granularity: a new file starts when written frames reach `N * output sample
+//! rate`, so each file can be up to one chunk (+/-20 ms) longer than requested. Chunks are never
 //! split or dropped; the next file starts with the next chunk. Since splitting is frame-based, it
 //! works independently of `--sources` (hot swap) and mix. It cannot be combined with stdout
 //! streaming (`--out -`); this is rejected at startup.
@@ -272,7 +272,7 @@ struct Cli {
 
     /// Seconds per WAV segment. Default 0 = no splitting (one file, as before).
     /// For values of 1 or more, finalize the current file (write its WAV header) and switch to the
-    /// next numbered file whenever written frames reach `split-seconds × output sample rate`
+    /// next numbered file whenever written frames reach `split-seconds * output sample rate`
     /// (`--out rec.wav` produces `rec-001.wav, rec-002.wav, ...`). Boundaries use 20 ms chunk
     /// granularity, so each file can be up to one chunk longer than requested. Chunks are never
     /// split or dropped; the next file starts with the next chunk. Cannot be combined with stdout
@@ -298,7 +298,7 @@ struct Cli {
     no_silence_probe: bool,
 
     /// Input gain (linear multiplier). Default 1.0; 1.0 leaves audio unchanged, 2.0 is about +6 dB,
-    /// and 0.0 is silence. Samples are clamped to ±1.0 after multiplication. Negative and NaN
+    /// and 0.0 is silence. Samples are clamped to +/-1.0 after multiplication. Negative and NaN
     /// values are errors.
     #[arg(long, default_value_t = 1.0)]
     gain: f32,
@@ -788,7 +788,7 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     let out_rate = output.sample_rate;
     let out_ch = output.channels;
 
-    // `--split-seconds × output rate` is the per-file frame threshold. Reject a product that
+    // `--split-seconds * output rate` is the per-file frame threshold. Reject a product that
     // overflows u64 here, before any device access, so the writer never has to fall back on a
     // saturated threshold (`parse_sources` has already bounded the `--sources` alternative).
     if cli.split_seconds > 0
@@ -1001,9 +1001,9 @@ fn list_processes() -> std::result::Result<(), String> {
 /// Count existing devices with `devices()` and print the count at startup.
 ///
 /// Output format (all to stderr):
-/// - `[+] ADDED   <source> <name> (<id>)` — device added
-/// - `[-] REMOVED <id>` — device removed (`id` is `node.name` only)
-/// - `[*] DEFAULT <source> -> <id>` — default device changed
+/// - `[+] ADDED   <source> <name> (<id>)` -- device added
+/// - `[-] REMOVED <id>` -- device removed (`id` is `node.name` only)
+/// - `[*] DEFAULT <source> -> <id>` -- default device changed
 fn watch_devices_loop() -> std::result::Result<(), String> {
     // Discovery failure must not masquerade as an empty authoritative inventory.
     let existing = flexaudio::devices()
@@ -1058,14 +1058,14 @@ fn source_kind_label(kind: SourceKind) -> &'static str {
     }
 }
 
-/// Truncate a display string to `max` characters (by `char`), using `…` for overflow.
+/// Truncate a display string to `max` characters (by `char`), using a U+2026 ellipsis for overflow.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
         let keep = max.saturating_sub(1);
         let mut t: String = s.chars().take(keep).collect();
-        t.push('…');
+        t.push('\u{2026}');
         t
     }
 }
@@ -1390,7 +1390,7 @@ fn write_chunk<W: Write>(out: &mut W, chunk: &AudioChunk, encoding: EncodingArg)
         }
         EncodingArg::S16 => {
             // s16 LE: quantize with the shared canonical implementation
-            // [`flexaudio::core::quantize_i16`] (scale 32768, round, clamp, NaN→0). 2 bytes per sample.
+            // [`flexaudio::core::quantize_i16`] (scale 32768, round, clamp, NaN->0). 2 bytes per sample.
             let mut buf = Vec::with_capacity(chunk.data.len() * 2);
             for &x in &chunk.data {
                 let s = flexaudio::core::quantize_i16(x);
@@ -1453,7 +1453,7 @@ struct WavSummary {
 ///
 /// With `--split-seconds 0` (no splitting), write one file to `--out` as before. For values >= 1,
 /// write to numbered paths from [`split_file_path`]. Whenever written frames reach
-/// `split_seconds × output sample rate`, finalize (write the WAV header) and close the current file,
+/// `split_seconds * output sample rate`, finalize (write the WAV header) and close the current file,
 /// then write the next chunk to the next file. Boundaries use 20 ms chunk granularity, so a file
 /// can be up to one chunk longer than requested (chunks are never split or dropped).
 ///
@@ -1467,7 +1467,7 @@ struct RotatingWavWriter {
     base: PathBuf,
     /// WAV header format (follows output format; fixed to 16-bit PCM).
     spec: hound::WavSpec,
-    /// Frame threshold per file (`split_seconds × rate`). 0 = no splitting.
+    /// Frame threshold per file (`split_seconds * rate`). 0 = no splitting.
     frames_per_file: u64,
     /// Current writer (lazy-created; None before writing and just after rotation).
     writer: Option<hound::WavWriter<BufWriter<File>>>,
@@ -2077,12 +2077,12 @@ mod tests {
         // Longer strings are limited to max characters with an ellipsis (keep = max-1).
         let t = truncate("abcdefgh", 5);
         assert_eq!(t.chars().count(), 5);
-        assert!(t.ends_with('…'));
+        assert!(t.ends_with('\u{2026}'));
         assert!(t.starts_with("abcd"));
         // Truncate safely by char boundary for multibyte text too (without panicking).
-        let jp = truncate("éøåæœ", 3);
+        let jp = truncate("\u{e9}\u{f8}\u{e5}\u{e6}\u{153}", 3);
         assert_eq!(jp.chars().count(), 3);
-        assert!(jp.ends_with('…'));
+        assert!(jp.ends_with('\u{2026}'));
     }
 
     #[test]
@@ -2282,7 +2282,7 @@ mod tests {
     /// chunk of excess). Chunks are not split; the next file starts with the next chunk.
     #[test]
     fn rotating_writer_rounds_boundary_up_to_chunk() {
-        // Threshold 1000 frames (1000 Hz × 1 second); chunk size 320 frames.
+        // Threshold 1000 frames (1000 Hz * 1 second); chunk size 320 frames.
         // The fourth chunk reaches 1280 >= 1000 and finalizes (up to one chunk of excess is expected).
         let output = OutputFormat {
             sample_rate: 1_000,
@@ -2503,17 +2503,17 @@ mod tests {
         chunk.rms = 0.5;
         let mut buf: Vec<u8> = Vec::new();
         write_chunk(&mut buf, &chunk, EncodingArg::S16).expect("write");
-        // s16 LE: 2 bytes per sample × 5 = 10 bytes.
+        // s16 LE: 2 bytes per sample * 5 = 10 bytes.
         assert_eq!(buf.len(), 10);
         let s = |i: usize| i16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]);
         assert_eq!(s(0), 0); // 0.0
-        assert_eq!(s(1), 32767); // 1.0 → clamp 32767
+        assert_eq!(s(1), 32767); // 1.0 -> clamp 32767
         assert_eq!(s(2), -32768); // -1.0 -> negative full scale -32768
-        assert_eq!(s(3), 32767); // 2.0 → clamp 32767
-        assert_eq!(s(4), -32768); // -2.0 → clamp -32768
+        assert_eq!(s(3), 32767); // 2.0 -> clamp 32767
+        assert_eq!(s(4), -32768); // -2.0 -> clamp -32768
     }
 
-    /// f32 path in `write_chunk`: byte length is sample count × 4 and little-endian decoding matches.
+    /// f32 path in `write_chunk`: byte length is sample count * 4 and little-endian decoding matches.
     #[test]
     fn write_chunk_f32_roundtrips() {
         let mut chunk = AudioChunk::new(vec![0.25, -0.5, 0.75], 3);
@@ -2526,7 +2526,7 @@ mod tests {
         chunk.rms = 0.5;
         let mut buf: Vec<u8> = Vec::new();
         write_chunk(&mut buf, &chunk, EncodingArg::F32).expect("write");
-        assert_eq!(buf.len(), 12); // 3 samples × 4 bytes.
+        assert_eq!(buf.len(), 12); // 3 samples * 4 bytes.
         let f = |i: usize| {
             f32::from_le_bytes([buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2], buf[i * 4 + 3]])
         };

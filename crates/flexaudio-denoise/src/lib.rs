@@ -1,6 +1,6 @@
-//! flexaudio-denoise — An offline noise-suppression addon using RNNoise (nnnoiseless).
+//! flexaudio-denoise -- An offline noise-suppression addon using RNNoise (nnnoiseless).
 //!
-//! It does not depend on `flexaudio-core`; it accepts only normalized ±1.0, 48 kHz interleaved
+//! It does not depend on `flexaudio-core`; it accepts only normalized +/-1.0, 48 kHz interleaved
 //! `&[f32]`. Model weights are embedded in the nnnoiseless crate (BSD-3-Clause), so no runtime
 //! model file or network access is needed. It targets steady noise in microphone recordings
 //! (fans, air conditioning, keyboard clicks, and similar sounds).
@@ -24,7 +24,7 @@
 //! use flexaudio_denoise::{Denoiser, FRAME_SIZE};
 //!
 //! let mut dn = Denoiser::new(1).unwrap();
-//! let mut chunk = vec![0.0f32; 1000]; // normalized ±1.0, mono, 48 kHz
+//! let mut chunk = vec![0.0f32; 1000]; // normalized +/-1.0, mono, 48 kHz
 //! dn.process(&mut chunk).unwrap();    // In place (the first 480 samples are latency silence)
 //! let tail = dn.flush();              // Remaining 480 samples per channel
 //! assert_eq!(tail.len(), FRAME_SIZE);
@@ -39,8 +39,8 @@ use nnnoiseless::DenoiseState;
 /// Samples per RNNoise frame per channel (10 ms at 48 kHz). Processing latency is also this fixed value.
 pub const FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
 
-/// nnnoiseless expects f32 scaled to the i16 range (±32768), so use this factor to convert to and
-/// from flexaudio's normalized ±1.0 range.
+/// nnnoiseless expects f32 scaled to the i16 range (+/-32768), so use this factor to convert to and
+/// from flexaudio's normalized +/-1.0 range.
 const I16_SCALE: f32 = 32768.0;
 
 /// Noise-suppression errors.
@@ -84,10 +84,10 @@ pub struct Denoiser {
     /// Per-channel RNNoise state. nnnoiseless has no reset, so reset by recreating the instance
     /// (the default embedded model is deterministic).
     states: Vec<Box<DenoiseState<'static>>>,
-    /// Unprocessed input per channel (kept at ±1.0 scale). Prepending FRAME_SIZE of silence at
+    /// Unprocessed input per channel (kept at +/-1.0 scale). Prepending FRAME_SIZE of silence at
     /// construction lets the delay line always emit as many samples as it receives.
     in_buf: Vec<Vec<f32>>,
-    /// Processed interleaved output awaiting emission (±1.0 scale, clamped).
+    /// Processed interleaved output awaiting emission (+/-1.0 scale, clamped).
     out_buf: VecDeque<f32>,
     /// Frame-processing input scratch buffer (i16 scale, 480 samples).
     frame_in: Vec<f32>,
@@ -114,13 +114,13 @@ impl Denoiser {
         Ok(dn)
     }
 
-    /// Apply noise suppression in place to any-length interleaved samples (normalized ±1.0, 48 kHz).
+    /// Apply noise suppression in place to any-length interleaved samples (normalized +/-1.0, 48 kHz).
     /// Length must be a multiple of the channel count (an empty slice is a no-op).
     ///
     /// Internally splits input into frames of [`FRAME_SIZE`] samples per channel and carries any
     /// remainder to the next call. Output is delayed by [`FRAME_SIZE`] samples per channel, with
     /// silence (0.0) at the start of the stream. Chunk boundaries do not change the output sequence.
-    /// Output samples are clamped to ±1.0.
+    /// Output samples are clamped to +/-1.0.
     pub fn process(&mut self, interleaved: &mut [f32]) -> Result<(), DenoiseError> {
         if interleaved.len() % self.channels != 0 {
             return Err(DenoiseError::InvalidLength {
@@ -205,14 +205,14 @@ impl Denoiser {
         // All channels contain the same number of samples, so checking the first channel is enough.
         while self.in_buf[0].len() >= FRAME_SIZE {
             for ch in 0..self.channels {
-                // Scale from ±1.0 to the i16 range and process one frame.
+                // Scale from +/-1.0 to the i16 range and process one frame.
                 for (dst, &src) in self.frame_in.iter_mut().zip(&self.in_buf[ch][..FRAME_SIZE]) {
                     *dst = src * I16_SCALE;
                 }
                 self.states[ch].process_frame(&mut self.frame_out[ch], &self.frame_in);
                 self.in_buf[ch].drain(..FRAME_SIZE);
             }
-            // Scale back from the i16 range to ±1.0, interleave, and queue for output.
+            // Scale back from the i16 range to +/-1.0, interleave, and queue for output.
             for i in 0..FRAME_SIZE {
                 for out_ch in &self.frame_out {
                     self.out_buf
@@ -241,7 +241,7 @@ mod tests {
         }
     }
 
-    /// Uniform white noise with amplitude ±amp (fixed seed, deterministic).
+    /// Uniform white noise with amplitude +/-amp (fixed seed, deterministic).
     fn white_noise(n: usize, amp: f32) -> Vec<f32> {
         let mut lcg = Lcg(0x5EED_1234_5678_9ABC);
         (0..n)
@@ -309,7 +309,7 @@ mod tests {
     fn stationary_noise_rms_strongly_reduced() {
         // Two seconds of low-frequency steady noise at 48 kHz mono (low-pass filtered LCG white noise).
         // This is the crate's target, similar to fan or air-conditioning noise. Measurement with
-        // measure_rms_ratios gave ratio = 0.0556 (in_rms 0.0399 → out_rms 0.0022; 0.006 for the last second).
+        // measure_rms_ratios gave ratio = 0.0556 (in_rms 0.0399 -> out_rms 0.0022; 0.006 for the last second).
         // Set the threshold to 25%, about 4.5 times the measured ratio.
         let input = lowpass(&white_noise(96_000, 0.3), 0.1);
         let output = run_aligned(1, &input);
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn white_noise_rms_reduced() {
-        // Two seconds of full-band white noise at 48 kHz mono (amplitude ±0.3). This synthetic
+        // Two seconds of full-band white noise at 48 kHz mono (amplitude +/-0.3). This synthetic
         // noise is far from the training distribution, so RNNoise suppression is weak; the measured
         // ratio is 0.7883 (stationary_noise_rms_strongly_reduced covers steady-noise effectiveness).
         // Here, verify only that it is not amplified and is reduced by at least 10% from measurement.
@@ -340,7 +340,7 @@ mod tests {
     fn sine_output_sane() {
         // Two seconds of a 440 Hz sine wave (amplitude 0.5). Measurement gave ratio = 0.9999,
         // nearly unchanged (RNNoise treats periodic signals as voiced). Since pure-tone handling
-        // depends on the model, assert only valid output (no NaN, within ±1.0) and that the tone
+        // depends on the model, assert only valid output (no NaN, within +/-1.0) and that the tone
         // is not erased (a 50% floor, half the measured level).
         let input = sine(96_000, 440.0, 0.5);
         let output = run_aligned(1, &input);

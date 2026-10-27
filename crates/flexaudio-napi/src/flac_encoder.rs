@@ -49,7 +49,7 @@ impl From<EncodeError> for EncoderError {
 
 /// Build the path for FLAC rotation `index` (1-based; pure function).
 ///
-/// Same convention as CLI `split_file_path`: `rec.flac` becomes `rec-001.flac, rec-002.flac, …`
+/// Same convention as CLI `split_file_path`: `rec.flac` becomes `rec-001.flac, rec-002.flac, ...`
 /// with a three-digit zero-padded sequence before the extension. Digits grow naturally from file
 /// 1000 onward. Paths without extensions append the sequence. The parent directory is preserved.
 fn split_flac_path(base: &Path, index: u64) -> PathBuf {
@@ -86,7 +86,7 @@ pub(super) struct RotatingFlacEncoder {
     state: FlacEncoderState,
     sample_rate: u32,
     channels: u16,
-    /// Frame threshold per file (splitSeconds × sampleRate). 0 = single file.
+    /// Frame threshold per file (splitSeconds * sampleRate). 0 = single file.
     frames_per_file: u64,
     /// Current writer. None immediately after rotation (lazily created on the next chunk).
     writer: Option<FlacWriter>,

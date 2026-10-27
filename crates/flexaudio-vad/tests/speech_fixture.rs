@@ -87,7 +87,7 @@ fn tract_matches_ort_frame_probs_on_speech_fixture() {
     let wav = fixture_path(FIXTURE_WAV);
     let (rate, samples) = load_pcm16_mono_wav(&wav);
     assert_eq!(rate, 16_000);
-    assert_eq!(samples.len(), 64_000, "4 s × 16 kHz");
+    assert_eq!(samples.len(), 64_000, "4 s \u{d7} 16 kHz");
 
     let expected = load_expected_probs(&fixture_path(FIXTURE_PROBS));
     assert_eq!(expected.len(), 64_000 / 512);

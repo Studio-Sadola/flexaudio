@@ -1,13 +1,13 @@
 ## Non-crate components
 
-### Silero VAD model — `silero_vad_openvino_16k.onnx`
+### Silero VAD model -- `silero_vad_openvino_16k.onnx`
 
 `flexaudio-vad` embeds the Silero VAD ONNX model
 (`crates/flexaudio-vad/assets/silero_vad_openvino_16k.onnx`) into the compiled artifact via
 `include_bytes!`. The model weights are therefore present in every binary that
 links `flexaudio-vad`, and this notice MUST be reproduced in distributions.
 
-  - Project: Silero VAD — https://github.com/snakers4/silero-vad
+  - Project: Silero VAD -- https://github.com/snakers4/silero-vad
   - Copyright (c) 2020-present Silero Team
   - License: MIT
 
@@ -50,7 +50,7 @@ SOFTWARE.
 
 The embedded `flexaudio-vad` implementation ports segmentation processing from
 whisper.cpp pin `85a69493a601d4ff5a834064f7b7bac250bd8739` (function
-`whisper_vad_segments_from_probs`, lines 5211–5444). The upstream source notes
+`whisper_vad_segments_from_probs`, lines 5211-5444). The upstream source notes
 the Silero lineage of its silence split rule. This notice covers the adapted
 segmentation implementation.
 

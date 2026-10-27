@@ -1,4 +1,4 @@
-//! [`MacSystemBackend`] — Process Tap loopback for all system audio output.
+//! [`MacSystemBackend`] - Process Tap loopback for all system audio output.
 //!
 //! Creates a tap with `CATapDescription::initStereoGlobalTapButExcludeProcesses([...])` and
 //! captures through a private aggregate device and IOProc. Equivalent to Windows'
@@ -7,12 +7,12 @@
 //!
 //! # `exclude_self`
 //! Use `exclude_self` in [`MacSystemBackend::new`] to choose the exclusion set.
-//! - `exclude_self == false` (default) → no exclusions via `excludeProcesses([])`; capture all system audio.
-//! - `exclude_self == true` → exclude the calling process ([`std::process::id`]) through
+//! - `exclude_self == false` (default) -> no exclusions via `excludeProcesses([])`; capture all system audio.
+//! - `exclude_self == true` -> exclude the calling process ([`std::process::id`]) through
 //!   `excludeProcesses([self_object])`. This prevents capturing our own output (feedback prevention).
 //!
 //! exclude_pids extends the exclusion set with arbitrary pids (Electron helper tree):
-//! the effective set is `exclude_pids ∪ {self if exclude_self}`, and a non-empty set
+//! the effective set is `exclude_pids union {self if exclude_self}`, and a non-empty set
 //! takes the exclusion path (so it also applies when `exclude_self == false`).
 //!
 //! `exclude_self` applies only to system sources and is not combined with a process source's
@@ -20,8 +20,8 @@
 //!
 //! # Selecting an output device (`device_id`)
 //! Select an output device with `device_id` in [`MacSystemBackend::new`].
-//! - `None` (default) → global tap for the default output.
-//! - `Some(id)` → create a tap for the output device selected by name or native UID with
+//! - `None` (default) -> global tap for the default output.
+//! - `Some(id)` -> create a tap for the output device selected by name or native UID with
 //!   `initExcludingProcesses:andDeviceUID:withStream:` (resolve through
 //!   [`resolve_output_device_uid`](crate::devices::resolve_output_device_uid)). If no device matches,
 //!   `start` returns [`Error::DeviceNotFound`]. Enumerate devices with
@@ -116,7 +116,7 @@ fn probe_process_exists(pid: i32) -> std::io::Result<()> {
 
 /// [`CaptureBackend`] that captures all system audio output through Process Tap.
 ///
-/// Builds the tap chain (global tap → aggregate → IOProc) on a dedicated thread and sends
+/// Builds the tap chain (global tap -> aggregate -> IOProc) on a dedicated thread and sends
 /// interleaved f32 from the IOProc RT block to [`RawSink::push`]. If tap creation fails (for
 /// example, because TCC permission has not been granted), [`start`](CaptureBackend::start)
 /// returns [`Error`] without panicking.
@@ -131,7 +131,7 @@ pub struct MacSystemBackend {
     /// with `excludeProcesses([self])`; when `false`, capture all system audio without exclusions.
     exclude_self: bool,
     /// Extra pids excluded from the tap (see `StreamConfig::exclude_pids`). The
-    /// effective exclusion set is `exclude_pids ∪ {self if exclude_self}`; a
+    /// effective exclusion set is `exclude_pids union {self if exclude_self}`; a
     /// non-empty set takes the exclusion path.
     exclude_pids: Vec<u32>,
     /// Target inventory ID (name or native UID fallback; [`DeviceInfo::id`](flexaudio_core::types::DeviceInfo)).
@@ -234,7 +234,7 @@ impl CaptureBackend for MacSystemBackend {
 
             // Version gate: Process Tap requires macOS 14.4 or later. Check the OS version before
             // creating the tap; if unsupported, return typed Error::UnsupportedOsVersion instead
-            // of obscuring the problem as a raw OSStatus→Backend error.
+            // of obscuring the problem as a raw OSStatus->Backend error.
             crate::version::ensure_process_tap_supported()?;
 
             self.stop_flag.store(false, Ordering::SeqCst);
@@ -248,8 +248,8 @@ impl CaptureBackend for MacSystemBackend {
             let cleanup = self.shutdown.cleanup.clone();
             let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
             let (event_tx, event_rx) = mpsc::channel();
-            // Effective exclusion set: `exclude_pids ∪ {self if exclude_self}`. Built here
-            // and moved into the closure (PID→object translation happens on that thread).
+            // Effective exclusion set: `exclude_pids union {self if exclude_self}`. Built here
+            // and moved into the closure (PID->object translation happens on that thread).
             let mut excluded: Vec<u32> = self.exclude_pids.clone();
             if self.exclude_self {
                 excluded.push(std::process::id());
@@ -809,7 +809,7 @@ mod tests {
         assert!(channels > 0);
     }
 
-    /// `start` → `stop` does not panic regardless of whether tap creation succeeds.
+    /// `start` -> `stop` does not panic regardless of whether tap creation succeeds.
     /// Accept `Err` if TCC permission is missing or tap creation is unavailable; panics are not accepted.
     #[test]
     fn start_then_stop_tolerates_failure() {
@@ -828,7 +828,7 @@ mod tests {
         }
     }
 
-    /// With `exclude_self == true`, `native_format` is valid and `start` → `stop` does not
+    /// With `exclude_self == true`, `native_format` is valid and `start` -> `stop` does not
     /// panic (headless/CI may return `Err` without TCC; exercise the self-PID conversion path).
     #[test]
     fn new_exclude_self_start_then_stop_tolerates_failure() {

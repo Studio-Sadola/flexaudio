@@ -221,11 +221,13 @@ impl ShutdownReport {
         match (causes.next(), causes.next()) {
             (None, _) => Ok(()),
             (Some(error), None) => Err(error),
-            (Some(primary), Some(first)) => Err(Error::Multiple(ErrorGroup::new(
-                primary,
-                first,
-                causes.collect(),
-            ))),
+            (Some(primary), Some(first)) => {
+                let mut retained = Some(primary);
+                for error in std::iter::once(first).chain(causes) {
+                    crate::terminal_causes::retain_terminal_cause(&mut retained, error);
+                }
+                Err(retained.expect("checked shutdown retains its first failure"))
+            }
         }
     }
 }
@@ -234,6 +236,26 @@ impl ShutdownReport {
 mod vad_tests {
     use super::*;
     use crate::VadErrorCode;
+
+    #[test]
+    fn grouped_primary_with_cleanup_uses_the_shared_retention_order() {
+        crate::test_support::assert_distinct_failures_retained(
+            Error::DeviceNotFound,
+            Error::DeviceLost,
+            |first, second| {
+                let cleanup = Error::Unsupported;
+                let report = ShutdownReport::new(
+                    Some(Error::Multiple(ErrorGroup::new(first, second, Vec::new()))),
+                    vec![cleanup.clone()],
+                );
+                let returned = report.result().unwrap_err();
+                assert!(crate::terminal_causes::retains_terminal_cause(
+                    &returned, &cleanup
+                ));
+                returned
+            },
+        );
+    }
 
     #[test]
     fn mixed_cleanup_group_retains_vad_and_capture_failures() {

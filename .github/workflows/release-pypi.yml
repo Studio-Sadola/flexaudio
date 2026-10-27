@@ -1,7 +1,7 @@
 # Build abi3 wheels (+ sdist) for the PyO3 binding and publish them to PyPI.
 #
 # === What the maintainer must set up ===
-#  - Default: PyPI Trusted Publishing (OIDC) — NO token needed. Register this
+#  - Default: PyPI Trusted Publishing (OIDC) -- NO token needed. Register this
 #    repo + workflow as a Trusted Publisher for the `flexaudio` project at
 #    https://pypi.org/manage/project/flexaudio/settings/publishing/
 #    (or, for the very first release, as a "pending publisher" at
@@ -106,11 +106,11 @@ jobs:
           # by hand below.
           #
           # manylinux_2_34 ships a recent toolchain and, crucially, a recent
-          # PipeWire — el8's 0.3.6 (manylinux_2_28) is too old for the
+          # PipeWire -- el8's 0.3.6 (manylinux_2_28) is too old for the
           # pipewire-rs / libspa bindings and fails to compile. A 2_34 wheel needs
           # glibc 2.34+ on the user's machine (RHEL 9 / Ubuntu 22.04+ / Debian 12+).
           container: quay.io/pypa/manylinux_2_34_${{ matrix.target }}
-          # abi3-py38 → a single wheel covers all CPython 3.8+, so we don't
+          # abi3-py38 -> a single wheel covers all CPython 3.8+, so we don't
           # iterate over Python versions. `--auditwheel skip` leaves the wheel
           # unrepaired (no libs grafted); the repair step below does the grafting
           # with the right exclusions.
@@ -124,7 +124,7 @@ jobs:
           #
           # NOTE: if pipewire-devel is ever unavailable for the chosen
           # manylinux image/arch, the Linux build will fail loudly here rather
-          # than silently shipping a broken wheel — pin a different manylinux
+          # than silently shipping a broken wheel -- pin a different manylinux
           # tag or move Linux wheels to a self-hosted builder. Do not remove
           # this step to "make it pass".
           before-script-linux: |
@@ -137,7 +137,7 @@ jobs:
       # Repair the wheel ourselves so we can bundle everything EXCEPT the system
       # audio client libraries.
       #
-      # Why exclude PipeWire/ALSA: flexaudio is an audio *client* — it talks to
+      # Why exclude PipeWire/ALSA: flexaudio is an audio *client* -- it talks to
       # the PipeWire daemon already running on the user's machine. Its client libs
       # (libpipewire-0.3.so.0 and the libspa plugins it dlopen()s at runtime) plus
       # ALSA's libasound.so.2 must therefore come from the host at runtime, exactly
@@ -283,4 +283,4 @@ jobs:
 
       - name: Dry run (skip publish)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
-        run: echo "dry_run=true → wheels + sdist built and collected, but not uploaded to PyPI."
+        run: echo "dry_run=true -> wheels + sdist built and collected, but not uploaded to PyPI."

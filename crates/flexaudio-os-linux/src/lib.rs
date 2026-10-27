@@ -1,4 +1,4 @@
-//! flexaudio-os-linux — Linux backend: PipeWire (`pipewire` 0.10)
+//! flexaudio-os-linux -- Linux backend: PipeWire (`pipewire` 0.10)
 //!
 //! Provides [`PwSystemBackend`] to capture system audio output (the default sink's monitor).
 //! This is the Linux equivalent of WASAPI loopback and captures the audio sent to the speakers
@@ -148,16 +148,16 @@ pub struct PwSystemBackend {
     /// `exclude_pids` is non-empty.
     exclude_self: bool,
     /// Extra pids excluded from the system capture alongside `exclude_self`
-    /// (see `StreamConfig::exclude_pids`). A non-empty exclusion set — from
-    /// either source — selects the fan-in path.
+    /// (see `StreamConfig::exclude_pids`). A non-empty exclusion set -- from
+    /// either source -- selects the fan-in path.
     exclude_pids: Vec<u32>,
     /// Select the sink to capture by `node.name`. `None` captures the default sink monitor;
     /// `Some(id)` captures that sink's monitor by setting `target.object` (`DeviceInfo.id` from
     /// [`list_devices`] is this `node.name`). Ignored when `exclude_self == true`, since fan-in
     /// does not target a specific sink.
     /// Since `exclude_pids` was added, the fan-in path is taken whenever the
-    /// effective exclusion set (`exclude_pids ∪ {self if exclude_self}`) is
-    /// non-empty, and `device_id` is ignored on that path — not only when
+    /// effective exclusion set (`exclude_pids union {self if exclude_self}`) is
+    /// non-empty, and `device_id` is ignored on that path -- not only when
     /// `exclude_self == true`.
     device_id: Option<String>,
     /// Running flag (guards against duplicate starts and is used by drop). `Send`.
@@ -186,9 +186,9 @@ impl PwSystemBackend {
     /// Select the sink to capture by `node.name` using `device_id`. `None` selects the default
     /// sink. Ignored when `exclude_self == true` (fan-in does not target a specific sink).
     /// Since `exclude_pids` was added, the fan-in path is taken whenever the
-    /// effective exclusion set (`exclude_pids ∪ {self if exclude_self}`,
+    /// effective exclusion set (`exclude_pids union {self if exclude_self}`,
     /// see [`with_exclude_pids`](Self::with_exclude_pids)) is non-empty, and
-    /// `device_id` is ignored on that path — not only when `exclude_self == true`.
+    /// `device_id` is ignored on that path -- not only when `exclude_self == true`.
     /// The actual connection and stream creation happen on a dedicated thread inside
     /// [`start`](CaptureBackend::start).
     pub fn new(exclude_self: bool, device_id: Option<String>) -> Self {
@@ -259,8 +259,8 @@ impl CaptureBackend for PwSystemBackend {
 
         // Stop channel for the loop thread (the receiver is attached to the loop).
         let (stop_tx, stop_rx) = pw::channel::channel::<Terminate>();
-        // Channel to synchronously return setup status to start(): Ok(()) if init→mainloop→context→
-        // connect→stream→connect succeeds, or Err(typed error) on failure.
+        // Channel to synchronously return setup status to start(): Ok(()) if init->mainloop->context->
+        // connect->stream->connect succeeds, or Err(typed error) on failure.
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
 
         let running = self.running.clone();
@@ -414,14 +414,14 @@ impl Drop for PwSystemBackend {
 /// Device testing showed that WirePlumber ignored node selection through `stream.connect`'s
 /// target/`target.object`, connecting capture to the default source (the microphone). Instead,
 /// explicitly link the capture stream's input ports to the target process's output node ports
-/// with link-factory (the API equivalent of `pw-link out_FL→in_FL / out_FR→in_FR`). The app's
+/// with link-factory (the API equivalent of `pw-link out_FL->in_FL / out_FR->in_FR`). The app's
 /// original link to the default sink remains (fan-out), so audio still plays through the speakers.
 ///
 /// Resolve PID-to-node mapping in two steps. PipeWire stores the PID on a Client object, not a
 /// node, and `pipewire.sec.pid` (`*pw::keys::SEC_PID`) is always present in the Client's registry
 /// global props (the daemon sets it from socket credentials, so it cannot be spoofed; verified
 /// on a stock device setup). A node only points to its owning Client via `client.id`. Therefore,
-/// follow PID → global id of the Client whose `pipewire.sec.pid == target_pid` →
+/// follow PID -> global id of the Client whose `pipewire.sec.pid == target_pid` ->
 /// `Stream/Output/Audio` nodes whose `client.id` has that id (see `resolve_node_pid`).
 ///
 /// Connect the capture stream with `stream.connect(Direction::Input, None, ...)`, but omit
@@ -702,7 +702,7 @@ fn run_pw_process_loop(
     // Run until Terminate or process exit. Wait here while the target PID is absent; the registry
     // callback creates the link when it appears.
     main_loop.run();
-    // On exit, drop _attached then _keep (listener→stream→registry→core→main_loop), destroying
+    // On exit, drop _attached then _keep (listener->stream->registry->core->main_loop), destroying
     // the PipeWire resources on this thread.
 }
 
@@ -727,8 +727,8 @@ type BoundNode = (
 /// - `links`: Map of [`pw::link::Link`] proxies created by link-factory, grouped by the registry
 ///   global id of each linked output node. Keep them alive on the loop thread because dropping
 ///   them breaks the links. Registry callbacks insert/remove/clear entries, so share the map via
-///   `Rc<RefCell<…>>`. Either mode may have many entries (dropping an entry disconnects its links).
-/// - `_bound_nodes`: bound Node proxies + their info listeners, keyed by registry global id — dropping an entry unregisters that node's info listener.
+///   `Rc<RefCell<...>>`. Either mode may have many entries (dropping an entry disconnects its links).
+/// - `_bound_nodes`: bound Node proxies + their info listeners, keyed by registry global id -- dropping an entry unregisters that node's info listener.
 #[allow(clippy::type_complexity)]
 struct ProcessKeep {
     _stream: pw::stream::StreamRc,
@@ -849,7 +849,7 @@ struct PortEntry {
 /// `(in_port_id, channel)` into `(out_port_id, in_port_id)` pairs.
 ///
 /// Matching rules:
-/// 1. Prefer matching channel names (FL→FL / FR→FR / MONO→MONO, etc.).
+/// 1. Prefer matching channel names (FL->FL / FR->FR / MONO->MONO, etc.).
 /// 2. Duplicate mono output: if there is one output port (typically MONO) and multiple input
 ///    ports, link that output to every input (mono to both FL/FR).
 /// 3. Order fallback: if channel names are unavailable or do not match, best-effort match the
@@ -1104,16 +1104,16 @@ impl PidSelect {
 /// - Subscribe to registry `global` events continuously and track Clients / Nodes / Ports. The
 ///   Client's `pipewire.sec.pid` (`*pw::keys::SEC_PID`) is always present (set by the daemon from
 ///   socket credentials, so it cannot be spoofed; verified on a stock device setup). A node only
-///   points to its Client via `client.id`, so PID lookup takes two steps (node → client.id →
+///   points to its Client via `client.id`, so PID lookup takes two steps (node -> client.id ->
 ///   Client PID; see [`resolve_node_pid`]). Reevaluate on each global event, regardless of
 ///   whether Client or Node arrives first.
-///   application.process.id takes precedence — see pid_from_props.
+///   application.process.id takes precedence -- see pid_from_props.
 /// - The [`PidSelect`] predicate chooses nodes to link. Include selects every Stream/Output/Audio
 ///   node owned by the target PID; Exclude selects every such node with a resolved PID outside
 ///   the excluded set (unresolved PIDs wait for their Client). Once a target's output ports and
 ///   our input ports are available, the loop-thread registry callback creates channel-matched
 ///   links with `core.create_object::<pw::link::Link>("link-factory", ...)` (see [`pair_ports`]:
-///   FL→FL/FR→FR, with mono duplication). Keep links in `linked` (node_id → Links), grouped by node.
+///   FL->FL/FR->FR, with mono duplication). Keep links in `linked` (node_id -> Links), grouped by node.
 /// - On `global_remove`, drop only the affected entry if a linked node or its output port
 ///   disappears (preserve other Exclude links). If our node, an input port, or the target Client
 ///   disappears, drop all entries and wait again. All paths support idempotent relinking.
@@ -1212,7 +1212,7 @@ fn setup_pw_process(
     // State tables. Registry callbacks run only on the loop thread, so Cell/RefCell provide
     // interior mutability; no Mutex is needed.
 
-    // Watched nodes: registry node global id → registration data (owning client.id / direct PID).
+    // Watched nodes: registry node global id -> registration data (owning client.id / direct PID).
     let nodes: Rc<RefCell<HashMap<u32, NodeEntry>>> = Rc::new(RefCell::new(HashMap::new()));
     // Client global id -> PID and protocol provenance, even when PID is unknown.
     let client_pid: Rc<RefCell<HashMap<u32, ClientEntry>>> = Rc::new(RefCell::new(HashMap::new()));
@@ -1222,9 +1222,9 @@ fn setup_pw_process(
     // be about several pids at once.
     let target_client_ids: Rc<RefCell<std::collections::HashSet<u32>>> =
         Rc::new(RefCell::new(std::collections::HashSet::new()));
-    // Ports: registry port global id → registration data (owning node.id / direction / channel).
+    // Ports: registry port global id -> registration data (owning node.id / direction / channel).
     let ports: Rc<RefCell<HashMap<u32, PortEntry>>> = Rc::new(RefCell::new(HashMap::new()));
-    // Currently linked output nodes: registry global id → Link proxies created for that node.
+    // Currently linked output nodes: registry global id -> Link proxies created for that node.
     // Keep them for the entire run because dropping them disconnects the links. Either mode may
     // have many entries (a process can own several output streams). Remove an entry to disconnect
     // one node or clear the map to disconnect all.
@@ -1345,10 +1345,10 @@ fn setup_pw_process(
                     continue;
                 }
 
-                // Pair ports by channel (FL→FL/FR→FR; duplicate mono; fall back to order if unavailable).
+                // Pair ports by channel (FL->FL/FR->FR; duplicate mono; fall back to order if unavailable).
                 let pairs = pair_ports(&out_ports, &in_ports);
                 // The node's own declared output-port count, if its bound info has
-                // arrived. Borrow of `nodes` ends with this block — nothing below is
+                // arrived. Borrow of `nodes` ends with this block -- nothing below is
                 // allowed to hold it across `create_object`.
                 let expected_out: Option<u32> = nodes
                     .borrow()
@@ -1446,7 +1446,7 @@ fn setup_pw_process(
     }
 
     // registry global / global_remove listeners.
-    // global registers Client→client_pid, Stream/Output/Audio node→nodes, and Port→ports entries,
+    // global registers Client->client_pid, Stream/Output/Audio node->nodes, and Port->ports entries,
     // then reevaluates links with try_link each time.
     // `PidSelect` is no longer `Copy` (Exclude owns a HashSet), so every closure
     // that used to capture it by copy gets its own clone.
@@ -1759,7 +1759,7 @@ fn setup_pw_process(
                 //   (Japanese above: the Exclude case used to be cleared here too, on the
                 //   grounds that clear-all then relink also ends up correct.) That applies
                 //   to Include only. In Exclude mode a tracked client id is an EXCLUDED
-                //   client, whose nodes are never in `linked` — so clearing every link on
+                //   client, whose nodes are never in `linked` -- so clearing every link on
                 //   its departure drops audio we were legitimately recording and costs an
                 //   audible gap while the links are rebuilt, which an Electron host pays
                 //   every time one of its libpulse helper clients closes. Nothing needs
@@ -2210,7 +2210,7 @@ fn run_pw_loop(
 
     // Run until Terminate, the negotiation deadline, or process exit.
     main_loop.run();
-    // On exit, drop _timer → _attached → _listener → _stream → main_loop in reverse declaration
+    // On exit, drop _timer -> _attached -> _listener -> _stream -> main_loop in reverse declaration
     // order, destroying the PipeWire resources on this thread.
 }
 
@@ -2390,9 +2390,9 @@ fn enumeration_properties<'a>(
 /// Enumerate audio devices (microphones and system output sinks) through PipeWire.
 ///
 /// Wait for one round of registry global events:
-/// - `media.class == "Audio/Sink"` → system audio output (target for recording the default sink
+/// - `media.class == "Audio/Sink"` -> system audio output (target for recording the default sink
 ///   monitor); `is_loopback = true` / `source_kind = SystemLoopback`.
-/// - `media.class == "Audio/Source"` → recording devices such as microphones;
+/// - `media.class == "Audio/Source"` -> recording devices such as microphones;
 ///   `is_loopback = false` / `source_kind = Mic`.
 ///   These are PipeWire graph identities, not cpal device-name IDs. The flexaudio
 ///   facade omits these entries and obtains its openable microphone IDs from cpal.
@@ -2548,7 +2548,7 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
         })
         .register();
 
-    // Wait for enumeration using a two-stage sync→done barrier.
+    // Wait for enumeration using a two-stage sync->done barrier.
     //
     // The first done guarantees that the initial registry globals have arrived, but the initial
     // property dump from default metadata bound within those globals (default sink/source values)
@@ -2582,7 +2582,7 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
             let seq = seq.seq();
             match stage_for_cb.get() {
                 0 if seq == pending1_for_cb.get() => {
-                    // Stage 1 complete → issue a second sync to wait for metadata properties.
+                    // Stage 1 complete -> issue a second sync to wait for metadata properties.
                     stage_for_cb.set(1);
                     let Some(core) = core_weak.upgrade() else {
                         // Without the core the second sync cannot be issued, so
@@ -2611,7 +2611,7 @@ fn enumerate_pw() -> Result<Vec<flexaudio_core::NamespacedDevice>> {
                     }
                 }
                 1 if seq == pending1_for_cb.get() => {
-                    // Stage 2 complete → enumeration finished.
+                    // Stage 2 complete -> enumeration finished.
                     done_for_cb.set(true);
                     loop_for_cb.quit();
                 }
@@ -2836,7 +2836,7 @@ impl PwDeviceWatcher {
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         let stop_error = request_worker_stop(&mut self.stop_tx);
-        // Wait for run() to exit and the thread to finish. On exit, Registry→Core→Context→MainLoop
+        // Wait for run() to exit and the thread to finish. On exit, Registry->Core->Context->MainLoop
         // are dropped in order, all on the watcher thread.
         finish_watch_worker(
             &mut self.handle,
@@ -2921,7 +2921,7 @@ fn run_watch_loop(
     // Run until Terminate or process exit. Unlike enumerate_pw, done does not call quit, so this
     // loop continues indefinitely.
     main_loop.run();
-    // On exit, drop _attached → _listeners → _registry → _core → main_loop in reverse
+    // On exit, drop _attached -> _listeners -> _registry -> _core -> main_loop in reverse
     // declaration order, destroying the PipeWire resources on this thread.
 }
 
@@ -2961,7 +2961,7 @@ struct WatchListeners {
 
 /// PipeWire watcher setup. Returns `Err(String)` on failure (does not panic).
 ///
-/// Reuses [`enumerate_pw`]'s registry global extraction and two-stage sync→done barrier, but
+/// Reuses [`enumerate_pw`]'s registry global extraction and two-stage sync->done barrier, but
 /// `done` only sets the initial-scan-complete flag instead of calling `quit()`. It then continues
 /// receiving global/global_remove events indefinitely.
 #[allow(clippy::type_complexity)]
@@ -3143,7 +3143,7 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
         })
         .register();
 
-    // Detect initial scan completion with the same two-stage sync→done barrier as enumerate_pw.
+    // Detect initial scan completion with the same two-stage sync->done barrier as enumerate_pw.
     // Unlike enumerate_pw, done only sets initial_scan_done and does not call quit(). After the
     // second done, initial globals and default metadata's initial property dump are available, so
     // later global/global_remove/property changes can be published as user-driven device or
@@ -3178,7 +3178,7 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                     let seq = seq.seq();
                     match stage_for_cb.get() {
                         0 if seq == pending_for_cb.get() => {
-                            // Stage 1 complete → issue a second sync to wait for metadata properties.
+                            // Stage 1 complete -> issue a second sync to wait for metadata properties.
                             stage_for_cb.set(1);
                             if let Some(core) = core_weak.upgrade() {
                                 match core.sync(0) {
@@ -3194,7 +3194,7 @@ fn setup_watch(events: WatchEventQueue) -> std::result::Result<WatchKeep, String
                             }
                         }
                         1 if seq == pending_for_cb.get() => {
-                            // Stage 2 complete → initial scan finished. quit() is called here only to
+                            // Stage 2 complete -> initial scan finished. quit() is called here only to
                             // exit the initial-scan run() (the while loop below). run_watch_loop handles
                             // persistent watching. stage is now 2, so later done events match no arm and
                             // never call quit() again.
@@ -3508,7 +3508,7 @@ mod tests {
     }
 
     /// Discovery returns a complete inventory or Backend failure. If devices are
-    /// returned, verify Sink→SystemLoopback / Source→Mic consistency and nonempty ids (=node.name).
+    /// returned, verify Sink->SystemLoopback / Source->Mic consistency and nonempty ids (=node.name).
     #[test]
     fn list_devices_is_complete_or_backend_error() {
         let devices = match list_devices() {
@@ -3743,7 +3743,7 @@ mod tests {
         assert_eq!(pid_from_props(None, Some("13394")), Some(13394));
         // node props carry no sec.pid at all.
         assert_eq!(pid_from_props(Some("42"), None), Some(42));
-        // garbage / zero app pid falls back to sec.pid; nothing usable → None.
+        // garbage / zero app pid falls back to sec.pid; nothing usable -> None.
         assert_eq!(pid_from_props(Some("nope"), Some("7")), Some(7));
         assert_eq!(pid_from_props(Some("0"), Some("7")), Some(7));
         assert_eq!(pid_from_props(None, None), None);
@@ -4129,7 +4129,7 @@ mod tests {
         assert!(!exclude.selects_node(&entry, &clients));
     }
 
-    /// `PidSelect::Exclude` holds a SET of pids (`exclude_self` ∪ `exclude_pids`),
+    /// `PidSelect::Exclude` holds a SET of pids (`exclude_self` union `exclude_pids`),
     /// and the predicate trio (`is_subject_pid` / `selects` / `node_key`) is
     /// PipeWire-independent.
     #[test]
@@ -4148,7 +4148,7 @@ mod tests {
     }
 
     /// `effective_exclusion` is table-driven and independent of the running
-    /// process: `exclude_pids` ∪ `{self_pid}` when `exclude_self`, deduped.
+    /// process: `exclude_pids` union `{self_pid}` when `exclude_self`, deduped.
     #[test]
     fn effective_exclusion_unions_and_dedups() {
         use std::collections::HashSet;
@@ -4158,25 +4158,25 @@ mod tests {
                 false,
                 &[],
                 HashSet::new(),
-                "neither flag nor pids → sink-monitor path",
+                "neither flag nor pids \u{2192} sink-monitor path",
             ),
             (
                 true,
                 &[],
                 HashSet::from([self_pid]),
-                "exclude_self alone → just self",
+                "exclude_self alone \u{2192} just self",
             ),
             (
                 false,
                 &[5, 6],
                 HashSet::from([5, 6]),
-                "pids alone → fan-in without self",
+                "pids alone \u{2192} fan-in without self",
             ),
             (
                 true,
                 &[5, 4242],
                 HashSet::from([5, self_pid]),
-                "self pid already listed → union, no duplicate",
+                "self pid already listed \u{2192} union, no duplicate",
             ),
         ];
         for (excl_self, pids, want, msg) in cases {
@@ -4199,13 +4199,17 @@ mod tests {
     /// Verify `pair_ports` channel matching (independent of PipeWire).
     #[test]
     fn pair_ports_maps_channels() {
-        // Stereo to stereo: FL→FL / FR→FR (matching channel names).
+        // Stereo to stereo: FL->FL / FR->FR (matching channel names).
         // Output ports: id 10=FL, 11=FR. Input ports: id 20=FL, 21=FR.
         let out = vec![(10u32, "FL".to_string()), (11u32, "FR".to_string())];
         let inp = vec![(20u32, "FL".to_string()), (21u32, "FR".to_string())];
         let mut pairs = pair_ports(&out, &inp);
         pairs.sort();
-        assert_eq!(pairs, vec![(10, 20), (11, 21)], "FL→FL / FR→FR");
+        assert_eq!(
+            pairs,
+            vec![(10, 20), (11, 21)],
+            "FL\u{2192}FL / FR\u{2192}FR"
+        );
 
         // Channel names produce the correct pairs even if input order is reversed.
         let inp_rev = vec![(21u32, "FR".to_string()), (20u32, "FL".to_string())];
@@ -4214,7 +4218,7 @@ mod tests {
         assert_eq!(
             pairs,
             vec![(10, 20), (11, 21)],
-            "FL→FL / FR→FR even with reversed order"
+            "FL\u{2192}FL / FR\u{2192}FR even with reversed order"
         );
 
         // Mono output to stereo input: duplicate the single output to both FL/FR.
@@ -4228,7 +4232,7 @@ mod tests {
             "mono is duplicated to FL/FR"
         );
 
-        // Missing (empty) channel names → order fallback.
+        // Missing (empty) channel names -> order fallback.
         let out_noch = vec![(50u32, String::new()), (51u32, String::new())];
         let in_noch = vec![(60u32, String::new()), (61u32, String::new())];
         let pairs = pair_ports(&out_noch, &in_noch);
@@ -4242,7 +4246,7 @@ mod tests {
         assert!(pair_ports(&out, &[]).is_empty());
 
         // If only one side has a matching channel, use order fallback instead of mono duplication.
-        // Output has FL only, input has FR only (name mismatch) → one pair by order fallback.
+        // Output has FL only, input has FR only (name mismatch) -> one pair by order fallback.
         let out_fl = vec![(70u32, "FL".to_string())];
         let in_fr = vec![(80u32, "FR".to_string())];
         // With one output port, mono duplication applies to the remaining inputs.
@@ -4294,7 +4298,7 @@ mod tests {
                 2,
                 2,
                 false,
-                "target output FR missing — pair_ports' mono rule duplicated FL onto both \
+                "target output FR missing \u{2014} pair_ports' mono rule duplicated FL onto both \
                  inputs, which must not latch",
             ),
             case(
@@ -4333,7 +4337,7 @@ mod tests {
                 2,
                 false,
                 "a declared count of 0 alongside a visible port means the node has not \
-                 finished describing itself — not known yet, so incomplete",
+                 finished describing itself \u{2014} not known yet, so incomplete",
             ),
         ];
         for c in cases {
@@ -4387,7 +4391,7 @@ mod tests {
     /// How to run (on a laptop or similar with PipeWire and audio playing from the target PID):
     /// ```text
     /// # Example: play speaker-test and get its PID
-    /// speaker-test -t sine -f 1000 -c 2 &  # → note the PID
+    /// speaker-test -t sine -f 1000 -c 2 &  # -> note the PID
     /// FLEXAUDIO_TEST_PID=<PID> \
     ///   cargo test -p flexaudio-os-linux -- --ignored process_capture_smoke
     /// ```

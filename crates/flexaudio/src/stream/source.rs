@@ -88,15 +88,15 @@ impl Stream {
     /// Steps (increment generation once at the end; all atomics use SeqCst):
     /// - If not started, return [`Error::InvalidState`].
     /// - Set `switching = true` (prevent concurrent watchdog reopen).
-    /// - Under the backend lock, stop the old backend → read the new backend's native format and
-    ///   update `shared.native_format` → create a new RawRing → call `new_backend.start(sink)`.
+    /// - Under the backend lock, stop the old backend -> read the new backend's native format and
+    ///   update `shared.native_format` -> create a new RawRing -> call `new_backend.start(sink)`.
     ///   - On success, replace the backend and install the new consumer (drop the old one).
     ///   - On failure, restart the old backend with [`open_backend_once`](Self::open_backend_once) and
     ///     continue the old source (preserve continuity). Set `discontinuity_pending`, increment
     ///     generation, set `switching=false`, and return `Err`.
     /// - On success, set `discontinuity_pending = true` (intentional switch, so do not set RECOVERED)
-    ///   → increment generation once at the end → set `last_sample_ns = now` → set `switching = false`
-    ///   → return `Ok`.
+    ///   -> increment generation once at the end -> set `last_sample_ns = now` -> set `switching = false`
+    ///   -> return `Ok`.
     ///
     /// Takes [`Box<dyn CaptureBackend>`] directly so mock backends can verify switch behavior. The
     /// high-level entry point is [`switch_source`](Self::switch_source).
@@ -168,7 +168,7 @@ impl Stream {
             let diagnostics = sink.diagnostics();
 
             // Start the new backend. catch_unwind converts a panic to Error::Backend, so it follows
-            // the Err branch below (restore old source → return Err). Restore the old source on failure.
+            // the Err branch below (restore old source -> return Err). Restore the old source on failure.
             let mut new_backend = new_backend;
             match start_backend_catching(&mut new_backend, sink) {
                 Ok(()) => {
@@ -221,7 +221,7 @@ impl Stream {
                         self.shared.switching.store(false, Ordering::SeqCst);
                         return Err(with_cleanup(e, replacement_cleanup));
                     }
-                    // New source startup failed → restart the old backend (still `*be`) and continue.
+                    // New source startup failed -> restart the old backend (still `*be`) and continue.
                     // Release the backend lock before restoring it, or open_backend_once will lock it
                     // again and deadlock.
                     drop(be);
@@ -268,11 +268,11 @@ impl Stream {
     /// to replace them together with the source.
     ///
     /// # Errors
-    /// - Not started → [`Error::InvalidState`].
-    /// - Request to change `output` → [`Error::InvalidArg`].
-    /// - New backend construction fails (missing process PID, unsupported OS, etc.) → error from
+    /// - Not started -> [`Error::InvalidState`].
+    /// - Request to change `output` -> [`Error::InvalidArg`].
+    /// - New backend construction fails (missing process PID, unsupported OS, etc.) -> error from
     ///   `build_backend` (private to the facade); the old source remains untouched.
-    /// - New backend start fails → [`switch_backend`](Self::switch_backend) restores the old source
+    /// - New backend start fails -> [`switch_backend`](Self::switch_backend) restores the old source
     ///   and returns the error.
     pub fn switch_source(&mut self, new_config: StreamConfig) -> Result<()> {
         let result = self.switch_source_inner(new_config, None, None);

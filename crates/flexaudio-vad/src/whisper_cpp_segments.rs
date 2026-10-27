@@ -1,4 +1,4 @@
-//! Incremental port of whisper_vad_segments_from_probs, whisper.cpp lines 5211–5444,
+//! Incremental port of whisper_vad_segments_from_probs, whisper.cpp lines 5211-5444,
 //! pin 85a69493a601d4ff5a834064f7b7bac250bd8739. The full MIT notice is below.
 //! The 98 ms split candidate follows the Silero lineage cited in the pinned source.
 //!

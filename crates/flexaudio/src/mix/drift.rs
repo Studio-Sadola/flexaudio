@@ -18,7 +18,7 @@ impl LinearStitcher {
 
     /// Number of output frames that can be interpolated at `ratio` when the FIFO has
     /// `fifo_frames` frames. The zero-based k-th output uses the two frames around
-    /// position `frac + k×ratio`, so output is possible only while that position does
+    /// position `frac + k*ratio`, so output is possible only while that position does
     /// not exceed the final frame F-1 (the exact final frame is valid because the right-hand
     /// interpolation term has zero weight).
     pub(super) fn producible(&self, fifo_frames: usize, ratio: f64) -> usize {
@@ -83,7 +83,7 @@ impl LinearStitcher {
 /// integrates the rate difference, so proportional correction balances it at a finite
 /// level.
 pub(super) struct DriftController {
-    /// Current read ratio r, clamped around 1.0 by ±[`DRIFT_RATIO_LIMIT`].
+    /// Current read ratio r, clamped around 1.0 by +/-[`DRIFT_RATIO_LIMIT`].
     pub(super) ratio: f64,
     /// Exponential moving average of the level difference (mic_len - system_len), in
     /// f32 samples.

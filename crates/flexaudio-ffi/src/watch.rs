@@ -270,7 +270,7 @@ mod tests {
         assert!(message.contains("join"), "{message}");
     }
 
-    /// One watch → poll → free cycle, or a typed startup failure without a panic.
+    /// One watch -> poll -> free cycle, or a typed startup failure without a panic.
     #[test]
     fn watch_poll_free_smoke() {
         if std::env::var("FLEXAUDIO_RUN_NATIVE_TESTS").as_deref() != Ok("1") {

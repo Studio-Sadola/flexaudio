@@ -5,13 +5,13 @@ Process Taps via [objc2-core-audio](https://crates.io/crates/objc2-core-audio).
 
 Provides two `CaptureBackend` implementations:
 
-- **`MacSystemBackend`** — records the full system audio output mix via a Core
+- **`MacSystemBackend`** -- records the full system audio output mix via a Core
   Audio process tap with an empty exclusion set by default (captures everything
   playing on the system). `exclude_self` opts into excluding the calling process.
   The macOS equivalent of WASAPI loopback on Windows.
-- **`MacProcessBackend`** — records audio from a specific process (INCLUDE tap),
-  or everything except that process (EXCLUDE tap), using `CATapDescription` →
-  process tap → private aggregate device → `IOProc` callback.
+- **`MacProcessBackend`** -- records audio from a specific process (INCLUDE tap),
+  or everything except that process (EXCLUDE tap), using `CATapDescription` ->
+  process tap -> private aggregate device -> `IOProc` callback.
 
 Because the ObjC objects involved (`Retained<CATapDescription>`, `RcBlock`,
 `TapChain`) are `!Send`, the entire tap chain is created and torn down on a
@@ -55,4 +55,4 @@ backend notifications when using a backend directly.
 
 ## License
 
-[MIT](LICENSE) © 2026 tubome / Studio Sadola.
+[MIT](LICENSE) (c) 2026 tubome / Studio Sadola.

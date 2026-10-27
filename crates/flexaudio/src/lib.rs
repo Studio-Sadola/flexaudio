@@ -1,10 +1,10 @@
-//! flexaudio — a general-purpose cross-platform audio capture library (mic / system loopback /
+//! flexaudio -- a general-purpose cross-platform audio capture library (mic / system loopback /
 //! per-process on Linux, Windows, and macOS).
 //!
 //! Facade that combines the core, OS backends, and mic through cfg.
 //!
-//! [`Stream`] drives the capture pipeline for one source (backend → RawRing → processing
-//! thread → Normalizer → ChunkRing → poll, with watchdog recovery).
+//! [`Stream`] drives the capture pipeline for one source (backend -> RawRing -> processing
+//! thread -> Normalizer -> ChunkRing -> poll, with watchdog recovery).
 
 #![warn(missing_docs)]
 #![deny(clippy::let_underscore_must_use)]
@@ -159,19 +159,19 @@ pub fn watch_devices() -> Result<DeviceWatcher> {
 /// then periodically calls [`Stream::poll_chunk`] / [`Stream::poll_event`].
 ///
 /// # Source-to-backend mapping
-/// - [`SourceKind::Mic`] → [`flexaudio_mic::CpalMicBackend`] (cpal, all OSes).
-/// - [`SourceKind::SystemLoopback`] → Linux / Windows / macOS
+/// - [`SourceKind::Mic`] -> [`flexaudio_mic::CpalMicBackend`] (cpal, all OSes).
+/// - [`SourceKind::SystemLoopback`] -> Linux / Windows / macOS
 ///   (Linux: [`flexaudio_os_linux::PwSystemBackend`] = output monitor / PipeWire.
 ///   Windows: `flexaudio_os_windows::WasapiSystemBackend` = WASAPI loopback on the render
 ///   endpoint). Pass through `config.exclude_self` (exclude this process) and
 ///   `config.device_id` (select the output endpoint; `None` uses the default output).
 ///   Other OSes return [`Error::Unsupported`].
-/// - [`SourceKind::ProcessLoopback`] → Linux / Windows / macOS
+/// - [`SourceKind::ProcessLoopback`] -> Linux / Windows / macOS
 ///   (Linux: [`flexaudio_os_linux::PwProcessBackend`]; Windows:
 ///   `flexaudio_os_windows::WasapiProcessBackend`). `config.target_pid` is required; if it is
 ///   missing, [`Error::InvalidArg`] is returned. Pass through `config.mode`. Other OSes return
 ///   [`Error::Unsupported`].
-/// - [`SourceKind::Mix`] → Composite backend containing a mic child (cpal) and system child
+/// - [`SourceKind::Mix`] -> Composite backend containing a mic child (cpal) and system child
 ///   (OS-specific loopback). Each child is normalized to 48 kHz stereo, scaled by its own gain
 ///   (`config.mix_mic_gain` / `config.mix_system_gain`), and mixed into one stream. Select
 ///   devices with `config.mix_mic_device_id` / `config.mix_system_device_id` (`None` uses the
@@ -183,12 +183,12 @@ pub fn watch_devices() -> Result<DeviceWatcher> {
 /// one-to-one to the OS's single-PID exclusion primitive.
 ///
 /// # Errors
-/// - Unsupported output format → [`Error::UnsupportedFormat`] (rejected early).
-/// - Missing `target_pid` for ProcessLoopback → [`Error::InvalidArg`] (required even for
+/// - Unsupported output format -> [`Error::UnsupportedFormat`] (rejected early).
+/// - Missing `target_pid` for ProcessLoopback -> [`Error::InvalidArg`] (required even for
 ///   [`ProcessMode::Exclude`]).
-/// - Non-finite or negative `mix_mic_gain` / `mix_system_gain` for Mix → [`Error::InvalidArg`].
+/// - Non-finite or negative `mix_mic_gain` / `mix_system_gain` for Mix -> [`Error::InvalidArg`].
 /// - Source unsupported on this OS (system/process/mix on OSes other than Linux/Windows/macOS)
-///   → [`Error::Unsupported`].
+///   -> [`Error::Unsupported`].
 /// - Other errors come from [`Stream::open`] (such as `ring_capacity_chunks == 0`).
 ///
 /// # Exclusion (Exclude / exclude_self)
@@ -284,20 +284,20 @@ pub(crate) fn validate_exclude_pids(config: &StreamConfig) -> Result<()> {
 /// build the replacement backend.
 ///
 /// The mappings and errors are the same as documented for [`open`]:
-/// - [`SourceKind::Mic`] → [`flexaudio_mic::CpalMicBackend`] (all OSes). Pass `config.device_id`
+/// - [`SourceKind::Mic`] -> [`flexaudio_mic::CpalMicBackend`] (all OSes). Pass `config.device_id`
 ///   to select an input device (`None` uses the default). The ID is the stable device-name key
 ///   returned by [`devices`]; a mismatch returns [`Error::DeviceNotFound`] at `start`.
 ///   `config.device_id` applies to mic input and system output selection (`None` uses the
 ///   default); process capture does not use it (the target is selected by target_pid).
-/// - [`SourceKind::SystemLoopback`] → supported on Linux/Windows/macOS
+/// - [`SourceKind::SystemLoopback`] -> supported on Linux/Windows/macOS
 ///   (Linux=[`flexaudio_os_linux::PwSystemBackend`] / Windows=WASAPI loopback /
 ///   macOS=CoreAudio Process Tap). Select an output endpoint with `config.device_id`
 ///   (`None` uses the default output). Other OSes return [`Error::Unsupported`].
-/// - [`SourceKind::ProcessLoopback`] → supported on Linux/Windows/macOS
+/// - [`SourceKind::ProcessLoopback`] -> supported on Linux/Windows/macOS
 ///   (Linux=[`flexaudio_os_linux::PwProcessBackend`] / Windows=WASAPI process loopback /
 ///   macOS=CoreAudio Process Tap). `target_pid` is required; if missing, return
 ///   [`Error::InvalidArg`]. Other OSes return [`Error::Unsupported`].
-/// - [`SourceKind::Mix`] → `mix::CompositeBackend` with a mic child
+/// - [`SourceKind::Mix`] -> `mix::CompositeBackend` with a mic child
 ///   ([`flexaudio_mic::CpalMicBackend`], `config.mix_mic_device_id`) and a system child
 ///   ([`build_system_backend`], `config.exclude_self` + `config.mix_system_device_id`).
 ///   `mix_mic_gain` / `mix_system_gain` must be finite and nonnegative or return

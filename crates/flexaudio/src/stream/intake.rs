@@ -2,8 +2,8 @@
 use super::*;
 /// Intake/processing thread body.
 ///
-/// Pop from RawConsumer → feed [`Normalizer`] (shared Stage1 → split to primary/secondary Stage2)
-/// → add `seq`, recording-zero-based PTS, peak/rms, and discontinuity flags to completed chunks →
+/// Pop from RawConsumer -> feed [`Normalizer`] (shared Stage1 -> split to primary/secondary Stage2)
+/// -> add `seq`, recording-zero-based PTS, peak/rms, and discontinuity flags to completed chunks ->
 /// push to the primary/secondary rings. On a generation change (reopen/source switch), rebuild the
 /// Normalizer/Clock and set RECOVERED|DISCONTINUITY on the next chunk. Detect RawRing overflow
 /// (capture-side data loss) too, and set DISCONTINUITY on the next primary and secondary chunks.

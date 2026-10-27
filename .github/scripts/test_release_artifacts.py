@@ -207,7 +207,7 @@ class ResolverTests(unittest.TestCase):
                         resolver.main()
                         self.assertIn("run_id=10", output.read_text())
                     else:
-                        with self.assertRaisesRegex(ValueError, "original tag-push run was re-run; resealing is forbidden — cut a new patch version"):
+                        with self.assertRaisesRegex(ValueError, "original tag-push run was re-run; resealing is forbidden \u2014 cut a new patch version"):
                             resolver.main()
                         self.assertFalse(output.exists(), "Rejected runs must not emit release outputs")
                     get.assert_called_once_with("/actions/runs/10")

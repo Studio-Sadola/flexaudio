@@ -18,7 +18,7 @@ documentation = "https://docs.rs/flexaudio-encode"
 # Disable them to avoid pulling in crossbeam-channel / serde / log.
 flacenc = { version = "0.5", default-features = false }
 thiserror = { workspace = true }
-# Canonical f32→s16 quantization: use core's quantize_i16 so all layers share one implementation.
+# Canonical f32->s16 quantization: use core's quantize_i16 so all layers share one implementation.
 flexaudio-core = { path = "../flexaudio-core", version = "0.9.0" }
 
 [target.'cfg(unix)'.dependencies]

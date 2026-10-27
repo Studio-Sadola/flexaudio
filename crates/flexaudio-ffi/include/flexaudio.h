@@ -1,5 +1,5 @@
 /*
- * flexaudio C API — pull-based audio capture bindings.
+ * flexaudio C API -- pull-based audio capture bindings.
  *
  * This header is generated from crates/flexaudio-ffi by cbindgen. Do not edit by hand;
  * regenerate it after changing the Rust ABI.
@@ -953,7 +953,7 @@ bool flexaudio_is_paused(const struct FlexStream *s);
 
 // Change the input gain (linear multiplier): 1.0 leaves it unchanged, 2.0 is about +6 dB,
 // and 0.0 is silent. Can be called during recording; it takes effect on the next chunk (20 ms
-// granularity). Samples are clamped to ±1.0 after multiplication. Must be finite and at least
+// granularity). Samples are clamped to +/-1.0 after multiplication. Must be finite and at least
 // 0, or FLEX_INVALID_ARG is returned.
 //
 // # Safety
@@ -1223,7 +1223,7 @@ int32_t flexaudio_capabilities_side_effect_source_v1(const struct FlexCapabiliti
 // handle with `flexaudio_denoise_free`. See the module docs for the 48 kHz requirement.
 struct FlexDenoiser *flexaudio_denoise_new(uint16_t channels);
 
-// Suppresses noise in interleaved f32 samples (48 kHz, normalized to ±1.0) **in place**.
+// Suppresses noise in interleaved f32 samples (48 kHz, normalized to +/-1.0) **in place**.
 //
 // `len` must be a multiple of the channel count (otherwise InvalidArg). `len=0` is a
 // no-op. Output is delayed by 480 samples per channel, so the beginning is silent.
@@ -1278,7 +1278,7 @@ struct FlexFlac *flexaudio_flac_create(const char *path,
                                        uint16_t ch,
                                        uint32_t split_seconds);
 
-// Append interleaved f32 (length = frame count × channel count).
+// Append interleaved f32 (length = frame count * channel count).
 //
 // `len` must be a multiple of the channel count (otherwise InvalidArg). `len=0` is a no-op.
 // Writing to a finalized handle returns `FLEX_INVALID_STATE`.
@@ -1731,7 +1731,7 @@ struct FlexVadOptions flexaudio_vad_default_options(void);
 struct FlexVad *flexaudio_vad_new(const struct FlexVadOptions *params,
                                   const struct FlexVadRuntimeOptions *options);
 
-// Feed normalized interleaved PCM at 8000–192000 Hz and a positive channel count.
+// Feed normalized interleaved PCM at 8000-192000 Hz and a positive channel count.
 // Input is converted to mono16k internally; event times use the input timeline,
 // compensated for converter group delay. After raw input validation, finite resampler
 // overshoot is clipped internally to [-1, 1]. Use 16000/1 for direct mono16k input.

@@ -73,7 +73,7 @@ fn stereo_44100_to_48000_yields_about_50_chunks_per_second() {
 
 // --- Stage 2 (output) tests ---
 
-/// 48k/stereo input + {16000, 1} output → 320-frame mono chunks.
+/// 48k/stereo input + {16000, 1} output -> 320-frame mono chunks.
 #[test]
 fn output_16k_mono_yields_320_frame_mono_chunks() {
     let out = OutputFormat {
@@ -112,7 +112,7 @@ fn output_16k_mono_yields_320_frame_mono_chunks() {
     );
 }
 
-/// Output {16000, 2} → 320 frames / 640 samples (stereo).
+/// Output {16000, 2} -> 320 frames / 640 samples (stereo).
 #[test]
 fn output_16k_stereo_yields_320_frame_640_sample_chunks() {
     let out = OutputFormat {
@@ -138,7 +138,7 @@ fn output_16k_stereo_yields_320_frame_640_sample_chunks() {
     );
 }
 
-/// Output {8000, 2} → 160 frames / 320 samples.
+/// Output {8000, 2} -> 160 frames / 320 samples.
 #[test]
 fn output_8k_stereo_yields_160_frame_chunks() {
     let out = OutputFormat {
@@ -163,7 +163,7 @@ fn output_8k_stereo_yields_160_frame_chunks() {
     );
 }
 
-/// stereo→mono averages L/R (opposite phase, L=+a and R=-a, approaches 0).
+/// stereo->mono averages L/R (opposite phase, L=+a and R=-a, approaches 0).
 #[test]
 fn stereo_to_mono_is_lr_average() {
     // Use 48000/mono output to test sample-rate passthrough and channel conversion only.
@@ -172,7 +172,7 @@ fn stereo_to_mono_is_lr_average() {
         channels: 1,
     };
     let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
-    // Perfectly opposite phase (L=+0.5, R=-0.5) → average 0.
+    // Perfectly opposite phase (L=+0.5, R=-0.5) -> average 0.
     let mut stereo = Vec::with_capacity(CHUNK_FRAMES * 2);
     for _ in 0..CHUNK_FRAMES {
         stereo.push(0.5);
@@ -215,7 +215,7 @@ fn resample_44100_to_48000_preserves_amplitude_and_frequency() {
     let mut left: Vec<f32> = Vec::new();
     while let Some((c, _)) = n.pop_chunk() {
         assert_eq!(c.len(), CHUNK_FRAMES * 2);
-        // Keep only the L channel (mono→stereo duplication means L==R).
+        // Keep only the L channel (mono->stereo duplication means L==R).
         for f in 0..CHUNK_FRAMES {
             assert_eq!(c[f * 2], c[f * 2 + 1], "L==R for mono input");
             left.push(c[f * 2]);
@@ -231,7 +231,7 @@ fn resample_44100_to_48000_preserves_amplitude_and_frequency() {
     let start = 12_000;
     let mid = &left[start..start + 48_000];
 
-    // Amplitude: sine-wave RMS is amp/√2 ≈ 0.3536. Allow ±5% through the resampler.
+    // Amplitude: sine-wave RMS is amp/sqrt(2) approx. 0.3536. Allow +/-5% through the resampler.
     let got_rms = rms(mid);
     let expect_rms = amp / std::f32::consts::SQRT_2;
     let rms_err = ((got_rms - expect_rms) / expect_rms).abs();
@@ -240,7 +240,7 @@ fn resample_44100_to_48000_preserves_amplitude_and_frequency() {
         "RMS preservation error too large: got={got_rms} expect={expect_rms} err={rms_err}"
     );
 
-    // Frequency: expect ≈ 2*440 = 880 crossings in the middle second (48000 samples), within ±2%.
+    // Frequency: expect approx. 2*440 = 880 crossings in the middle second (48000 samples), within +/-2%.
     let crossings = zero_crossings(mid);
     let est_freq = crossings as f32 / 2.0; // One second, so crossings/2 = Hz.
     let freq_err = ((est_freq - freq) / freq).abs();
@@ -291,7 +291,7 @@ fn output_16k_mono_preserves_values() {
     let start = 4_000;
     let mid = &mono[start..start + 16_000];
 
-    // Averaging in-phase L==R leaves the level unchanged → RMS ≈ amp/√2.
+    // Averaging in-phase L==R leaves the level unchanged -> RMS approx. amp/sqrt(2).
     let got_rms = rms(mid);
     let expect_rms = amp / std::f32::consts::SQRT_2;
     let rms_err = ((got_rms - expect_rms) / expect_rms).abs();
@@ -300,7 +300,7 @@ fn output_16k_mono_preserves_values() {
         "16k/mono RMS preservation error: got={got_rms} expect={expect_rms} err={rms_err}"
     );
 
-    // Frequency: expect ≈ 880 crossings in the middle second (16000 samples), within ±2%.
+    // Frequency: expect approx. 880 crossings in the middle second (16000 samples), within +/-2%.
     let est_freq = zero_crossings(mid) as f32 / 2.0;
     let freq_err = ((est_freq - freq) / freq).abs();
     assert!(
@@ -316,7 +316,7 @@ fn push_empty_and_subframe_are_noops() {
     let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
     // Empty input.
     n.push(&[], 0).expect("empty push ok");
-    // Only one sample for stereo (2ch) → `in_frames=0`, so return early.
+    // Only one sample for stereo (2ch) -> `in_frames=0`, so return early.
     n.push(&[0.5], 0).expect("subframe push ok");
     assert!(
         n.pop_chunk().is_none(),

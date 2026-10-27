@@ -5,7 +5,7 @@
 //! is separate from stream-integrated denoising (`FlexConfig::denoise`).
 //!
 //! # 48 kHz requirement
-//! RNNoise expects 48 kHz interleaved f32 samples normalized to ±1.0. It processes
+//! RNNoise expects 48 kHz interleaved f32 samples normalized to +/-1.0. It processes
 //! fixed frames of 480 samples per channel. Other sample rates are accepted but will
 //! not produce the intended suppression, so callers must pass 48 kHz. Output is
 //! delayed by 480 samples per channel; the initial delay is silence.
@@ -46,7 +46,7 @@ pub extern "C" fn flexaudio_denoise_new(channels: u16) -> *mut FlexDenoiser {
     })
 }
 
-/// Suppresses noise in interleaved f32 samples (48 kHz, normalized to ±1.0) **in place**.
+/// Suppresses noise in interleaved f32 samples (48 kHz, normalized to +/-1.0) **in place**.
 ///
 /// `len` must be a multiple of the channel count (otherwise InvalidArg). `len=0` is a
 /// no-op. Output is delayed by 480 samples per channel, so the beginning is silent.
@@ -201,7 +201,7 @@ pub unsafe extern "C" fn flexaudio_denoise_free(d: *mut FlexDenoiser) {
 mod tests {
     use super::*;
 
-    /// Smoke test: new → process (silence) → reset → free completes without panicking.
+    /// Smoke test: new -> process (silence) -> reset -> free completes without panicking.
     #[test]
     fn denoise_new_process_free_smoke() {
         let d = unsafe { &mut *flexaudio_denoise_new(1) };

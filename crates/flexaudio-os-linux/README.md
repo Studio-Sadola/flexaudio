@@ -4,7 +4,7 @@ Linux audio capture backend for the `flexaudio` workspace, built on
 [PipeWire](https://pipewire.org/) (`pipewire` 0.10).
 
 Provides `PwSystemBackend`, which captures the default sink monitor (system output
-loopback — the audio mix flowing to the speakers) via a PipeWire
+loopback -- the audio mix flowing to the speakers) via a PipeWire
 `Stream/Input/Audio` stream with `stream.capture.sink=true`. This is the Linux
 equivalent of WASAPI loopback on Windows. Per-process capture is also routed
 through PipeWire.
@@ -24,4 +24,4 @@ targets (`#![cfg(target_os = "linux")]`).
 
 ## License
 
-[MIT](LICENSE) © 2026 tubome / Studio Sadola.
+[MIT](LICENSE) (c) 2026 tubome / Studio Sadola.

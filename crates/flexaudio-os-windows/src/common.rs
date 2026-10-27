@@ -39,11 +39,11 @@ use flexaudio_core::{ErrorContext, NativeStatus, Operation, ShutdownReport};
 /// Classify access-denied and device-unavailable HRESULTs as typed [`Error`] variants.
 ///
 /// Map common WASAPI/COM HRESULTs to cross-platform error types:
-/// - Access denied → [`Error::PermissionDenied`]: `E_ACCESSDENIED` for
+/// - Access denied -> [`Error::PermissionDenied`]: `E_ACCESSDENIED` for
 ///   system/process capture. Microphone consent is checked in `flexaudio-mic`.
-/// - Exclusive-use/policy conflicts → [`Error::Backend`]; these do not establish
+/// - Exclusive-use/policy conflicts -> [`Error::Backend`]; these do not establish
 ///   a recording-consent denial.
-/// - Device invalidation → [`Error::DeviceLost`]; missing endpoint → [`Error::DeviceNotFound`]:
+/// - Device invalidation -> [`Error::DeviceLost`]; missing endpoint -> [`Error::DeviceNotFound`]:
 ///   `AUDCLNT_E_DEVICE_INVALIDATED` (the endpoint/device disappeared or was
 ///   invalidated) and `E_NOTFOUND` (the item/endpoint does not exist).
 ///
@@ -51,11 +51,11 @@ use flexaudio_core::{ErrorContext, NativeStatus, Operation, ShutdownReport};
 /// [`Error::Backend`]. Constant imports vary across `windows` crate versions, so
 /// compare stable raw i32 values here (hex values are noted in comments below).
 pub(crate) fn classify_hr(code: i32) -> Option<Error> {
-    // Access denied → PermissionDenied
+    // Access denied -> PermissionDenied
     const E_ACCESSDENIED: i32 = 0x80070005u32 as i32;
     const AUDCLNT_E_DEVICE_IN_USE: i32 = 0x8889000Au32 as i32;
     const AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED: i32 = 0x8889000Eu32 as i32;
-    // Device unavailable/invalidated → DeviceNotFound
+    // Device unavailable/invalidated -> DeviceNotFound
     const AUDCLNT_E_DEVICE_INVALIDATED: i32 = 0x88890004u32 as i32;
     // E_NOTFOUND (ERROR_NOT_FOUND converted to HRESULT 0x80070490): specified endpoint/item missing.
     const E_NOTFOUND: i32 = 0x80070490u32 as i32;

@@ -19,7 +19,7 @@
 // exclusion, and its failure mode is the real leak (1 kHz still present).
 // Requires: pw-cli, pw-play, paplay on PATH; XDG_RUNTIME_DIR set.
 //
-// Detector: Goertzel at exact FFT bins. The bin index is round(N*f/rate) —
+// Detector: Goertzel at exact FFT bins. The bin index is round(N*f/rate) --
 // the +0.5 variant lands one bin off and reads a pure tone as silence.
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -86,7 +86,7 @@ function expect(label, r, want1k) {
     }
     if (!(levels[key] >= PRESENT_MIN)) fail(`${label}: ${channel} channel missing its ${tone} tone`);
     if (!(r[otherChannel][key] < levels[key] * 0.1)) {
-      fail(`${label}: ${otherChannel} channel contains ${tone} from ${channel} (expected <10% of ${channel} level) — duplicated or misrouted channel`);
+      fail(`${label}: ${otherChannel} channel contains ${tone} from ${channel} (expected <10% of ${channel} level) \u2014 duplicated or misrouted channel`);
     }
   }
 }
@@ -135,8 +135,8 @@ try {
     const ratio = excl[channel][key] / ctl[channel][key];
     console.log(`[fan-in level ${channel}] exclude/control = ${ratio.toFixed(3)}`);
     if (!Number.isFinite(ratio)) fail(`fan-in ${channel} channel has no valid control level`);
-    else if (ratio < 0.9) fail(`fan-in ${channel} channel captured its tone at ${(ratio * 100).toFixed(0)}% of the control — a channel is missing`);
-    else if (ratio > 1.15) fail(`fan-in ${channel} channel captured its tone at ${(ratio * 100).toFixed(0)}% of the control — the source is double-linked`);
+    else if (ratio < 0.9) fail(`fan-in ${channel} channel captured its tone at ${(ratio * 100).toFixed(0)}% of the control \u2014 a channel is missing`);
+    else if (ratio > 1.15) fail(`fan-in ${channel} channel captured its tone at ${(ratio * 100).toFixed(0)}% of the control \u2014 the source is double-linked`);
   }
 } catch (err) {
   fail(err instanceof Error ? err.message : String(err));

@@ -89,7 +89,7 @@ impl CaptureBackend for MockBackend {
 
                 // Global frame index for continuous phase (avoids phase discontinuities).
                 let mut phase_frame: u64 = 0;
-                // Device PTS (ns) — monotonic timestamp based on the native sample rate.
+                // Device PTS (ns) -- monotonic timestamp based on the native sample rate.
                 let start = Instant::now();
 
                 let mut scratch: Vec<f32> = Vec::with_capacity(frames_per_block * channels);
@@ -150,10 +150,10 @@ impl Drop for MockBackend {
 /// Test-only backend that can stall.
 ///
 /// The regular [`MockBackend`] keeps pushing a sine wave, so it cannot exercise the watchdog's
-/// stall detection → reopen → [`ChunkFlags::RECOVERED`](flexaudio_core::types::ChunkFlags::RECOVERED)
+/// stall detection -> reopen -> [`ChunkFlags::RECOVERED`](flexaudio_core::types::ChunkFlags::RECOVERED)
 /// path. This backend stops feeding (stalls) the first `start()` session after `stall_after`;
-/// sessions after the watchdog reopens with `stop()` → `start()` feed normally. This reproduces
-/// stall → automatic recovery → RECOVERED on the recovery chunk without real hardware.
+/// sessions after the watchdog reopens with `stop()` -> `start()` feed normally. This reproduces
+/// stall -> automatic recovery -> RECOVERED on the recovery chunk without real hardware.
 ///
 /// A shared [`AtomicU32`] counts `start()` calls; only generation 0 (the first call) stalls.
 /// For tests only (not a public API).

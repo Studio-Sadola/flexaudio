@@ -125,10 +125,16 @@ impl OwnerShutdown {
             .cloned()
             .chain(self.cleanup.take())
             .collect();
-        let report = ShutdownReport::new(Some(error), cleanup);
-        let result = report.result();
-        // Startup's primary reaches start() through this result; only cleanup belongs to shutdown.
-        self.retain(ShutdownReport::new(None, report.cleanup().to_vec()));
+        let attempt = ShutdownReport::new(joined.primary().cloned(), cleanup);
+        let retained =
+            flexaudio_core::terminal_causes::merge_shutdown_reports(self.report.as_ref(), &attempt);
+        let result = flexaudio_core::terminal_causes::merge_shutdown_reports(
+            Some(&ShutdownReport::new(Some(error), Vec::new())),
+            &retained,
+        )
+        .result();
+        // The readiness error stays start-only; independent worker failures remain retained.
+        self.retain(attempt);
         result
     }
 
@@ -139,22 +145,16 @@ impl OwnerShutdown {
             .cloned()
             .chain(self.cleanup.take())
             .collect();
-        let previous = self.report.take();
-        let primary = match previous.as_ref() {
-            Some(previous) => previous.primary().cloned(),
-            None => report.primary().cloned(),
-        };
         self.events.extend(
             cleanup
                 .iter()
                 .cloned()
                 .map(|error| Event::ShutdownError { error }),
         );
-        let mut retained_cleanup = previous
-            .map(|report| report.cleanup().to_vec())
-            .unwrap_or_default();
-        retained_cleanup.extend(cleanup);
-        self.report = Some(ShutdownReport::new(primary, retained_cleanup));
+        self.report = Some(flexaudio_core::terminal_causes::merge_shutdown_reports(
+            self.report.as_ref(),
+            &ShutdownReport::new(report.primary().cloned(), cleanup),
+        ));
     }
 
     pub(crate) fn result(&self) -> Result<()> {
@@ -262,9 +262,20 @@ mod tests {
             let attempt =
                 ShutdownReport::new(Some(restart_error.clone()), vec![restart_cleanup.clone()]);
             let worker = thread::spawn(|| panic!("injected failed restart owner panic"));
+            let mut returned_primary = attempt.primary().cloned();
+            if let Some(primary) = &previous_primary {
+                flexaudio_core::terminal_causes::retain_terminal_cause(
+                    &mut returned_primary,
+                    primary.clone(),
+                );
+            }
             assert_eq!(
                 shutdown.retain_start_failure(restart_error, worker),
-                attempt.result()
+                ShutdownReport::new(
+                    returned_primary,
+                    vec![previous_cleanup.clone(), restart_cleanup.clone()],
+                )
+                .result()
             );
             let retained = ShutdownReport::new(
                 previous_primary,
@@ -286,6 +297,35 @@ mod tests {
             assert!(shutdown.finish(None).is_ok());
             assert_eq!(shutdown.report, Some(ShutdownReport::new(None, Vec::new())));
         }
+    }
+
+    #[test]
+    fn failed_restart_keeps_independent_worker_primary_and_every_cleanup() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            Error::DeviceNotFound,
+            Error::DeviceLost,
+            |startup, runtime| {
+                let mut shutdown = OwnerShutdown {
+                    report: Some(ShutdownReport::new(None, vec![Error::Unsupported])),
+                    ..OwnerShutdown::default()
+                };
+                let current_cleanup = Error::Backend("independent worker cleanup failure".into());
+                let worker_report =
+                    ShutdownReport::new(Some(runtime.clone()), vec![current_cleanup.clone()]);
+                let result = shutdown
+                    .retain_start_failure(startup, thread::spawn(move || worker_report))
+                    .unwrap_err();
+                let retained = shutdown.report.as_ref().unwrap();
+                assert_eq!(retained.primary(), Some(&runtime));
+                assert_eq!(retained.cleanup(), &[Error::Unsupported, current_cleanup]);
+                for error in retained.cleanup() {
+                    assert!(flexaudio_core::terminal_causes::retains_terminal_cause(
+                        &result, error
+                    ));
+                }
+                result
+            },
+        );
     }
 
     #[test]

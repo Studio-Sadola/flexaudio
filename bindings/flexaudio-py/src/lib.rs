@@ -1,4 +1,4 @@
-//! flexaudio-py — Python bindings (PyO3 + maturin) that link directly to flexaudio.
+//! flexaudio-py -- Python bindings (PyO3 + maturin) that link directly to flexaudio.
 //!
 //! Bindings for using flexaudio in-process from Python applications. Like flexaudio-napi
 //! (for Node), adapted to PyO3.
