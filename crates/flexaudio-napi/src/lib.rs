@@ -23,6 +23,7 @@ mod bridge_drain;
 mod callback;
 mod capabilities;
 mod devices;
+mod error_conversion;
 mod failure_delivery;
 use bridge_drain::start_bridge_stream;
 use callback::UserCallback;
@@ -188,13 +189,19 @@ fn forward_stream_events(
             // unbounded queue is owned by this bridge thread, so its notice is
             // queued before PCM on the same TSFN. If the queue is Closing,
             // subsequent PCM enqueues fail too; no callback can overtake it.
-            stream_event_delivery::deliver(None, report, "startup notice", || {
-                tsfn_delivery::call(
-                    chunk_queue,
-                    ChunkEmit::StartupDropped(Box::new(event_to_js(event))),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                )
-            });
+            stream_event_delivery::deliver(
+                None,
+                report,
+                "startup notice",
+                flexaudio::Operation::Start,
+                || {
+                    tsfn_delivery::call(
+                        chunk_queue,
+                        ChunkEmit::StartupDropped(Box::new(event_to_js(event))),
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                    )
+                },
+            );
         } else {
             stream_event_delivery::event(
                 event,
@@ -591,6 +598,19 @@ fn denoise_err(err: DenoiseError) -> NapiError {
     NapiError::new(Status::InvalidArg, err.to_string())
 }
 
+fn throw_denoise_error(env: &Env, error: DenoiseError) -> NapiError {
+    let message = error.to_string();
+    let original = flexaudio::Error::InvalidArg(message.clone());
+    error_conversion::throw(
+        env,
+        &original,
+        flexaudio::DropFailureOwner::Stream,
+        "denoise exception",
+        &message,
+        || error_conversion::build(env, denoise_err(error), None, |_| Ok(())),
+    )
+}
+
 /// Convert pure encoder diagnostics only at the Node boundary.
 fn encode_err(err: flac_encoder::EncoderError) -> NapiError {
     let status = match err.kind {
@@ -604,18 +624,22 @@ fn encoder_exception(env: &Env, error: flac_encoder::EncoderError) -> napi::Resu
     let audio_error = boundary::audio_error(&error.audio_error);
     let error = encode_err(error);
     let code = error.status.as_ref().to_owned();
-    let mut exception = env.create_error(error)?;
-    exception.set_named_property("code", code)?;
-    exception.set_named_property("audioError", audio_error)?;
-    Ok(exception)
+    error_conversion::build(env, error, Some(&code), |exception| {
+        exception.set_named_property("audioError", audio_error)
+    })
 }
 
 fn throw_encoder_error(env: &Env, error: flac_encoder::EncoderError) -> NapiError {
     let reason = error.reason.clone();
-    match encoder_exception(env, error).and_then(|exception| env.throw(exception)) {
-        Ok(()) => NapiError::new(Status::PendingException, reason),
-        Err(error) => error,
-    }
+    let original = error.audio_error.clone();
+    error_conversion::throw(
+        env,
+        &original,
+        flexaudio::DropFailureOwner::FlacWriter,
+        "FLAC exception",
+        &reason,
+        || encoder_exception(env, error),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,6 +1239,7 @@ impl PairingBridge {
                 ThreadsafeFunctionCallMode::NonBlocking,
             ),
             "stream terminator",
+            flexaudio::Operation::Stop,
         );
     }
 
@@ -1317,6 +1342,7 @@ impl PairingBridge {
                 ThreadsafeFunctionCallMode::NonBlocking,
             ),
             "secondary envelope",
+            flexaudio::Operation::Normalize,
         );
     }
 
@@ -1374,6 +1400,7 @@ impl PairingBridge {
                     ThreadsafeFunctionCallMode::NonBlocking,
                 ),
                 "paired audio chunk",
+                flexaudio::Operation::Normalize,
             );
         }
     }
@@ -1556,6 +1583,7 @@ impl FlexStream {
                                     original,
                                     &bridge.report,
                                     "VAD flush settlement",
+                                    flexaudio::Operation::Flush,
                                     || {
                                         match tsfn_delivery::call(
                                             &bridge.on_chunk,
@@ -1568,6 +1596,7 @@ impl FlexStream {
                                                     failure_delivery::queue_error(
                                                         "VAD flush settlement",
                                                         status,
+                                                        flexaudio::Operation::Flush,
                                                     ),
                                                 );
                                                 tsfn_delivery::call(
@@ -2132,7 +2161,12 @@ fn finish_gc_shutdown(report: &FinalReport, notify: &SettleTsfn, requested: bool
     if let Err(status) =
         tsfn_delivery::call(notify.as_ref(), (), ThreadsafeFunctionCallMode::NonBlocking)
     {
-        shutdown::report_unreachable_failure(report, status, "GC shutdown notice");
+        shutdown::report_unreachable_failure(
+            report,
+            status,
+            "GC shutdown notice",
+            flexaudio::Operation::Stop,
+        );
     }
 }
 
@@ -2663,6 +2697,7 @@ impl Drop for FlacEncoder {
                     &report,
                     status,
                     "encoder GC notice",
+                    flexaudio::Operation::Stop,
                 );
             }
         }
@@ -2784,8 +2819,9 @@ impl Denoiser {
     /// Construct with a channel count (1 = mono, 2 = stereo interleaved). Out-of-range values yield
     /// InvalidArg.
     #[napi(constructor)]
-    pub fn new(channels: u16) -> napi::Result<Self> {
-        let inner = CoreDenoiser::new(channels).map_err(denoise_err)?;
+    pub fn new(env: Env, channels: u16) -> napi::Result<Self> {
+        let inner =
+            CoreDenoiser::new(channels).map_err(|error| throw_denoise_error(&env, error))?;
         Ok(Denoiser { inner })
     }
 
@@ -2793,9 +2829,11 @@ impl Denoiser {
     /// channels), returning a **new array** (copied because in-place processing is awkward in napi).
     /// A length not divisible by channels yields InvalidArg.
     #[napi]
-    pub fn process(&mut self, samples: Float32Array) -> napi::Result<Float32Array> {
+    pub fn process(&mut self, env: Env, samples: Float32Array) -> napi::Result<Float32Array> {
         let mut buf = samples.to_vec();
-        self.inner.process(&mut buf).map_err(denoise_err)?;
+        self.inner
+            .process(&mut buf)
+            .map_err(|error| throw_denoise_error(&env, error))?;
         Ok(Float32Array::new(buf))
     }
 

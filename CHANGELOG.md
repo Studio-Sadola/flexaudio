@@ -86,9 +86,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Node Promise resolution and rejection retain native settlement failures beside
-  the original shutdown outcome and route undeliverable failures to the typed
-  process receiver. Only safe pending-exception refusals retry a deferred.
+- Node error-conversion failures preserve the original typed cause through the
+  process receiver. Conversion status remains diagnostic context on that cause;
+  ordinary queue and warning delivery failures retain their independent causes.
+- Node checks Promise completion and reports original failures with rejection
+  status as diagnostic context. Resolution without an original failure reports
+  completion failures separately. Only safe pending-exception refusals retry a deferred.
 - Node queue delivery uses one checked, must-use boundary. Direct TSFN delivery
   is denied by Clippy, and rejected failure notifications retain their typed causes.
 - Preserve deferred native failures through teardown, keep mixed VAD/non-VAD

@@ -73,7 +73,10 @@ fn retry_open_queue(
     let mut attempt = |mode| {
         let result = send(mode);
         if let Err(status) = result {
-            record_cleanup_failure(report, failure_delivery::queue_error(role, status));
+            record_cleanup_failure(
+                report,
+                failure_delivery::queue_error(role, status, flexaudio::Operation::Stop),
+            );
         }
         result
     };
@@ -98,7 +101,12 @@ fn post_with(
     if let Err(status) = retry_open_queue(settle, report, "stop settlement") {
         // Neither queue can settle the stop; release waiters and rescue retained failures.
         drop(take_stop_waiters(phase));
-        shutdown::report_unreachable_failure(report, status, "stop settlement");
+        shutdown::report_unreachable_failure(
+            report,
+            status,
+            "stop settlement",
+            flexaudio::Operation::Stop,
+        );
     }
 }
 
@@ -109,8 +117,16 @@ mod tests {
     #[test]
     fn distinct_chunk_retry_failures_remain_typed_when_settlement_succeeds() {
         flexaudio_core::test_support::assert_distinct_failures_retained(
-            failure_delivery::queue_error("stop chunk", Status::QueueFull),
-            failure_delivery::queue_error("stop chunk", Status::Closing),
+            failure_delivery::queue_error(
+                "stop chunk",
+                Status::QueueFull,
+                flexaudio::Operation::Stop,
+            ),
+            failure_delivery::queue_error(
+                "stop chunk",
+                Status::Closing,
+                flexaudio::Operation::Stop,
+            ),
             |first, second| {
                 let phase = Mutex::new(StopPhase::Stopping { waiters: vec![] });
                 let report = Arc::new(Mutex::new(None));

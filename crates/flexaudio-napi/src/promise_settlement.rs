@@ -43,9 +43,13 @@ impl From<Status> for NativeFailure {
     }
 }
 
-fn native_error(role: &str, failure: impl Into<NativeFailure>) -> flexaudio::Error {
+fn native_error(
+    role: &str,
+    failure: impl Into<NativeFailure>,
+    operation: flexaudio::Operation,
+) -> flexaudio::Error {
     let failure = failure.into();
-    let error = failure_delivery::queue_error(role, failure.status);
+    let error = failure_delivery::queue_error(role, failure.status, operation);
     if failure.status == Status::Unknown {
         error.with_diagnostic_detail(format!("native N-API status code: {}", failure.raw))
     } else {
@@ -54,22 +58,19 @@ fn native_error(role: &str, failure: impl Into<NativeFailure>) -> flexaudio::Err
 }
 
 #[must_use = "Every native settlement or preparation failure must remain typed."]
-fn checked(status: sys::napi_status, role: &str) -> Result<(), flexaudio::Error> {
+fn checked(
+    status: sys::napi_status,
+    role: &str,
+    operation: flexaudio::Operation,
+) -> Result<(), flexaudio::Error> {
     match Status::from(status) {
         Status::Ok => Ok(()),
-        _ => Err(native_error(role, NativeFailure::from(status))),
+        _ => Err(native_error(role, NativeFailure::from(status), operation)),
     }
 }
 
-fn deliver(
-    report: &FinalReport,
-    result: Result<(), flexaudio::Error>,
-    original: Option<flexaudio::Error>,
-) {
+fn deliver(report: &FinalReport, result: Result<(), flexaudio::Error>) {
     if let Err(error) = result {
-        if let Some(original) = original {
-            record_cleanup_failure(report, original);
-        }
         record_failure(report, error);
     }
 }
@@ -79,6 +80,7 @@ fn deliver(
 #[must_use = "A refused Promise completion must reach its retained report and failure receiver."]
 fn settle_with<F: Into<NativeFailure>>(
     role: &str,
+    operation: flexaudio::Operation,
     mut settle: impl FnMut() -> Result<(), F>,
     mut clear_pending: impl FnMut() -> Result<(), F>,
 ) -> Result<(), flexaudio::Error> {
@@ -86,11 +88,17 @@ fn settle_with<F: Into<NativeFailure>>(
         Ok(()) => Ok(()),
         Err(failure) if failure.status == Status::PendingException => {
             let retry = clear_pending()
-                .map_err(|status| native_error(&format!("{role} pending exception clear"), status))
+                .map_err(|status| {
+                    native_error(
+                        &format!("{role} pending exception clear"),
+                        status,
+                        operation,
+                    )
+                })
                 .and_then(|()| match settle().map_err(Into::into) {
                     Ok(()) => Ok(()),
                     Err(status) => {
-                        let mut retained = Some(native_error(role, status));
+                        let mut retained = Some(native_error(role, status, operation));
                         if status.status == Status::PendingException {
                             // Exhausted retry still clears the JS exception, without reusing the deferred.
                             if let Err(status) = clear_pending() {
@@ -99,6 +107,7 @@ fn settle_with<F: Into<NativeFailure>>(
                                     native_error(
                                         &format!("{role} pending exception clear"),
                                         status,
+                                        operation,
                                     ),
                                 );
                             }
@@ -108,12 +117,12 @@ fn settle_with<F: Into<NativeFailure>>(
                 });
             // A successful retry transparently handles an already pending JS exception.
             retry.map_err(|error| {
-                let mut retained = Some(native_error(role, Status::PendingException));
+                let mut retained = Some(native_error(role, Status::PendingException, operation));
                 flexaudio::core::terminal_causes::retain_terminal_cause(&mut retained, error);
                 retained.expect("pending refusal remains retained")
             })
         }
-        Err(status) => Err(native_error(role, status)),
+        Err(status) => Err(native_error(role, status, operation)),
     }
 }
 
@@ -153,9 +162,11 @@ fn complete(
     value: sys::napi_value,
     completion: Completion,
     role: &str,
+    operation: flexaudio::Operation,
 ) -> Result<(), flexaudio::Error> {
     settle_with(
         role,
+        operation,
         || complete_status(env, deferred, value, completion),
         || {
             let mut pending = ptr::null_mut();
@@ -169,24 +180,37 @@ fn complete(
 }
 
 #[must_use = "A missing completion value must not abandon its Promise silently."]
-fn undefined(env: sys::napi_env, role: &str) -> Result<sys::napi_value, flexaudio::Error> {
+fn undefined(
+    env: sys::napi_env,
+    role: &str,
+    operation: flexaudio::Operation,
+) -> Result<sys::napi_value, flexaudio::Error> {
     let mut value = ptr::null_mut();
-    checked(unsafe { sys::napi_get_undefined(env, &mut value) }, role)?;
+    checked(
+        unsafe { sys::napi_get_undefined(env, &mut value) },
+        role,
+        operation,
+    )?;
     Ok(value)
 }
 
 #[must_use = "Exception inspection and clearing failures must be retained."]
-fn clear_pending(env: sys::napi_env) -> Result<(), flexaudio::Error> {
+fn clear_pending(
+    env: sys::napi_env,
+    operation: flexaudio::Operation,
+) -> Result<(), flexaudio::Error> {
     let mut pending = false;
     checked(
         unsafe { sys::napi_is_exception_pending(env, &mut pending) },
         "promise exception inspection",
+        operation,
     )?;
     if pending {
         let mut exception = ptr::null_mut();
         checked(
             unsafe { sys::napi_get_and_clear_last_exception(env, &mut exception) },
             "promise exception clear",
+            operation,
         )?;
     }
     Ok(())
@@ -207,23 +231,18 @@ fn reject_with_fallback<T, E>(
 
 fn fallback_value(
     env: &Env,
-    report: &FinalReport,
+    failure: &mut error_conversion::Failure,
     role: &str,
+    operation: flexaudio::Operation,
     error: NapiError,
 ) -> Result<sys::napi_value, flexaudio::Error> {
-    record_failure(
-        report,
-        native_error(&format!("{role} error construction"), error.status),
-    );
-    clear_pending(env.raw())?;
-    match env.create_error(error) {
+    failure.napi(&format!("{role} error construction"), &error);
+    clear_pending(env.raw(), operation)?;
+    match error_conversion::build(env, error, None, |_| Ok(())) {
         Ok(error) => return Ok(unsafe { error.raw() }),
-        Err(error) => record_failure(
-            report,
-            native_error("promise fallback error construction", error.status),
-        ),
+        Err(error) => failure.napi("promise fallback error construction", &error),
     }
-    clear_pending(env.raw())?;
+    clear_pending(env.raw(), operation)?;
     let message = b"flexaudio Promise failed while creating its error";
     let mut text = ptr::null_mut();
     if let Err(error) = checked(
@@ -236,24 +255,26 @@ fn fallback_value(
             )
         },
         "promise fallback message construction",
+        operation,
     ) {
-        record_failure(report, error);
-        clear_pending(env.raw())?;
-        return undefined(env.raw(), "promise fallback undefined value");
+        failure.native("promise fallback message construction", &error);
+        clear_pending(env.raw(), operation)?;
+        return undefined(env.raw(), "promise fallback undefined value", operation);
     }
-    let mut plain = ptr::null_mut();
-    match checked(
-        unsafe { sys::napi_create_error(env.raw(), ptr::null_mut(), text, &mut plain) },
-        "promise plain error construction",
-    ) {
-        Ok(()) => Ok(plain),
-        Err(error) => {
-            record_failure(report, error);
-            clear_pending(env.raw())?;
-            // The string was successfully created and remains a valid rejection value.
-            Ok(text)
-        }
+    // The fallback string is a valid rejection value; do not repeat failed error allocation.
+    Ok(text)
+}
+
+fn finish_rejection(
+    report: &FinalReport,
+    mut failure: error_conversion::Failure,
+    result: Result<(), flexaudio::Error>,
+    role: &str,
+) {
+    if let Err(error) = result {
+        failure.native(role, &error);
     }
+    failure.finish_report(report);
 }
 
 fn reject_exception(
@@ -261,18 +282,26 @@ fn reject_exception(
     deferred: SendDeferred,
     report: &FinalReport,
     role: &str,
+    operation: flexaudio::Operation,
     original: flexaudio::Error,
     rich: napi::Result<JsObject>,
 ) {
+    let mut failure = error_conversion::Failure::new(original, flexaudio::DropFailureOwner::Stream);
     let result = reject_with_fallback(
         rich.map(|error| unsafe { error.raw() }),
-        |error| {
-            record_cleanup_failure(report, original.clone());
-            fallback_value(env, report, role, error)
+        |error| fallback_value(env, &mut failure, role, operation, error),
+        |value| {
+            complete(
+                env.raw(),
+                deferred,
+                value,
+                Completion::Reject,
+                role,
+                operation,
+            )
         },
-        |value| complete(env.raw(), deferred, value, Completion::Reject, role),
     );
-    deliver(report, result, Some(original));
+    finish_rejection(report, failure, result, role);
 }
 
 pub(super) fn settle_stop(env: sys::napi_env, deferred: SendDeferred, report: &FinalReport) {
@@ -295,22 +324,28 @@ pub(super) fn settle_stop(env: sys::napi_env, deferred: SendDeferred, report: &F
                 deferred,
                 report,
                 "stop promise rejection",
+                flexaudio::Operation::Stop,
                 error,
                 rich,
             );
         }
         None => deliver(
             report,
-            undefined(env.raw(), "stop promise undefined value").and_then(|value| {
+            undefined(
+                env.raw(),
+                "stop promise undefined value",
+                flexaudio::Operation::Stop,
+            )
+            .and_then(|value| {
                 complete(
                     env.raw(),
                     deferred,
                     value,
                     Completion::Resolve,
                     "stop promise resolution",
+                    flexaudio::Operation::Stop,
                 )
             }),
-            None,
         ),
     }
 }
@@ -330,22 +365,28 @@ pub(super) fn settle_flush(
                 deferred,
                 report,
                 "VAD flush promise rejection",
+                flexaudio::Operation::Flush,
                 error.audio_error(),
                 rich,
             );
         }
         None => deliver(
             report,
-            undefined(env.raw(), "VAD flush promise undefined value").and_then(|value| {
+            undefined(
+                env.raw(),
+                "VAD flush promise undefined value",
+                flexaudio::Operation::Flush,
+            )
+            .and_then(|value| {
                 complete(
                     env.raw(),
                     deferred,
                     value,
                     Completion::Resolve,
                     "VAD flush promise resolution",
+                    flexaudio::Operation::Flush,
                 )
             }),
-            None,
         ),
     }
 }
@@ -353,6 +394,18 @@ pub(super) fn settle_flush(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_error(role: &str, failure: impl Into<NativeFailure>) -> flexaudio::Error {
+        super::native_error(role, failure, flexaudio::Operation::Stop)
+    }
+
+    fn settle_with<F: Into<NativeFailure>>(
+        role: &str,
+        settle: impl FnMut() -> Result<(), F>,
+        clear: impl FnMut() -> Result<(), F>,
+    ) -> Result<(), flexaudio::Error> {
+        super::settle_with(role, flexaudio::Operation::Stop, settle, clear)
+    }
 
     #[test]
     fn silent_failure_failed_error_creation_still_rejects_once() {
@@ -476,11 +529,11 @@ mod tests {
     }
 
     #[test]
-    fn refused_settlement_preserves_original_and_distinct_delivery_failures() {
+    fn refused_rejection_reports_original_once_with_conversion_diagnostics() {
         const CHILD: &str = "FLEXAUDIO_NAPI_PROMISE_SETTLEMENT_TEST";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["promise_settlement::tests::refused_settlement_preserves_original_and_distinct_delivery_failures", "--exact"])
+                .args(["promise_settlement::tests::refused_rejection_reports_original_once_with_conversion_diagnostics", "--exact"])
                 .env(CHILD, "1").output().unwrap();
             assert!(
                 output.status.success(),
@@ -495,44 +548,55 @@ mod tests {
             output.lock().unwrap().push(failure.clone());
         })));
         for status in [Status::GenericFailure, Status::Closing] {
-            flexaudio_core::test_support::assert_distinct_failures_retained(
-                flexaudio::Error::DeviceLost,
-                native_error("stop promise rejection", status),
-                |first, _second| {
-                    let report = Arc::new(Mutex::new(Some(shutdown::ShutdownReport::from_core(
-                        Some(flexaudio::ShutdownReport::new(Some(first.clone()), vec![])),
-                    ))));
-                    for _attempt in 0..2 {
-                        deliver(
-                            &report,
-                            settle_with(
-                                "stop promise rejection",
-                                || Err(status),
-                                || panic!("unsafe retry"),
-                            ),
-                            Some(first.clone()),
-                        );
-                    }
-                    let mut notifications = received.lock().unwrap();
-                    assert_eq!(notifications.len(), 1, "equal failures must remain quiet");
-                    let failure = notifications.pop().unwrap();
-                    drop(notifications);
-                    deliver(
-                        &report,
-                        settle_with(
-                            "stop promise rejection",
-                            || Err(Status::InvalidArg),
-                            || panic!("unsafe retry"),
-                        ),
-                        Some(first),
-                    );
-                    let distinct = received.lock().unwrap().pop().unwrap();
-                    assert_eq!(
-                        distinct.report.cleanup(),
-                        &[native_error("stop promise rejection", Status::InvalidArg)]
-                    );
-                    failure.report.result().unwrap_err()
-                },
+            let first = flexaudio::Error::DeviceLost;
+            let report = Arc::new(Mutex::new(Some(shutdown::ShutdownReport::from_core(Some(
+                flexaudio::ShutdownReport::new(Some(first.clone()), vec![]),
+            )))));
+            for _attempt in 0..2 {
+                finish_rejection(
+                    &report,
+                    error_conversion::Failure::new(
+                        first.clone(),
+                        flexaudio::DropFailureOwner::Stream,
+                    ),
+                    settle_with(
+                        "stop promise rejection",
+                        || Err(status),
+                        || panic!("unsafe retry"),
+                    ),
+                    "stop promise rejection",
+                );
+            }
+            let mut notifications = received.lock().unwrap();
+            assert_eq!(notifications.len(), 1, "equal failures must remain quiet");
+            let failure = notifications.pop().unwrap();
+            drop(notifications);
+            assert_eq!(failure.report.primary().unwrap().root(), &first);
+            assert!(failure.report.cleanup().is_empty());
+            assert!(failure
+                .report
+                .primary()
+                .unwrap()
+                .diagnostic_details()
+                .iter()
+                .any(|detail| detail.contains(status.as_ref())));
+            finish_rejection(
+                &report,
+                error_conversion::Failure::new(first.clone(), flexaudio::DropFailureOwner::Stream),
+                settle_with(
+                    "stop promise rejection",
+                    || Err(Status::InvalidArg),
+                    || panic!("unsafe retry"),
+                ),
+                "stop promise rejection",
+            );
+            assert!(
+                received.lock().unwrap().is_empty(),
+                "conversion statuses do not redeliver the same original"
+            );
+            assert_eq!(
+                report.lock().unwrap().as_ref().unwrap().outcome().result(),
+                Err(first)
             );
         }
         let clean = Arc::new(Mutex::new(None));
@@ -543,7 +607,6 @@ mod tests {
                 || Err(Status::Closing),
                 || panic!("unsafe retry"),
             ),
-            None,
         );
         let clean_failure = received.lock().unwrap().pop().unwrap();
         assert!(clean_failure.report.primary().is_none());

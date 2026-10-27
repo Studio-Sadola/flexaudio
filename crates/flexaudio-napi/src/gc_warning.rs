@@ -11,8 +11,8 @@ pub(super) const WARNING_NAME: &str = "FlexaudioShutdownWarning";
 pub(super) const WARNING_CODE: &str = "FLEXAUDIO_GC_SHUTDOWN";
 
 /// Emit a typed warning `Error`. `attach` adds the typed fields an explicit stop/finalize
-/// would have delivered. If construction or delivery fails, the original typed report and
-/// delivery error reach the process receiver. Exception cleanup failures are retained too.
+/// would have delivered. Construction refusal reports the original with conversion diagnostics.
+/// Actual warning delivery refusal retains its independent delivery and exception-cleanup causes.
 pub(super) fn emit(
     env: &Env,
     message: &str,
@@ -24,7 +24,34 @@ pub(super) fn emit(
         attach(&mut warning)?;
         Ok(warning)
     });
-    if let Err(error) = warning.and_then(|warning| call_emit_warning(env, warning)) {
+    let warning = match warning {
+        Ok(warning) => warning,
+        Err(error) => {
+            if let Some(original) = error_conversion::report_failure(report) {
+                let mut failure = error_conversion::Failure::new(original, owner);
+                failure.napi("GC warning construction", &error);
+                let inspected = (|| {
+                    let mut pending = false;
+                    check_status!(unsafe {
+                        sys::napi_is_exception_pending(env.raw(), &mut pending)
+                    })?;
+                    if pending {
+                        let mut exception = ptr::null_mut();
+                        check_status!(unsafe {
+                            sys::napi_get_and_clear_last_exception(env.raw(), &mut exception)
+                        })?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = inspected {
+                    failure.napi("GC warning exception cleanup", &error);
+                }
+                failure.finish();
+            }
+            return;
+        }
+    };
+    if let Err(error) = call_emit_warning(env, warning) {
         let delivery = warning_failure(
             error,
             || {
@@ -46,10 +73,12 @@ pub(super) fn emit(
 }
 
 fn build(env: &Env, message: &str) -> napi::Result<JsObject> {
-    let mut warning = env.create_error(NapiError::new(Status::GenericFailure, message))?;
-    warning.set_named_property("name", WARNING_NAME)?;
-    warning.set_named_property("code", WARNING_CODE)?;
-    Ok(warning)
+    error_conversion::build(
+        env,
+        NapiError::new(Status::GenericFailure, message),
+        Some(WARNING_CODE),
+        |warning| warning.set_named_property("name", WARNING_NAME),
+    )
 }
 
 fn call_emit_warning(env: &Env, warning: JsObject) -> napi::Result<()> {
@@ -66,7 +95,7 @@ fn warning_failure(
     clear: impl FnOnce() -> napi::Result<()>,
 ) -> flexaudio::Error {
     let mut retained = Some(
-        failure_delivery::queue_error("shutdown warning", error.status)
+        failure_delivery::queue_error("shutdown warning", error.status, flexaudio::Operation::Stop)
             .with_diagnostic_detail(error.reason),
     );
     let cleanup = match inspect() {
@@ -80,7 +109,8 @@ fn warning_failure(
     if let Some((role, error)) = cleanup {
         flexaudio::core::terminal_causes::retain_terminal_cause(
             &mut retained,
-            failure_delivery::queue_error(role, error.status).with_diagnostic_detail(error.reason),
+            failure_delivery::queue_error(role, error.status, flexaudio::Operation::Stop)
+                .with_diagnostic_detail(error.reason),
         );
     }
     retained.expect("warning delivery failed")
@@ -99,10 +129,18 @@ mod tests {
                 "shutdown warning exception clearing"
             };
             flexaudio_core::test_support::assert_distinct_failures_retained(
-                failure_delivery::queue_error("shutdown warning", Status::GenericFailure)
-                    .with_diagnostic_detail("warning refusal".into()),
-                failure_delivery::queue_error(role, Status::PendingException)
-                    .with_diagnostic_detail("exception cleanup refusal".into()),
+                failure_delivery::queue_error(
+                    "shutdown warning",
+                    Status::GenericFailure,
+                    flexaudio::Operation::Stop,
+                )
+                .with_diagnostic_detail("warning refusal".into()),
+                failure_delivery::queue_error(
+                    role,
+                    Status::PendingException,
+                    flexaudio::Operation::Stop,
+                )
+                .with_diagnostic_detail("exception cleanup refusal".into()),
                 |_first, _second| {
                     warning_failure(
                         NapiError::new(Status::GenericFailure, "warning refusal"),
@@ -145,8 +183,12 @@ mod tests {
             );
             assert_eq!(
                 retained,
-                failure_delivery::queue_error("shutdown warning", Status::GenericFailure)
-                    .with_diagnostic_detail("warning refusal".into()),
+                failure_delivery::queue_error(
+                    "shutdown warning",
+                    Status::GenericFailure,
+                    flexaudio::Operation::Stop
+                )
+                .with_diagnostic_detail("warning refusal".into()),
             );
         }
     }

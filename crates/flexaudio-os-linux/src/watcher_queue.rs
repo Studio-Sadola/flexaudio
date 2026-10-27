@@ -1,5 +1,7 @@
 // Bounded watcher deltas with a separate sticky inventory invalidation.
-use flexaudio_core::{DefaultDeviceKind, DeviceEvent, Error, ErrorGroup};
+use flexaudio_core::{
+    terminal_causes::retain_terminal_cause, DefaultDeviceKind, DeviceEvent, Error,
+};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -46,10 +48,7 @@ impl WatchEvents {
     }
 
     pub(crate) fn fail(&mut self, error: Error) {
-        self.terminal = Some(match self.terminal.take() {
-            None => error,
-            Some(primary) => Error::Multiple(ErrorGroup::new(primary, error, Vec::new())),
-        });
+        retain_terminal_cause(&mut self.terminal, error);
         self.terminal_pending = true;
     }
 
@@ -85,6 +84,41 @@ impl WatchEvents {
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+
+    #[test]
+    fn distinct_failures_and_equal_snapshots_keep_one_ordered_flat_group() {
+        flexaudio_core::test_support::assert_distinct_failures_retained(
+            Error::DeviceLost,
+            Error::Backend("later watcher join failure".into()),
+            |first, second| {
+                let mut queue = WatchEvents::default();
+                queue.fail(first.clone());
+                assert_eq!(
+                    queue.poll(),
+                    Some(DeviceEvent::TerminalError {
+                        error: first.clone(),
+                    })
+                );
+                queue.fail(first.clone());
+                queue.fail(second.clone());
+                queue.fail(second.clone());
+                let expected =
+                    Error::Multiple(flexaudio_core::ErrorGroup::new(first, second, Vec::new()));
+                queue.fail(expected.clone());
+                let retained = queue.terminal_error().unwrap();
+                assert_eq!(retained, expected);
+                assert_eq!(
+                    queue.poll(),
+                    Some(DeviceEvent::TerminalError {
+                        error: retained.clone(),
+                    })
+                );
+                assert_eq!(queue.poll(), None);
+                retained
+            },
+        );
+    }
+
     #[test]
     fn terminal_failure_survives_overflow_and_remains_structured() {
         let mut queue = WatchEvents::default();

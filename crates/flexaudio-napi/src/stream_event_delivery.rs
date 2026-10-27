@@ -19,6 +19,7 @@ pub(super) fn deliver(
     original: Option<Error>,
     report: &FinalReport,
     role: &str,
+    operation: flexaudio::Operation,
     send: impl FnOnce() -> Result<(), Status>,
 ) {
     let Err(status) = send() else {
@@ -28,10 +29,10 @@ pub(super) fn deliver(
         Some(error) => error,
         // A closed host cannot consume ordinary PCM, startup or advisory notices.
         None if status == Status::Closing => return,
-        None => failure_delivery::queue_error(role, status),
+        None => failure_delivery::queue_error(role, status, operation),
     };
     retain_failure(report, failure);
-    shutdown::report_unreachable_failure(report, status, role);
+    shutdown::report_unreachable_failure(report, status, role, operation);
 }
 
 /// Forward subscribed events, retaining original failures when delivery is refused.
@@ -49,6 +50,7 @@ pub(super) fn event(
         event.failure().map(std::borrow::Cow::into_owned),
         report,
         EVENT_ROLE,
+        flexaudio::Operation::Normalize,
         || send(event_to_js(event)),
     );
 }
@@ -184,7 +186,7 @@ mod tests {
                 for (event, original, kind) in failures() {
                     flexaudio_core::test_support::assert_distinct_failures_retained(
                         original,
-                        failure_delivery::queue_error(EVENT_ROLE, status),
+                        failure_delivery::queue_error(EVENT_ROLE, status, flexaudio::Operation::Normalize),
                         |first, _second| {
                             assert_eq!(event.failure().as_deref(), Some(&first));
                             let retained = report();
@@ -216,7 +218,7 @@ mod tests {
                     }
                     let failures = std::mem::take(&mut *received.lock().unwrap());
                     assert_eq!(failures.len(), 2);
-                    assert!(retains_terminal_cause(&failures[0].report.result().unwrap_err(), &failure_delivery::queue_error(EVENT_ROLE, Status::Closing)));
+                    assert!(retains_terminal_cause(&failures[0].report.result().unwrap_err(), &failure_delivery::queue_error(EVENT_ROLE, Status::Closing, flexaudio::Operation::Normalize)));
                     assert_eq!(failures[1].report.cleanup(), std::slice::from_ref(&second));
                     let mut observed = None;
                     // Project the original payloads received by the sink; queue failure is checked above.
@@ -275,7 +277,7 @@ mod tests {
             assert!(retained.lock().unwrap().is_none());
             event(Event::RecoverableError { error: Error::DeviceLost }, &retained, Some(|_| Err(Status::Closing)));
             let failure = received.lock().unwrap().pop().unwrap();
-            assert_eq!(failure.report.cleanup(), &[Error::DeviceLost, failure_delivery::queue_error(EVENT_ROLE, Status::Closing)]);
+            assert_eq!(failure.report.cleanup(), &[Error::DeviceLost, failure_delivery::queue_error(EVENT_ROLE, Status::Closing, flexaudio::Operation::Normalize)]);
         });
     }
 
@@ -325,8 +327,8 @@ mod tests {
                         let result = outcome.result().unwrap_err();
                         assert!(retains_terminal_cause(&result, &first));
                         assert!(retains_terminal_cause(&result, &second));
-                        assert!(retains_terminal_cause(&result, &failure_delivery::queue_error(EVENT_ROLE, Status::Closing)));
-                        shutdown::report_unreachable_failure(&retained, Status::Closing, EVENT_ROLE);
+                        assert!(retains_terminal_cause(&result, &failure_delivery::queue_error(EVENT_ROLE, Status::Closing, flexaudio::Operation::Normalize)));
+                        shutdown::report_unreachable_failure(&retained, Status::Closing, EVENT_ROLE, flexaudio::Operation::Normalize);
                         let later = received.lock().unwrap().pop().unwrap();
                         assert_eq!(later.report.result(), Err(second));
                         assert!(received.lock().unwrap().is_empty());
@@ -373,7 +375,7 @@ mod tests {
             }
             let received = received.lock().unwrap();
             assert_eq!(received.len(), 2);
-            assert_eq!(received[1].report.cleanup(), &[failure_delivery::queue_error(EVENT_ROLE, Status::QueueFull)]);
+            assert_eq!(received[1].report.cleanup(), &[failure_delivery::queue_error(EVENT_ROLE, Status::QueueFull, flexaudio::Operation::Normalize)]);
         });
     }
 
@@ -382,15 +384,15 @@ mod tests {
         isolated("stream_event_delivery::tests::nonfailure_queue_errors_and_generic_vad_failure_delivery_are_retained", |received| {
             for status in [Status::QueueFull, Status::GenericFailure] {
                 let retained = report();
-                deliver(None, &retained, "startup notice", || Err(status));
+                deliver(None, &retained, "startup notice", flexaudio::Operation::Start, || Err(status));
                 let failure = received.lock().unwrap().pop().unwrap();
-                assert_eq!(failure.report.cleanup(), &[failure_delivery::queue_error("startup notice", status)]);
+                assert_eq!(failure.report.cleanup(), &[failure_delivery::queue_error("startup notice", status, flexaudio::Operation::Start)]);
             }
             let original = Error::Vad { code: VadErrorCode::Inference };
             let retained = report();
-            deliver(Some(original.clone()), &retained, "VAD failure notice", || Err(Status::Closing));
+            deliver(Some(original.clone()), &retained, "VAD failure notice", flexaudio::Operation::Normalize, || Err(Status::Closing));
             let failure = received.lock().unwrap().pop().unwrap();
-            assert_eq!(failure.report.cleanup(), &[original, failure_delivery::queue_error("VAD failure notice", Status::Closing)]);
+            assert_eq!(failure.report.cleanup(), &[original, failure_delivery::queue_error("VAD failure notice", Status::Closing, flexaudio::Operation::Normalize)]);
         });
     }
 }

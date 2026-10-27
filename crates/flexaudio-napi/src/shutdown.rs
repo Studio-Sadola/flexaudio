@@ -202,7 +202,12 @@ fn take_gc_failure(
 }
 
 /// Once every JS queue refuses teardown, the process receiver owns the retained failures.
-pub(super) fn report_unreachable_failure(report: &FinalReport, status: Status, role: &str) {
+pub(super) fn report_unreachable_failure(
+    report: &FinalReport,
+    status: Status,
+    role: &str,
+    operation: flexaudio::Operation,
+) {
     if status == Status::Ok {
         return;
     }
@@ -216,7 +221,7 @@ pub(super) fn report_unreachable_failure(report: &FinalReport, status: Status, r
             return;
         }
         // Different roles/statuses are distinct observed failures; identical retries collapse.
-        let delivery = failure_delivery::queue_error(role, status);
+        let delivery = failure_delivery::queue_error(role, status, operation);
         if !report.binding_cleanup.contains(&delivery) {
             report.binding_cleanup.push(delivery);
         }
@@ -418,11 +423,21 @@ mod tests {
                 let report = Arc::new(Mutex::new(Some(ShutdownReport::from_core(Some(
                     flexaudio::ShutdownReport::new(Some(first.clone()), vec![]),
                 )))));
-                report_unreachable_failure(&report, Status::QueueFull, "stream event callback");
+                report_unreachable_failure(
+                    &report,
+                    Status::QueueFull,
+                    "stream event callback",
+                    flexaudio::Operation::Normalize,
+                );
                 assert_eq!(received.lock().unwrap().len(), 1);
                 record_cleanup_failure(&report, second.clone());
                 report.lock().unwrap().as_mut().unwrap().gc_requested = true;
-                report_unreachable_failure(&report, Status::Ok, "GC shutdown notice");
+                report_unreachable_failure(
+                    &report,
+                    Status::Ok,
+                    "GC shutdown notice",
+                    flexaudio::Operation::Stop,
+                );
                 // The accepted GC callback follows the same existing-sink branch as production.
                 assert!(report_handed_off_gc_failure(&report));
                 assert!(report_handed_off_gc_failure(&report));

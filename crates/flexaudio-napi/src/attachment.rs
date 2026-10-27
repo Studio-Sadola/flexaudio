@@ -218,6 +218,7 @@ impl PairingBridge {
                 Some(original),
                 &self.report,
                 "VAD failure notice",
+                failure.stage.operation(),
                 || {
                     tsfn_delivery::call(
                         &self.on_chunk,
@@ -272,6 +273,7 @@ impl PairingBridge {
                 ThreadsafeFunctionCallMode::NonBlocking,
             ),
             "VAD event carrier",
+            flexaudio::Operation::Normalize,
         );
     }
 }
@@ -341,21 +343,29 @@ pub(super) fn failure_event(
 }
 
 pub(super) fn throw_error(env: &Env, error: VadTapError) -> NapiError {
-    match js_error(env, &error).and_then(|exception| env.throw(exception)) {
-        Ok(()) => NapiError::new(Status::PendingException, error.to_string()),
-        Err(error) => error,
-    }
+    error_conversion::throw(
+        env,
+        &error.audio_error(),
+        flexaudio::DropFailureOwner::Stream,
+        "attached VAD exception",
+        &error.to_string(),
+        || js_error(env, &error),
+    )
 }
 
 pub(super) fn js_error(env: &Env, error: &VadTapError) -> napi::Result<JsObject> {
-    let mut object = env.create_error(NapiError::new(Status::GenericFailure, error.to_string()))?;
-    object.set_named_property("code", error_code(error))?;
-    object.set_named_property(
-        "audioError",
-        super::boundary::audio_error(&error.audio_error()),
-    )?;
-    object.set_named_property("terminalEvents", env.create_array(0)?)?;
-    Ok(object)
+    error_conversion::build(
+        env,
+        NapiError::new(Status::GenericFailure, error.to_string()),
+        Some(error_code(error)),
+        |object| {
+            object.set_named_property(
+                "audioError",
+                super::boundary::audio_error(&error.audio_error()),
+            )?;
+            object.set_named_property("terminalEvents", env.create_array(0)?)
+        },
+    )
 }
 
 pub(super) fn error_code(error: &VadTapError) -> &'static str {

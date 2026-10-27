@@ -328,6 +328,12 @@ fn standalone(events: Vec<VadEvent>) -> Vec<JsVadEvent> {
 }
 
 pub(crate) fn throw_boundary(env: &Env, error: BoundaryError) -> Error {
+    let original = flexaudio::Error::Vad {
+        code: match error {
+            BoundaryError::InvalidParameter => flexaudio::VadErrorCode::InvalidParameter,
+            BoundaryError::UnsupportedTap => flexaudio::VadErrorCode::UnsupportedTap,
+        },
+    };
     throw_error(
         env,
         error.code(),
@@ -335,6 +341,7 @@ pub(crate) fn throw_boundary(env: &Env, error: BoundaryError) -> Error {
         Status::InvalidArg,
         Vec::new(),
         None,
+        original,
     )
 }
 
@@ -345,20 +352,29 @@ fn throw_error(
     status: Status,
     events: Vec<JsVadEvent>,
     audio_error: Option<super::boundary::JsAudioError>,
+    original: flexaudio::Error,
 ) -> Error {
-    let result = (|| {
-        let mut exception = env.create_error(Error::new(status, message))?;
-        exception.set_named_property("code", code)?;
-        exception.set_named_property("terminalEvents", events)?;
-        if let Some(error) = audio_error {
-            exception.set_named_property("audioError", error)?;
-        }
-        env.throw(exception)
-    })();
-    match result {
-        Ok(()) => Error::new(Status::PendingException, message),
-        Err(error) => error,
-    }
+    super::error_conversion::throw(
+        env,
+        &original,
+        flexaudio::DropFailureOwner::Stream,
+        "standalone VAD exception",
+        message,
+        || {
+            super::error_conversion::build(
+                env,
+                Error::new(status, message),
+                Some(code),
+                |exception| {
+                    exception.set_named_property("terminalEvents", events)?;
+                    if let Some(error) = audio_error {
+                        exception.set_named_property("audioError", error)?;
+                    }
+                    Ok(())
+                },
+            )
+        },
+    )
 }
 
 fn failure(env: &Env, error: VadFailure) -> Error {
@@ -370,6 +386,7 @@ fn failure(env: &Env, error: VadFailure) -> Error {
         status,
         standalone(error.terminal_events),
         Some(super::boundary::audio_error(&error.error.audio_error())),
+        error.error.audio_error(),
     )
 }
 
@@ -430,6 +447,9 @@ impl Vad {
                     Status::InvalidArg,
                     Vec::new(),
                     None,
+                    flexaudio::Error::Vad {
+                        code: flexaudio::VadErrorCode::InvalidPcm,
+                    },
                 )
             })?;
         let rate = integer(input_sample_rate.unwrap_or(16_000.0), f64::from(u32::MAX))

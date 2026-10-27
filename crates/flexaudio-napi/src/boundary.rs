@@ -51,27 +51,40 @@ pub(super) fn to_napi_err(error: Error) -> NapiError {
 }
 
 pub(super) fn js_error(env: &Env, error: &Error) -> napi::Result<JsObject> {
-    let mut object = env.create_error(to_napi_err(error.clone()))?;
-    object.set_named_property("code", error_code(error.kind()))?;
-    if let Some(report) = error.ignored_settings() {
-        object.set_named_property("report", settings::to_js(env, report)?)?;
-    } else {
-        object.set_named_property("audioError", audio_error(error))?;
-    }
-    Ok(object)
+    error_conversion::build(
+        env,
+        to_napi_err(error.clone()),
+        Some(error_code(error.kind())),
+        |object| {
+            if let Some(report) = error.ignored_settings() {
+                object.set_named_property("report", settings::to_js(env, report)?)
+            } else {
+                object.set_named_property("audioError", audio_error(error))
+            }
+        },
+    )
 }
 
 pub(super) fn throw_error(env: &Env, error: Error) -> NapiError {
-    match js_error(env, &error).and_then(|exception| env.throw(exception)) {
-        Ok(()) => NapiError::new(Status::PendingException, error.to_string()),
-        Err(error) => error,
-    }
+    error_conversion::throw(
+        env,
+        &error,
+        flexaudio::DropFailureOwner::Stream,
+        "capture exception",
+        &error.to_string(),
+        || js_error(env, &error),
+    )
 }
 
 /// AsyncTask rejects with the referenced exception; leaving a pending exception in
 /// Task::resolve would prevent napi-rs from settling its promise.
 pub(super) fn async_error(env: &Env, error: Error) -> NapiError {
-    match js_error(env, &error) {
+    match error_conversion::attempt(
+        &error,
+        flexaudio::DropFailureOwner::Stream,
+        "async exception",
+        || js_error(env, &error),
+    ) {
         Ok(exception) => {
             let mut mapped = NapiError::from(exception.into_unknown());
             mapped.status = to_napi_err(error).status;

@@ -161,7 +161,12 @@ impl LifecycleDelivery {
             if delivery.is_err() {
                 self.drain.pending.fetch_sub(1, Ordering::SeqCst);
             }
-            failure_delivery::retain_queue_result(&self.report, delivery, "lifecycle notification");
+            failure_delivery::retain_queue_result(
+                &self.report,
+                delivery,
+                "lifecycle notification",
+                flexaudio::Operation::Normalize,
+            );
         }
     }
 
@@ -189,7 +194,11 @@ impl LifecycleDelivery {
             Err(status) => {
                 record_cleanup_failure(
                     &self.report,
-                    failure_delivery::queue_error("lifecycle callback release", status),
+                    failure_delivery::queue_error(
+                        "lifecycle callback release",
+                        status,
+                        flexaudio::Operation::Stop,
+                    ),
                 );
             }
         }
@@ -300,7 +309,11 @@ mod deferred_stop_tests {
         for expired in [false, true] {
             flexaudio_core::test_support::assert_distinct_failures_retained(
                 flexaudio::Error::DeviceLost,
-                failure_delivery::queue_error("stop chunk", Status::Closing),
+                failure_delivery::queue_error(
+                    "stop chunk",
+                    Status::Closing,
+                    flexaudio::Operation::Stop,
+                ),
                 |first, _second| {
                     let report = Arc::new(Mutex::new(Some(shutdown::ShutdownReport::from_core(
                         Some(flexaudio::ShutdownReport::new(Some(first), vec![])),
@@ -356,6 +369,7 @@ mod deferred_stop_tests {
                         .contains(&failure_delivery::queue_error(
                             "stop settlement",
                             Status::Closing,
+                            flexaudio::Operation::Stop
                         )));
                     failure.report.result().unwrap_err()
                 },
