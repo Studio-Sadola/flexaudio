@@ -389,6 +389,7 @@ mod thread {
 }
 struct ProcessOwner {
     shutdown: Option<ShutdownReport>, events: BackendEvents,
+    shutdown_receipt: flexaudio_core::ShutdownReceipt,
     running: Arc<AtomicBool>, target_pid: u32, mode: ProcessMode,
     stop_tx: Option<pw::channel::Sender<Terminate>>, handle: Option<thread::JoinHandle<()>>,
 }
@@ -402,6 +403,7 @@ impl ProcessOwner {
 }
 struct SystemOwner {
     shutdown: Option<ShutdownReport>, events: BackendEvents,
+    shutdown_receipt: flexaudio_core::ShutdownReceipt,
     running: Arc<AtomicBool>, stop_tx: Option<pw::channel::Sender<Terminate>>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -410,6 +412,7 @@ impl SystemOwner {
 }
 struct WatchOwner {
     shutdown: Option<ShutdownReport>, events: WatchEventQueue,
+    shutdown_receipt: flexaudio_core::ShutdownReceipt,
     running: Arc<AtomicBool>, stop_tx: Option<pw::channel::Sender<Terminate>>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -423,7 +426,7 @@ impl flexaudio_core::CaptureBackend for ProcessOwner {
     fn stop_checked(&mut self) -> Result<()> { ProcessOwner::stop_checked(self) }
     fn poll_event(&mut self) -> Option<Event> { ProcessOwner::poll_event(self) }
 }
-fn process_owner() -> ProcessOwner { ProcessOwner { shutdown: None, events: Arc::new(Mutex::new(Default::default())), running: Arc::new(AtomicBool::new(false)), target_pid: 42, mode: ProcessMode::Include, stop_tx: None, handle: None } }
+fn process_owner() -> ProcessOwner { ProcessOwner { shutdown: None, shutdown_receipt: Default::default(), events: Arc::new(Mutex::new(Default::default())), running: Arc::new(AtomicBool::new(false)), target_pid: 42, mode: ProcessMode::Include, stop_tx: None, handle: None } }
 #[derive(Clone, Copy)]
 enum StopOwnerKind { System, Process, Watcher }
 enum StopOwner { System(SystemOwner), Process(ProcessOwner), Watcher(WatchOwner) }
@@ -462,14 +465,17 @@ fn check_stop_delivery_and_join(kind: StopOwnerKind) {
         let mut owner = match kind {
             StopOwnerKind::System => StopOwner::System(SystemOwner {
                 shutdown: None, events: Arc::new(Mutex::new(Default::default())),
+                shutdown_receipt: Default::default(),
                 running, stop_tx: Some(sender), handle,
             }),
             StopOwnerKind::Process => StopOwner::Process(ProcessOwner {
                 shutdown: None, events: Arc::new(Mutex::new(Default::default())),
+                shutdown_receipt: Default::default(),
                 running, stop_tx: Some(sender), handle, target_pid: 42, mode: ProcessMode::Include,
             }),
             StopOwnerKind::Watcher => StopOwner::Watcher(WatchOwner {
                 shutdown: None, events: Arc::new(Mutex::new(WatchEvents::default())),
+                shutdown_receipt: Default::default(),
                 running, stop_tx: Some(sender), handle,
             }),
         };
@@ -534,14 +540,14 @@ fn pipewire_join_failure_control() {
     let mut owner = process_owner(); owner.handle = Some(std::thread::spawn(|| {})); owner.stop();
     assert!(owner.handle.is_none()); assert!(flexaudio_core::CaptureBackend::poll_event(&mut owner).is_none());
 }
-struct WatchQueue { events: WatchEventQueue }
+struct WatchQueue { events: WatchEventQueue, shutdown_receipt: flexaudio_core::ShutdownReceipt }
 impl WatchQueue { // LIVE_POLL
 }
 fn watcher(poison: bool) -> WatchQueue {
     let events = Arc::new(Mutex::new(WatchEvents::default()));
     enqueue_event(&events, DeviceEvent::Removed { id: "mic".into() });
     if poison { let shared = events.clone(); let _ = std::thread::spawn(move || { let _lock = shared.lock().unwrap(); panic!("injected queue-owner panic"); }).join(); }
-    WatchQueue { events }
+    WatchQueue { events, shutdown_receipt: Default::default() }
 }
 #[test]
 fn pipewire_poisoned_queue() {
