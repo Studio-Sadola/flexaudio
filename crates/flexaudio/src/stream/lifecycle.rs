@@ -34,6 +34,7 @@ impl Stream {
             .len();
         let old_event_count = self.events.lock().unwrap_or_else(|e| e.into_inner()).len();
         self.shared.stopping.store(false, Ordering::SeqCst);
+        self.shared.level.start();
         self.shared.switching.store(false, Ordering::SeqCst);
 
         // A new start does not carry over a paused state (even if the previous run was stopped while
@@ -206,6 +207,7 @@ impl Stream {
 
     // Explicit stop, checked stop and startup rollback share this retained report.
     fn retain_shutdown_outcome(&mut self) {
+        self.shared.level.close();
         if self.shutdown.is_some() {
             return;
         }

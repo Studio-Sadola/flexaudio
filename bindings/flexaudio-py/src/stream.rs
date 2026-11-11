@@ -130,6 +130,19 @@ impl Stream {
         self.inner.is_paused()
     }
 
+    /// Latest post-denoise/gain primary level, without consuming it or polling PCM.
+    /// Returns None before measurement/after clean stop; raises on terminal failure.
+    fn poll_level(&self) -> PyResult<Option<crate::level::Level>> {
+        if let Some(error) = self.inner.terminal_error() {
+            return Err(to_py_err(error));
+        }
+        self.inner
+            .level_reader()
+            .poll_level()
+            .map(|value| value.map(Into::into))
+            .map_err(|error| to_py_err(self.inner.terminal_error().unwrap_or(error)))
+    }
+
     /// Change input gain (linear multiplier). 1.0 leaves audio unchanged, 2.0 is about +6dB, and 0.0
     /// is silence. May be called during recording and takes effect from the next chunk (20ms
     /// granularity). Samples are clamped to +/-1.0 after multiplication. Must be finite and >= 0, or
@@ -664,6 +677,7 @@ mod tests {
             assert!(!error.to_string().contains("denied by user"));
             assert!(stream.poll_event().is_some());
             assert!(stream.terminal_error().is_some());
+            assert!(stream.poll_level().is_err());
             assert!(stream.stop().is_err());
             assert!(stream.poll_chunk().is_err());
             assert!(stream.resume().is_err());

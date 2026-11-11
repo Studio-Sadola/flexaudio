@@ -108,6 +108,18 @@ pub struct FlexChunk {
     pub rms: f32,
 }
 
+/// Latest primary level, copied by flexaudio_poll_level without consuming it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FlexLevel {
+    /// Maximum absolute float sample after denoise, conversion, gain and clipping.
+    pub peak: f32,
+    /// Root mean square of the same float samples.
+    pub rms: f32,
+    /// Monotonic nanoseconds since measurement, not hardware capture latency.
+    pub age_ns: u64,
+}
+
 /// Stream event kind (`FlexEventKind`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -139,6 +139,13 @@ export interface JsNativeFormat {
   sampleRate: number
   channels: number
 }
+/** The level of what the primary stream would deliver, after denoise/conversion/gain/clipping. */
+export interface Level {
+  peak: number
+  rms: number
+  /** Monotonic nanoseconds since measurement, not hardware latency. */
+  ageNs: bigint
+}
 /** Streaming segmentation settings, shared by standalone and attached VAD. */
 export interface VadOptions {
   /** Finite [0,1], default 0.5. */
@@ -696,6 +703,11 @@ export declare function watchDevices(onEvent: (event: JsDeviceEvent) => void): D
  * `StreamShutdownWarning` through `process.on('warning')`, never as an uncaught exception.
  */
 export declare class FlexStream {
+  /** Non-consuming shared-cell read, also updated while paused. No bridge round-trip.
+   * Undefined before measurement or after clean stop; throws AudioException on terminal failure.
+   * Pause clears the value; subsequent processed input, including queued backlog, refreshes it.
+   * Gain zero meters zero. Repeated reads retain the latest value with increasing ageNs. */
+  pollLevel(): Level | undefined
   /** Snapshot at successful open/switch commit; available after stop. */
   effectiveSettings(): SettingsReport
   /**

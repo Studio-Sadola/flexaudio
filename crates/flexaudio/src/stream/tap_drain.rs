@@ -3,6 +3,7 @@ use super::*;
 
 #[derive(Default)]
 pub(super) struct TapState {
+    pub generation: u64,
     pub seq: u64,
     pub recovered: bool,
     pub discontinuity: bool,
@@ -36,14 +37,19 @@ pub(super) fn drain(
         let frames = data.len() / channels;
         let frame_index = advance_frame_index(counter, frames as u64, format.sample_rate)?;
         // Popped frames advance even while discarded, retaining flags until delivery.
-        if shared.paused.load(Ordering::SeqCst) {
+        let paused = shared.paused.load(Ordering::SeqCst);
+        if !primary && paused {
             continue;
         }
         // Preserve the legacy output PTS/metrics preparation before the delivery lock.
         let prepared = if capture {
             None
         } else {
-            let pts = apply_epoch(shared, raw_pts).max(state.last_pts);
+            let pts = if paused {
+                state.last_pts
+            } else {
+                apply_epoch(shared, raw_pts).max(state.last_pts)
+            };
             state.last_pts = pts;
             if apply_gain(&mut data, gain) {
                 integrity_flags |= ChunkFlags::CLIPPED;
@@ -51,7 +57,12 @@ pub(super) fn drain(
             Some((pts, peak_rms(&data)))
         };
         let _delivery = shared.delivery.lock().unwrap_or_else(|e| e.into_inner());
-        if shared.paused.load(Ordering::SeqCst) || shared.terminal.is_failed() {
+        if primary && !shared.stopping.load(Ordering::SeqCst) && !shared.terminal.is_failed() {
+            if let Some((_, (peak, rms))) = prepared {
+                shared.level.publish(state.generation, peak, rms);
+            }
+        }
+        if paused || shared.paused.load(Ordering::SeqCst) || shared.terminal.is_failed() {
             continue;
         }
         let (pts_ns, (peak, rms)) = prepared.unwrap_or_else(|| {

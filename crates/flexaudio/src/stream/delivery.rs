@@ -6,7 +6,8 @@ impl Stream {
     /// Keep OS-side capture running but stop delivering completed chunks. While paused,
     /// [`poll_chunk`](Self::poll_chunk) returns no new chunks. Intake continues internally to keep the
     /// device active, enabling a quick resume and avoiding false watchdog stall reports. Does nothing
-    /// if already paused (safe to call repeatedly).
+    /// to capture state if already paused (safe to call repeatedly). Each call clears the latest
+    /// level; completed input blocks continue refreshing it while paused.
     ///
     /// When this call returns, any chunk being assembled by the intake thread has either been queued
     /// or discarded. After draining chunks already queued, [`poll_chunk`](Self::poll_chunk) returns no
@@ -22,6 +23,7 @@ impl Stream {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         self.shared.paused.store(true, Ordering::SeqCst);
+        self.shared.level.clear();
     }
 
     /// Resume delivery after [`pause`](Self::pause).

@@ -92,6 +92,20 @@ add-ons `vad` and `denoise` (see below).
 
 `Stream.switch_source(...)` hot-swaps the input source without stopping the
 stream. `pause()` / `resume()` / `is_paused()` control delivery.
+
+`stream.poll_level()` returns a read-only `Level` with `peak`, `rms`, and
+`age_ns`, including while paused and without polling PCM/VAD. Reads do not consume
+the value; updates follow completed primary 20 ms blocks. `age_ns` is monotonic
+time since measurement, not hardware latency. Levels describe what the stream
+would deliver after denoise, conversion, gain and clipping; gain zero meters zero.
+Pause clears the level, then processed input (including pre-pause backlog) refreshes
+it. Pre-pause PCM/VAD remain drainable; paused input produces no new recording PCM
+or attached VAD results. Existing closure/resume/stop tails are unchanged.
+Enabled denoise still costs CPU while paused; metering adds primary gain/clipping
+and peak/RMS work. Stalls/device-loss advisories retain the last value with growing
+age; switch/recovery clears it. Returns `None` before measurement/after clean stop,
+and raises the existing typed exception on terminal failure. Silence does not
+prove permission or device health.
 `stop()` spends the stream; open a new stream to capture again.
 `Stream.native_format()` returns the source's native `(sample_rate, channels)`
 and `Stream.dropped_chunks()` returns the cumulative number of dropped chunks.

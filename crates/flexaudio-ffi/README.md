@@ -33,6 +33,28 @@ build 20348 (Windows 11 / Windows Server 2022 or later is required); the OS is u
 access is denied), if the OS does not respond within 3 seconds, or if the previous query is still
 running.
 
+## Input meter while paused
+
+`flexaudio_poll_level(s, &level)` copies a `FlexLevel` (`float peak`, `float rms`,
+`uint64_t age_ns`) without consuming it, including while paused. Returns 1 for a
+value, 0 before measurement/after clean stop (output untouched), or a negative
+code with `flexaudio_last_error()` set. Terminal failures return `FLEX_FAILURE`,
+as in `flexaudio_poll_chunk`; typed error accessors retain the cause. No freeing
+is required for the caller-owned level struct. Existing ABI layouts are unchanged.
+
+Levels update on completed primary 20 ms blocks, independently of PCM/VAD polls.
+They describe what the stream would deliver after denoise, conversion, gain and
+clipping; gain zero meters zero. Reads retain the latest values with increasing
+age (monotonic time since measurement, not hardware latency). Pause clears the
+cell; subsequent processed input, including pre-pause backlog, refreshes it.
+Pre-pause PCM/VAD remain drainable; paused input produces no new recording PCM
+or attached VAD results. Closure/resume/stop tails are unchanged. Enabled denoise
+keeps running during pause; metering adds primary gain/clipping and peak/RMS work.
+Stop/terminal failure clears levels; switch/recovery rejects old-generation
+values. Stalls/device-loss advisories retain the value with growing age.
+For mute, use `flexaudio_set_gain(s, 0.0)` or explicit v5 gains; legacy
+configuration zero sentinels still select unity gain.
+
 ## Build and Generate the Header
 
 This builds both `staticlib` (`.a`) and `cdylib` (`.so` / `.dll` / `.dylib`).

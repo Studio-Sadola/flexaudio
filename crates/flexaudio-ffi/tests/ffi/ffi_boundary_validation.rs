@@ -94,6 +94,52 @@ fn stop_no_addons_control() {
     assert_eq!(unsafe { crate::flexaudio_stop(&mut stream) }, code::FLEX_OK);
     assert!(stream.poll_processed().unwrap().is_none());
 }
+
+#[test]
+fn poll_level_preserves_values_while_paused_and_closes_at_stop() {
+    let (mut stream, sink) = stream(false);
+    let mut level = crate::FlexLevel {
+        peak: -1.0,
+        rms: -1.0,
+        age_ns: 99,
+    };
+    unsafe {
+        assert_eq!(crate::flexaudio_poll_level(&mut stream, &mut level), 0);
+        assert_eq!(level.peak, -1.0, "no data must leave output untouched");
+        assert_eq!(crate::flexaudio_pause(&mut stream), code::FLEX_OK);
+    }
+    push(&sink, &[0.5; 2880]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { crate::flexaudio_poll_level(&mut stream, &mut level) } == 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!((level.peak, level.rms), (0.5, 0.5));
+    for _ in 0..100 {
+        assert_eq!(
+            unsafe { crate::flexaudio_poll_level(&mut stream, &mut level) },
+            1
+        );
+        assert_eq!((level.peak, level.rms), (0.5, 0.5));
+    }
+    assert!(stream.inner.poll_chunk().is_none());
+    assert_eq!(unsafe { crate::flexaudio_stop(&mut stream) }, code::FLEX_OK);
+    level.peak = -1.0;
+    assert_eq!(
+        unsafe { crate::flexaudio_poll_level(&mut stream, &mut level) },
+        0
+    );
+    assert_eq!(level.peak, -1.0);
+    assert_eq!(
+        unsafe { crate::flexaudio_poll_level(std::ptr::null_mut(), &mut level) },
+        code::FLEX_INVALID_ARG
+    );
+    assert!(!crate::flexaudio_last_error().is_null());
+    assert_eq!(
+        unsafe { crate::flexaudio_poll_level(&mut stream, std::ptr::null_mut()) },
+        code::FLEX_INVALID_ARG
+    );
+}
 #[test]
 fn resume_denoise_matches_facade_history() {
     let (mut binding, binding_sink) = stream(true);

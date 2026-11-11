@@ -294,6 +294,13 @@ fn js_stream(env: &Env, stream: FlexStream) -> napi::Result<JsObject> {
     })?;
     object.set_named_property("terminalError", terminal)?;
     let pause_stream = stream.clone();
+    let level_stream = stream.clone();
+    object.set_named_property(
+        "pollLevel",
+        env.create_function_from_closure("pollLevel", move |ctx| {
+            level_stream.poll_level(*ctx.env)
+        })?,
+    )?;
     object.set_named_property(
         "pause",
         env.create_function_from_closure("pause", move |_| pause_stream.pause())?,
@@ -795,6 +802,7 @@ pub fn binding_contract_bridge(
     )
     .map_err(|error| boundary::throw_error(&env, error))?;
     Ok(FlexStream {
+        level: Default::default(),
         settings: Arc::new(Mutex::new(None)),
         lifecycle: None,
         stop_flag: Arc::new(AtomicBool::new(false)),

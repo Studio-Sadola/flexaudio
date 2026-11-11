@@ -402,6 +402,16 @@ typedef struct FlexChunk {
     float rms;
 } FlexChunk;
 
+// Latest primary level, copied by flexaudio_poll_level without consuming it.
+typedef struct FlexLevel {
+    // Maximum absolute float sample after denoise, conversion, gain and clipping.
+    float peak;
+    // Root mean square of the same float samples.
+    float rms;
+    // Monotonic nanoseconds since measurement, not hardware capture latency.
+    uint64_t age_ns;
+} FlexLevel;
+
 // One captured event, populated by `flexaudio_poll_event`.
 //
 // For Error, PermissionDenied, SilenceWhileSourceActive, and PermissionPending,
@@ -1000,6 +1010,15 @@ uint64_t flexaudio_dropped_chunks(const struct FlexStream *s);
 // # Safety
 // `s` must be a valid handle, and `out` must point to a valid `FlexChunk` destination.
 int32_t flexaudio_poll_chunk(struct FlexStream *s, struct FlexChunk *out);
+
+// Copy the latest primary level without consuming it, including while paused.
+// Returns 1 on success, 0 before measurement/after clean stop (out untouched),
+// or a negative code with last_error set. Terminal failures return FLEX_FAILURE.
+// This does not poll PCM or run VAD. The value is post-denoise/gain; gain zero meters zero.
+//
+// # Safety
+// s must be a valid handle and out must point to a writable, aligned FlexLevel.
+int32_t flexaudio_poll_level(struct FlexStream *s, struct FlexLevel *out);
 
 // Return the producer frame index in canonical 48 kHz units without changing v1 layout.
 // NULL, a freed chunk, or caller-owned PCM returns zero and sets last_error.

@@ -317,6 +317,28 @@ sequence with `chunk.seq + 1n`. `ptsNs` and VAD milliseconds remain `number` tim
 
 ## Voice activity detection, noise suppression, FLAC
 
+### Input meter during pause
+
+After `stream.pause()`, read `stream.pollLevel()` for `{ peak, rms, ageNs }`.
+This synchronous shared-cell read makes no bridge round-trip and consumes
+nothing: faster polling or multiple readers retain the latest value. It updates
+on completed primary 20 ms blocks without requiring PCM callbacks. `ageNs` is a
+bigint monotonic elapsed time since measurement, not hardware latency. Missing
+input leaves the previous value with increasing age; silence is not proof of
+permission or device health.
+
+Levels describe what the stream would deliver after denoise, output conversion,
+gain and clipping; gain zero meters zero. Pause clears the cell synchronously;
+subsequently processed input, including pre-pause backlog, can refresh it.
+Pre-pause PCM/VAD callbacks remain drainable; no new paused input is delivered
+as recording PCM or attached VAD results. Closure/resume/stop-tail behavior stays
+unchanged. Enabled denoise keeps running while paused; metering adds gain/clipping
+and peak/RMS work. Stop clears the meter immediately; switch/recovery clears
+old-generation values. Returns `undefined` before measurement/after clean stop;
+terminal failure throws the existing typed `AudioException`.
+
+### Standalone add-ons
+
 The add-ons work standalone on any `Float32Array` of interleaved samples, and the
 VAD / noise suppression can also be wired into a live `openStream`.
 

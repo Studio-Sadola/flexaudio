@@ -597,7 +597,26 @@ class SecondaryChunk:
     @property
     def vad_events(self) -> Optional[List[AttachedVadEvent]]: ...
 
+class Level:
+    """Primary float level after denoise/conversion/gain/clipping; gain zero meters zero."""
+    @property
+    def peak(self) -> float: ...
+    @property
+    def rms(self) -> float: ...
+    @property
+    def age_ns(self) -> int:
+        """Monotonic nanoseconds since measurement, not hardware latency."""
+        ...
+
 class Stream:
+    def poll_level(self) -> Optional[Level]:
+        """Non-consuming latest level, also updated while paused without PCM polling.
+
+        None before measurement/after clean stop; raises on terminal failure.
+        Pause clears the value; processed input, including queued backlog, refreshes it.
+        Repeated reads retain the values with increasing age_ns.
+        """
+        ...
     def effective_settings(self) -> SettingsReport: ...
     def poll_lifecycle_event(self) -> Optional[LifecycleEvent]:
         """Consume only helper lifecycle notifications, including after stop.

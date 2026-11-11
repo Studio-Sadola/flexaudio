@@ -31,6 +31,7 @@ pub use capabilities::capabilities;
 pub use devices::devices_with_namespaces;
 mod flac_encoder;
 mod gc_warning;
+mod level;
 mod lifecycle;
 mod promise_settlement;
 use promise_settlement::{create_js_promise, settle_stop, SendDeferred};
@@ -1412,6 +1413,7 @@ impl PairingBridge {
 /// `FlexaudioShutdownWarning` through `process.on('warning')`, never as uncaught exceptions.
 #[napi]
 pub struct FlexStream {
+    level: flexaudio::stream::LevelReader,
     // Native reports are queried from Stream while running and retained here at shutdown.
     settings: Arc<Mutex<Option<flexaudio::SettingsReport>>>,
     lifecycle: Option<Arc<lifecycle::LifecycleDelivery>>,
@@ -1441,6 +1443,7 @@ impl FlexStream {
         mock_source: bool,
     ) -> napi::Result<Self> {
         let report = bridge.report.clone();
+        let level = stream.level_reader();
         let settings = Arc::new(Mutex::new(bridge.settings.take()));
         let thread_settings = settings.clone();
         let lifecycle = bridge.lifecycle.clone();
@@ -1695,6 +1698,7 @@ impl FlexStream {
             mock_source,
             settings,
             lifecycle,
+            level,
         })
     }
 
@@ -1824,6 +1828,7 @@ impl FlexStream {
     pub fn stop(&self, env: Env) -> napi::Result<JsObject> {
         let (deferred, promise) = create_js_promise(&env)?;
         // Every returned stop Promise is an explicit request, including an already-ended bridge.
+        self.level.close();
         self.stop_flag.store(true, Ordering::SeqCst);
         // This is the JS thread. If the TSFN is already closed, no join handle remains, or phase is
         // Stopped, napi_resolve_deferred can be called here.
@@ -1875,6 +1880,25 @@ impl FlexStream {
             .clone()
             .map(|StreamTerminal(error)| Either::A(terminal_event(error)))
             .unwrap_or(Either::B(()))
+    }
+
+    /// Latest post-denoise/gain primary level without consuming it or querying the bridge.
+    /// Returns undefined before measurement/after clean stop; throws on terminal failure.
+    #[napi(ts_return_type = "Level | undefined")]
+    pub fn poll_level(&self, env: Env) -> napi::Result<Either<level::JsLevel, Undefined>> {
+        if let Some(StreamTerminal(error)) =
+            self.terminal.lock().unwrap_or_else(lock_poisoned).clone()
+        {
+            return Err(boundary::throw_error(&env, error));
+        }
+        self.level
+            .poll_level()
+            .map(|value| {
+                value
+                    .map(|level| Either::A(level.into()))
+                    .unwrap_or(Either::B(()))
+            })
+            .map_err(|error| boundary::throw_error(&env, error))
     }
 
     /// Retained checked shutdown, including binding bridge failures.
@@ -1990,6 +2014,7 @@ impl FlexStream {
                 "bridge thread is not running".to_string(),
             )
         })?;
+        self.level.clear();
         Ok(())
     }
 
@@ -2110,6 +2135,7 @@ impl Drop for FlexStream {
         // GC path. Do not block the JS thread (GC) with join. Set stop_flag and join the handle
         // on a reaper thread. Resources (bridge, TSFN, capture) are destroyed when the bridge exits.
         // No Promise waiters exist (no explicit stop).
+        self.level.close();
         let gc_requested = !self.stop_flag.swap(true, Ordering::SeqCst);
         let notify = self.settle_tsfn.clone();
         if let Some(h) = self.take_join_handle() {

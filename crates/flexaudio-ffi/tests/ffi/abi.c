@@ -10,6 +10,7 @@
 #if UINTPTR_MAX == UINT64_MAX
 L(FlexConfig, 80, 8, silence_probe, 73);
 L(FlexChunk, 56, 8, rms, 52);
+L(FlexLevel, 16, 8, age_ns, 8);
 L(FlexEvent, 16, 8, count, 8);
 L(FlexDeviceInfo, 32, 8, is_default, 27);
 L(FlexProcessInfo, 40, 8, output_activity, 32);

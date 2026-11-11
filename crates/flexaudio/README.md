@@ -43,6 +43,14 @@ Use `AudioChunk::new(data, frames)`, `DeviceInfo::new(id, name, source_kind)` or
 
 - `open(StreamConfig)` selects the right backend by source + OS.
 - `Stream::poll_chunk` / `poll_event` -- simple pull loop; no callbacks required.
+- `Stream::poll_level` -- non-consuming `Option<Level>` with primary peak/RMS and
+  monotonic measurement age, also updated while paused without PCM polling.
+  It measures what the stream would deliver after denoise/conversion/gain;
+  gain zero meters zero. Pause clears the level, then processed input (including
+  backlog) refreshes it. Existing queued PCM/VAD draining and stop tails are
+  unchanged. Enabled denoise retains its paused CPU cost; metering adds gain and
+  peak/RMS computation. Stop/terminal failure clears the level; inspect
+  `terminal_error()` for failures.
 - `Stream::switch_source` -- hot-swap source without stopping the stream.
 - `devices()` enumerates devices; `watch_devices()` reports Linux PipeWire system
   output additions, removals and default changes using the same output IDs as

@@ -400,6 +400,8 @@ The facade crate `flexaudio` re-exports everything you need:
   those values are not reported again during Drop.
   Late failures from bounded queries that already timed out use this receiver too.
 - `Stream::poll_chunk` / `Stream::poll_event` -- pull `AudioChunk`s and `Event`s.
+- `Stream::poll_level() -> Option<Level>` -- non-consuming latest primary
+  `peak`, `rms`, and `age_ns`, also updated while paused without PCM polling.
 - `Stream::terminal_error() -> Option<Error>` -- inspect a stored terminal failure,
   including after stop. `Stream::resume()` returns `Result<()>`.
 - `Stream::switch_source` -- hot-swap the input source without stopping the
@@ -444,6 +446,33 @@ The facade crate `flexaudio` re-exports everything you need:
   `AudioChunk`, `SecondaryChunk`, `ChunkFlags`, `DeviceInfo`, `ProcessInfo`,
   `DeviceEvent`, `DefaultDeviceKind`, `Event`, `Permission`, `Error`, `ErrorKind`,
   `ErrorContext`, `AddonErrorKind`, `AudioLoss`, `ShutdownReport`, `Result`.
+
+### Input levels while paused
+
+`stream.pause(); let level = stream.poll_level();` keeps the same capture stream
+alive for input monitoring. Levels describe **what the primary stream would
+deliver**, after denoise, output conversion, gain and clipping. Gain zero meters
+zero. The cell updates on completed 20 ms primary blocks; repeated reads retain
+the latest values with increasing `age_ns` (monotonic time since measurement,
+not hardware latency). Pause clears the cell; subsequently processed input,
+including queued pre-pause backlog, can refresh it. This is a meter, not a
+sample-accurate capture timestamp or proof of permission/device health.
+
+Pre-pause PCM/VAD remain drainable; paused input produces no new recording PCM
+or attached VAD results. Existing VAD closure, resume discontinuity and stop tails
+are unchanged. Enabled denoise keeps running during pause; metering additionally
+performs primary gain/clipping and peak/RMS computation. No extra capture stream
+or realtime callback allocations/locks are needed. Stop/terminal failure clears
+the meter; switch/recovery clears it until new-generation input is processed.
+Transient stalls/device-loss advisories retain the previous value with growing
+age. Rust returns `None` on terminal failure; inspect `terminal_error()`.
+
+Node uses `pollLevel()` (`ageNs: bigint`), Python `poll_level()` (`age_ns: int`),
+and C `flexaudio_poll_level()` with `FlexLevel`. Bindings expose terminal failures
+through their existing typed error conventions. Every binding reads one shared
+core cell; Node makes no per-read bridge command.
+
+### Voice activity detection
 
 Voice activity detection (`flexaudio-vad`) uses one `Vad` engine for standalone
 and attached processing. `VadPostProcessor` and `speech_segments` expose the same

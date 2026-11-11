@@ -66,7 +66,9 @@ use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use error::{clear_last_error, code, last_error_ptr, set_last_error};
-use types::{FlexChunk, FlexConfig, FlexDeviceInfo, FlexEvent, FlexProcessInfo, FlexStream};
+use types::{
+    FlexChunk, FlexConfig, FlexDeviceInfo, FlexEvent, FlexLevel, FlexProcessInfo, FlexStream,
+};
 
 // ---------------------------------------------------------------------------
 // Panic guards
@@ -597,6 +599,39 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
     })
 }
 
+/// Copy the latest primary level without consuming it, including while paused.
+/// Returns 1 on success, 0 before measurement/after clean stop (out untouched),
+/// or a negative code with last_error set. Terminal failures return FLEX_FAILURE.
+/// This does not poll PCM or run VAD. The value is post-denoise/gain; gain zero meters zero.
+///
+/// # Safety
+/// s must be a valid handle and out must point to a writable, aligned FlexLevel.
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_poll_level(s: *mut FlexStream, out: *mut FlexLevel) -> i32 {
+    guard_i32(|| {
+        clear_last_error();
+        if s.is_null() || !s.is_aligned() || out.is_null() || !out.is_aligned() {
+            set_last_error("flexaudio_poll_level: invalid stream or output pointer");
+            return code::FLEX_INVALID_ARG;
+        }
+        match (*s).inner.level_reader().poll_level() {
+            Ok(Some(level)) => {
+                out.write(FlexLevel {
+                    peak: level.peak,
+                    rms: level.rms,
+                    age_ns: level.age_ns,
+                });
+                1
+            }
+            Ok(None) => 0,
+            Err(error) => {
+                fail((*s).inner.terminal_error().unwrap_or(error));
+                code::FLEX_FAILURE
+            }
+        }
+    })
+}
+
 /// Return the producer frame index in canonical 48 kHz units without changing v1 layout.
 /// NULL, a freed chunk, or caller-owned PCM returns zero and sets last_error.
 /// # Safety
@@ -1035,6 +1070,12 @@ mod permission_tests {
         let mut chunk = std::mem::MaybeUninit::<FlexChunk>::uninit();
         // SAFETY: stream is live and all output pointers reference writable local destinations.
         unsafe {
+            let mut level = FlexLevel::default();
+            assert_eq!(
+                flexaudio_poll_level(&mut stream, &mut level),
+                code::FLEX_FAILURE
+            );
+            assert!(!flexaudio_last_error().is_null());
             assert_eq!(flexaudio_poll_chunk(&mut stream, chunk.as_mut_ptr()), -2);
             let message = CStr::from_ptr(flexaudio_last_error()).to_str().unwrap();
             assert!(message.contains("recording permission denied"));
@@ -1049,6 +1090,10 @@ mod permission_tests {
             assert_eq!(flexaudio_poll_chunk(&mut stream, chunk.as_mut_ptr()), -2);
             assert_eq!(flexaudio_resume(&mut stream), code::FLEX_PERMISSION_DENIED);
             assert_eq!(flexaudio_terminal_error(&stream), -2);
+            assert_eq!(
+                flexaudio_poll_level(&mut stream, &mut level),
+                code::FLEX_FAILURE
+            );
         }
     }
 

@@ -44,6 +44,7 @@ mod denoise;
 mod device_namespace;
 mod encode;
 mod errors;
+mod level;
 mod lifecycle;
 mod marshal;
 mod pcm_buffer;
@@ -178,6 +179,7 @@ fn flexaudio(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Stream and its returned data types.
     m.add_class::<stream::Stream>()?;
+    m.add_class::<level::Level>()?;
     m.add_class::<device_namespace::NamespacedDevice>()?;
     m.add_class::<lifecycle::LifecycleEvent>()?;
     m.add_class::<secondary::SecondaryOutputOptions>()?;

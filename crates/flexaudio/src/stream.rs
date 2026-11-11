@@ -49,7 +49,9 @@ pub(crate) use control::is_helper_lifecycle;
 mod delivery;
 mod intake;
 mod intake_generation;
+mod level;
 mod lifecycle;
+pub use level::{Level, LevelReader};
 mod processor;
 mod shared;
 mod source;
@@ -65,6 +67,8 @@ use terminal::TerminalFailure;
 
 #[cfg(test)]
 mod contract_tests;
+#[cfg(test)]
+mod level_tests;
 #[cfg(test)]
 mod permission_tests;
 #[cfg(test)]
@@ -137,6 +141,7 @@ pub struct Stream {
 
 /// State shared by the intake thread, watchdog thread, and main thread.
 struct SharedState {
+    level: LevelReader,
     startup_order: Mutex<startup_order::StartupOrder>,
     output_format: OutputFormat,
     secondary_format: Option<OutputFormat>,
@@ -320,6 +325,7 @@ impl Stream {
         let events = Arc::new(Mutex::new(VecDeque::new()));
 
         let shared = Arc::new(SharedState {
+            level: LevelReader::default(),
             startup_order: Mutex::new(startup_order::StartupOrder::default()),
             output_format: config.output,
             secondary_format: config.secondary_output,

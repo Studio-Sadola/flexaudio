@@ -56,7 +56,7 @@ pub use device_watcher::DeviceWatcher;
 pub use mock::MockBackend;
 pub use open_options::OpenOptions;
 pub use processes::processes;
-pub use stream::Stream;
+pub use stream::{Level, Stream};
 
 // Re-export types used with `open()` from the facade root so consumers and napi bindings can
 // use `flexaudio::{StreamConfig, SourceKind, ...}` without going through `flexaudio::core`.

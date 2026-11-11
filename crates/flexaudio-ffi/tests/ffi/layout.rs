@@ -35,6 +35,7 @@ macro_rules! assert_layout {
     any(target_os = "linux", target_os = "windows", target_os = "macos")
 ))]
 fn all_fields_have_supported_64_bit_layout() {
+    assert_layout!(FlexLevel, 16, 8; peak = 0 => f32, rms = 4 => f32, age_ns = 8 => u64);
     assert_eq!(size_of::<i32>(), 4);
     assert_eq!(size_of::<u8>(), 1);
     assert_eq!(size_of::<FlexSourceKind>(), 4);

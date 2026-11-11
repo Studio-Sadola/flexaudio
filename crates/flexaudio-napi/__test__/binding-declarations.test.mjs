@@ -2,6 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 const declarations = readFileSync(new URL('../index.d.ts', import.meta.url), 'utf8');
+test('level declaration is a non-consuming snapshot with exact monotonic age', () => {
+  assert.match(declarations, /pollLevel\(\): Level \| undefined/);
+  assert.match(declarations, /export interface Level \{\s+peak: number\s+rms: number[\s\S]*?ageNs: bigint\s+\}/);
+});
 function alias(name) {
   const start = declarations.indexOf(`export type ${name} =`);
   assert.ok(start >= 0, `${name} must be an exported type alias`);

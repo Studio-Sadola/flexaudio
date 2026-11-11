@@ -46,6 +46,45 @@ pub(super) fn binding(inner: fa::Stream) -> Stream {
 }
 
 #[test]
+fn poll_level_is_non_consuming_and_independent_of_paused_pcm() {
+    Python::initialize();
+    Python::attach(|py| {
+        let sink = Sink::default();
+        let inner =
+            fa::Stream::open(fa::StreamConfig::default(), Box::new(Input(sink.clone()))).unwrap();
+        let mut stream = binding(start_capture(inner, false, true).unwrap());
+        assert!(stream.poll_level().unwrap().is_none());
+        stream.pause();
+        sink.lock().unwrap().as_mut().unwrap().push(&[0.5; 5760], 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let first = loop {
+            if let Some(level) = stream.poll_level().unwrap() {
+                break level;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let first = Py::new(py, first).unwrap();
+        assert_eq!(
+            first
+                .bind(py)
+                .getattr("peak")
+                .unwrap()
+                .extract::<f32>()
+                .unwrap(),
+            0.5
+        );
+        for _ in 0..100 {
+            assert!(stream.poll_level().unwrap().is_some());
+            assert!(stream.poll_chunk().unwrap().is_none());
+            assert!(stream.inner.poll_capture().is_none());
+        }
+        stream.stop().unwrap();
+        assert!(stream.poll_level().unwrap().is_none());
+    });
+}
+
+#[test]
 fn stream_denoise_matches_facade_before_downmix_and_gain_on_both_taps() {
     let input: Vec<f32> = (0..9600)
         .flat_map(|i| {

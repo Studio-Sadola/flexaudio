@@ -64,7 +64,11 @@ impl SharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = 0;
         **consumer = Some(new_consumer);
-        self.raw_generation.fetch_add(1, Ordering::SeqCst);
+        let generation = self
+            .raw_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        self.level.replace_generation(generation);
         self.recovered_pending.store(
             matches!(change, GenerationChange::Recovery) && !self.stopping.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -177,6 +181,7 @@ impl SharedState {
 
     /// Stop and recovery publication share the raw lock; delivery cannot announce after this.
     pub(super) fn begin_stopping(&self, _delivery: &MutexGuard<'_, ()>) {
+        self.level.close();
         let _consumer = self.raw_consumer.lock().unwrap_or_else(|e| e.into_inner());
         self.stopping.store(true, Ordering::SeqCst);
         self.recovered_pending.store(false, Ordering::SeqCst);
@@ -286,7 +291,10 @@ impl SharedState {
     }
 
     pub(super) fn fail_terminal_locked(&self, error: Error, delivery: &MutexGuard<'_, ()>) {
-        if self.terminal.record(error.clone()) {
+        let first = self.terminal.record(error.clone());
+        self.level
+            .fail(self.terminal.error().expect("recorded terminal cause"));
+        if first {
             self.begin_stopping(delivery);
             self.push_event(match error {
                 Error::PermissionDenied { permission, detail } => {
