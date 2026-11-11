@@ -238,6 +238,13 @@
       "C": {"status": "supported", "symbols": ["flexaudio_pause", "flexaudio_resume"]},
       "CLI": {"status": "missing", "reason": "No pause/resume command or interactive control is exposed."}
     }},
+    {"feature": "Input levels while paused", "bindings": {
+      "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::poll_level", "flexaudio::Level::peak", "flexaudio::Level::rms", "flexaudio::Level::age_ns"], "note": "Non-consuming raw normalized input before denoise and gain, with measurement age."},
+      "Node": {"status": "supported", "symbols": ["FlexStream.pollLevel", "Level.peak", "Level.rms", "Level.ageNs"]},
+      "Python": {"status": "supported", "symbols": ["Stream.poll_level", "Level.peak", "Level.rms", "Level.age_ns"]},
+      "C": {"status": "supported", "symbols": ["flexaudio_poll_level", "FlexLevel.peak", "FlexLevel.rms", "FlexLevel.age_ns"]},
+      "CLI": {"status": "missing", "reason": "No input-level polling or interactive meter is exposed."}
+    }},
     {"feature": "Automatic stall recovery", "bindings": {
       "Rust": {"status": "supported", "symbols": ["flexaudio::Stream::poll_event", "flexaudio::Event::StreamStalled", "flexaudio::Event::StreamRecovered"], "note": "Watchdog reopens capture; terminal failures require a new stream."},
       "Node": {"status": "supported", "symbols": ["JsStreamEvent"], "note": "Automatic watchdog; stalled/recovered events."},

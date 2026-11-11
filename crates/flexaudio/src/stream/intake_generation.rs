@@ -45,6 +45,7 @@ impl IntakeGeneration {
                 formats.0,
                 formats.1,
                 snapshot.denoise_enabled,
+                snapshot.generation,
             )?,
             overflows: 0,
             minimum_pts,
@@ -78,6 +79,7 @@ impl IntakeGeneration {
             formats.0,
             formats.1,
             denoise_enabled,
+            self.number,
         )?;
         self.clock = ClockNormalizer::new();
         Ok(())

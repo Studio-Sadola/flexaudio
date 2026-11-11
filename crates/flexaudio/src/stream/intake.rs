@@ -95,7 +95,6 @@ fn run_intake_inner(
                         secondary: secondary_producer.as_mut(),
                     },
                     OutputStates {
-                        generation: input.number,
                         capture: &mut capture_state,
                         primary: &mut primary_state,
                         secondary: &mut secondary_state,
@@ -224,7 +223,6 @@ fn run_intake_inner(
                 secondary: secondary_producer.as_mut(),
             },
             OutputStates {
-                generation: input.number,
                 capture: &mut capture_state,
                 primary: &mut primary_state,
                 secondary: &mut secondary_state,
@@ -261,7 +259,6 @@ struct OutputRings<'a> {
     secondary: Option<&'a mut SecondaryChunkProducer>,
 }
 struct OutputStates<'a> {
-    generation: u64,
     capture: &'a mut tap_drain::TapState,
     primary: &'a mut tap_drain::TapState,
     secondary: &'a mut tap_drain::TapState,
@@ -277,7 +274,6 @@ fn drain_outputs(
     stopping: bool,
 ) -> Result<bool> {
     let (output, secondary_output) = formats;
-    states.primary.generation = states.generation;
     if let Some(producer) = rings.capture.as_deref_mut() {
         tap_drain::drain(
             shared,

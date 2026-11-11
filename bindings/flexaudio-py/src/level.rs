@@ -1,7 +1,7 @@
-//! Python projection of the shared primary level.
+//! Python projection of the shared raw input level.
 use pyo3::prelude::*;
 
-/// The level of what the primary stream would deliver, including while paused.
+/// Raw normalized input level before denoise and gain, including while paused.
 #[pyclass(module = "flexaudio", name = "Level", frozen, get_all)]
 pub struct Level {
     peak: f32,

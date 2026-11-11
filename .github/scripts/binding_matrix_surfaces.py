@@ -73,7 +73,7 @@ def rust_declarations(text: str) -> set[str]:
             if depth_at(body, member.start()) == 0:
                 names.add(f"{name}::{member[1]}")
     # Only inherent impls; trait methods and private methods are not public API.
-    for match in re.finditer(r"\bimpl\s+(\w+)\s*\{", text):
+    for match in re.finditer(r"\bimpl\s+(?:super::)?(\w+)\s*\{", text):
         if depth_at(text, match.start()) != 0:
             continue
         body = block(text, match.end() - 1)
@@ -109,6 +109,7 @@ def rust_surface(root: Path) -> set[str]:
             "crates/flexaudio/src/open_options.rs",
             "crates/flexaudio/src/stream.rs",
             "crates/flexaudio/src/stream/delivery.rs",
+            "crates/flexaudio/src/stream/level.rs",
             "crates/flexaudio/src/stream/source.rs",
             "crates/flexaudio/src/stream/lifecycle.rs",
             "crates/flexaudio-core/src/types.rs",

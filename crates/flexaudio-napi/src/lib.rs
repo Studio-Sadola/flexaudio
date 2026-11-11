@@ -1882,7 +1882,7 @@ impl FlexStream {
             .unwrap_or(Either::B(()))
     }
 
-    /// Latest post-denoise/gain primary level without consuming it or querying the bridge.
+    /// Latest raw input level before denoise/gain, without consuming it or querying the bridge.
     /// Returns undefined before measurement/after clean stop; throws on terminal failure.
     #[napi(ts_return_type = "Level | undefined")]
     pub fn poll_level(&self, env: Env) -> napi::Result<Either<level::JsLevel, Undefined>> {

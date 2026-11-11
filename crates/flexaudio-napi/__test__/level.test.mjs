@@ -26,7 +26,8 @@ test('paused shared levels persist across reads without new PCM or attached VAD'
     await delay(25); // Drain callbacks queued before the bridge acknowledged pause.
     const count = chunks.length;
     const a = await waitForLevel(stream);
-    assert.ok(a.peak > 0 && a.peak <= 0.5);
+    assert.ok(a.peak > 0.45 && a.peak <= 0.5,
+      'input levels must be measured before gain and primary output conversion');
     assert.ok(a.rms > 0 && a.rms <= a.peak);
     assert.equal(typeof a.ageNs, 'bigint');
     // Calls are synchronous direct reads; they cannot consume the cell.
@@ -36,6 +37,10 @@ test('paused shared levels persist across reads without new PCM or attached VAD'
       'level reads must not wait for the bridge polling tick on every call');
     await delay(100);
     assert.equal(chunks.length, count, 'paused input must produce neither PCM nor VAD carriers');
+    stream.setGain(0);
+    stream.pause(); // Clear the cell, requiring a new measurement while muted.
+    const muted = await waitForLevel(stream);
+    assert.ok(muted.peak > 0.45 && muted.rms > 0, 'mute must not silence the input meter');
     stream.resume();
     await delay(100);
     assert.ok(chunks.length > count, 'recording must resume');
@@ -47,7 +52,7 @@ test('paused shared levels persist across reads without new PCM or attached VAD'
   assert.equal(stream.pollLevel(), undefined);
 });
 
-test('zero gain meters zero and source replacement still updates the shared cell', async () => {
+test('silent input meters zero and source replacement still updates the shared cell', async () => {
   const stream = native.openStream({ kind: 'mock', gain: 0 }, () => {});
   try {
     const level = await waitForLevel(stream);

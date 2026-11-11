@@ -402,9 +402,9 @@ typedef struct FlexChunk {
     float rms;
 } FlexChunk;
 
-// Latest primary level, copied by flexaudio_poll_level without consuming it.
+// Latest raw input level, copied by flexaudio_poll_level without consuming it.
 typedef struct FlexLevel {
-    // Maximum absolute float sample after denoise, conversion, gain and clipping.
+    // Maximum absolute normalized 48 kHz stereo input sample before denoise and gain.
     float peak;
     // Root mean square of the same float samples.
     float rms;
@@ -1011,10 +1011,11 @@ uint64_t flexaudio_dropped_chunks(const struct FlexStream *s);
 // `s` must be a valid handle, and `out` must point to a valid `FlexChunk` destination.
 int32_t flexaudio_poll_chunk(struct FlexStream *s, struct FlexChunk *out);
 
-// Copy the latest primary level without consuming it, including while paused.
+// Copy the latest raw input level without consuming it, including while paused.
 // Returns 1 on success, 0 before measurement/after clean stop (out untouched),
 // or a negative code with last_error set. Terminal failures return FLEX_FAILURE.
-// This does not poll PCM or run VAD. The value is post-denoise/gain; gain zero meters zero.
+// This does not poll PCM or run VAD. The value is raw normalized input before denoise
+// and gain; gain zero still meters non-silent input.
 //
 // # Safety
 // s must be a valid handle and out must point to a writable, aligned FlexLevel.

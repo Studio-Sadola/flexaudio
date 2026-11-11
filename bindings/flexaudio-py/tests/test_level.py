@@ -18,7 +18,7 @@ class LevelContracts(unittest.TestCase):
 
     @skip_unless_mock_capture
     def test_paused_levels_persist_without_pcm_or_vad_output(self):
-        with fa.open("mock", gain=0.5, vad=fa.StreamVadOptions()) as stream:
+        with fa.open("mock", gain=0.5, denoise=True, vad=fa.StreamVadOptions()) as stream:
             self.wait_level(stream)
             stream.pause()
             while stream.poll_chunk() is not None:
@@ -28,6 +28,10 @@ class LevelContracts(unittest.TestCase):
             # The binding's mock source intentionally sends digital silence.
             # Valid zero samples must still publish a level, rather than None.
             self.assertEqual((level.peak, level.rms), (0, 0))
+            stream.set_gain(0)
+            stream.pause()  # Require a fresh measurement at mute, without polling PCM.
+            muted = self.wait_level(stream)
+            self.assertEqual((muted.peak, muted.rms), (0, 0))
             self.assertIsInstance(level.age_ns, int)
             with self.assertRaises(AttributeError):
                 level.peak = 1

@@ -42,14 +42,17 @@ code with `flexaudio_last_error()` set. Terminal failures return `FLEX_FAILURE`,
 as in `flexaudio_poll_chunk`; typed error accessors retain the cause. No freeing
 is required for the caller-owned level struct. Existing ABI layouts are unchanged.
 
-Levels update on completed primary 20 ms blocks, independently of PCM/VAD polls.
-They describe what the stream would deliver after denoise, conversion, gain and
-clipping; gain zero meters zero. Reads retain the latest values with increasing
-age (monotonic time since measurement, not hardware latency). Pause clears the
+Levels update on completed normalized 20 ms input blocks, independently of PCM/VAD
+polls.
+They measure raw normalized 48 kHz stereo float input before denoise, per-tap
+conversion and gain; gain zero still meters non-silent input. Reads retain the
+latest values with increasing age (monotonic time since measurement, not hardware
+latency). Pause clears the
 cell; subsequent processed input, including pre-pause backlog, refreshes it.
 Pre-pause PCM/VAD remain drainable; paused input produces no new recording PCM
-or attached VAD results. Closure/resume/stop tails are unchanged. Enabled denoise
-keeps running during pause; metering adds primary gain/clipping and peak/RMS work.
+or attached VAD results. Closure/resume/stop tails are unchanged. Metering adds
+only peak/RMS work, without enabling denoise or running an extra denoise pass;
+enabled recording denoise retains its existing paused CPU cost.
 Stop/terminal failure clears levels; switch/recovery rejects old-generation
 values. Stalls/device-loss advisories retain the value with growing age.
 For mute, use `flexaudio_set_gain(s, 0.0)` or explicit v5 gains; legacy

@@ -599,10 +599,11 @@ pub unsafe extern "C" fn flexaudio_poll_chunk(s: *mut FlexStream, out: *mut Flex
     })
 }
 
-/// Copy the latest primary level without consuming it, including while paused.
+/// Copy the latest raw input level without consuming it, including while paused.
 /// Returns 1 on success, 0 before measurement/after clean stop (out untouched),
 /// or a negative code with last_error set. Terminal failures return FLEX_FAILURE.
-/// This does not poll PCM or run VAD. The value is post-denoise/gain; gain zero meters zero.
+/// This does not poll PCM or run VAD. The value is raw normalized input before denoise
+/// and gain; gain zero still meters non-silent input.
 ///
 /// # Safety
 /// s must be a valid handle and out must point to a writable, aligned FlexLevel.

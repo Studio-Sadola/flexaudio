@@ -2,7 +2,7 @@
 use napi::bindgen_prelude::BigInt;
 use napi_derive::napi;
 
-/// The level of what the primary stream would deliver, including while paused.
+/// Raw normalized input level before denoise and gain, including while paused.
 #[napi(object, js_name = "Level")]
 pub struct JsLevel {
     pub peak: f64,

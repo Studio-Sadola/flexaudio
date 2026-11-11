@@ -125,8 +125,58 @@ const TEXT: &str = r#"pub fn fake() { }"#;
             root = Path(temporary)
             self.fixture(root)
             facade = root / "crates/flexaudio/src/lib.rs"
-            facade.write_text(facade.read_text(encoding="utf-8").replace("pub use stream::Stream;", ""), encoding="utf-8")
-            self.assertNotIn("flexaudio::Stream::switch_source", rust_surface(root))
+            # Control the fixture, rather than silently replacing a line that may
+            # no longer exist in the real facade after another type is exported.
+            for exported, removed in (
+                ("pub use stream::Stream;", ""),
+                ("pub use stream::{Level, Stream};", "pub use stream::Level;"),
+            ):
+                with self.subTest(exported=exported):
+                    facade.write_text(exported, encoding="utf-8")
+                    before = rust_surface(root)
+                    self.assertIn("flexaudio::Stream::switch_source", before)
+                    facade.write_text(removed, encoding="utf-8")
+                    after = rust_surface(root)
+                    self.assertNotIn("flexaudio::Stream::switch_source", after)
+                    if removed:
+                        self.assertIn("flexaudio::Level::peak", before)
+                        self.assertIn("flexaudio::Level::peak", after)
+
+    def test_rust_index_handles_parent_qualified_inherent_impls(self) -> None:
+        names = rust_declarations('''
+impl super::Stream { pub fn poll_level(&self) {} }
+impl SomeTrait for super::Stream { fn trait_method() {} }
+mod private { impl super::Stream { pub fn hidden() {} } }
+''')
+        self.assertEqual(names, {"Stream::poll_level"})
+
+    def test_removing_input_level_declarations_invalidates_registered_claims(self) -> None:
+        declarations = {
+            "Rust": ("crates/flexaudio/src/stream/level.rs",
+                     "pub fn poll_level(", "fn poll_level(", "flexaudio::Stream::poll_level"),
+            "Node": ("crates/flexaudio-napi/index.d.ts",
+                     "pollLevel():", "removedPollLevel():", "FlexStream.pollLevel"),
+            "Python": ("bindings/flexaudio-py/flexaudio.pyi",
+                       "def poll_level(", "def removed_poll_level(", "Stream.poll_level"),
+            "C": ("crates/flexaudio-ffi/include/flexaudio.h",
+                  "int32_t flexaudio_poll_level(", "int32_t removed_poll_level(", "flexaudio_poll_level"),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            data = json.loads((root / matrix.DATA).read_text(encoding="utf-8"))
+            row = next(row for row in data["features"] if row["feature"] == "Input levels while paused")
+            matrix.validate(data, surfaces(root))
+            for frontend, (relative, declaration, removed, symbol) in declarations.items():
+                with self.subTest(frontend=frontend):
+                    self.assertIn(symbol, row["bindings"][frontend]["symbols"])
+                    source = root / relative
+                    original = source.read_text(encoding="utf-8")
+                    self.assertIn(declaration, original, "fixture mutation must remove a real declaration")
+                    source.write_text(original.replace(declaration, removed), encoding="utf-8")
+                    with self.assertRaisesRegex(matrix.MatrixError, "unknown symbol " + symbol):
+                        matrix.validate(data, surfaces(root))
+                    source.write_text(original, encoding="utf-8")
 
     def run_gate(self, root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), "--repo-root", str(root), *args],

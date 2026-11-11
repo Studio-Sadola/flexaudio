@@ -450,9 +450,10 @@ The facade crate `flexaudio` re-exports everything you need:
 ### Input levels while paused
 
 `stream.pause(); let level = stream.poll_level();` keeps the same capture stream
-alive for input monitoring. Levels describe **what the primary stream would
-deliver**, after denoise, output conversion, gain and clipping. Gain zero meters
-zero. The cell updates on completed 20 ms primary blocks; repeated reads retain
+alive for input monitoring. Levels measure **raw input before denoise and gain**,
+at the shared normalized 48 kHz stereo float signal, before per-tap output conversion.
+Gain zero still meters non-silent input. The cell updates on completed 20 ms input
+blocks; repeated reads retain
 the latest values with increasing `age_ns` (monotonic time since measurement,
 not hardware latency). Pause clears the cell; subsequently processed input,
 including queued pre-pause backlog, can refresh it. This is a meter, not a
@@ -460,8 +461,10 @@ sample-accurate capture timestamp or proof of permission/device health.
 
 Pre-pause PCM/VAD remain drainable; paused input produces no new recording PCM
 or attached VAD results. Existing VAD closure, resume discontinuity and stop tails
-are unchanged. Enabled denoise keeps running during pause; metering additionally
-performs primary gain/clipping and peak/RMS computation. No extra capture stream
+are unchanged. Metering adds only peak/RMS computation on the intake worker: it
+neither enables denoise nor invokes it separately, and skips paused output gain/clipping.
+Existing recording DSP and its flush behavior are unchanged; enabled recording
+denoise retains its existing paused CPU cost. No extra capture stream
 or realtime callback allocations/locks are needed. Stop/terminal failure clears
 the meter; switch/recovery clears it until new-generation input is processed.
 Transient stalls/device-loss advisories retain the previous value with growing

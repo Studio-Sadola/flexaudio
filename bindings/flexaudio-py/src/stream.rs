@@ -130,7 +130,7 @@ impl Stream {
         self.inner.is_paused()
     }
 
-    /// Latest post-denoise/gain primary level, without consuming it or polling PCM.
+    /// Latest raw input level before denoise/gain, without consuming it or polling PCM.
     /// Returns None before measurement/after clean stop; raises on terminal failure.
     fn poll_level(&self) -> PyResult<Option<crate::level::Level>> {
         if let Some(error) = self.inner.terminal_error() {

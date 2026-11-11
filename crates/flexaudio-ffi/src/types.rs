@@ -108,11 +108,11 @@ pub struct FlexChunk {
     pub rms: f32,
 }
 
-/// Latest primary level, copied by flexaudio_poll_level without consuming it.
+/// Latest raw input level, copied by flexaudio_poll_level without consuming it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FlexLevel {
-    /// Maximum absolute float sample after denoise, conversion, gain and clipping.
+    /// Maximum absolute normalized 48 kHz stereo input sample before denoise and gain.
     pub peak: f32,
     /// Root mean square of the same float samples.
     pub rms: f32,

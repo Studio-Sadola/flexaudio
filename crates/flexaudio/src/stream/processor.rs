@@ -49,6 +49,28 @@ fn build_inner_processor(denoise_enabled: bool) -> Option<Box<dyn InnerProcessor
     }
 }
 
+/// Observe the existing canonical signal before the optional recording DSP.
+/// Metering never enables denoise or processes its synthetic flush tail.
+struct MonitoredInput {
+    meter: level::InputMeter,
+    processor: Option<Box<dyn InnerProcessor>>,
+}
+
+impl InnerProcessor for MonitoredInput {
+    fn process(&mut self, samples: &mut [f32]) {
+        self.meter.process(samples);
+        if let Some(processor) = self.processor.as_mut() {
+            processor.process(samples);
+        }
+    }
+
+    fn flush(&mut self) -> Vec<f32> {
+        self.processor
+            .as_mut()
+            .map_or_else(Vec::new, |processor| processor.flush())
+    }
+}
+
 /// Build the [`Normalizer`] for the current generation: primary output, the
 /// optional secondary tap, and the optional denoise inner processor. Kept in one
 /// place so `start` and the intake generation-change path stay in sync.
@@ -59,6 +81,7 @@ pub(super) fn build_normalizer(
     output: OutputFormat,
     secondary_output: Option<OutputFormat>,
     denoise_enabled: bool,
+    generation: u64,
 ) -> Result<Normalizer> {
     let mut n = Normalizer::new(rate, channels, output)?;
     if shared.capture_enabled.load(Ordering::SeqCst) {
@@ -67,9 +90,9 @@ pub(super) fn build_normalizer(
     if let Some(sec) = secondary_output {
         n = n.with_secondary(sec)?;
     }
-    let processor = build_inner_processor(denoise_enabled);
-    if let Some(processor) = processor {
-        n = n.with_inner_processor(processor);
-    }
+    n = n.with_inner_processor(Box::new(MonitoredInput {
+        meter: level::InputMeter::new(shared.level.clone(), generation),
+        processor: build_inner_processor(denoise_enabled),
+    }));
     Ok(n)
 }

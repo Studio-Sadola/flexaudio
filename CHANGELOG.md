@@ -16,12 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Input level monitoring while capture delivery is paused: Rust `Stream::poll_level`,
   Node `pollLevel`, Python `poll_level`, and C `flexaudio_poll_level`/`FlexLevel`.
-  Non-consuming reads return primary peak/RMS after denoise, conversion, gain and
-  clipping, plus monotonic measurement age. Node reads the shared core cell without
-  a bridge round-trip. Pause clears the level; completed input blocks refresh it.
+  Non-consuming reads return raw input peak/RMS after shared normalization, before
+  denoise, per-tap conversion and gain, plus monotonic measurement age. Node reads
+  the shared core cell without a bridge round-trip. Pause clears the level;
+  completed input blocks refresh it.
   Existing queued PCM/VAD draining, gap closure and stop tails remain unchanged.
-- Level monitoring keeps enabled denoise running during pause and adds gain/meter
-  computation on paused primary blocks. Gain zero meters zero; stopped/terminal
+- Level monitoring reuses normalized 48 kHz stereo float input without another
+  converter or denoise pass. Gain zero still meters non-silent input; stopped/terminal
   streams cannot publish new levels, and source replacement rejects old generations.
 - Rust `DeviceWatcher::stop_checked()` and `shutdown_report()` expose retained
   teardown outcomes independently of polling, with identical repeated results.

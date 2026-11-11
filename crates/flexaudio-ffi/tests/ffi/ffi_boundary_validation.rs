@@ -98,6 +98,7 @@ fn stop_no_addons_control() {
 #[test]
 fn poll_level_preserves_values_while_paused_and_closes_at_stop() {
     let (mut stream, sink) = stream(false);
+    stream.inner.set_gain(0.0).unwrap();
     let mut level = crate::FlexLevel {
         peak: -1.0,
         rms: -1.0,

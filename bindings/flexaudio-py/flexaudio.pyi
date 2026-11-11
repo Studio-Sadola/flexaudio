@@ -598,7 +598,7 @@ class SecondaryChunk:
     def vad_events(self) -> Optional[List[AttachedVadEvent]]: ...
 
 class Level:
-    """Primary float level after denoise/conversion/gain/clipping; gain zero meters zero."""
+    """Raw normalized 48 kHz stereo input level before denoise and gain; mute does not mute the meter."""
     @property
     def peak(self) -> float: ...
     @property

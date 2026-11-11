@@ -4,10 +4,10 @@ use std::time::Instant;
 
 use crate::{Error, Result};
 
-/// The level of what the primary stream would deliver, including while paused.
+/// Raw input level after normalization, before denoise and gain, including while paused.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Level {
-    /// Maximum absolute sample after denoise, output conversion, gain and clipping.
+    /// Maximum absolute normalized input sample before denoise, output conversion and gain.
     pub peak: f32,
     /// Root mean square of those same float samples.
     pub rms: f32,
@@ -29,6 +29,44 @@ struct State {
 #[doc(hidden)]
 #[derive(Clone, Default)]
 pub struct LevelReader(Arc<Mutex<State>>);
+
+/// Accumulate one canonical 20 ms block without buffering or converting PCM again.
+pub(super) struct InputMeter {
+    reader: LevelReader,
+    generation: u64,
+    samples: usize,
+    peak: f32,
+    sum_sq: f64,
+}
+
+impl InputMeter {
+    pub fn new(reader: LevelReader, generation: u64) -> Self {
+        Self {
+            reader,
+            generation,
+            samples: 0,
+            peak: 0.0,
+            sum_sq: 0.0,
+        }
+    }
+
+    /// Called only on the intake worker, on the existing normalized stereo signal.
+    pub fn process(&mut self, input: &[f32]) {
+        const BLOCK_SAMPLES: usize = flexaudio_core::normalizer::CHUNK_FRAMES * 2;
+        for &sample in input {
+            self.peak = self.peak.max(sample.abs());
+            self.sum_sq += f64::from(sample) * f64::from(sample);
+            self.samples += 1;
+            if self.samples == BLOCK_SAMPLES {
+                let rms = (self.sum_sq / BLOCK_SAMPLES as f64).sqrt() as f32;
+                self.reader.publish(self.generation, self.peak, rms);
+                self.samples = 0;
+                self.peak = 0.0;
+                self.sum_sq = 0.0;
+            }
+        }
+    }
+}
 
 impl LevelReader {
     /// Copy the latest value without consuming it; retain typed terminal failures.
@@ -82,11 +120,12 @@ impl LevelReader {
 }
 
 impl super::Stream {
-    /// Latest primary level, without consuming it. Also updates while paused.
+    /// Latest raw input level, without consuming it. Also updates while paused.
     ///
-    /// Measures the float samples the stream would deliver after denoise/conversion/gain.
-    /// Gain zero meters zero. Pause clears the cell, then any completed block (including
-    /// queued input) can refresh it. Repeated reads retain the value with increasing age.
+    /// Measures normalized 48 kHz stereo float input before denoise, output conversion
+    /// and gain. Gain zero still meters non-silent input. Pause clears the cell, then
+    /// any completed block (including queued input) can refresh it. Repeated reads
+    /// retain the value with increasing age.
     /// Returns None before the first measurement, after stop, or on terminal failure;
     /// inspect [`Self::terminal_error`] for the retained failure.
     pub fn poll_level(&self) -> Option<Level> {

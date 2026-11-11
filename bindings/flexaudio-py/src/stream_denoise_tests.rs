@@ -52,8 +52,9 @@ fn poll_level_is_non_consuming_and_independent_of_paused_pcm() {
         let sink = Sink::default();
         let inner =
             fa::Stream::open(fa::StreamConfig::default(), Box::new(Input(sink.clone()))).unwrap();
-        let mut stream = binding(start_capture(inner, false, true).unwrap());
+        let mut stream = binding(start_capture(inner, true, true).unwrap());
         assert!(stream.poll_level().unwrap().is_none());
+        stream.inner.set_gain(0.0).unwrap();
         stream.pause();
         sink.lock().unwrap().as_mut().unwrap().push(&[0.5; 5760], 0);
         let deadline = Instant::now() + Duration::from_secs(2);

@@ -52,13 +52,11 @@ fn fixture() -> (Stream, Sink) {
 
 fn drain_inflight_primary(stream: &Stream, generation: u64) {
     let format = OutputFormat::default();
-    let mut normalizer = Normalizer::new(48_000, 2, format).unwrap();
+    let mut normalizer =
+        build_normalizer(&stream.shared, 48_000, 2, format, None, false, generation).unwrap();
     normalizer.push(&[0.875; 1920], 0).unwrap();
     let (mut producer, _consumer) = chunk_ring(4);
-    let mut state = tap_drain::TapState {
-        generation,
-        ..Default::default()
-    };
+    let mut state = tap_drain::TapState::default();
     tap_drain::drain(
         &stream.shared,
         || normalizer.pop_chunk_with_metadata(),
@@ -77,19 +75,23 @@ fn paused_level_keeps_up_without_publishing_pcm_or_vad_input() {
     push(&sink, 0.25);
     wait(|| stream.shared.primary_frame_index.load(Ordering::SeqCst) >= 2880);
     stream.pause();
+    assert!(
+        stream.poll_level().is_none(),
+        "pause must clear the previous level"
+    );
     // The existing contract permits draining pre-pause queues on every tap.
     while stream.poll_chunk().is_some() {}
     while stream.poll_secondary().is_some() {}
     while stream.poll_capture().is_some() {}
     stream.set_gain(2.0).unwrap();
     push(&sink, 0.375);
-    wait(|| stream.poll_level().is_some_and(|v| v.peak == 0.75));
+    wait(|| stream.poll_level().is_some_and(|v| v.peak == 0.375));
     assert!(stream.is_paused());
     let shared = stream.shared.clone();
     let delivery = shared.delivery.lock().unwrap();
     let a = stream.poll_level().unwrap();
     let b = stream.level_reader().poll_level().unwrap().unwrap();
-    assert_eq!((a.peak, a.rms), (0.75, 0.75));
+    assert_eq!((a.peak, a.rms), (0.375, 0.375));
     assert_eq!((a.peak, a.rms), (b.peak, b.rms));
     assert!(b.age_ns >= a.age_ns);
     drop(delivery);
@@ -107,7 +109,7 @@ fn paused_level_keeps_up_without_publishing_pcm_or_vad_input() {
     wait(|| {
         stream
             .poll_level()
-            .is_some_and(|v| v.peak == 0.0 && v.rms == 0.0)
+            .is_some_and(|v| v.peak == 0.75 && v.rms == 0.75)
     });
     stream.resume().unwrap();
     push(&sink, 0.5);
@@ -122,7 +124,7 @@ fn paused_level_keeps_up_without_publishing_pcm_or_vad_input() {
 }
 
 #[test]
-fn levels_match_denoised_primary_pcm_and_clipping() {
+fn levels_measure_input_before_denoise_gain_and_clipping() {
     for denoise in [false, true] {
         let (mut stream, sink) = fixture();
         // Rebuild as a generation, just like a source switch applies denoise.
@@ -132,6 +134,7 @@ fn levels_match_denoised_primary_pcm_and_clipping() {
         stream.set_gain(4.0).unwrap();
         push(&sink, 0.5);
         wait(|| stream.poll_level().is_some());
+        wait(|| stream.shared.primary_frame_index.load(Ordering::SeqCst) >= 2880);
         // Finish consumption before comparing to the most recently published chunk.
         wait(|| {
             stream
@@ -154,17 +157,54 @@ fn levels_match_denoised_primary_pcm_and_clipping() {
         }
         let level = stream.poll_level().unwrap();
         let chunk = last.unwrap();
-        assert_eq!((level.peak, level.rms), (chunk.peak, chunk.rms));
+        assert_eq!((level.peak, level.rms), (0.5, 0.5));
         if !denoise {
-            assert_eq!((level.peak, level.rms), (1.0, 1.0));
+            assert_eq!((chunk.peak, chunk.rms), (1.0, 1.0));
         }
         drop(delivery);
+        stream.pause();
+        stream.set_gain(0.0).unwrap();
+        push(&sink, 0.75);
+        wait(|| stream.poll_level().is_some_and(|value| value.peak == 0.75));
+        let raw = stream.poll_level().unwrap();
+        assert_eq!(
+            (raw.peak, raw.rms),
+            (0.75, 0.75),
+            "denoise and mute must not change input levels"
+        );
         stream.stop_checked().unwrap();
         assert!(
             stream.poll_level().is_none(),
             "stop tails must not refresh the meter"
         );
     }
+}
+
+#[test]
+fn input_meter_uses_shared_normalization_before_denoise_and_tap_conversion() {
+    let (mut stream, _) = fixture();
+    let generation = stream.shared.raw_generation.load(Ordering::SeqCst);
+    let output = OutputFormat {
+        sample_rate: 16_000,
+        channels: 1,
+    };
+    let mut metered =
+        build_normalizer(&stream.shared, 44_100, 1, output, None, true, generation).unwrap();
+    let mut reference = Normalizer::new(44_100, 1, OutputFormat::default()).unwrap();
+    let input: Vec<f32> = (0..4410).map(|i| 0.4 * (i as f32 * 0.1).sin()).collect();
+    metered.push(&input, 0).unwrap();
+    reference.push(&input, 0).unwrap();
+    let mut expected = None;
+    while let Some((raw, _)) = reference.pop_chunk() {
+        expected = Some(peak_rms(&raw));
+    }
+    let raw = stream.poll_level().unwrap();
+    assert_eq!(
+        (raw.peak, raw.rms),
+        expected.unwrap(),
+        "use the existing stage-one conversion, before denoise or per-tap conversion"
+    );
+    stream.stop_checked().unwrap();
 }
 
 #[test]
