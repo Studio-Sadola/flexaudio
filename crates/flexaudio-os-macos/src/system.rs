@@ -165,12 +165,20 @@ impl MacSystemBackend {
     /// UID at `start`, returning [`Error::DeviceNotFound`] if missing). `None` selects the
     /// default output. Process exclusions also apply when a device is selected.
     ///
-    /// Cache fallback native format `(48000, 2)`. The actual format comes from the tap's ASBD
-    /// when the tap is created at `start`, but `native_format` must return a value at
-    /// construction time, so use a fallback that does not require a tap. Startup verifies
-    /// the tap's full native description against the sink and rejects mismatches with
-    /// `NativeFormatChanged` before delivering samples.
+    /// Seed `native_format` from the selected/default output device's output stream ASBD at
+    /// construction time, because the facade builds the sink and normalizer from that value
+    /// before `start` creates the tap. Startup still verifies the tap's full native
+    /// description against the sink and rejects mismatches with `NativeFormatChanged`;
+    /// `(48000, 2)` remains only as the fallback when the device format cannot be read.
     pub fn new(exclude_self: bool, device_id: Option<String>) -> Self {
+        // Resolve before `device_id` moves into the struct. The tap follows the device's
+        // output stream ASBD, so seed that instead of assuming 48 kHz stereo (Bluetooth A2DP
+        // outputs commonly run at 44.1 kHz, which previously made every start fail with
+        // `NativeFormatChanged`).
+        let native = match crate::devices::selected_output_format(device_id.as_deref()) {
+            Ok((rate, channels)) if rate > 0 && channels > 0 => (rate, channels),
+            _ => FALLBACK_FORMAT,
+        };
         Self {
             exclude_self,
             exclude_pids: Vec::new(),
@@ -182,7 +190,7 @@ impl MacSystemBackend {
             handle: None,
             shutdown: OwnerShutdown::default(),
             events: None,
-            native: FALLBACK_FORMAT,
+            native,
         }
     }
 
@@ -506,6 +514,17 @@ pub(crate) fn run_tap_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The backend seeds `native_format` from the selected/default output stream format so the
+    /// tap's startup verification matches non-48 kHz outputs (for example Bluetooth A2DP).
+    #[test]
+    fn native_format_seeds_from_selected_output_format() {
+        let backend = MacSystemBackend::new(false, None);
+        match crate::devices::selected_output_format(None) {
+            Ok(format) => assert_eq!(backend.native_format(), format),
+            Err(_) => assert_eq!(backend.native_format(), FALLBACK_FORMAT),
+        }
+    }
 
     #[test]
     fn silence_probe_defaults_on_and_can_be_disabled() {
