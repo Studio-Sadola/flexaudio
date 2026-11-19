@@ -18,13 +18,14 @@ use std::ptr::NonNull;
 
 use objc2_core_audio::{
     kAudioDevicePropertyDeviceUID, kAudioDevicePropertyNominalSampleRate,
-    kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyStreams,
-    kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDevices,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, AudioObjectGetPropertyData,
-    AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
+    kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyStreamFormat,
+    kAudioDevicePropertyStreams, kAudioHardwarePropertyDefaultOutputDevice,
+    kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain, kAudioObjectPropertyName,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
+    AudioObjectPropertyAddress,
 };
-use objc2_core_audio_types::AudioBufferList;
+use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription};
 
 use flexaudio_core::types::{DeviceInfo, Error, Result, SourceKind};
 
@@ -248,6 +249,92 @@ fn device_uid(device: AudioObjectID) -> Result<String> {
     .ok_or_else(invalid_property)
 }
 
+/// Resolve the selectable output device a request refers to.
+///
+/// `None` resolves the default output and fails with `DeviceNotFound` when there is none;
+/// `Some(id)` accepts the same name-based IDs and UID fallbacks as [`list_output_devices`]
+/// and is resolved with the identity matching used by the tap. Shared by
+/// [`selected_output_format`] and [`resolve_output_device_uid`] so both agree on which
+/// device is meant.
+fn resolve_output_device_id(requested_id: Option<&str>) -> Result<AudioObjectID> {
+    match requested_id {
+        Some(requested_id) => {
+            for id in all_device_ids(read_system_object_list)? {
+                if crate::inventory::output_device_matches(is_output_device(id), || {
+                    flexaudio_core::inventory::device_identity_matches(
+                        requested_id,
+                        device_name(id),
+                        || device_uid(id),
+                    )
+                })? {
+                    return Ok(id);
+                }
+            }
+            Err(Error::DeviceNotFound)
+        }
+        None => {
+            let id = default_output_device()?;
+            if id == 0 {
+                return Err(Error::DeviceNotFound);
+            }
+            Ok(id)
+        }
+    }
+}
+
+/// Real output stream format `(rate, channels)` of the selected/default output device.
+///
+/// A process tap follows its destination device's output stream ASBD, which is not
+/// necessarily the device's nominal sample rate: Bluetooth A2DP outputs, for example, can
+/// report a nominal rate that differs from the active stream format. Seeding
+/// `MacSystemBackend::native_format` from this value keeps the tap's startup verification
+/// consistent instead of assuming 48 kHz stereo.
+///
+/// This is the single format source for output devices: both `native_format` seeding and
+/// `require_output_format` (open-time validation) read the same stream 0 ASBD the tap sees.
+pub(crate) fn selected_output_format(requested_id: Option<&str>) -> Result<(u32, u16)> {
+    output_stream_format(resolve_output_device_id(requested_id)?)
+}
+
+/// Read stream 0's output ASBD on the device's output scope.
+///
+/// That is the native format a process tap on this device receives, so callers use it for
+/// both the expected `native_format` and open-time format validation.
+fn output_stream_format(device: AudioObjectID) -> Result<(u32, u16)> {
+    let addr = address(
+        kAudioDevicePropertyStreamFormat,
+        kAudioObjectPropertyScopeOutput,
+    );
+    // ASBD has no Default, so zero-initialize it and let the OS fill it in.
+    // SAFETY: AudioStreamBasicDescription is a `#[repr(C)]` POD with only numeric fields.
+    let mut asbd: AudioStreamBasicDescription = unsafe { core::mem::zeroed() };
+    let mut size = core::mem::size_of::<AudioStreamBasicDescription>() as u32;
+    // SAFETY: addr, size, and asbd are valid local values.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device,
+            NonNull::from(&addr),
+            0,
+            core::ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::new_unchecked(
+                (&mut asbd as *mut AudioStreamBasicDescription).cast::<c_void>(),
+            ),
+        )
+    };
+    check_status("AudioObjectGetPropertyData(StreamFormat)", status)?;
+    if size as usize != core::mem::size_of::<AudioStreamBasicDescription>() {
+        return Err(invalid_property());
+    }
+    let rate = asbd.mSampleRate;
+    if !rate.is_finite() || rate <= 0.0 || asbd.mChannelsPerFrame == 0 {
+        return Err(invalid_property());
+    }
+    let rate = u32::try_from(rate as u64).map_err(|_| invalid_property())?;
+    let channels = u16::try_from(asbd.mChannelsPerFrame).map_err(|_| invalid_property())?;
+    Ok((rate, channels))
+}
+
 /// Enumerate output (playback) devices.
 ///
 /// Each [`DeviceInfo`]:
@@ -354,38 +441,27 @@ fn output_device_identity(id: AudioObjectID) -> Option<(String, String)> {
     flexaudio_core::inventory::device_identity(device_name(id), || device_uid(id))
 }
 
-/// Validate the actual selected/default device's format before creating any tap.
+/// Validate the device's output stream ASBD before creating any tap.
+///
+/// Deliberately reads the stream format (what the tap receives) rather than
+/// `kAudioDevicePropertyNominalSampleRate`, so open-time validation and startup verification
+/// agree on non-48 kHz outputs. See [`selected_output_format`].
 fn require_output_format(id: AudioObjectID) -> Result<(u32, u16)> {
-    flexaudio_core::inventory::require_device_format(
-        device_sample_rate(id)
-            .and_then(|rate| device_channels(id).map(|channels| (rate, channels))),
-    )
+    flexaudio_core::inventory::require_device_format(output_stream_format(id))
 }
 
 /// Resolve a name-based inventory ID or its unknown-name UID fallback.
 /// None retains default tap routing after validating the resolved default device.
+///
+/// Format validation uses [`require_output_format`], i.e. the same output stream ASBD that
+/// [`selected_output_format`] seeds into `native_format`.
 pub(crate) fn resolve_output_device_uid(requested_id: Option<&str>) -> Result<Option<String>> {
-    let Some(requested_id) = requested_id else {
-        let id = default_output_device()?;
-        if id == 0 {
-            return Err(Error::DeviceNotFound);
-        }
-        require_output_format(id)?;
+    let device = resolve_output_device_id(requested_id)?;
+    require_output_format(device)?;
+    if requested_id.is_none() {
         return Ok(None);
-    };
-    for id in all_device_ids(read_system_object_list)? {
-        if crate::inventory::output_device_matches(is_output_device(id), || {
-            flexaudio_core::inventory::device_identity_matches(
-                requested_id,
-                device_name(id),
-                || device_uid(id),
-            )
-        })? {
-            require_output_format(id)?;
-            return device_uid(id).map(Some);
-        }
     }
-    Err(Error::DeviceNotFound)
+    device_uid(device).map(Some)
 }
 
 #[cfg(test)]
@@ -453,6 +529,69 @@ mod tests {
                 .permission(),
             Some(flexaudio_core::Permission::SystemAudio)
         );
+    }
+
+    /// Open-time validation and native-format seeding read the same stream ASBD.
+    #[test]
+    fn require_output_format_agrees_with_selected_output_format() {
+        let Ok(id) = default_output_device() else {
+            return;
+        };
+        if id == 0 {
+            return;
+        }
+        let Ok(required) = require_output_format(id) else {
+            return;
+        };
+        let Ok(selected) = selected_output_format(None) else {
+            return;
+        };
+        assert_eq!(required, selected);
+    }
+
+    /// The selected/default output resolves to a usable stream format, or the environment has no
+    /// default output (headless CI); neither case may panic or fabricate a format.
+    #[test]
+    fn selected_output_format_resolves_default_output() {
+        match default_output_device() {
+            Ok(id) if id != 0 => {
+                let (rate, channels) =
+                    selected_output_format(None).expect("default output stream format");
+                assert!(rate > 0, "rate must be positive");
+                assert!(channels > 0, "channels must be positive");
+            }
+            _ => {}
+        }
+    }
+
+    /// A listed output device resolves through the same identity matching the tap uses.
+    #[test]
+    fn selected_output_format_resolves_listed_device() {
+        let devices = list_output_devices().expect("list_output_devices should not error");
+        let Some(device) = devices
+            .iter()
+            .find(|device| device.format_available && device.channels > 0)
+        else {
+            return;
+        };
+        match selected_output_format(Some(&device.id)) {
+            Ok((rate, channels)) => {
+                assert!(rate > 0, "rate must be positive");
+                assert!(channels > 0, "channels must be positive");
+            }
+            // The device may disappear between enumeration and resolution.
+            Err(Error::DeviceNotFound) => {}
+            Err(error) => panic!("unexpected error for listed device: {error:?}"),
+        }
+    }
+
+    /// A nonexistent device is reported as DeviceNotFound instead of silently using the default.
+    #[test]
+    fn selected_output_format_rejects_unknown_device() {
+        assert!(matches!(
+            selected_output_format(Some("flexaudio-no-such-output-device-xyzzy")),
+            Err(Error::DeviceNotFound)
+        ));
     }
 
     /// Resolving a nonexistent inventory ID returns DeviceNotFound.
