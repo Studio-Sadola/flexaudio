@@ -16,6 +16,7 @@
 //! Uses the same design as [`MacSystemBackend`](crate::MacSystemBackend). Confine the `!Send` ObjC
 //! value ([`TapChain`]) to a dedicated thread; the backend itself holds only `Send` values.
 
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -27,11 +28,31 @@ use flexaudio_core::types::{Error, Event, ProcessMode, Result};
 use crate::owner::{stop_owner, OwnerShutdown};
 use flexaudio_core::{ErrorContext, Operation, ShutdownReport};
 
-use crate::common::{translate_pid_to_object, FALLBACK_FORMAT};
+use crate::common::{native_format_from_source, translate_pid_to_object, FALLBACK_FORMAT};
 use crate::probe::PublicationGate;
 use crate::system::{run_tap_thread, TapThreadConfig};
-use crate::tap::TapKind;
+use crate::tap::{probe_tap_format, TapKind};
 use crate::terminal::{StartAction, TerminalFailure};
+
+fn probe_process_kind(object: u32, mode: ProcessMode) -> Result<TapKind> {
+    if object == 0 {
+        return Err(Error::DeviceNotFound);
+    }
+    Ok(match mode {
+        ProcessMode::Include => TapKind::IncludeProcesses(vec![object]),
+        ProcessMode::Exclude => TapKind::ExcludeProcesses(vec![object]),
+    })
+}
+
+fn probe_process_format(target_pid: u32, mode: ProcessMode) -> Result<(u32, u16)> {
+    crate::version::ensure_process_tap_supported()?;
+    let pid = i32::try_from(target_pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| Error::InvalidArg("target_pid must be in 1..=i32::MAX".into()))?;
+    let object = translate_pid_to_object(pid)?;
+    probe_tap_format(probe_process_kind(object, mode)?)
+}
 
 /// A [`CaptureBackend`] that captures audio for a specific PID using a process-specific Process Tap.
 ///
@@ -60,9 +81,9 @@ pub struct MacProcessBackend {
     shutdown: OwnerShutdown,
     /// Owner-thread notifications for the current capture generation.
     events: Option<mpsc::Receiver<Event>>,
-    /// Native format `(rate, channels)`. Cache the fallback because the actual format is determined
-    /// when the tap is created, following [`MacSystemBackend`].
-    native: (u32, u16),
+    /// Last format read from a short-lived tap.
+    native: Cell<(u32, u16)>,
+    seed_error: RefCell<Option<Error>>,
 }
 
 impl MacProcessBackend {
@@ -78,7 +99,8 @@ impl MacProcessBackend {
             handle: None,
             shutdown: OwnerShutdown::default(),
             events: None,
-            native: FALLBACK_FORMAT,
+            native: Cell::new(FALLBACK_FORMAT),
+            seed_error: RefCell::new(None),
         }
     }
 
@@ -101,7 +123,12 @@ impl MacProcessBackend {
 
 impl CaptureBackend for MacProcessBackend {
     fn native_format(&self) -> (u32, u16) {
-        self.native
+        native_format_from_source(
+            &self.native,
+            &self.seed_error,
+            self.handle.is_none() && self.terminal.error().is_none(),
+            || probe_process_format(self.target_pid, self.mode),
+        )
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
@@ -113,6 +140,10 @@ impl CaptureBackend for MacProcessBackend {
             .ok()
             .filter(|pid| *pid > 0)
             .ok_or_else(|| Error::InvalidArg("target_pid must be in 1..=i32::MAX".into()))?;
+
+        if let Some(error) = self.seed_error.borrow().as_ref() {
+            return Err(error.clone());
+        }
 
         // Version gate: Process Tap requires macOS 14.4 or later. Check the OS version before
         // creating the tap; return the typed Error::UnsupportedOsVersion instead of converting a
@@ -240,6 +271,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn probe_requires_a_process_object_for_both_modes() {
+        for mode in [ProcessMode::Include, ProcessMode::Exclude] {
+            assert!(matches!(
+                probe_process_kind(0, mode),
+                Err(Error::DeviceNotFound)
+            ));
+        }
+        assert!(
+            matches!(probe_process_kind(42, ProcessMode::Include), Ok(TapKind::IncludeProcesses(ids)) if ids == vec![42])
+        );
+        assert!(
+            matches!(probe_process_kind(42, ProcessMode::Exclude), Ok(TapKind::ExcludeProcesses(ids)) if ids == vec![42])
+        );
+    }
+
+    #[test]
     fn silence_probe_defaults_on_and_can_be_disabled() {
         assert!(MacProcessBackend::new(1234, ProcessMode::Include).silence_probe);
         assert!(
@@ -250,6 +297,15 @@ mod tests {
     }
 
     use flexaudio_core::raw_ring;
+
+    #[test]
+    fn start_returns_retained_probe_error_without_hardware() {
+        let mut backend = MacProcessBackend::new(1234, ProcessMode::Include);
+        let error = Error::Backend("probe failed".into());
+        backend.seed_error.replace(Some(error.clone()));
+        let (producer, _consumer) = raw_ring(16);
+        assert_eq!(backend.start(RawSink::new(producer, 48_000, 2)), Err(error));
+    }
 
     #[test]
     fn repeated_start_returns_terminal_cause_before_running_noop_and_after_stop() {

@@ -36,6 +36,7 @@
 //! thread. [`MacSystemBackend`] stores only `Send` values (stop flag, [`JoinHandle`], and
 //! cached format), following the same design as Windows.
 
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -49,10 +50,10 @@ use crate::capture_health::SilenceDetector;
 use crate::owner::{stop_owner, OwnerShutdown};
 use flexaudio_core::{ErrorContext, Operation, ShutdownReport};
 
-use crate::common::{translate_pid_to_object, FALLBACK_FORMAT};
+use crate::common::{native_format_from_source, translate_pid_to_object, FALLBACK_FORMAT};
 use crate::native_probe::NativeProbe;
 use crate::probe::{GenerationProbe, ProbeControl, ProbeDecision, PublicationGate, PROBE_TIMEOUT};
-use crate::tap::{build_tap_chain, TapChain, TapKind};
+use crate::tap::{build_tap_chain, probe_tap_format, TapChain, TapKind};
 use crate::terminal::{StartAction, TerminalFailure};
 
 /// Choose the system tap from the resolved exclusion snapshot and optional device UID.
@@ -64,6 +65,32 @@ fn system_tap_kind(excluded_objects: Vec<u32>, device_uid: Option<String>) -> Ta
         },
         None => TapKind::ExcludeProcesses(excluded_objects),
     }
+}
+
+fn probe_system_format(
+    exclude_self: bool,
+    exclude_pids: &[u32],
+    device_id: Option<&str>,
+) -> Result<(u32, u16)> {
+    crate::version::ensure_process_tap_supported()?;
+    let mut ids = Vec::new();
+    let own_pid = std::process::id();
+    for pid in exclude_pids
+        .iter()
+        .copied()
+        .chain(exclude_self.then_some(own_pid))
+    {
+        let macos_pid = checked_exclusion_pid(pid)?;
+        if let Some(id) =
+            resolve_exclusion(translate_pid_to_object(macos_pid), pid == own_pid, || {
+                probe_process_exists(macos_pid)
+            })?
+        {
+            ids.push(id);
+        }
+    }
+    let uid = crate::devices::resolve_output_device_uid(device_id)?;
+    probe_tap_format(system_tap_kind(ids, uid))
 }
 
 fn checked_exclusion_pid(pid: u32) -> Result<i32> {
@@ -150,9 +177,9 @@ pub struct MacSystemBackend {
     shutdown: OwnerShutdown,
     /// Owner-thread notifications for the current capture generation.
     events: Option<mpsc::Receiver<Event>>,
-    /// Native format `(rate, channels)`. The actual values are determined after tap creation
-    /// through `start`, but `native_format` returns the cached fallback beforehand.
-    native: (u32, u16),
+    /// Last format read from a short-lived tap.
+    native: Cell<(u32, u16)>,
+    seed_error: RefCell<Option<Error>>,
 }
 
 impl MacSystemBackend {
@@ -165,11 +192,7 @@ impl MacSystemBackend {
     /// UID at `start`, returning [`Error::DeviceNotFound`] if missing). `None` selects the
     /// default output. Process exclusions also apply when a device is selected.
     ///
-    /// Cache fallback native format `(48000, 2)`. The actual format comes from the tap's ASBD
-    /// when the tap is created at `start`, but `native_format` must return a value at
-    /// construction time, so use a fallback that does not require a tap. Startup verifies
-    /// the tap's full native description against the sink and rejects mismatches with
-    /// `NativeFormatChanged` before delivering samples.
+    /// The format is probed when the facade requests it before constructing a sink.
     pub fn new(exclude_self: bool, device_id: Option<String>) -> Self {
         Self {
             exclude_self,
@@ -182,7 +205,8 @@ impl MacSystemBackend {
             handle: None,
             shutdown: OwnerShutdown::default(),
             events: None,
-            native: FALLBACK_FORMAT,
+            native: Cell::new(FALLBACK_FORMAT),
+            seed_error: RefCell::new(None),
         }
     }
 
@@ -221,12 +245,27 @@ impl Default for MacSystemBackend {
 
 impl CaptureBackend for MacSystemBackend {
     fn native_format(&self) -> (u32, u16) {
-        self.native
+        native_format_from_source(
+            &self.native,
+            &self.seed_error,
+            self.handle.is_none() && self.terminal.error().is_none(),
+            || {
+                probe_system_format(
+                    self.exclude_self,
+                    &self.exclude_pids,
+                    self.device_id.as_deref(),
+                )
+            },
+        )
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
         if self.terminal.check_start(self.handle.is_some())? == StartAction::AlreadyRunning {
             return Ok(());
+        }
+
+        if let Some(error) = self.seed_error.borrow().as_ref() {
+            return Err(error.clone());
         }
 
         // Version gate: Process Tap requires macOS 14.4 or later. Check the OS version before
@@ -537,6 +576,15 @@ mod tests {
             matches!(backend.poll_event(), Some(Event::ShutdownError { error }) if matches!(error, Error::Context { context, .. } if context.operation() == Operation::Stop))
         );
         assert!(backend.poll_event().is_none());
+    }
+
+    #[test]
+    fn start_returns_retained_probe_error_without_hardware() {
+        let mut backend = MacSystemBackend::new(false, None);
+        let error = Error::Backend("probe failed".into());
+        backend.seed_error.replace(Some(error.clone()));
+        let (producer, _consumer) = raw_ring(16);
+        assert_eq!(backend.start(RawSink::new(producer, 48_000, 2)), Err(error));
     }
 
     #[test]

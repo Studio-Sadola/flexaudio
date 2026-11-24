@@ -33,6 +33,30 @@ pub(crate) const NO_ERR: i32 = 0;
 /// Fallback `(48000, 2)` when format retrieval fails.
 pub(crate) const FALLBACK_FORMAT: (u32, u16) = (48_000, 2);
 
+/// Refresh a stopped backend while retaining failures for start.
+pub(crate) fn native_format_from_source(
+    cached: &std::cell::Cell<(u32, u16)>,
+    failure: &std::cell::RefCell<Option<Error>>,
+    refresh: bool,
+    source: impl FnOnce() -> flexaudio_core::types::Result<(u32, u16)>,
+) -> (u32, u16) {
+    if refresh {
+        match source() {
+            Ok(format) => {
+                cached.set(format);
+                failure.replace(None);
+            }
+            Err(Error::UnsupportedOsVersion) => {
+                failure.replace(None);
+            }
+            Err(error) => {
+                failure.replace(Some(error));
+            }
+        }
+    }
+    cached.get()
+}
+
 /// Monotonic clock (ns). The downstream `ClockNormalizer` establishes the initial origin, so a
 /// monotonic approximation of the arrival time is sufficient here.
 pub(crate) fn now_ns() -> i64 {
@@ -441,5 +465,62 @@ mod repro_tests {
         );
         assert!(!error.to_string().contains("AudioDeviceStart"));
         assert!(error.to_string().contains("560227702"));
+    }
+}
+
+#[cfg(test)]
+mod format_cache_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn backends_remain_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<crate::MacSystemBackend>();
+        assert_send::<crate::MacProcessBackend>();
+    }
+
+    #[test]
+    fn stopped_success_updates_cache_and_clears_failure() {
+        let cache = Cell::new(FALLBACK_FORMAT);
+        let error = RefCell::new(Some(Error::DeviceNotFound));
+        assert_eq!(
+            native_format_from_source(&cache, &error, true, || Ok((44_100, 1))),
+            (44_100, 1)
+        );
+        assert_eq!(*error.borrow(), None);
+    }
+
+    #[test]
+    fn stopped_failure_retains_cache_and_error() {
+        let cache = Cell::new((44_100, 2));
+        let error = RefCell::new(None);
+        let cause = Error::Backend("probe failed".into());
+        assert_eq!(
+            native_format_from_source(&cache, &error, true, || Err(cause.clone())),
+            (44_100, 2)
+        );
+        assert_eq!(*error.borrow(), Some(cause));
+    }
+
+    #[test]
+    fn running_does_not_probe() {
+        let cache = Cell::new(FALLBACK_FORMAT);
+        let error = RefCell::new(None);
+        assert_eq!(
+            native_format_from_source(&cache, &error, false, || panic!("must not probe")),
+            FALLBACK_FORMAT
+        );
+    }
+
+    #[test]
+    fn unsupported_version_does_not_retain_probe_error() {
+        let cache = Cell::new(FALLBACK_FORMAT);
+        let error = RefCell::new(Some(Error::DeviceNotFound));
+        assert_eq!(
+            native_format_from_source(&cache, &error, true, || Err(Error::UnsupportedOsVersion)),
+            FALLBACK_FORMAT
+        );
+        assert_eq!(*error.borrow(), None);
     }
 }

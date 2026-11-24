@@ -248,6 +248,37 @@ fn device_uid(device: AudioObjectID) -> Result<String> {
     .ok_or_else(invalid_property)
 }
 
+/// Resolve the selectable output device a request refers to.
+///
+/// `None` resolves the default output and fails with `DeviceNotFound` when there is none;
+/// `Some(id)` accepts the same name-based IDs and UID fallbacks as [`list_output_devices`]
+/// and uses the same identity matching as tap selection.
+fn resolve_output_device_id(requested_id: Option<&str>) -> Result<AudioObjectID> {
+    match requested_id {
+        Some(requested_id) => {
+            for id in all_device_ids(read_system_object_list)? {
+                if crate::inventory::output_device_matches(is_output_device(id), || {
+                    flexaudio_core::inventory::device_identity_matches(
+                        requested_id,
+                        device_name(id),
+                        || device_uid(id),
+                    )
+                })? {
+                    return Ok(id);
+                }
+            }
+            Err(Error::DeviceNotFound)
+        }
+        None => {
+            let id = default_output_device()?;
+            if id == 0 {
+                return Err(Error::DeviceNotFound);
+            }
+            Ok(id)
+        }
+    }
+}
+
 /// Enumerate output (playback) devices.
 ///
 /// Each [`DeviceInfo`]:
@@ -354,7 +385,7 @@ fn output_device_identity(id: AudioObjectID) -> Option<(String, String)> {
     flexaudio_core::inventory::device_identity(device_name(id), || device_uid(id))
 }
 
-/// Validate the actual selected/default device's format before creating any tap.
+/// Validate the selected output using the existing device properties.
 fn require_output_format(id: AudioObjectID) -> Result<(u32, u16)> {
     flexaudio_core::inventory::require_device_format(
         device_sample_rate(id)
@@ -365,27 +396,12 @@ fn require_output_format(id: AudioObjectID) -> Result<(u32, u16)> {
 /// Resolve a name-based inventory ID or its unknown-name UID fallback.
 /// None retains default tap routing after validating the resolved default device.
 pub(crate) fn resolve_output_device_uid(requested_id: Option<&str>) -> Result<Option<String>> {
-    let Some(requested_id) = requested_id else {
-        let id = default_output_device()?;
-        if id == 0 {
-            return Err(Error::DeviceNotFound);
-        }
-        require_output_format(id)?;
+    let device = resolve_output_device_id(requested_id)?;
+    require_output_format(device)?;
+    if requested_id.is_none() {
         return Ok(None);
-    };
-    for id in all_device_ids(read_system_object_list)? {
-        if crate::inventory::output_device_matches(is_output_device(id), || {
-            flexaudio_core::inventory::device_identity_matches(
-                requested_id,
-                device_name(id),
-                || device_uid(id),
-            )
-        })? {
-            require_output_format(id)?;
-            return device_uid(id).map(Some);
-        }
     }
-    Err(Error::DeviceNotFound)
+    device_uid(device).map(Some)
 }
 
 #[cfg(test)]
