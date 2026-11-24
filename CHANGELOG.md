@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > changes; **patch** bumps (`0.2.0 → 0.2.1`) remain backward-compatible. Pin to
 > `0.8` to receive only compatible updates.
 
+## [0.8.2] - 2026-11-24
+
+### Fixed
+
+- macOS system and process loopback now probe the process tap's native format
+  before building capture sinks, including on open, start, watchdog reopen,
+  source switches, and for Mix children. This fixes `NativeFormatChanged` when
+  a tap uses a different rate, such as a device-scoped tap on a 44.1 kHz
+  Bluetooth output (#40). Format probe failures are returned by start.
+
+### Changed
+
+- On macOS, opening a system or process stream may create a short-lived tap,
+  so the system audio recording permission prompt can appear at open rather
+  than at start.
+
 ## [0.8.1] - 2026-10-20
 
 ### Fixed
