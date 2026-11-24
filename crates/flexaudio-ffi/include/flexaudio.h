@@ -929,7 +929,8 @@ float flexaudio_gain(const struct FlexStream *s);
 
 // Write the current backend's native format `(sample_rate, channels)` to `sr` / `ch`.
 //
-// These values come from the backend at open and are updated by `flexaudio_switch_source`.
+// These values come from the backend at open and are refreshed whenever capture starts or
+// restarts, including watchdog recovery and `flexaudio_switch_source`.
 // They are for display / diagnostics; the output format is set in `config`. Return 0 on
 // success and a negative value on error.
 //

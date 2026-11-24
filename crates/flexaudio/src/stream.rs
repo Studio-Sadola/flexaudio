@@ -175,10 +175,9 @@ struct SharedState {
 
     /// Native format `(sample_rate, channels)` of the current `backend`.
     ///
-    /// Unchanged when the watchdog reopens the same backend, but updated to the new backend's value
-    /// when [`Stream::switch_source`] changes the source (native SR/ch commonly differ between
-    /// mic↔system/process). On a generation change, the intake thread rereads this and rebuilds the
-    /// native-dependent first stage of [`Normalizer`].
+    /// Obtained from the backend at open and refreshed whenever capture starts or restarts, including
+    /// watchdog recovery and [`Stream::switch_source`]. On a generation change, the intake thread
+    /// rereads this and rebuilds the native-dependent first stage of [`Normalizer`].
     native_format: Mutex<(u32, u16)>,
 
     /// Source-switch flag. [`Stream::switch_backend`] sets it to true during a switch. The watchdog
