@@ -206,8 +206,67 @@ fn cstr_key(key: &std::ffi::CStr) -> Retained<NSString> {
     NSString::from_str(key.to_str().unwrap_or(""))
 }
 
-/// Build the process tap → aggregate device → IOProc → start chain.
-///
+/// Build the shared tap description.
+fn tap_description(kind: &TapKind, name: &str) -> Retained<CATapDescription> {
+    // SAFETY: The arrays and strings are valid Objective-C objects for each initializer.
+    let desc: Retained<CATapDescription> = unsafe {
+        match kind {
+            TapKind::IncludeProcesses(ids) => {
+                let arr = object_ids_to_nsarray(ids);
+                CATapDescription::initStereoMixdownOfProcesses(CATapDescription::alloc(), &arr)
+            }
+            TapKind::ExcludeProcesses(ids) => {
+                let arr = object_ids_to_nsarray(ids);
+                CATapDescription::initStereoGlobalTapButExcludeProcesses(
+                    CATapDescription::alloc(),
+                    &arr,
+                )
+            }
+            TapKind::ExcludeProcessesOnDevice { ids, device_uid } => {
+                let arr = object_ids_to_nsarray(ids);
+                let uid = NSString::from_str(device_uid);
+                // Stream 0 is the device's first output stream.
+                // Restrict the destination to the device with `device_uid` and mix down its audio,
+                // excluding `ids`.
+                CATapDescription::initExcludingProcesses_andDeviceUID_withStream(
+                    CATapDescription::alloc(),
+                    &arr,
+                    &uid,
+                    0,
+                )
+            }
+        }
+    };
+    // SAFETY: The initialized description and name are valid Objective-C objects.
+    unsafe {
+        desc.setName(&NSString::from_str(name));
+        desc.setPrivate(true);
+    }
+    desc
+}
+
+/// Create and immediately destroy a tap after reading its validated native format.
+pub(crate) fn probe_tap_format(kind: TapKind) -> Result<(u32, u16), Error> {
+    let desc = tap_description(&kind, "flexaudio-format-probe");
+    let mut tap_id: AudioObjectID = 0;
+    // SAFETY: The description and output pointer are valid for the duration of the call.
+    let status = unsafe { AudioHardwareCreateProcessTap(Some(&desc), &mut tap_id) };
+    if status != NO_ERR {
+        return Err(map_os_status("AudioHardwareCreateProcessTap", status));
+    }
+    if tap_id == 0 {
+        return Err(
+            Error::Backend("native tap creation returned no audio object".into())
+                .with_context(ErrorContext::new(Operation::Start)),
+        );
+    }
+    let format = tap_native_format(tap_id);
+    // SAFETY: This function owns the tap and destroys it exactly once.
+    let cleanup = unsafe { release_resources(0, None, tap_id) };
+    ShutdownReport::new(format.as_ref().err().cloned(), cleanup).result()?;
+    format
+}
+
 /// `sink` is moved into the IOProc block and receives [`RawSink::push`] calls from the RT
 /// callback. On success, returns [`TapChain`] (drop releases all resources in reverse order). On
 /// failure, releases any resources created so far before returning [`Error`].
@@ -220,36 +279,7 @@ pub(crate) unsafe fn build_tap_chain(
     name: &str,
     sink: RawSink,
 ) -> Result<TapChain, Error> {
-    // 1) CATapDescription (INCLUDE = mixdown / EXCLUDE = global-but-exclude /
-    //    ExcludeOnDevice = exclude audio sent to a specific output device).
-    let desc: Retained<CATapDescription> = match &kind {
-        TapKind::IncludeProcesses(ids) => {
-            let arr = object_ids_to_nsarray(ids);
-            CATapDescription::initStereoMixdownOfProcesses(CATapDescription::alloc(), &arr)
-        }
-        TapKind::ExcludeProcesses(ids) => {
-            let arr = object_ids_to_nsarray(ids);
-            CATapDescription::initStereoGlobalTapButExcludeProcesses(
-                CATapDescription::alloc(),
-                &arr,
-            )
-        }
-        TapKind::ExcludeProcessesOnDevice { ids, device_uid } => {
-            let arr = object_ids_to_nsarray(ids);
-            let uid = NSString::from_str(device_uid);
-            // Stream 0 is the device's first output stream. The tap format follows this stream.
-            // Restrict the destination to the device with `device_uid` and mix down its audio,
-            // excluding `ids`.
-            CATapDescription::initExcludingProcesses_andDeviceUID_withStream(
-                CATapDescription::alloc(),
-                &arr,
-                &uid,
-                0,
-            )
-        }
-    };
-    desc.setName(&NSString::from_str(name));
-    desc.setPrivate(true);
+    let desc = tap_description(&kind, name);
     // Tap UUID string used for the aggregate's sub-tap UID.
     let uuid_str: Retained<NSString> = desc.UUID().UUIDString();
 

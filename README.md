@@ -867,6 +867,7 @@ permission events keep type `permissionDenied` and add `permission`
   had no continuous revocation monitor. Native capture failures follow the
   backend's normal error path.
 - **System and per-process audio** use Core Audio process taps (macOS 14.4+).
+  Opening a system or process stream may create a short-lived tap to read its format, so the system audio recording permission prompt can appear at open rather than at start.
   Add a usage description to your app's `Info.plist`:
   ```xml
   <key>NSAudioCaptureUsageDescription</key>

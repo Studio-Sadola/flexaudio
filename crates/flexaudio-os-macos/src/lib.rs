@@ -18,6 +18,8 @@
 //! on first capture determines permission. If tap creation is rejected because permission has not
 //! been granted, [`map_os_status`](common::map_os_status) maps the permission-related OSStatus to
 //! [`Error::PermissionDenied`](flexaudio_core::types::Error).
+//! Opening a system or process stream may create a short-lived tap to read its format, so the
+//! system audio recording permission prompt can appear at open rather than at start.
 //! Successful tap creation does not prove consent. There is no public system-audio permission
 //! status API. Five continuous seconds of exact-zero native samples with eligible external output
 //! activity trigger one active self-probe per generation. It renders a roughly 300 ms diagnostic
