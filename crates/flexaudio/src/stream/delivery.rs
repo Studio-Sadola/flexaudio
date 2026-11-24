@@ -215,9 +215,9 @@ impl Stream {
 
     /// Native format `(sample_rate, channels)` of the current backend.
     ///
-    /// Value obtained from the backend at open. Unchanged on watchdog recovery, but updated to the
-    /// new backend's value when [`switch_source`](Self::switch_source) changes the source. For display
-    /// and diagnostics (output format is `config().output`).
+    /// Obtained from the backend at open and refreshed whenever capture starts or restarts, including
+    /// watchdog recovery and [`switch_source`](Self::switch_source). For display and diagnostics
+    /// (output format is `config().output`).
     pub fn native_format(&self) -> (u32, u16) {
         // Recover and read the value even if poisoned (avoid a panic cascade).
         *self

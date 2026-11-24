@@ -2041,8 +2041,8 @@ impl FlexStream {
 
     /// Current backend's native format `{ sampleRate, channels }`, for display/diagnostics
     /// (delivered chunks use output format `outputRate`/`outputChannels`).
-    /// Changing sources with `switchSource` updates this to the new backend's values. Throws if `stop()`
-    /// has already completed.
+    /// Obtained at open and refreshed whenever capture starts or restarts, including watchdog recovery
+    /// and `switchSource`. Throws if `stop()` has already completed.
     #[napi]
     pub fn native_format(&self) -> napi::Result<JsNativeFormat> {
         let s = self.query_snapshot()?;
